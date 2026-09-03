@@ -56,3 +56,12 @@ Full workspace tests need `git submodule update --init` (ethereum/tests). This c
 ## Metrics
 
 After a parallel block: `wait_admissions`, `speculate_executions`, `region_promotions`, `occ_aborts`, plus the addresses that waited vs speculated. `last_initial_wait_accounts()` is the test hook for inter-block heat seeding.
+
+## Lab
+
+VLDB-style mainnet multi-core sweep (Sequential / OCC / PCC / SpecFence) lives under [`lab/`](lab/README.md):
+
+- `lab/experiments/` — block list, cores, repeats, plot script
+- `lab/results/` — generated JSON/CSV
+- `lab/figures/` — TPS vs cores + abort-rate plots
+- `crates/pevm/examples/specfence_mainnet_sweep.rs` — sweep driver
