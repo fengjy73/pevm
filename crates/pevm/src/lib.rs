@@ -220,6 +220,8 @@ mod mv_memory;
 mod pevm;
 pub use pevm::{Pevm, PevmError, PevmResult, execute_revm_sequential};
 mod scheduler;
+pub mod specfence;
+pub use specfence::{ConcurrencyMode, SpecFenceMetrics};
 mod storage;
 pub use storage::{
     AccountBasic, BlockHashes, Bytecodes, ChainState, EvmAccount, EvmCode, InMemoryStorage,

@@ -26,6 +26,10 @@ use crate::{
     hash_deterministic,
     mv_memory::MvMemory,
     scheduler::Scheduler,
+    specfence::{
+        AccountHints, ConcurrencyMode, HeatMap, MetricsInner, SpecFenceCtx, SpecFenceMetrics,
+        seed_wait_regions, update_heat,
+    },
     storage::StorageWrapper,
     vm::{
         ExecutionError, PevmTxExecutionResult, Vm, VmExecutionError, receipt_from_revm,
@@ -142,15 +146,69 @@ impl ExecutionResults {
 }
 
 // TODO: Port more recyclable resources into here.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 /// The main pevm struct that executes blocks.
 pub struct Pevm {
     execution_results: ExecutionResults,
     abort_reason: OnceLock<AbortReason>,
     dropper: AsyncDropper<(MvMemory, Scheduler)>,
+    concurrency_mode: ConcurrencyMode,
+    heat: HeatMap,
+    last_metrics: SpecFenceMetrics,
+    last_initial_wait_accounts: std::collections::HashSet<alloy_primitives::Address>,
+}
+
+impl Default for Pevm {
+    fn default() -> Self {
+        Self {
+            execution_results: ExecutionResults::default(),
+            abort_reason: OnceLock::new(),
+            dropper: AsyncDropper::default(),
+            concurrency_mode: ConcurrencyMode::Occ,
+            heat: HeatMap::new(),
+            last_metrics: SpecFenceMetrics::default(),
+            last_initial_wait_accounts: std::collections::HashSet::new(),
+        }
+    }
 }
 
 impl Pevm {
+    /// Create an executor with a concurrency-control mode. Default is OCC.
+    pub fn with_concurrency_mode(mode: ConcurrencyMode) -> Self {
+        Self {
+            concurrency_mode: mode,
+            ..Self::default()
+        }
+    }
+
+    /// Set the concurrency-control mode for subsequent blocks.
+    pub const fn set_concurrency_mode(&mut self, mode: ConcurrencyMode) {
+        self.concurrency_mode = mode;
+    }
+
+    /// Current concurrency-control mode.
+    pub const fn concurrency_mode(&self) -> ConcurrencyMode {
+        self.concurrency_mode
+    }
+
+    /// Metrics from the last parallel execution (OCC/PCC/`SpecFence`).
+    pub const fn last_specfence_metrics(&self) -> &SpecFenceMetrics {
+        &self.last_metrics
+    }
+
+    /// Accounts seeded in Wait at the start of the last parallel block.
+    pub const fn last_initial_wait_accounts(
+        &self,
+    ) -> &std::collections::HashSet<alloy_primitives::Address> {
+        &self.last_initial_wait_accounts
+    }
+
+    /// Clear inter-block heat (test / replay).
+    pub fn reset_heat(&mut self) {
+        self.heat.reset();
+        self.last_initial_wait_accounts.clear();
+    }
+
     /// Execute an Alloy block, which is becoming the "standard" format in Rust.
     /// TODO: Better error handling.
     pub fn execute<S, C>(
@@ -225,14 +283,35 @@ impl Pevm {
         let scheduler = Scheduler::new(block_size);
 
         let mv_memory = chain.build_mv_memory(&block_env, &txs);
+        let hints = AccountHints::build(chain, &txs);
+        let metrics_inner = MetricsInner::default();
+        let mut initial_wait = std::collections::HashSet::new();
+        seed_wait_regions(
+            &mv_memory.regions,
+            &hints,
+            &self.heat,
+            self.concurrency_mode,
+            block_env.beneficiary,
+            &mut initial_wait,
+        );
 
         self.execution_results.grow_to(block_size);
+
+        let specfence = SpecFenceCtx {
+            mode: self.concurrency_mode,
+            hints: &hints,
+            metrics: &metrics_inner,
+            scheduler: &scheduler,
+            beneficiary: block_env.beneficiary,
+        };
 
         // TODO: Better thread handling
         thread::scope(|scope| {
             for _ in 0..concurrency_level.into() {
                 scope.spawn(|| {
-                    let mut vm = Vm::new(chain, spec_id, &block_env, &txs, storage, &mv_memory);
+                    let mut vm = Vm::new(
+                        chain, spec_id, &block_env, &txs, storage, &mv_memory, specfence,
+                    );
                     let mut task = scheduler.next_task();
                     while task.is_some() {
                         task = match task.unwrap() {
@@ -240,7 +319,7 @@ impl Pevm {
                                 self.try_execute(&mut vm, &scheduler, tx_version)
                             }
                             Task::Validation(tx_version) => {
-                                try_validate(&mv_memory, &scheduler, &tx_version)
+                                try_validate(&mv_memory, &scheduler, &tx_version, specfence)
                             }
                         };
 
@@ -261,6 +340,12 @@ impl Pevm {
                 });
             }
         });
+
+        if self.concurrency_mode.uses_regions() {
+            update_heat(&self.heat, &hints, &metrics_inner, block_env.beneficiary);
+        }
+        self.last_metrics = metrics_inner.snapshot();
+        self.last_initial_wait_accounts = initial_wait;
 
         if let Some(abort_reason) = self.abort_reason.take() {
             match abort_reason {
@@ -415,6 +500,16 @@ impl Pevm {
     ) -> Option<Task> {
         let result_slot = self.execution_results.slot_mut(tx_version.tx_idx);
         loop {
+            // Proactive Wait admission (per-region PCC), before optimistic execute.
+            if let Some((blocking_tx_idx, address)) = vm.hinted_wait_blocker(tx_version.tx_idx) {
+                if !scheduler.add_dependency(tx_version.tx_idx, blocking_tx_idx)
+                    && self.abort_reason.get().is_none()
+                {
+                    continue;
+                }
+                vm.record_wait_admission(address);
+                return None;
+            }
             return match vm.execute(&tx_version, result_slot) {
                 Ok(flags) => scheduler.finish_execution(tx_version, flags),
                 Err(VmExecutionError::Retry) => {
@@ -454,11 +549,29 @@ fn try_validate(
     mv_memory: &MvMemory,
     scheduler: &Scheduler,
     tx_version: &TxVersion,
+    specfence: SpecFenceCtx<'_>,
 ) -> Option<Task> {
-    let read_set_valid = mv_memory.validate_read_locations(tx_version.tx_idx);
+    let invalid = if specfence.mode.uses_regions() {
+        mv_memory.collect_invalid_reads(tx_version.tx_idx)
+    } else {
+        Vec::new()
+    };
+    let read_set_valid = if specfence.mode.uses_regions() {
+        invalid.is_empty()
+    } else {
+        mv_memory.validate_read_locations(tx_version.tx_idx)
+    };
     let aborted = !read_set_valid && scheduler.try_validation_abort(tx_version);
     if aborted {
         mv_memory.convert_writes_to_estimates(tx_version.tx_idx);
+        if specfence.mode.uses_regions() {
+            specfence.metrics.record_occ_abort();
+            for location in invalid {
+                if mv_memory.regions.promote_location(location) {
+                    specfence.metrics.record_promotion(None);
+                }
+            }
+        }
     }
     scheduler.finish_validation(tx_version, aborted)
 }

@@ -7,9 +7,11 @@ use alloy_primitives::{Address, B256};
 use dashmap::DashMap;
 use revm::state::Bytecode;
 
+use smallvec::SmallVec;
+
 use crate::{
     BuildIdentityHasher, BuildSuffixHasher, MemoryEntry, MemoryLocationHash, ReadOrigin, ReadSet,
-    TxIdx, TxVersion, WriteSet,
+    TxIdx, TxVersion, WriteSet, specfence::RegionTable,
 };
 
 #[derive(Default, Debug)]
@@ -39,6 +41,8 @@ pub struct MvMemory {
     lazy_addresses: Mutex<LazyAddresses>,
     /// New bytecodes deployed in this block
     pub(crate) new_bytecodes: DashMap<B256, Bytecode, BuildSuffixHasher>,
+    /// Per-location / per-account Wait vs Speculate for `SpecFence`.
+    pub(crate) regions: RegionTable,
 }
 
 impl MvMemory {
@@ -70,6 +74,7 @@ impl MvMemory {
             // TODO: Fine-tune the number of shards, like to the next number of two from the
             // number of worker threads.
             new_bytecodes: DashMap::default(),
+            regions: RegionTable::new(),
         }
     }
 
@@ -89,7 +94,7 @@ impl MvMemory {
         tx_version: &TxVersion,
         read_set: ReadSet,
         write_set: WriteSet,
-    ) -> bool {
+    ) -> (bool, SmallVec<[MemoryLocationHash; 4]>) {
         let mut last_locations = index_mutex!(self.last_locations, tx_version.tx_idx);
         last_locations.read = read_set;
 
@@ -110,19 +115,29 @@ impl MvMemory {
 
         // Register new writes.
         let mut wrote_new_location = false;
+        let mut contended = SmallVec::<[MemoryLocationHash; 4]>::new();
 
         for (location, value) in write_set {
-            self.data.entry(location).or_default().insert(
-                tx_version.tx_idx,
-                MemoryEntry::Data(tx_version.tx_incarnation, value),
-            );
+            {
+                let mut written_transactions = self.data.entry(location).or_default();
+                if written_transactions
+                    .keys()
+                    .any(|&idx| idx != tx_version.tx_idx)
+                {
+                    contended.push(location);
+                }
+                written_transactions.insert(
+                    tx_version.tx_idx,
+                    MemoryEntry::Data(tx_version.tx_incarnation, value),
+                );
+            }
             if !last_locations.write.contains(&location) {
                 last_locations.write.push(location);
                 wrote_new_location = true;
             }
         }
 
-        wrote_new_location
+        (wrote_new_location, contended)
     }
 
     // Obtain the last read set recorded by an execution of [tx_idx] and check
@@ -138,9 +153,16 @@ impl MvMemory {
     // validations that successfully abort affect the state and each incarnation
     // can be aborted at most once).
     pub(crate) fn validate_read_locations(&self, tx_idx: TxIdx) -> bool {
+        self.collect_invalid_reads(tx_idx).is_empty()
+    }
+
+    /// Locations in the last recorded read set whose origins no longer match.
+    pub(crate) fn collect_invalid_reads(&self, tx_idx: TxIdx) -> Vec<MemoryLocationHash> {
+        let mut invalid = Vec::new();
         for (location, prior_origins) in &index_mutex!(self.last_locations, tx_idx).read {
-            if let Some(written_transactions) = self.data.get(location) {
+            let still_valid = if let Some(written_transactions) = self.data.get(location) {
                 let mut iter = written_transactions.range(..tx_idx);
+                let mut ok = true;
                 for prior_origin in prior_origins {
                     if let ReadOrigin::MvMemory(prior_version) = prior_origin {
                         // Found something: Must match version.
@@ -150,29 +172,45 @@ impl MvMemory {
                             if closest_idx != &prior_version.tx_idx
                                 || &prior_version.tx_incarnation != tx_incarnation
                             {
-                                return false;
+                                ok = false;
+                                break;
                             }
                         }
                         // The previously read value is now cleared
                         // or marked with ESTIMATE.
                         else {
-                            return false;
+                            ok = false;
+                            break;
                         }
                     }
                     // Read from storage but there is now something
                     // in between!
                     else if iter.next_back().is_some() {
-                        return false;
+                        ok = false;
+                        break;
                     }
                 }
-            }
-            // Read from multi-version data but now it's cleared.
-            else if prior_origins.len() != 1 || prior_origins.last() != Some(&ReadOrigin::Storage)
-            {
-                return false;
+                ok
+            } else {
+                // Read from multi-version data but now it's cleared.
+                prior_origins.len() == 1 && prior_origins.last() == Some(&ReadOrigin::Storage)
+            };
+            if !still_valid {
+                invalid.push(*location);
             }
         }
-        true
+        invalid
+    }
+
+    /// Last writer with index strictly below `tx_idx`, if any.
+    pub(crate) fn last_writer_before(
+        &self,
+        location: MemoryLocationHash,
+        tx_idx: TxIdx,
+    ) -> Option<TxIdx> {
+        self.data
+            .get(&location)
+            .and_then(|written| written.range(..tx_idx).next_back().map(|(idx, _)| *idx))
     }
 
     // Replace the write set of the aborted version in the shared memory data

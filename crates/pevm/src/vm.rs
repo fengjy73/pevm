@@ -17,6 +17,7 @@ use crate::{
     AccountBasic, BuildIdentityHasher, BuildSuffixHasher, EvmAccount, FinishExecFlags, MemoryEntry,
     MemoryLocation, MemoryLocationHash, MemoryValue, ReadOrigin, ReadOrigins, ReadSet, Storage,
     TxIdx, TxVersion, WriteSet, chain::PevmChain, hash_deterministic, mv_memory::MvMemory,
+    specfence::SpecFenceCtx,
 };
 
 /// The execution error from the underlying EVM executor.
@@ -121,6 +122,7 @@ impl From<ReadError> for VmExecutionError {
 struct VmDb<'a, S: Storage> {
     storage: &'a S,
     mv_memory: &'a MvMemory,
+    specfence: SpecFenceCtx<'a>,
     tx_idx: TxIdx,
     tx: &'a TxEnv,
     from_hash: MemoryLocationHash,
@@ -185,6 +187,47 @@ impl<'a, S: Storage> VmDb<'a, S> {
         hash_deterministic(MemoryLocation::Basic(*address))
     }
 
+    fn promote_on_conflict(&self, address: Address, location: MemoryLocationHash) {
+        if !self.specfence.mode.uses_regions() || address == self.specfence.beneficiary {
+            return;
+        }
+        if self.mv_memory.regions.promote_location(location) {
+            self.specfence.metrics.record_promotion(Some(address));
+        }
+        self.mv_memory.regions.promote_account(address);
+        self.specfence.metrics.mark_hot(address);
+    }
+
+    /// Proactive Wait: depend on the last lower-idx writer instead of a speculative read.
+    fn maybe_wait(
+        &self,
+        address: Address,
+        location_hash: MemoryLocationHash,
+    ) -> Result<(), ReadError> {
+        if !self
+            .specfence
+            .should_wait_location(&self.mv_memory.regions, location_hash, &address)
+        {
+            return Ok(());
+        }
+        if let Some(prev) =
+            self.specfence
+                .wait_blocker(&self.mv_memory.regions, &address, self.tx_idx)
+        {
+            self.specfence.metrics.record_wait(address);
+            return Err(ReadError::Blocking(prev));
+        }
+        if let Some(prev) = self
+            .mv_memory
+            .last_writer_before(location_hash, self.tx_idx)
+            && !self.specfence.scheduler.is_done(prev)
+        {
+            self.specfence.metrics.record_wait(address);
+            return Err(ReadError::Blocking(prev));
+        }
+        Ok(())
+    }
+
     // Push a new read origin. Return an error when there's already
     // an origin but doesn't match the new one to force re-execution.
     fn push_origin(read_origins: &mut ReadOrigins, origin: ReadOrigin) -> Result<(), ReadError> {
@@ -240,6 +283,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         let location_hash = self.hash_basic(&address);
+        self.maybe_wait(address, location_hash)?;
 
         // We return a mock for non-contract addresses (for lazy updates) to avoid
         // unnecessarily evaluating its balance here.
@@ -280,6 +324,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
             loop {
                 match iter.next_back() {
                     Some((blocking_idx, MemoryEntry::Estimate)) => {
+                        self.promote_on_conflict(address, location_hash);
                         return Err(ReadError::Blocking(*blocking_idx));
                     }
                     Some((closest_idx, MemoryEntry::Data(tx_incarnation, value))) => {
@@ -369,6 +414,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
                 return if self.tx_idx > 0 {
                     // TODO: Better retry strategy -- immediately, to the
                     // closest sender tx, to the missing sender tx, etc.
+                    self.promote_on_conflict(address, location_hash);
                     Err(ReadError::Blocking(self.tx_idx - 1))
                 } else {
                     Err(ReadError::InvalidNonce(self.tx_idx))
@@ -428,6 +474,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
 
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
         let location_hash = hash_deterministic(MemoryLocation::Storage(address, index));
+        self.maybe_wait(address, location_hash)?;
 
         let read_origins = self.read_set.entry(location_hash).or_default();
 
@@ -448,7 +495,10 @@ impl<S: Storage> Database for VmDb<'_, S> {
                     )?;
                     return Ok(*value);
                 }
-                MemoryEntry::Estimate => return Err(ReadError::Blocking(*closest_idx)),
+                MemoryEntry::Estimate => {
+                    self.promote_on_conflict(address, location_hash);
+                    return Err(ReadError::Blocking(*closest_idx));
+                }
                 _ => return Err(ReadError::InvalidMemoryValueType),
             }
         }
@@ -475,6 +525,7 @@ pub(crate) struct Vm<'a, S: Storage, C: PevmChain> {
     block_env: &'a BlockEnv,
     txs: &'a [C::EvmTx],
     mv_memory: &'a MvMemory,
+    specfence: SpecFenceCtx<'a>,
     beneficiary_location_hash: MemoryLocationHash,
     // Dedicated EVM for the worker, reset before each transaction exectution.
     evm: C::Evm<VmDb<'a, S>>,
@@ -488,12 +539,14 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         txs: &'a [C::EvmTx],
         storage: &'a S,
         mv_memory: &'a MvMemory,
+        specfence: SpecFenceCtx<'a>,
     ) -> Self {
         // The DB is initialised with mock values; each transaction execution
         // [VmDb::set_tx] the intended transaction before executing.
         let db = VmDb {
             storage,
             mv_memory,
+            specfence,
             tx_idx: 0,
             // SAFETY: txs is non-empty (checked by the caller before spawning threads).
             tx: chain.tx_env(unsafe { txs.get_unchecked(0) }),
@@ -513,10 +566,65 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             block_env,
             txs,
             mv_memory,
+            specfence,
             beneficiary_location_hash: hash_deterministic(MemoryLocation::Basic(
                 block_env.beneficiary,
             )),
             evm: chain.build_evm(spec_id, block_env.clone(), db),
+        }
+    }
+
+    /// Hinted Wait admission: previous `from`/`to` writer that is not done yet.
+    pub(crate) fn hinted_wait_blocker(&self, tx_idx: TxIdx) -> Option<(TxIdx, Address)> {
+        if !self.specfence.mode.uses_regions() {
+            return None;
+        }
+        let tx = self.chain.tx_env(unsafe { self.txs.get_unchecked(tx_idx) });
+        if let Some(prev) = self
+            .specfence
+            .wait_blocker(&self.mv_memory.regions, &tx.caller, tx_idx)
+        {
+            return Some((prev, tx.caller));
+        }
+        if let Some(to) = tx.kind.to()
+            && let Some(prev) = self
+                .specfence
+                .wait_blocker(&self.mv_memory.regions, to, tx_idx)
+        {
+            return Some((prev, *to));
+        }
+        None
+    }
+
+    pub(crate) fn record_wait_admission(&self, address: Address) {
+        self.specfence.metrics.record_wait(address);
+    }
+
+    fn promote_region(&self, location: MemoryLocationHash, address: Option<Address>) {
+        if self.mv_memory.regions.promote_location(location) {
+            self.specfence.metrics.record_promotion(address);
+        }
+        if let Some(address) = address {
+            if address == self.specfence.beneficiary {
+                return;
+            }
+            self.mv_memory.regions.promote_account(address);
+            self.specfence.metrics.mark_hot(address);
+        }
+    }
+
+    fn promote_if_multi_writer(&self, address: Address, location: Option<MemoryLocationHash>) {
+        if address == self.specfence.beneficiary {
+            return;
+        }
+        if self.specfence.hints.writer_count(&address) < 2 {
+            return;
+        }
+        if let Some(location) = location {
+            self.promote_region(location, Some(address));
+        } else {
+            self.mv_memory.regions.promote_account(address);
+            self.specfence.metrics.mark_hot(address);
         }
     }
 
@@ -718,8 +826,55 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     FinishExecFlags::empty()
                 };
 
-                if self.mv_memory.record(tx_version, read_set, write_set) {
+                let (wrote_new_location, contended) =
+                    self.mv_memory.record(tx_version, read_set, write_set);
+                if wrote_new_location {
                     flags |= FinishExecFlags::WroteNewLocation;
+                }
+                if self.specfence.mode.uses_regions() {
+                    let from_wait = self
+                        .specfence
+                        .should_wait_account(&self.mv_memory.regions, &tx.caller);
+                    let to_wait = tx.kind.to().is_some_and(|to| {
+                        self.specfence
+                            .should_wait_account(&self.mv_memory.regions, to)
+                    });
+                    // Independents (no hinted predecessor) still count as Speculate
+                    // even when PCC seeds their account Wait with nobody to wait for.
+                    let from_has_pred = self
+                        .specfence
+                        .hints
+                        .prev(&tx.caller, tx_version.tx_idx)
+                        .is_some();
+                    let to_has_pred = tx.kind.to().is_some_and(|to| {
+                        self.specfence.hints.prev(to, tx_version.tx_idx).is_some()
+                    });
+                    if (!from_wait || !from_has_pred) && (!to_wait || !to_has_pred) {
+                        self.specfence
+                            .metrics
+                            .record_speculate(tx.caller, tx.kind.to().copied());
+                    }
+                    // Wave: a second hinted writer to the same account is a WW overlap.
+                    self.promote_if_multi_writer(tx.caller, Some(from_hash));
+                    if let Some(to) = tx.kind.to().copied() {
+                        self.promote_if_multi_writer(to, to_hash);
+                    }
+                    for loc in contended {
+                        if loc == self.beneficiary_location_hash {
+                            continue;
+                        }
+                        let addr = if loc == from_hash {
+                            Some(tx.caller)
+                        } else if Some(loc) == to_hash {
+                            tx.kind.to().copied()
+                        } else {
+                            None
+                        };
+                        if addr == Some(self.specfence.beneficiary) {
+                            continue;
+                        }
+                        self.promote_region(loc, addr);
+                    }
                 }
 
                 let receipt = receipt_from_revm(exec_result);

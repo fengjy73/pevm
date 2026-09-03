@@ -282,6 +282,19 @@ impl Scheduler {
     // When there is a successful abort, schedule the transaction for re-execution
     // and the higher transactions for validation. The re-execution task is returned
     // for the aborted transaction.
+    /// True when this transaction has finished the current incarnation enough
+    /// for a Wait-mode reader to consume its writes (`Executed` or `Validated`).
+    pub(crate) fn is_done(&self, tx_idx: TxIdx) -> bool {
+        if tx_idx >= self.block_size {
+            return true;
+        }
+        let tx = index_mutex!(self.transactions_status, tx_idx);
+        matches!(
+            tx.status,
+            IncarnationStatus::Executed | IncarnationStatus::Validated
+        )
+    }
+
     pub(crate) fn finish_validation(&self, tx_version: &TxVersion, aborted: bool) -> Option<Task> {
         if aborted {
             self.set_ready_status(tx_version.tx_idx);
