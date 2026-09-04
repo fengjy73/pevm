@@ -227,6 +227,7 @@ pub use storage::{
     AccountBasic, BlockHashes, Bytecodes, ChainState, EvmAccount, EvmCode, InMemoryStorage,
     Storage, StorageWrapper,
 };
+mod tx_runner;
 mod vm;
 pub use vm::{ExecutionError, PevmTxExecutionResult};
 

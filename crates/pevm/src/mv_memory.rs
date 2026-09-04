@@ -113,6 +113,19 @@ impl MvMemory {
 
     /// Residual write locations from the last aborted incarnation (Bohm-lite).
     #[allow(dead_code)]
+    /// Data value still published by `tx_idx` at `location`, if any.
+    pub(crate) fn published_data_value(
+        &self,
+        tx_idx: TxIdx,
+        location: MemoryLocationHash,
+    ) -> Option<crate::MemoryValue> {
+        let written = self.data.get(&location)?;
+        match written.get(&tx_idx)? {
+            MemoryEntry::Data(_, value) => Some(value.clone()),
+            MemoryEntry::Estimate => None,
+        }
+    }
+
     pub(crate) fn residual_writes(&self, tx_idx: TxIdx) -> Vec<MemoryLocationHash> {
         self.residual_write_sets
             .get(&tx_idx)

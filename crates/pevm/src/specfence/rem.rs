@@ -549,6 +549,23 @@ impl PartialRetryTable {
             .and_then(|c| c.boundary.clone())
     }
 
+    /// Suffix write locations from the armed RewindTo continuation (empty if none).
+    pub(crate) fn ff_suffix_writes(&self, tx_idx: TxIdx) -> Vec<MemoryLocationHash> {
+        self.ff_resume
+            .get(&tx_idx)
+            .map(|c| c.suffix_writes.clone())
+            .unwrap_or_default()
+    }
+
+    /// True when certified-prefix effects contain no writes (safe for live PC jump
+    /// without revm journal-blob FF).
+    pub(crate) fn ff_prefix_is_read_only(&self, tx_idx: TxIdx) -> bool {
+        self.ff_resume
+            .get(&tx_idx)
+            .map(|c| c.effects.iter().all(|e| e.mode == AccessMode::Read))
+            .unwrap_or(true)
+    }
+
     pub(crate) fn ff_values(
         &self,
         tx_idx: TxIdx,

@@ -111,8 +111,14 @@ pub struct SpecFenceMetrics {
     /// M1c: times RewindTo credited a boundary resume (PC jump or effect-boundary skip).
     pub pc_resume_count: usize,
     /// M1c: estimated prefix opcodes/work units skipped on resume (`BoundarySnapshot.opcode_steps`).
-    /// Production path uses effect-ordinal grain (Handler::run); Inspector unit tests use real steps.
+    /// M1d: live Inspector path records real skipped steps when `live_pc_resume_count` > 0.
     pub prefix_opcodes_skipped: usize,
+    /// M1d: times SpecFenceInspector actually applied a live PC/stack/gas snap on resume.
+    pub live_pc_resume_count: usize,
+    /// M1d: cumulative SpecFenceInspector::step counts (real opcodes entered).
+    pub inspector_steps: usize,
+    /// M1d: inspector steps during RewindTo resume executes only.
+    pub inspector_steps_resume: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -158,6 +164,9 @@ pub(crate) struct MetricsInner {
     db_heavy_ops: AtomicUsize,
     pc_resume_count: AtomicUsize,
     prefix_opcodes_skipped: AtomicUsize,
+    live_pc_resume_count: AtomicUsize,
+    inspector_steps: AtomicUsize,
+    inspector_steps_resume: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -367,12 +376,30 @@ impl MetricsInner {
         self.db_heavy_ops.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// M1c: PC/boundary resume applied; `skipped` = prefix opcode steps not re-run.
+    /// M1c/M1d: PC/boundary resume applied; `skipped` = prefix opcode steps not re-run.
     pub(crate) fn record_pc_resume(&self, skipped: u64) {
         self.pc_resume_count.fetch_add(1, Ordering::Relaxed);
         if skipped > 0 {
             self.prefix_opcodes_skipped
                 .fetch_add(skipped as usize, Ordering::Relaxed);
+        }
+    }
+
+    /// M1d: live `initialize_interp` applied a BoundarySnapshot (real PC jump).
+    pub(crate) fn record_live_pc_resume(&self) {
+        self.live_pc_resume_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// M1d: accumulate Inspector::step counts for this execute.
+    pub(crate) fn record_inspector_steps(&self, steps: u64, is_resume: bool) {
+        if steps == 0 {
+            return;
+        }
+        self.inspector_steps
+            .fetch_add(steps as usize, Ordering::Relaxed);
+        if is_resume {
+            self.inspector_steps_resume
+                .fetch_add(steps as usize, Ordering::Relaxed);
         }
     }
 
@@ -452,6 +479,9 @@ impl MetricsInner {
             db_heavy_ops: self.db_heavy_ops.load(Ordering::Relaxed),
             pc_resume_count: self.pc_resume_count.load(Ordering::Relaxed),
             prefix_opcodes_skipped: self.prefix_opcodes_skipped.load(Ordering::Relaxed),
+            live_pc_resume_count: self.live_pc_resume_count.load(Ordering::Relaxed),
+            inspector_steps: self.inspector_steps.load(Ordering::Relaxed),
+            inspector_steps_resume: self.inspector_steps_resume.load(Ordering::Relaxed),
         }
     }
 }

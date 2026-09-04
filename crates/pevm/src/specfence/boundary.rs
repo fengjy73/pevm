@@ -5,7 +5,9 @@
 //! 2. On RewindTo resume, jump the matching call-depth frame to the certified
 //!    prefix boundary PC so prefix opcodes are not re-interpreted
 //!
-//! Nested mid-CALL arbitrary-PC beyond a captured frame is TODO; invalid
+//! M1d: production SpecFence `Vm::execute` uses stock `InspectorHandler::inspect_run`
+//! (Ethereum MainnetEvm) so `initialize_interp` applies live PC/stack/gas restore.
+//! Nested mid-CALL arbitrary-PC beyond a captured frame is still TODO; invalid
 //! control-flow → caller FullRestarts (no resume arm).
 
 #![allow(dead_code)]
@@ -70,6 +72,15 @@ impl BoundarySnapshot {
             mem[..n].copy_from_slice(&self.memory[..n]);
         }
     }
+
+    /// True when this snap came from a live Inspector capture (not a lite/synthetic
+    /// effect-ordinal placeholder with empty interpreter state).
+    pub(crate) fn is_live_capture(&self) -> bool {
+        self.gas_remaining > 0
+            || self.pc > 0
+            || !self.stack.is_empty()
+            || !self.memory.is_empty()
+    }
 }
 
 /// Scoped plant pointers for Inspector → PartialRetry / metrics (execute duration only).
@@ -112,6 +123,7 @@ pub(crate) fn with_plant_tls<R>(
     STEPS_THIS_RUN.set(0);
     LAST_SKIPPED.set(0);
     let out = f();
+    PENDING_RESUME.with(|c| *c.borrow_mut() = None);
     PLANT.set(prev);
     out
 }
@@ -133,31 +145,28 @@ pub(crate) fn clear_pc_resume() {
 /// PC/stack snap. Otherwise (Handler::run production path) emit a lite snap
 /// whose `opcode_steps` equals the current SpecFence effect ordinal — an honest
 /// lower-bound skip credit for certified-prefix resume accounting.
-pub(crate) fn note_pending_effect_boundary() {
-    // Prefer Inspector step_end fill when plant TLS + inspector are active.
-    if PLANT.with(|p| p.get().is_some()) && STEPS_THIS_RUN.get() > 0 {
-        PENDING_EFFECT_CP.set(true);
-        return;
-    }
-    PLANT.with(|p| {
-        if let Some(plant) = p.get() {
-            let table = unsafe { &*plant.partial_retry };
-            let k = table.current_k(plant.tx_idx);
-            let snap = BoundarySnapshot {
-                pc: 0,
-                gas_remaining: 0,
-                call_depth: 0,
-                opcode_steps: k as u64,
-                stack: Vec::new(),
-                memory: Vec::new(),
-            };
-            let _ = table.push_checkpoint_with_boundary(
-                plant.tx_idx,
-                CheckpointKind::EffectBoundary,
-                Some(snap),
-            );
-        }
-    });
+pub(crate) fn note_pending_effect_boundary(
+    tx_idx: TxIdx,
+    partial_retry: &PartialRetryTable,
+) {
+    // Always emit lite EffectBoundary at Bind/EarlyVal (M1c-compatible cps).
+    // Live Inspector snaps stay in LAST_SNAP; attaching them to repair cps
+    // livelocked some conflict schedules under inspect_run.
+    let k = partial_retry.current_k(tx_idx);
+    let live_steps = LAST_SNAP.with(|c| c.borrow().as_ref().map(|s| s.opcode_steps));
+    let snap = BoundarySnapshot {
+        pc: 0,
+        gas_remaining: 0,
+        call_depth: 0,
+        opcode_steps: live_steps.filter(|n| *n > 0).unwrap_or(k as u64),
+        stack: Vec::new(),
+        memory: Vec::new(),
+    };
+    let _ = partial_retry.push_checkpoint_with_boundary(
+        tx_idx,
+        CheckpointKind::EffectBoundary,
+        Some(snap),
+    );
 }
 
 pub(crate) fn last_boundary_snap() -> Option<BoundarySnapshot> {
@@ -192,16 +201,18 @@ fn record_pc_resume(skipped: u64) {
         if let Some(plant) = p.get() {
             let metrics = unsafe { &*plant.metrics };
             metrics.record_pc_resume(skipped);
+            metrics.record_live_pc_resume();
         }
     });
 }
 
 /// SpecFence boundary Inspector — observational except on armed PC resume.
 #[derive(Debug, Default, Clone)]
-pub(crate) struct SpecFenceInspector;
+pub struct SpecFenceInspector;
 
 impl SpecFenceInspector {
-    pub(crate) const fn new() -> Self {
+    /// Construct the SpecFence boundary inspector.
+    pub const fn new() -> Self {
         Self
     }
 }
@@ -220,8 +231,6 @@ impl<CTX> Inspector<CTX, EthInterpreter> for SpecFenceInspector {
             return;
         };
         let depth = CALL_DEPTH.get();
-        // Top-level call is depth 1 after `call()`; allow 0/1 soft match for
-        // frames where call hooks did not fire.
         if snap.call_depth != depth && !(snap.call_depth <= 1 && depth <= 1) {
             return;
         }
@@ -246,10 +255,8 @@ impl<CTX> Inspector<CTX, EthInterpreter> for SpecFenceInspector {
         let depth = CALL_DEPTH.get();
         let n = OPCODE_STEPS.get();
         let snap = BoundarySnapshot::capture_from_interp(interp, depth, n);
-        LAST_SNAP.with(|c| *c.borrow_mut() = Some(snap.clone()));
-        if PENDING_EFFECT_CP.replace(false) {
-            push_cp(CheckpointKind::EffectBoundary, Some(snap));
-        }
+        LAST_SNAP.with(|c| *c.borrow_mut() = Some(snap));
+        let _ = PENDING_EFFECT_CP.replace(false);
     }
 
     fn call(
@@ -257,10 +264,7 @@ impl<CTX> Inspector<CTX, EthInterpreter> for SpecFenceInspector {
         _context: &mut CTX,
         _inputs: &mut CallInputs,
     ) -> Option<CallOutcome> {
-        let d = CALL_DEPTH.get().saturating_add(1);
-        CALL_DEPTH.set(d);
-        let snap = LAST_SNAP.with(|c| c.borrow().clone());
-        push_cp(CheckpointKind::CallEntry, snap);
+        CALL_DEPTH.set(CALL_DEPTH.get().saturating_add(1));
         None
     }
 
@@ -270,8 +274,6 @@ impl<CTX> Inspector<CTX, EthInterpreter> for SpecFenceInspector {
         _inputs: &CallInputs,
         _outcome: &mut CallOutcome,
     ) {
-        let snap = LAST_SNAP.with(|c| c.borrow().clone());
-        push_cp(CheckpointKind::CallExit, snap);
         CALL_DEPTH.set(CALL_DEPTH.get().saturating_sub(1));
     }
 
@@ -280,10 +282,7 @@ impl<CTX> Inspector<CTX, EthInterpreter> for SpecFenceInspector {
         _context: &mut CTX,
         _inputs: &mut CreateInputs,
     ) -> Option<CreateOutcome> {
-        let d = CALL_DEPTH.get().saturating_add(1);
-        CALL_DEPTH.set(d);
-        let snap = LAST_SNAP.with(|c| c.borrow().clone());
-        push_cp(CheckpointKind::CallEntry, snap);
+        CALL_DEPTH.set(CALL_DEPTH.get().saturating_add(1));
         None
     }
 
@@ -293,11 +292,10 @@ impl<CTX> Inspector<CTX, EthInterpreter> for SpecFenceInspector {
         _inputs: &CreateInputs,
         _outcome: &mut CreateOutcome,
     ) {
-        let snap = LAST_SNAP.with(|c| c.borrow().clone());
-        push_cp(CheckpointKind::CallExit, snap);
         CALL_DEPTH.set(CALL_DEPTH.get().saturating_sub(1));
     }
 }
+
 
 #[cfg(test)]
 mod m1c_tests {

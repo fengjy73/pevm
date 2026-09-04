@@ -20,7 +20,7 @@ use revm::{
     Database, ExecuteEvm,
     context::{
         BlockEnv, ContextTr,
-        result::{EVMError, ExecutionResult},
+        result::{EVMError, ExecutionResult, InvalidTransaction},
     },
 };
 use smallvec::SmallVec;
@@ -161,6 +161,18 @@ pub trait PevmChain: Debug {
         txs: &BlockTransactions<Self::Transaction>,
         tx_results: &[PevmTxExecutionResult],
     ) -> Result<B256, CalculateReceiptRootError>;
+
+
+    /// Execute one tx with pevm's no-beneficiary handler.
+    ///
+    /// When `use_inspect` is true (SpecFence), chains that wire SpecFenceInspector
+    /// (Ethereum) use stock `inspect_run` for live PC resume. Others fall back to
+    /// `Handler::run`.
+    fn run_pevm_tx<DB: Database>(
+        &self,
+        evm: &mut Self::Evm<DB>,
+        use_inspect: bool,
+    ) -> Result<ExecutionResult<Self::EvmHaltReason>, EVMError<DB::Error, InvalidTransaction>>;
 
     /// Check whether EIP-1559 is enabled
     /// <https://github.com/ethereum/EIPs/blob/96523ef4d76ca440f73f0403ddb5c9cb3b24dcae/EIPS/eip-1559.md>

@@ -7,7 +7,7 @@ use revm::{
         BlockEnv, ContextSetters, ContextTr, DBErrorMarker, JournalTr, TxEnv,
         result::{EVMError, ExecutionResult, InvalidTransaction},
     },
-    handler::{EvmTr, FrameResult, Handler},
+    handler::EvmTr,
     primitives::KECCAK_EMPTY,
     state::{AccountInfo, Bytecode, EvmState},
 };
@@ -18,8 +18,9 @@ use crate::{
     MemoryLocation, MemoryLocationHash, MemoryValue, ReadOrigin, ReadOrigins, ReadSet, Storage,
     TxIdx, TxVersion, WriteSet, chain::PevmChain, hash_deterministic, mv_memory::MvMemory,
     specfence::{
-        AccessMode, BoundarySnapshot, CheckpointKind, FfValue, ResolveAction, SpecFenceCtx,
-        TAU_VERY_HIGH, early_val_probability,
+        AccessMode, CheckpointKind, FfValue, ResolveAction, SpecFenceCtx,
+        TAU_VERY_HIGH, arm_pc_resume, early_val_probability, note_pending_effect_boundary,
+        resume_was_applied, steps_this_run, with_plant_tls,
     },
 };
 
@@ -471,21 +472,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     .partial_retry
                     .note_certified(self.tx_idx, location_hash);
                 self.specfence.rem.note_checkpoint_opportunity();
-                let k = self.specfence.partial_retry.current_k(self.tx_idx);
-                let snap = BoundarySnapshot {
-                    pc: 0,
-                    gas_remaining: 0,
-                    call_depth: 1,
-                    // Effect ordinal as estimated prefix opcode/work units skipped on resume.
-                    opcode_steps: k as u64,
-                    stack: Vec::new(),
-                    memory: Vec::new(),
-                };
-                let _ = self.specfence.partial_retry.push_checkpoint_with_boundary(
-                    self.tx_idx,
-                    CheckpointKind::EffectBoundary,
-                    Some(snap),
-                );
+                // M1d: defer to Inspector step_end for live PC/stack snap when
+                // inspect_run is driving; else lite effect-ordinal snap.
+                note_pending_effect_boundary(self.tx_idx, self.specfence.partial_retry);
                 Ok(())
             }
             ResolveAction::SpecRead => {
@@ -531,21 +520,8 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 .note_certified(self.tx_idx, location_hash);
             self.specfence.rem.note_checkpoint_opportunity();
             self.specfence.metrics.record_checkpoint_opportunity();
-            let k = self.specfence.partial_retry.current_k(self.tx_idx);
-            let snap = BoundarySnapshot {
-                pc: 0,
-                gas_remaining: 0,
-                call_depth: 1,
-                // Effect ordinal as estimated prefix opcode/work units skipped on resume.
-                opcode_steps: k as u64,
-                stack: Vec::new(),
-                memory: Vec::new(),
-            };
-            let _ = self.specfence.partial_retry.push_checkpoint_with_boundary(
-                self.tx_idx,
-                CheckpointKind::EffectBoundary,
-                Some(snap),
-            );
+            // M1d: live Inspector snap via step_end when plant TLS active.
+            note_pending_effect_boundary(self.tx_idx, self.specfence.partial_retry);
             Ok(())
         } else {
             // EarlyVal fail → enter PartialRetry path (re-exec with force-bind).
@@ -1213,11 +1189,16 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 .partial_retry
                 .is_rewind_resume(tx_version.tx_idx);
         if rewind_resume {
-            // M1b/M1c: journal FF in set_tx; boundary skip credit below.
+            // M1b/M1d: journal FF in set_tx; live PC arm below inside inspect_run.
             self.specfence.metrics.record_resume();
         } else {
             self.specfence.metrics.record_evm_entry();
+            // CallEntry/CallExit come from SpecFenceInspector on the inspect path.
+            // OCC/PCC keep a synthetic CallEntry for PartialRetry bookkeeping only
+            // when SpecFence mode... (SpecFence uses inspector hooks instead).
             if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+                // Still record a k=0 CallEntry so plan_repair has a floor cp when
+                // the inspector call hook is delayed; inspector may add richer cps.
                 let _ = self.specfence.partial_retry.push_checkpoint(
                     tx_version.tx_idx,
                     CheckpointKind::CallEntry,
@@ -1225,27 +1206,58 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             }
         }
 
-        // M1c: when RewindTo carries a boundary snap, credit prefix opcode skip
-        // (effect-boundary grain). True mid-frame PC inject is proven in
-        // `boundary` unit tests via SpecFenceInspector; production path keeps
-        // Handler::run for sequential ≡ parallel (custom run_exec_loop landmine).
+        // M1d: seed certified-prefix read origins so validation still covers
+        // locations whose SLOAD/BALANCE opcodes are PC-skipped.
         if rewind_resume {
-            let skipped = self
-                .specfence
-                .partial_retry
-                .ff_boundary(tx_version.tx_idx)
-                .map(|s| s.opcode_steps)
-                .filter(|n| *n > 0)
-                .or_else(|| {
-                    let n = self.specfence.partial_retry.ff_entries(tx_version.tx_idx) as u64;
-                    (n > 0).then_some(n)
-                });
-            if let Some(n) = skipped {
-                self.specfence.metrics.record_pc_resume(n);
+            let db = self.evm.ctx().db_mut();
+            for (location_hash, ff) in self.specfence.partial_retry.ff_values(tx_version.tx_idx)
+            {
+                let origin = match &ff {
+                    FfValue::Storage { origin, .. } | FfValue::Basic { origin, .. } => *origin,
+                };
+                let read_origin = match origin {
+                    Some((tx_idx, tx_incarnation)) => ReadOrigin::MvMemory(TxVersion {
+                        tx_idx,
+                        tx_incarnation,
+                    }),
+                    None => ReadOrigin::Storage,
+                };
+                db.read_set
+                    .entry(location_hash)
+                    .or_default()
+                    .push(read_origin);
             }
         }
 
-        match NoBeneficiaryHandler::<C, _>::default().run(&mut self.evm) {
+        let use_inspect = self.specfence.mode == crate::ConcurrencyMode::SpecFence;
+        let run_result = if use_inspect {
+            let partial_retry = self.specfence.partial_retry;
+            let metrics = self.specfence.metrics;
+            let tx_idx = tx_version.tx_idx;
+            // Credit skip from boundary snap (M1c/M1d accounting).
+            if rewind_resume {
+                if let Some(snap) = partial_retry.ff_boundary(tx_idx) {
+                    if snap.opcode_steps > 0 {
+                        metrics.record_pc_resume(snap.opcode_steps);
+                    }
+                } else {
+                    let n = partial_retry.ff_entries(tx_idx) as u64;
+                    if n > 0 {
+                        metrics.record_pc_resume(n);
+                    }
+                }
+            }
+            with_plant_tls(tx_idx, partial_retry, metrics, || {
+                let result = self.chain.run_pevm_tx(&mut self.evm, true);
+                let steps = steps_this_run();
+                metrics.record_inspector_steps(steps, rewind_resume);
+                result
+            })
+        } else {
+            self.chain.run_pevm_tx(&mut self.evm, false)
+        };
+
+        match run_result {
 
             Ok(exec_result) => {
                 // There are at least six locations most of the time: the sender,
@@ -1336,6 +1348,31 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                             hash_deterministic(MemoryLocation::Storage(*address, *slot)),
                             MemoryValue::Storage(value.present_value),
                         ));
+                    }
+                }
+
+                // M1d: when live PC skip omitted prefix SSTORE/account writes from the
+                // revm journal, re-publish certified-prefix Data still held in MvMemory
+                // so record() does not drop them (journal-blob FF still TODO).
+                if rewind_resume {
+                    let suffix: hashbrown::HashSet<_, BuildIdentityHasher> = self
+                        .specfence
+                        .partial_retry
+                        .ff_suffix_writes(tx_version.tx_idx)
+                        .into_iter()
+                        .collect();
+                    for loc in self.mv_memory.residual_writes(tx_version.tx_idx) {
+                        if suffix.contains(&loc) {
+                            continue;
+                        }
+                        if write_set.iter().any(|(l, _)| *l == loc) {
+                            continue;
+                        }
+                        if let Some(value) =
+                            self.mv_memory.published_data_value(tx_version.tx_idx, loc)
+                        {
+                            write_set.push((loc, value));
+                        }
                     }
                 }
 
@@ -1513,30 +1550,3 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         }
     }
 }
-
-struct NoBeneficiaryHandler<C, DB> {
-    _phantom: core::marker::PhantomData<(C, DB)>,
-}
-
-impl<C, DB> Default for NoBeneficiaryHandler<C, DB> {
-    fn default() -> Self {
-        Self {
-            _phantom: core::marker::PhantomData,
-        }
-    }
-}
-
-impl<C: PevmChain, DB: Database> Handler for NoBeneficiaryHandler<C, DB> {
-    type Evm = C::Evm<DB>;
-    type Error = EVMError<DB::Error, InvalidTransaction>;
-    type HaltReason = C::EvmHaltReason;
-
-    fn reward_beneficiary(
-        &self,
-        _: &mut Self::Evm,
-        _: &mut FrameResult,
-    ) -> Result<(), Self::Error> {
-        Ok(())
-    }
-}
-

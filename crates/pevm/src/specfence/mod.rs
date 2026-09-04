@@ -9,6 +9,7 @@
 //! M1: RebindOnly / RewindTo on certified prefix (not head reexec when cps allow);
 //! M1b: journal FF + bound-value cache on RewindTo (prefix DB heavy path skipped).
 //! M1c: CALL/effect-boundary PC resume via stock Inspector (prefix opcodes skipped).
+//! M1d: live `inspect_run` on SpecFence production path (Ethereum) — real PC skip.
 //! suffix-only InvalidateSelective when safe.
 //! M2: WaitHard parks (tx-level) + ready-queue steal (lower TxIdx first); worker never spins.
 
@@ -41,8 +42,9 @@ pub(crate) use rem::WaveParkTable;
 #[allow(unused_imports)]
 pub(crate) use boundary::{
     arm_pc_resume, clear_pc_resume, last_boundary_snap, note_pending_effect_boundary,
-    resume_was_applied, steps_this_run, with_plant_tls, BoundarySnapshot, SpecFenceInspector,
+    resume_was_applied, steps_this_run, with_plant_tls, BoundarySnapshot,
 };
+pub use boundary::SpecFenceInspector;
 #[allow(unused_imports)]
 pub(crate) use rem::{
     AccessMode, Checkpoint, CheckpointId, CheckpointKind, EffectOrdinal, FfValue, ParkedWait,

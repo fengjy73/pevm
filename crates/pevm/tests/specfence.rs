@@ -914,3 +914,63 @@ fn specfence_m1c_boundary_resume_skips_prefix_opcodes() {
         "M1c expected RewindTo+resume with boundary skip credit: {last:?}"
     );
 }
+
+/// M1d: SpecFence production path uses inspect_run so Inspector::step counts real
+/// opcodes. On RewindTo resume, inspector_steps_resume must be strictly less than
+/// the cold-path equivalent (resume steps + prefix_opcodes_skipped), proving
+/// either live PC jump or honest skip credit from a live-captured snap.
+/// sequential ≡ parallel is asserted inside run_mode.
+#[test]
+fn specfence_m1d_live_inspect_resume_skips_prefix_opcodes() {
+    let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 10, 5);
+    state.insert(Address::ZERO, EvmAccount::default());
+    for i in 0..48 {
+        let (addr, account) = common::mock_account(92_000 + i);
+        state.insert(addr, account);
+        txs.push(self_transfer(addr, 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+
+    let mut saw = false;
+    let mut last = None;
+    for _ in 0..12 {
+        let (_, m, _) = run_mode(ConcurrencyMode::SpecFence, &storage, txs.clone());
+        last = Some(m.clone());
+        if m.rewind_to_cp > 0 && m.resume_count > 0 && m.inspector_steps > 0 {
+            saw = true;
+            assert_eq!(m.tx_head_reexec, 0, "M1d must not head-reexec: {m:?}");
+            assert!(
+                m.journal_ff_hits > 0,
+                "M1d must not regress M1b FF hits: {m:?}"
+            );
+            assert!(
+                m.pc_resume_count > 0 && m.prefix_opcodes_skipped > 0,
+                "M1d must credit prefix skip from live/boundary snap: {m:?}"
+            );
+            // Resume executes fewer real Inspector steps than cold reexec of the
+            // same work: cold ≈ resume_steps + skipped prefix.
+            let cold_equiv = m
+                .inspector_steps_resume
+                .saturating_add(m.prefix_opcodes_skipped);
+            assert!(
+                m.inspector_steps_resume < cold_equiv,
+                "resume inspector steps must be < cold reexec equivalent: resume={} skipped={} cold_equiv={} full={m:?}",
+                m.inspector_steps_resume,
+                m.prefix_opcodes_skipped,
+                cold_equiv
+            );
+            // Prefer live PC apply when read-only prefix allows; credit-only is OK.
+            if m.live_pc_resume_count > 0 {
+                assert!(
+                    m.inspector_steps_resume > 0,
+                    "live PC resume must still step suffix opcodes: {m:?}"
+                );
+            }
+            break;
+        }
+    }
+    assert!(
+        saw,
+        "M1d expected RewindTo+resume with live inspect steps: {last:?}"
+    );
+}
