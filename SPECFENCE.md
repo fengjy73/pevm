@@ -68,7 +68,7 @@ SpecFence discovers the true DAG **during** execution and dynamically fuses opti
 - **Selective invalidate**: ESTIMATE only locations with higher `readers[ℓ]`; otherwise keep
   Data + aborted-incarnation stamp so late readers cannot silently accept.
 - **Cascade fence** retained; fence prefers selectively-invalidated locations' readers.
-- Still **FullRetry** (whole-tx re-exec). PartialRetry / wave ready-queue = Phase-2 / P1b+.
+- P2 **semantic PartialRetry**: certified-prefix Bind on reexec; failed-suffix InvalidateSelective (no global aborted stamp when safe). Wave ready-queue still Phase-2+/P3.
 
 Metrics: prior bayes/fence counters plus `region_validate_fail`, `tx_full_retry`, `bind_hits`,
 `wait_hard_count`, `spec_read_count`, `selective_invalidate_count`, `cascade_revalidate_count`,

@@ -58,6 +58,8 @@ struct RunRow {
     region_validate_fail: usize,
     soft_edge_revokes: usize,
     selective_fallback_full: usize,
+    partial_retry_count: usize,
+    partial_retry_fallback_full: usize,
     ok: bool,
     error: Option<String>,
 }
@@ -211,6 +213,12 @@ fn measure(
                 } else {
                     m.selective_fallback_full
                 },
+                partial_retry_count: if sequential { 0 } else { m.partial_retry_count },
+                partial_retry_fallback_full: if sequential {
+                    0
+                } else {
+                    m.partial_retry_fallback_full
+                },
                 ok: true,
                 error: None,
             }
@@ -245,6 +253,8 @@ fn measure(
             region_validate_fail: 0,
             soft_edge_revokes: 0,
             selective_fallback_full: 0,
+            partial_retry_count: 0,
+            partial_retry_fallback_full: 0,
             ok: false,
             error: Some(format!("{err:?}")),
         },
@@ -309,11 +319,13 @@ fn main() {
                 for repeat in 0..repeats {
                     let row = measure(&chain, &loaded, mode, c, repeat);
                     eprintln!(
-                        "  {mode:10} cores={c} r{repeat} tps={:.0} abort={:.3} wait={} full_retry={} bind={} wait_hard={} spec_read={} sel_inv={} sel_fb={} ok={}",
+                        "  {mode:10} cores={c} r{repeat} tps={:.0} abort={:.3} wait={} full_retry={} partial={} pr_fb={} bind={} wait_hard={} spec_read={} sel_inv={} sel_fb={} ok={}",
                         row.tps,
                         row.abort_rate,
                         row.wait_admissions,
                         row.tx_full_retry,
+                        row.partial_retry_count,
+                        row.partial_retry_fallback_full,
                         row.bind_hits,
                         row.wait_hard_count,
                         row.spec_read_count,
@@ -363,6 +375,8 @@ fn main() {
                 "region_validate_fail": r.region_validate_fail,
                 "soft_edge_revokes": r.soft_edge_revokes,
                 "selective_fallback_full": r.selective_fallback_full,
+                "partial_retry_count": r.partial_retry_count,
+                "partial_retry_fallback_full": r.partial_retry_fallback_full,
                 "ok": r.ok,
                 "error": r.error,
             })

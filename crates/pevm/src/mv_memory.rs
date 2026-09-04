@@ -236,6 +236,16 @@ impl MvMemory {
         self.origin_still_valid(tx_idx, location, prior_origins)
     }
 
+    /// EarlyVal helper: validate origins from the in-flight VmDb read set.
+    pub(crate) fn origins_still_valid(
+        &self,
+        tx_idx: TxIdx,
+        location: MemoryLocationHash,
+        prior_origins: &crate::ReadOrigins,
+    ) -> bool {
+        self.origin_still_valid(tx_idx, location, prior_origins)
+    }
+
     fn origin_still_valid(
         &self,
         tx_idx: TxIdx,
@@ -444,6 +454,26 @@ impl MvMemory {
     pub(crate) fn convert_writes_to_estimates_selective(&self, tx_idx: TxIdx) {
         let (estimated, _) = self.invalidate_selective(tx_idx, None);
         let _ = estimated;
+    }
+
+    /// P2 PartialRetry: ESTIMATE only `suffix` write locations; leave prefix Data
+    /// intact and **do not** stamp a global aborted incarnation (so higher readers
+    /// of certified-prefix writes remain valid).
+    pub(crate) fn invalidate_partial_suffix(
+        &self,
+        tx_idx: TxIdx,
+        suffix: &[MemoryLocationHash],
+    ) -> Vec<MemoryLocationHash> {
+        let writes = self.write_locations(tx_idx);
+        self.residual_write_sets.insert(tx_idx, writes);
+        let mut estimated = Vec::new();
+        for &location in suffix {
+            if let Some(mut written_transactions) = self.data.get_mut(&location) {
+                written_transactions.insert(tx_idx, MemoryEntry::Estimate);
+            }
+            estimated.push(location);
+        }
+        estimated
     }
 
     pub(crate) fn consume_lazy_addresses(&self) -> impl IntoIterator<Item = Address> {

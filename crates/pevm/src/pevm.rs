@@ -27,8 +27,9 @@ use crate::{
     mv_memory::MvMemory,
     scheduler::Scheduler,
     specfence::{
-        AccountHints, BayesMap, ConcurrencyMode, DEFAULT_TAU, HeatMap, MetricsInner, RemCounters,
-        SpecDag, SpecFenceCtx, SpecFenceMetrics, seed_wait_regions, update_bayes, update_heat,
+        AccountHints, BayesMap, ConcurrencyMode, DEFAULT_TAU, HeatMap, MetricsInner,
+        PartialRetryTable, RemCounters, SpecDag, SpecFenceCtx, SpecFenceMetrics,
+        seed_wait_regions, update_bayes, update_heat,
     },
     storage::StorageWrapper,
     vm::{
@@ -313,6 +314,7 @@ impl Pevm {
 
         let dag = SpecDag::new();
         let rem = RemCounters::default();
+        let partial_retry = PartialRetryTable::new(block_size);
         let specfence = SpecFenceCtx {
             mode: self.concurrency_mode,
             hints: &hints,
@@ -323,6 +325,7 @@ impl Pevm {
             tau: DEFAULT_TAU,
             dag: &dag,
             rem: &rem,
+            partial_retry: &partial_retry,
         };
 
         // TODO: Better thread handling
@@ -613,27 +616,7 @@ fn try_validate(
             Vec::new()
         };
         if specfence.mode == ConcurrencyMode::SpecFence {
-            // Prefer selective invalidate; fall back to full ESTIMATE if needed.
-            let (estimated, fallback) =
-                mv_memory.invalidate_selective(tx_version.tx_idx, Some(tx_version.tx_incarnation));
-            if fallback {
-                specfence.metrics.record_selective_fallback_full();
-                // Full path already applied inside invalidate_selective when incarnation
-                // is None; with Some we never fallback — force full if estimated empty
-                // but write set non-empty and safety demanded. Spec: prefer selective.
-            } else {
-                specfence
-                    .metrics
-                    .record_selective_invalidate(estimated.len().max(1));
-            }
-            // Fence uses selectively-invalidated locations' readers when available.
-            let fence_locs = if estimated.is_empty() {
-                write_locations.clone()
-            } else {
-                estimated
-            };
             specfence.metrics.record_occ_abort();
-            specfence.metrics.record_tx_full_retry();
             for location in &invalid {
                 specfence.bayes.observe_conflict_location_always(*location);
                 specfence.metrics.record_bayes_conflict();
@@ -647,6 +630,53 @@ fn try_validate(
                 }
                 specfence.promote_from_bayes(&mv_memory.regions, *location, None);
             }
+
+            // P2: try semantic PartialRetry before FullRetry.
+            let plan = specfence.partial_retry.plan_partial_retry(
+                tx_version.tx_idx,
+                &read_locations,
+                &invalid,
+                &write_locations,
+            );
+            let fence_locs = if let Some(plan) = plan {
+                specfence.metrics.record_partial_retry();
+                specfence
+                    .partial_retry
+                    .set_force_bind(tx_version.tx_idx, plan.certified.clone());
+                let estimated = mv_memory
+                    .invalidate_partial_suffix(tx_version.tx_idx, &plan.suffix_writes);
+                if !estimated.is_empty() {
+                    specfence
+                        .metrics
+                        .record_selective_invalidate(estimated.len());
+                }
+                // Fence only on failed-suffix writes (prefix readers stay valid).
+                if estimated.is_empty() {
+                    plan.suffix_writes
+                } else {
+                    estimated
+                }
+            } else {
+                // Unsafe / no certified prefix → FullRetry.
+                specfence.metrics.record_tx_full_retry();
+                specfence.metrics.record_partial_retry_fallback_full();
+                specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
+                let (estimated, fallback) = mv_memory
+                    .invalidate_selective(tx_version.tx_idx, Some(tx_version.tx_incarnation));
+                if fallback {
+                    specfence.metrics.record_selective_fallback_full();
+                } else {
+                    specfence
+                        .metrics
+                        .record_selective_invalidate(estimated.len().max(1));
+                }
+                if estimated.is_empty() {
+                    write_locations.clone()
+                } else {
+                    estimated
+                }
+            };
+
             let rewind_to = mv_memory.min_higher_reader_of(tx_version.tx_idx, &fence_locs);
             let block_size = scheduler.block_size();
             let cascade_from = tx_version.tx_idx + 1;
@@ -674,6 +704,10 @@ fn try_validate(
             }
         }
     } else if !aborted && specfence.mode == ConcurrencyMode::SpecFence && read_set_valid {
+        // Successful validation clears PartialRetry force-bind for this tx.
+        specfence
+            .partial_retry
+            .clear_force_bind(tx_version.tx_idx);
         // Successful SpecRead validation → success++; try revoke sticky Waits.
         for location in &read_locations {
             if *location

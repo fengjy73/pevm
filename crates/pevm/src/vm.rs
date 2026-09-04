@@ -17,7 +17,7 @@ use crate::{
     AccountBasic, BuildIdentityHasher, BuildSuffixHasher, EvmAccount, FinishExecFlags, MemoryEntry,
     MemoryLocation, MemoryLocationHash, MemoryValue, ReadOrigin, ReadOrigins, ReadSet, Storage,
     TxIdx, TxVersion, WriteSet, chain::PevmChain, hash_deterministic, mv_memory::MvMemory,
-    specfence::{ResolveAction, SpecFenceCtx},
+    specfence::{AccessMode, ResolveAction, SpecFenceCtx, early_val_probability},
 };
 
 /// The execution error from the underlying EVM executor.
@@ -159,6 +159,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.has_nonce = has_nonce;
         self.read_set.clear();
         self.read_accounts.clear();
+        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            self.specfence.partial_retry.reset_incarnation(tx_idx);
+        }
         if let TxKind::Call(to) = tx.kind {
             self.to_code_hash = self.get_code_hash(to)?;
 
@@ -213,14 +216,19 @@ impl<'a, S: Storage> VmDb<'a, S> {
 
     /// SpecFence π at location granularity: WaitHard / Bind / SpecRead.
     /// PCC keeps sticky Wait. Beneficiary never waits.
+    /// P2: force Bind/WaitHard on certified-prefix locations after PartialRetry.
     fn maybe_wait(
         &self,
         address: Address,
         location_hash: MemoryLocationHash,
     ) -> Result<(), ReadError> {
-        // Region effect ordinal (Phase-2 checkpoint prep).
         if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
             let _ = self.specfence.rem.note_effect();
+            self.specfence.partial_retry.note_access(
+                self.tx_idx,
+                location_hash,
+                AccessMode::Read,
+            );
         }
 
         if self.specfence.mode != crate::ConcurrencyMode::SpecFence {
@@ -271,22 +279,52 @@ impl<'a, S: Storage> VmDb<'a, S> {
             .residual_writer_before(location_hash, self.tx_idx)
             .is_some();
 
-        // Sticky Wait still honored unless revoked by should_wait_location.
+        // P2: certified-prefix from prior PartialRetry → force Bind/WaitHard.
+        let force_prefix = self
+            .specfence
+            .partial_retry
+            .must_force_bind(self.tx_idx, location_hash);
+
+        // Sticky Wait still honored unless revoked; never WaitHard on cold posteriors
+        // when revoked (should_wait_location already clears sticky).
         let sticky = self
             .specfence
             .should_wait_location(&self.mv_memory.regions, location_hash, &address);
 
-        let action = if sticky {
+        let posterior = self
+            .specfence
+            .bayes
+            .conflict_probability(location_hash, Some(&address));
+
+        let action = if force_prefix {
+            if let Some(v) = bind_version.clone() {
+                ResolveAction::Bind(v)
+            } else {
+                ResolveAction::WaitHard
+            }
+        } else if sticky {
             ResolveAction::WaitHard
         } else {
-            self.specfence.choose_resolve(
+            let mut a = self.specfence.choose_resolve(
                 location_hash,
                 &address,
                 writer,
                 writer_done,
-                bind_version,
+                bind_version.clone(),
                 residual_predicts,
-            )
+            );
+            // EarlyVal under pressure: prefer WaitHard/Bind over SpecRead when hot.
+            if matches!(a, ResolveAction::SpecRead)
+                && early_val_probability(posterior) >= 0.35
+                && (writer.is_some() || residual_predicts)
+            {
+                a = if let Some(v) = bind_version {
+                    ResolveAction::Bind(v)
+                } else {
+                    ResolveAction::WaitHard
+                };
+            }
+            a
         };
 
         match action {
@@ -299,7 +337,16 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     self.specfence.dag.note_soft_wait(location_hash, self.tx_idx);
                     return Err(ReadError::Blocking(prev));
                 }
-                // Cold-start account hint predecessor.
+                // Cold-start account hint predecessor — skip when posterior is cold
+                // (secondary: don't WaitHard on cold posteriors).
+                if posterior < crate::specfence::TAU_REVOKE {
+                    let _ = self.specfence.try_revoke(
+                        &self.mv_memory.regions,
+                        location_hash,
+                        Some(&address),
+                    );
+                    return Ok(());
+                }
                 if !self.specfence.bayes.has_location(location_hash)
                     && let Some(prev) = self.specfence.hints.prev(&address, self.tx_idx)
                     && !self.specfence.scheduler.is_done(prev)
@@ -318,12 +365,81 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     return Err(ReadError::Blocking(v.tx_idx));
                 }
                 self.specfence.dag.note_hard_edge();
+                // Bind success → certify for PartialRetry prefix.
+                self.specfence
+                    .partial_retry
+                    .note_certified(self.tx_idx, location_hash);
+                self.specfence.rem.note_checkpoint_opportunity();
                 Ok(())
             }
             ResolveAction::SpecRead => {
                 self.specfence.metrics.record_spec_read();
                 Ok(())
             }
+        }
+    }
+
+    /// P2 EarlyVal after a SpecRead origin is recorded: certify or abort early.
+    fn maybe_early_val(
+        &mut self,
+        address: Address,
+        location_hash: MemoryLocationHash,
+    ) -> Result<(), ReadError> {
+        if self.specfence.mode != crate::ConcurrencyMode::SpecFence {
+            return Ok(());
+        }
+        if address == self.specfence.beneficiary {
+            return Ok(());
+        }
+        let posterior = self
+            .specfence
+            .bayes
+            .conflict_probability(location_hash, Some(&address));
+        // Only EarlyVal when cheap/pressure: high P_conflict or hot SpecRead.
+        if early_val_probability(posterior) < 0.35
+            && self.mv_memory.regions.location_mode(location_hash)
+                != crate::specfence::RegionMode::Wait
+        {
+            return Ok(());
+        }
+        let origins = match self.read_set.get(&location_hash) {
+            Some(o) => o.clone(),
+            None => return Ok(()),
+        };
+        if self
+            .mv_memory
+            .origins_still_valid(self.tx_idx, location_hash, &origins)
+        {
+            self.specfence
+                .partial_retry
+                .note_certified(self.tx_idx, location_hash);
+            self.specfence.rem.note_checkpoint_opportunity();
+            self.specfence.metrics.record_checkpoint_opportunity();
+            Ok(())
+        } else {
+            // EarlyVal fail → enter PartialRetry path (re-exec with force-bind).
+            let mut certified = self
+                .specfence
+                .partial_retry
+                .force_bind_locations(self.tx_idx);
+            for loc in self.read_set.keys() {
+                if *loc != location_hash
+                    && !certified.contains(loc)
+                    && self.mv_memory.origins_still_valid(
+                        self.tx_idx,
+                        *loc,
+                        self.read_set.get(loc).unwrap(),
+                    )
+                {
+                    certified.push(*loc);
+                }
+            }
+            self.specfence
+                .partial_retry
+                .set_force_bind(self.tx_idx, certified);
+            self.specfence.metrics.record_partial_retry();
+            self.specfence.metrics.record_region_validate_fail(1);
+            Err(ReadError::InconsistentRead)
         }
     }
 
@@ -561,6 +677,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
             self.read_accounts
                 .insert(location_hash, (account.clone(), code_hash));
 
+            self.maybe_early_val(address, location_hash)?;
             return Ok(Some(AccountInfo {
                 balance: account.balance,
                 nonce: account.nonce,
@@ -570,6 +687,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
             }));
         }
 
+        self.maybe_early_val(address, location_hash)?;
         Ok(None)
     }
 
@@ -612,6 +730,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
                             tx_incarnation: *tx_incarnation,
                         }),
                     )?;
+                    self.maybe_early_val(address, location_hash)?;
                     return Ok(*value);
                 }
                 MemoryEntry::Estimate => {
@@ -624,9 +743,12 @@ impl<S: Storage> Database for VmDb<'_, S> {
 
         // Fall back to storage
         Self::push_origin(read_origins, ReadOrigin::Storage)?;
-        self.storage
+        let value = self
+            .storage
             .storage(&address, &index)
-            .map_err(|err| ReadError::StorageError(err.to_string()))
+            .map_err(|err| ReadError::StorageError(err.to_string()))?;
+        self.maybe_early_val(address, location_hash)?;
+        Ok(value)
     }
 
     fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
@@ -964,6 +1086,16 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 } else {
                     FinishExecFlags::empty()
                 };
+
+                if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+                    for (loc, _) in &write_set {
+                        self.specfence.partial_retry.note_access(
+                            tx_version.tx_idx,
+                            *loc,
+                            AccessMode::Write,
+                        );
+                    }
+                }
 
                 let (wrote_new_location, contended) =
                     self.mv_memory.record(tx_version, read_set, write_set);

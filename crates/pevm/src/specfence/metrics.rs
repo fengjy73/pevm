@@ -63,6 +63,10 @@ pub struct SpecFenceMetrics {
     pub selective_fallback_full: usize,
     /// Checkpoint opportunities recorded (Phase-2 prep).
     pub checkpoint_opportunities: usize,
+    /// Semantic PartialRetry applications (certified-prefix Bind on reexec).
+    pub partial_retry_count: usize,
+    /// PartialRetry attempted but fell back to FullRetry (unsafe split).
+    pub partial_retry_fallback_full: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -89,6 +93,8 @@ pub(crate) struct MetricsInner {
     soft_edge_revokes: AtomicUsize,
     selective_fallback_full: AtomicUsize,
     checkpoint_opportunities: AtomicUsize,
+    partial_retry_count: AtomicUsize,
+    partial_retry_fallback_full: AtomicUsize,
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
     hot_accounts: DashMap<Address, (), BuildSuffixHasher>,
@@ -204,6 +210,15 @@ impl MetricsInner {
         self.checkpoint_opportunities.store(n, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_partial_retry(&self) {
+        self.partial_retry_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_partial_retry_fallback_full(&self) {
+        self.partial_retry_fallback_full
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn mark_hot(&self, address: Address) {
         self.hot_accounts.insert(address, ());
     }
@@ -249,6 +264,10 @@ impl MetricsInner {
             soft_edge_revokes: self.soft_edge_revokes.load(Ordering::Relaxed),
             selective_fallback_full: self.selective_fallback_full.load(Ordering::Relaxed),
             checkpoint_opportunities: self.checkpoint_opportunities.load(Ordering::Relaxed),
+            partial_retry_count: self.partial_retry_count.load(Ordering::Relaxed),
+            partial_retry_fallback_full: self
+                .partial_retry_fallback_full
+                .load(Ordering::Relaxed),
         }
     }
 }

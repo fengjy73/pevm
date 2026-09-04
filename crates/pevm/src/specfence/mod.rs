@@ -1,11 +1,12 @@
-//! `SpecFence`: adaptive region/wave concurrency control (Spec v1 / P1a).
+//! `SpecFence`: adaptive region/wave concurrency control (Spec v1 / P2).
 //!
 //! Control unit = memory location / slot-level region
 //! (`MemoryLocation::{Basic, CodeHash, Storage}`), not whole-tx.
 //! Bayesian Beta-Bernoulli posteriors drive WaitHard / Bind / SpecRead per
 //! region; sticky Wait is revokeable when posterior < τ_revoke. Cascade fence
 //! remains a correctness shield. Whole-tx re-execution remains (revm);
-//! PartialRetry is Phase-2.
+//! P2 semantic PartialRetry: certified-prefix Bind on reexec + suffix-only
+//! InvalidateSelective (no global aborted stamp when safe).
 
 use crate::{
     BuildSuffixHasher, MemoryLocation, TxIdx, chain::PevmChain, hash_deterministic,
@@ -30,8 +31,11 @@ pub use metrics::SpecFenceMetrics;
 pub use region::RegionMode;
 pub(crate) use region::RegionTable;
 pub(crate) use rem::RemCounters;
+pub(crate) use rem::PartialRetryTable;
 #[allow(unused_imports)]
-pub(crate) use rem::{AccessMode, EffectOrdinal, RegionAccess, RemTask};
+pub(crate) use rem::{
+    AccessMode, EffectOrdinal, PartialRetryPlan, PartialRetryState, RegionAccess, RemTask,
+};
 pub(crate) use resolve::{PolicyCtx, ResolveAction, choose_action};
 #[allow(unused_imports)]
 pub(crate) use resolve::{
@@ -114,6 +118,7 @@ pub(crate) struct SpecFenceCtx<'a> {
     pub tau: f64,
     pub dag: &'a SpecDag,
     pub rem: &'a RemCounters,
+    pub partial_retry: &'a PartialRetryTable,
 }
 
 impl<'a> SpecFenceCtx<'a> {

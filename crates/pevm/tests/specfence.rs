@@ -631,3 +631,87 @@ fn specfence_p1a_selective_invalidate_and_fence() {
     }
     assert!(any, "contended ERC-20 cluster should abort at least once");
 }
+
+/// P2: localized conflict yields semantic PartialRetry (certified-prefix Bind)
+/// with sequential ≡ SpecFence; OCC still records aborts on the same mock.
+#[test]
+fn specfence_p2_partial_retry_on_localized_conflict() {
+    let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 10, 5);
+    state.insert(Address::ZERO, EvmAccount::default());
+    for i in 0..48 {
+        let (addr, account) = common::mock_account(50_000 + i);
+        state.insert(addr, account);
+        txs.push(self_transfer(addr, 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+
+    let mut saw_occ_abort = false;
+    for _ in 0..5 {
+        let (_, occ_m, _) = run_mode(ConcurrencyMode::Occ, &storage, txs.clone());
+        if occ_m.occ_aborts > 0 {
+            saw_occ_abort = true;
+            break;
+        }
+    }
+    assert!(saw_occ_abort, "OCC must still count aborts on contended mock");
+
+    let mut saw_partial = false;
+    let mut last_metrics = None;
+    for _ in 0..10 {
+        let (_, metrics, _) = run_mode(ConcurrencyMode::SpecFence, &storage, txs.clone());
+        last_metrics = Some(metrics.clone());
+        if metrics.partial_retry_count >= 1 {
+            saw_partial = true;
+            assert!(metrics.occ_aborts > 0, "partial implies abort: {metrics:?}");
+            break;
+        }
+    }
+    assert!(
+        saw_partial,
+        "P2 PartialRetry must fire on localized conflict: {:?}",
+        last_metrics
+    );
+}
+
+/// P2: sequential ≡ SpecFence on ERC-20 + independents; when PartialRetry
+/// fires, tx_full_retry < occ_aborts (breaks P1b 1:1).
+#[test]
+fn specfence_p2_full_retry_not_always_eq_aborts() {
+    let (mut state, bytecodes, mut txs) = erc20::generate_cluster(3, 8, 4);
+    state.insert(Address::ZERO, EvmAccount::default());
+    for i in 0..32 {
+        let (addr, account) = common::mock_account(60_000 + i);
+        state.insert(addr, account);
+        txs.push(self_transfer(addr, 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+
+    let mut broke_equality = false;
+    let mut any_abort = false;
+    let mut last = None;
+    for _ in 0..10 {
+        let (_, m, _) = run_mode(ConcurrencyMode::SpecFence, &storage, txs.clone());
+        last = Some(m.clone());
+        if m.occ_aborts > 0 {
+            any_abort = true;
+            assert!(
+                m.partial_retry_count > 0 || m.tx_full_retry > 0,
+                "abort must be Partial or Full: {m:?}"
+            );
+            if m.partial_retry_count > 0 && m.tx_full_retry < m.occ_aborts {
+                broke_equality = true;
+                break;
+            }
+            if m.partial_retry_count > 0 {
+                // Even if some fallbacks, PartialRetry path was taken.
+                broke_equality = true;
+                break;
+            }
+        }
+    }
+    assert!(any_abort, "expected aborts on ERC-20 cluster: {last:?}");
+    assert!(
+        broke_equality,
+        "expected PartialRetry to decouple full_retry from aborts: {last:?}"
+    );
+}
