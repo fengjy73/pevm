@@ -19,8 +19,8 @@ use crate::{
     TxIdx, TxVersion, WriteSet, chain::PevmChain, hash_deterministic, mv_memory::MvMemory,
     specfence::{
         AccessMode, CheckpointKind, FfValue, ResolveAction, SpecFenceCtx,
-        TAU_VERY_HIGH, arm_pc_resume, early_val_probability, note_pending_effect_boundary,
-        resume_was_applied, steps_this_run, with_plant_tls,
+        TAU_VERY_HIGH, early_val_probability, note_pending_effect_boundary,
+        resume_was_applied, steps_this_run, try_arm_safe_absolute_jump, with_plant_tls,
     },
 };
 
@@ -1234,21 +1234,28 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             let partial_retry = self.specfence.partial_retry;
             let metrics = self.specfence.metrics;
             let tx_idx = tx_version.tx_idx;
-            // Credit skip from boundary snap (M1c/M1d accounting).
-            if rewind_resume {
-                if let Some(snap) = partial_retry.ff_boundary(tx_idx) {
-                    if snap.opcode_steps > 0 {
-                        metrics.record_pc_resume(snap.opcode_steps);
-                    }
-                } else {
-                    let n = partial_retry.ff_entries(tx_idx) as u64;
-                    if n > 0 {
-                        metrics.record_pc_resume(n);
+            with_plant_tls(tx_idx, partial_retry, metrics, || {
+                if rewind_resume {
+                    let jumped = partial_retry.ff_continuation(tx_idx).is_some_and(|cont| {
+                        try_arm_safe_absolute_jump(tx_idx, partial_retry, &cont, metrics)
+                    });
+                    if !jumped {
+                        if let Some(snap) = partial_retry.ff_boundary(tx_idx) {
+                            if snap.opcode_steps > 0 {
+                                metrics.record_pc_resume(snap.opcode_steps);
+                            }
+                        } else {
+                            let n = partial_retry.ff_entries(tx_idx) as u64;
+                            if n > 0 {
+                                metrics.record_pc_resume(n);
+                            }
+                        }
                     }
                 }
-            }
-            with_plant_tls(tx_idx, partial_retry, metrics, || {
                 let result = self.chain.run_pevm_tx(&mut self.evm, true);
+                if rewind_resume {
+                    partial_retry.note_jump_applied(tx_idx, resume_was_applied());
+                }
                 let steps = steps_this_run();
                 metrics.record_inspector_steps(steps, rewind_resume);
                 result
@@ -1351,9 +1358,9 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     }
                 }
 
-                // M1d: when live PC skip omitted prefix SSTORE/account writes from the
-                // revm journal, re-publish certified-prefix Data still held in MvMemory
-                // so record() does not drop them (journal-blob FF still TODO).
+                // M1d/M1e: when live PC jump omitted prefix SSTORE/account writes from the
+                // revm journal (or journal-blob FF missed a location), re-publish
+                // certified-prefix Data still held in MvMemory so record() does not drop them.
                 if rewind_resume {
                     let suffix: hashbrown::HashSet<_, BuildIdentityHasher> = self
                         .specfence

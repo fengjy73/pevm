@@ -119,6 +119,12 @@ pub struct SpecFenceMetrics {
     pub inspector_steps: usize,
     /// M1d: inspector steps during RewindTo resume executes only.
     pub inspector_steps_resume: usize,
+    /// M1e: production absolute PC jump applied (initialize_interp jumped).
+    pub absolute_jump_applied: usize,
+    /// M1e: RewindTo resume deferred absolute jump (safety gate / fallback).
+    pub absolute_jump_fallback: usize,
+    /// M1e: accounts restored from revm journal blob on jump resume.
+    pub journal_blob_ff_accounts: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -167,6 +173,9 @@ pub(crate) struct MetricsInner {
     live_pc_resume_count: AtomicUsize,
     inspector_steps: AtomicUsize,
     inspector_steps_resume: AtomicUsize,
+    absolute_jump_applied: AtomicUsize,
+    absolute_jump_fallback: AtomicUsize,
+    journal_blob_ff_accounts: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -390,6 +399,24 @@ impl MetricsInner {
         self.live_pc_resume_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// M1e: absolute PC jump applied on production RewindTo resume.
+    pub(crate) fn record_absolute_jump_applied(&self) {
+        self.absolute_jump_applied.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// M1e: safety gate deferred jump → credit-only / non-jump fallback.
+    pub(crate) fn record_absolute_jump_fallback(&self) {
+        self.absolute_jump_fallback.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// M1e: journal-blob accounts merged into revm state on jump resume.
+    pub(crate) fn record_journal_blob_ff(&self, accounts: usize) {
+        if accounts > 0 {
+            self.journal_blob_ff_accounts
+                .fetch_add(accounts, Ordering::Relaxed);
+        }
+    }
+
     /// M1d: accumulate Inspector::step counts for this execute.
     pub(crate) fn record_inspector_steps(&self, steps: u64, is_resume: bool) {
         if steps == 0 {
@@ -482,6 +509,9 @@ impl MetricsInner {
             live_pc_resume_count: self.live_pc_resume_count.load(Ordering::Relaxed),
             inspector_steps: self.inspector_steps.load(Ordering::Relaxed),
             inspector_steps_resume: self.inspector_steps_resume.load(Ordering::Relaxed),
+            absolute_jump_applied: self.absolute_jump_applied.load(Ordering::Relaxed),
+            absolute_jump_fallback: self.absolute_jump_fallback.load(Ordering::Relaxed),
+            journal_blob_ff_accounts: self.journal_blob_ff_accounts.load(Ordering::Relaxed),
         }
     }
 }

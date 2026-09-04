@@ -10,6 +10,7 @@
 //! M1b: journal FF + bound-value cache on RewindTo (prefix DB heavy path skipped).
 //! M1c: CALL/effect-boundary PC resume via stock Inspector (prefix opcodes skipped).
 //! M1d: live `inspect_run` on SpecFence production path (Ethereum) — real PC skip.
+//! M1e: journal-blob FF + safety-gated absolute PC jump on RewindTo resume.
 //! suffix-only InvalidateSelective when safe.
 //! M2: WaitHard parks (tx-level) + ready-queue steal (lower TxIdx first); worker never spins.
 
@@ -41,8 +42,9 @@ pub(crate) use rem::PartialRetryTable;
 pub(crate) use rem::WaveParkTable;
 #[allow(unused_imports)]
 pub(crate) use boundary::{
-    arm_pc_resume, clear_pc_resume, last_boundary_snap, note_pending_effect_boundary,
-    resume_was_applied, steps_this_run, with_plant_tls, BoundarySnapshot,
+    arm_pc_resume, clear_pc_resume, jump_is_safe, last_boundary_snap,
+    note_pending_effect_boundary, resume_was_applied, steps_this_run,
+    try_arm_safe_absolute_jump, with_plant_tls, BoundarySnapshot, JournalBlob,
 };
 pub use boundary::SpecFenceInspector;
 #[allow(unused_imports)]

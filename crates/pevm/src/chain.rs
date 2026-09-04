@@ -11,6 +11,7 @@ use revm::context::{ContextSetters, JournalTr, TxEnv};
 use revm::context_interface::LocalContextTr;
 use revm::handler::instructions::InstructionProvider;
 use revm::handler::{EvmTr, FrameResult, FrameTr, PrecompileProvider};
+use revm::inspector::JournalExt;
 use revm::interpreter::InterpreterResult;
 use revm::interpreter::interpreter::EthInterpreter;
 use revm::interpreter::interpreter_action::FrameInit;
@@ -57,7 +58,7 @@ pub trait PevmChain: Debug {
             Context: ContextTr<
                 Db = DB,
                 Tx = Self::EvmTx,
-                Journal: JournalTr<State = EvmState>,
+                Journal: JournalTr<State = EvmState> + JournalExt,
                 Local: LocalContextTr,
             > + ContextSetters,
             Frame: FrameTr<FrameInit = FrameInit, FrameResult = FrameResult>,

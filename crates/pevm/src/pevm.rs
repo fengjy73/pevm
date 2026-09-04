@@ -682,6 +682,9 @@ fn try_validate(
         };
         if specfence.mode == ConcurrencyMode::SpecFence {
             specfence.metrics.record_occ_abort();
+            let _ = specfence
+                .partial_retry
+                .disable_jump_after_failed_resume(tx_version.tx_idx);
             for location in &invalid {
                 specfence.bayes.observe_conflict_location_always(*location);
                 specfence.metrics.record_bayes_conflict();
@@ -822,6 +825,9 @@ fn try_validate(
             .partial_retry
             .clear_force_bind(tx_version.tx_idx);
         specfence.partial_retry.clear_repair(tx_version.tx_idx);
+        specfence
+            .partial_retry
+            .clear_jump_disabled(tx_version.tx_idx);
         // Successful SpecRead validation → success++; try revoke sticky Waits.
         for location in &read_locations {
             if *location

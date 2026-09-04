@@ -10,6 +10,7 @@
 //! M1 (plant v2): checkpoints at CALL + write/effect boundaries; RewindTo /
 //! RebindOnly demote head PartialRetry when a certified prefix exists.
 //! M1b: journal fast-forward + bound-value cache on RewindTo resume — SpecFence
+//! M1e: journal-blob side channel + jump_snap for safe absolute PC jump (opt-in).
 //! effect journal restored to `cp`, certified-prefix DB reads served from FF
 //! cache (skip MV lazy walks).
 //! M1c: CALL/effect-boundary PC resume via stock Inspector — skip prefix opcodes
@@ -31,7 +32,7 @@ use hashbrown::{HashMap, HashSet};
 
 use alloy_primitives::{Address, U256};
 use crate::{BuildIdentityHasher, MemoryLocationHash, TxIdx, TxIncarnation};
-use super::boundary::BoundarySnapshot;
+use super::boundary::{BoundarySnapshot, JournalBlob};
 
 /// Spec v1 REM task kinds (plant vocabulary).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,8 +126,9 @@ pub(crate) enum FfValue {
     },
 }
 
-/// Serialized continuation for M1b/M1c RewindTo: restore SpecFence journal to
-/// `cp`, FF certified-prefix reads, and optionally PC-resume at `boundary`.
+/// Serialized continuation for M1b/M1c/M1e RewindTo: restore SpecFence journal to
+/// `cp`, FF certified-prefix reads, optionally PC-resume at `boundary`, and
+/// restore revm journal blob for write-prefix SSTORE when absolute-jumping.
 #[derive(Debug, Clone)]
 pub(crate) struct ResumeContinuation {
     pub cp: CheckpointId,
@@ -139,8 +141,12 @@ pub(crate) struct ResumeContinuation {
     pub checkpoints: Vec<Checkpoint>,
     /// Bound values for locations touched at `k <= cp.k`.
     pub values: HashMap<MemoryLocationHash, FfValue, BuildIdentityHasher>,
-    /// M1c: boundary snap at `cp` for PC resume (skip prefix opcodes).
+    /// M1c: lite/synthetic boundary snap at `cp` for skip-credit accounting.
     pub boundary: Option<BoundarySnapshot>,
+    /// M1e: live Inspector snap for absolute PC jump (separate from repair lite snap).
+    pub jump_snap: Option<BoundarySnapshot>,
+    /// M1e: revm journal blob (touched state + logs) at certified-prefix boundary.
+    pub journal_blob: Option<JournalBlob>,
 }
 
 /// Decision after classifying a validation failure for PartialRetry / M1 repair.
@@ -195,6 +201,8 @@ pub(crate) struct PartialRetryState {
     checkpoints: Vec<Checkpoint>,
     /// Bound values observed this incarnation (for M1b journal FF).
     value_snap: HashMap<MemoryLocationHash, FfValue, BuildIdentityHasher>,
+    /// M1e: live Inspector snap + journal blob keyed by effect ordinal `k`.
+    live_boundaries: HashMap<usize, (BoundarySnapshot, JournalBlob), BuildIdentityHasher>,
 }
 
 impl PartialRetryState {
@@ -206,6 +214,7 @@ impl PartialRetryState {
         self.journal.clear();
         self.checkpoints.clear();
         self.value_snap.clear();
+        self.live_boundaries.clear();
     }
 
     pub(crate) fn note_access(
@@ -278,6 +287,7 @@ impl PartialRetryState {
             .filter(|c| c.id.k <= cp.k)
             .cloned()
             .collect();
+        // M1d: lite/synthetic boundary for skip-credit (never put live PC into repair snap).
         let boundary = self
             .checkpoints
             .iter()
@@ -292,8 +302,6 @@ impl PartialRetryState {
                     .and_then(|c| c.boundary.clone())
             })
             .or_else(|| {
-                // Synthetic CALL/effect-boundary credit when only CallEntry@0 exists:
-                // use certified-prefix effect count as estimated opcode/work units.
                 let steps = cp.k.max(effects.len()) as u64;
                 if steps == 0 {
                     None
@@ -305,9 +313,25 @@ impl PartialRetryState {
                         opcode_steps: steps,
                         stack: Vec::new(),
                         memory: Vec::new(),
+                        code_hash: None,
+                        bytecode_len: 0,
                     })
                 }
             });
+        // M1e side channel: live snap + journal blob for absolute jump only.
+        let (jump_snap, journal_blob) = self
+            .live_boundaries
+            .get(&cp.k)
+            .map(|(s, b)| (Some(s.clone()), Some(b.clone())))
+            .or_else(|| {
+                self.live_boundaries
+                    .iter()
+                    .filter(|(k, _)| **k <= cp.k)
+                    .max_by_key(|(k, _)| *k)
+                    .map(|(_, (s, b))| (Some(s.clone()), Some(b.clone())))
+            })
+            .unwrap_or((None, None));
+        let journal_blob = journal_blob.filter(|b| !b.is_empty());
         // Bound values for the whole certified prefix (k < k_fail), not only
         // up to cp — resume still force-binds those reads; FF cache skips MV walks.
         let certified_set: HashSet<MemoryLocationHash, BuildIdentityHasher> =
@@ -328,7 +352,22 @@ impl PartialRetryState {
             checkpoints,
             values,
             boundary,
+            jump_snap,
+            journal_blob,
         }
+    }
+
+    /// M1e: attach live Inspector snap + journal blob at current effect ordinal.
+    ///
+    /// Does **not** mutate checkpoint.boundary (lite snaps stay for repair/metrics);
+    /// live data lives only in `live_boundaries` / `ResumeContinuation.jump_*`.
+    pub(crate) fn attach_live_boundary(
+        &mut self,
+        snap: BoundarySnapshot,
+        blob: JournalBlob,
+    ) {
+        let k = self.k;
+        self.live_boundaries.insert(k, (snap, blob));
     }
 
     /// Restore SpecFence journal/checkpoints/values from an FF continuation
@@ -418,6 +457,10 @@ pub(crate) struct PartialRetryTable {
     repair: DashMap<TxIdx, RepairPlan, BuildIdentityHasher>,
     /// M1b journal-FF continuation armed with RewindTo.
     ff_resume: DashMap<TxIdx, ResumeContinuation, BuildIdentityHasher>,
+    /// M1e: last RewindTo resume applied an absolute jump (for abort→disable).
+    last_jump_applied: DashMap<TxIdx, bool, BuildIdentityHasher>,
+    /// M1e: absolute jump disabled after a jumped resume failed validation (anti-livelock).
+    jump_disabled: DashMap<TxIdx, (), BuildIdentityHasher>,
 }
 
 impl PartialRetryTable {
@@ -429,6 +472,8 @@ impl PartialRetryTable {
             force_bind: DashMap::default(),
             repair: DashMap::default(),
             ff_resume: DashMap::default(),
+            last_jump_applied: DashMap::default(),
+            jump_disabled: DashMap::default(),
         }
     }
 
@@ -549,6 +594,30 @@ impl PartialRetryTable {
             .and_then(|c| c.boundary.clone())
     }
 
+    /// M1e: full FF continuation (for safety-gated absolute jump).
+    pub(crate) fn ff_continuation(&self, tx_idx: TxIdx) -> Option<ResumeContinuation> {
+        self.ff_resume.get(&tx_idx).map(|c| c.clone())
+    }
+
+    /// M1e: revm journal blob for write-prefix restore.
+    pub(crate) fn ff_journal_blob(&self, tx_idx: TxIdx) -> Option<JournalBlob> {
+        self.ff_resume
+            .get(&tx_idx)
+            .and_then(|c| c.journal_blob.clone())
+    }
+
+    /// M1e: store live Inspector snap + journal blob on the current incarnation state.
+    pub(crate) fn attach_live_boundary(
+        &self,
+        tx_idx: TxIdx,
+        snap: BoundarySnapshot,
+        blob: JournalBlob,
+    ) {
+        if let Some(slot) = self.states.get(tx_idx) {
+            slot.lock().unwrap().attach_live_boundary(snap, blob);
+        }
+    }
+
     /// Suffix write locations from the armed RewindTo continuation (empty if none).
     pub(crate) fn ff_suffix_writes(&self, tx_idx: TxIdx) -> Vec<MemoryLocationHash> {
         self.ff_resume
@@ -632,6 +701,35 @@ impl PartialRetryTable {
     pub(crate) fn clear_repair(&self, tx_idx: TxIdx) {
         self.repair.remove(&tx_idx);
         self.ff_resume.remove(&tx_idx);
+        self.last_jump_applied.remove(&tx_idx);
+    }
+
+    /// M1e: record whether this execute applied an absolute jump.
+    pub(crate) fn note_jump_applied(&self, tx_idx: TxIdx, applied: bool) {
+        self.last_jump_applied.insert(tx_idx, applied);
+    }
+
+    /// M1e: if last resume jumped and then failed validation, disable further jumps.
+    pub(crate) fn disable_jump_after_failed_resume(&self, tx_idx: TxIdx) -> bool {
+        let jumped = self
+            .last_jump_applied
+            .remove(&tx_idx)
+            .map(|(_, v)| v)
+            .unwrap_or(false);
+        if jumped {
+            self.jump_disabled.insert(tx_idx, ());
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn is_jump_disabled(&self, tx_idx: TxIdx) -> bool {
+        self.jump_disabled.contains_key(&tx_idx)
+    }
+
+    pub(crate) fn clear_jump_disabled(&self, tx_idx: TxIdx) {
+        self.jump_disabled.remove(&tx_idx);
     }
 
     pub(crate) fn peek_repair(&self, tx_idx: TxIdx) -> Option<RepairPlan> {

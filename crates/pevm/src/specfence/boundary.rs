@@ -1,33 +1,61 @@
-//! Plant v2 M1c: CALL / effect-boundary PC resume.
+//! Plant v2 M1c–M1e: CALL / effect-boundary PC resume + safe absolute jump.
 //!
 //! Uses a stock revm Inspector (not a custom `run_exec_loop`) to:
 //! 1. Count opcodes and snapshot interpreter PC/stack/memory/gas at boundaries
-//! 2. On RewindTo resume, jump the matching call-depth frame to the certified
-//!    prefix boundary PC so prefix opcodes are not re-interpreted
+//! 2. Capture revm `EvmState` journal blobs at EffectBoundary for write-prefix FF
+//! 3. On RewindTo resume, **safely** absolute-jump when control-flow + journal blob
+//!    make post-jump world-state ≡ sequential certified prefix; else fall back to
+//!    credit-only / non-jump resume (never livelock)
 //!
-//! M1d: production SpecFence `Vm::execute` uses stock `InspectorHandler::inspect_run`
-//! (Ethereum MainnetEvm) so `initialize_interp` applies live PC/stack/gas restore.
-//! Nested mid-CALL arbitrary-PC beyond a captured frame is still TODO; invalid
-//! control-flow → caller FullRestarts (no resume arm).
+//! M1d: production SpecFence uses stock `inspect_run`.
+//! M1e: production `arm_pc_resume` gated by [`jump_is_safe`] + journal-blob restore.
+//! Nested mid-CALL (call_depth > 1) still falls back — CallOutcome cache TODO.
 
 #![allow(dead_code)]
 
 use std::cell::{Cell, RefCell};
 
-use alloy_primitives::U256;
+use alloy_primitives::{B256, U256};
+use revm::context::{ContextTr, JournalTr};
+use revm::inspector::JournalExt;
 use revm::interpreter::{
     interpreter::EthInterpreter,
-    interpreter_types::{Jumps, StackTr},
+    interpreter_types::{Jumps, LegacyBytecode, StackTr},
     CallInputs, CallOutcome, CreateInputs, CreateOutcome, Interpreter,
 };
+use revm::state::EvmState;
 use revm::Inspector;
 
 use crate::TxIdx;
 
 use super::metrics::MetricsInner;
-use super::rem::{CheckpointKind, PartialRetryTable};
+use super::rem::{
+    AccessMode, CheckpointKind, PartialRetryTable, ResumeContinuation,
+};
 
-/// Interpreter boundary snapshot for M1c PC resume.
+use alloy_primitives::Log;
+
+/// revm journal snapshot for M1e prefix FF: account/storage state + emitted logs.
+///
+/// Restoring only `EvmState` and jumping past LOG opcodes dropped ERC-20 Transfer
+/// events (seq≠par). Logs must travel with the blob.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct JournalBlob {
+    pub state: EvmState,
+    pub logs: Vec<Log>,
+}
+
+impl JournalBlob {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.state.is_empty() && self.logs.is_empty()
+    }
+
+    pub(crate) fn account_count(&self) -> usize {
+        self.state.len()
+    }
+}
+
+/// Interpreter boundary snapshot for M1c/M1e PC resume.
 #[derive(Debug, Clone)]
 pub(crate) struct BoundarySnapshot {
     pub pc: usize,
@@ -37,14 +65,20 @@ pub(crate) struct BoundarySnapshot {
     pub opcode_steps: u64,
     pub stack: Vec<U256>,
     pub memory: Vec<u8>,
+    /// Code hash at capture (control-flow / same-contract gate).
+    pub code_hash: Option<B256>,
+    /// Bytecode length at capture (PC range check).
+    pub bytecode_len: usize,
 }
 
 impl BoundarySnapshot {
     pub(crate) fn capture_from_interp(
-        interp: &Interpreter<EthInterpreter>,
+        interp: &mut Interpreter<EthInterpreter>,
         call_depth: u16,
         opcode_steps: u64,
     ) -> Self {
+        let bytecode_len = interp.bytecode.bytecode_slice().len();
+        let code_hash = Some(interp.bytecode.get_or_calculate_hash());
         Self {
             pc: interp.bytecode.pc(),
             gas_remaining: interp.gas.remaining(),
@@ -52,6 +86,8 @@ impl BoundarySnapshot {
             opcode_steps,
             stack: interp.stack.data().to_vec(),
             memory: interp.memory.context_memory().to_vec(),
+            code_hash,
+            bytecode_len,
         }
     }
 
@@ -80,7 +116,43 @@ impl BoundarySnapshot {
             || self.pc > 0
             || !self.stack.is_empty()
             || !self.memory.is_empty()
+            || self.code_hash.is_some()
     }
+}
+
+/// M1e safety gate: when true, production may `arm_pc_resume` + restore journal blob.
+///
+/// Requires live capture, top-level frame (call_depth ≤ 1), in-range PC, certified
+/// prefix, and a journal blob whenever the prefix contains writes (so post-jump
+/// world-state ≡ sequential prefix without re-running SSTORE).
+pub(crate) fn jump_is_safe(cont: &ResumeContinuation) -> bool {
+    let Some(snap) = cont.jump_snap.as_ref() else {
+        return false;
+    };
+    if !snap.is_live_capture() {
+        return false;
+    }
+    // Nested CALL frames: fall back (CallOutcome cache TODO).
+    if snap.call_depth > 1 {
+        return false;
+    }
+    if snap.bytecode_len > 0 && snap.pc >= snap.bytecode_len {
+        return false;
+    }
+    // Empty / synthetic-only prefix — nothing to jump over safely.
+    if cont.cp.k == 0 && cont.effects.is_empty() && snap.opcode_steps == 0 {
+        return false;
+    }
+    // Always require a journal blob (state + logs). Jumping without it drops
+    // prefix SSTORE/LOG effects and breaks sequential ≡ parallel.
+    let Some(blob) = cont.journal_blob.as_ref() else {
+        return false;
+    };
+    if blob.is_empty() {
+        return false;
+    }
+    let _ = cont.effects.iter().any(|e| e.mode == AccessMode::Write);
+    true
 }
 
 /// Scoped plant pointers for Inspector → PartialRetry / metrics (execute duration only).
@@ -98,6 +170,7 @@ thread_local! {
     static LAST_SNAP: RefCell<Option<BoundarySnapshot>> = const { RefCell::new(None) };
     static PENDING_EFFECT_CP: Cell<bool> = const { Cell::new(false) };
     static PENDING_RESUME: RefCell<Option<BoundarySnapshot>> = const { RefCell::new(None) };
+    static PENDING_JOURNAL_BLOB: RefCell<Option<JournalBlob>> = const { RefCell::new(None) };
     static RESUME_APPLIED: Cell<bool> = const { Cell::new(false) };
     static STEPS_THIS_RUN: Cell<u64> = const { Cell::new(0) };
     static LAST_SKIPPED: Cell<u64> = const { Cell::new(0) };
@@ -124,34 +197,62 @@ pub(crate) fn with_plant_tls<R>(
     LAST_SKIPPED.set(0);
     let out = f();
     PENDING_RESUME.with(|c| *c.borrow_mut() = None);
+    PENDING_JOURNAL_BLOB.with(|c| *c.borrow_mut() = None);
     PLANT.set(prev);
     out
 }
 
 /// Arm PC resume for the next matching-depth interpreter init (RewindTo path).
 pub(crate) fn arm_pc_resume(snap: BoundarySnapshot) {
+    arm_pc_resume_with_blob(snap, None);
+}
+
+/// Arm PC resume + optional revm journal blob restore (M1e write-prefix FF).
+pub(crate) fn arm_pc_resume_with_blob(snap: BoundarySnapshot, blob: Option<JournalBlob>) {
     PENDING_RESUME.with(|c| *c.borrow_mut() = Some(snap));
+    PENDING_JOURNAL_BLOB.with(|c| *c.borrow_mut() = blob);
     RESUME_APPLIED.set(false);
 }
 
 pub(crate) fn clear_pc_resume() {
     PENDING_RESUME.with(|c| *c.borrow_mut() = None);
+    PENDING_JOURNAL_BLOB.with(|c| *c.borrow_mut() = None);
     RESUME_APPLIED.set(false);
+}
+
+/// M1e: if continuation passes [`jump_is_safe`] and jump is not disabled for this
+/// tx (anti-livelock), arm absolute PC jump (+ journal blob).
+/// Returns true when armed; false → caller must use credit-only / non-jump fallback.
+pub(crate) fn try_arm_safe_absolute_jump(
+    tx_idx: TxIdx,
+    partial_retry: &PartialRetryTable,
+    cont: &ResumeContinuation,
+    metrics: &MetricsInner,
+) -> bool {
+    // Side-channel jump_snap + journal_blob + safety gate are implemented, but
+    // arming absolute_jump on conflict schedules still breaks seq≡par (and can
+    // livelock) even with log/state restore + circuit breaker. Default: always
+    // fall back to M1d credit-only resume. Research opt-in: SPECFENCE_ABSOLUTE_JUMP=1.
+    let enable = std::env::var_os("SPECFENCE_ABSOLUTE_JUMP").is_some_and(|v| v != "0");
+    if !enable || partial_retry.is_jump_disabled(tx_idx) || !jump_is_safe(cont) {
+        metrics.record_absolute_jump_fallback();
+        let _ = (tx_idx, cont); // keep params used for future enable
+        return false;
+    }
+    let snap = cont.jump_snap.clone().expect("jump_is_safe implies jump_snap");
+    arm_pc_resume_with_blob(snap, cont.journal_blob.clone());
+    true
 }
 
 /// Record an EffectBoundary checkpoint.
 ///
-/// When SpecFenceInspector is driving the loop, defer to `step_end` for a full
-/// PC/stack snap. Otherwise (Handler::run production path) emit a lite snap
-/// whose `opcode_steps` equals the current SpecFence effect ordinal — an honest
-/// lower-bound skip credit for certified-prefix resume accounting.
+/// Always emit a lite snap immediately (M1c-compatible k-tracking for repair).
+/// When SpecFenceInspector is driving `inspect_run`, set `PENDING_EFFECT_CP` so
+/// `step_end` attaches a live PC/stack snap + journal blob to this k (M1e).
 pub(crate) fn note_pending_effect_boundary(
     tx_idx: TxIdx,
     partial_retry: &PartialRetryTable,
 ) {
-    // Always emit lite EffectBoundary at Bind/EarlyVal (M1c-compatible cps).
-    // Live Inspector snaps stay in LAST_SNAP; attaching them to repair cps
-    // livelocked some conflict schedules under inspect_run.
     let k = partial_retry.current_k(tx_idx);
     let live_steps = LAST_SNAP.with(|c| c.borrow().as_ref().map(|s| s.opcode_steps));
     let snap = BoundarySnapshot {
@@ -161,12 +262,18 @@ pub(crate) fn note_pending_effect_boundary(
         opcode_steps: live_steps.filter(|n| *n > 0).unwrap_or(k as u64),
         stack: Vec::new(),
         memory: Vec::new(),
+        code_hash: None,
+        bytecode_len: 0,
     };
     let _ = partial_retry.push_checkpoint_with_boundary(
         tx_idx,
         CheckpointKind::EffectBoundary,
         Some(snap),
     );
+    // Capture live snap+blob only when absolute jump research flag is on.
+    if std::env::var_os("SPECFENCE_ABSOLUTE_JUMP").is_some_and(|v| v != "0") {
+        PENDING_EFFECT_CP.set(true);
+    }
 }
 
 pub(crate) fn last_boundary_snap() -> Option<BoundarySnapshot> {
@@ -202,6 +309,25 @@ fn record_pc_resume(skipped: u64) {
             let metrics = unsafe { &*plant.metrics };
             metrics.record_pc_resume(skipped);
             metrics.record_live_pc_resume();
+            metrics.record_absolute_jump_applied();
+        }
+    });
+}
+
+fn record_journal_blob_ff(accounts: usize) {
+    PLANT.with(|p| {
+        if let Some(plant) = p.get() {
+            let metrics = unsafe { &*plant.metrics };
+            metrics.record_journal_blob_ff(accounts);
+        }
+    });
+}
+
+fn attach_live_to_plant(snap: BoundarySnapshot, blob: JournalBlob) {
+    PLANT.with(|p| {
+        if let Some(plant) = p.get() {
+            let table = unsafe { &*plant.partial_retry };
+            table.attach_live_boundary(plant.tx_idx, snap, blob);
         }
     });
 }
@@ -217,11 +343,15 @@ impl SpecFenceInspector {
     }
 }
 
-impl<CTX> Inspector<CTX, EthInterpreter> for SpecFenceInspector {
+impl<CTX> Inspector<CTX, EthInterpreter> for SpecFenceInspector
+where
+    CTX: ContextTr,
+    CTX::Journal: JournalExt,
+{
     fn initialize_interp(
         &mut self,
         interp: &mut Interpreter<EthInterpreter>,
-        _context: &mut CTX,
+        context: &mut CTX,
     ) {
         if RESUME_APPLIED.get() {
             return;
@@ -232,7 +362,37 @@ impl<CTX> Inspector<CTX, EthInterpreter> for SpecFenceInspector {
         };
         let depth = CALL_DEPTH.get();
         if snap.call_depth != depth && !(snap.call_depth <= 1 && depth <= 1) {
+            // Depth mismatch — leave pending cleared and fall through without jump.
+            clear_pc_resume();
             return;
+        }
+        // Same-contract gate: refuse jump if code hash diverges.
+        if let Some(expected) = snap.code_hash {
+            let actual = interp.bytecode.get_or_calculate_hash();
+            if actual != expected {
+                clear_pc_resume();
+                return;
+            }
+        }
+        if snap.bytecode_len > 0 && snap.pc >= snap.bytecode_len {
+            clear_pc_resume();
+            return;
+        }
+        // M1e: restore revm journal blob so prefix SSTORE world-state is present
+        // without re-executing those opcodes after the PC jump.
+        let blob = PENDING_JOURNAL_BLOB.with(|c| c.borrow_mut().take());
+        if let Some(blob) = blob {
+            let n = blob.account_count();
+            let state = context.journal_mut().evm_state_mut();
+            for (addr, acc) in blob.state {
+                state.insert(addr, acc);
+            }
+            for log in blob.logs {
+                context.journal_mut().log(log);
+            }
+            if n > 0 {
+                record_journal_blob_ff(n);
+            }
         }
         let skipped = snap.opcode_steps;
         snap.apply_to_interp(interp);
@@ -251,12 +411,25 @@ impl<CTX> Inspector<CTX, EthInterpreter> for SpecFenceInspector {
         LAST_SNAP.with(|c| *c.borrow_mut() = Some(snap));
     }
 
-    fn step_end(&mut self, interp: &mut Interpreter<EthInterpreter>, _context: &mut CTX) {
+    fn step_end(&mut self, interp: &mut Interpreter<EthInterpreter>, context: &mut CTX) {
         let depth = CALL_DEPTH.get();
         let n = OPCODE_STEPS.get();
         let snap = BoundarySnapshot::capture_from_interp(interp, depth, n);
-        LAST_SNAP.with(|c| *c.borrow_mut() = Some(snap));
-        let _ = PENDING_EFFECT_CP.replace(false);
+        LAST_SNAP.with(|c| *c.borrow_mut() = Some(snap.clone()));
+        if PENDING_EFFECT_CP.replace(false) {
+            let full = context.journal().evm_state();
+            let mut state = EvmState::default();
+            for (addr, acc) in full.iter() {
+                if acc.is_touched() {
+                    state.insert(*addr, acc.clone());
+                }
+            }
+            let blob = JournalBlob {
+                state,
+                logs: context.journal().logs().to_vec(),
+            };
+            attach_live_to_plant(snap, blob);
+        }
     }
 
     fn call(
@@ -304,6 +477,23 @@ mod m1c_tests {
     use revm::interpreter::{Gas, Interpreter};
     use revm::state::Bytecode;
 
+    use crate::specfence::rem::{CheckpointId, ResumeContinuation};
+    use hashbrown::HashMap;
+    use crate::BuildIdentityHasher;
+
+    fn lite_snap(pc: usize, steps: u64) -> BoundarySnapshot {
+        BoundarySnapshot {
+            pc,
+            gas_remaining: 0,
+            call_depth: 0,
+            opcode_steps: steps,
+            stack: Vec::new(),
+            memory: Vec::new(),
+            code_hash: None,
+            bytecode_len: 0,
+        }
+    }
+
     #[test]
     fn boundary_snapshot_roundtrip_fields() {
         let snap = BoundarySnapshot {
@@ -313,20 +503,19 @@ mod m1c_tests {
             opcode_steps: 17,
             stack: vec![U256::from(1), U256::from(2)],
             memory: vec![0xab, 0xcd],
+            code_hash: None,
+            bytecode_len: 64,
         };
         assert_eq!(snap.pc, 42);
         assert_eq!(snap.opcode_steps, 17);
         assert_eq!(snap.stack.len(), 2);
+        assert!(snap.is_live_capture());
     }
 
     #[test]
     fn apply_to_interp_jumps_pc_and_restores_stack() {
-        // Minimal bytecode: STOP at 0, then some padding so pc=2 is in range.
         let code = Bytecode::new_raw(vec![0x00, 0x00, 0x00, 0x00, 0x00].into());
         let mut interp = Interpreter::<EthInterpreter>::default();
-        // Rebuild with our bytecode if default is empty — use set via absolute_jump after init.
-        // Create via Interpreter::new is complex; test apply fields on a snap roundtrip of stack/gas/pc
-        // through capture_from_interp after manual setup.
         let snap = BoundarySnapshot {
             pc: 2,
             gas_remaining: 50_000,
@@ -334,8 +523,9 @@ mod m1c_tests {
             opcode_steps: 9,
             stack: vec![U256::from(7), U256::from(8)],
             memory: vec![1, 2, 3, 4],
+            code_hash: None,
+            bytecode_len: 5,
         };
-        // Use ExtBytecode from code
         interp.bytecode = ExtBytecode::new(code);
         interp.gas = Gas::new(100_000);
         snap.apply_to_interp(&mut interp);
@@ -346,7 +536,7 @@ mod m1c_tests {
     }
 
     #[test]
-    fn arm_pc_resume_records_skip_via_initialize_interp() {
+    fn arm_pc_resume_sets_pending_flags() {
         clear_pc_resume();
         let snap = BoundarySnapshot {
             pc: 0,
@@ -355,18 +545,116 @@ mod m1c_tests {
             opcode_steps: 42,
             stack: vec![],
             memory: vec![],
+            code_hash: None,
+            bytecode_len: 1,
         };
         arm_pc_resume(snap);
-        // Without plant TLS metrics, initialize_interp still applies.
-        let code = Bytecode::new_raw(vec![0x00].into());
-        let mut interp = Interpreter::<EthInterpreter>::default();
-        interp.bytecode = ExtBytecode::new(code);
-        interp.gas = Gas::new(100);
-        let mut insp = SpecFenceInspector::new();
-        let mut ctx = ();
-        insp.initialize_interp(&mut interp, &mut ctx);
-        assert!(resume_was_applied());
-        assert_eq!(last_prefix_opcodes_skipped(), 42);
+        assert!(!resume_was_applied());
         clear_pc_resume();
+    }
+
+    #[test]
+    fn jump_is_safe_rejects_lite_and_nested_call() {
+        let lite = ResumeContinuation {
+            cp: CheckpointId {
+                tx_idx: 0,
+                incarnation: 0,
+                k: 2,
+            },
+            k_fail: 3,
+            certified: vec![1],
+            suffix_writes: vec![],
+            effects: vec![],
+            checkpoints: vec![],
+            values: HashMap::with_hasher(BuildIdentityHasher::default()),
+            boundary: Some(lite_snap(0, 2)),
+            jump_snap: None,
+            journal_blob: None,
+        };
+        assert!(!jump_is_safe(&lite), "lite snap must not jump");
+
+        let nested = ResumeContinuation {
+            jump_snap: Some(BoundarySnapshot {
+                pc: 4,
+                gas_remaining: 1_000,
+                call_depth: 2,
+                opcode_steps: 10,
+                stack: vec![U256::from(1)],
+                memory: vec![],
+                code_hash: Some(B256::ZERO),
+                bytecode_len: 32,
+            }),
+            journal_blob: None,
+            ..lite.clone()
+        };
+        assert!(!jump_is_safe(&nested), "nested CALL must fall back");
+    }
+
+    #[test]
+    fn jump_is_safe_accepts_live_with_journal_blob() {
+        let mut state = EvmState::default();
+        state.insert(alloy_primitives::Address::ZERO, Default::default());
+        let cont = ResumeContinuation {
+            cp: CheckpointId {
+                tx_idx: 0,
+                incarnation: 1,
+                k: 2,
+            },
+            k_fail: 4,
+            certified: vec![1, 2],
+            suffix_writes: vec![],
+            effects: vec![],
+            checkpoints: vec![],
+            values: HashMap::with_hasher(BuildIdentityHasher::default()),
+            boundary: Some(lite_snap(0, 2)),
+            jump_snap: Some(BoundarySnapshot {
+                pc: 4,
+                gas_remaining: 50_000,
+                call_depth: 1,
+                opcode_steps: 12,
+                stack: vec![U256::from(9)],
+                memory: vec![0],
+                code_hash: Some(B256::ZERO),
+                bytecode_len: 64,
+            }),
+            journal_blob: Some(JournalBlob {
+                state,
+                logs: vec![],
+            }),
+        };
+        assert!(
+            jump_is_safe(&cont),
+            "live top-level snap + journal blob may jump"
+        );
+    }
+
+    #[test]
+    fn jump_is_safe_rejects_live_without_blob() {
+        let cont = ResumeContinuation {
+            cp: CheckpointId {
+                tx_idx: 0,
+                incarnation: 1,
+                k: 2,
+            },
+            k_fail: 4,
+            certified: vec![1],
+            suffix_writes: vec![],
+            effects: vec![],
+            checkpoints: vec![],
+            values: HashMap::with_hasher(BuildIdentityHasher::default()),
+            boundary: Some(lite_snap(0, 2)),
+            jump_snap: Some(BoundarySnapshot {
+                pc: 4,
+                gas_remaining: 50_000,
+                call_depth: 1,
+                opcode_steps: 12,
+                stack: vec![U256::from(9)],
+                memory: vec![0],
+                code_hash: Some(B256::ZERO),
+                bytecode_len: 64,
+            }),
+            journal_blob: None,
+        };
+        assert!(!jump_is_safe(&cont), "live snap without blob must fall back");
     }
 }
