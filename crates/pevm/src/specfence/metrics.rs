@@ -272,20 +272,17 @@ impl MetricsInner {
         self.evm_entries.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// M1 hook: resume without fresh `transact` (currently unused).
-    #[allow(dead_code)]
+    /// M1: resume from checkpoint without counting as fresh tx-head entry.
     pub(crate) fn record_resume(&self) {
         self.resume_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// M1 hook: rebind-only (currently unused).
-    #[allow(dead_code)]
+    /// M1: rebind-only repair without rewind/restart.
     pub(crate) fn record_rebind_only(&self) {
         self.rebind_only.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// M1 hook: rewind-to-checkpoint (currently unused).
-    #[allow(dead_code)]
+    /// M1: rewind journal/PC to checkpoint then resume.
     pub(crate) fn record_rewind_to_cp(&self) {
         self.rewind_to_cp.fetch_add(1, Ordering::Relaxed);
     }

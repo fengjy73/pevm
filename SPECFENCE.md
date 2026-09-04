@@ -73,16 +73,20 @@ SpecFence discovers the true DAG **during** execution and dynamically fuses opti
 Metrics: prior bayes/fence counters plus `region_validate_fail`, `tx_full_retry`, `bind_hits`,
 `wait_hard_count`, `spec_read_count`, `selective_invalidate_count`, `cascade_revalidate_count`,
 `soft_edge_revokes`, `selective_fallback_full`, `checkpoint_opportunities`, plus plant v2 M0
-`evm_entries` / `tx_head_reexec` / `full_restart` (and zeroed `resume_count` / `rebind_only` /
-`rewind_to_cp` until M1).
+`evm_entries` / `tx_head_reexec` / `full_restart` / `resume_count` / `rebind_only` /
+`rewind_to_cp` (M1 RewindTo/RebindOnly).
 
 ### Plant v2 M0 baseline (metrics only)
 
 Instrument `evm_entries` at every fresh `Vm::execute` → handler `run` (OCC + SpecFence).
-Today's semantic PartialRetry still restarts the interpreter from tx head → counts as
-`tx_head_reexec` (and bumps `evm_entries` on the next entry), **not** as L1 resume.
-Expectation: SF `evm_entries ≈ n_tx + head-reexecs`, not better than OCC until M1 RewindTo.
-See `lab/notes/specfence-rem-plant-v2-revm.md`.
+See `lab/notes/specfence-plant-v2-m0-status.md`.
+
+### Plant v2 M1 — Checkpoints + RewindTo (L1 partial)
+
+Checkpoints `(t,inc,k)` on SpecFence path; validation fail with certified prefix →
+`RebindOnly` (no abort) or `RewindTo` (resume entry: `rewind_to_cp`/`resume_count`,
+**not** `evm_entries`/`tx_head_reexec`). `FullRestart` only when prefix empty.
+True PC / journal fast-forward still TODO — see `lab/notes/specfence-plant-v2-m1-status.md`.
 
 ## Design specs
 

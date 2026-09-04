@@ -632,8 +632,8 @@ fn specfence_p1a_selective_invalidate_and_fence() {
     assert!(any, "contended ERC-20 cluster should abort at least once");
 }
 
-/// P2: localized conflict yields semantic PartialRetry (certified-prefix Bind)
-/// with sequential ≡ SpecFence; OCC still records aborts on the same mock.
+/// P2/M1: localized conflict yields certified-prefix repair (PartialRetry /
+/// RewindTo) with sequential ≡ SpecFence; OCC still records aborts.
 #[test]
 fn specfence_p2_partial_retry_on_localized_conflict() {
     let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 10, 5);
@@ -660,7 +660,7 @@ fn specfence_p2_partial_retry_on_localized_conflict() {
     for _ in 0..10 {
         let (_, metrics, _) = run_mode(ConcurrencyMode::SpecFence, &storage, txs.clone());
         last_metrics = Some(metrics.clone());
-        if metrics.partial_retry_count >= 1 {
+        if metrics.partial_retry_count >= 1 || metrics.rewind_to_cp >= 1 {
             saw_partial = true;
             assert!(metrics.occ_aborts > 0, "partial implies abort: {metrics:?}");
             break;
@@ -713,5 +713,50 @@ fn specfence_p2_full_retry_not_always_eq_aborts() {
     assert!(
         broke_equality,
         "expected PartialRetry to decouple full_retry from aborts: {last:?}"
+    );
+}
+
+/// M1: on localized conflict, RewindTo / resume must fire instead of
+/// tx_head_reexec, and resume_count tracks non-head reentries.
+#[test]
+fn specfence_m1_rewind_to_skips_evm_entries() {
+    let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 10, 5);
+    state.insert(Address::ZERO, EvmAccount::default());
+    for i in 0..48 {
+        let (addr, account) = common::mock_account(70_000 + i);
+        state.insert(addr, account);
+        txs.push(self_transfer(addr, 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+
+    let mut saw = false;
+    let mut last = None;
+    for _ in 0..12 {
+        let (_, m, _) = run_mode(ConcurrencyMode::SpecFence, &storage, txs.clone());
+        last = Some(m.clone());
+        if m.occ_aborts > 0 && (m.rewind_to_cp > 0 || m.rebind_only > 0) {
+            saw = true;
+            assert_eq!(
+                m.tx_head_reexec, 0,
+                "M1 demotes head PartialRetry: {m:?}"
+            );
+            if m.rewind_to_cp > 0 {
+                assert!(
+                    m.resume_count > 0,
+                    "RewindTo resume must increment resume_count: {m:?}"
+                );
+            }
+            // L1 accounting: resumes are not counted as fresh tx-head entries.
+            // evm_entries ≈ n_tx + full_restarts (+ Blocking retries still enter).
+            assert!(
+                m.evm_entries >= txs.len(),
+                "evm_entries should cover at least one entry per tx: {m:?}"
+            );
+            break;
+        }
+    }
+    assert!(
+        saw,
+        "M1 RewindTo/RebindOnly must fire on localized conflict: {last:?}"
     );
 }

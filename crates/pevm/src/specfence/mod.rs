@@ -5,9 +5,9 @@
 //! Bayesian Beta-Bernoulli posteriors + cost-aware π drive WaitHard / Bind /
 //! SpecRead per region; sticky Wait is revokeable when posterior < τ_revoke.
 //! Cascade fence
-//! remains a correctness shield. Whole-tx re-execution remains (revm);
-//! P2 semantic PartialRetry: certified-prefix Bind on reexec + suffix-only
-//! InvalidateSelective (no global aborted stamp when safe).
+//! remains a correctness shield. FullRestart remains whole-tx reexec (revm).
+//! M1: RebindOnly / RewindTo on certified prefix (not head reexec when cps allow);
+//! suffix-only InvalidateSelective when safe.
 
 use crate::{
     BuildSuffixHasher, MemoryLocation, TxIdx, chain::PevmChain, hash_deterministic,
@@ -35,7 +35,8 @@ pub(crate) use rem::RemCounters;
 pub(crate) use rem::PartialRetryTable;
 #[allow(unused_imports)]
 pub(crate) use rem::{
-    AccessMode, EffectOrdinal, PartialRetryPlan, PartialRetryState, RegionAccess, RemTask,
+    AccessMode, Checkpoint, CheckpointId, CheckpointKind, EffectOrdinal, PartialRetryPlan,
+    PartialRetryState, RegionAccess, RemTask, RepairPlan,
 };
 pub(crate) use resolve::{PolicyCtx, ResolveAction, choose_action};
 #[allow(unused_imports)]

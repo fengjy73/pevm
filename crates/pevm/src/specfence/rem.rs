@@ -1,4 +1,4 @@
-//! Region Execution Machine (REM) plant scaffolding for SpecFence Spec v1.
+//! Region Execution Machine (REM) plant scaffolding for SpecFence Spec v1 / plant v2.
 //!
 //! Phase-1 still drives one interpreter session per incarnation (`RunTx`), but
 //! must emit region events and expose per-location validate semantics.
@@ -6,6 +6,11 @@
 //! P2: semantic PartialRetry — revm re-executes from start, but π forces
 //! Bind/WaitHard on the previously certified-prefix locations, and only
 //! failed-suffix writes are selectively invalidated (no global aborted stamp).
+//!
+//! M1 (plant v2): checkpoints at CALL + write/effect boundaries; RewindTo /
+//! RebindOnly demote head PartialRetry when a certified prefix exists.
+//! True PC resume is TODO — resume path still re-enters the handler with
+//! force-bind / journal fast-forward prep, but must NOT count as `evm_entries`.
 
 #![allow(dead_code)]
 use std::sync::Mutex;
@@ -53,7 +58,37 @@ pub(crate) struct RegionAccess {
     pub mode: AccessMode,
 }
 
-/// Decision after classifying a validation failure for PartialRetry.
+/// Checkpoint identity `(t, inc, k)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct CheckpointId {
+    pub tx_idx: TxIdx,
+    pub incarnation: TxIncarnation,
+    pub k: usize,
+}
+
+/// Why a checkpoint was taken (plant v2 M1 grain).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CheckpointKind {
+    /// External CALL / create frame entry (incl. tx top-level).
+    CallEntry,
+    /// CALL / create frame exit.
+    CallExit,
+    /// Account basic / code write boundary.
+    AccountWrite,
+    /// Storage slot write boundary.
+    StorageWrite,
+    /// Generic effect boundary (certified Bind / EarlyVal).
+    EffectBoundary,
+}
+
+/// Snapshot recorded on the SpecFence path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Checkpoint {
+    pub id: CheckpointId,
+    pub kind: CheckpointKind,
+}
+
+/// Decision after classifying a validation failure for PartialRetry / M1 repair.
 #[derive(Debug, Clone)]
 pub(crate) struct PartialRetryPlan {
     /// Locations whose origins still matched (certified prefix).
@@ -66,9 +101,33 @@ pub(crate) struct PartialRetryPlan {
     pub prefix_writes: Vec<MemoryLocationHash>,
 }
 
-/// Per-tx checkpoint / certified-prefix state for semantic PartialRetry.
+/// Next-incarnation (or Retry-loop) repair op for plant v2 L1.
+#[derive(Debug, Clone)]
+pub(crate) enum RepairPlan {
+    /// Origins wrong but suffix empty — patched in place (no new incarnation).
+    RebindOnly {
+        locations: Vec<MemoryLocationHash>,
+    },
+    /// Certified prefix OK — resume from last good checkpoint (not tx head).
+    ///
+    /// TODO(M1+): true PC / journal fast-forward from `cp`; today the resume
+    /// entry still runs the handler with force-bind, but does **not** increment
+    /// `evm_entries` / `tx_head_reexec`.
+    RewindTo {
+        cp: CheckpointId,
+        certified: Vec<MemoryLocationHash>,
+        k_fail: usize,
+        suffix_writes: Vec<MemoryLocationHash>,
+    },
+    /// Empty prefix / control-flow broken — FullRestart from tx head.
+    FullRestart,
+}
+
+/// Per-tx checkpoint / certified-prefix state for PartialRetry + M1 RewindTo.
 #[derive(Debug, Default)]
 pub(crate) struct PartialRetryState {
+    /// Incarnation currently being journaled (for CheckpointId).
+    incarnation: TxIncarnation,
     /// Monotonic effect ordinal for the current incarnation.
     k: usize,
     /// First-touch effect ordinal per location this incarnation.
@@ -77,14 +136,18 @@ pub(crate) struct PartialRetryState {
     certified: HashSet<MemoryLocationHash, BuildIdentityHasher>,
     /// Full access journal (metrics / debugging).
     journal: Vec<RegionAccess>,
+    /// Checkpoints captured this incarnation (CALL + write + effect).
+    checkpoints: Vec<Checkpoint>,
 }
 
 impl PartialRetryState {
-    pub(crate) fn reset(&mut self) {
+    pub(crate) fn reset(&mut self, incarnation: TxIncarnation) {
+        self.incarnation = incarnation;
         self.k = 0;
         self.first_k.clear();
         self.certified.clear();
         self.journal.clear();
+        self.checkpoints.clear();
     }
 
     pub(crate) fn note_access(
@@ -109,6 +172,41 @@ impl PartialRetryState {
         self.certified.insert(location);
     }
 
+    pub(crate) fn push_checkpoint(&mut self, tx_idx: TxIdx, kind: CheckpointKind) -> CheckpointId {
+        let id = CheckpointId {
+            tx_idx,
+            incarnation: self.incarnation,
+            k: self.k,
+        };
+        self.checkpoints.push(Checkpoint { id, kind });
+        id
+    }
+
+    /// Last checkpoint with `k < k_fail` (certified-prefix end).
+    pub(crate) fn last_checkpoint_before(&self, k_fail: usize) -> Option<CheckpointId> {
+        self.checkpoints
+            .iter()
+            .rev()
+            .find(|cp| cp.id.k < k_fail)
+            .map(|cp| cp.id)
+            .or_else(|| {
+                // Synthetic CallEntry at k=0 when we recorded no earlier cp.
+                if k_fail > 0 {
+                    Some(CheckpointId {
+                        tx_idx: self
+                            .journal
+                            .first()
+                            .map(|a| a.tx_idx)
+                            .unwrap_or(0),
+                        incarnation: self.incarnation,
+                        k: 0,
+                    })
+                } else {
+                    None
+                }
+            })
+    }
+
     pub(crate) fn first_k(&self, location: MemoryLocationHash) -> Option<usize> {
         self.first_k.get(&location).copied()
     }
@@ -120,14 +218,24 @@ impl PartialRetryState {
     pub(crate) fn current_k(&self) -> usize {
         self.k
     }
+
+    pub(crate) fn incarnation(&self) -> TxIncarnation {
+        self.incarnation
+    }
+
+    pub(crate) fn checkpoint_count(&self) -> usize {
+        self.checkpoints.len()
+    }
 }
 
-/// Block-scoped PartialRetry plant: per-tx journals + next-incarnation force-bind.
+/// Block-scoped PartialRetry / checkpoint plant.
 #[derive(Debug)]
 pub(crate) struct PartialRetryTable {
     states: Vec<Mutex<PartialRetryState>>,
     /// Locations π must Bind/WaitHard on the next incarnation of `t`.
     force_bind: DashMap<TxIdx, Vec<MemoryLocationHash>, BuildIdentityHasher>,
+    /// Pending repair for next execute / Retry loop of `t`.
+    repair: DashMap<TxIdx, RepairPlan, BuildIdentityHasher>,
 }
 
 impl PartialRetryTable {
@@ -137,12 +245,13 @@ impl PartialRetryTable {
                 .map(|_| Mutex::new(PartialRetryState::default()))
                 .collect(),
             force_bind: DashMap::default(),
+            repair: DashMap::default(),
         }
     }
 
-    pub(crate) fn reset_incarnation(&self, tx_idx: TxIdx) {
+    pub(crate) fn reset_incarnation(&self, tx_idx: TxIdx, incarnation: TxIncarnation) {
         if let Some(slot) = self.states.get(tx_idx) {
-            slot.lock().unwrap().reset();
+            slot.lock().unwrap().reset(incarnation);
         }
     }
 
@@ -163,11 +272,40 @@ impl PartialRetryTable {
             .note_certified(location);
     }
 
+    pub(crate) fn push_checkpoint(
+        &self,
+        tx_idx: TxIdx,
+        kind: CheckpointKind,
+    ) -> Option<CheckpointId> {
+        self.states.get(tx_idx).map(|slot| {
+            slot.lock().unwrap().push_checkpoint(tx_idx, kind)
+        })
+    }
+
+    pub(crate) fn last_checkpoint_before(
+        &self,
+        tx_idx: TxIdx,
+        k_fail: usize,
+    ) -> Option<CheckpointId> {
+        self.states
+            .get(tx_idx)?
+            .lock()
+            .unwrap()
+            .last_checkpoint_before(k_fail)
+    }
+
+    pub(crate) fn current_k(&self, tx_idx: TxIdx) -> usize {
+        self.states
+            .get(tx_idx)
+            .map(|s| s.lock().unwrap().current_k())
+            .unwrap_or(0)
+    }
+
     pub(crate) fn first_k(&self, tx_idx: TxIdx, location: MemoryLocationHash) -> Option<usize> {
         self.states[tx_idx].lock().unwrap().first_k(location)
     }
 
-    /// Locations π should force Bind/WaitHard for this incarnation (from prior PartialRetry).
+    /// Locations π should force Bind/WaitHard for this incarnation (from prior repair).
     pub(crate) fn force_bind_locations(&self, tx_idx: TxIdx) -> Vec<MemoryLocationHash> {
         self.force_bind
             .get(&tx_idx)
@@ -191,6 +329,24 @@ impl PartialRetryTable {
 
     pub(crate) fn clear_force_bind(&self, tx_idx: TxIdx) {
         self.force_bind.remove(&tx_idx);
+    }
+
+    pub(crate) fn set_repair(&self, tx_idx: TxIdx, plan: RepairPlan) {
+        self.repair.insert(tx_idx, plan);
+    }
+
+    pub(crate) fn clear_repair(&self, tx_idx: TxIdx) {
+        self.repair.remove(&tx_idx);
+    }
+
+    pub(crate) fn peek_repair(&self, tx_idx: TxIdx) -> Option<RepairPlan> {
+        self.repair.get(&tx_idx).map(|v| v.clone())
+    }
+
+    pub(crate) fn is_rewind_resume(&self, tx_idx: TxIdx) -> bool {
+        self.repair
+            .get(&tx_idx)
+            .is_some_and(|p| matches!(*p, RepairPlan::RewindTo { .. }))
     }
 
     /// Classify validation failure into PartialRetry plan, or `None` if unsafe → FullRetry.
@@ -258,6 +414,31 @@ impl PartialRetryTable {
             suffix_writes,
             prefix_writes,
         })
+    }
+
+    /// Build an M1 repair plan from a PartialRetry classification.
+    ///
+    /// Caller may attempt `RebindOnly` first when `suffix_writes` is empty
+    /// (patch origins in place without abort). Otherwise prefer `RewindTo`
+    /// when a checkpoint exists; `FullRestart` only if prefix/control-flow
+    /// cannot be recovered.
+    pub(crate) fn plan_repair(
+        &self,
+        tx_idx: TxIdx,
+        plan: &PartialRetryPlan,
+    ) -> RepairPlan {
+        if plan.certified.is_empty() {
+            return RepairPlan::FullRestart;
+        }
+        match self.last_checkpoint_before(tx_idx, plan.k_fail) {
+            Some(cp) => RepairPlan::RewindTo {
+                cp,
+                certified: plan.certified.clone(),
+                k_fail: plan.k_fail,
+                suffix_writes: plan.suffix_writes.clone(),
+            },
+            None => RepairPlan::FullRestart,
+        }
     }
 }
 

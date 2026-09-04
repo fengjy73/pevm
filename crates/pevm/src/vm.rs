@@ -17,7 +17,7 @@ use crate::{
     AccountBasic, BuildIdentityHasher, BuildSuffixHasher, EvmAccount, FinishExecFlags, MemoryEntry,
     MemoryLocation, MemoryLocationHash, MemoryValue, ReadOrigin, ReadOrigins, ReadSet, Storage,
     TxIdx, TxVersion, WriteSet, chain::PevmChain, hash_deterministic, mv_memory::MvMemory,
-    specfence::{AccessMode, ResolveAction, SpecFenceCtx, TAU_VERY_HIGH, early_val_probability},
+    specfence::{AccessMode, CheckpointKind, RepairPlan, ResolveAction, SpecFenceCtx, TAU_VERY_HIGH, early_val_probability},
 };
 
 /// The execution error from the underlying EVM executor.
@@ -149,6 +149,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
         from_hash: MemoryLocationHash,
         to_hash: Option<MemoryLocationHash>,
         has_nonce: bool,
+        incarnation: crate::TxIncarnation,
     ) -> Result<(), ReadError> {
         self.tx_idx = tx_idx;
         self.tx = tx;
@@ -160,7 +161,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.read_set.clear();
         self.read_accounts.clear();
         if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
-            self.specfence.partial_retry.reset_incarnation(tx_idx);
+            self.specfence
+                .partial_retry
+                .reset_incarnation(tx_idx, incarnation);
         }
         if let TxKind::Call(to) = tx.kind {
             self.to_code_hash = self.get_code_hash(to)?;
@@ -366,11 +369,15 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     return Err(ReadError::Blocking(v.tx_idx));
                 }
                 self.specfence.dag.note_hard_edge();
-                // Bind success → certify for PartialRetry prefix.
+                // Bind success → certify for PartialRetry prefix + effect cp.
                 self.specfence
                     .partial_retry
                     .note_certified(self.tx_idx, location_hash);
                 self.specfence.rem.note_checkpoint_opportunity();
+                let _ = self.specfence.partial_retry.push_checkpoint(
+                    self.tx_idx,
+                    CheckpointKind::EffectBoundary,
+                );
                 Ok(())
             }
             ResolveAction::SpecRead => {
@@ -416,6 +423,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 .note_certified(self.tx_idx, location_hash);
             self.specfence.rem.note_checkpoint_opportunity();
             self.specfence.metrics.record_checkpoint_opportunity();
+            let _ = self.specfence.partial_retry.push_checkpoint(
+                self.tx_idx,
+                CheckpointKind::EffectBoundary,
+            );
             Ok(())
         } else {
             // EarlyVal fail → enter PartialRetry path (re-exec with force-bind).
@@ -437,10 +448,33 @@ impl<'a, S: Storage> VmDb<'a, S> {
             }
             self.specfence
                 .partial_retry
-                .set_force_bind(self.tx_idx, certified);
-            // Semantic PartialRetry still restarts interpreter from tx head (Retry loop).
+                .set_force_bind(self.tx_idx, certified.clone());
+            // M1: demote head PartialRetry → RewindTo when a checkpoint exists.
+            let k_fail = self
+                .specfence
+                .partial_retry
+                .first_k(self.tx_idx, location_hash)
+                .unwrap_or_else(|| self.specfence.partial_retry.current_k(self.tx_idx));
+            let cp = self
+                .specfence
+                .partial_retry
+                .last_checkpoint_before(self.tx_idx, k_fail)
+                .unwrap_or(crate::specfence::CheckpointId {
+                    tx_idx: self.tx_idx,
+                    incarnation: 0,
+                    k: 0,
+                });
+            self.specfence.partial_retry.set_repair(
+                self.tx_idx,
+                RepairPlan::RewindTo {
+                    cp,
+                    certified,
+                    k_fail,
+                    suffix_writes: Vec::new(),
+                },
+            );
             self.specfence.metrics.record_partial_retry();
-            self.specfence.metrics.record_tx_head_reexec();
+            self.specfence.metrics.record_rewind_to_cp();
             self.specfence.metrics.record_region_validate_fail(1);
             Err(ReadError::InconsistentRead)
         }
@@ -930,7 +964,14 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             let ctx = self.evm.ctx();
 
             ctx.db_mut()
-                .set_tx(tx_version.tx_idx, tx, from_hash, to_hash, has_nonce)
+                .set_tx(
+                    tx_version.tx_idx,
+                    tx,
+                    from_hash,
+                    to_hash,
+                    has_nonce,
+                    tx_version.tx_incarnation,
+                )
                 .map_err(VmExecutionError::from)?;
 
             ctx.set_tx(full_tx.clone());
@@ -940,10 +981,33 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             ctx.journal_mut().clear();
         }
 
-        // Plant v2 M0: every fresh EVM/transact/interpreter start from tx head
-        // (OCC abort+reexec and SpecFence incarnations). M1 resume/RewindTo must
-        // use a different entry point and must not call record_evm_entry.
-        self.specfence.metrics.record_evm_entry();
+        // Plant v2 M1: RewindTo resume must NOT call record_evm_entry / head path.
+        // Fresh starts (incl. FullRestart) still count as evm_entries.
+        let rewind_resume = self.specfence.mode == crate::ConcurrencyMode::SpecFence
+            && self
+                .specfence
+                .partial_retry
+                .is_rewind_resume(tx_version.tx_idx);
+        if rewind_resume {
+            // TODO(M1+): journal fast-forward + true PC resume from checkpoint;
+            // for now still run the handler with force-bind, but account as resume.
+            self.specfence.metrics.record_resume();
+            let _ = self.specfence.partial_retry.push_checkpoint(
+                tx_version.tx_idx,
+                CheckpointKind::CallEntry,
+            );
+        } else {
+            self.specfence.metrics.record_evm_entry();
+            if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+                let _ = self.specfence.partial_retry.push_checkpoint(
+                    tx_version.tx_idx,
+                    CheckpointKind::CallEntry,
+                );
+            }
+        }
+
+        // TODO(M1+): nested CALL entry/exit via Handler::run_exec_loop / Inspector.
+        // M1 records CallEntry above and CallExit after successful finalize.
 
         match NoBeneficiaryHandler::<C, _>::default().run(&mut self.evm) {
             Ok(exec_result) => {
@@ -1096,13 +1160,30 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 };
 
                 if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
-                    for (loc, _) in &write_set {
+                    for (loc, value) in &write_set {
                         self.specfence.partial_retry.note_access(
                             tx_version.tx_idx,
                             *loc,
                             AccessMode::Write,
                         );
+                        let kind = match value {
+                            MemoryValue::Basic(_)
+                            | MemoryValue::LazySender(_)
+                            | MemoryValue::LazyRecipient(_)
+                            | MemoryValue::SelfDestructed => CheckpointKind::AccountWrite,
+                            MemoryValue::Storage(_) => CheckpointKind::StorageWrite,
+                            // Code-hash / other account-adjacent writes.
+                            _ => CheckpointKind::AccountWrite,
+                        };
+                        let _ = self
+                            .specfence
+                            .partial_retry
+                            .push_checkpoint(tx_version.tx_idx, kind);
                     }
+                    let _ = self.specfence.partial_retry.push_checkpoint(
+                        tx_version.tx_idx,
+                        CheckpointKind::CallExit,
+                    );
                 }
 
                 let (wrote_new_location, contended) =

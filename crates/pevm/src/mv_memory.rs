@@ -291,6 +291,61 @@ impl MvMemory {
         invalid
     }
 
+    /// M1 RebindOnly: patch invalid read origins to the current valid version
+    /// without aborting. Refuses multi-origin (lazy) reads — those need RewindTo.
+    /// Returns true iff after patching `collect_invalid_reads` is empty.
+    pub(crate) fn try_rebind_invalid_reads(
+        &self,
+        tx_idx: TxIdx,
+        invalid: &[MemoryLocationHash],
+    ) -> bool {
+        if invalid.is_empty() {
+            return true;
+        }
+        let mut locs = index_mutex!(self.last_locations, tx_idx);
+        for &location in invalid {
+            let prior = locs.read.get(&location).cloned();
+            if prior.as_ref().is_some_and(|o| o.len() > 1) {
+                // Lazy multi-origin — unsafe to rebind in place.
+                return false;
+            }
+            let Some(new_origins) = self.current_read_origins(tx_idx, location) else {
+                return false;
+            };
+            locs.read.insert(location, new_origins);
+        }
+        drop(locs);
+        self.collect_invalid_reads(tx_idx).is_empty()
+    }
+
+    /// Current single-origin read for `location` as of `tx_idx` (for RebindOnly).
+    fn current_read_origins(
+        &self,
+        tx_idx: TxIdx,
+        location: MemoryLocationHash,
+    ) -> Option<crate::ReadOrigins> {
+        use crate::{ReadOrigin, ReadOrigins, TxVersion};
+        let mut origins = ReadOrigins::new();
+        if let Some(written_transactions) = self.data.get(&location) {
+            match written_transactions.range(..tx_idx).next_back() {
+                Some((closest_idx, MemoryEntry::Data(tx_incarnation, ..))) => {
+                    if self.is_aborted_incarnation(*closest_idx, *tx_incarnation) {
+                        return None;
+                    }
+                    origins.push(ReadOrigin::MvMemory(TxVersion {
+                        tx_idx: *closest_idx,
+                        tx_incarnation: *tx_incarnation,
+                    }));
+                }
+                Some((_, MemoryEntry::Estimate)) => return None,
+                None => origins.push(ReadOrigin::Storage),
+            }
+        } else {
+            origins.push(ReadOrigin::Storage);
+        }
+        Some(origins)
+    }
+
     /// Last writer with index strictly below `tx_idx`, if any.
     pub(crate) fn last_writer_before(
         &self,

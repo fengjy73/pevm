@@ -18,9 +18,6 @@
 SF `evm_entries ≈ n_tx + head-reexecs` (`tx_head_reexec` + `full_restart`), **not** better than OCC.
 Semantic PartialRetry does **not** reduce `evm_entries` (L1 still unmet).
 
-## Next (M1)
+## Next (M1) — DONE (partial L1)
 
-Hook points for RewindTo:
-1. Checkpoint capture in revm/pevm adapter at CALL + storage/account write boundaries.
-2. On selective invalidate / certified-prefix fail: `RewindTo(cp)` → `resume_count` / `rewind_to_cp`, **without** `record_evm_entry`.
-3. Keep `Vm::execute` head path for FullRestart / empty prefix only.
+See `lab/notes/specfence-plant-v2-m1-status.md`.
