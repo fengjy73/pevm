@@ -17,7 +17,7 @@ use crate::{
     AccountBasic, BuildIdentityHasher, BuildSuffixHasher, EvmAccount, FinishExecFlags, MemoryEntry,
     MemoryLocation, MemoryLocationHash, MemoryValue, ReadOrigin, ReadOrigins, ReadSet, Storage,
     TxIdx, TxVersion, WriteSet, chain::PevmChain, hash_deterministic, mv_memory::MvMemory,
-    specfence::SpecFenceCtx,
+    specfence::{ResolveAction, SpecFenceCtx},
 };
 
 /// The execution error from the underlying EVM executor.
@@ -211,49 +211,120 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.specfence.metrics.mark_hot(address);
     }
 
-    /// Proactive Wait at **location** granularity: block on last lower-idx writer
-    /// of that location. Account-hint prev is cold-start only when the location
-    /// has never been observed in the Bayesian map.
+    /// SpecFence π at location granularity: WaitHard / Bind / SpecRead.
+    /// PCC keeps sticky Wait. Beneficiary never waits.
     fn maybe_wait(
         &self,
         address: Address,
         location_hash: MemoryLocationHash,
     ) -> Result<(), ReadError> {
-        if !self
-            .specfence
-            .should_wait_location(&self.mv_memory.regions, location_hash, &address)
-        {
-            return Ok(());
+        // Region effect ordinal (Phase-2 checkpoint prep).
+        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            let _ = self.specfence.rem.note_effect();
         }
-        // Prefer location-level last writer (region < tx).
-        if let Some(prev) = self
-            .mv_memory
-            .last_writer_before(location_hash, self.tx_idx)
-            && !self.specfence.scheduler.is_done(prev)
-        {
-            self.specfence.metrics.record_wait(address);
-            return Err(ReadError::Blocking(prev));
-        }
-        // Cold-start: location never seen → fall back to account hint predecessor.
-        if self.specfence.mode == crate::ConcurrencyMode::SpecFence
-            && !self.specfence.bayes.has_location(location_hash)
-        {
-            if let Some(prev) = self.specfence.hints.prev(&address, self.tx_idx)
+
+        if self.specfence.mode != crate::ConcurrencyMode::SpecFence {
+            if !self
+                .specfence
+                .should_wait_location(&self.mv_memory.regions, location_hash, &address)
+            {
+                return Ok(());
+            }
+            if let Some(prev) = self
+                .mv_memory
+                .last_writer_before(location_hash, self.tx_idx)
                 && !self.specfence.scheduler.is_done(prev)
+            {
+                self.specfence.metrics.record_wait(address);
+                return Err(ReadError::Blocking(prev));
+            }
+            if let Some(prev) =
+                self.specfence
+                    .wait_blocker(&self.mv_memory.regions, &address, self.tx_idx)
             {
                 self.specfence.metrics.record_wait(address);
                 return Err(ReadError::Blocking(prev));
             }
             return Ok(());
         }
-        if let Some(prev) =
-            self.specfence
-                .wait_blocker(&self.mv_memory.regions, &address, self.tx_idx)
-        {
-            self.specfence.metrics.record_wait(address);
-            return Err(ReadError::Blocking(prev));
+
+        // --- SpecFence path ---
+        if address == self.specfence.beneficiary {
+            self.specfence.metrics.record_spec_read();
+            return Ok(());
         }
-        Ok(())
+
+        let writer = self
+            .mv_memory
+            .last_writer_before(location_hash, self.tx_idx)
+            .or_else(|| self.mv_memory.residual_writer_before(location_hash, self.tx_idx));
+        let writer_done = writer.is_some_and(|w| self.specfence.scheduler.is_done(w));
+        let bind_version = self
+            .mv_memory
+            .last_data_before(location_hash, self.tx_idx)
+            .map(|(tx_idx, tx_incarnation)| TxVersion {
+                tx_idx,
+                tx_incarnation,
+            });
+        let residual_predicts = self
+            .mv_memory
+            .residual_writer_before(location_hash, self.tx_idx)
+            .is_some();
+
+        // Sticky Wait still honored unless revoked by should_wait_location.
+        let sticky = self
+            .specfence
+            .should_wait_location(&self.mv_memory.regions, location_hash, &address);
+
+        let action = if sticky {
+            ResolveAction::WaitHard
+        } else {
+            self.specfence.choose_resolve(
+                location_hash,
+                &address,
+                writer,
+                writer_done,
+                bind_version,
+                residual_predicts,
+            )
+        };
+
+        match action {
+            ResolveAction::WaitHard => {
+                self.specfence.metrics.record_wait_hard();
+                if let Some(prev) = writer
+                    && !self.specfence.scheduler.is_done(prev)
+                {
+                    self.specfence.metrics.record_wait(address);
+                    self.specfence.dag.note_soft_wait(location_hash, self.tx_idx);
+                    return Err(ReadError::Blocking(prev));
+                }
+                // Cold-start account hint predecessor.
+                if !self.specfence.bayes.has_location(location_hash)
+                    && let Some(prev) = self.specfence.hints.prev(&address, self.tx_idx)
+                    && !self.specfence.scheduler.is_done(prev)
+                {
+                    self.specfence.metrics.record_wait(address);
+                    return Err(ReadError::Blocking(prev));
+                }
+                Ok(())
+            }
+            ResolveAction::Bind(v) => {
+                self.specfence.metrics.record_bind_hit();
+                self.specfence.bayes.observe_bind_hit(location_hash);
+                if !self.specfence.scheduler.is_done(v.tx_idx) {
+                    self.specfence.metrics.record_wait_hard();
+                    self.specfence.metrics.record_wait(address);
+                    return Err(ReadError::Blocking(v.tx_idx));
+                }
+                self.specfence.dag.note_hard_edge();
+                Ok(())
+            }
+            ResolveAction::SpecRead => {
+                self.specfence.metrics.record_spec_read();
+                Ok(())
+            }
+        }
     }
 
     // Push a new read origin. Return an error when there's already
@@ -280,6 +351,12 @@ impl<'a, S: Storage> VmDb<'a, S> {
             && let Some((tx_idx, MemoryEntry::Data(tx_incarnation, value))) =
                 written_transactions.range(..self.tx_idx).next_back()
         {
+            if self
+                .mv_memory
+                .is_aborted_incarnation(*tx_idx, *tx_incarnation)
+            {
+                return Err(ReadError::Blocking(*tx_idx));
+            }
             match value {
                 MemoryValue::SelfDestructed => {
                     return Err(ReadError::SelfDestructedAccount);
@@ -356,6 +433,13 @@ impl<S: Storage> Database for VmDb<'_, S> {
                         return Err(ReadError::Blocking(*blocking_idx));
                     }
                     Some((closest_idx, MemoryEntry::Data(tx_incarnation, value))) => {
+                        if self
+                            .mv_memory
+                            .is_aborted_incarnation(*closest_idx, *tx_incarnation)
+                        {
+                            self.promote_on_conflict(address, location_hash);
+                            return Err(ReadError::Blocking(*closest_idx));
+                        }
                         // About to push a new origin
                         // Inconsistent: new origin will be longer than the previous!
                         if has_prev_origins && read_origins.len() == new_origins.len() {
@@ -514,6 +598,13 @@ impl<S: Storage> Database for VmDb<'_, S> {
         {
             match entry {
                 MemoryEntry::Data(tx_incarnation, MemoryValue::Storage(value)) => {
+                    if self
+                        .mv_memory
+                        .is_aborted_incarnation(*closest_idx, *tx_incarnation)
+                    {
+                        self.promote_on_conflict(address, location_hash);
+                        return Err(ReadError::Blocking(*closest_idx));
+                    }
                     Self::push_origin(
                         read_origins,
                         ReadOrigin::MvMemory(TxVersion {

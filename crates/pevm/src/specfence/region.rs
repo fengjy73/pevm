@@ -1,4 +1,5 @@
 //! Per-region (memory location / account) Wait vs Speculate mode for the current block.
+//! Spec v1: sticky Wait is revokeable when posterior < τ_revoke.
 
 use alloy_primitives::Address;
 use dashmap::DashMap;
@@ -58,11 +59,27 @@ impl RegionTable {
         }
     }
 
+    /// Revoke sticky Wait → Speculate. Returns true if a Wait was cleared.
+    pub(crate) fn clear_location_wait(&self, location: MemoryLocationHash) -> bool {
+        match self.locations.insert(location, RegionMode::Speculate) {
+            Some(RegionMode::Wait) => true,
+            _ => false,
+        }
+    }
+
     /// Promote an account Speculate → Wait. Returns true if this was a new promotion.
     pub(crate) fn promote_account(&self, address: Address) -> bool {
         match self.accounts.insert(address, RegionMode::Wait) {
             None | Some(RegionMode::Speculate) => true,
             Some(RegionMode::Wait) => false,
+        }
+    }
+
+    /// Revoke account-level Wait.
+    pub(crate) fn clear_account_wait(&self, address: Address) -> bool {
+        match self.accounts.insert(address, RegionMode::Speculate) {
+            Some(RegionMode::Wait) => true,
+            _ => false,
         }
     }
 

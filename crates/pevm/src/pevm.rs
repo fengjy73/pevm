@@ -27,8 +27,8 @@ use crate::{
     mv_memory::MvMemory,
     scheduler::Scheduler,
     specfence::{
-        AccountHints, BayesMap, ConcurrencyMode, DEFAULT_TAU, HeatMap, MetricsInner, SpecFenceCtx,
-        SpecFenceMetrics, seed_wait_regions, update_bayes, update_heat,
+        AccountHints, BayesMap, ConcurrencyMode, DEFAULT_TAU, HeatMap, MetricsInner, RemCounters,
+        SpecDag, SpecFenceCtx, SpecFenceMetrics, seed_wait_regions, update_bayes, update_heat,
     },
     storage::StorageWrapper,
     vm::{
@@ -311,6 +311,8 @@ impl Pevm {
 
         self.execution_results.grow_to(block_size);
 
+        let dag = SpecDag::new();
+        let rem = RemCounters::default();
         let specfence = SpecFenceCtx {
             mode: self.concurrency_mode,
             hints: &hints,
@@ -319,6 +321,8 @@ impl Pevm {
             beneficiary: block_env.beneficiary,
             bayes: &self.bayes,
             tau: DEFAULT_TAU,
+            dag: &dag,
+            rem: &rem,
         };
 
         // TODO: Better thread handling
@@ -367,6 +371,7 @@ impl Pevm {
             0.0
         };
         let wave_id = self.bayes.wave_id();
+        metrics_inner.set_checkpoint_opportunities(rem.checkpoint_opportunities());
         self.last_metrics = metrics_inner.snapshot(wave_id, mean_wait);
         self.last_initial_wait_accounts = initial_wait;
 
@@ -589,51 +594,60 @@ fn try_validate(
     } else {
         mv_memory.validate_read_locations(tx_version.tx_idx)
     };
+    if specfence.mode == ConcurrencyMode::SpecFence && !invalid.is_empty() {
+        specfence
+            .metrics
+            .record_region_validate_fail(invalid.len());
+        // Per-location validate opportunities for Phase-2 checkpoint prep.
+        for _ in &read_locations {
+            specfence.rem.note_checkpoint_opportunity();
+            specfence.metrics.record_checkpoint_opportunity();
+        }
+    }
     let aborted = !read_set_valid && scheduler.try_validation_abort(tx_version);
     if aborted {
-        // Snapshot write locations before ESTIMATE conversion (same set).
+        // Snapshot write locations before invalidate (same set).
         let write_locations = if specfence.mode == ConcurrencyMode::SpecFence {
             mv_memory.write_locations(tx_version.tx_idx)
         } else {
             Vec::new()
         };
-        // SpecFence v2: keep full write-set ESTIMATE for serial equivalence.
-        // Selective ESTIMATE (estimate only locations with higher readers; remove
-        // the rest) was tried and broke equivalence under concurrent readers that
-        // had not yet recorded a read set — see redesign-v2 note. Fence still
-        // confines the validation rewind.
-        mv_memory.convert_writes_to_estimates(tx_version.tx_idx);
-        // Always count validation aborts, including pure OCC. Region promotion
-        // remains SpecFence/PCC-only.
-        specfence.metrics.record_occ_abort();
-        if specfence.mode.uses_regions() {
-            for location in &invalid {
-                if specfence.mode == ConcurrencyMode::SpecFence {
-                    specfence.bayes.observe_conflict_location_always(*location);
-                    specfence.metrics.record_bayes_conflict();
-                    // Cold-start / inter-block seed uses account posteriors: bump any
-                    // hinted account whose Basic hash matches this invalid location.
-                    for address in specfence.hints.accounts() {
-                        if address == specfence.beneficiary {
-                            continue;
-                        }
-                        if hash_deterministic(MemoryLocation::Basic(address)) == *location {
-                            specfence.bayes.observe_conflict_account(address);
-                        }
-                    }
-                    specfence.promote_from_bayes(&mv_memory.regions, *location, None);
-                } else if mv_memory.regions.promote_location(*location) {
-                    specfence.metrics.record_promotion(None);
-                }
-            }
-        }
-        // SpecFence: fence the validation cascade to dependent readers of the
-        // aborted write set. Independent higher txs with disjoint reads are not
-        // forced into the abort queue. Whole-tx re-execution of the aborted
-        // incarnation remains (revm cannot partial-reexec a tx).
         if specfence.mode == ConcurrencyMode::SpecFence {
-            let rewind_to =
-                mv_memory.min_higher_reader_of(tx_version.tx_idx, &write_locations);
+            // Prefer selective invalidate; fall back to full ESTIMATE if needed.
+            let (estimated, fallback) =
+                mv_memory.invalidate_selective(tx_version.tx_idx, Some(tx_version.tx_incarnation));
+            if fallback {
+                specfence.metrics.record_selective_fallback_full();
+                // Full path already applied inside invalidate_selective when incarnation
+                // is None; with Some we never fallback — force full if estimated empty
+                // but write set non-empty and safety demanded. Spec: prefer selective.
+            } else {
+                specfence
+                    .metrics
+                    .record_selective_invalidate(estimated.len().max(1));
+            }
+            // Fence uses selectively-invalidated locations' readers when available.
+            let fence_locs = if estimated.is_empty() {
+                write_locations.clone()
+            } else {
+                estimated
+            };
+            specfence.metrics.record_occ_abort();
+            specfence.metrics.record_tx_full_retry();
+            for location in &invalid {
+                specfence.bayes.observe_conflict_location_always(*location);
+                specfence.metrics.record_bayes_conflict();
+                for address in specfence.hints.accounts() {
+                    if address == specfence.beneficiary {
+                        continue;
+                    }
+                    if hash_deterministic(MemoryLocation::Basic(address)) == *location {
+                        specfence.bayes.observe_conflict_account(address);
+                    }
+                }
+                specfence.promote_from_bayes(&mv_memory.regions, *location, None);
+            }
+            let rewind_to = mv_memory.min_higher_reader_of(tx_version.tx_idx, &fence_locs);
             let block_size = scheduler.block_size();
             let cascade_from = tx_version.tx_idx + 1;
             let (cascade, skipped) = match rewind_to {
@@ -649,20 +663,33 @@ fn try_validate(
             specfence.metrics.record_fence_cascade(cascade, skipped);
             return scheduler.finish_validation_fenced(tx_version, true, rewind_to);
         }
+        // OCC / PCC: full write-set ESTIMATE (unchanged).
+        mv_memory.convert_writes_to_estimates(tx_version.tx_idx);
+        specfence.metrics.record_occ_abort();
+        if specfence.mode.uses_regions() {
+            for location in &invalid {
+                if mv_memory.regions.promote_location(*location) {
+                    specfence.metrics.record_promotion(None);
+                }
+            }
+        }
     } else if !aborted && specfence.mode == ConcurrencyMode::SpecFence && read_set_valid {
-        // Successful validation: reinforce Speculate on read locations that were
-        // not already forced to Wait for the rest of the block.
+        // Successful SpecRead validation → success++; try revoke sticky Waits.
         for location in &read_locations {
             if *location
                 == hash_deterministic(MemoryLocation::Basic(specfence.beneficiary))
             {
                 continue;
             }
+            specfence.rem.note_checkpoint_opportunity();
             if mv_memory.regions.location_mode(*location) == crate::specfence::RegionMode::Wait {
+                // Revoke when posterior dropped below τ_revoke.
+                let _ = specfence.try_revoke(&mv_memory.regions, *location, None);
                 continue;
             }
             specfence.bayes.observe_speculate_ok_location(*location);
             specfence.metrics.record_bayes_success();
+            let _ = specfence.try_revoke(&mv_memory.regions, *location, None);
         }
     }
     scheduler.finish_validation(tx_version, aborted)

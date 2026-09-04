@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     sync::Mutex,
 };
 
@@ -11,7 +11,7 @@ use smallvec::SmallVec;
 
 use crate::{
     BuildIdentityHasher, BuildSuffixHasher, MemoryEntry, MemoryLocationHash, ReadOrigin, ReadSet,
-    TxIdx, TxVersion, WriteSet, specfence::RegionTable,
+    TxIdx, TxIncarnation, TxVersion, WriteSet, specfence::RegionTable,
 };
 
 #[derive(Default, Debug)]
@@ -43,6 +43,12 @@ pub struct MvMemory {
     pub(crate) new_bytecodes: DashMap<B256, Bytecode, BuildSuffixHasher>,
     /// Per-location / per-account Wait vs Speculate for `SpecFence`.
     pub(crate) regions: RegionTable,
+    /// SpecFence readers index: `readers[ℓ]` = txs that currently record a read origin on ℓ.
+    readers: DashMap<MemoryLocationHash, BTreeSet<TxIdx>, BuildIdentityHasher>,
+    /// Aborted incarnation numbers: reading Data with this (tx,inc) is invalid.
+    aborted_incarnations: DashMap<TxIdx, TxIncarnation, BuildIdentityHasher>,
+    /// Prior incarnation write-set (Bohm-lite residual) for Bind/WaitHard placeholders.
+    residual_write_sets: DashMap<TxIdx, Vec<MemoryLocationHash>, BuildIdentityHasher>,
 }
 
 impl MvMemory {
@@ -75,6 +81,9 @@ impl MvMemory {
             // number of worker threads.
             new_bytecodes: DashMap::default(),
             regions: RegionTable::new(),
+            readers: DashMap::default(),
+            aborted_incarnations: DashMap::default(),
+            residual_write_sets: DashMap::default(),
         }
     }
 
@@ -83,6 +92,65 @@ impl MvMemory {
         for address in new_lazy_addresses {
             lazy_addresses.insert(address);
         }
+    }
+
+    /// True if incarnation `inc` of `tx_idx` was aborted (Data must not be trusted).
+    pub(crate) fn is_aborted_incarnation(&self, tx_idx: TxIdx, incarnation: TxIncarnation) -> bool {
+        self.aborted_incarnations
+            .get(&tx_idx)
+            .is_some_and(|a| *a == incarnation)
+    }
+
+    /// Mark an incarnation aborted so late readers detect dangling Data.
+    pub(crate) fn mark_incarnation_aborted(&self, tx_idx: TxIdx, incarnation: TxIncarnation) {
+        self.aborted_incarnations.insert(tx_idx, incarnation);
+    }
+
+    /// Clear aborted stamp when a newer incarnation publishes.
+    pub(crate) fn clear_aborted_incarnation(&self, tx_idx: TxIdx) {
+        self.aborted_incarnations.remove(&tx_idx);
+    }
+
+    /// Residual write locations from the last aborted incarnation (Bohm-lite).
+    #[allow(dead_code)]
+    pub(crate) fn residual_writes(&self, tx_idx: TxIdx) -> Vec<MemoryLocationHash> {
+        self.residual_write_sets
+            .get(&tx_idx)
+            .map(|v| v.clone())
+            .unwrap_or_default()
+    }
+
+    /// True if some prior tx `t_w < me` lists `location` in its residual write-set.
+    pub(crate) fn residual_writer_before(
+        &self,
+        location: MemoryLocationHash,
+        me: TxIdx,
+    ) -> Option<TxIdx> {
+        let mut best = None;
+        for entry in self.residual_write_sets.iter() {
+            let tw = *entry.key();
+            if tw < me && entry.value().iter().any(|l| *l == location) {
+                best = Some(match best {
+                    Some(prev) if prev > tw => prev,
+                    _ => tw,
+                });
+            }
+        }
+        best
+    }
+
+    fn unregister_reader(&self, tx_idx: TxIdx, location: MemoryLocationHash) {
+        if let Some(mut set) = self.readers.get_mut(&location) {
+            set.remove(&tx_idx);
+            if set.is_empty() {
+                drop(set);
+                self.readers.remove(&location);
+            }
+        }
+    }
+
+    fn register_reader(&self, tx_idx: TxIdx, location: MemoryLocationHash) {
+        self.readers.entry(location).or_default().insert(tx_idx);
     }
 
     // Apply a new pair of read & write sets to the multi-version data structure.
@@ -96,7 +164,18 @@ impl MvMemory {
         write_set: WriteSet,
     ) -> (bool, SmallVec<[MemoryLocationHash; 4]>) {
         let mut last_locations = index_mutex!(self.last_locations, tx_version.tx_idx);
+
+        // Update readers index: clear prior read locations, register new ones.
+        for old_loc in last_locations.read.keys() {
+            self.unregister_reader(tx_version.tx_idx, *old_loc);
+        }
+        for loc in read_set.keys() {
+            self.register_reader(tx_version.tx_idx, *loc);
+        }
         last_locations.read = read_set;
+
+        // Successful publish clears aborted stamp for this tx.
+        self.clear_aborted_incarnation(tx_version.tx_idx);
 
         // TODO: Group updates by shard to avoid locking operations.
         // Remove old locations that aren't written to anymore.
@@ -143,59 +222,59 @@ impl MvMemory {
     // Obtain the last read set recorded by an execution of [tx_idx] and check
     // that re-reading each memory location in the read set still yields the
     // same read origins.
-    // This is invoked during validation, when the incarnation being validated is
-    // already executed and has recorded the read set. However, if the thread
-    // performing a validation for incarnation i of a transaction is slow, it is
-    // possible that this function invocation observes a read set recorded by a
-    // latter (> i) incarnation. In this case, incarnation i is guaranteed to be
-    // already aborted (else higher incarnations would never start), and the
-    // validation task will have no effect regardless of the outcome (only
-    // validations that successfully abort affect the state and each incarnation
-    // can be aborted at most once).
     pub(crate) fn validate_read_locations(&self, tx_idx: TxIdx) -> bool {
         self.collect_invalid_reads(tx_idx).is_empty()
+    }
+
+    /// Per-location validate API (SpecFence Spec v1): true iff origin still matches.
+    #[allow(dead_code)]
+    pub(crate) fn validate_location(&self, tx_idx: TxIdx, location: MemoryLocationHash) -> bool {
+        let locs = index_mutex!(self.last_locations, tx_idx);
+        let Some(prior_origins) = locs.read.get(&location) else {
+            return true;
+        };
+        self.origin_still_valid(tx_idx, location, prior_origins)
+    }
+
+    fn origin_still_valid(
+        &self,
+        tx_idx: TxIdx,
+        location: MemoryLocationHash,
+        prior_origins: &crate::ReadOrigins,
+    ) -> bool {
+        if let Some(written_transactions) = self.data.get(&location) {
+            let mut iter = written_transactions.range(..tx_idx);
+            for prior_origin in prior_origins {
+                if let ReadOrigin::MvMemory(prior_version) = prior_origin {
+                    if let Some((closest_idx, MemoryEntry::Data(tx_incarnation, ..))) =
+                        iter.next_back()
+                    {
+                        if self.is_aborted_incarnation(*closest_idx, *tx_incarnation) {
+                            return false;
+                        }
+                        if closest_idx != &prior_version.tx_idx
+                            || &prior_version.tx_incarnation != tx_incarnation
+                        {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                } else if iter.next_back().is_some() {
+                    return false;
+                }
+            }
+            true
+        } else {
+            prior_origins.len() == 1 && prior_origins.last() == Some(&ReadOrigin::Storage)
+        }
     }
 
     /// Locations in the last recorded read set whose origins no longer match.
     pub(crate) fn collect_invalid_reads(&self, tx_idx: TxIdx) -> Vec<MemoryLocationHash> {
         let mut invalid = Vec::new();
         for (location, prior_origins) in &index_mutex!(self.last_locations, tx_idx).read {
-            let still_valid = if let Some(written_transactions) = self.data.get(location) {
-                let mut iter = written_transactions.range(..tx_idx);
-                let mut ok = true;
-                for prior_origin in prior_origins {
-                    if let ReadOrigin::MvMemory(prior_version) = prior_origin {
-                        // Found something: Must match version.
-                        if let Some((closest_idx, MemoryEntry::Data(tx_incarnation, ..))) =
-                            iter.next_back()
-                        {
-                            if closest_idx != &prior_version.tx_idx
-                                || &prior_version.tx_incarnation != tx_incarnation
-                            {
-                                ok = false;
-                                break;
-                            }
-                        }
-                        // The previously read value is now cleared
-                        // or marked with ESTIMATE.
-                        else {
-                            ok = false;
-                            break;
-                        }
-                    }
-                    // Read from storage but there is now something
-                    // in between!
-                    else if iter.next_back().is_some() {
-                        ok = false;
-                        break;
-                    }
-                }
-                ok
-            } else {
-                // Read from multi-version data but now it's cleared.
-                prior_origins.len() == 1 && prior_origins.last() == Some(&ReadOrigin::Storage)
-            };
-            if !still_valid {
+            if !self.origin_still_valid(tx_idx, *location, prior_origins) {
                 invalid.push(*location);
             }
         }
@@ -213,6 +292,29 @@ impl MvMemory {
             .and_then(|written| written.range(..tx_idx).next_back().map(|(idx, _)| *idx))
     }
 
+    /// Last non-ESTIMATE Data version strictly below `tx_idx` (OrderedDirtyRead).
+    /// Skips ESTIMATE and aborted incarnations.
+    pub(crate) fn last_data_before(
+        &self,
+        location: MemoryLocationHash,
+        tx_idx: TxIdx,
+    ) -> Option<(TxIdx, TxIncarnation)> {
+        let written = self.data.get(&location)?;
+        for (idx, entry) in written.range(..tx_idx).rev() {
+            match entry {
+                MemoryEntry::Data(inc, _) => {
+                    if !self.is_aborted_incarnation(*idx, *inc) {
+                        return Some((*idx, *inc));
+                    }
+                }
+                MemoryEntry::Estimate => {
+                    // Skip ESTIMATE → caller may WaitHard on this writer.
+                    return None;
+                }
+            }
+        }
+        None
+    }
 
     /// Write locations recorded by the last incarnation of `tx_idx`.
     pub(crate) fn write_locations(&self, tx_idx: TxIdx) -> Vec<MemoryLocationHash> {
@@ -228,20 +330,27 @@ impl MvMemory {
             .collect()
     }
 
+    /// Readers currently registered on `location` with index > `after`.
+    pub(crate) fn higher_readers_of(
+        &self,
+        location: MemoryLocationHash,
+        after: TxIdx,
+    ) -> Vec<TxIdx> {
+        self.readers
+            .get(&location)
+            .map(|set| set.iter().copied().filter(|&t| t > after).collect())
+            .unwrap_or_default()
+    }
+
     /// True if any higher tx has this location in its last recorded read set.
-    #[allow(dead_code)]
     pub(crate) fn has_higher_reader(&self, aborted_idx: TxIdx, location: MemoryLocationHash) -> bool {
-        for idx in (aborted_idx + 1)..self.last_locations.len() {
-            let locs = index_mutex!(self.last_locations, idx);
-            if locs.read.contains_key(&location) {
-                return true;
-            }
-        }
-        false
+        self.readers
+            .get(&location)
+            .is_some_and(|set| set.iter().any(|&t| t > aborted_idx))
     }
 
     /// Minimum higher transaction that read any location in `write_locations`.
-    /// Used by SpecFence to fence the validation cascade to dependent readers only.
+    /// Prefer readers index; fall back to scanning last_locations.
     pub(crate) fn min_higher_reader_of(
         &self,
         aborted_idx: TxIdx,
@@ -250,6 +359,19 @@ impl MvMemory {
         if write_locations.is_empty() {
             return None;
         }
+        let mut min_reader = None;
+        for &loc in write_locations {
+            for r in self.higher_readers_of(loc, aborted_idx) {
+                min_reader = Some(match min_reader {
+                    Some(m) if m < r => m,
+                    _ => r,
+                });
+            }
+        }
+        if min_reader.is_some() {
+            return min_reader;
+        }
+        // Fallback scan (readers index may lag concurrent unrecorded readers).
         for idx in (aborted_idx + 1)..self.last_locations.len() {
             let locs = index_mutex!(self.last_locations, idx);
             if locs
@@ -267,42 +389,61 @@ impl MvMemory {
     // structure with special ESTIMATE markers to quickly abort higher transactions
     // that read them.
     pub(crate) fn convert_writes_to_estimates(&self, tx_idx: TxIdx) {
-        for location in &index_mutex!(self.last_locations, tx_idx).write {
+        let writes = self.write_locations(tx_idx);
+        self.residual_write_sets.insert(tx_idx, writes.clone());
+        for location in &writes {
             if let Some(mut written_transactions) = self.data.get_mut(location) {
                 written_transactions.insert(tx_idx, MemoryEntry::Estimate);
             }
         }
     }
 
-    /// SpecFence finer ESTIMATE: mark ESTIMATE only on writes that have at least
-    /// one higher recorded reader; **remove** other aborted writes so independent
-    /// readers of unrelated slots are not poisoned by leftover Data versions.
-    /// (Leaving Data from an aborted incarnation would be incorrect.)
+    /// SpecFence Spec v1 §6.1 selective invalidate.
     ///
-    /// Lock order: inspect `last_locations` first, then touch `data` — same order
-    /// as [`Self::record`], to avoid deadlocking with concurrent recorders.
-    #[allow(dead_code)]
-    pub(crate) fn convert_writes_to_estimates_selective(&self, tx_idx: TxIdx) {
+    /// For each written location:
+    /// - if `readers[ℓ]` contains any `t > t_w` → ESTIMATE
+    /// - else keep Data but stamp `incarnation_aborted` so late readers detect mismatch
+    ///
+    /// Returns `(estimated_locations, used_fallback_full)`.
+    /// If the aborted incarnation number is unknown, falls back to full ESTIMATE.
+    pub(crate) fn invalidate_selective(
+        &self,
+        tx_idx: TxIdx,
+        incarnation: Option<TxIncarnation>,
+    ) -> (Vec<MemoryLocationHash>, bool) {
         let writes = self.write_locations(tx_idx);
-        let mut estimate = Vec::new();
-        let mut remove = Vec::new();
+        self.residual_write_sets.insert(tx_idx, writes.clone());
+
+        let Some(inc) = incarnation else {
+            for location in &writes {
+                if let Some(mut written_transactions) = self.data.get_mut(location) {
+                    written_transactions.insert(tx_idx, MemoryEntry::Estimate);
+                }
+            }
+            return (writes, true);
+        };
+
+        self.mark_incarnation_aborted(tx_idx, inc);
+
+        let mut estimated = Vec::new();
         for location in writes {
             if self.has_higher_reader(tx_idx, location) {
-                estimate.push(location);
-            } else {
-                remove.push(location);
+                if let Some(mut written_transactions) = self.data.get_mut(&location) {
+                    written_transactions.insert(tx_idx, MemoryEntry::Estimate);
+                }
+                estimated.push(location);
             }
+            // else: keep Data; aborted stamp detects late readers.
         }
-        for location in estimate {
-            if let Some(mut written_transactions) = self.data.get_mut(&location) {
-                written_transactions.insert(tx_idx, MemoryEntry::Estimate);
-            }
-        }
-        for location in remove {
-            if let Some(mut written_transactions) = self.data.get_mut(&location) {
-                written_transactions.remove(&tx_idx);
-            }
-        }
+        (estimated, false)
+    }
+
+    /// SpecFence finer ESTIMATE (legacy helper): mark ESTIMATE only on writes that
+    /// have higher readers; remove other aborted writes.
+    #[allow(dead_code)]
+    pub(crate) fn convert_writes_to_estimates_selective(&self, tx_idx: TxIdx) {
+        let (estimated, _) = self.invalidate_selective(tx_idx, None);
+        let _ = estimated;
     }
 
     pub(crate) fn consume_lazy_addresses(&self) -> impl IntoIterator<Item = Address> {

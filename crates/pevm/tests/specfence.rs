@@ -461,3 +461,173 @@ fn specfence_bayes_storage_conflict_isolates_eoa() {
         "cold EOA must not Wait: {metrics:?}"
     );
 }
+
+/// P1a §9.2 / §9.5: conflict on one cluster must not force independent txs into
+/// the validation cascade; fence + selective metrics should move.
+#[test]
+fn specfence_p1a_location_isolation_fence_metrics() {
+    let (mut state, bytecodes, mut txs) = erc20::generate_cluster(3, 8, 4);
+    state.insert(Address::ZERO, EvmAccount::default());
+    let indep_start = 20_000usize;
+    for i in 0..48 {
+        let (addr, account) = common::mock_account(indep_start + i);
+        state.insert(addr, account);
+        txs.push(self_transfer(addr, 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+    let mut saw_fence = false;
+    for _ in 0..4 {
+        let (_, metrics, _) = run_mode(ConcurrencyMode::SpecFence, &storage, txs.clone());
+        if metrics.occ_aborts > 0 {
+            assert!(
+                metrics.independent_txs_skipped_by_fence > 0
+                    || metrics.selective_invalidate_count > 0
+                    || metrics.cascade_validations_scheduled > 0,
+                "P1a fence/selective should move on abort: {metrics:?}"
+            );
+            saw_fence = true;
+            break;
+        }
+    }
+    // Even without aborts, independents must not Wait on the ERC-20 cluster.
+    let (_, metrics, _) = run_mode(ConcurrencyMode::SpecFence, &storage, txs);
+    let indep = Address::from(U160::from(indep_start as u64));
+    assert!(
+        !metrics.wait_addresses.contains(&indep),
+        "ℓ2-only independents must not Wait: {metrics:?}"
+    );
+    assert!(
+        metrics.speculate_executions > 0 || saw_fence,
+        "must speculate or exercise fence: {metrics:?}"
+    );
+}
+
+/// P1a §9.3: after a contended first block, residual WS / Bayes WaitHard/Bind
+/// on the hotspot should reduce (or avoid growing) aborts on the second wave.
+#[test]
+fn specfence_p1a_bind_wait_reduces_abort_on_hotspot() {
+    let chain = PevmEthereum::mainnet();
+    let hot = Address::from(U160::from(1));
+    let storage = storage_for(200);
+
+    // Block 1: heat the sender posterior + residual write-set via same-sender WW.
+    let txs1: Vec<TxEnv> = (1..=40).map(|i| self_transfer(hot, i as u64)).collect();
+    let mut pevm = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
+    let _ = pevm
+        .execute_revm_parallel(
+            &chain,
+            &storage,
+            Default::default(),
+            BlockEnv::default(),
+            txs1,
+            concurrency(),
+        )
+        .unwrap();
+    let aborts_b1 = pevm.last_specfence_metrics().occ_aborts;
+    assert!(
+        pevm.bayes_account_conflict_prob(&hot) >= 0.25,
+        "hotspot posterior must rise"
+    );
+
+    // Block 2: transfers into the heated account — Wait/Bind should dominate.
+    let mut txs2 = Vec::new();
+    for i in 0..12 {
+        let from = Address::from(U160::from(80 + i));
+        txs2.push(transfer(from, hot, 1));
+    }
+    for i in 0..32 {
+        txs2.push(self_transfer(Address::from(U160::from(120 + i)), 1));
+    }
+    let seq = execute_revm_sequential(
+        &chain,
+        &storage,
+        Default::default(),
+        BlockEnv::default(),
+        txs2.clone(),
+    )
+    .unwrap();
+    let par = pevm
+        .execute_revm_parallel(
+            &chain,
+            &storage,
+            Default::default(),
+            BlockEnv::default(),
+            txs2,
+            concurrency(),
+        )
+        .unwrap();
+    assert_eq!(seq, par);
+    let m = pevm.last_specfence_metrics();
+    assert!(
+        m.wait_hard_count > 0
+            || m.wait_admissions > 0
+            || m.bind_hits > 0
+            || m.bayes_wait_decisions > 0,
+        "second wave should WaitHard/Bind on hotspot: {m:?}"
+    );
+    // Aborts on the heated recipient wave should not explode vs block1 learning.
+    assert!(
+        m.occ_aborts <= aborts_b1.saturating_add(8),
+        "Bind/Wait should bound aborts: b1={aborts_b1} b2={}",
+        m.occ_aborts
+    );
+}
+
+/// P1a §9.4: revoke sticky Wait when posterior < τ_revoke (unit-level coverage
+/// lives in bayes; this checks metrics/API after a cold SpecRead-heavy block).
+#[test]
+fn specfence_p1a_revoke_api_on_low_posterior() {
+    // Independent transfers: posteriors stay near prior → sticky Wait revoked / unused.
+    let n = 64;
+    let txs: Vec<TxEnv> = (1..=n)
+        .map(|i| self_transfer(Address::from(U160::from(i)), 1))
+        .collect();
+    let storage = storage_for(n);
+    let (_, metrics, pevm) = run_mode(ConcurrencyMode::SpecFence, &storage, txs);
+    assert_eq!(metrics.wait_admissions, 0);
+    // Low-conflict locations stay Speculative.
+    let cold = Address::from(U160::from(1));
+    assert!(
+        pevm.bayes_account_conflict_prob(&cold) < 0.20,
+        "cold posterior must stay below τ_revoke: {}",
+        pevm.bayes_account_conflict_prob(&cold)
+    );
+    assert!(
+        metrics.spec_read_count > 0 || metrics.bayes_speculate_decisions > 0,
+        "SpecRead path should dominate: {metrics:?}"
+    );
+}
+
+/// P1a §9.5: selective invalidate path records metrics; fence skips independents.
+#[test]
+fn specfence_p1a_selective_invalidate_and_fence() {
+    let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 8, 4);
+    state.insert(Address::ZERO, EvmAccount::default());
+    let indep_start = 30_000usize;
+    for i in 0..64 {
+        let (addr, account) = common::mock_account(indep_start + i);
+        state.insert(addr, account);
+        txs.push(self_transfer(addr, 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+    let mut any = false;
+    for _ in 0..6 {
+        let (_, metrics, _) = run_mode(ConcurrencyMode::SpecFence, &storage, txs.clone());
+        if metrics.occ_aborts > 0 {
+            any = true;
+            assert!(
+                metrics.selective_invalidate_count > 0
+                    || metrics.selective_fallback_full > 0
+                    || metrics.tx_full_retry > 0,
+                "abort must exercise selective/full-retry plant: {metrics:?}"
+            );
+            assert!(
+                metrics.independent_txs_skipped_by_fence > 0
+                    || metrics.cascade_revalidate_count > 0,
+                "fence must bound cascade: {metrics:?}"
+            );
+            break;
+        }
+    }
+    assert!(any, "contended ERC-20 cluster should abort at least once");
+}

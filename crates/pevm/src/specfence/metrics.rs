@@ -43,6 +43,26 @@ pub struct SpecFenceMetrics {
     pub wait_addresses: Vec<Address>,
     /// `from`/`to` accounts of speculative executions in this block.
     pub speculate_addresses: Vec<Address>,
+    /// Per-location validation failures.
+    pub region_validate_fail: usize,
+    /// FullRetry (whole-tx re-exec) counts.
+    pub tx_full_retry: usize,
+    /// Bind hits (read matched predicted writer).
+    pub bind_hits: usize,
+    /// WaitHard decisions / admissions at location grain.
+    pub wait_hard_count: usize,
+    /// SpecRead (OrderedDirtyRead) path counts.
+    pub spec_read_count: usize,
+    /// Selective invalidate applications.
+    pub selective_invalidate_count: usize,
+    /// Cascade revalidations scheduled (alias tracking for Spec v1 metrics).
+    pub cascade_revalidate_count: usize,
+    /// Soft Wait flags cleared because posterior < τ_revoke.
+    pub soft_edge_revokes: usize,
+    /// Times selective invalidate fell back to full write-set ESTIMATE.
+    pub selective_fallback_full: usize,
+    /// Checkpoint opportunities recorded (Phase-2 prep).
+    pub checkpoint_opportunities: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -59,6 +79,16 @@ pub(crate) struct MetricsInner {
     bayes_conflict_updates: AtomicUsize,
     bayes_success_updates: AtomicUsize,
     wave_promotions: AtomicUsize,
+    region_validate_fail: AtomicUsize,
+    tx_full_retry: AtomicUsize,
+    bind_hits: AtomicUsize,
+    wait_hard_count: AtomicUsize,
+    spec_read_count: AtomicUsize,
+    selective_invalidate_count: AtomicUsize,
+    cascade_revalidate_count: AtomicUsize,
+    soft_edge_revokes: AtomicUsize,
+    selective_fallback_full: AtomicUsize,
+    checkpoint_opportunities: AtomicUsize,
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
     hot_accounts: DashMap<Address, (), BuildSuffixHasher>,
@@ -98,6 +128,8 @@ impl MetricsInner {
         if cascade_scheduled > 0 {
             self.cascade_validations_scheduled
                 .fetch_add(cascade_scheduled, Ordering::Relaxed);
+            self.cascade_revalidate_count
+                .fetch_add(cascade_scheduled, Ordering::Relaxed);
         }
         if independent_skipped > 0 {
             self.independent_txs_skipped_by_fence
@@ -124,6 +156,52 @@ impl MetricsInner {
 
     pub(crate) fn record_wave_promotion(&self) {
         self.wave_promotions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_region_validate_fail(&self, n: usize) {
+        if n > 0 {
+            self.region_validate_fail.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_tx_full_retry(&self) {
+        self.tx_full_retry.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_bind_hit(&self) {
+        self.bind_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_wait_hard(&self) {
+        self.wait_hard_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_spec_read(&self) {
+        self.spec_read_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_selective_invalidate(&self, n: usize) {
+        if n > 0 {
+            self.selective_invalidate_count
+                .fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_soft_edge_revoke(&self) {
+        self.soft_edge_revokes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_selective_fallback_full(&self) {
+        self.selective_fallback_full.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_checkpoint_opportunity(&self) {
+        self.checkpoint_opportunities
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_checkpoint_opportunities(&self, n: usize) {
+        self.checkpoint_opportunities.store(n, Ordering::Relaxed);
     }
 
     pub(crate) fn mark_hot(&self, address: Address) {
@@ -161,6 +239,16 @@ impl MetricsInner {
             mean_wait_posterior,
             wait_addresses,
             speculate_addresses,
+            region_validate_fail: self.region_validate_fail.load(Ordering::Relaxed),
+            tx_full_retry: self.tx_full_retry.load(Ordering::Relaxed),
+            bind_hits: self.bind_hits.load(Ordering::Relaxed),
+            wait_hard_count: self.wait_hard_count.load(Ordering::Relaxed),
+            spec_read_count: self.spec_read_count.load(Ordering::Relaxed),
+            selective_invalidate_count: self.selective_invalidate_count.load(Ordering::Relaxed),
+            cascade_revalidate_count: self.cascade_revalidate_count.load(Ordering::Relaxed),
+            soft_edge_revokes: self.soft_edge_revokes.load(Ordering::Relaxed),
+            selective_fallback_full: self.selective_fallback_full.load(Ordering::Relaxed),
+            checkpoint_opportunities: self.checkpoint_opportunities.load(Ordering::Relaxed),
         }
     }
 }

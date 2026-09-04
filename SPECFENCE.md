@@ -52,20 +52,32 @@ SpecFence discovers the true DAG **during** execution and dynamically fuses opti
 - `crates/pevm/src/specfence/` — bayes, region table, metrics, cascade fence; wave/repair/local validation to be expanded.
 - `scheduler.rs` / `mv_memory.rs` / `vm.rs` / `pevm.rs` — admission, validation, abort accounting.
 
-## SpecFence v2 status (this branch)
+## Spec status
 
-See `lab/notes/specfence-redesign-v2.md` for equations and remaining gaps.
+- **Spec v1 frozen:** `lab/notes/specfence-rem-spec-v1.md` (authoritative contract).
+- **P1a in progress / landed plant:** region events, per-location validate API, `readers[ℓ]`,
+  selective invalidate (+ aborted-incarnation detection), revokeable Bayes Wait/SpecRead/Bind
+  (placeholder from prior incarnation write-set). See `lab/notes/specfence-p1a-status.md`.
 
-- **Unit of control**: `MemoryLocationHash` (slot/Basic/CodeHash), not whole-tx.
-- **Bayesian feedback**: Beta-Bernoulli `(α,β)` per region; `observe_conflict` / `observe_speculate_ok`; inter-block decay; `decide` with `τ≈0.30`. EWMA heat subsumed for SpecFence decisions (PCC stays conservative).
-- **Location Wait**: `vm` blocks on `last_writer_before(location)`; one tx can Wait on A and Speculate on B.
-- **Validation feedback**: invalid reads → conflict update + Wait promotion + `wave_id` bump; successful validate → success update.
-- **ESTIMATE**: full write-set ESTIMATE kept for serial equivalence (selective higher-reader ESTIMATE prototyped, unsafe under concurrent unrecorded readers).
-- **Cascade fence** retained as correctness shield.
-- Still **whole-tx** re-exec on abort (revm). Not yet partial reexec / full wave DAG.
+### P1a plant (this branch)
 
-Metrics: `bayes_wait_decisions`, `bayes_speculate_decisions`, `bayes_conflict_updates`,
-`bayes_success_updates`, `wave_promotions`, `mean_wait_posterior`, plus fence/OCC counters.
+- **Unit of control**: `MemoryLocationHash` (slot/Basic/CodeHash).
+- **π**: `WaitHard` / `Bind` / `SpecRead` with `τ_w=0.35`, `τ_s=0.50`, `τ_revoke=0.20`
+  (block-start seed still uses `DEFAULT_TAU=0.30` for inter-block carry).
+- **Revoke**: sticky Wait cleared when `P_conflict < τ_revoke` (no forever Wait).
+- **Selective invalidate**: ESTIMATE only locations with higher `readers[ℓ]`; otherwise keep
+  Data + aborted-incarnation stamp so late readers cannot silently accept.
+- **Cascade fence** retained; fence prefers selectively-invalidated locations' readers.
+- Still **FullRetry** (whole-tx re-exec). PartialRetry / wave ready-queue = Phase-2 / P1b+.
+
+Metrics: prior bayes/fence counters plus `region_validate_fail`, `tx_full_retry`, `bind_hits`,
+`wait_hard_count`, `spec_read_count`, `selective_invalidate_count`, `cascade_revalidate_count`,
+`soft_edge_revokes`, `selective_fallback_full`, `checkpoint_opportunities`.
+
+## Design specs
+
+- First principles: `lab/notes/specfence-cc-architecture-v4-first-principles.md`
+- **Implementable contract (frozen):** `lab/notes/specfence-rem-spec-v1.md`
 
 ## Lab
 

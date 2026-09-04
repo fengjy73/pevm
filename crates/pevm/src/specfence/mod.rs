@@ -1,11 +1,11 @@
-//! `SpecFence`: adaptive region/wave concurrency control (v2).
+//! `SpecFence`: adaptive region/wave concurrency control (Spec v1 / P1a).
 //!
 //! Control unit = memory location / slot-level region
 //! (`MemoryLocation::{Basic, CodeHash, Storage}`), not whole-tx.
-//! Bayesian Beta-Bernoulli posteriors predict Wait vs Speculate per region;
-//! validation/abort/success observations update posteriors across waves and
-//! blocks. Cascade fence is a correctness shield only — not the decision rule.
-//! Whole-tx re-execution remains (revm); region-local repair is future work.
+//! Bayesian Beta-Bernoulli posteriors drive WaitHard / Bind / SpecRead per
+//! region; sticky Wait is revokeable when posterior < τ_revoke. Cascade fence
+//! remains a correctness shield. Whole-tx re-execution remains (revm);
+//! PartialRetry is Phase-2.
 
 use crate::{
     BuildSuffixHasher, MemoryLocation, TxIdx, chain::PevmChain, hash_deterministic,
@@ -15,16 +15,28 @@ use alloy_primitives::Address;
 use hashbrown::HashMap;
 
 mod bayes;
+mod dag;
 mod heat;
 mod metrics;
 mod region;
+mod rem;
+mod resolve;
 
 pub(crate) use bayes::{BayesMap, DEFAULT_TAU};
+pub(crate) use dag::SpecDag;
 pub(crate) use heat::HeatMap;
 pub(crate) use metrics::MetricsInner;
 pub use metrics::SpecFenceMetrics;
 pub use region::RegionMode;
 pub(crate) use region::RegionTable;
+pub(crate) use rem::RemCounters;
+#[allow(unused_imports)]
+pub(crate) use rem::{AccessMode, EffectOrdinal, RegionAccess, RemTask};
+pub(crate) use resolve::{PolicyCtx, ResolveAction, choose_action};
+#[allow(unused_imports)]
+pub(crate) use resolve::{
+    BindTarget, SelectiveOutcome, TAU_REVOKE, TAU_S, TAU_W, early_val_probability,
+};
 
 /// Selectable concurrency control for parallel block execution.
 ///
@@ -100,6 +112,8 @@ pub(crate) struct SpecFenceCtx<'a> {
     pub beneficiary: Address,
     pub bayes: &'a BayesMap,
     pub tau: f64,
+    pub dag: &'a SpecDag,
+    pub rem: &'a RemCounters,
 }
 
 impl<'a> SpecFenceCtx<'a> {
@@ -110,8 +124,17 @@ impl<'a> SpecFenceCtx<'a> {
         if self.mode == ConcurrencyMode::Pcc {
             return true;
         }
-        // SpecFence: account Wait only as cold-start / seeded Basic proxy.
+        // SpecFence: revoke sticky account Wait when posterior low.
         if regions.account_mode(address) == RegionMode::Wait {
+            if self.bayes.should_revoke(
+                hash_deterministic(MemoryLocation::Basic(*address)),
+                Some(address),
+            ) {
+                if regions.clear_account_wait(*address) {
+                    self.metrics.record_soft_edge_revoke();
+                }
+                return false;
+            }
             return true;
         }
         if self.bayes.decide_account(address, self.tau) == RegionMode::Wait {
@@ -124,8 +147,7 @@ impl<'a> SpecFenceCtx<'a> {
         }
     }
 
-    /// Location-granularity Wait: region table promotion, else bayes on that
-    /// location hash, else address-level cold-start posterior.
+    /// Location-granularity Wait via π (WaitHard) with revokeable sticky flags.
     pub(crate) fn should_wait_location(
         &self,
         regions: &RegionTable,
@@ -138,12 +160,26 @@ impl<'a> SpecFenceCtx<'a> {
         if self.mode == ConcurrencyMode::Pcc {
             return true;
         }
-        if regions.location_mode(location) == RegionMode::Wait {
-            return true;
+        // Revoke sticky Wait when posterior < τ_revoke.
+        if regions.location_mode(location) == RegionMode::Wait
+            || self.dag.is_wait(location)
+        {
+            if self.bayes.should_revoke(location, Some(address)) {
+                let cleared_region = regions.clear_location_wait(location);
+                let cleared_dag = self.dag.clear_wait(location);
+                if cleared_region || cleared_dag {
+                    self.metrics.record_soft_edge_revoke();
+                }
+                // Fall through to live π decision.
+            } else {
+                return true;
+            }
         }
-        // Once the location has its own posterior, do **not** inherit whole-account Wait.
+        // Live π: WaitHard when writer-aware posterior high or P >= τ_s.
+        let writer_known = self.hints.prev(address, 0).is_some()
+            || self.bayes.has_location(location);
         if self.bayes.has_location(location) {
-            if self.bayes.decide(location, Some(address), self.tau) == RegionMode::Wait {
+            if self.bayes.should_wait_hard(location, Some(address), writer_known) {
                 self.metrics.record_bayes_wait();
                 self.bayes.note_wait_decision(location, Some(address));
                 true
@@ -152,8 +188,15 @@ impl<'a> SpecFenceCtx<'a> {
                 false
             }
         } else if regions.account_mode(address) == RegionMode::Wait {
-            true
-        } else if self.bayes.decide(location, Some(address), self.tau) == RegionMode::Wait {
+            if self.bayes.should_revoke(location, Some(address)) {
+                if regions.clear_account_wait(*address) {
+                    self.metrics.record_soft_edge_revoke();
+                }
+                false
+            } else {
+                true
+            }
+        } else if self.bayes.should_wait_hard(location, Some(address), writer_known) {
             self.metrics.record_bayes_wait();
             self.bayes.note_wait_decision(location, Some(address));
             true
@@ -161,6 +204,30 @@ impl<'a> SpecFenceCtx<'a> {
             self.metrics.record_bayes_speculate();
             false
         }
+    }
+
+    /// Choose ResolveAction for a SpecFence location read (π).
+    pub(crate) fn choose_resolve(
+        &self,
+        location: crate::MemoryLocationHash,
+        address: &Address,
+        writer: Option<TxIdx>,
+        writer_done: bool,
+        bind_version: Option<crate::TxVersion>,
+        residual_predicts: bool,
+    ) -> ResolveAction {
+        let posterior_conflict = self.bayes.conflict_probability(location, Some(address));
+        let posterior_bind = self.bayes.bind_useful_probability(location);
+        let ctx = PolicyCtx {
+            location,
+            writer_known: writer.is_some(),
+            writer,
+            posterior_conflict,
+            posterior_bind_success: posterior_bind,
+            placeholder_ready: residual_predicts && (writer_done || bind_version.is_some()),
+            bind_version: if writer_done { bind_version } else { None },
+        };
+        choose_action(ctx)
     }
 
     /// Proactive PCC / cold-start: previous hinted writer that has not finished.
@@ -181,17 +248,39 @@ impl<'a> SpecFenceCtx<'a> {
         }
     }
 
-    /// Promote location to Wait for the rest of the block; bump wave on new flip.
+    /// Promote location to Wait; bump wave on new flip. Also mirrors into Ĝ.
     pub(crate) fn promote_from_bayes(
         &self,
         regions: &RegionTable,
         location: crate::MemoryLocationHash,
         address: Option<Address>,
     ) -> bool {
-        if regions.promote_location(location) {
+        let promoted = regions.promote_location(location);
+        let _ = self.dag.set_wait(location);
+        if promoted {
             self.metrics.record_promotion(address);
             self.metrics.record_wave_promotion();
             self.bayes.bump_wave();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Attempt revoke of sticky Wait when posterior dropped.
+    pub(crate) fn try_revoke(
+        &self,
+        regions: &RegionTable,
+        location: crate::MemoryLocationHash,
+        address: Option<&Address>,
+    ) -> bool {
+        if !self.bayes.should_revoke(location, address) {
+            return false;
+        }
+        let cleared_region = regions.clear_location_wait(location);
+        let cleared_dag = self.dag.clear_wait(location);
+        if cleared_region || cleared_dag {
+            self.metrics.record_soft_edge_revoke();
             true
         } else {
             false
