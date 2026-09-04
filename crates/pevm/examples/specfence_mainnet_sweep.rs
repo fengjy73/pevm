@@ -50,6 +50,14 @@ struct RunRow {
     bayes_success_updates: usize,
     wave_promotions: usize,
     mean_wait_posterior: f64,
+    bind_hits: usize,
+    wait_hard_count: usize,
+    spec_read_count: usize,
+    selective_invalidate_count: usize,
+    tx_full_retry: usize,
+    region_validate_fail: usize,
+    soft_edge_revokes: usize,
+    selective_fallback_full: usize,
     ok: bool,
     error: Option<String>,
 }
@@ -187,6 +195,22 @@ fn measure(
                 bayes_success_updates: if sequential { 0 } else { m.bayes_success_updates },
                 wave_promotions: if sequential { 0 } else { m.wave_promotions },
                 mean_wait_posterior: if sequential { 0.0 } else { m.mean_wait_posterior },
+                bind_hits: if sequential { 0 } else { m.bind_hits },
+                wait_hard_count: if sequential { 0 } else { m.wait_hard_count },
+                spec_read_count: if sequential { 0 } else { m.spec_read_count },
+                selective_invalidate_count: if sequential {
+                    0
+                } else {
+                    m.selective_invalidate_count
+                },
+                tx_full_retry: if sequential { 0 } else { m.tx_full_retry },
+                region_validate_fail: if sequential { 0 } else { m.region_validate_fail },
+                soft_edge_revokes: if sequential { 0 } else { m.soft_edge_revokes },
+                selective_fallback_full: if sequential {
+                    0
+                } else {
+                    m.selective_fallback_full
+                },
                 ok: true,
                 error: None,
             }
@@ -213,6 +237,14 @@ fn measure(
             bayes_success_updates: 0,
             wave_promotions: 0,
             mean_wait_posterior: 0.0,
+            bind_hits: 0,
+            wait_hard_count: 0,
+            spec_read_count: 0,
+            selective_invalidate_count: 0,
+            tx_full_retry: 0,
+            region_validate_fail: 0,
+            soft_edge_revokes: 0,
+            selective_fallback_full: 0,
             ok: false,
             error: Some(format!("{err:?}")),
         },
@@ -277,8 +309,17 @@ fn main() {
                 for repeat in 0..repeats {
                     let row = measure(&chain, &loaded, mode, c, repeat);
                     eprintln!(
-                        "  {mode:10} cores={c} r{repeat} tps={:.0} abort={:.3} wait={} ok={}",
-                        row.tps, row.abort_rate, row.wait_admissions, row.ok
+                        "  {mode:10} cores={c} r{repeat} tps={:.0} abort={:.3} wait={} full_retry={} bind={} wait_hard={} spec_read={} sel_inv={} sel_fb={} ok={}",
+                        row.tps,
+                        row.abort_rate,
+                        row.wait_admissions,
+                        row.tx_full_retry,
+                        row.bind_hits,
+                        row.wait_hard_count,
+                        row.spec_read_count,
+                        row.selective_invalidate_count,
+                        row.selective_fallback_full,
+                        row.ok
                     );
                     rows.push(row);
                 }
@@ -314,6 +355,14 @@ fn main() {
                 "bayes_success_updates": r.bayes_success_updates,
                 "wave_promotions": r.wave_promotions,
                 "mean_wait_posterior": r.mean_wait_posterior,
+                "bind_hits": r.bind_hits,
+                "wait_hard_count": r.wait_hard_count,
+                "spec_read_count": r.spec_read_count,
+                "selective_invalidate_count": r.selective_invalidate_count,
+                "tx_full_retry": r.tx_full_retry,
+                "region_validate_fail": r.region_validate_fail,
+                "soft_edge_revokes": r.soft_edge_revokes,
+                "selective_fallback_full": r.selective_fallback_full,
                 "ok": r.ok,
                 "error": r.error,
             })
