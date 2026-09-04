@@ -339,6 +339,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 {
                     self.specfence.metrics.record_wait(address);
                     self.specfence.dag.note_soft_wait(location_hash, self.tx_idx);
+                    self.specfence
+                        .wave
+                        .set_pending_park_location(location_hash);
                     return Err(ReadError::Blocking(prev));
                 }
                 // Cold-start account hint predecessor — skip when posterior is cold
@@ -356,6 +359,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     && !self.specfence.scheduler.is_done(prev)
                 {
                     self.specfence.metrics.record_wait(address);
+                    self.specfence
+                        .wave
+                        .set_pending_park_location(location_hash);
                     return Err(ReadError::Blocking(prev));
                 }
                 Ok(())
@@ -366,6 +372,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 if !self.specfence.scheduler.is_done(v.tx_idx) {
                     self.specfence.metrics.record_wait_hard();
                     self.specfence.metrics.record_wait(address);
+                    self.specfence
+                        .wave
+                        .set_pending_park_location(location_hash);
                     return Err(ReadError::Blocking(v.tx_idx));
                 }
                 self.specfence.dag.note_hard_edge();
@@ -872,6 +881,11 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             return Some((prev, *to));
         }
         None
+    }
+
+    /// SpecFence M2: location of WaitHard that returned Blocking (if any).
+    pub(crate) fn take_pending_park_location(&self) -> Option<crate::MemoryLocationHash> {
+        self.specfence.wave.take_pending_park_location()
     }
 
     pub(crate) fn record_wait_admission(&self, address: Address) {

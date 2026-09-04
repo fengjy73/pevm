@@ -74,7 +74,8 @@ Metrics: prior bayes/fence counters plus `region_validate_fail`, `tx_full_retry`
 `wait_hard_count`, `spec_read_count`, `selective_invalidate_count`, `cascade_revalidate_count`,
 `soft_edge_revokes`, `selective_fallback_full`, `checkpoint_opportunities`, plus plant v2 M0
 `evm_entries` / `tx_head_reexec` / `full_restart` / `resume_count` / `rebind_only` /
-`rewind_to_cp` (M1 RewindTo/RebindOnly).
+`rewind_to_cp` (M1 RewindTo/RebindOnly), plus M2 `wait_park_count` /
+`wait_park_ns` / `ready_steal_on_wait` / `wave_width_mean`.
 
 ### Plant v2 M0 baseline (metrics only)
 
@@ -87,6 +88,17 @@ Checkpoints `(t,inc,k)` on SpecFence path; validation fail with certified prefix
 `RebindOnly` (no abort) or `RewindTo` (resume entry: `rewind_to_cp`/`resume_count`,
 **not** `evm_entries`/`tx_head_reexec`). `FullRestart` only when prefix empty.
 True PC / journal fast-forward still TODO — see `lab/notes/specfence-plant-v2-m1-status.md`.
+
+### Plant v2 M2 — Wave park / steal (L2)
+
+WaitHard **parks** at **tx grain** (Block-STM `Blocking` → `Aborting` + dependency);
+the worker returns to `next_task_with_wave` and **steals** from a global ready deque
+(priority: **lower TxIdx first**). On writer `finish_execution` / PublishWrite-done:
+`wake_writer_done` → push waiters to ready + accumulate `wait_park_ns`. Soft/Bayes
+edges only reorder within the ready set (revocable). Mid-effect Interpreter park
+is **not** implemented — see `lab/notes/specfence-plant-v2-m2-status.md`.
+
+Metrics: `wait_park_count`, `wait_park_ns`, `ready_steal_on_wait`, `wave_width_mean`.
 
 ## Design specs
 

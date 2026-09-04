@@ -94,6 +94,14 @@ pub struct SpecFenceMetrics {
     /// from tx head — not an L1 resume. Documented alias for "head reexec under PartialRetry".
     /// M1 RewindTo must NOT increment this; use `resume_count` / `rewind_to_cp` instead.
     pub tx_head_reexec: usize,
+    /// M2: WaitHard parks (tx-level Blocking → worker returns to steal).
+    pub wait_park_count: usize,
+    /// M2: best-effort nanoseconds spent parked waiting on a writer.
+    pub wait_park_ns: u64,
+    /// M2: worker stole other ready work immediately after a WaitHard park.
+    pub ready_steal_on_wait: usize,
+    /// M2: mean ready-queue depth sampled at park/push (best-effort wave width).
+    pub wave_width_mean: f64,
 }
 
 /// Shared counters written by worker threads.
@@ -131,6 +139,10 @@ pub(crate) struct MetricsInner {
     rewind_to_cp: AtomicUsize,
     full_restart: AtomicUsize,
     tx_head_reexec: AtomicUsize,
+    wait_park_count: AtomicUsize,
+    wait_park_ns: std::sync::atomic::AtomicU64,
+    ready_steal_on_wait: AtomicUsize,
+    /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
     hot_accounts: DashMap<Address, (), BuildSuffixHasher>,
@@ -296,6 +308,35 @@ impl MetricsInner {
         self.tx_head_reexec.fetch_add(1, Ordering::Relaxed);
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn record_wait_park(&self) {
+        self.wait_park_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn add_wait_park_ns(&self, ns: u64) {
+        self.wait_park_ns.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_ready_steal_on_wait(&self) {
+        self.ready_steal_on_wait.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Copy M2 wave counters from the block's WaveParkTable at snapshot time.
+    pub(crate) fn set_wave_metrics(
+        &self,
+        wait_park_count: usize,
+        wait_park_ns: u64,
+        ready_steal_on_wait: usize,
+    ) {
+        self.wait_park_count
+            .store(wait_park_count, Ordering::Relaxed);
+        self.wait_park_ns.store(wait_park_ns, Ordering::Relaxed);
+        self.ready_steal_on_wait
+            .store(ready_steal_on_wait, Ordering::Relaxed);
+    }
+
     pub(crate) fn mark_hot(&self, address: Address) {
         self.hot_accounts.insert(address, ());
     }
@@ -310,6 +351,7 @@ impl MetricsInner {
         mean_wait_posterior: f64,
         mean_p_at_wait: f64,
         mean_p_at_spec: f64,
+        wave_width_mean: f64,
     ) -> SpecFenceMetrics {
         let mut wait_addresses: Vec<Address> =
             self.wait_addresses.iter().map(|e| *e.key()).collect();
@@ -362,6 +404,10 @@ impl MetricsInner {
             rewind_to_cp: self.rewind_to_cp.load(Ordering::Relaxed),
             full_restart: self.full_restart.load(Ordering::Relaxed),
             tx_head_reexec: self.tx_head_reexec.load(Ordering::Relaxed),
+            wait_park_count: self.wait_park_count.load(Ordering::Relaxed),
+            wait_park_ns: self.wait_park_ns.load(Ordering::Relaxed),
+            ready_steal_on_wait: self.ready_steal_on_wait.load(Ordering::Relaxed),
+            wave_width_mean,
         }
     }
 }

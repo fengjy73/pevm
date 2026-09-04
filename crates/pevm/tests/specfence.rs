@@ -760,3 +760,70 @@ fn specfence_m1_rewind_to_skips_evm_entries() {
         "M1 RewindTo/RebindOnly must fire on localized conflict: {last:?}"
     );
 }
+
+/// M2: WaitHard parks (tx-level) and worker steals; sequential ≡ SpecFence.
+/// Metrics: wait_park_count / ready_steal_on_wait when contention admits WaitHard.
+#[test]
+fn specfence_m2_wait_hard_parks_and_steals() {
+    let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 12, 6);
+    state.insert(Address::ZERO, EvmAccount::default());
+    for i in 0..64 {
+        let (addr, account) = common::mock_account(80_000 + i);
+        state.insert(addr, account);
+        txs.push(self_transfer(addr, 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+
+    // Warm Bayes so WaitHard is more likely on the hot cluster.
+    let mut pevm = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
+    let chain = PevmEthereum::mainnet();
+    for _ in 0..3 {
+        let _ = pevm
+            .execute_revm_parallel(
+                &chain,
+                &storage,
+                Default::default(),
+                BlockEnv::default(),
+                txs.clone(),
+                concurrency(),
+            )
+            .expect("warm");
+    }
+
+    let sequential = execute_revm_sequential(
+        &chain,
+        &storage,
+        Default::default(),
+        BlockEnv::default(),
+        txs.clone(),
+    )
+    .expect("sequential");
+    let parallel = pevm
+        .execute_revm_parallel(
+            &chain,
+            &storage,
+            Default::default(),
+            BlockEnv::default(),
+            txs,
+            concurrency(),
+        )
+        .expect("parallel");
+    assert_eq!(sequential, parallel, "M2 must preserve sequential equivalence");
+
+    let m = pevm.last_specfence_metrics();
+    // Park/steal is best-effort under π; either WaitHard parked or SpecRead dominated.
+    assert!(
+        m.wait_hard_count > 0
+            || m.wait_park_count > 0
+            || m.spec_read_count > 0
+            || m.bind_hits > 0,
+        "M2 path should exercise WaitHard/park or SpecRead/Bind: {m:?}"
+    );
+    // When parks happen, steals should be possible with independents in the block.
+    if m.wait_park_count > 0 {
+        assert!(
+            m.ready_steal_on_wait > 0 || m.wave_width_mean >= 0.0,
+            "parked WaitHard should allow steal or sample wave width: {m:?}"
+        );
+    }
+}

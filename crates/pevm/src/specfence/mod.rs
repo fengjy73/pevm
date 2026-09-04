@@ -8,6 +8,7 @@
 //! remains a correctness shield. FullRestart remains whole-tx reexec (revm).
 //! M1: RebindOnly / RewindTo on certified prefix (not head reexec when cps allow);
 //! suffix-only InvalidateSelective when safe.
+//! M2: WaitHard parks (tx-level) + ready-queue steal (lower TxIdx first); worker never spins.
 
 use crate::{
     BuildSuffixHasher, MemoryLocation, TxIdx, chain::PevmChain, hash_deterministic,
@@ -33,10 +34,11 @@ pub use region::RegionMode;
 pub(crate) use region::RegionTable;
 pub(crate) use rem::RemCounters;
 pub(crate) use rem::PartialRetryTable;
+pub(crate) use rem::WaveParkTable;
 #[allow(unused_imports)]
 pub(crate) use rem::{
-    AccessMode, Checkpoint, CheckpointId, CheckpointKind, EffectOrdinal, PartialRetryPlan,
-    PartialRetryState, RegionAccess, RemTask, RepairPlan,
+    AccessMode, Checkpoint, CheckpointId, CheckpointKind, EffectOrdinal, ParkedWait,
+    PartialRetryPlan, PartialRetryState, RegionAccess, RemTask, RepairPlan,
 };
 pub(crate) use resolve::{PolicyCtx, ResolveAction, choose_action};
 #[allow(unused_imports)]
@@ -122,6 +124,8 @@ pub(crate) struct SpecFenceCtx<'a> {
     pub dag: &'a SpecDag,
     pub rem: &'a RemCounters,
     pub partial_retry: &'a PartialRetryTable,
+    /// M2 wave park / ready deque (SpecFence only; unused by OCC/PCC).
+    pub wave: &'a WaveParkTable,
 }
 
 impl<'a> SpecFenceCtx<'a> {

@@ -11,10 +11,17 @@
 //! RebindOnly demote head PartialRetry when a certified prefix exists.
 //! True PC resume is TODO — resume path still re-enters the handler with
 //! force-bind / journal fast-forward prep, but must NOT count as `evm_entries`.
+//!
+//! M2 (plant v2): `WaveParkTable` parks WaitHard at **tx grain** (Block-STM
+//! Blocking style) and steals from a lower-TxIdx-first ready deque. Live
+//! mid-effect Interpreter park is out of scope.
 
 #![allow(dead_code)]
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Instant;
 
 use dashmap::DashMap;
 use hashbrown::{HashMap, HashSet};
@@ -485,5 +492,211 @@ impl EffectOrdinal {
 
     pub(crate) fn current(&self) -> usize {
         self.k
+    }
+}
+
+// --- Plant v2 M2: wave park / ready-queue (L2) --------------------------------
+
+thread_local! {
+    /// Set when this worker just parked a WaitHard; next successful ready steal counts.
+    static STEAL_AFTER_PARK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Location of the in-flight WaitHard Blocking about to be confirmed in pevm.
+    static PENDING_PARK_LOC: std::cell::Cell<Option<MemoryLocationHash>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// One WaitHard park entry (tx-level continuation — not mid-effect Interpreter).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ParkedWait {
+    pub waiter: TxIdx,
+    pub writer: TxIdx,
+    pub location: MemoryLocationHash,
+}
+
+/// M2 wave ready-queue + WaitHard park table.
+///
+/// **Grain (honest):** PEVM tasks are still whole-tx. Park = Block-STM
+/// `Aborting` + dependency (`add_dependency`); wake = `ReadyToExecute` +
+/// incarnation++ (resume from tx head or M1 RewindTo force-bind). The rayon
+/// worker never spins inside WaitHard — it returns to `next_task` / steals.
+/// Mid-effect live Interpreter park is not implemented.
+#[derive(Debug, Default)]
+pub(crate) struct WaveParkTable {
+    /// Min-heap: lower `TxIdx` first (frozen choice §8.3).
+    ready: Mutex<BinaryHeap<Reverse<TxIdx>>>,
+    /// Waiters parked on location ℓ (PublishWrite / writer-done wake).
+    waiters_by_loc:
+        DashMap<MemoryLocationHash, Vec<ParkedWait>, BuildIdentityHasher>,
+    /// Waiters indexed by writer for `finish_execution` wake.
+    waiters_by_writer: DashMap<TxIdx, Vec<ParkedWait>, BuildIdentityHasher>,
+    /// Best-effort park start for `wait_park_ns`.
+    park_started: DashMap<TxIdx, Instant, BuildIdentityHasher>,
+    wait_park_count: AtomicUsize,
+    wait_park_ns: AtomicU64,
+    ready_steal_on_wait: AtomicUsize,
+    wave_width_sum: AtomicU64,
+    wave_width_samples: AtomicUsize,
+}
+
+impl WaveParkTable {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record location for the WaitHard that is about to return `Blocking`.
+    pub(crate) fn set_pending_park_location(&self, location: MemoryLocationHash) {
+        PENDING_PARK_LOC.with(|c| c.set(Some(location)));
+    }
+
+    pub(crate) fn take_pending_park_location(&self) -> Option<MemoryLocationHash> {
+        PENDING_PARK_LOC.with(|c| c.take())
+    }
+
+    fn sample_wave_width_locked(&self, depth: usize) {
+        self.wave_width_sum
+            .fetch_add(depth as u64, Ordering::Relaxed);
+        self.wave_width_samples.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Park a WaitHard waiter; worker must then steal (not spin).
+    pub(crate) fn park(
+        &self,
+        waiter: TxIdx,
+        writer: TxIdx,
+        location: MemoryLocationHash,
+    ) {
+        let entry = ParkedWait {
+            waiter,
+            writer,
+            location,
+        };
+        self.waiters_by_loc
+            .entry(location)
+            .or_default()
+            .push(entry);
+        self.waiters_by_writer
+            .entry(writer)
+            .or_default()
+            .push(entry);
+        self.park_started.insert(waiter, Instant::now());
+        self.wait_park_count.fetch_add(1, Ordering::Relaxed);
+        let depth = self.ready.lock().unwrap().len();
+        self.sample_wave_width_locked(depth);
+        STEAL_AFTER_PARK.with(|c| c.set(true));
+    }
+
+    /// Undo park if `add_dependency` lost the race (writer already done).
+    pub(crate) fn unpark(&self, waiter: TxIdx, writer: TxIdx, location: MemoryLocationHash) {
+        if let Some(mut v) = self.waiters_by_loc.get_mut(&location) {
+            v.retain(|p| p.waiter != waiter);
+        }
+        if let Some(mut v) = self.waiters_by_writer.get_mut(&writer) {
+            v.retain(|p| p.waiter != waiter);
+        }
+        self.park_started.remove(&waiter);
+        STEAL_AFTER_PARK.with(|c| c.set(false));
+    }
+
+    /// Push a ready continuation; priority = lower TxIdx first.
+    pub(crate) fn push_ready(&self, tx_idx: TxIdx) {
+        let mut q = self.ready.lock().unwrap();
+        q.push(Reverse(tx_idx));
+        self.sample_wave_width_locked(q.len());
+    }
+
+    /// Soft/Bayes edges: only reorder within the ready set (revocable).
+    pub(crate) fn reorder_soft(&self, tx_idx: TxIdx) {
+        self.push_ready(tx_idx);
+    }
+
+    /// Pop lowest TxIdx from the ready deque (stale entries skipped by caller).
+    pub(crate) fn pop_ready(&self) -> Option<TxIdx> {
+        self.ready.lock().unwrap().pop().map(|Reverse(t)| t)
+    }
+
+    /// Mark that a steal after park succeeded.
+    pub(crate) fn note_ready_steal_if_after_park(&self) {
+        STEAL_AFTER_PARK.with(|c| {
+            if c.get() {
+                c.set(false);
+                self.ready_steal_on_wait.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    }
+
+    /// Clear steal-after-park flag without counting (e.g. idle yield).
+    pub(crate) fn clear_steal_flag(&self) {
+        STEAL_AFTER_PARK.with(|c| c.set(false));
+    }
+
+    /// Writer finished (`Executed`/`Validated`): wake location waiters → ready.
+    ///
+    /// Call after scheduler has set waiters to `ReadyToExecute` (dependents drain)
+    /// or in addition when location publish is known. Accumulates `wait_park_ns`.
+    pub(crate) fn wake_writer_done(&self, writer: TxIdx) -> Vec<TxIdx> {
+        let mut woken = Vec::new();
+        if let Some((_, parked)) = self.waiters_by_writer.remove(&writer) {
+            for p in parked {
+                self.finish_park_ns(p.waiter);
+                if let Some(mut v) = self.waiters_by_loc.get_mut(&p.location) {
+                    v.retain(|x| x.waiter != p.waiter);
+                }
+                if !woken.contains(&p.waiter) {
+                    woken.push(p.waiter);
+                    self.push_ready(p.waiter);
+                }
+            }
+        }
+        woken
+    }
+
+    /// PublishWrite wake for location ℓ (same as writer-done for that ℓ's waiters).
+    pub(crate) fn wake_location(&self, location: MemoryLocationHash) -> Vec<TxIdx> {
+        let mut woken = Vec::new();
+        if let Some((_, parked)) = self.waiters_by_loc.remove(&location) {
+            for p in parked {
+                self.finish_park_ns(p.waiter);
+                if let Some(mut v) = self.waiters_by_writer.get_mut(&p.writer) {
+                    v.retain(|x| x.waiter != p.waiter || x.location != location);
+                }
+                if !woken.contains(&p.waiter) {
+                    woken.push(p.waiter);
+                    self.push_ready(p.waiter);
+                }
+            }
+        }
+        woken
+    }
+
+    fn finish_park_ns(&self, waiter: TxIdx) {
+        if let Some((_, started)) = self.park_started.remove(&waiter) {
+            let ns = started.elapsed().as_nanos() as u64;
+            self.wait_park_ns.fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn wait_park_count(&self) -> usize {
+        self.wait_park_count.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn wait_park_ns(&self) -> u64 {
+        self.wait_park_ns.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn ready_steal_on_wait(&self) -> usize {
+        self.ready_steal_on_wait.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn wave_width_mean(&self) -> f64 {
+        let n = self.wave_width_samples.load(Ordering::Relaxed);
+        if n == 0 {
+            0.0
+        } else {
+            self.wave_width_sum.load(Ordering::Relaxed) as f64 / n as f64
+        }
+    }
+
+    pub(crate) fn ready_depth(&self) -> usize {
+        self.ready.lock().unwrap().len()
     }
 }

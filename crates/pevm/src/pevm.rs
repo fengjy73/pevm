@@ -29,7 +29,7 @@ use crate::{
     specfence::{
         AccountHints, BayesMap, ConcurrencyMode, DEFAULT_TAU, HeatMap, MetricsInner,
         PartialRetryTable, RemCounters, RepairPlan, SpecDag, SpecFenceCtx, SpecFenceMetrics,
-        seed_wait_regions, update_bayes, update_heat,
+        WaveParkTable, seed_wait_regions, update_bayes, update_heat,
     },
     storage::StorageWrapper,
     vm::{
@@ -315,6 +315,12 @@ impl Pevm {
         let dag = SpecDag::new();
         let rem = RemCounters::default();
         let partial_retry = PartialRetryTable::new(block_size);
+        let wave = WaveParkTable::new();
+        let wave_ref = if self.concurrency_mode == ConcurrencyMode::SpecFence {
+            Some(&wave)
+        } else {
+            None
+        };
         let specfence = SpecFenceCtx {
             mode: self.concurrency_mode,
             hints: &hints,
@@ -326,6 +332,7 @@ impl Pevm {
             dag: &dag,
             rem: &rem,
             partial_retry: &partial_retry,
+            wave: &wave,
         };
 
         // TODO: Better thread handling
@@ -335,11 +342,11 @@ impl Pevm {
                     let mut vm = Vm::new(
                         chain, spec_id, &block_env, &txs, storage, &mv_memory, specfence,
                     );
-                    let mut task = scheduler.next_task();
+                    let mut task = scheduler.next_task_with_wave(wave_ref);
                     while task.is_some() {
                         task = match task.unwrap() {
                             Task::Execution(tx_version) => {
-                                self.try_execute(&mut vm, &scheduler, tx_version)
+                                self.try_execute(&mut vm, &scheduler, tx_version, wave_ref)
                             }
                             Task::Validation(tx_version) => {
                                 try_validate(&mv_memory, &scheduler, &tx_version, specfence)
@@ -357,7 +364,7 @@ impl Pevm {
                         }
 
                         if task.is_none() {
-                            task = scheduler.next_task();
+                            task = scheduler.next_task_with_wave(wave_ref);
                         }
                     }
                 });
@@ -380,8 +387,18 @@ impl Pevm {
             };
         let wave_id = self.bayes.wave_id();
         metrics_inner.set_checkpoint_opportunities(rem.checkpoint_opportunities());
-        self.last_metrics =
-            metrics_inner.snapshot(wave_id, mean_wait, mean_p_at_wait, mean_p_at_spec);
+        metrics_inner.set_wave_metrics(
+            wave.wait_park_count(),
+            wave.wait_park_ns(),
+            wave.ready_steal_on_wait(),
+        );
+        self.last_metrics = metrics_inner.snapshot(
+            wave_id,
+            mean_wait,
+            mean_p_at_wait,
+            mean_p_at_spec,
+            wave.wave_width_mean(),
+        );
         self.last_initial_wait_accounts = initial_wait;
 
         if let Some(abort_reason) = self.abort_reason.take() {
@@ -534,6 +551,7 @@ impl Pevm {
         vm: &mut Vm<'a, S, C>,
         scheduler: &Scheduler,
         tx_version: TxVersion,
+        wave: Option<&WaveParkTable>,
     ) -> Option<Task> {
         let result_slot = self.execution_results.slot_mut(tx_version.tx_idx);
         loop {
@@ -548,7 +566,10 @@ impl Pevm {
                 return None;
             }
             return match vm.execute(&tx_version, result_slot) {
-                Ok(flags) => scheduler.finish_execution(tx_version, flags),
+                Ok(flags) => {
+                    // PublishWrite ≈ incarnation finished: wake location waiters + ready.
+                    scheduler.finish_execution_with_wave(tx_version, flags, wave)
+                }
                 Err(VmExecutionError::Retry) => {
                     if self.abort_reason.get().is_none() {
                         continue;
@@ -562,13 +583,29 @@ impl Pevm {
                     None
                 }
                 Err(VmExecutionError::Blocking(blocking_tx_idx)) => {
+                    // M2: WaitHard already registered park+location in Vm (SpecFence).
+                    // add_dependency parks the tx (Aborting); worker returns to steal.
+                    let park_loc = vm.take_pending_park_location();
+                    if let Some(wave) = wave {
+                        if let Some(loc) = park_loc {
+                            wave.park(tx_version.tx_idx, blocking_tx_idx, loc);
+                        } else {
+                            // Blocking without location (lazy/ESTIMATE) — still park by writer.
+                            wave.park(tx_version.tx_idx, blocking_tx_idx, 0);
+                        }
+                    }
                     if !scheduler.add_dependency(tx_version.tx_idx, blocking_tx_idx)
                         && self.abort_reason.get().is_none()
                     {
                         // Retry the execution immediately if the blocking transaction was
                         // re-executed by the time we can add it as a dependency.
+                        if let Some(wave) = wave {
+                            let loc = park_loc.unwrap_or(0);
+                            wave.unpark(tx_version.tx_idx, blocking_tx_idx, loc);
+                        }
                         continue;
                     }
+                    // Worker-free Wait: return None → next_task_with_wave steals.
                     None
                 }
                 Err(VmExecutionError::ExecutionError(err)) => {

@@ -128,16 +128,18 @@ Cost model must include **system** term: `steal_ready_depth`, not only local `1+
 - Counters: `resume_count`, `rebind_only`, `rewind_to_cp` (0 until M1); `full_restart` (OCC abort / SF FullRetry); `tx_head_reexec` (today’s semantic PartialRetry / EarlyVal head restart).
 - Exposed in `SpecFenceMetrics` + `specfence_mainnet_sweep` JSON/CSV.
 - Baseline expectation: today’s SF `evm_entries ≈ n_tx + head-reexecs` (PartialRetry ≡ head reexec), **not** better than OCC until M1 RewindTo.
-- Deferred to M2: `wait_park_ns`, `ready_steal_on_wait`.
+- M2 landed: `wait_park_ns`, `ready_steal_on_wait`, `wait_park_count`, `wave_width_mean`.
 
 ### M1 — Checkpoints + RewindTo (L1 minimum)
 - Patch revm/pevm adapter: checkpoint at CALL + storage write boundaries.
 - On selective invalidate: RewindTo last certified cp; resume.
 - Success gate: `evm_entries_sf < evm_entries_occ` on ≥1 hot conflict block@8 **or** clear gap only on FullRestart count; SF/OCC TPS moves toward 1.
 
-### M2 — Park/Wake + ready-queue (L2)
-- WaitHard parks continuation; worker steals.
-- Success gate: `wait_time` down, `wave_width_mean` up, TPS↑ at 8 cores vs M1.
+### M2 — Park/Wake + ready-queue (L2) ✅ (tx-grain landed)
+- WaitHard parks continuation (**tx-level** Blocking + `WaveParkTable`); worker steals lower-TxIdx-first ready deque.
+- Metrics: `wait_park_count`, `wait_park_ns`, `ready_steal_on_wait`, `wave_width_mean`.
+- Success gate: `wait_time` down, `wave_width_mean` up, TPS↑ at 8 cores vs M1 (measure in next sweep).
+- See `lab/notes/specfence-plant-v2-m2-status.md`.
 
 ### M3 — Online RW learning → Bind-before-touch
 - Use completed incarnation / prior blocks to Bind predicted reads before interpret.
