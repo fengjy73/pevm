@@ -1,4 +1,6 @@
 //! Multi-core mainnet sweep: Sequential / OCC / PCC / SpecFence.
+
+#![recursion_limit = "256"]
 //!
 //! Writes JSON for `lab/experiments/scripts/plot_vldb.py`.
 
@@ -65,6 +67,12 @@ struct RunRow {
     cost_chose_bind: usize,
     mean_p_at_wait: f64,
     mean_p_at_spec: f64,
+    evm_entries: usize,
+    resume_count: usize,
+    rebind_only: usize,
+    rewind_to_cp: usize,
+    full_restart: usize,
+    tx_head_reexec: usize,
     ok: bool,
     error: Option<String>,
 }
@@ -229,6 +237,12 @@ fn measure(
                 cost_chose_bind: if sequential { 0 } else { m.cost_chose_bind },
                 mean_p_at_wait: if sequential { 0.0 } else { m.mean_p_at_wait },
                 mean_p_at_spec: if sequential { 0.0 } else { m.mean_p_at_spec },
+                evm_entries: if sequential { 0 } else { m.evm_entries },
+                resume_count: if sequential { 0 } else { m.resume_count },
+                rebind_only: if sequential { 0 } else { m.rebind_only },
+                rewind_to_cp: if sequential { 0 } else { m.rewind_to_cp },
+                full_restart: if sequential { 0 } else { m.full_restart },
+                tx_head_reexec: if sequential { 0 } else { m.tx_head_reexec },
                 ok: true,
                 error: None,
             }
@@ -270,6 +284,12 @@ fn measure(
             cost_chose_bind: 0,
             mean_p_at_wait: 0.0,
             mean_p_at_spec: 0.0,
+            evm_entries: 0,
+            resume_count: 0,
+            rebind_only: 0,
+            rewind_to_cp: 0,
+            full_restart: 0,
+            tx_head_reexec: 0,
             ok: false,
             error: Some(format!("{err:?}")),
         },
@@ -400,6 +420,12 @@ fn main() {
                 "cost_chose_bind": r.cost_chose_bind,
                 "mean_p_at_wait": r.mean_p_at_wait,
                 "mean_p_at_spec": r.mean_p_at_spec,
+                "evm_entries": r.evm_entries,
+                "resume_count": r.resume_count,
+                "rebind_only": r.rebind_only,
+                "rewind_to_cp": r.rewind_to_cp,
+                "full_restart": r.full_restart,
+                "tx_head_reexec": r.tx_head_reexec,
                 "ok": r.ok,
                 "error": r.error,
             })
@@ -415,14 +441,14 @@ fn main() {
     let mut csv = File::create(&csv_path).expect("write csv");
     writeln!(
         csv,
-        "block,n_tx,gas_used,mode,cores,repeat,elapsed_ms,tps,occ_aborts,abort_rate,wait_admissions,speculate_executions,region_promotions,cascade_validations_scheduled,independent_txs_skipped_by_fence,bayes_wait_decisions,bayes_speculate_decisions,bayes_conflict_updates,bayes_success_updates,wave_promotions,mean_wait_posterior,bind_hits,wait_hard_count,spec_read_count,selective_invalidate_count,tx_full_retry,region_validate_fail,soft_edge_revokes,selective_fallback_full,partial_retry_count,partial_retry_fallback_full,cost_chose_wait,cost_chose_spec,cost_chose_bind,mean_p_at_wait,mean_p_at_spec,ok,error"
+        "block,n_tx,gas_used,mode,cores,repeat,elapsed_ms,tps,occ_aborts,abort_rate,wait_admissions,speculate_executions,region_promotions,cascade_validations_scheduled,independent_txs_skipped_by_fence,bayes_wait_decisions,bayes_speculate_decisions,bayes_conflict_updates,bayes_success_updates,wave_promotions,mean_wait_posterior,bind_hits,wait_hard_count,spec_read_count,selective_invalidate_count,tx_full_retry,region_validate_fail,soft_edge_revokes,selective_fallback_full,partial_retry_count,partial_retry_fallback_full,cost_chose_wait,cost_chose_spec,cost_chose_bind,mean_p_at_wait,mean_p_at_spec,evm_entries,resume_count,rebind_only,rewind_to_cp,full_restart,tx_head_reexec,ok,error"
     )
     .unwrap();
     for r in &rows {
         let err = r.error.as_deref().unwrap_or("").replace(",", ";");
         writeln!(
             csv,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             r.block,
             r.n_tx,
             r.gas_used,
@@ -459,6 +485,12 @@ fn main() {
             r.cost_chose_bind,
             r.mean_p_at_wait,
             r.mean_p_at_spec,
+            r.evm_entries,
+            r.resume_count,
+            r.rebind_only,
+            r.rewind_to_cp,
+            r.full_restart,
+            r.tx_head_reexec,
             r.ok,
             err
         )

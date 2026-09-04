@@ -645,7 +645,11 @@ fn try_validate(
                 &write_locations,
             );
             let fence_locs = if let Some(plan) = plan {
+                // Semantic PartialRetry: certified-prefix Bind, but still reexec from
+                // tx head → counts as tx_head_reexec (not L1 resume). Next Vm::execute
+                // increments evm_entries.
                 specfence.metrics.record_partial_retry();
+                specfence.metrics.record_tx_head_reexec();
                 specfence
                     .partial_retry
                     .set_force_bind(tx_version.tx_idx, plan.certified.clone());
@@ -663,8 +667,9 @@ fn try_validate(
                     estimated
                 }
             } else {
-                // Unsafe / no certified prefix → FullRetry.
+                // Unsafe / no certified prefix → FullRetry / FullRestart from tx head.
                 specfence.metrics.record_tx_full_retry();
+                specfence.metrics.record_full_restart();
                 specfence.metrics.record_partial_retry_fallback_full();
                 specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
                 let (estimated, fallback) = mv_memory
@@ -702,6 +707,8 @@ fn try_validate(
         // OCC / PCC: full write-set ESTIMATE (unchanged).
         mv_memory.convert_writes_to_estimates(tx_version.tx_idx);
         specfence.metrics.record_occ_abort();
+        // OCC/PCC abort always restarts interpreter from tx head on next incarnation.
+        specfence.metrics.record_full_restart();
         if specfence.mode.uses_regions() {
             for location in &invalid {
                 if mv_memory.regions.promote_location(*location) {

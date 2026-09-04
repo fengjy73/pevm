@@ -438,7 +438,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
             self.specfence
                 .partial_retry
                 .set_force_bind(self.tx_idx, certified);
+            // Semantic PartialRetry still restarts interpreter from tx head (Retry loop).
             self.specfence.metrics.record_partial_retry();
+            self.specfence.metrics.record_tx_head_reexec();
             self.specfence.metrics.record_region_validate_fail(1);
             Err(ReadError::InconsistentRead)
         }
@@ -937,6 +939,11 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             // successful execution but not on errors. Always reset here to be sure.
             ctx.journal_mut().clear();
         }
+
+        // Plant v2 M0: every fresh EVM/transact/interpreter start from tx head
+        // (OCC abort+reexec and SpecFence incarnations). M1 resume/RewindTo must
+        // use a different entry point and must not call record_evm_entry.
+        self.specfence.metrics.record_evm_entry();
 
         match NoBeneficiaryHandler::<C, _>::default().run(&mut self.evm) {
             Ok(exec_result) => {

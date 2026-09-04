@@ -77,6 +77,23 @@ pub struct SpecFenceMetrics {
     pub mean_p_at_wait: f64,
     /// Mean P_conflict among cost-aware SpecRead decisions.
     pub mean_p_at_spec: f64,
+    /// Plant v2 M0: fresh EVM/transact/interpreter starts (new incarnation from tx head).
+    /// Incremented at `Vm::execute` immediately before the handler `run` (OCC + SpecFence).
+    /// Baseline today: ≈ n_tx + head-reexecs (PartialRetry and FullRetry both restart from head).
+    pub evm_entries: usize,
+    /// M1+: resume from checkpoint without fresh interpreter start (stays 0 until RewindTo).
+    pub resume_count: usize,
+    /// M1+: rebind-only repair without rewind/restart (stays 0 until Rebind).
+    pub rebind_only: usize,
+    /// M1+: rewind journal/PC to checkpoint then resume (stays 0 until RewindTo).
+    pub rewind_to_cp: usize,
+    /// FullRestart decisions: OCC abort reexec, or SpecFence FullRetry (no certified prefix).
+    /// Each corresponding reexec also increments `evm_entries` at the next `Vm::execute`.
+    pub full_restart: usize,
+    /// Semantic PartialRetry (and EarlyVal force-bind) that still restarts the interpreter
+    /// from tx head — not an L1 resume. Documented alias for "head reexec under PartialRetry".
+    /// M1 RewindTo must NOT increment this; use `resume_count` / `rewind_to_cp` instead.
+    pub tx_head_reexec: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -108,6 +125,12 @@ pub(crate) struct MetricsInner {
     cost_chose_wait: AtomicUsize,
     cost_chose_spec: AtomicUsize,
     cost_chose_bind: AtomicUsize,
+    evm_entries: AtomicUsize,
+    resume_count: AtomicUsize,
+    rebind_only: AtomicUsize,
+    rewind_to_cp: AtomicUsize,
+    full_restart: AtomicUsize,
+    tx_head_reexec: AtomicUsize,
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
     hot_accounts: DashMap<Address, (), BuildSuffixHasher>,
@@ -244,6 +267,38 @@ impl MetricsInner {
         self.cost_chose_bind.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Fresh EVM session / interpreter start from tx head (plant v2 L1 denominator).
+    pub(crate) fn record_evm_entry(&self) {
+        self.evm_entries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// M1 hook: resume without fresh `transact` (currently unused).
+    #[allow(dead_code)]
+    pub(crate) fn record_resume(&self) {
+        self.resume_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// M1 hook: rebind-only (currently unused).
+    #[allow(dead_code)]
+    pub(crate) fn record_rebind_only(&self) {
+        self.rebind_only.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// M1 hook: rewind-to-checkpoint (currently unused).
+    #[allow(dead_code)]
+    pub(crate) fn record_rewind_to_cp(&self) {
+        self.rewind_to_cp.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_full_restart(&self) {
+        self.full_restart.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Today's PartialRetry / EarlyVal still restarts interpreter from tx head.
+    pub(crate) fn record_tx_head_reexec(&self) {
+        self.tx_head_reexec.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn mark_hot(&self, address: Address) {
         self.hot_accounts.insert(address, ());
     }
@@ -304,6 +359,12 @@ impl MetricsInner {
             cost_chose_bind: self.cost_chose_bind.load(Ordering::Relaxed),
             mean_p_at_wait,
             mean_p_at_spec,
+            evm_entries: self.evm_entries.load(Ordering::Relaxed),
+            resume_count: self.resume_count.load(Ordering::Relaxed),
+            rebind_only: self.rebind_only.load(Ordering::Relaxed),
+            rewind_to_cp: self.rewind_to_cp.load(Ordering::Relaxed),
+            full_restart: self.full_restart.load(Ordering::Relaxed),
+            tx_head_reexec: self.tx_head_reexec.load(Ordering::Relaxed),
         }
     }
 }

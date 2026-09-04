@@ -72,7 +72,17 @@ SpecFence discovers the true DAG **during** execution and dynamically fuses opti
 
 Metrics: prior bayes/fence counters plus `region_validate_fail`, `tx_full_retry`, `bind_hits`,
 `wait_hard_count`, `spec_read_count`, `selective_invalidate_count`, `cascade_revalidate_count`,
-`soft_edge_revokes`, `selective_fallback_full`, `checkpoint_opportunities`.
+`soft_edge_revokes`, `selective_fallback_full`, `checkpoint_opportunities`, plus plant v2 M0
+`evm_entries` / `tx_head_reexec` / `full_restart` (and zeroed `resume_count` / `rebind_only` /
+`rewind_to_cp` until M1).
+
+### Plant v2 M0 baseline (metrics only)
+
+Instrument `evm_entries` at every fresh `Vm::execute` → handler `run` (OCC + SpecFence).
+Today's semantic PartialRetry still restarts the interpreter from tx head → counts as
+`tx_head_reexec` (and bumps `evm_entries` on the next entry), **not** as L1 resume.
+Expectation: SF `evm_entries ≈ n_tx + head-reexecs`, not better than OCC until M1 RewindTo.
+See `lab/notes/specfence-rem-plant-v2-revm.md`.
 
 ## Design specs
 
