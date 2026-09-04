@@ -44,6 +44,7 @@ impl RegionTable {
     }
 
     /// Location or its owning account is Wait.
+    #[allow(dead_code)]
     pub(crate) fn should_wait(&self, location: MemoryLocationHash, address: &Address) -> bool {
         self.location_mode(location) == RegionMode::Wait
             || self.account_mode(address) == RegionMode::Wait

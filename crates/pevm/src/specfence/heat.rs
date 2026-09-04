@@ -8,6 +8,7 @@ use crate::BuildSuffixHasher;
 /// Smoothing for `heat = α * 1 + (1-α) * heat`.
 const ALPHA: f64 = 0.6;
 /// Accounts at or above this score start the next block in Wait.
+#[allow(dead_code)]
 const HOT_THRESHOLD: f64 = 0.35;
 /// Cap map size so a noisy block cannot grow heat without bound.
 const MAX_ENTRIES: usize = 4096;
@@ -34,6 +35,7 @@ impl HeatMap {
         self.evict_if_needed();
     }
 
+    #[allow(dead_code)]
     pub(crate) fn is_hot(&self, address: &Address) -> bool {
         self.scores
             .get(address)

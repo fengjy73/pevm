@@ -8,7 +8,7 @@ use dashmap::DashMap;
 use crate::BuildSuffixHasher;
 
 /// Snapshot of `SpecFence` counters after a parallel block.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct SpecFenceMetrics {
     /// Times a transaction was blocked because a Wait-mode region was not yet
     /// written by the prior consensus-order writer (proactive PCC admission).
@@ -25,6 +25,20 @@ pub struct SpecFenceMetrics {
     /// Higher txs between `aborted_idx+1` and the first dependent reader that
     /// were **not** forced into the abort cascade (SpecFence fence).
     pub independent_txs_skipped_by_fence: usize,
+    /// Bayesian decide() chose Wait for a location/account access.
+    pub bayes_wait_decisions: usize,
+    /// Bayesian decide() chose Speculate.
+    pub bayes_speculate_decisions: usize,
+    /// `observe_conflict` updates applied.
+    pub bayes_conflict_updates: usize,
+    /// `observe_speculate_ok` updates applied.
+    pub bayes_success_updates: usize,
+    /// Wave counter bumps when regions flip Speculate→Wait from bayes.
+    pub wave_promotions: usize,
+    /// Final wave id after the block.
+    pub wave_id: usize,
+    /// Mean conflict posterior among Wait decisions this block.
+    pub mean_wait_posterior: f64,
     /// Accounts that triggered a Wait admission in this block.
     pub wait_addresses: Vec<Address>,
     /// `from`/`to` accounts of speculative executions in this block.
@@ -40,6 +54,11 @@ pub(crate) struct MetricsInner {
     occ_aborts: AtomicUsize,
     cascade_validations_scheduled: AtomicUsize,
     independent_txs_skipped_by_fence: AtomicUsize,
+    bayes_wait_decisions: AtomicUsize,
+    bayes_speculate_decisions: AtomicUsize,
+    bayes_conflict_updates: AtomicUsize,
+    bayes_success_updates: AtomicUsize,
+    wave_promotions: AtomicUsize,
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
     hot_accounts: DashMap<Address, (), BuildSuffixHasher>,
@@ -86,6 +105,27 @@ impl MetricsInner {
         }
     }
 
+    pub(crate) fn record_bayes_wait(&self) {
+        self.bayes_wait_decisions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_bayes_speculate(&self) {
+        self.bayes_speculate_decisions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_bayes_conflict(&self) {
+        self.bayes_conflict_updates.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_bayes_success(&self) {
+        self.bayes_success_updates.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_wave_promotion(&self) {
+        self.wave_promotions.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn mark_hot(&self, address: Address) {
         self.hot_accounts.insert(address, ());
     }
@@ -94,7 +134,7 @@ impl MetricsInner {
         self.hot_accounts.iter().map(|entry| *entry.key())
     }
 
-    pub(crate) fn snapshot(&self) -> SpecFenceMetrics {
+    pub(crate) fn snapshot(&self, wave_id: usize, mean_wait_posterior: f64) -> SpecFenceMetrics {
         let mut wait_addresses: Vec<Address> =
             self.wait_addresses.iter().map(|e| *e.key()).collect();
         wait_addresses.sort_unstable();
@@ -112,6 +152,13 @@ impl MetricsInner {
             independent_txs_skipped_by_fence: self
                 .independent_txs_skipped_by_fence
                 .load(Ordering::Relaxed),
+            bayes_wait_decisions: self.bayes_wait_decisions.load(Ordering::Relaxed),
+            bayes_speculate_decisions: self.bayes_speculate_decisions.load(Ordering::Relaxed),
+            bayes_conflict_updates: self.bayes_conflict_updates.load(Ordering::Relaxed),
+            bayes_success_updates: self.bayes_success_updates.load(Ordering::Relaxed),
+            wave_promotions: self.wave_promotions.load(Ordering::Relaxed),
+            wave_id,
+            mean_wait_posterior,
             wait_addresses,
             speculate_addresses,
         }

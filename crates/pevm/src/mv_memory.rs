@@ -219,6 +219,27 @@ impl MvMemory {
         index_mutex!(self.last_locations, tx_idx).write.clone()
     }
 
+    /// Read location hashes recorded by the last incarnation of `tx_idx`.
+    pub(crate) fn read_locations(&self, tx_idx: TxIdx) -> Vec<MemoryLocationHash> {
+        index_mutex!(self.last_locations, tx_idx)
+            .read
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    /// True if any higher tx has this location in its last recorded read set.
+    #[allow(dead_code)]
+    pub(crate) fn has_higher_reader(&self, aborted_idx: TxIdx, location: MemoryLocationHash) -> bool {
+        for idx in (aborted_idx + 1)..self.last_locations.len() {
+            let locs = index_mutex!(self.last_locations, idx);
+            if locs.read.contains_key(&location) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Minimum higher transaction that read any location in `write_locations`.
     /// Used by SpecFence to fence the validation cascade to dependent readers only.
     pub(crate) fn min_higher_reader_of(
@@ -249,6 +270,37 @@ impl MvMemory {
         for location in &index_mutex!(self.last_locations, tx_idx).write {
             if let Some(mut written_transactions) = self.data.get_mut(location) {
                 written_transactions.insert(tx_idx, MemoryEntry::Estimate);
+            }
+        }
+    }
+
+    /// SpecFence finer ESTIMATE: mark ESTIMATE only on writes that have at least
+    /// one higher recorded reader; **remove** other aborted writes so independent
+    /// readers of unrelated slots are not poisoned by leftover Data versions.
+    /// (Leaving Data from an aborted incarnation would be incorrect.)
+    ///
+    /// Lock order: inspect `last_locations` first, then touch `data` — same order
+    /// as [`Self::record`], to avoid deadlocking with concurrent recorders.
+    #[allow(dead_code)]
+    pub(crate) fn convert_writes_to_estimates_selective(&self, tx_idx: TxIdx) {
+        let writes = self.write_locations(tx_idx);
+        let mut estimate = Vec::new();
+        let mut remove = Vec::new();
+        for location in writes {
+            if self.has_higher_reader(tx_idx, location) {
+                estimate.push(location);
+            } else {
+                remove.push(location);
+            }
+        }
+        for location in estimate {
+            if let Some(mut written_transactions) = self.data.get_mut(&location) {
+                written_transactions.insert(tx_idx, MemoryEntry::Estimate);
+            }
+        }
+        for location in remove {
+            if let Some(mut written_transactions) = self.data.get_mut(&location) {
+                written_transactions.remove(&tx_idx);
             }
         }
     }

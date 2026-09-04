@@ -27,8 +27,8 @@ use crate::{
     mv_memory::MvMemory,
     scheduler::Scheduler,
     specfence::{
-        AccountHints, ConcurrencyMode, HeatMap, MetricsInner, SpecFenceCtx, SpecFenceMetrics,
-        seed_wait_regions, update_heat,
+        AccountHints, BayesMap, ConcurrencyMode, DEFAULT_TAU, HeatMap, MetricsInner, SpecFenceCtx,
+        SpecFenceMetrics, seed_wait_regions, update_bayes, update_heat,
     },
     storage::StorageWrapper,
     vm::{
@@ -154,6 +154,7 @@ pub struct Pevm {
     dropper: AsyncDropper<(MvMemory, Scheduler)>,
     concurrency_mode: ConcurrencyMode,
     heat: HeatMap,
+    bayes: BayesMap,
     last_metrics: SpecFenceMetrics,
     last_initial_wait_accounts: std::collections::HashSet<alloy_primitives::Address>,
 }
@@ -166,6 +167,7 @@ impl Default for Pevm {
             dropper: AsyncDropper::default(),
             concurrency_mode: ConcurrencyMode::Occ,
             heat: HeatMap::new(),
+            bayes: BayesMap::new(),
             last_metrics: SpecFenceMetrics::default(),
             last_initial_wait_accounts: std::collections::HashSet::new(),
         }
@@ -203,10 +205,21 @@ impl Pevm {
         &self.last_initial_wait_accounts
     }
 
-    /// Clear inter-block heat (test / replay).
+    /// Clear inter-block heat and Bayesian posteriors (test / replay).
     pub fn reset_heat(&mut self) {
         self.heat.reset();
+        self.bayes.reset();
         self.last_initial_wait_accounts.clear();
+    }
+
+    /// Conflict probability for an account-level region (tests / diagnostics).
+    pub fn bayes_account_conflict_prob(&self, address: &alloy_primitives::Address) -> f64 {
+        self.bayes.account_wait_probability(address)
+    }
+
+    /// Conflict probability for a location hash (tests / diagnostics).
+    pub fn bayes_location_conflict_prob(&self, location: u64) -> f64 {
+        self.bayes.prior_wait_probability(location)
     }
 
     /// Execute an Alloy block, which is becoming the "standard" format in Rust.
@@ -289,9 +302,10 @@ impl Pevm {
         seed_wait_regions(
             &mv_memory.regions,
             &hints,
-            &self.heat,
+            &self.bayes,
             self.concurrency_mode,
             block_env.beneficiary,
+            DEFAULT_TAU,
             &mut initial_wait,
         );
 
@@ -303,6 +317,8 @@ impl Pevm {
             metrics: &metrics_inner,
             scheduler: &scheduler,
             beneficiary: block_env.beneficiary,
+            bayes: &self.bayes,
+            tau: DEFAULT_TAU,
         };
 
         // TODO: Better thread handling
@@ -341,10 +357,17 @@ impl Pevm {
             }
         });
 
-        if self.concurrency_mode.uses_regions() {
+        if self.concurrency_mode == ConcurrencyMode::Pcc {
             update_heat(&self.heat, &hints, &metrics_inner, block_env.beneficiary);
         }
-        self.last_metrics = metrics_inner.snapshot();
+        let mean_wait = if self.concurrency_mode == ConcurrencyMode::SpecFence {
+            update_bayes(&self.bayes);
+            self.bayes.take_mean_wait_posterior()
+        } else {
+            0.0
+        };
+        let wave_id = self.bayes.wave_id();
+        self.last_metrics = metrics_inner.snapshot(wave_id, mean_wait);
         self.last_initial_wait_accounts = initial_wait;
 
         if let Some(abort_reason) = self.abort_reason.take() {
@@ -551,6 +574,11 @@ fn try_validate(
     tx_version: &TxVersion,
     specfence: SpecFenceCtx<'_>,
 ) -> Option<Task> {
+    let read_locations = if specfence.mode == ConcurrencyMode::SpecFence {
+        mv_memory.read_locations(tx_version.tx_idx)
+    } else {
+        Vec::new()
+    };
     let invalid = if specfence.mode.uses_regions() {
         mv_memory.collect_invalid_reads(tx_version.tx_idx)
     } else {
@@ -569,18 +597,37 @@ fn try_validate(
         } else {
             Vec::new()
         };
+        // SpecFence v2: keep full write-set ESTIMATE for serial equivalence.
+        // Selective ESTIMATE (estimate only locations with higher readers; remove
+        // the rest) was tried and broke equivalence under concurrent readers that
+        // had not yet recorded a read set — see redesign-v2 note. Fence still
+        // confines the validation rewind.
         mv_memory.convert_writes_to_estimates(tx_version.tx_idx);
         // Always count validation aborts, including pure OCC. Region promotion
         // remains SpecFence/PCC-only.
         specfence.metrics.record_occ_abort();
         if specfence.mode.uses_regions() {
             for location in &invalid {
-                if mv_memory.regions.promote_location(*location) {
+                if specfence.mode == ConcurrencyMode::SpecFence {
+                    specfence.bayes.observe_conflict_location_always(*location);
+                    specfence.metrics.record_bayes_conflict();
+                    // Cold-start / inter-block seed uses account posteriors: bump any
+                    // hinted account whose Basic hash matches this invalid location.
+                    for address in specfence.hints.accounts() {
+                        if address == specfence.beneficiary {
+                            continue;
+                        }
+                        if hash_deterministic(MemoryLocation::Basic(address)) == *location {
+                            specfence.bayes.observe_conflict_account(address);
+                        }
+                    }
+                    specfence.promote_from_bayes(&mv_memory.regions, *location, None);
+                } else if mv_memory.regions.promote_location(*location) {
                     specfence.metrics.record_promotion(None);
                 }
             }
         }
-        // SpecFence v1: fence the validation cascade to dependent readers of the
+        // SpecFence: fence the validation cascade to dependent readers of the
         // aborted write set. Independent higher txs with disjoint reads are not
         // forced into the abort queue. Whole-tx re-execution of the aborted
         // incarnation remains (revm cannot partial-reexec a tx).
@@ -601,6 +648,21 @@ fn try_validate(
             };
             specfence.metrics.record_fence_cascade(cascade, skipped);
             return scheduler.finish_validation_fenced(tx_version, true, rewind_to);
+        }
+    } else if !aborted && specfence.mode == ConcurrencyMode::SpecFence && read_set_valid {
+        // Successful validation: reinforce Speculate on read locations that were
+        // not already forced to Wait for the rest of the block.
+        for location in &read_locations {
+            if *location
+                == hash_deterministic(MemoryLocation::Basic(specfence.beneficiary))
+            {
+                continue;
+            }
+            if mv_memory.regions.location_mode(*location) == crate::specfence::RegionMode::Wait {
+                continue;
+            }
+            specfence.bayes.observe_speculate_ok_location(*location);
+            specfence.metrics.record_bayes_success();
         }
     }
     scheduler.finish_validation(tx_version, aborted)

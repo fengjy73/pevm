@@ -191,6 +191,19 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if !self.specfence.mode.uses_regions() || address == self.specfence.beneficiary {
             return;
         }
+        // Intra-block Wait; at most one Bayes conflict obs per location per block
+        // (validation aborts still call observe_conflict_location_always).
+        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            if self.specfence.bayes.observe_conflict_location(location) {
+                self.specfence.metrics.record_bayes_conflict();
+                if address != self.specfence.beneficiary {
+                    self.specfence.bayes.observe_conflict_account_n(address, 3);
+                }
+            }
+            self.specfence
+                .promote_from_bayes(&self.mv_memory.regions, location, Some(address));
+            return;
+        }
         if self.mv_memory.regions.promote_location(location) {
             self.specfence.metrics.record_promotion(Some(address));
         }
@@ -198,7 +211,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.specfence.metrics.mark_hot(address);
     }
 
-    /// Proactive Wait: depend on the last lower-idx writer instead of a speculative read.
+    /// Proactive Wait at **location** granularity: block on last lower-idx writer
+    /// of that location. Account-hint prev is cold-start only when the location
+    /// has never been observed in the Bayesian map.
     fn maybe_wait(
         &self,
         address: Address,
@@ -210,17 +225,30 @@ impl<'a, S: Storage> VmDb<'a, S> {
         {
             return Ok(());
         }
-        if let Some(prev) =
-            self.specfence
-                .wait_blocker(&self.mv_memory.regions, &address, self.tx_idx)
-        {
-            self.specfence.metrics.record_wait(address);
-            return Err(ReadError::Blocking(prev));
-        }
+        // Prefer location-level last writer (region < tx).
         if let Some(prev) = self
             .mv_memory
             .last_writer_before(location_hash, self.tx_idx)
             && !self.specfence.scheduler.is_done(prev)
+        {
+            self.specfence.metrics.record_wait(address);
+            return Err(ReadError::Blocking(prev));
+        }
+        // Cold-start: location never seen → fall back to account hint predecessor.
+        if self.specfence.mode == crate::ConcurrencyMode::SpecFence
+            && !self.specfence.bayes.has_location(location_hash)
+        {
+            if let Some(prev) = self.specfence.hints.prev(&address, self.tx_idx)
+                && !self.specfence.scheduler.is_done(prev)
+            {
+                self.specfence.metrics.record_wait(address);
+                return Err(ReadError::Blocking(prev));
+            }
+            return Ok(());
+        }
+        if let Some(prev) =
+            self.specfence
+                .wait_blocker(&self.mv_memory.regions, &address, self.tx_idx)
         {
             self.specfence.metrics.record_wait(address);
             return Err(ReadError::Blocking(prev));
@@ -601,6 +629,20 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
     }
 
     fn promote_region(&self, location: MemoryLocationHash, address: Option<Address>) {
+        // WW contention → intra-block Wait; mild once-per-block Bayes conflict.
+        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            if self.specfence.bayes.observe_conflict_location(location) {
+                self.specfence.metrics.record_bayes_conflict();
+                if let Some(address) = address {
+                    if address != self.specfence.beneficiary {
+                        self.specfence.bayes.observe_conflict_account_n(address, 3);
+                    }
+                }
+            }
+            self.specfence
+                .promote_from_bayes(&self.mv_memory.regions, location, address);
+            return;
+        }
         if self.mv_memory.regions.promote_location(location) {
             self.specfence.metrics.record_promotion(address);
         }
@@ -616,7 +658,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
     fn promote_if_multi_writer(&self, address: Address, location: Option<MemoryLocationHash>) {
         // SpecFence v1: do not promote Wait from mere from/to writer_count hints.
         // Intra-block Wait comes from observed invalid locations / WW contention.
-        // Inter-block heat still seeds Wait via seed_wait_regions.
+        // Inter-block Bayes posteriors seed Wait via seed_wait_regions.
         if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
             return;
         }

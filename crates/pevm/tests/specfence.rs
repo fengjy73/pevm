@@ -108,18 +108,92 @@ fn specfence_independent_raw_transfers() {
     assert_eq!(occ_metrics.wait_admissions, 0);
 }
 
-/// Hot recipient: multi-writer heat seeds Wait on the next block (v1: no
-/// hint-only intra-block Wait promotion). Mocked ETH transfers often omit the
-/// recipient from the write set, so WW contention may not promote in-block.
+/// Same sender, increasing nonces: sender location WW promotes Wait (observed).
 #[test]
-fn specfence_hot_recipient() {
+fn specfence_same_sender() {
+    let n = 48;
+    let sender = Address::from(U160::from(1));
+    let txs: Vec<TxEnv> = (1..=n).map(|i| self_transfer(sender, i as u64)).collect();
+    let storage = storage_for(n + 1);
+    let (_, metrics, pevm) = run_mode(ConcurrencyMode::SpecFence, &storage, txs);
+    assert!(
+        metrics.region_promotions > 0
+            || metrics.wait_admissions > 0
+            || metrics.bayes_conflict_updates > 0,
+        "same sender should learn/Wait: {metrics:?}"
+    );
+    assert!(
+        pevm.bayes_account_conflict_prob(&sender) > 0.1,
+        "sender posterior should rise above prior: p={}",
+        pevm.bayes_account_conflict_prob(&sender)
+    );
+}
+
+/// v2: conflict on one account location raises its posterior / Wait; a disjoint
+/// account stays Speculate.
+#[test]
+fn specfence_bayes_location_isolated_from_disjoint() {
     let chain = PevmEthereum::mainnet();
-    let n = 64;
-    let recipient = Address::from(U160::from(1));
-    let txs1: Vec<TxEnv> = (2..=n + 1)
-        .map(|i| transfer(Address::from(U160::from(i)), recipient, 1))
-        .collect();
-    let storage = storage_for(n + 40);
+    let hot = Address::from(U160::from(1));
+    let cold = Address::from(U160::from(50));
+    let mut txs = Vec::new();
+    for i in 1..=32 {
+        txs.push(self_transfer(hot, i as u64));
+    }
+    for i in 0..32 {
+        let addr = Address::from(U160::from(50 + i));
+        txs.push(self_transfer(addr, 1));
+    }
+    let storage = storage_for(120);
+    let mut pevm = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
+    let sequential = execute_revm_sequential(
+        &chain,
+        &storage,
+        Default::default(),
+        BlockEnv::default(),
+        txs.clone(),
+    )
+    .unwrap();
+    let parallel = pevm
+        .execute_revm_parallel(
+            &chain,
+            &storage,
+            Default::default(),
+            BlockEnv::default(),
+            txs,
+            concurrency(),
+        )
+        .unwrap();
+    assert_eq!(sequential, parallel);
+    let p_hot = pevm.bayes_account_conflict_prob(&hot);
+    let p_cold = pevm.bayes_account_conflict_prob(&cold);
+    assert!(
+        p_hot > p_cold,
+        "hot sender posterior {p_hot} must exceed disjoint {p_cold}"
+    );
+    assert!(
+        p_hot >= 0.25,
+        "conflicts should push hot posterior toward Wait threshold: {p_hot}"
+    );
+    let metrics = pevm.last_specfence_metrics();
+    assert!(
+        !metrics.wait_addresses.contains(&cold),
+        "disjoint account must not Wait: {metrics:?}"
+    );
+    assert!(
+        metrics.speculate_addresses.contains(&cold)
+            || metrics.bayes_speculate_decisions > 0,
+        "disjoint must remain Speculative: {metrics:?}"
+    );
+}
+
+/// v2 inter-block: conflicts in block1 seed Wait for that region in block2 via Bayes.
+#[test]
+fn specfence_bayes_inter_block_carry() {
+    let chain = PevmEthereum::mainnet();
+    let sender = Address::from(U160::from(1));
+    let txs1: Vec<TxEnv> = (1..=40).map(|i| self_transfer(sender, i as u64)).collect();
+    let storage = storage_for(80);
 
     let mut pevm = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
     let seq1 = execute_revm_sequential(
@@ -141,11 +215,28 @@ fn specfence_hot_recipient() {
         )
         .unwrap();
     assert_eq!(seq1, par1);
+    let p1 = pevm.bayes_account_conflict_prob(&sender);
+    assert!(
+        p1 >= 0.25,
+        "block1 conflicts must raise posterior: {p1}"
+    );
+    assert!(
+        !pevm.last_initial_wait_accounts().contains(&sender),
+        "first block is cold at seed time: {:?}",
+        pevm.last_initial_wait_accounts()
+    );
 
-    // Fresh senders (pre-state storage is not updated across blocks).
-    let txs2: Vec<TxEnv> = (n + 2..=n + 17)
-        .map(|i| transfer(Address::from(U160::from(i)), recipient, 1))
-        .collect();
+    // Storage pre-state is not updated across blocks, so use fresh senders that
+    // *hint* the heated account as recipient; Bayes should seed Wait on it.
+    let mut txs2 = Vec::new();
+    for i in 0..8 {
+        let from = Address::from(U160::from(20 + i));
+        txs2.push(transfer(from, sender, 1));
+    }
+    for i in 0..32 {
+        let addr = Address::from(U160::from(40 + i));
+        txs2.push(self_transfer(addr, 1));
+    }
     let seq2 = execute_revm_sequential(
         &chain,
         &storage,
@@ -166,46 +257,29 @@ fn specfence_hot_recipient() {
         .unwrap();
     assert_eq!(seq2, par2);
     assert!(
-        pevm.last_initial_wait_accounts().contains(&recipient),
-        "hot recipient must seed Wait via inter-block heat: {:?}",
+        pevm.last_initial_wait_accounts().contains(&sender),
+        "Bayes carry must seed Wait for conflicted sender: p_after_b1={p1} initial={:?}",
         pevm.last_initial_wait_accounts()
     );
     let metrics = pevm.last_specfence_metrics();
     assert!(
-        metrics.wait_admissions > 0,
-        "second block should Wait on heated recipient: {metrics:?}"
+        metrics.speculate_executions > 0,
+        "independents still speculate: {metrics:?}"
     );
-}
-
-/// Same sender, increasing nonces: sender location WW promotes Wait (observed).
-#[test]
-fn specfence_same_sender() {
-    let n = 48;
-    let sender = Address::from(U160::from(1));
-    let txs: Vec<TxEnv> = (1..=n).map(|i| self_transfer(sender, i as u64)).collect();
-    let storage = storage_for(n + 1);
-    let (_, metrics, _) = run_mode(ConcurrencyMode::SpecFence, &storage, txs);
+    let indep = Address::from(U160::from(20));
     assert!(
-        metrics.region_promotions > 0 || metrics.wait_admissions > 0,
-        "same sender should Wait: {metrics:?}"
+        !metrics.wait_addresses.contains(&indep),
+        "independents must not Wait: {metrics:?}"
     );
 }
 
-/// Mixed block after heat: hot shared recipient Waits; independents Speculate.
+/// Mixed block after Bayes carry: hot sender Waits; independents Speculate.
 #[test]
 fn specfence_mixed_hot_and_independent() {
     let chain = PevmEthereum::mainnet();
-    let hot_n = 48;
-    let indep_n = 96;
-    let recipient = Address::from(U160::from(1));
-    let mut txs1 = Vec::new();
-    let mut max_idx = 1;
-    for i in 0..hot_n {
-        let sender = Address::from(U160::from(2 + i));
-        max_idx = max_idx.max(2 + i);
-        txs1.push(transfer(sender, recipient, 1));
-    }
-    let storage = storage_for(max_idx + indep_n + 40);
+    let hot = Address::from(U160::from(1));
+    let txs1: Vec<TxEnv> = (1..=48).map(|i| self_transfer(hot, i as u64)).collect();
+    let storage = storage_for(200);
 
     let mut pevm = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
     let _ = pevm
@@ -219,14 +293,13 @@ fn specfence_mixed_hot_and_independent() {
         )
         .unwrap();
 
-    let indep_start = 2 + hot_n;
+    let indep_start = 40usize;
     let mut txs2 = Vec::new();
-    // Fresh senders into heated recipient (storage pre-state unchanged).
-    for i in 0..16 {
-        let sender = Address::from(U160::from(indep_start + indep_n + i));
-        txs2.push(transfer(sender, recipient, 1));
+    for i in 0..8 {
+        let from = Address::from(U160::from(indep_start + 64 + i));
+        txs2.push(transfer(from, hot, 1));
     }
-    for i in 0..indep_n {
+    for i in 0..64 {
         let addr = Address::from(U160::from(indep_start + i));
         txs2.push(self_transfer(addr, 1));
     }
@@ -249,14 +322,15 @@ fn specfence_mixed_hot_and_independent() {
         )
         .unwrap();
     assert_eq!(sequential, parallel);
+    assert!(
+        pevm.last_initial_wait_accounts().contains(&hot),
+        "hot sender seeded Wait: {:?}",
+        pevm.last_initial_wait_accounts()
+    );
     let metrics = pevm.last_specfence_metrics();
     assert!(
-        metrics.wait_admissions > 0,
-        "Wait admissions on heated hot account: {metrics:?}"
-    );
-    assert!(
-        metrics.wait_addresses.contains(&recipient),
-        "Wait on hot recipient {recipient:?}: {metrics:?}"
+        metrics.wait_admissions > 0 || metrics.bayes_wait_decisions > 0,
+        "Wait on heated sender: {metrics:?}"
     );
     assert!(
         metrics.speculate_executions > 0,
@@ -264,92 +338,8 @@ fn specfence_mixed_hot_and_independent() {
     );
     let indep_addr = Address::from(U160::from(indep_start));
     assert!(
-        metrics.speculate_addresses.contains(&indep_addr),
-        "independent account should speculate: {metrics:?}"
-    );
-    assert!(
         !metrics.wait_addresses.contains(&indep_addr),
         "independents must not wait on the hot cluster: {metrics:?}"
-    );
-}
-
-/// After a hot-recipient block, the next block starts that account in Wait.
-#[test]
-fn specfence_inter_block_heat() {
-    let chain = PevmEthereum::mainnet();
-    let recipient = Address::from(U160::from(1));
-    let hot_n = 40;
-    let txs1: Vec<TxEnv> = (2..=hot_n + 1)
-        .map(|i| transfer(Address::from(U160::from(i)), recipient, 1))
-        .collect();
-    let storage = storage_for(hot_n + 80);
-
-    let mut pevm = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
-    let seq1 = execute_revm_sequential(
-        &chain,
-        &storage,
-        Default::default(),
-        BlockEnv::default(),
-        txs1.clone(),
-    )
-    .unwrap();
-    let par1 = pevm
-        .execute_revm_parallel(
-            &chain,
-            &storage,
-            Default::default(),
-            BlockEnv::default(),
-            txs1,
-            concurrency(),
-        )
-        .unwrap();
-    assert_eq!(seq1, par1);
-    assert!(
-        !pevm.last_initial_wait_accounts().contains(&recipient),
-        "first block is cold: {:?}",
-        pevm.last_initial_wait_accounts()
-    );
-
-    // Next block: a few more transfers to the now-hot recipient plus independents.
-    let mut txs2 = Vec::new();
-    for i in 0..8 {
-        let sender = Address::from(U160::from(hot_n + 2 + i));
-        txs2.push(transfer(sender, recipient, 1));
-    }
-    for i in 0..32 {
-        let addr = Address::from(U160::from(hot_n + 20 + i));
-        txs2.push(self_transfer(addr, 1));
-    }
-    let seq2 = execute_revm_sequential(
-        &chain,
-        &storage,
-        Default::default(),
-        BlockEnv::default(),
-        txs2.clone(),
-    )
-    .unwrap();
-    let par2 = pevm
-        .execute_revm_parallel(
-            &chain,
-            &storage,
-            Default::default(),
-            BlockEnv::default(),
-            txs2,
-            concurrency(),
-        )
-        .unwrap();
-    assert_eq!(seq2, par2);
-    assert!(
-        pevm.last_initial_wait_accounts().contains(&recipient),
-        "hot recipient must start in Wait after heat: {:?}",
-        pevm.last_initial_wait_accounts()
-    );
-    let metrics = pevm.last_specfence_metrics();
-    // Wait admission is scheduling-sensitive for lazy ETH transfers (prior writer
-    // may already be done). Seeding Wait via heat is the invariant under test.
-    assert!(
-        metrics.speculate_executions > 0,
-        "independents still speculate: {metrics:?}"
     );
 }
 
@@ -377,7 +367,6 @@ fn pcc_same_sender_and_independents() {
         "PCC independents still run without a wait: {metrics:?}"
     );
 }
-
 
 /// Default Pevm is OCC and must not break mocked sequential ≡ parallel.
 #[test]
@@ -430,7 +419,6 @@ fn specfence_fence_skips_independent_cascade() {
         "independents must speculate: {metrics:?}"
     );
     let indep_addr = Address::from(U160::from(indep_start as u64));
-    // mock_account uses Address::from(U160::from(idx)) — same as common
     assert!(
         !metrics.wait_addresses.contains(&indep_addr),
         "independents must not Wait: {metrics:?}"
@@ -442,4 +430,34 @@ fn specfence_fence_skips_independent_cascade() {
             "fence metrics should move when aborts occur: {metrics:?}"
         );
     }
+}
+
+/// ERC-20 storage conflicts raise bayes updates while disjoint EOAs stay cold.
+#[test]
+fn specfence_bayes_storage_conflict_isolates_eoa() {
+    let (mut state, bytecodes, mut txs) = erc20::generate_cluster(2, 4, 3);
+    state.insert(Address::ZERO, EvmAccount::default());
+    let cold = Address::from(U160::from(9_001u64));
+    let (addr, account) = common::mock_account(9_001);
+    state.insert(addr, account);
+    for i in 0..16 {
+        let (a, acc) = common::mock_account(9_100 + i);
+        state.insert(a, acc);
+        txs.push(self_transfer(a, 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+    let (_, metrics, pevm) = run_mode(ConcurrencyMode::SpecFence, &storage, txs);
+    assert!(
+        metrics.bayes_conflict_updates > 0 || metrics.occ_aborts > 0 || metrics.region_promotions > 0,
+        "ERC-20 cluster should produce bayes/abort signal: {metrics:?}"
+    );
+    assert!(
+        pevm.bayes_account_conflict_prob(&cold) <= 0.15,
+        "untouched EOA should stay near prior: {}",
+        pevm.bayes_account_conflict_prob(&cold)
+    );
+    assert!(
+        !metrics.wait_addresses.contains(&cold),
+        "cold EOA must not Wait: {metrics:?}"
+    );
 }

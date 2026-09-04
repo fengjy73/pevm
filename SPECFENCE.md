@@ -22,7 +22,7 @@ A transaction may touch many regions. Conflict on a subset of regions of txs 1�
 
 ## Closed loop (same block)
 
-1. **Predict / avoid** — inter-block heat and hints seed an initial wave plan (hot regions more likely Wait).
+1. **Predict / avoid** — inter-block Bayesian posteriors (and hints for cold-start) seed Wait vs Speculate per region.
 2. **Speculate** on uncertain / cold regions (OCC-style).
 3. **Detect** conflicts from exact RW version origins at validation time.
 4. **Confirm dependencies** and update the live region dependency graph.
@@ -49,17 +49,23 @@ SpecFence discovers the true DAG **during** execution and dynamically fuses opti
 
 ## Hooks
 
-- `crates/pevm/src/specfence/` — heat, region table, metrics; wave/repair/local validation to be expanded.
+- `crates/pevm/src/specfence/` — bayes, region table, metrics, cascade fence; wave/repair/local validation to be expanded.
 - `scheduler.rs` / `mv_memory.rs` / `vm.rs` / `pevm.rs` — admission, validation, abort accounting.
 
-## SpecFence v1 status (this branch)
+## SpecFence v2 status (this branch)
 
-Incremental step toward the redesign (see `lab/notes/specfence-redesign-v1.md`):
+See `lab/notes/specfence-redesign-v2.md` for equations and remaining gaps.
 
-- **OCC abort metrics** instrumented for all modes (`occ_aborts` counts successful validation aborts).
-- **Validation cascade fence** (SpecFence only): on abort, rewind `validation_idx` to the first higher tx that read an aborted write — not blindly `aborted_idx+1` for the whole suffix. Metrics: `cascade_validations_scheduled`, `independent_txs_skipped_by_fence`.
-- **Hint-only Wait promotion gated** in SpecFence; Wait still seeds from inter-block heat and from **observed** invalid / WW locations.
-- Still **whole-tx** re-execution on abort (revm); ESTIMATE still covers the aborted write set. Not yet region-local repair / wave re-form.
+- **Unit of control**: `MemoryLocationHash` (slot/Basic/CodeHash), not whole-tx.
+- **Bayesian feedback**: Beta-Bernoulli `(α,β)` per region; `observe_conflict` / `observe_speculate_ok`; inter-block decay; `decide` with `τ≈0.30`. EWMA heat subsumed for SpecFence decisions (PCC stays conservative).
+- **Location Wait**: `vm` blocks on `last_writer_before(location)`; one tx can Wait on A and Speculate on B.
+- **Validation feedback**: invalid reads → conflict update + Wait promotion + `wave_id` bump; successful validate → success update.
+- **ESTIMATE**: full write-set ESTIMATE kept for serial equivalence (selective higher-reader ESTIMATE prototyped, unsafe under concurrent unrecorded readers).
+- **Cascade fence** retained as correctness shield.
+- Still **whole-tx** re-exec on abort (revm). Not yet partial reexec / full wave DAG.
+
+Metrics: `bayes_wait_decisions`, `bayes_speculate_decisions`, `bayes_conflict_updates`,
+`bayes_success_updates`, `wave_promotions`, `mean_wait_posterior`, plus fence/OCC counters.
 
 ## Lab
 
@@ -68,5 +74,5 @@ See `lab/README.md`. Mainnet multi-core sweeps and VLDB-style TPS / abort figure
 ```sh
 cargo test -p pevm --release --config 'profile.release.lto=false' --test specfence -- --test-threads=1
 cargo run -p pevm --release --config 'profile.release.lto=false' --example specfence_mainnet_sweep -- \
-  --out lab/results/mainnet-sweep.json
+  --out lab/results/mainnet-sweep-v3.json
 ```

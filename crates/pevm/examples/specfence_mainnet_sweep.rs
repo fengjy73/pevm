@@ -44,6 +44,12 @@ struct RunRow {
     region_promotions: usize,
     cascade_validations_scheduled: usize,
     independent_txs_skipped_by_fence: usize,
+    bayes_wait_decisions: usize,
+    bayes_speculate_decisions: usize,
+    bayes_conflict_updates: usize,
+    bayes_success_updates: usize,
+    wave_promotions: usize,
+    mean_wait_posterior: f64,
     ok: bool,
     error: Option<String>,
 }
@@ -171,6 +177,16 @@ fn measure(
                 } else {
                     m.independent_txs_skipped_by_fence
                 },
+                bayes_wait_decisions: if sequential { 0 } else { m.bayes_wait_decisions },
+                bayes_speculate_decisions: if sequential {
+                    0
+                } else {
+                    m.bayes_speculate_decisions
+                },
+                bayes_conflict_updates: if sequential { 0 } else { m.bayes_conflict_updates },
+                bayes_success_updates: if sequential { 0 } else { m.bayes_success_updates },
+                wave_promotions: if sequential { 0 } else { m.wave_promotions },
+                mean_wait_posterior: if sequential { 0.0 } else { m.mean_wait_posterior },
                 ok: true,
                 error: None,
             }
@@ -191,6 +207,12 @@ fn measure(
             region_promotions: 0,
             cascade_validations_scheduled: 0,
             independent_txs_skipped_by_fence: 0,
+            bayes_wait_decisions: 0,
+            bayes_speculate_decisions: 0,
+            bayes_conflict_updates: 0,
+            bayes_success_updates: 0,
+            wave_promotions: 0,
+            mean_wait_posterior: 0.0,
             ok: false,
             error: Some(format!("{err:?}")),
         },
@@ -286,6 +308,12 @@ fn main() {
                 "region_promotions": r.region_promotions,
                 "cascade_validations_scheduled": r.cascade_validations_scheduled,
                 "independent_txs_skipped_by_fence": r.independent_txs_skipped_by_fence,
+                "bayes_wait_decisions": r.bayes_wait_decisions,
+                "bayes_speculate_decisions": r.bayes_speculate_decisions,
+                "bayes_conflict_updates": r.bayes_conflict_updates,
+                "bayes_success_updates": r.bayes_success_updates,
+                "wave_promotions": r.wave_promotions,
+                "mean_wait_posterior": r.mean_wait_posterior,
                 "ok": r.ok,
                 "error": r.error,
             })

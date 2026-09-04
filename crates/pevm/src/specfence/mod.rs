@@ -1,10 +1,11 @@
-//! `SpecFence`: adaptive region/wave concurrency control (v1 WIP).
+//! `SpecFence`: adaptive region/wave concurrency control (v2).
 //!
-//! Cold regions Speculate (OCC). Hot regions may Wait after **observed**
-//! conflicts or inter-block heat — not from hint-only multi-writer promotion.
-//! On validation abort, SpecFence fences the validation cascade to higher txs
-//! that actually read the aborted writes (see `finish_validation_fenced`).
-//! Whole-tx re-execution remains; region-local repair is future work.
+//! Control unit = memory location / slot-level region
+//! (`MemoryLocation::{Basic, CodeHash, Storage}`), not whole-tx.
+//! Bayesian Beta-Bernoulli posteriors predict Wait vs Speculate per region;
+//! validation/abort/success observations update posteriors across waves and
+//! blocks. Cascade fence is a correctness shield only — not the decision rule.
+//! Whole-tx re-execution remains (revm); region-local repair is future work.
 
 use crate::{
     BuildSuffixHasher, MemoryLocation, TxIdx, chain::PevmChain, hash_deterministic,
@@ -13,10 +14,12 @@ use crate::{
 use alloy_primitives::Address;
 use hashbrown::HashMap;
 
+mod bayes;
 mod heat;
 mod metrics;
 mod region;
 
+pub(crate) use bayes::{BayesMap, DEFAULT_TAU};
 pub(crate) use heat::HeatMap;
 pub(crate) use metrics::MetricsInner;
 pub use metrics::SpecFenceMetrics;
@@ -34,7 +37,7 @@ pub enum ConcurrencyMode {
     Occ,
     /// Conservative PCC: hinted `from`/`to` accounts start in Wait.
     Pcc,
-    /// Mixed Wait/Speculate at region granularity.
+    /// Mixed Wait/Speculate at **location** granularity with Bayesian feedback.
     SpecFence,
 }
 
@@ -95,6 +98,8 @@ pub(crate) struct SpecFenceCtx<'a> {
     pub metrics: &'a MetricsInner,
     pub scheduler: &'a Scheduler,
     pub beneficiary: Address,
+    pub bayes: &'a BayesMap,
+    pub tau: f64,
 }
 
 impl<'a> SpecFenceCtx<'a> {
@@ -102,9 +107,25 @@ impl<'a> SpecFenceCtx<'a> {
         if !self.mode.uses_regions() || *address == self.beneficiary {
             return false;
         }
-        self.mode == ConcurrencyMode::Pcc || regions.account_mode(address) == RegionMode::Wait
+        if self.mode == ConcurrencyMode::Pcc {
+            return true;
+        }
+        // SpecFence: account Wait only as cold-start / seeded Basic proxy.
+        if regions.account_mode(address) == RegionMode::Wait {
+            return true;
+        }
+        if self.bayes.decide_account(address, self.tau) == RegionMode::Wait {
+            self.metrics.record_bayes_wait();
+            self.bayes.note_wait_decision_account(address);
+            true
+        } else {
+            self.metrics.record_bayes_speculate();
+            false
+        }
     }
 
+    /// Location-granularity Wait: region table promotion, else bayes on that
+    /// location hash, else address-level cold-start posterior.
     pub(crate) fn should_wait_location(
         &self,
         regions: &RegionTable,
@@ -114,10 +135,35 @@ impl<'a> SpecFenceCtx<'a> {
         if !self.mode.uses_regions() || *address == self.beneficiary {
             return false;
         }
-        self.mode == ConcurrencyMode::Pcc || regions.should_wait(location, address)
+        if self.mode == ConcurrencyMode::Pcc {
+            return true;
+        }
+        if regions.location_mode(location) == RegionMode::Wait {
+            return true;
+        }
+        // Once the location has its own posterior, do **not** inherit whole-account Wait.
+        if self.bayes.has_location(location) {
+            if self.bayes.decide(location, Some(address), self.tau) == RegionMode::Wait {
+                self.metrics.record_bayes_wait();
+                self.bayes.note_wait_decision(location, Some(address));
+                true
+            } else {
+                self.metrics.record_bayes_speculate();
+                false
+            }
+        } else if regions.account_mode(address) == RegionMode::Wait {
+            true
+        } else if self.bayes.decide(location, Some(address), self.tau) == RegionMode::Wait {
+            self.metrics.record_bayes_wait();
+            self.bayes.note_wait_decision(location, Some(address));
+            true
+        } else {
+            self.metrics.record_bayes_speculate();
+            false
+        }
     }
 
-    /// Proactive PCC: previous hinted writer that has not finished this incarnation.
+    /// Proactive PCC / cold-start: previous hinted writer that has not finished.
     pub(crate) fn wait_blocker(
         &self,
         regions: &RegionTable,
@@ -134,15 +180,33 @@ impl<'a> SpecFenceCtx<'a> {
             Some(prev)
         }
     }
+
+    /// Promote location to Wait for the rest of the block; bump wave on new flip.
+    pub(crate) fn promote_from_bayes(
+        &self,
+        regions: &RegionTable,
+        location: crate::MemoryLocationHash,
+        address: Option<Address>,
+    ) -> bool {
+        if regions.promote_location(location) {
+            self.metrics.record_promotion(address);
+            self.metrics.record_wave_promotion();
+            self.bayes.bump_wave();
+            true
+        } else {
+            false
+        }
+    }
 }
 
-/// Seed Wait from PCC (all hinted accounts) or `SpecFence` inter-block heat.
+/// Seed Wait from PCC (all hinted accounts) or SpecFence Bayesian posteriors.
 pub(crate) fn seed_wait_regions(
     regions: &RegionTable,
     hints: &AccountHints,
-    heat: &HeatMap,
+    bayes: &BayesMap,
     mode: ConcurrencyMode,
     beneficiary: Address,
+    tau: f64,
     initial_wait: &mut std::collections::HashSet<Address>,
 ) {
     if !mode.uses_regions() {
@@ -152,7 +216,8 @@ pub(crate) fn seed_wait_regions(
         if address == beneficiary {
             continue;
         }
-        let wait = mode == ConcurrencyMode::Pcc || heat.is_hot(&address);
+        let wait = mode == ConcurrencyMode::Pcc
+            || bayes.decide_account(&address, tau) == RegionMode::Wait;
         if wait {
             regions.seed_account_wait(address);
             regions.promote_location(hash_deterministic(MemoryLocation::Basic(address)));
@@ -161,7 +226,7 @@ pub(crate) fn seed_wait_regions(
     }
 }
 
-/// Apply bounded EWMA updates from this block's contended / multi-writer accounts.
+/// Apply bounded EWMA updates (PCC / legacy heat path). SpecFence uses Bayes.
 pub(crate) fn update_heat(
     heat: &HeatMap,
     hints: &AccountHints,
@@ -178,4 +243,9 @@ pub(crate) fn update_heat(
             heat.observe(address);
         }
     }
+}
+
+/// End-of-block Bayesian maintenance for SpecFence.
+pub(crate) fn update_bayes(bayes: &BayesMap) {
+    bayes.decay_block();
 }
