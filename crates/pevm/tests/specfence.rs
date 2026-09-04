@@ -3,12 +3,13 @@
 use std::{fmt::Debug, num::NonZeroUsize, sync::Arc, thread};
 
 use pevm::{
-    ConcurrencyMode, EvmAccount, InMemoryStorage, Pevm, PevmTxExecutionResult, Storage,
-    chain::PevmEthereum, execute_revm_sequential,
+    Bytecodes, ChainState, ConcurrencyMode, EvmAccount, InMemoryStorage, Pevm,
+    PevmTxExecutionResult, Storage, chain::PevmEthereum, execute_revm_sequential,
 };
 use revm::{
     context::{BlockEnv, TransactTo, TxEnv},
-    primitives::{Address, U256, alloy_primitives::U160},
+    primitives::{Address, Bytes, U256, alloy_primitives::U160},
+    state::Bytecode,
 };
 
 pub mod common;
@@ -975,40 +976,109 @@ fn specfence_m1d_live_inspect_resume_skips_prefix_opcodes() {
     );
 }
 
-/// M1e: RewindTo resume records absolute_jump_fallback (default production path
-/// keeps lite cps; live snap+blob+jump is opt-in via SPECFENCE_ABSOLUTE_JUMP to
-/// avoid conflict-schedule livelock). Still proves skip credit + M1b FF +
-/// inspector_steps_resume < cold equivalent. sequential ≡ parallel via run_mode.
+
+
+
+
+
+/// M1f: default path applies absolute PC jump when `jump_is_safe` (no env needed).
+/// Balance-probe contract (BALANCE-only, no storage) + writers to the same hot
+/// account yield Basic-only certified prefixes with live inspect snaps — the
+/// default-safe jump set. Proves `absolute_jump_applied > 0` + seq≡par via run_mode.
+/// `SPECFENCE_ABSOLUTE_JUMP=0` remains available to force-disable for debugging.
 #[test]
-fn specfence_m1e_absolute_jump_or_safe_fallback() {
-    let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 10, 5);
-    state.insert(Address::ZERO, EvmAccount::default());
+fn specfence_m1f_default_absolute_jump_seq_eq_par() {
+    let hot = Address::from(U160::from(42));
+    let probe = Address::from(U160::from(99));
+
+    // CALLER; BALANCE; POP then PUSH20 hot; BALANCE; POP ×7 ; STOP.
+    // Prefix CALLER balance creates effect k=1 before hot conflict so RewindTo
+    // live-tip can land at k>=1 with jump_snap (k_fail is later).
+    let mut code = Vec::new();
+    code.push(0x33); // CALLER
+    code.push(0x31); // BALANCE
+    code.push(0x50); // POP
+    for _ in 0..7 {
+        code.push(0x73); // PUSH20
+        code.extend_from_slice(hot.as_slice());
+        code.push(0x31); // BALANCE
+        code.push(0x50); // POP
+    }
+    code.push(0x00); // STOP
+    let bytecode = Bytecode::new_raw(Bytes::from(code));
+    let code_hash = bytecode.hash_slow();
+
+    let mut state = (0..=60_000).map(common::mock_account).collect::<ChainState>();
+    state.insert(
+        probe,
+        EvmAccount {
+            balance: U256::from(1),
+            nonce: 1,
+            code_hash: Some(code_hash),
+            code: Some(bytecode.clone().into()),
+            storage: Default::default(),
+        },
+    );
+    // Ensure hot exists with balance for BALANCE / transfers.
+    state.entry(hot).or_insert_with(|| {
+        let (_, acc) = common::mock_account(42);
+        acc
+    });
+
+    let mut bytecodes = Bytecodes::default();
+    bytecodes.insert(code_hash, bytecode.into());
+
+    let mut txs: Vec<TxEnv> = Vec::new();
+    // Writers: bump Basic(hot).
+    for i in 0..24 {
+        let from = Address::from(U160::from(1_000 + i));
+        txs.push(transfer(from, hot, 1));
+    }
+    // Readers: probe BALANCE(hot) — Basic-only contract work + live Inspector steps.
+    for i in 0..24 {
+        let from = Address::from(U160::from(2_000 + i));
+        txs.push(TxEnv {
+            caller: from,
+            nonce: 1,
+            kind: TransactTo::Call(probe),
+            gas_limit: 100_000,
+            gas_price: 1,
+            ..TxEnv::default()
+        });
+    }
     for i in 0..48 {
-        let (addr, account) = common::mock_account(93_000 + i);
-        state.insert(addr, account);
-        txs.push(self_transfer(addr, 1));
+        txs.push(self_transfer(Address::from(U160::from(50_000 + i)), 1));
     }
     let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
 
+    assert!(
+        std::env::var_os("SPECFENCE_ABSOLUTE_JUMP").is_none(),
+        "M1f integration must run with absolute jump default-on (env unset)"
+    );
+
     let mut saw = false;
     let mut last = None;
-    for _ in 0..12 {
+    for _ in 0..20 {
         let (_, m, _) = run_mode(ConcurrencyMode::SpecFence, &storage, txs.clone());
         last = Some(m.clone());
         if m.rewind_to_cp > 0 && m.resume_count > 0 && m.inspector_steps > 0 {
             saw = true;
-            assert_eq!(m.tx_head_reexec, 0, "M1e must not head-reexec: {m:?}");
+            assert_eq!(m.tx_head_reexec, 0, "M1f must not head-reexec: {m:?}");
             assert!(
                 m.journal_ff_hits > 0,
-                "M1e must not regress M1b FF hits: {m:?}"
+                "M1f must not regress M1b FF hits: {m:?}"
             );
             assert!(
                 m.pc_resume_count > 0 && m.prefix_opcodes_skipped > 0,
-                "M1e must credit prefix skip: {m:?}"
+                "M1f must credit prefix skip: {m:?}"
             );
             assert!(
-                m.absolute_jump_fallback > 0,
-                "M1e default path records absolute_jump_fallback (jump opt-in): {m:?}"
+                m.absolute_jump_applied > 0,
+                "M1f default path must apply absolute jump when jump_is_safe: {m:?}"
+            );
+            assert!(
+                m.live_pc_resume_count > 0,
+                "applied jump must count live PC resume: {m:?}"
             );
             let cold_equiv = m
                 .inspector_steps_resume
@@ -1024,6 +1094,6 @@ fn specfence_m1e_absolute_jump_or_safe_fallback() {
     }
     assert!(
         saw,
-        "M1e expected RewindTo+resume with inspect steps: {last:?}"
+        "M1f expected RewindTo+resume with inspect steps: {last:?}"
     );
 }

@@ -8,8 +8,11 @@
 //!    credit-only / non-jump resume (never livelock)
 //!
 //! M1d: production SpecFence uses stock `inspect_run`.
-//! M1e: production `arm_pc_resume` gated by [`jump_is_safe`] + journal-blob restore.
-//! Nested mid-CALL (call_depth > 1) still falls back — CallOutcome cache TODO.
+//! M1e: journal-blob FF + safety-gated absolute PC jump (opt-in).
+//! M1f: absolute jump **default-on** when [`jump_is_safe`]; restore MemoryGas +
+//! gas refunds so post-jump expansion/refunds ≡ sequential prefix. Nested CALL
+//! (call_depth > 1) still falls back — CallOutcome cache TODO.
+//! Disable with `SPECFENCE_ABSOLUTE_JUMP=0`.
 
 #![allow(dead_code)]
 
@@ -60,6 +63,13 @@ impl JournalBlob {
 pub(crate) struct BoundarySnapshot {
     pub pc: usize,
     pub gas_remaining: u64,
+    /// Interpreter gas refund accumulator at capture (SSTORE refunds etc.).
+    pub gas_refunded: i64,
+    /// `Gas::memory().words_num` — must restore or post-jump MLOAD/MSTORE
+    /// re-charges full expansion from 0 and breaks gas ≡ sequential.
+    pub memory_words: usize,
+    /// `Gas::memory().expansion_cost` paired with `memory_words`.
+    pub memory_expansion_cost: u64,
     pub call_depth: u16,
     /// Cumulative interpreter steps at capture (honest skip credit on resume).
     pub opcode_steps: u64,
@@ -79,9 +89,13 @@ impl BoundarySnapshot {
     ) -> Self {
         let bytecode_len = interp.bytecode.bytecode_slice().len();
         let code_hash = Some(interp.bytecode.get_or_calculate_hash());
+        let mem_gas = *interp.gas.memory();
         Self {
             pc: interp.bytecode.pc(),
             gas_remaining: interp.gas.remaining(),
+            gas_refunded: interp.gas.refunded(),
+            memory_words: mem_gas.words_num,
+            memory_expansion_cost: mem_gas.expansion_cost,
             call_depth,
             opcode_steps,
             stack: interp.stack.data().to_vec(),
@@ -94,17 +108,29 @@ impl BoundarySnapshot {
     pub(crate) fn apply_to_interp(&self, interp: &mut Interpreter<EthInterpreter>) {
         interp.bytecode.absolute_jump(self.pc);
         interp.gas.set_remaining(self.gas_remaining);
+        interp.gas.set_refund(self.gas_refunded);
+        // Critical (M1f): sync MemoryGas with restored memory length. Leaving
+        // words_num=0 after copying memory bytes makes the next memory op pay
+        // full expansion from zero → OOG / wrong gas_used / seq≠par.
+        let words = if self.memory_words > 0 {
+            self.memory_words
+        } else {
+            self.memory.len().div_ceil(32)
+        };
+        let mg = interp.gas.memory_mut();
+        mg.words_num = words;
+        mg.expansion_cost = self.memory_expansion_cost;
         interp.stack.clear();
         for v in &self.stack {
             let _ = interp.stack.push(*v);
         }
-        let need = self.memory.len();
+        let need = self.memory.len().max(words.saturating_mul(32));
         if interp.memory.len() < need {
             interp.memory.resize(need);
         }
-        if need > 0 {
+        if !self.memory.is_empty() {
             let mut mem = interp.memory.context_memory_mut();
-            let n = need.min(mem.len());
+            let n = self.memory.len().min(mem.len());
             mem[..n].copy_from_slice(&self.memory[..n]);
         }
     }
@@ -120,11 +146,11 @@ impl BoundarySnapshot {
     }
 }
 
-/// M1e safety gate: when true, production may `arm_pc_resume` + restore journal blob.
+/// M1f safety gate: when true, production may absolute-jump PC on RewindTo resume.
 ///
-/// Requires live capture, top-level frame (call_depth ≤ 1), in-range PC, certified
-/// prefix, and a journal blob whenever the prefix contains writes (so post-jump
-/// world-state ≡ sequential prefix without re-running SSTORE).
+/// Live capture, depth≤1, in-range PC, non-empty read-only prefix with ≥1 Basic FF
+/// and **no Storage FF**. Storage jumps livelock; write prefixes need blob FF.
+/// Restore PC/stack/memory/MemoryGas only — never journal blob (poisons pevm Db).
 pub(crate) fn jump_is_safe(cont: &ResumeContinuation) -> bool {
     let Some(snap) = cont.jump_snap.as_ref() else {
         return false;
@@ -132,27 +158,59 @@ pub(crate) fn jump_is_safe(cont: &ResumeContinuation) -> bool {
     if !snap.is_live_capture() {
         return false;
     }
-    // Nested CALL frames: fall back (CallOutcome cache TODO).
     if snap.call_depth > 1 {
         return false;
     }
     if snap.bytecode_len > 0 && snap.pc >= snap.bytecode_len {
         return false;
     }
-    // Empty / synthetic-only prefix — nothing to jump over safely.
+    // Cap bytecode size: ERC-20-scale contracts can have Basic-only certified
+    // prefixes mid-frame; absolute jump there still livelocks under pevm MV.
+    // Balance-probe / tiny contracts (≤256 bytes) are the default-safe set.
+    if snap.bytecode_len > 256 {
+        return false;
+    }
     if cont.cp.k == 0 && cont.effects.is_empty() && snap.opcode_steps == 0 {
         return false;
     }
-    // Always require a journal blob (state + logs). Jumping without it drops
-    // prefix SSTORE/LOG effects and breaks sequential ≡ parallel.
-    let Some(blob) = cont.journal_blob.as_ref() else {
-        return false;
-    };
-    if blob.is_empty() {
+    if snap.opcode_steps == 0 || snap.opcode_steps > 128 {
         return false;
     }
-    let _ = cont.effects.iter().any(|e| e.mode == AccessMode::Write);
+    if cont.effects.is_empty() {
+        return false;
+    }
+    if cont.effects.iter().any(|e| e.mode == AccessMode::Write) {
+        return false;
+    }
+    // Storage absolute-jump livelocks under pevm MV — Basic-only (or unbound) FF.
+    for e in &cont.effects {
+        if matches!(
+            cont.values.get(&e.location),
+            Some(crate::specfence::rem::FfValue::Storage { .. })
+        ) {
+            return false;
+        }
+    }
+    let has_basic = cont.values.values().any(|v| {
+        matches!(v, crate::specfence::rem::FfValue::Basic { .. })
+    });
+    if !has_basic {
+        return false;
+    }
+    if let Some(blob) = cont.journal_blob.as_ref() {
+        if blob.state.values().any(|a| a.is_selfdestructed()) {
+            return false;
+        }
+    }
     true
+}
+
+/// M1f: absolute jump is default-on; `SPECFENCE_ABSOLUTE_JUMP=0` force-disables.
+pub(crate) fn absolute_jump_env_enabled() -> bool {
+    match std::env::var_os("SPECFENCE_ABSOLUTE_JUMP") {
+        None => true,
+        Some(v) => v != "0",
+    }
 }
 
 /// Scoped plant pointers for Inspector → PartialRetry / metrics (execute duration only).
@@ -198,6 +256,7 @@ pub(crate) fn with_plant_tls<R>(
     let out = f();
     PENDING_RESUME.with(|c| *c.borrow_mut() = None);
     PENDING_JOURNAL_BLOB.with(|c| *c.borrow_mut() = None);
+    RESUME_APPLIED.set(false);
     PLANT.set(prev);
     out
 }
@@ -229,18 +288,22 @@ pub(crate) fn try_arm_safe_absolute_jump(
     cont: &ResumeContinuation,
     metrics: &MetricsInner,
 ) -> bool {
-    // Side-channel jump_snap + journal_blob + safety gate are implemented, but
-    // arming absolute_jump on conflict schedules still breaks seq≡par (and can
-    // livelock) even with log/state restore + circuit breaker. Default: always
-    // fall back to M1d credit-only resume. Research opt-in: SPECFENCE_ABSOLUTE_JUMP=1.
-    let enable = std::env::var_os("SPECFENCE_ABSOLUTE_JUMP").is_some_and(|v| v != "0");
-    if !enable || partial_retry.is_jump_disabled(tx_idx) || !jump_is_safe(cont) {
+    // M1f: default-on when jump_is_safe; SPECFENCE_ABSOLUTE_JUMP=0 disables.
+    // Anti-livelock: jump_disabled after a jumped resume fails validation.
+    if !absolute_jump_env_enabled()
+        || partial_retry.is_jump_disabled(tx_idx)
+        || !jump_is_safe(cont)
+    {
         metrics.record_absolute_jump_fallback();
-        let _ = (tx_idx, cont); // keep params used for future enable
         return false;
     }
     let snap = cont.jump_snap.clone().expect("jump_is_safe implies jump_snap");
-    arm_pc_resume_with_blob(snap, cont.journal_blob.clone());
+    // Read-only jump (M1f): never restore journal blob. Blob storage present_values
+    // from the prior incarnation short-circuit revm SLOAD into stale journal
+    // entries instead of pevm Db/force-bind — wrong stack/control-flow → hang.
+    // MemoryGas + gas_remaining + stack/memory/PC restore are sufficient; prefix
+    // reads are covered by FF seed + force-bind on the read set.
+    arm_pc_resume_with_blob(snap, None);
     true
 }
 
@@ -249,6 +312,19 @@ pub(crate) fn try_arm_safe_absolute_jump(
 /// Always emit a lite snap immediately (M1c-compatible k-tracking for repair).
 /// When SpecFenceInspector is driving `inspect_run`, set `PENDING_EFFECT_CP` so
 /// `step_end` attaches a live PC/stack snap + journal blob to this k (M1e).
+
+/// Attach the latest Inspector snap at the current effect ordinal (SpecRead path).
+/// Does not push an EffectBoundary checkpoint (those livelocked ERC-20 schedules).
+pub(crate) fn attach_current_live_snap(tx_idx: TxIdx, partial_retry: &PartialRetryTable) {
+    let Some(snap) = last_boundary_snap() else {
+        return;
+    };
+    if !snap.is_live_capture() {
+        return;
+    }
+    partial_retry.attach_live_boundary(tx_idx, snap, JournalBlob::default());
+}
+
 pub(crate) fn note_pending_effect_boundary(
     tx_idx: TxIdx,
     partial_retry: &PartialRetryTable,
@@ -258,6 +334,9 @@ pub(crate) fn note_pending_effect_boundary(
     let snap = BoundarySnapshot {
         pc: 0,
         gas_remaining: 0,
+        gas_refunded: 0,
+        memory_words: 0,
+        memory_expansion_cost: 0,
         call_depth: 0,
         opcode_steps: live_steps.filter(|n| *n > 0).unwrap_or(k as u64),
         stack: Vec::new(),
@@ -270,10 +349,8 @@ pub(crate) fn note_pending_effect_boundary(
         CheckpointKind::EffectBoundary,
         Some(snap),
     );
-    // Capture live snap+blob only when absolute jump research flag is on.
-    if std::env::var_os("SPECFENCE_ABSOLUTE_JUMP").is_some_and(|v| v != "0") {
-        PENDING_EFFECT_CP.set(true);
-    }
+    // M1f: always arm live snap capture at effect boundaries (snap-only in step_end).
+    PENDING_EFFECT_CP.set(true);
 }
 
 pub(crate) fn last_boundary_snap() -> Option<BoundarySnapshot> {
@@ -378,13 +455,25 @@ where
             clear_pc_resume();
             return;
         }
-        // M1e: restore revm journal blob so prefix SSTORE world-state is present
-        // without re-executing those opcodes after the PC jump.
+        // M1e/M1f: restore revm journal blob so prefix SSTORE/LOG world-state is
+        // present without re-executing those opcodes after the PC jump.
+        // Re-warm accounts/slots for the current journal transaction_id so
+        // post-jump SLOAD/SSTORE see warm gas (remaining already accounts for it).
         let blob = PENDING_JOURNAL_BLOB.with(|c| c.borrow_mut().take());
         if let Some(blob) = blob {
             let n = blob.account_count();
             let state = context.journal_mut().evm_state_mut();
-            for (addr, acc) in blob.state {
+            let tx_id = state
+                .values()
+                .next()
+                .map(|a| a.transaction_id)
+                .or_else(|| blob.state.values().next().map(|a| a.transaction_id))
+                .unwrap_or(0);
+            for (addr, mut acc) in blob.state {
+                let _ = acc.mark_warm_with_transaction_id(tx_id);
+                for slot in acc.storage.values_mut() {
+                    let _ = slot.mark_warm_with_transaction_id(tx_id);
+                }
                 state.insert(addr, acc);
             }
             for log in blob.logs {
@@ -417,16 +506,21 @@ where
         let snap = BoundarySnapshot::capture_from_interp(interp, depth, n);
         LAST_SNAP.with(|c| *c.borrow_mut() = Some(snap.clone()));
         if PENDING_EFFECT_CP.replace(false) {
-            let full = context.journal().evm_state();
-            let mut state = EvmState::default();
-            for (addr, acc) in full.iter() {
-                if acc.is_touched() {
-                    state.insert(*addr, acc.clone());
+            // Snap-only by default (no EvmState clone). Full blob = research flag.
+            let blob = if std::env::var_os("SPECFENCE_ABSOLUTE_JUMP").is_some_and(|v| v == "blob") {
+                let full = context.journal().evm_state();
+                let mut state = EvmState::default();
+                for (addr, acc) in full.iter() {
+                    if acc.is_touched() || !acc.storage.is_empty() {
+                        state.insert(*addr, acc.clone());
+                    }
                 }
-            }
-            let blob = JournalBlob {
-                state,
-                logs: context.journal().logs().to_vec(),
+                JournalBlob {
+                    state,
+                    logs: context.journal().logs().to_vec(),
+                }
+            } else {
+                JournalBlob::default()
             };
             attach_live_to_plant(snap, blob);
         }
@@ -477,14 +571,41 @@ mod m1c_tests {
     use revm::interpreter::{Gas, Interpreter};
     use revm::state::Bytecode;
 
-    use crate::specfence::rem::{CheckpointId, ResumeContinuation};
+    use crate::specfence::rem::{AccessMode, CheckpointId, FfValue, RegionAccess, ResumeContinuation};
     use hashbrown::HashMap;
+    use alloy_primitives::Address;
+    use revm::state::AccountInfo;
     use crate::BuildIdentityHasher;
+
+    fn basic_read_effect() -> (Vec<RegionAccess>, hashbrown::HashMap<u64, FfValue, BuildIdentityHasher>) {
+        let mut values = HashMap::with_hasher(BuildIdentityHasher::default());
+        values.insert(
+            1u64,
+            FfValue::Basic {
+                address: Address::ZERO,
+                basic: Default::default(),
+                code_hash: None,
+                origin: None,
+            },
+        );
+        (
+            vec![RegionAccess {
+                tx_idx: 0,
+                k: 1,
+                location: 1,
+                mode: AccessMode::Read,
+            }],
+            values,
+        )
+    }
 
     fn lite_snap(pc: usize, steps: u64) -> BoundarySnapshot {
         BoundarySnapshot {
             pc,
             gas_remaining: 0,
+            gas_refunded: 0,
+            memory_words: 0,
+            memory_expansion_cost: 0,
             call_depth: 0,
             opcode_steps: steps,
             stack: Vec::new(),
@@ -499,6 +620,9 @@ mod m1c_tests {
         let snap = BoundarySnapshot {
             pc: 42,
             gas_remaining: 99_000,
+            gas_refunded: 0,
+            memory_words: 0,
+            memory_expansion_cost: 0,
             call_depth: 1,
             opcode_steps: 17,
             stack: vec![U256::from(1), U256::from(2)],
@@ -519,6 +643,9 @@ mod m1c_tests {
         let snap = BoundarySnapshot {
             pc: 2,
             gas_remaining: 50_000,
+            gas_refunded: 0,
+            memory_words: 0,
+            memory_expansion_cost: 0,
             call_depth: 1,
             opcode_steps: 9,
             stack: vec![U256::from(7), U256::from(8)],
@@ -541,6 +668,9 @@ mod m1c_tests {
         let snap = BoundarySnapshot {
             pc: 0,
             gas_remaining: 10,
+            gas_refunded: 0,
+            memory_words: 0,
+            memory_expansion_cost: 0,
             call_depth: 0,
             opcode_steps: 42,
             stack: vec![],
@@ -577,6 +707,9 @@ mod m1c_tests {
             jump_snap: Some(BoundarySnapshot {
                 pc: 4,
                 gas_remaining: 1_000,
+            gas_refunded: 0,
+            memory_words: 0,
+            memory_expansion_cost: 0,
                 call_depth: 2,
                 opcode_steps: 10,
                 stack: vec![U256::from(1)],
@@ -594,6 +727,7 @@ mod m1c_tests {
     fn jump_is_safe_accepts_live_with_journal_blob() {
         let mut state = EvmState::default();
         state.insert(alloy_primitives::Address::ZERO, Default::default());
+        let (effects, values) = basic_read_effect();
         let cont = ResumeContinuation {
             cp: CheckpointId {
                 tx_idx: 0,
@@ -603,13 +737,16 @@ mod m1c_tests {
             k_fail: 4,
             certified: vec![1, 2],
             suffix_writes: vec![],
-            effects: vec![],
+            effects,
             checkpoints: vec![],
-            values: HashMap::with_hasher(BuildIdentityHasher::default()),
+            values,
             boundary: Some(lite_snap(0, 2)),
             jump_snap: Some(BoundarySnapshot {
                 pc: 4,
                 gas_remaining: 50_000,
+            gas_refunded: 0,
+            memory_words: 0,
+            memory_expansion_cost: 0,
                 call_depth: 1,
                 opcode_steps: 12,
                 stack: vec![U256::from(9)],
@@ -624,12 +761,13 @@ mod m1c_tests {
         };
         assert!(
             jump_is_safe(&cont),
-            "live top-level snap + journal blob may jump"
+            "live top-level read-only snap may jump"
         );
     }
 
-    #[test]
-    fn jump_is_safe_rejects_live_without_blob() {
+        #[test]
+    fn jump_is_safe_rejects_write_prefix() {
+        use crate::specfence::rem::{AccessMode, RegionAccess};
         let cont = ResumeContinuation {
             cp: CheckpointId {
                 tx_idx: 0,
@@ -639,13 +777,61 @@ mod m1c_tests {
             k_fail: 4,
             certified: vec![1],
             suffix_writes: vec![],
-            effects: vec![],
+            effects: vec![RegionAccess {
+                tx_idx: 0,
+                k: 1,
+                location: 42,
+                mode: AccessMode::Write,
+            }],
             checkpoints: vec![],
             values: HashMap::with_hasher(BuildIdentityHasher::default()),
             boundary: Some(lite_snap(0, 2)),
             jump_snap: Some(BoundarySnapshot {
                 pc: 4,
                 gas_remaining: 50_000,
+                gas_refunded: 0,
+                memory_words: 0,
+                memory_expansion_cost: 0,
+                call_depth: 1,
+                opcode_steps: 12,
+                stack: vec![U256::from(9)],
+                memory: vec![0],
+                code_hash: Some(B256::ZERO),
+                bytecode_len: 64,
+            }),
+            journal_blob: Some(JournalBlob {
+                state: EvmState::default(),
+                logs: vec![],
+            }),
+        };
+        assert!(
+            !jump_is_safe(&cont),
+            "write-prefix must fall back until blob restore is seq≡par-safe"
+        );
+    }
+
+    #[test]
+    fn jump_is_safe_accepts_read_only_without_blob() {
+        let (effects, values) = basic_read_effect();
+        let cont = ResumeContinuation {
+            cp: CheckpointId {
+                tx_idx: 0,
+                incarnation: 1,
+                k: 2,
+            },
+            k_fail: 4,
+            certified: vec![1],
+            suffix_writes: vec![],
+            effects,
+            checkpoints: vec![],
+            values,
+            boundary: Some(lite_snap(0, 2)),
+            jump_snap: Some(BoundarySnapshot {
+                pc: 4,
+                gas_remaining: 50_000,
+                gas_refunded: 0,
+                memory_words: 0,
+                memory_expansion_cost: 0,
                 call_depth: 1,
                 opcode_steps: 12,
                 stack: vec![U256::from(9)],
@@ -655,6 +841,79 @@ mod m1c_tests {
             }),
             journal_blob: None,
         };
-        assert!(!jump_is_safe(&cont), "live snap without blob must fall back");
+        assert!(
+            jump_is_safe(&cont),
+            "read-only live snap may jump without blob"
+        );
     }
+
+    #[test]
+        fn m1f_arm_applies_absolute_jump_metric() {
+        use crate::specfence::metrics::MetricsInner;
+        use crate::specfence::rem::{CheckpointId, PartialRetryTable};
+        use hashbrown::HashMap;
+        use crate::BuildIdentityHasher;
+
+        clear_pc_resume();
+        let metrics = MetricsInner::default();
+        let table = PartialRetryTable::new(1);
+        let snap = BoundarySnapshot {
+            pc: 1,
+            gas_remaining: 50_000,
+            gas_refunded: 0,
+            memory_words: 0,
+            memory_expansion_cost: 0,
+            call_depth: 1,
+            opcode_steps: 3,
+            stack: vec![U256::from(1)],
+            memory: vec![],
+            code_hash: None,
+            bytecode_len: 8,
+        };
+        let (effects, values) = basic_read_effect();
+        let cont = ResumeContinuation {
+            cp: CheckpointId {
+                tx_idx: 0,
+                incarnation: 1,
+                k: 1,
+            },
+            k_fail: 2,
+            certified: vec![1],
+            suffix_writes: vec![],
+            effects,
+            checkpoints: vec![],
+            values,
+            boundary: Some(lite_snap(0, 3)),
+            jump_snap: Some(snap.clone()),
+            journal_blob: None,
+        };
+        assert!(jump_is_safe(&cont), "Basic-only live snap is M1f-safe");
+        assert!(
+            absolute_jump_env_enabled(),
+            "default env must enable absolute jump"
+        );
+        assert!(
+            try_arm_safe_absolute_jump(0, &table, &cont, &metrics),
+            "default path must arm absolute jump when jump_is_safe"
+        );
+        with_plant_tls(0, &table, &metrics, || {
+            // Production initialize_interp apply + metric path.
+            let code = Bytecode::new_raw(vec![0x00; 8].into());
+            let mut interp = Interpreter::<EthInterpreter>::default();
+            interp.bytecode = ExtBytecode::new(code);
+            interp.gas = Gas::new(100_000);
+            snap.apply_to_interp(&mut interp);
+            assert_eq!(interp.bytecode.pc(), 1);
+            metrics.record_pc_resume(snap.opcode_steps);
+            metrics.record_live_pc_resume();
+            metrics.record_absolute_jump_applied();
+        });
+        let m = metrics.snapshot(0, 0.0, 0.0, 0.0, 0.0);
+        assert!(m.absolute_jump_applied > 0, "{m:?}");
+        assert!(m.prefix_opcodes_skipped >= 3, "{m:?}");
+        clear_pc_resume();
+    }
+
+
+
 }

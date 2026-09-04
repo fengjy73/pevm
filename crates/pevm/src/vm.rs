@@ -479,6 +479,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
             }
             ResolveAction::SpecRead => {
                 self.specfence.metrics.record_spec_read();
+                // M1f: EffectBoundary so RewindTo can leave CallEntry with a live
+                // jump_snap. Absolute jump remains narrowly gated (Basic-only,
+                // bytecode_len<=256, no Storage) — ERC-20 stays credit-only.
+                note_pending_effect_boundary(self.tx_idx, self.specfence.partial_retry);
                 Ok(())
             }
         }
@@ -1267,6 +1271,9 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         match run_result {
 
             Ok(exec_result) => {
+                // M1f: jumped Success may commit when jump_is_safe. Validation abort
+                // still disables further jumps via pevm.rs circuit breaker (anti-livelock).
+
                 // There are at least six locations most of the time: the sender,
                 // the recipient, and up to four fee recipients (beneficiary, base fee,
                 // L1 fee, operator fee on OP Stack chains).

@@ -309,6 +309,9 @@ impl PartialRetryState {
                     Some(BoundarySnapshot {
                         pc: 0,
                         gas_remaining: 0,
+            gas_refunded: 0,
+            memory_words: 0,
+            memory_expansion_cost: 0,
                         call_depth: 1,
                         opcode_steps: steps,
                         stack: Vec::new(),
@@ -318,7 +321,9 @@ impl PartialRetryState {
                     })
                 }
             });
-        // M1e side channel: live snap + journal blob for absolute jump only.
+        // M1f side channel: prefer exact `cp.k` live snap; else nearest k ≤ cp.k.
+        // Always-on step_end attach usually hits exact k; fallback covers CallEntry
+        // floor when an EffectBoundary live exists at the certified prefix tip.
         let (jump_snap, journal_blob) = self
             .live_boundaries
             .get(&cp.k)
@@ -403,20 +408,34 @@ impl PartialRetryState {
 
     /// Last checkpoint with `k < k_fail` (certified-prefix end).
     pub(crate) fn last_checkpoint_before(&self, k_fail: usize) -> Option<CheckpointId> {
+        let tx_idx = self
+            .journal
+            .first()
+            .map(|a| a.tx_idx)
+            .unwrap_or(0);
         self.checkpoints
             .iter()
             .rev()
             .find(|cp| cp.id.k < k_fail)
             .map(|cp| cp.id)
             .or_else(|| {
-                // Synthetic CallEntry at k=0 when we recorded no earlier cp.
+                // M1f: if SpecRead skipped EffectBoundary but step_end attached a
+                // live snap, rewind to that tip so jump_snap is available.
+                self.live_boundaries
+                    .keys()
+                    .copied()
+                    .filter(|k| *k > 0 && *k < k_fail)
+                    .max()
+                    .map(|k| CheckpointId {
+                        tx_idx,
+                        incarnation: self.incarnation,
+                        k,
+                    })
+            })
+            .or_else(|| {
                 if k_fail > 0 {
                     Some(CheckpointId {
-                        tx_idx: self
-                            .journal
-                            .first()
-                            .map(|a| a.tx_idx)
-                            .unwrap_or(0),
+                        tx_idx,
                         incarnation: self.incarnation,
                         k: 0,
                     })
