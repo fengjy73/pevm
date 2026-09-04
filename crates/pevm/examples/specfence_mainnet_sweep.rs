@@ -386,4 +386,55 @@ fn main() {
     serde_json::to_writer_pretty(&mut f, &values).expect("json");
     f.write_all(b"\n").ok();
     eprintln!("wrote {} rows to {}", rows.len(), out.display());
+
+    // Companion CSV next to JSON (same stem).
+    let csv_path = out.with_extension("csv");
+    let mut csv = File::create(&csv_path).expect("write csv");
+    writeln!(
+        csv,
+        "block,n_tx,gas_used,mode,cores,repeat,elapsed_ms,tps,occ_aborts,abort_rate,wait_admissions,speculate_executions,region_promotions,cascade_validations_scheduled,independent_txs_skipped_by_fence,bayes_wait_decisions,bayes_speculate_decisions,bayes_conflict_updates,bayes_success_updates,wave_promotions,mean_wait_posterior,bind_hits,wait_hard_count,spec_read_count,selective_invalidate_count,tx_full_retry,region_validate_fail,soft_edge_revokes,selective_fallback_full,partial_retry_count,partial_retry_fallback_full,ok,error"
+    )
+    .unwrap();
+    for r in &rows {
+        let err = r.error.as_deref().unwrap_or("").replace(",", ";");
+        writeln!(
+            csv,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            r.block,
+            r.n_tx,
+            r.gas_used,
+            r.mode,
+            r.cores,
+            r.repeat,
+            r.elapsed_ms,
+            r.tps,
+            r.occ_aborts,
+            r.abort_rate,
+            r.wait_admissions,
+            r.speculate_executions,
+            r.region_promotions,
+            r.cascade_validations_scheduled,
+            r.independent_txs_skipped_by_fence,
+            r.bayes_wait_decisions,
+            r.bayes_speculate_decisions,
+            r.bayes_conflict_updates,
+            r.bayes_success_updates,
+            r.wave_promotions,
+            r.mean_wait_posterior,
+            r.bind_hits,
+            r.wait_hard_count,
+            r.spec_read_count,
+            r.selective_invalidate_count,
+            r.tx_full_retry,
+            r.region_validate_fail,
+            r.soft_edge_revokes,
+            r.selective_fallback_full,
+            r.partial_retry_count,
+            r.partial_retry_fallback_full,
+            r.ok,
+            err
+        )
+        .unwrap();
+    }
+    eprintln!("wrote {} rows to {}", rows.len(), csv_path.display());
 }

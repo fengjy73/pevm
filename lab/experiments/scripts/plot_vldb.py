@@ -224,6 +224,66 @@ def main():
     plt.close(fig)
     written.append(str(p))
 
+
+    # P2: partial_retry vs full_retry (SpecFence, mean over cores×repeats)
+    fig, ax = plt.subplots(figsize=(8.4, 3.6), dpi=160)
+    pr, fr = [], []
+    for b in blocks:
+        pvals, fvals = [], []
+        for r in rows:
+            if r["block"] == b and r["mode"] == "specfence" and r.get("ok", True):
+                pvals.append(float(r.get("partial_retry_count", 0) or 0))
+                fvals.append(float(r.get("tx_full_retry", 0) or 0))
+        pr.append(float(np.mean(pvals) if pvals else 0))
+        fr.append(float(np.mean(fvals) if fvals else 0))
+    ax.bar(x - 0.18, pr, 0.36, color=COLORS["pcc"], label="PartialRetry")
+    ax.bar(x + 0.18, fr, 0.36, color=COLORS["specfence"], label="FullRetry")
+    ax.set_xticks(x, [str(b) for b in blocks], rotation=30, ha="right")
+    style_ax(ax, "Block", "Count (mean over cores × repeats)", "SpecFence P2 — PartialRetry vs FullRetry")
+    ax.legend(frameon=False, fontsize=8)
+    fig.tight_layout()
+    p = outdir / "specfence_partial_vs_full_retry.png"
+    fig.savefig(p, bbox_inches="tight")
+    plt.close(fig)
+    written.append(str(p))
+
+    # P2 overview: partial_retry / full_retry / pr_fallback / bind vs cores
+    fig, axes = plt.subplots(2, 2, figsize=(10.2, 7.0), dpi=160)
+    panels_p2 = [
+        ("partial_retry_count", "Mean partial_retry_count", "PartialRetry vs cores"),
+        ("tx_full_retry", "Mean tx_full_retry", "FullRetry vs cores"),
+        ("partial_retry_fallback_full", "Mean partial_retry_fallback_full", "Partial→full fallback vs cores"),
+        ("bind_hits", "Mean bind_hits", "Bind hits vs cores"),
+    ]
+    for ax, (metric, ylabel, title) in zip(axes.ravel(), panels_p2):
+        core_set = sorted({int(r["cores"]) for r in rows if r["mode"] == "specfence"})
+        xs, ys = [], []
+        for c in core_set:
+            per_block = []
+            for b in blocks:
+                vals = [
+                    float(r.get(metric, 0) or 0)
+                    for r in rows
+                    if r.get("block") == b
+                    and r.get("mode") == "specfence"
+                    and int(r["cores"]) == c
+                    and r.get("ok", True)
+                ]
+                if vals:
+                    per_block.append(float(np.mean(vals)))
+            if per_block:
+                xs.append(c)
+                ys.append(float(np.mean(per_block)))
+        if xs:
+            ax.plot(xs, ys, color=COLORS["specfence"], marker="o", linewidth=1.7, label="SpecFence")
+        style_ax(ax, "Worker threads", ylabel, title)
+        ax.legend(frameon=False, fontsize=8)
+    fig.tight_layout()
+    p = outdir / "specfence_p2_metrics_overview.png"
+    fig.savefig(p, bbox_inches="tight")
+    plt.close(fig)
+    written.append(str(p))
+
     print("\n".join(written))
 
 
