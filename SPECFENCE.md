@@ -74,7 +74,8 @@ Metrics: prior bayes/fence counters plus `region_validate_fail`, `tx_full_retry`
 `wait_hard_count`, `spec_read_count`, `selective_invalidate_count`, `cascade_revalidate_count`,
 `soft_edge_revokes`, `selective_fallback_full`, `checkpoint_opportunities`, plus plant v2 M0
 `evm_entries` / `tx_head_reexec` / `full_restart` / `resume_count` / `rebind_only` /
-`rewind_to_cp` (M1 RewindTo/RebindOnly), plus M2 `wait_park_count` /
+`rewind_to_cp` (M1 RewindTo/RebindOnly), M1b `journal_ff_entries` /
+`journal_ff_hits` / `db_heavy_ops`, plus M2 `wait_park_count` /
 `wait_park_ns` / `ready_steal_on_wait` / `wave_width_mean`.
 
 ### Plant v2 M0 baseline (metrics only)
@@ -87,7 +88,13 @@ See `lab/notes/specfence-plant-v2-m0-status.md`.
 Checkpoints `(t,inc,k)` on SpecFence path; validation fail with certified prefix →
 `RebindOnly` (no abort) or `RewindTo` (resume entry: `rewind_to_cp`/`resume_count`,
 **not** `evm_entries`/`tx_head_reexec`). `FullRestart` only when prefix empty.
-True PC / journal fast-forward still TODO — see `lab/notes/specfence-plant-v2-m1-status.md`.
+See `lab/notes/specfence-plant-v2-m1-status.md`.
+
+### Plant v2 M1b — Journal FF / boundary resume (L1 stronger partial)
+
+RewindTo arms a `ResumeContinuation`: SpecFence journal restored to `cp`; certified-prefix
+bound values served from FF cache (skip MV lazy walks — `journal_ff_hits`). Handler still
+re-enters from tx head (true PC TODO). See `lab/notes/specfence-plant-v2-m1b-status.md`.
 
 ### Plant v2 M2 — Wave park / steal (L2)
 

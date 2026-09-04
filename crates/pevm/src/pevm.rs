@@ -716,14 +716,13 @@ fn try_validate(
                     } => {
                         specfence.metrics.record_partial_retry();
                         specfence.metrics.record_rewind_to_cp();
-                        specfence.partial_retry.set_repair(
+                        // M1b: arm journal FF continuation from failed incarnation snap.
+                        specfence.partial_retry.arm_rewind_to(
                             tx_version.tx_idx,
-                            RepairPlan::RewindTo {
-                                cp,
-                                certified: certified.clone(),
-                                k_fail,
-                                suffix_writes: suffix_writes.clone(),
-                            },
+                            cp,
+                            k_fail,
+                            certified.clone(),
+                            suffix_writes.clone(),
                         );
                         specfence
                             .partial_retry

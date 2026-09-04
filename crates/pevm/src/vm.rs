@@ -17,7 +17,7 @@ use crate::{
     AccountBasic, BuildIdentityHasher, BuildSuffixHasher, EvmAccount, FinishExecFlags, MemoryEntry,
     MemoryLocation, MemoryLocationHash, MemoryValue, ReadOrigin, ReadOrigins, ReadSet, Storage,
     TxIdx, TxVersion, WriteSet, chain::PevmChain, hash_deterministic, mv_memory::MvMemory,
-    specfence::{AccessMode, CheckpointKind, RepairPlan, ResolveAction, SpecFenceCtx, TAU_VERY_HIGH, early_val_probability},
+    specfence::{AccessMode, CheckpointKind, FfValue, ResolveAction, SpecFenceCtx, TAU_VERY_HIGH, early_val_probability},
 };
 
 /// The execution error from the underlying EVM executor.
@@ -164,6 +164,16 @@ impl<'a, S: Storage> VmDb<'a, S> {
             self.specfence
                 .partial_retry
                 .reset_incarnation(tx_idx, incarnation);
+            // M1b: restore SpecFence journal to checkpoint via FF continuation.
+            let n = self.specfence.partial_retry.replay_ff_if_armed(tx_idx);
+            let entries = self
+                .specfence
+                .partial_retry
+                .ff_entries(tx_idx)
+                .max(n);
+            if entries > 0 {
+                self.specfence.metrics.record_journal_ff_entries(entries);
+            }
         }
         if let TxKind::Call(to) = tx.kind {
             self.to_code_hash = self.get_code_hash(to)?;
@@ -179,6 +189,79 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     || self.mv_memory.data.contains_key(&to_hash.unwrap()));
         }
         Ok(())
+    }
+
+
+    /// M1b: try serving a certified-prefix read from the FF value cache.
+    /// Returns Some when origin is unchanged — caller skips MV lazy walk.
+    fn try_ff_storage(
+        &self,
+        location_hash: MemoryLocationHash,
+    ) -> Option<(U256, ReadOrigin)> {
+        if !self
+            .specfence
+            .partial_retry
+            .is_rewind_resume(self.tx_idx)
+        {
+            return None;
+        }
+        let FfValue::Storage { value, origin } =
+            self.specfence.partial_retry.ff_value(self.tx_idx, location_hash)?
+        else {
+            return None;
+        };
+        let current = self
+            .mv_memory
+            .last_data_before(location_hash, self.tx_idx)
+            .map(|(tx_idx, tx_incarnation)| (tx_idx, tx_incarnation));
+        if current != origin {
+            return None;
+        }
+        let read_origin = match origin {
+            Some((tx_idx, tx_incarnation)) => ReadOrigin::MvMemory(TxVersion {
+                tx_idx,
+                tx_incarnation,
+            }),
+            None => ReadOrigin::Storage,
+        };
+        Some((value, read_origin))
+    }
+
+    fn try_ff_basic(
+        &self,
+        location_hash: MemoryLocationHash,
+    ) -> Option<(AccountBasic, Option<B256>, ReadOrigin)> {
+        if !self
+            .specfence
+            .partial_retry
+            .is_rewind_resume(self.tx_idx)
+        {
+            return None;
+        }
+        let FfValue::Basic {
+            basic,
+            code_hash,
+            origin,
+        } = self.specfence.partial_retry.ff_value(self.tx_idx, location_hash)?
+        else {
+            return None;
+        };
+        // Only single-origin basics are cached; require matching top writer.
+        let current = self
+            .mv_memory
+            .last_data_before(location_hash, self.tx_idx)
+            .map(|(tx_idx, tx_incarnation)| (tx_idx, tx_incarnation));
+        if current != origin {
+            return None;
+        }
+        let read_origin = match origin {
+            Some((tx_idx, tx_incarnation)) => ReadOrigin::MvMemory(TxVersion {
+                tx_idx,
+                tx_incarnation,
+            }),
+            None => ReadOrigin::Storage,
+        };
+        Some((basic, code_hash, read_origin))
     }
 
     fn hash_basic(&self, address: &Address) -> MemoryLocationHash {
@@ -455,10 +538,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     certified.push(*loc);
                 }
             }
-            self.specfence
-                .partial_retry
-                .set_force_bind(self.tx_idx, certified.clone());
-            // M1: demote head PartialRetry → RewindTo when a checkpoint exists.
+            // M1/M1b: demote head PartialRetry → RewindTo + journal FF when a cp exists.
             let k_fail = self
                 .specfence
                 .partial_retry
@@ -473,15 +553,16 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     incarnation: 0,
                     k: 0,
                 });
-            self.specfence.partial_retry.set_repair(
+            self.specfence.partial_retry.arm_rewind_to(
                 self.tx_idx,
-                RepairPlan::RewindTo {
-                    cp,
-                    certified,
-                    k_fail,
-                    suffix_writes: Vec::new(),
-                },
+                cp,
+                k_fail,
+                certified.clone(),
+                Vec::new(),
             );
+            self.specfence
+                .partial_retry
+                .set_force_bind(self.tx_idx, certified);
             self.specfence.metrics.record_partial_retry();
             self.specfence.metrics.record_rewind_to_cp();
             self.specfence.metrics.record_region_validate_fail(1);
@@ -568,6 +649,36 @@ impl<S: Storage> Database for VmDb<'_, S> {
             }
         }
 
+        // M1b: single-origin basic FF (no lazy chain) — skip MV walk when stable.
+        if !self.is_lazy
+            && let Some((account, code_hash, origin)) = self.try_ff_basic(location_hash)
+        {
+            let read_origins = self.read_set.entry(location_hash).or_default();
+            Self::push_origin(read_origins, origin)?;
+            self.specfence.metrics.record_journal_ff_hit();
+            self.read_accounts
+                .insert(location_hash, (account.clone(), code_hash));
+            let code = if let Some(code_hash) = &code_hash {
+                if let Some(code) = self.mv_memory.new_bytecodes.get(code_hash) {
+                    Some(code.clone())
+                } else {
+                    match self.storage.code_by_hash(code_hash) {
+                        Ok(code) => code.map(Bytecode::from),
+                        Err(err) => return Err(ReadError::StorageError(err.to_string())),
+                    }
+                }
+            } else {
+                None
+            };
+            return Ok(Some(AccountInfo {
+                balance: account.balance,
+                nonce: account.nonce,
+                code_hash: code_hash.unwrap_or(KECCAK_EMPTY),
+                code,
+                account_id: None,
+            }));
+        }
+
         let read_origins = self.read_set.entry(location_hash).or_default();
         let has_prev_origins = !read_origins.is_empty();
         // We accumulate new origins to either:
@@ -602,6 +713,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
                             self.promote_on_conflict(address, location_hash);
                             return Err(ReadError::Blocking(*closest_idx));
                         }
+                        self.specfence.metrics.record_db_heavy_op();
                         // About to push a new origin
                         // Inconsistent: new origin will be longer than the previous!
                         if has_prev_origins && read_origins.len() == new_origins.len() {
@@ -657,6 +769,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
 
         // Fall back to storage
         if final_account.is_none() {
+            self.specfence.metrics.record_db_heavy_op();
             // Populate [Storage] on the first read
             if !has_prev_origins {
                 new_origins.push(ReadOrigin::Storage);
@@ -723,6 +836,26 @@ impl<S: Storage> Database for VmDb<'_, S> {
             self.read_accounts
                 .insert(location_hash, (account.clone(), code_hash));
 
+            // M1b: cache single-origin basics for FF (lazy chains have multi-origins).
+            if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+                let origins = self.read_set.get(&location_hash);
+                if origins.is_some_and(|o| o.len() == 1) {
+                    let origin = match origins.and_then(|o| o.first()) {
+                        Some(ReadOrigin::MvMemory(v)) => Some((v.tx_idx, v.tx_incarnation)),
+                        Some(ReadOrigin::Storage) | None => None,
+                    };
+                    self.specfence.partial_retry.note_value(
+                        self.tx_idx,
+                        location_hash,
+                        FfValue::Basic {
+                            basic: account.clone(),
+                            code_hash,
+                            origin,
+                        },
+                    );
+                }
+            }
+
             self.maybe_early_val(address, location_hash)?;
             return Ok(Some(AccountInfo {
                 balance: account.balance,
@@ -752,6 +885,27 @@ impl<S: Storage> Database for VmDb<'_, S> {
         let location_hash = hash_deterministic(MemoryLocation::Storage(address, index));
         self.maybe_wait(address, location_hash)?;
 
+        // M1b: certified-prefix FF cache — skip MV/storage heavy path when origin stable.
+        if let Some((value, origin)) = self.try_ff_storage(location_hash) {
+            let read_origins = self.read_set.entry(location_hash).or_default();
+            Self::push_origin(read_origins, origin)?;
+            self.specfence.metrics.record_journal_ff_hit();
+            if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+                self.specfence.partial_retry.note_value(
+                    self.tx_idx,
+                    location_hash,
+                    FfValue::Storage {
+                        value,
+                        origin: match self.read_set.get(&location_hash).and_then(|o| o.last()) {
+                            Some(ReadOrigin::MvMemory(v)) => Some((v.tx_idx, v.tx_incarnation)),
+                            _ => None,
+                        },
+                    },
+                );
+            }
+            return Ok(value);
+        }
+
         let read_origins = self.read_set.entry(location_hash).or_default();
 
         // Try reading from multi-version data
@@ -769,6 +923,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
                         self.promote_on_conflict(address, location_hash);
                         return Err(ReadError::Blocking(*closest_idx));
                     }
+                    self.specfence.metrics.record_db_heavy_op();
                     Self::push_origin(
                         read_origins,
                         ReadOrigin::MvMemory(TxVersion {
@@ -776,6 +931,16 @@ impl<S: Storage> Database for VmDb<'_, S> {
                             tx_incarnation: *tx_incarnation,
                         }),
                     )?;
+                    if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+                        self.specfence.partial_retry.note_value(
+                            self.tx_idx,
+                            location_hash,
+                            FfValue::Storage {
+                                value: *value,
+                                origin: Some((*closest_idx, *tx_incarnation)),
+                            },
+                        );
+                    }
                     self.maybe_early_val(address, location_hash)?;
                     return Ok(*value);
                 }
@@ -788,11 +953,22 @@ impl<S: Storage> Database for VmDb<'_, S> {
         }
 
         // Fall back to storage
+        self.specfence.metrics.record_db_heavy_op();
         Self::push_origin(read_origins, ReadOrigin::Storage)?;
         let value = self
             .storage
             .storage(&address, &index)
             .map_err(|err| ReadError::StorageError(err.to_string()))?;
+        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            self.specfence.partial_retry.note_value(
+                self.tx_idx,
+                location_hash,
+                FfValue::Storage {
+                    value,
+                    origin: None,
+                },
+            );
+        }
         self.maybe_early_val(address, location_hash)?;
         Ok(value)
     }
@@ -1003,9 +1179,13 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 .partial_retry
                 .is_rewind_resume(tx_version.tx_idx);
         if rewind_resume {
-            // TODO(M1+): journal fast-forward + true PC resume from checkpoint;
-            // for now still run the handler with force-bind, but account as resume.
+            // M1b: SpecFence journal already FF-restored in set_tx; bound-value
+            // cache serves certified-prefix reads (skip MV lazy walks). True PC
+            // resume inside revm still TODO — handler re-enters, but prefix DB
+            // work drops. Account as resume (not evm_entries).
             self.specfence.metrics.record_resume();
+            // CallEntry boundary for the resumed incarnation (journal prefix
+            // already replayed up to cp in set_tx).
             let _ = self.specfence.partial_retry.push_checkpoint(
                 tx_version.tx_idx,
                 CheckpointKind::CallEntry,

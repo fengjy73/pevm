@@ -102,6 +102,12 @@ pub struct SpecFenceMetrics {
     pub ready_steal_on_wait: usize,
     /// M2: mean ready-queue depth sampled at park/push (best-effort wave width).
     pub wave_width_mean: f64,
+    /// M1b: SpecFence journal effects / bound values restored on RewindTo resume.
+    pub journal_ff_entries: usize,
+    /// M1b: certified-prefix DB reads served from FF cache (skipped MV lazy walk).
+    pub journal_ff_hits: usize,
+    /// M1b: MV lazy-walk steps + cold storage fallbacks (heavy DB work).
+    pub db_heavy_ops: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -142,6 +148,9 @@ pub(crate) struct MetricsInner {
     wait_park_count: AtomicUsize,
     wait_park_ns: std::sync::atomic::AtomicU64,
     ready_steal_on_wait: AtomicUsize,
+    journal_ff_entries: AtomicUsize,
+    journal_ff_hits: AtomicUsize,
+    db_heavy_ops: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -337,6 +346,20 @@ impl MetricsInner {
             .store(ready_steal_on_wait, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_journal_ff_entries(&self, n: usize) {
+        if n > 0 {
+            self.journal_ff_entries.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_journal_ff_hit(&self) {
+        self.journal_ff_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_db_heavy_op(&self) {
+        self.db_heavy_ops.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn mark_hot(&self, address: Address) {
         self.hot_accounts.insert(address, ());
     }
@@ -408,6 +431,9 @@ impl MetricsInner {
             wait_park_ns: self.wait_park_ns.load(Ordering::Relaxed),
             ready_steal_on_wait: self.ready_steal_on_wait.load(Ordering::Relaxed),
             wave_width_mean,
+            journal_ff_entries: self.journal_ff_entries.load(Ordering::Relaxed),
+            journal_ff_hits: self.journal_ff_hits.load(Ordering::Relaxed),
+            db_heavy_ops: self.db_heavy_ops.load(Ordering::Relaxed),
         }
     }
 }

@@ -24,7 +24,7 @@ Checkpoint id: `(t, incarnation, k)`. Grain: `CallEntry`/`CallExit` at tx execut
 
 ## Limitations (L1 **partial**)
 
-1. **True PC resume / journal fast-forward not implemented** — RewindTo still re-enters `Handler::run` from tx bytecode start with force-bind; honesty is in **metrics** (`evm_entries` excludes resume) + repair classification.
+1. **True PC resume not implemented** — RewindTo still re-enters `Handler::run` from tx bytecode start with force-bind; honesty is in **metrics** (`evm_entries` excludes resume) + repair classification. **M1b** adds SpecFence journal FF + bound-value DB cache — see `specfence-plant-v2-m1b-status.md`.
 2. **Nested CALL entry/exit hooks deferred** — custom `run_exec_loop` broke sequential ≡ parallel; M1 keeps CallEntry/Exit at execute boundaries only.
 3. **Write checkpoints recorded post-finalize** — effect ordinal for writes is end-of-tx order (pre-existing P2 journal shape); mid-interpreter storage write cps need deeper revm hooks.
 4. **RebindOnly rare** on ERC-20 mocks because write `first_k` is assigned after reads → `suffix_writes` usually non-empty.

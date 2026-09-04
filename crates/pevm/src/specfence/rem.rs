@@ -9,8 +9,10 @@
 //!
 //! M1 (plant v2): checkpoints at CALL + write/effect boundaries; RewindTo /
 //! RebindOnly demote head PartialRetry when a certified prefix exists.
-//! True PC resume is TODO — resume path still re-enters the handler with
-//! force-bind / journal fast-forward prep, but must NOT count as `evm_entries`.
+//! M1b: journal fast-forward + bound-value cache on RewindTo resume — SpecFence
+//! effect journal restored to `cp`, certified-prefix DB reads served from FF
+//! cache (skip MV lazy walks). Bytecode still re-enters handler (true PC resume
+//! TODO); must NOT count as `evm_entries`.
 //!
 //! M2 (plant v2): `WaveParkTable` parks WaitHard at **tx grain** (Block-STM
 //! Blocking style) and steals from a lower-TxIdx-first ready deque. Live
@@ -93,6 +95,42 @@ pub(crate) enum CheckpointKind {
 pub(crate) struct Checkpoint {
     pub id: CheckpointId,
     pub kind: CheckpointKind,
+    /// SpecFence effect-journal length at capture (`== id.k`).
+    pub journal_len: usize,
+}
+
+/// Bound value captured for journal fast-forward on RewindTo resume.
+///
+/// Used to skip MV lazy evaluation / storage I/O for certified-prefix reads
+/// when the origin version is unchanged. Not a full revm journal blob.
+#[derive(Debug, Clone)]
+pub(crate) enum FfValue {
+    Storage {
+        value: alloy_primitives::U256,
+        /// `None` = storage origin; `Some` = MvMemory writer version.
+        origin: Option<(TxIdx, TxIncarnation)>,
+    },
+    Basic {
+        basic: crate::AccountBasic,
+        code_hash: Option<alloy_primitives::B256>,
+        origin: Option<(TxIdx, TxIncarnation)>,
+    },
+}
+
+/// Serialized continuation for M1b RewindTo: restore SpecFence journal to `cp`
+/// and serve certified-prefix reads from `values` (fast-forward).
+#[derive(Debug, Clone)]
+pub(crate) struct ResumeContinuation {
+    pub cp: CheckpointId,
+    pub k_fail: usize,
+    pub certified: Vec<MemoryLocationHash>,
+    pub suffix_writes: Vec<MemoryLocationHash>,
+    /// Effect journal prefix `[0..=cp.k]` (empty if cp.k==0).
+    pub effects: Vec<RegionAccess>,
+    /// Checkpoints with `k <= cp.k`.
+    pub checkpoints: Vec<Checkpoint>,
+    /// Bound values for locations touched at `k <= cp.k`.
+    pub values: HashMap<MemoryLocationHash, FfValue, BuildIdentityHasher>,
 }
 
 /// Decision after classifying a validation failure for PartialRetry / M1 repair.
@@ -117,9 +155,9 @@ pub(crate) enum RepairPlan {
     },
     /// Certified prefix OK — resume from last good checkpoint (not tx head).
     ///
-    /// TODO(M1+): true PC / journal fast-forward from `cp`; today the resume
-    /// entry still runs the handler with force-bind, but does **not** increment
-    /// `evm_entries` / `tx_head_reexec`.
+    /// M1b: pairs with [`ResumeContinuation`] — SpecFence journal FF + bound
+    /// value cache. Handler still re-enters (true PC TODO) but prefix DB/π
+    /// work is skipped; does **not** increment `evm_entries` / `tx_head_reexec`.
     RewindTo {
         cp: CheckpointId,
         certified: Vec<MemoryLocationHash>,
@@ -145,6 +183,8 @@ pub(crate) struct PartialRetryState {
     journal: Vec<RegionAccess>,
     /// Checkpoints captured this incarnation (CALL + write + effect).
     checkpoints: Vec<Checkpoint>,
+    /// Bound values observed this incarnation (for M1b journal FF).
+    value_snap: HashMap<MemoryLocationHash, FfValue, BuildIdentityHasher>,
 }
 
 impl PartialRetryState {
@@ -155,6 +195,7 @@ impl PartialRetryState {
         self.certified.clear();
         self.journal.clear();
         self.checkpoints.clear();
+        self.value_snap.clear();
     }
 
     pub(crate) fn note_access(
@@ -185,8 +226,89 @@ impl PartialRetryState {
             incarnation: self.incarnation,
             k: self.k,
         };
-        self.checkpoints.push(Checkpoint { id, kind });
+        self.checkpoints.push(Checkpoint {
+            id,
+            kind,
+            journal_len: self.k,
+        });
         id
+    }
+
+    pub(crate) fn note_value(&mut self, location: MemoryLocationHash, value: FfValue) {
+        self.value_snap.insert(location, value);
+    }
+
+    /// Build an M1b resume continuation for RewindTo(`cp`) with fail at `k_fail`.
+    pub(crate) fn build_continuation(
+        &self,
+        cp: CheckpointId,
+        k_fail: usize,
+        certified: Vec<MemoryLocationHash>,
+        suffix_writes: Vec<MemoryLocationHash>,
+    ) -> ResumeContinuation {
+        let effects: Vec<RegionAccess> = self
+            .journal
+            .iter()
+            .filter(|a| a.k <= cp.k)
+            .copied()
+            .collect();
+        let checkpoints: Vec<Checkpoint> = self
+            .checkpoints
+            .iter()
+            .filter(|c| c.id.k <= cp.k)
+            .copied()
+            .collect();
+        // Bound values for the whole certified prefix (k < k_fail), not only
+        // up to cp — resume still force-binds those reads; FF cache skips MV walks.
+        let certified_set: HashSet<MemoryLocationHash, BuildIdentityHasher> =
+            certified.iter().copied().collect();
+        let mut values = HashMap::with_hasher(BuildIdentityHasher::default());
+        for (loc, val) in &self.value_snap {
+            let fk = self.first_k.get(loc).copied().unwrap_or(usize::MAX);
+            if fk < k_fail && (fk <= cp.k || certified_set.contains(loc)) {
+                values.insert(*loc, val.clone());
+            }
+        }
+        ResumeContinuation {
+            cp,
+            k_fail,
+            certified,
+            suffix_writes,
+            effects,
+            checkpoints,
+            values,
+        }
+    }
+
+    /// Restore SpecFence journal/checkpoints/values from an FF continuation
+    /// (after `reset` for the new incarnation). Returns number of effects replayed.
+    pub(crate) fn replay_continuation(&mut self, cont: &ResumeContinuation) -> usize {
+        self.k = 0;
+        self.first_k.clear();
+        self.certified.clear();
+        self.journal.clear();
+        self.checkpoints.clear();
+        self.value_snap.clear();
+        for access in &cont.effects {
+            self.k = access.k;
+            self.first_k.entry(access.location).or_insert(access.k);
+            self.journal.push(*access);
+        }
+        // Ensure k reflects cp even if effects empty (synthetic CallEntry at 0).
+        self.k = self.k.max(cont.cp.k);
+        for loc in &cont.certified {
+            let fk = self.first_k.get(loc).copied().unwrap_or(0);
+            if fk <= cont.cp.k {
+                self.certified.insert(*loc);
+            }
+        }
+        for cp in &cont.checkpoints {
+            self.checkpoints.push(*cp);
+        }
+        for (loc, val) in &cont.values {
+            self.value_snap.insert(*loc, val.clone());
+        }
+        cont.effects.len()
     }
 
     /// Last checkpoint with `k < k_fail` (certified-prefix end).
@@ -243,6 +365,8 @@ pub(crate) struct PartialRetryTable {
     force_bind: DashMap<TxIdx, Vec<MemoryLocationHash>, BuildIdentityHasher>,
     /// Pending repair for next execute / Retry loop of `t`.
     repair: DashMap<TxIdx, RepairPlan, BuildIdentityHasher>,
+    /// M1b journal-FF continuation armed with RewindTo.
+    ff_resume: DashMap<TxIdx, ResumeContinuation, BuildIdentityHasher>,
 }
 
 impl PartialRetryTable {
@@ -253,6 +377,7 @@ impl PartialRetryTable {
                 .collect(),
             force_bind: DashMap::default(),
             repair: DashMap::default(),
+            ff_resume: DashMap::default(),
         }
     }
 
@@ -277,6 +402,72 @@ impl PartialRetryTable {
             .lock()
             .unwrap()
             .note_certified(location);
+    }
+
+    pub(crate) fn note_value(&self, tx_idx: TxIdx, location: MemoryLocationHash, value: FfValue) {
+        if let Some(slot) = self.states.get(tx_idx) {
+            slot.lock().unwrap().note_value(location, value);
+        }
+    }
+
+    /// Arm RewindTo + build M1b FF continuation from the failed incarnation's journal.
+    pub(crate) fn arm_rewind_to(
+        &self,
+        tx_idx: TxIdx,
+        cp: CheckpointId,
+        k_fail: usize,
+        certified: Vec<MemoryLocationHash>,
+        suffix_writes: Vec<MemoryLocationHash>,
+    ) {
+        let cont = self.states[tx_idx].lock().unwrap().build_continuation(
+            cp,
+            k_fail,
+            certified.clone(),
+            suffix_writes.clone(),
+        );
+        self.ff_resume.insert(tx_idx, cont);
+        self.repair.insert(
+            tx_idx,
+            RepairPlan::RewindTo {
+                cp,
+                certified,
+                k_fail,
+                suffix_writes,
+            },
+        );
+    }
+
+    /// After `reset_incarnation`, replay FF continuation into the fresh journal.
+    /// Returns effects replayed (0 if none).
+    pub(crate) fn replay_ff_if_armed(&self, tx_idx: TxIdx) -> usize {
+        let Some(cont) = self.ff_resume.get(&tx_idx).map(|c| c.clone()) else {
+            return 0;
+        };
+        self.states[tx_idx]
+            .lock()
+            .unwrap()
+            .replay_continuation(&cont)
+    }
+
+    pub(crate) fn ff_value(
+        &self,
+        tx_idx: TxIdx,
+        location: MemoryLocationHash,
+    ) -> Option<FfValue> {
+        self.ff_resume
+            .get(&tx_idx)
+            .and_then(|c| c.values.get(&location).cloned())
+    }
+
+    pub(crate) fn ff_entries(&self, tx_idx: TxIdx) -> usize {
+        self.ff_resume
+            .get(&tx_idx)
+            .map(|c| c.effects.len().max(c.values.len()))
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn clear_ff(&self, tx_idx: TxIdx) {
+        self.ff_resume.remove(&tx_idx);
     }
 
     pub(crate) fn push_checkpoint(
@@ -344,6 +535,7 @@ impl PartialRetryTable {
 
     pub(crate) fn clear_repair(&self, tx_idx: TxIdx) {
         self.repair.remove(&tx_idx);
+        self.ff_resume.remove(&tx_idx);
     }
 
     pub(crate) fn peek_repair(&self, tx_idx: TxIdx) -> Option<RepairPlan> {
@@ -700,3 +892,45 @@ impl WaveParkTable {
         self.ready.lock().unwrap().len()
     }
 }
+
+#[cfg(test)]
+mod m1b_tests {
+    use super::*;
+
+    #[test]
+    fn journal_ff_continuation_truncates_to_cp_and_replays() {
+        let mut st = PartialRetryState::default();
+        st.reset(1);
+        // Simulate 4 reads then fail at k=4; cp at k=2.
+        for i in 1..=4 {
+            st.note_access(0, i as MemoryLocationHash, AccessMode::Read);
+            st.note_value(
+                i as MemoryLocationHash,
+                FfValue::Storage {
+                    value: alloy_primitives::U256::from(i),
+                    origin: None,
+                },
+            );
+            if i <= 2 {
+                st.note_certified(i as MemoryLocationHash);
+                st.push_checkpoint(0, CheckpointKind::EffectBoundary);
+            }
+        }
+        let cp = st.last_checkpoint_before(4).expect("cp");
+        assert_eq!(cp.k, 2);
+        let cont = st.build_continuation(cp, 4, vec![1, 2], vec![3, 4]);
+        assert_eq!(cont.effects.len(), 2);
+        assert!(cont.values.contains_key(&1));
+        assert!(cont.values.contains_key(&2));
+        assert!(!cont.values.contains_key(&3));
+
+        st.reset(2);
+        let n = st.replay_continuation(&cont);
+        assert_eq!(n, 2);
+        assert_eq!(st.current_k(), 2);
+        assert_eq!(st.checkpoint_count(), cont.checkpoints.len());
+        assert!(st.certified_locations().contains(&1));
+        assert!(st.certified_locations().contains(&2));
+    }
+}
+

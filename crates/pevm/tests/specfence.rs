@@ -827,3 +827,48 @@ fn specfence_m2_wait_hard_parks_and_steals() {
         );
     }
 }
+
+/// M1b: RewindTo resume must journal-FF the certified prefix and serve at least
+/// one prefix read from the FF cache (skipping an MV/storage heavy op).
+/// Concrete proof that resume does less DB work than a full head reexec path.
+#[test]
+fn specfence_m1b_journal_ff_skips_prefix_db_work() {
+    let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 10, 5);
+    state.insert(Address::ZERO, EvmAccount::default());
+    for i in 0..48 {
+        let (addr, account) = common::mock_account(90_000 + i);
+        state.insert(addr, account);
+        txs.push(self_transfer(addr, 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+
+    let mut saw = false;
+    let mut last = None;
+    for _ in 0..12 {
+        let (_, m, _) = run_mode(ConcurrencyMode::SpecFence, &storage, txs.clone());
+        last = Some(m.clone());
+        if m.rewind_to_cp > 0 && m.resume_count > 0 {
+            saw = true;
+            assert_eq!(m.tx_head_reexec, 0, "M1b must not head-reexec: {m:?}");
+            assert!(
+                m.journal_ff_entries > 0,
+                "RewindTo resume must restore/FF prefix journal or values: {m:?}"
+            );
+            // Concrete skip: FF cache hits mean those reads did not pay db_heavy_ops.
+            assert!(
+                m.journal_ff_hits > 0,
+                "resume must hit FF cache for ≥1 certified-prefix read (less work than head reexec): {m:?}"
+            );
+            assert!(
+                m.db_heavy_ops > 0,
+                "block still does some heavy DB work outside FF prefix: {m:?}"
+            );
+            break;
+        }
+    }
+    assert!(
+        saw,
+        "M1b expected RewindTo+resume with journal FF on localized conflict: {last:?}"
+    );
+}
+

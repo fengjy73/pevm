@@ -130,10 +130,15 @@ Cost model must include **system** term: `steal_ready_depth`, not only local `1+
 - Baseline expectation: today’s SF `evm_entries ≈ n_tx + head-reexecs` (PartialRetry ≡ head reexec), **not** better than OCC until M1 RewindTo.
 - M2 landed: `wait_park_ns`, `ready_steal_on_wait`, `wait_park_count`, `wave_width_mean`.
 
-### M1 — Checkpoints + RewindTo (L1 minimum)
+### M1 — Checkpoints + RewindTo (L1 minimum) ✅ (partial)
 - Patch revm/pevm adapter: checkpoint at CALL + storage write boundaries.
 - On selective invalidate: RewindTo last certified cp; resume.
 - Success gate: `evm_entries_sf < evm_entries_occ` on ≥1 hot conflict block@8 **or** clear gap only on FullRestart count; SF/OCC TPS moves toward 1.
+
+### M1b — Journal fast-forward / boundary resume ✅ (partial)
+- On checkpoint/incarnation: capture SpecFence journal + bound values (`ResumeContinuation`).
+- On RewindTo: restore journal to `cp`; FF certified-prefix DB reads via value cache (skip MV lazy walks).
+- True PC / nested CALL resume still TODO — see `lab/notes/specfence-plant-v2-m1b-status.md`.
 
 ### M2 — Park/Wake + ready-queue (L2) ✅ (tx-grain landed)
 - WaitHard parks continuation (**tx-level** Blocking + `WaveParkTable`); worker steals lower-TxIdx-first ready deque.
