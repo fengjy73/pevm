@@ -1,67 +1,72 @@
 # SpecFence
 
-Mixed **Wait (PCC)** and **Speculate (OCC)** in the **same block**, at **region** granularity (account basic / storage slot). Not an OCC variant that only shrinks abort blast radius.
+Runtime-fact-driven **adaptive fine-grained** concurrency control for the blockchain execution layer.
 
-Committed state is always equivalent to sequential execution in preset block order. No commit reordering.
+This is **not** “faster OCC”, “finer MVCC alone”, or “account-hint Wait on top of Block-STM”. The first `specfence` branch prototype (account-level Wait + whole-tx abort) is an incomplete baseline and is expected to lose to OCC when it only adds waiting without region-local repair.
 
-## Mechanism
+## Goal
 
-- **Speculate (cold):** current Block-STM path — optimistic execute, validate, abort/retry.
-- **Wait (hot):** later transactions that touch the region **wait for the last lower-idx writer** (hinted `from`/`to`, then MV last writer) before reading or writing it. This is a proactive admission/read-side action, not only ESTIMATE-after-the-fact.
-- One transaction may Wait on region A and Speculate on region B in the same execution.
-- **Intra-block wave:** first observed conflict on a region (validation abort, ESTIMATE, RW/WW overlap) promotes that region Speculate → Wait for the rest of the block. No global barrier.
-- **Inter-block heat:** EWMA on cheap `from`/`to` account hints. Multi-writer / promoted accounts get hotter. Next block seeds those accounts in Wait. Unknown/cold stays Speculate. Map size is capped.
-- **Beneficiary / lazy sender-recipient:** gas-payment writes to the beneficiary never promote or Wait. Lazy ETH updates are preserved.
+Raise useful parallelism and useful work share so peak TPS approaches the concurrency ceiling set by the **true dependency DAG critical path**. Keep (or raise) TPS at high core counts without claiming linear scaling. Preserve determinism and sequential equivalence.
 
-## Modes
+## Unit of control: region
 
-Selectable on `Pevm`. Default is current PEVM OCC.
+A **region** (account basic / storage slot, later tighter clusters) is the unit for:
 
-| Mode | Behaviour |
-|------|-----------|
-| `ConcurrencyMode::Occ` | Block-STM only. Existing tests. |
-| `ConcurrencyMode::Pcc` | Hinted accounts start in Wait (conservative prior-writer wait). |
-| `ConcurrencyMode::SpecFence` | Mixed: heat-seeded Wait + OCC elsewhere + intra-block promotion. |
+- access tracking and version management
+- dependency edges
+- validation
+- commit readiness
+- repair / targeted re-execution
 
-```rust
-let mut pevm = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
-pevm.execute_revm_parallel(/* ... */)?;
-let metrics = pevm.last_specfence_metrics();
-```
+A transaction may touch many regions. Conflict on a subset of regions of txs 1–5 must be confined to regions that actually depend on those versions: wait, reorder, version-switch, or locally repair **inside** that dependency component. Do **not** invalidate an entire independent transaction, and do **not** cascade to tx 6 when it shares no dependent regions.
+
+## Closed loop (same block)
+
+1. **Predict / avoid** — inter-block heat and hints seed an initial wave plan (hot regions more likely Wait).
+2. **Speculate** on uncertain / cold regions (OCC-style).
+3. **Detect** conflicts from exact RW version origins at validation time.
+4. **Confirm dependencies** and update the live region dependency graph.
+5. **Local block / Wait** only where dependency is confirmed.
+6. **Version select / targeted re-exec / repair** only for affected regions (or the minimal dependent set).
+7. **Re-form waves** from the executed prefix (intra-block learning).
+
+Learning improves schedule quality only. Correctness comes from exact RW version relations, commit conditions, and serial equivalence to the preset block order.
+
+## Why pure OCC / PCC fail the target
+
+- **OCC (Block-STM):** late detection, whole-tx rollback, repeated full re-execution, and ESTIMATE cascade. Even with DAG width 4, realized speedup can be far below 4×.
+- **PCC:** needs accurate pre-execution RW sets / DAG that smart contracts do not provide; wrong predictions over-serialize.
+
+SpecFence discovers the true DAG **during** execution and dynamically fuses optimistic work, necessary waits, and local pessimism from confirmed deps, remaining uncertainty, and resource pressure.
+
+## Modes in this fork
+
+| Mode | Role |
+|------|------|
+| `Occ` | Baseline Block-STM (instrumented abort metrics). |
+| `Pcc` | Conservative hinted Wait baseline (over-serialization upper bound). |
+| `SpecFence` | Target adaptive region/wave controller (WIP redesign). |
 
 ## Hooks
 
-- `crates/pevm/src/specfence/` — region table, EWMA heat, wave promotion, metrics.
-- `scheduler.rs` — `is_done` so Wait can block on a prior writer; `add_dependency` used for admission.
-- `mv_memory.rs` — per-location / per-account `{Speculate, Wait}`; WW overlap detection.
-- `vm.rs` — Wait region: depend on last lower-idx writer. Speculate region: OCC read.
-- `pevm.rs` — mode, heat map (thread-safe, `reset_heat`), metrics snapshot.
+- `crates/pevm/src/specfence/` — heat, region table, metrics; wave/repair/local validation to be expanded.
+- `scheduler.rs` / `mv_memory.rs` / `vm.rs` / `pevm.rs` — admission, validation, abort accounting.
 
-## Tests
+## SpecFence v1 status (this branch)
 
-Mocked OCC (no `ethereum/tests` submodule):
+Incremental step toward the redesign (see `lab/notes/specfence-redesign-v1.md`):
 
-```sh
-cargo test -p pevm --release --test raw_transfers --test beneficiary --test small_blocks --test mixed -- --test-threads=1
-```
-
-SpecFence:
-
-```sh
-cargo test -p pevm --release --test specfence -- --test-threads=1
-```
-
-Full workspace tests need `git submodule update --init` (ethereum/tests). This crate does not download mainnet.
-
-## Metrics
-
-After a parallel block: `wait_admissions`, `speculate_executions`, `region_promotions`, `occ_aborts`, plus the addresses that waited vs speculated. `last_initial_wait_accounts()` is the test hook for inter-block heat seeding.
+- **OCC abort metrics** instrumented for all modes (`occ_aborts` counts successful validation aborts).
+- **Validation cascade fence** (SpecFence only): on abort, rewind `validation_idx` to the first higher tx that read an aborted write — not blindly `aborted_idx+1` for the whole suffix. Metrics: `cascade_validations_scheduled`, `independent_txs_skipped_by_fence`.
+- **Hint-only Wait promotion gated** in SpecFence; Wait still seeds from inter-block heat and from **observed** invalid / WW locations.
+- Still **whole-tx** re-execution on abort (revm); ESTIMATE still covers the aborted write set. Not yet region-local repair / wave re-form.
 
 ## Lab
 
-VLDB-style mainnet multi-core sweep (Sequential / OCC / PCC / SpecFence) lives under [`lab/`](lab/README.md):
+See `lab/README.md`. Mainnet multi-core sweeps and VLDB-style TPS / abort figures live under `lab/`.
 
-- `lab/experiments/` — block list, cores, repeats, plot script
-- `lab/results/` — generated JSON/CSV
-- `lab/figures/` — TPS vs cores + abort-rate plots
-- `crates/pevm/examples/specfence_mainnet_sweep.rs` — sweep driver
+```sh
+cargo test -p pevm --release --config 'profile.release.lto=false' --test specfence -- --test-threads=1
+cargo run -p pevm --release --config 'profile.release.lto=false' --example specfence_mainnet_sweep -- \
+  --out lab/results/mainnet-sweep.json
+```

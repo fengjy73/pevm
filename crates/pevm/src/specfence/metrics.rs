@@ -17,8 +17,14 @@ pub struct SpecFenceMetrics {
     pub speculate_executions: usize,
     /// Intra-block Speculate → Wait promotions (wave updates).
     pub region_promotions: usize,
-    /// Validation aborts (OCC).
+    /// Validation aborts (OCC / SpecFence / PCC).
     pub occ_aborts: usize,
+    /// Higher txs forced into the validation cascade by an abort rewind
+    /// (`block_size - rewind_to` when a dependent reader exists).
+    pub cascade_validations_scheduled: usize,
+    /// Higher txs between `aborted_idx+1` and the first dependent reader that
+    /// were **not** forced into the abort cascade (SpecFence fence).
+    pub independent_txs_skipped_by_fence: usize,
     /// Accounts that triggered a Wait admission in this block.
     pub wait_addresses: Vec<Address>,
     /// `from`/`to` accounts of speculative executions in this block.
@@ -32,6 +38,8 @@ pub(crate) struct MetricsInner {
     speculate_executions: AtomicUsize,
     region_promotions: AtomicUsize,
     occ_aborts: AtomicUsize,
+    cascade_validations_scheduled: AtomicUsize,
+    independent_txs_skipped_by_fence: AtomicUsize,
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
     hot_accounts: DashMap<Address, (), BuildSuffixHasher>,
@@ -63,6 +71,21 @@ impl MetricsInner {
         self.occ_aborts.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_fence_cascade(
+        &self,
+        cascade_scheduled: usize,
+        independent_skipped: usize,
+    ) {
+        if cascade_scheduled > 0 {
+            self.cascade_validations_scheduled
+                .fetch_add(cascade_scheduled, Ordering::Relaxed);
+        }
+        if independent_skipped > 0 {
+            self.independent_txs_skipped_by_fence
+                .fetch_add(independent_skipped, Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn mark_hot(&self, address: Address) {
         self.hot_accounts.insert(address, ());
     }
@@ -83,6 +106,12 @@ impl MetricsInner {
             speculate_executions: self.speculate_executions.load(Ordering::Relaxed),
             region_promotions: self.region_promotions.load(Ordering::Relaxed),
             occ_aborts: self.occ_aborts.load(Ordering::Relaxed),
+            cascade_validations_scheduled: self
+                .cascade_validations_scheduled
+                .load(Ordering::Relaxed),
+            independent_txs_skipped_by_fence: self
+                .independent_txs_skipped_by_fence
+                .load(Ordering::Relaxed),
             wait_addresses,
             speculate_addresses,
         }

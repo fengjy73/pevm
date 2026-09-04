@@ -614,6 +614,12 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
     }
 
     fn promote_if_multi_writer(&self, address: Address, location: Option<MemoryLocationHash>) {
+        // SpecFence v1: do not promote Wait from mere from/to writer_count hints.
+        // Intra-block Wait comes from observed invalid locations / WW contention.
+        // Inter-block heat still seeds Wait via seed_wait_regions.
+        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            return;
+        }
         if address == self.specfence.beneficiary {
             return;
         }

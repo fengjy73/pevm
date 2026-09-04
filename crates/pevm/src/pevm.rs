@@ -563,16 +563,44 @@ fn try_validate(
     };
     let aborted = !read_set_valid && scheduler.try_validation_abort(tx_version);
     if aborted {
+        // Snapshot write locations before ESTIMATE conversion (same set).
+        let write_locations = if specfence.mode == ConcurrencyMode::SpecFence {
+            mv_memory.write_locations(tx_version.tx_idx)
+        } else {
+            Vec::new()
+        };
         mv_memory.convert_writes_to_estimates(tx_version.tx_idx);
         // Always count validation aborts, including pure OCC. Region promotion
         // remains SpecFence/PCC-only.
         specfence.metrics.record_occ_abort();
         if specfence.mode.uses_regions() {
-            for location in invalid {
-                if mv_memory.regions.promote_location(location) {
+            for location in &invalid {
+                if mv_memory.regions.promote_location(*location) {
                     specfence.metrics.record_promotion(None);
                 }
             }
+        }
+        // SpecFence v1: fence the validation cascade to dependent readers of the
+        // aborted write set. Independent higher txs with disjoint reads are not
+        // forced into the abort queue. Whole-tx re-execution of the aborted
+        // incarnation remains (revm cannot partial-reexec a tx).
+        if specfence.mode == ConcurrencyMode::SpecFence {
+            let rewind_to =
+                mv_memory.min_higher_reader_of(tx_version.tx_idx, &write_locations);
+            let block_size = scheduler.block_size();
+            let cascade_from = tx_version.tx_idx + 1;
+            let (cascade, skipped) = match rewind_to {
+                Some(to) => {
+                    let to = to.min(block_size);
+                    (
+                        block_size.saturating_sub(to),
+                        to.saturating_sub(cascade_from),
+                    )
+                }
+                None => (0, block_size.saturating_sub(cascade_from)),
+            };
+            specfence.metrics.record_fence_cascade(cascade, skipped);
+            return scheduler.finish_validation_fenced(tx_version, true, rewind_to);
         }
     }
     scheduler.finish_validation(tx_version, aborted)

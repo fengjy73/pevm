@@ -42,6 +42,8 @@ struct RunRow {
     wait_admissions: usize,
     speculate_executions: usize,
     region_promotions: usize,
+    cascade_validations_scheduled: usize,
+    independent_txs_skipped_by_fence: usize,
     ok: bool,
     error: Option<String>,
 }
@@ -159,6 +161,16 @@ fn measure(
                 wait_admissions: if sequential { 0 } else { m.wait_admissions },
                 speculate_executions: if sequential { 0 } else { m.speculate_executions },
                 region_promotions: if sequential { 0 } else { m.region_promotions },
+                cascade_validations_scheduled: if sequential {
+                    0
+                } else {
+                    m.cascade_validations_scheduled
+                },
+                independent_txs_skipped_by_fence: if sequential {
+                    0
+                } else {
+                    m.independent_txs_skipped_by_fence
+                },
                 ok: true,
                 error: None,
             }
@@ -177,6 +189,8 @@ fn measure(
             wait_admissions: 0,
             speculate_executions: 0,
             region_promotions: 0,
+            cascade_validations_scheduled: 0,
+            independent_txs_skipped_by_fence: 0,
             ok: false,
             error: Some(format!("{err:?}")),
         },
@@ -270,6 +284,8 @@ fn main() {
                 "wait_admissions": r.wait_admissions,
                 "speculate_executions": r.speculate_executions,
                 "region_promotions": r.region_promotions,
+                "cascade_validations_scheduled": r.cascade_validations_scheduled,
+                "independent_txs_skipped_by_fence": r.independent_txs_skipped_by_fence,
                 "ok": r.ok,
                 "error": r.error,
             })

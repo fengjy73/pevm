@@ -1,10 +1,10 @@
-//! `SpecFence`: mixed Wait (PCC) and Speculate (OCC) at region granularity.
+//! `SpecFence`: adaptive region/wave concurrency control (v1 WIP).
 //!
-//! Hot regions Wait: later transactions depend on the last lower-idx writer
-//! before accessing the region. Cold regions Speculate: optimistic execute,
-//! validate, abort/retry. A transaction may Wait on region A and Speculate on
-//! region B in the same execution. Intra-block conflicts promote a region
-//! Speculate → Wait (a wave). Inter-block EWMA heat seeds the next block.
+//! Cold regions Speculate (OCC). Hot regions may Wait after **observed**
+//! conflicts or inter-block heat — not from hint-only multi-writer promotion.
+//! On validation abort, SpecFence fences the validation cascade to higher txs
+//! that actually read the aborted writes (see `finish_validation_fenced`).
+//! Whole-tx re-execution remains; region-local repair is future work.
 
 use crate::{
     BuildSuffixHasher, MemoryLocation, TxIdx, chain::PevmChain, hash_deterministic,

@@ -213,6 +213,35 @@ impl MvMemory {
             .and_then(|written| written.range(..tx_idx).next_back().map(|(idx, _)| *idx))
     }
 
+
+    /// Write locations recorded by the last incarnation of `tx_idx`.
+    pub(crate) fn write_locations(&self, tx_idx: TxIdx) -> Vec<MemoryLocationHash> {
+        index_mutex!(self.last_locations, tx_idx).write.clone()
+    }
+
+    /// Minimum higher transaction that read any location in `write_locations`.
+    /// Used by SpecFence to fence the validation cascade to dependent readers only.
+    pub(crate) fn min_higher_reader_of(
+        &self,
+        aborted_idx: TxIdx,
+        write_locations: &[MemoryLocationHash],
+    ) -> Option<TxIdx> {
+        if write_locations.is_empty() {
+            return None;
+        }
+        for idx in (aborted_idx + 1)..self.last_locations.len() {
+            let locs = index_mutex!(self.last_locations, idx);
+            if locs
+                .read
+                .keys()
+                .any(|loc| write_locations.iter().any(|w| w == loc))
+            {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
     // Replace the write set of the aborted version in the shared memory data
     // structure with special ESTIMATE markers to quickly abort higher transactions
     // that read them.
