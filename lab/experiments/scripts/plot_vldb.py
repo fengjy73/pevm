@@ -68,7 +68,7 @@ def plot_block(rows, block, outdir: Path):
             continue
         if mode == "occ" and 1 in x:
             occ1 = m[list(x).index(1)]
-        yerr = np.vstack([m - lo, hi - m])
+        yerr = np.vstack([np.maximum(0, m - lo), np.maximum(0, hi - m)])
         ax.errorbar(
             x, m, yerr=yerr, color=COLORS[mode], marker="o", markersize=4.5,
             linewidth=1.6, capsize=3, label=LABELS[mode],
@@ -84,7 +84,7 @@ def plot_block(rows, block, outdir: Path):
         x, m, lo, hi = agg(rows, block, mode, "abort_rate")
         if len(x) == 0:
             continue
-        yerr = np.vstack([m - lo, hi - m])
+        yerr = np.vstack([np.maximum(0, m - lo), np.maximum(0, hi - m)])
         ax.errorbar(
             x, m, yerr=yerr, color=COLORS[mode], marker="o", markersize=4.5,
             linewidth=1.6, capsize=3, label=LABELS[mode],
