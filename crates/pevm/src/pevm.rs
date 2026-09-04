@@ -367,15 +367,21 @@ impl Pevm {
         if self.concurrency_mode == ConcurrencyMode::Pcc {
             update_heat(&self.heat, &hints, &metrics_inner, block_env.beneficiary);
         }
-        let mean_wait = if self.concurrency_mode == ConcurrencyMode::SpecFence {
-            update_bayes(&self.bayes);
-            self.bayes.take_mean_wait_posterior()
-        } else {
-            0.0
-        };
+        let (mean_wait, mean_p_at_wait, mean_p_at_spec) =
+            if self.concurrency_mode == ConcurrencyMode::SpecFence {
+                update_bayes(&self.bayes);
+                // mean_wait_posterior keeps historical Wait-decision mean;
+                // cost-aware means are taken after (same accumulators for wait).
+                let mean_wait = self.bayes.take_mean_wait_posterior();
+                let mean_spec = self.bayes.take_mean_spec_posterior();
+                (mean_wait, mean_wait, mean_spec)
+            } else {
+                (0.0, 0.0, 0.0)
+            };
         let wave_id = self.bayes.wave_id();
         metrics_inner.set_checkpoint_opportunities(rem.checkpoint_opportunities());
-        self.last_metrics = metrics_inner.snapshot(wave_id, mean_wait);
+        self.last_metrics =
+            metrics_inner.snapshot(wave_id, mean_wait, mean_p_at_wait, mean_p_at_spec);
         self.last_initial_wait_accounts = initial_wait;
 
         if let Some(abort_reason) = self.abort_reason.take() {

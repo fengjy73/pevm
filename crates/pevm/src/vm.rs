@@ -17,7 +17,7 @@ use crate::{
     AccountBasic, BuildIdentityHasher, BuildSuffixHasher, EvmAccount, FinishExecFlags, MemoryEntry,
     MemoryLocation, MemoryLocationHash, MemoryValue, ReadOrigin, ReadOrigins, ReadSet, Storage,
     TxIdx, TxVersion, WriteSet, chain::PevmChain, hash_deterministic, mv_memory::MvMemory,
-    specfence::{AccessMode, ResolveAction, SpecFenceCtx, early_val_probability},
+    specfence::{AccessMode, ResolveAction, SpecFenceCtx, TAU_VERY_HIGH, early_val_probability},
 };
 
 /// The execution error from the underlying EVM executor.
@@ -285,11 +285,13 @@ impl<'a, S: Storage> VmDb<'a, S> {
             .partial_retry
             .must_force_bind(self.tx_idx, location_hash);
 
-        // Sticky Wait still honored unless revoked; never WaitHard on cold posteriors
-        // when revoked (should_wait_location already clears sticky).
-        let sticky = self
-            .specfence
-            .should_wait_location(&self.mv_memory.regions, location_hash, &address);
+        // Revoke sticky Wait when posterior < τ_revoke (side effects only).
+        // v6: sticky no longer forces WaitHard — cost-aware π decides.
+        let _ = self.specfence.try_revoke(
+            &self.mv_memory.regions,
+            location_hash,
+            Some(&address),
+        );
 
         let posterior = self
             .specfence
@@ -302,8 +304,6 @@ impl<'a, S: Storage> VmDb<'a, S> {
             } else {
                 ResolveAction::WaitHard
             }
-        } else if sticky {
-            ResolveAction::WaitHard
         } else {
             let mut a = self.specfence.choose_resolve(
                 location_hash,
@@ -313,9 +313,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 bind_version.clone(),
                 residual_predicts,
             );
-            // EarlyVal under pressure: prefer WaitHard/Bind over SpecRead when hot.
+            // Safety valve only: escalate SpecRead when P is very high.
+            // (Old EarlyVal@0.35 WaitHard bias removed — cost model owns π.)
             if matches!(a, ResolveAction::SpecRead)
-                && early_val_probability(posterior) >= 0.35
+                && posterior >= TAU_VERY_HIGH
                 && (writer.is_some() || residual_predicts)
             {
                 a = if let Some(v) = bind_version {

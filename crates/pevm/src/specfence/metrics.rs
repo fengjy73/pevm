@@ -67,6 +67,16 @@ pub struct SpecFenceMetrics {
     pub partial_retry_count: usize,
     /// PartialRetry attempted but fell back to FullRetry (unsafe split).
     pub partial_retry_fallback_full: usize,
+    /// Cost-aware π chose WaitHard.
+    pub cost_chose_wait: usize,
+    /// Cost-aware π chose SpecRead.
+    pub cost_chose_spec: usize,
+    /// Cost-aware π chose Bind.
+    pub cost_chose_bind: usize,
+    /// Mean P_conflict among cost-aware WaitHard decisions.
+    pub mean_p_at_wait: f64,
+    /// Mean P_conflict among cost-aware SpecRead decisions.
+    pub mean_p_at_spec: f64,
 }
 
 /// Shared counters written by worker threads.
@@ -95,6 +105,9 @@ pub(crate) struct MetricsInner {
     checkpoint_opportunities: AtomicUsize,
     partial_retry_count: AtomicUsize,
     partial_retry_fallback_full: AtomicUsize,
+    cost_chose_wait: AtomicUsize,
+    cost_chose_spec: AtomicUsize,
+    cost_chose_bind: AtomicUsize,
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
     hot_accounts: DashMap<Address, (), BuildSuffixHasher>,
@@ -219,6 +232,18 @@ impl MetricsInner {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_cost_chose_wait(&self) {
+        self.cost_chose_wait.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_cost_chose_spec(&self) {
+        self.cost_chose_spec.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_cost_chose_bind(&self) {
+        self.cost_chose_bind.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn mark_hot(&self, address: Address) {
         self.hot_accounts.insert(address, ());
     }
@@ -227,7 +252,13 @@ impl MetricsInner {
         self.hot_accounts.iter().map(|entry| *entry.key())
     }
 
-    pub(crate) fn snapshot(&self, wave_id: usize, mean_wait_posterior: f64) -> SpecFenceMetrics {
+    pub(crate) fn snapshot(
+        &self,
+        wave_id: usize,
+        mean_wait_posterior: f64,
+        mean_p_at_wait: f64,
+        mean_p_at_spec: f64,
+    ) -> SpecFenceMetrics {
         let mut wait_addresses: Vec<Address> =
             self.wait_addresses.iter().map(|e| *e.key()).collect();
         wait_addresses.sort_unstable();
@@ -268,6 +299,11 @@ impl MetricsInner {
             partial_retry_fallback_full: self
                 .partial_retry_fallback_full
                 .load(Ordering::Relaxed),
+            cost_chose_wait: self.cost_chose_wait.load(Ordering::Relaxed),
+            cost_chose_spec: self.cost_chose_spec.load(Ordering::Relaxed),
+            cost_chose_bind: self.cost_chose_bind.load(Ordering::Relaxed),
+            mean_p_at_wait,
+            mean_p_at_spec,
         }
     }
 }

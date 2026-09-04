@@ -2,8 +2,9 @@
 //!
 //! Control unit = memory location / slot-level region
 //! (`MemoryLocation::{Basic, CodeHash, Storage}`), not whole-tx.
-//! Bayesian Beta-Bernoulli posteriors drive WaitHard / Bind / SpecRead per
-//! region; sticky Wait is revokeable when posterior < τ_revoke. Cascade fence
+//! Bayesian Beta-Bernoulli posteriors + cost-aware π drive WaitHard / Bind /
+//! SpecRead per region; sticky Wait is revokeable when posterior < τ_revoke.
+//! Cascade fence
 //! remains a correctness shield. Whole-tx re-execution remains (revm);
 //! P2 semantic PartialRetry: certified-prefix Bind on reexec + suffix-only
 //! InvalidateSelective (no global aborted stamp when safe).
@@ -39,7 +40,8 @@ pub(crate) use rem::{
 pub(crate) use resolve::{PolicyCtx, ResolveAction, choose_action};
 #[allow(unused_imports)]
 pub(crate) use resolve::{
-    BindTarget, SelectiveOutcome, TAU_REVOKE, TAU_S, TAU_W, early_val_probability,
+    BindTarget, SelectiveOutcome, C_RETRY, COST_MARGIN, TAU_REVOKE, TAU_S, TAU_VERY_HIGH, TAU_W,
+    cost_prefers_wait, early_val_probability,
 };
 
 /// Selectable concurrency control for parallel block execution.
@@ -152,7 +154,9 @@ impl<'a> SpecFenceCtx<'a> {
         }
     }
 
-    /// Location-granularity Wait via π (WaitHard) with revokeable sticky flags.
+    /// Location-granularity Wait via cost-aware π with revokeable sticky flags.
+    /// Sticky Wait is a soft hint only: always re-evaluate with producer-unknown
+    /// (`writer_done=false`) so over-WaitHard from sticky bias is avoided.
     pub(crate) fn should_wait_location(
         &self,
         regions: &RegionTable,
@@ -175,16 +179,18 @@ impl<'a> SpecFenceCtx<'a> {
                 if cleared_region || cleared_dag {
                     self.metrics.record_soft_edge_revoke();
                 }
-                // Fall through to live π decision.
-            } else {
-                return true;
             }
+            // Fall through — do not auto-WaitHard on sticky (v6 cost-aware).
         }
-        // Live π: WaitHard when writer-aware posterior high or P >= τ_s.
+        // Live cost-aware π (producer unknown here → SpecRead-biased).
         let writer_known = self.hints.prev(address, 0).is_some()
             || self.bayes.has_location(location);
+        let writer_done = false;
         if self.bayes.has_location(location) {
-            if self.bayes.should_wait_hard(location, Some(address), writer_known) {
+            if self
+                .bayes
+                .should_wait_hard(location, Some(address), writer_known, writer_done)
+            {
                 self.metrics.record_bayes_wait();
                 self.bayes.note_wait_decision(location, Some(address));
                 true
@@ -198,10 +204,21 @@ impl<'a> SpecFenceCtx<'a> {
                     self.metrics.record_soft_edge_revoke();
                 }
                 false
-            } else {
+            } else if self
+                .bayes
+                .should_wait_hard(location, Some(address), writer_known, writer_done)
+            {
+                self.metrics.record_bayes_wait();
+                self.bayes.note_wait_decision(location, Some(address));
                 true
+            } else {
+                self.metrics.record_bayes_speculate();
+                false
             }
-        } else if self.bayes.should_wait_hard(location, Some(address), writer_known) {
+        } else if self
+            .bayes
+            .should_wait_hard(location, Some(address), writer_known, writer_done)
+        {
             self.metrics.record_bayes_wait();
             self.bayes.note_wait_decision(location, Some(address));
             true
@@ -211,7 +228,7 @@ impl<'a> SpecFenceCtx<'a> {
         }
     }
 
-    /// Choose ResolveAction for a SpecFence location read (π).
+    /// Choose ResolveAction for a SpecFence location read (cost-aware π).
     pub(crate) fn choose_resolve(
         &self,
         location: crate::MemoryLocationHash,
@@ -227,12 +244,28 @@ impl<'a> SpecFenceCtx<'a> {
             location,
             writer_known: writer.is_some(),
             writer,
+            writer_done,
             posterior_conflict,
             posterior_bind_success: posterior_bind,
             placeholder_ready: residual_predicts && (writer_done || bind_version.is_some()),
+            // Bind only against a published writer version.
             bind_version: if writer_done { bind_version } else { None },
         };
-        choose_action(ctx)
+        let action = choose_action(ctx);
+        match &action {
+            ResolveAction::WaitHard => {
+                self.metrics.record_cost_chose_wait();
+                self.bayes.note_cost_decision_posterior(posterior_conflict, true);
+            }
+            ResolveAction::SpecRead => {
+                self.metrics.record_cost_chose_spec();
+                self.bayes.note_cost_decision_posterior(posterior_conflict, false);
+            }
+            ResolveAction::Bind(_) => {
+                self.metrics.record_cost_chose_bind();
+            }
+        }
+        action
     }
 
     /// Proactive PCC / cold-start: previous hinted writer that has not finished.

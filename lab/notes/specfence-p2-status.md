@@ -71,3 +71,9 @@ TPS mixed → **no full 7-block v5**. Details: `lab/notes/mainnet-sweep-v5-smoke
 - Over-Wait / WaitHard tax still dominates TPS on hot blocks.  
 - True mid-tx resume still non-goal (revm).  
 - Optional full 7-block v5 when TPS path improves.
+
+---
+
+## Follow-on: v6 cost-aware π
+
+See `lab/notes/specfence-cost-policy-v6.md`. Sticky/low-τ WaitHard replaced by expected-cost comparison; smoke only (gate not met for full v6).

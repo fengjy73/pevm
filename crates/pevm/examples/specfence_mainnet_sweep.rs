@@ -60,6 +60,11 @@ struct RunRow {
     selective_fallback_full: usize,
     partial_retry_count: usize,
     partial_retry_fallback_full: usize,
+    cost_chose_wait: usize,
+    cost_chose_spec: usize,
+    cost_chose_bind: usize,
+    mean_p_at_wait: f64,
+    mean_p_at_spec: f64,
     ok: bool,
     error: Option<String>,
 }
@@ -219,6 +224,11 @@ fn measure(
                 } else {
                     m.partial_retry_fallback_full
                 },
+                cost_chose_wait: if sequential { 0 } else { m.cost_chose_wait },
+                cost_chose_spec: if sequential { 0 } else { m.cost_chose_spec },
+                cost_chose_bind: if sequential { 0 } else { m.cost_chose_bind },
+                mean_p_at_wait: if sequential { 0.0 } else { m.mean_p_at_wait },
+                mean_p_at_spec: if sequential { 0.0 } else { m.mean_p_at_spec },
                 ok: true,
                 error: None,
             }
@@ -255,6 +265,11 @@ fn measure(
             selective_fallback_full: 0,
             partial_retry_count: 0,
             partial_retry_fallback_full: 0,
+            cost_chose_wait: 0,
+            cost_chose_spec: 0,
+            cost_chose_bind: 0,
+            mean_p_at_wait: 0.0,
+            mean_p_at_spec: 0.0,
             ok: false,
             error: Some(format!("{err:?}")),
         },
@@ -319,7 +334,7 @@ fn main() {
                 for repeat in 0..repeats {
                     let row = measure(&chain, &loaded, mode, c, repeat);
                     eprintln!(
-                        "  {mode:10} cores={c} r{repeat} tps={:.0} abort={:.3} wait={} full_retry={} partial={} pr_fb={} bind={} wait_hard={} spec_read={} sel_inv={} sel_fb={} ok={}",
+                        "  {mode:10} cores={c} r{repeat} tps={:.0} abort={:.3} wait={} full_retry={} partial={} pr_fb={} bind={} wait_hard={} spec_read={} cost_w/s/b={}/{}/{} sel_inv={} sel_fb={} ok={}",
                         row.tps,
                         row.abort_rate,
                         row.wait_admissions,
@@ -329,6 +344,9 @@ fn main() {
                         row.bind_hits,
                         row.wait_hard_count,
                         row.spec_read_count,
+                        row.cost_chose_wait,
+                        row.cost_chose_spec,
+                        row.cost_chose_bind,
                         row.selective_invalidate_count,
                         row.selective_fallback_full,
                         row.ok
@@ -377,6 +395,11 @@ fn main() {
                 "selective_fallback_full": r.selective_fallback_full,
                 "partial_retry_count": r.partial_retry_count,
                 "partial_retry_fallback_full": r.partial_retry_fallback_full,
+                "cost_chose_wait": r.cost_chose_wait,
+                "cost_chose_spec": r.cost_chose_spec,
+                "cost_chose_bind": r.cost_chose_bind,
+                "mean_p_at_wait": r.mean_p_at_wait,
+                "mean_p_at_spec": r.mean_p_at_spec,
                 "ok": r.ok,
                 "error": r.error,
             })
@@ -392,14 +415,14 @@ fn main() {
     let mut csv = File::create(&csv_path).expect("write csv");
     writeln!(
         csv,
-        "block,n_tx,gas_used,mode,cores,repeat,elapsed_ms,tps,occ_aborts,abort_rate,wait_admissions,speculate_executions,region_promotions,cascade_validations_scheduled,independent_txs_skipped_by_fence,bayes_wait_decisions,bayes_speculate_decisions,bayes_conflict_updates,bayes_success_updates,wave_promotions,mean_wait_posterior,bind_hits,wait_hard_count,spec_read_count,selective_invalidate_count,tx_full_retry,region_validate_fail,soft_edge_revokes,selective_fallback_full,partial_retry_count,partial_retry_fallback_full,ok,error"
+        "block,n_tx,gas_used,mode,cores,repeat,elapsed_ms,tps,occ_aborts,abort_rate,wait_admissions,speculate_executions,region_promotions,cascade_validations_scheduled,independent_txs_skipped_by_fence,bayes_wait_decisions,bayes_speculate_decisions,bayes_conflict_updates,bayes_success_updates,wave_promotions,mean_wait_posterior,bind_hits,wait_hard_count,spec_read_count,selective_invalidate_count,tx_full_retry,region_validate_fail,soft_edge_revokes,selective_fallback_full,partial_retry_count,partial_retry_fallback_full,cost_chose_wait,cost_chose_spec,cost_chose_bind,mean_p_at_wait,mean_p_at_spec,ok,error"
     )
     .unwrap();
     for r in &rows {
         let err = r.error.as_deref().unwrap_or("").replace(",", ";");
         writeln!(
             csv,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             r.block,
             r.n_tx,
             r.gas_used,
@@ -431,6 +454,11 @@ fn main() {
             r.selective_fallback_full,
             r.partial_retry_count,
             r.partial_retry_fallback_full,
+            r.cost_chose_wait,
+            r.cost_chose_spec,
+            r.cost_chose_bind,
+            r.mean_p_at_wait,
+            r.mean_p_at_spec,
             r.ok,
             err
         )

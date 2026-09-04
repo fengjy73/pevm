@@ -12,7 +12,9 @@ use dashmap::{DashMap, DashSet};
 use crate::{BuildIdentityHasher, BuildSuffixHasher, MemoryLocationHash};
 
 use super::RegionMode;
-use super::resolve::{TAU_REVOKE, TAU_S, TAU_W};
+use super::resolve::{TAU_REVOKE, cost_prefers_wait};
+#[cfg(test)]
+use super::resolve::{TAU_S, TAU_VERY_HIGH, TAU_W};
 
 /// Prior: mild low-conflict (`α=1`, `β=9` → P≈0.1).
 const PRIOR_ALPHA: f64 = 1.0;
@@ -76,6 +78,9 @@ pub(crate) struct BayesMap {
     /// Sum of conflict posteriors at Wait decisions (for mean metric).
     wait_posterior_sum_bits: AtomicU64,
     wait_posterior_count: AtomicUsize,
+    /// Sum of conflict posteriors at SpecRead cost decisions.
+    spec_posterior_sum_bits: AtomicU64,
+    spec_posterior_count: AtomicUsize,
     success_seen: DashSet<MemoryLocationHash, BuildIdentityHasher>,
     conflict_seen: DashSet<MemoryLocationHash, BuildIdentityHasher>,
 }
@@ -89,6 +94,8 @@ impl BayesMap {
             wave_id: AtomicUsize::new(0),
             wait_posterior_sum_bits: AtomicU64::new(0),
             wait_posterior_count: AtomicUsize::new(0),
+            spec_posterior_sum_bits: AtomicU64::new(0),
+            spec_posterior_count: AtomicUsize::new(0),
             success_seen: DashSet::default(),
             conflict_seen: DashSet::default(),
         }
@@ -195,18 +202,17 @@ impl BayesMap {
         self.conflict_probability(location, address) < TAU_REVOKE
     }
 
-    /// True when π prefers WaitHard over SpecRead (`P >= τ_s`, or writer known & `P >= τ_w`).
+    /// True when cost-aware π prefers WaitHard over SpecRead.
+    /// `writer_done`: producer Executed/Validated (wait cheap); unknown → false.
     pub(crate) fn should_wait_hard(
         &self,
         location: MemoryLocationHash,
         address: Option<&Address>,
         writer_known: bool,
+        writer_done: bool,
     ) -> bool {
         let p = self.conflict_probability(location, address);
-        if writer_known && p >= TAU_W {
-            return true;
-        }
-        p >= TAU_S
+        cost_prefers_wait(writer_known, writer_done, p)
     }
 
     /// Record a Wait decision's posterior for the mean-waited metric.
@@ -216,6 +222,14 @@ impl BayesMap {
 
     pub(crate) fn note_wait_decision_account(&self, address: &Address) {
         self.record_wait_posterior(self.account_wait_probability(address));
+    }
+
+    pub(crate) fn note_cost_decision_posterior(&self, p: f64, chose_wait: bool) {
+        if chose_wait {
+            self.record_wait_posterior(p);
+        } else {
+            self.record_spec_posterior(p);
+        }
     }
 
     fn record_wait_posterior(&self, p: f64) {
@@ -238,6 +252,33 @@ impl BayesMap {
     pub(crate) fn take_mean_wait_posterior(&self) -> f64 {
         let count = self.wait_posterior_count.swap(0, Ordering::Relaxed);
         let sum = f64::from_bits(self.wait_posterior_sum_bits.swap(0, Ordering::Relaxed));
+        if count == 0 {
+            0.0
+        } else {
+            sum / count as f64
+        }
+    }
+
+    fn record_spec_posterior(&self, p: f64) {
+        let mut cur = self.spec_posterior_sum_bits.load(Ordering::Relaxed);
+        loop {
+            let next = (f64::from_bits(cur) + p).to_bits();
+            match self.spec_posterior_sum_bits.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(v) => cur = v,
+            }
+        }
+        self.spec_posterior_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn take_mean_spec_posterior(&self) -> f64 {
+        let count = self.spec_posterior_count.swap(0, Ordering::Relaxed);
+        let sum = f64::from_bits(self.spec_posterior_sum_bits.swap(0, Ordering::Relaxed));
         if count == 0 {
             0.0
         } else {
@@ -427,11 +468,17 @@ mod tests {
         for _ in 0..5 {
             bayes.observe_conflict_location_always(loc);
         }
-        // α=6, β=9 → P=6/15=0.40 ≥ τ_w=0.35 → WaitHard when writer known.
+        // α=6, β=9 → P=6/15=0.40: moderate — SpecRead if writer not done;
+        // WaitHard if writer done (cost_wait=0).
         assert!(!bayes.should_revoke(loc, None));
         assert!(
-            bayes.should_wait_hard(loc, None, true),
-            "p={}",
+            !bayes.should_wait_hard(loc, None, true, false),
+            "moderate P + writer running → SpecRead; p={}",
+            bayes.prior_wait_probability(loc)
+        );
+        assert!(
+            bayes.should_wait_hard(loc, None, true, true),
+            "moderate P + writer done → WaitHard; p={}",
             bayes.prior_wait_probability(loc)
         );
         // Simulate many success observations across "blocks" by decaying and
@@ -461,5 +508,6 @@ mod tests {
         assert!((TAU_W - 0.35).abs() < f64::EPSILON);
         assert!((TAU_S - 0.50).abs() < f64::EPSILON);
         assert!((TAU_REVOKE - 0.20).abs() < f64::EPSILON);
+        assert!((TAU_VERY_HIGH - 0.75).abs() < f64::EPSILON);
     }
 }
