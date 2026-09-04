@@ -4,6 +4,7 @@
 **Branch:** `specfence`  
 **Contract:** `specfence-rem-spec-v1.md` §4.3, §6 PartialRetry, §10 P2  
 **Base:** `5c57e32` (P1b)
+**Commit:** `da8d0e8`
 
 ## Mechanism (semantic PartialRetry)
 

@@ -1,7 +1,7 @@
 # Mainnet sweep v5 smoke (P2 PartialRetry)
 
 **Date:** 2026-09-04 (Asia/Shanghai)  
-**Commit:** (see git)  
+**Commit:** `da8d0e8`  
 **Command:**
 ```
 cargo run -p pevm --release --config 'profile.release.lto=false' --example specfence_mainnet_sweep -- \
