@@ -564,8 +564,10 @@ fn try_validate(
     let aborted = !read_set_valid && scheduler.try_validation_abort(tx_version);
     if aborted {
         mv_memory.convert_writes_to_estimates(tx_version.tx_idx);
+        // Always count validation aborts, including pure OCC. Region promotion
+        // remains SpecFence/PCC-only.
+        specfence.metrics.record_occ_abort();
         if specfence.mode.uses_regions() {
-            specfence.metrics.record_occ_abort();
             for location in invalid {
                 if mv_memory.regions.promote_location(location) {
                     specfence.metrics.record_promotion(None);

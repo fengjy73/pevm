@@ -1,10 +1,10 @@
 //! `SpecFence` mixed Wait/Speculate tests (no mainnet download).
 
-use std::{fmt::Debug, num::NonZeroUsize, thread};
+use std::{fmt::Debug, num::NonZeroUsize, sync::Arc, thread};
 
 use pevm::{
-    ConcurrencyMode, InMemoryStorage, Pevm, PevmTxExecutionResult, Storage, chain::PevmEthereum,
-    execute_revm_sequential,
+    ConcurrencyMode, EvmAccount, InMemoryStorage, Pevm, PevmTxExecutionResult, Storage,
+    chain::PevmEthereum, execute_revm_sequential,
 };
 use revm::{
     context::{BlockEnv, TransactTo, TxEnv},
@@ -12,6 +12,7 @@ use revm::{
 };
 
 pub mod common;
+pub mod erc20;
 
 fn concurrency() -> NonZeroUsize {
     thread::available_parallelism().unwrap_or(NonZeroUsize::MIN)
@@ -302,4 +303,25 @@ fn default_mode_is_occ() {
         .collect();
     let storage = storage_for(n);
     common::test_execute_revm(&PevmEthereum::mainnet(), storage, txs);
+}
+
+
+/// OCC must count validation aborts on a conflicting ERC-20 cluster (non-lazy).
+#[test]
+fn occ_counts_validation_aborts() {
+    let (mut state, bytecodes, txs) = erc20::generate_cluster(4, 8, 4);
+    state.insert(Address::ZERO, EvmAccount::default());
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+    let mut saw_abort = false;
+    for _ in 0..5 {
+        let (_, metrics, _) = run_mode(ConcurrencyMode::Occ, &storage, txs.clone());
+        if metrics.occ_aborts > 0 {
+            saw_abort = true;
+            break;
+        }
+    }
+    assert!(
+        saw_abort,
+        "OCC ERC-20 cluster must record occ_aborts > 0 (metrics instrumentation)"
+    );
 }
