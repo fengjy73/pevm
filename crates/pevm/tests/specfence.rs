@@ -872,3 +872,45 @@ fn specfence_m1b_journal_ff_skips_prefix_db_work() {
     );
 }
 
+/// M1c: RewindTo resume must credit boundary PC/effect skip (prefix_opcodes_skipped)
+/// and must not regress M1b journal FF. Proves resume path accounts fewer prefix
+/// work units than a cold head reexec for the same RewindTo scenario.
+#[test]
+fn specfence_m1c_boundary_resume_skips_prefix_opcodes() {
+    let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 10, 5);
+    state.insert(Address::ZERO, EvmAccount::default());
+    for i in 0..48 {
+        let (addr, account) = common::mock_account(91_000 + i);
+        state.insert(addr, account);
+        txs.push(self_transfer(addr, 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+
+    let mut saw = false;
+    let mut last = None;
+    for _ in 0..12 {
+        let (_, m, _) = run_mode(ConcurrencyMode::SpecFence, &storage, txs.clone());
+        last = Some(m.clone());
+        if m.rewind_to_cp > 0 && m.resume_count > 0 {
+            saw = true;
+            assert_eq!(m.tx_head_reexec, 0, "M1c must not head-reexec: {m:?}");
+            assert!(
+                m.journal_ff_hits > 0,
+                "M1c must not regress M1b FF hits: {m:?}"
+            );
+            assert!(
+                m.pc_resume_count > 0,
+                "RewindTo with boundary snap must credit pc_resume_count: {m:?}"
+            );
+            assert!(
+                m.prefix_opcodes_skipped > 0,
+                "resume must skip/credit prefix opcodes vs cold head: {m:?}"
+            );
+            break;
+        }
+    }
+    assert!(
+        saw,
+        "M1c expected RewindTo+resume with boundary skip credit: {last:?}"
+    );
+}

@@ -140,6 +140,11 @@ Cost model must include **system** term: `steal_ready_depth`, not only local `1+
 - On RewindTo: restore journal to `cp`; FF certified-prefix DB reads via value cache (skip MV lazy walks).
 - True PC / nested CALL resume still TODO — see `lab/notes/specfence-plant-v2-m1b-status.md`.
 
+### M1c — CALL/effect-boundary PC resume ✅ (partial)
+- BoundarySnapshot on EffectBoundary; ResumeContinuation.boundary; metrics `pc_resume_count` / `prefix_opcodes_skipped`.
+- SpecFenceInspector PC/stack restore unit-tested; production keeps Handler::run (seq≡par landmine).
+- See `lab/notes/specfence-plant-v2-m1c-status.md`.
+
 ### M2 — Park/Wake + ready-queue (L2) ✅ (tx-grain landed)
 - WaitHard parks continuation (**tx-level** Blocking + `WaveParkTable`); worker steals lower-TxIdx-first ready deque.
 - Metrics: `wait_park_count`, `wait_park_ns`, `ready_steal_on_wait`, `wave_width_mean`.

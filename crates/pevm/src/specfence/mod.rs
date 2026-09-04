@@ -8,6 +8,7 @@
 //! remains a correctness shield. FullRestart remains whole-tx reexec (revm).
 //! M1: RebindOnly / RewindTo on certified prefix (not head reexec when cps allow);
 //! M1b: journal FF + bound-value cache on RewindTo (prefix DB heavy path skipped).
+//! M1c: CALL/effect-boundary PC resume via stock Inspector (prefix opcodes skipped).
 //! suffix-only InvalidateSelective when safe.
 //! M2: WaitHard parks (tx-level) + ready-queue steal (lower TxIdx first); worker never spins.
 
@@ -19,6 +20,7 @@ use alloy_primitives::Address;
 use hashbrown::HashMap;
 
 mod bayes;
+mod boundary;
 mod dag;
 mod heat;
 mod metrics;
@@ -36,6 +38,11 @@ pub(crate) use region::RegionTable;
 pub(crate) use rem::RemCounters;
 pub(crate) use rem::PartialRetryTable;
 pub(crate) use rem::WaveParkTable;
+#[allow(unused_imports)]
+pub(crate) use boundary::{
+    arm_pc_resume, clear_pc_resume, last_boundary_snap, note_pending_effect_boundary,
+    resume_was_applied, steps_this_run, with_plant_tls, BoundarySnapshot, SpecFenceInspector,
+};
 #[allow(unused_imports)]
 pub(crate) use rem::{
     AccessMode, Checkpoint, CheckpointId, CheckpointKind, EffectOrdinal, FfValue, ParkedWait,

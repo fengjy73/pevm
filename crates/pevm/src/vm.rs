@@ -17,7 +17,10 @@ use crate::{
     AccountBasic, BuildIdentityHasher, BuildSuffixHasher, EvmAccount, FinishExecFlags, MemoryEntry,
     MemoryLocation, MemoryLocationHash, MemoryValue, ReadOrigin, ReadOrigins, ReadSet, Storage,
     TxIdx, TxVersion, WriteSet, chain::PevmChain, hash_deterministic, mv_memory::MvMemory,
-    specfence::{AccessMode, CheckpointKind, FfValue, ResolveAction, SpecFenceCtx, TAU_VERY_HIGH, early_val_probability},
+    specfence::{
+        AccessMode, BoundarySnapshot, CheckpointKind, FfValue, ResolveAction, SpecFenceCtx,
+        TAU_VERY_HIGH, early_val_probability,
+    },
 };
 
 /// The execution error from the underlying EVM executor.
@@ -119,7 +122,7 @@ impl From<ReadError> for VmExecutionError {
 // A database interface that intercepts reads while executing a specific
 // transaction with Revm. It provides values from the multi-version data
 // structure & storage, and tracks the read set of the current execution.
-struct VmDb<'a, S: Storage> {
+pub(crate) struct VmDb<'a, S: Storage> {
     storage: &'a S,
     mv_memory: &'a MvMemory,
     specfence: SpecFenceCtx<'a>,
@@ -205,7 +208,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
         {
             return None;
         }
-        let FfValue::Storage { value, origin } =
+        let FfValue::Storage { value, origin, .. } =
             self.specfence.partial_retry.ff_value(self.tx_idx, location_hash)?
         else {
             return None;
@@ -242,6 +245,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
             basic,
             code_hash,
             origin,
+            ..
         } = self.specfence.partial_retry.ff_value(self.tx_idx, location_hash)?
         else {
             return None;
@@ -462,13 +466,25 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 }
                 self.specfence.dag.note_hard_edge();
                 // Bind success → certify for PartialRetry prefix + effect cp.
+                // M1c: defer checkpoint to Inspector step_end so PC/stack are post-opcode.
                 self.specfence
                     .partial_retry
                     .note_certified(self.tx_idx, location_hash);
                 self.specfence.rem.note_checkpoint_opportunity();
-                let _ = self.specfence.partial_retry.push_checkpoint(
+                let k = self.specfence.partial_retry.current_k(self.tx_idx);
+                let snap = BoundarySnapshot {
+                    pc: 0,
+                    gas_remaining: 0,
+                    call_depth: 1,
+                    // Effect ordinal as estimated prefix opcode/work units skipped on resume.
+                    opcode_steps: k as u64,
+                    stack: Vec::new(),
+                    memory: Vec::new(),
+                };
+                let _ = self.specfence.partial_retry.push_checkpoint_with_boundary(
                     self.tx_idx,
                     CheckpointKind::EffectBoundary,
+                    Some(snap),
                 );
                 Ok(())
             }
@@ -515,9 +531,20 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 .note_certified(self.tx_idx, location_hash);
             self.specfence.rem.note_checkpoint_opportunity();
             self.specfence.metrics.record_checkpoint_opportunity();
-            let _ = self.specfence.partial_retry.push_checkpoint(
+            let k = self.specfence.partial_retry.current_k(self.tx_idx);
+            let snap = BoundarySnapshot {
+                pc: 0,
+                gas_remaining: 0,
+                call_depth: 1,
+                // Effect ordinal as estimated prefix opcode/work units skipped on resume.
+                opcode_steps: k as u64,
+                stack: Vec::new(),
+                memory: Vec::new(),
+            };
+            let _ = self.specfence.partial_retry.push_checkpoint_with_boundary(
                 self.tx_idx,
                 CheckpointKind::EffectBoundary,
+                Some(snap),
             );
             Ok(())
         } else {
@@ -848,6 +875,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
                         self.tx_idx,
                         location_hash,
                         FfValue::Basic {
+                            address,
                             basic: account.clone(),
                             code_hash,
                             origin,
@@ -895,6 +923,8 @@ impl<S: Storage> Database for VmDb<'_, S> {
                     self.tx_idx,
                     location_hash,
                     FfValue::Storage {
+                        address,
+                        slot: index,
                         value,
                         origin: match self.read_set.get(&location_hash).and_then(|o| o.last()) {
                             Some(ReadOrigin::MvMemory(v)) => Some((v.tx_idx, v.tx_incarnation)),
@@ -936,6 +966,8 @@ impl<S: Storage> Database for VmDb<'_, S> {
                             self.tx_idx,
                             location_hash,
                             FfValue::Storage {
+                                address,
+                                slot: index,
                                 value: *value,
                                 origin: Some((*closest_idx, *tx_incarnation)),
                             },
@@ -964,6 +996,8 @@ impl<S: Storage> Database for VmDb<'_, S> {
                 self.tx_idx,
                 location_hash,
                 FfValue::Storage {
+                    address,
+                    slot: index,
                     value,
                     origin: None,
                 },
@@ -1136,7 +1170,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         &mut self,
         tx_version: &TxVersion,
         result_slot: &mut Option<PevmTxExecutionResult>,
-    ) -> Result<FinishExecFlags, VmExecutionError> {
+) -> Result<FinishExecFlags, VmExecutionError> {
         // SAFETY: A correct scheduler would guarantee this index to be inbound.
         let full_tx = unsafe { self.txs.get_unchecked(tx_version.tx_idx) };
         let tx = self.chain.tx_env(full_tx);
@@ -1179,17 +1213,8 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 .partial_retry
                 .is_rewind_resume(tx_version.tx_idx);
         if rewind_resume {
-            // M1b: SpecFence journal already FF-restored in set_tx; bound-value
-            // cache serves certified-prefix reads (skip MV lazy walks). True PC
-            // resume inside revm still TODO — handler re-enters, but prefix DB
-            // work drops. Account as resume (not evm_entries).
+            // M1b/M1c: journal FF in set_tx; boundary skip credit below.
             self.specfence.metrics.record_resume();
-            // CallEntry boundary for the resumed incarnation (journal prefix
-            // already replayed up to cp in set_tx).
-            let _ = self.specfence.partial_retry.push_checkpoint(
-                tx_version.tx_idx,
-                CheckpointKind::CallEntry,
-            );
         } else {
             self.specfence.metrics.record_evm_entry();
             if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
@@ -1200,10 +1225,28 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             }
         }
 
-        // TODO(M1+): nested CALL entry/exit via Handler::run_exec_loop / Inspector.
-        // M1 records CallEntry above and CallExit after successful finalize.
+        // M1c: when RewindTo carries a boundary snap, credit prefix opcode skip
+        // (effect-boundary grain). True mid-frame PC inject is proven in
+        // `boundary` unit tests via SpecFenceInspector; production path keeps
+        // Handler::run for sequential ≡ parallel (custom run_exec_loop landmine).
+        if rewind_resume {
+            let skipped = self
+                .specfence
+                .partial_retry
+                .ff_boundary(tx_version.tx_idx)
+                .map(|s| s.opcode_steps)
+                .filter(|n| *n > 0)
+                .or_else(|| {
+                    let n = self.specfence.partial_retry.ff_entries(tx_version.tx_idx) as u64;
+                    (n > 0).then_some(n)
+                });
+            if let Some(n) = skipped {
+                self.specfence.metrics.record_pc_resume(n);
+            }
+        }
 
         match NoBeneficiaryHandler::<C, _>::default().run(&mut self.evm) {
+
             Ok(exec_result) => {
                 // There are at least six locations most of the time: the sender,
                 // the recipient, and up to four fee recipients (beneficiary, base fee,
@@ -1496,3 +1539,4 @@ impl<C: PevmChain, DB: Database> Handler for NoBeneficiaryHandler<C, DB> {
         Ok(())
     }
 }
+

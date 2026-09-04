@@ -108,6 +108,11 @@ pub struct SpecFenceMetrics {
     pub journal_ff_hits: usize,
     /// M1b: MV lazy-walk steps + cold storage fallbacks (heavy DB work).
     pub db_heavy_ops: usize,
+    /// M1c: times RewindTo credited a boundary resume (PC jump or effect-boundary skip).
+    pub pc_resume_count: usize,
+    /// M1c: estimated prefix opcodes/work units skipped on resume (`BoundarySnapshot.opcode_steps`).
+    /// Production path uses effect-ordinal grain (Handler::run); Inspector unit tests use real steps.
+    pub prefix_opcodes_skipped: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -151,6 +156,8 @@ pub(crate) struct MetricsInner {
     journal_ff_entries: AtomicUsize,
     journal_ff_hits: AtomicUsize,
     db_heavy_ops: AtomicUsize,
+    pc_resume_count: AtomicUsize,
+    prefix_opcodes_skipped: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -360,6 +367,15 @@ impl MetricsInner {
         self.db_heavy_ops.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// M1c: PC/boundary resume applied; `skipped` = prefix opcode steps not re-run.
+    pub(crate) fn record_pc_resume(&self, skipped: u64) {
+        self.pc_resume_count.fetch_add(1, Ordering::Relaxed);
+        if skipped > 0 {
+            self.prefix_opcodes_skipped
+                .fetch_add(skipped as usize, Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn mark_hot(&self, address: Address) {
         self.hot_accounts.insert(address, ());
     }
@@ -434,6 +450,8 @@ impl MetricsInner {
             journal_ff_entries: self.journal_ff_entries.load(Ordering::Relaxed),
             journal_ff_hits: self.journal_ff_hits.load(Ordering::Relaxed),
             db_heavy_ops: self.db_heavy_ops.load(Ordering::Relaxed),
+            pc_resume_count: self.pc_resume_count.load(Ordering::Relaxed),
+            prefix_opcodes_skipped: self.prefix_opcodes_skipped.load(Ordering::Relaxed),
         }
     }
 }

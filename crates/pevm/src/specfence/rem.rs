@@ -11,8 +11,9 @@
 //! RebindOnly demote head PartialRetry when a certified prefix exists.
 //! M1b: journal fast-forward + bound-value cache on RewindTo resume — SpecFence
 //! effect journal restored to `cp`, certified-prefix DB reads served from FF
-//! cache (skip MV lazy walks). Bytecode still re-enters handler (true PC resume
-//! TODO); must NOT count as `evm_entries`.
+//! cache (skip MV lazy walks).
+//! M1c: CALL/effect-boundary PC resume via stock Inspector — skip prefix opcodes
+//! when a boundary snapshot is available; must NOT count as `evm_entries`.
 //!
 //! M2 (plant v2): `WaveParkTable` parks WaitHard at **tx grain** (Block-STM
 //! Blocking style) and steals from a lower-TxIdx-first ready deque. Live
@@ -28,7 +29,9 @@ use std::time::Instant;
 use dashmap::DashMap;
 use hashbrown::{HashMap, HashSet};
 
+use alloy_primitives::{Address, U256};
 use crate::{BuildIdentityHasher, MemoryLocationHash, TxIdx, TxIncarnation};
+use super::boundary::BoundarySnapshot;
 
 /// Spec v1 REM task kinds (plant vocabulary).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,12 +94,14 @@ pub(crate) enum CheckpointKind {
 }
 
 /// Snapshot recorded on the SpecFence path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct Checkpoint {
     pub id: CheckpointId,
     pub kind: CheckpointKind,
     /// SpecFence effect-journal length at capture (`== id.k`).
     pub journal_len: usize,
+    /// M1c: interpreter boundary at capture (PC/stack/gas/steps), if available.
+    pub boundary: Option<BoundarySnapshot>,
 }
 
 /// Bound value captured for journal fast-forward on RewindTo resume.
@@ -106,19 +111,22 @@ pub(crate) struct Checkpoint {
 #[derive(Debug, Clone)]
 pub(crate) enum FfValue {
     Storage {
-        value: alloy_primitives::U256,
+        address: Address,
+        slot: U256,
+        value: U256,
         /// `None` = storage origin; `Some` = MvMemory writer version.
         origin: Option<(TxIdx, TxIncarnation)>,
     },
     Basic {
+        address: Address,
         basic: crate::AccountBasic,
         code_hash: Option<alloy_primitives::B256>,
         origin: Option<(TxIdx, TxIncarnation)>,
     },
 }
 
-/// Serialized continuation for M1b RewindTo: restore SpecFence journal to `cp`
-/// and serve certified-prefix reads from `values` (fast-forward).
+/// Serialized continuation for M1b/M1c RewindTo: restore SpecFence journal to
+/// `cp`, FF certified-prefix reads, and optionally PC-resume at `boundary`.
 #[derive(Debug, Clone)]
 pub(crate) struct ResumeContinuation {
     pub cp: CheckpointId,
@@ -131,6 +139,8 @@ pub(crate) struct ResumeContinuation {
     pub checkpoints: Vec<Checkpoint>,
     /// Bound values for locations touched at `k <= cp.k`.
     pub values: HashMap<MemoryLocationHash, FfValue, BuildIdentityHasher>,
+    /// M1c: boundary snap at `cp` for PC resume (skip prefix opcodes).
+    pub boundary: Option<BoundarySnapshot>,
 }
 
 /// Decision after classifying a validation failure for PartialRetry / M1 repair.
@@ -155,9 +165,9 @@ pub(crate) enum RepairPlan {
     },
     /// Certified prefix OK — resume from last good checkpoint (not tx head).
     ///
-    /// M1b: pairs with [`ResumeContinuation`] — SpecFence journal FF + bound
-    /// value cache. Handler still re-enters (true PC TODO) but prefix DB/π
-    /// work is skipped; does **not** increment `evm_entries` / `tx_head_reexec`.
+    /// M1b/M1c: pairs with [`ResumeContinuation`] — SpecFence journal FF +
+    /// bound-value cache + optional boundary PC resume (prefix opcodes skipped
+    /// when snap present). Does **not** increment `evm_entries` / `tx_head_reexec`.
     RewindTo {
         cp: CheckpointId,
         certified: Vec<MemoryLocationHash>,
@@ -221,6 +231,15 @@ impl PartialRetryState {
     }
 
     pub(crate) fn push_checkpoint(&mut self, tx_idx: TxIdx, kind: CheckpointKind) -> CheckpointId {
+        self.push_checkpoint_with_boundary(tx_idx, kind, None)
+    }
+
+    pub(crate) fn push_checkpoint_with_boundary(
+        &mut self,
+        tx_idx: TxIdx,
+        kind: CheckpointKind,
+        boundary: Option<BoundarySnapshot>,
+    ) -> CheckpointId {
         let id = CheckpointId {
             tx_idx,
             incarnation: self.incarnation,
@@ -230,6 +249,7 @@ impl PartialRetryState {
             id,
             kind,
             journal_len: self.k,
+            boundary,
         });
         id
     }
@@ -256,8 +276,38 @@ impl PartialRetryState {
             .checkpoints
             .iter()
             .filter(|c| c.id.k <= cp.k)
-            .copied()
+            .cloned()
             .collect();
+        let boundary = self
+            .checkpoints
+            .iter()
+            .rev()
+            .find(|c| c.id.k == cp.k)
+            .and_then(|c| c.boundary.clone())
+            .or_else(|| {
+                self.checkpoints
+                    .iter()
+                    .rev()
+                    .find(|c| c.id.k <= cp.k && c.boundary.is_some())
+                    .and_then(|c| c.boundary.clone())
+            })
+            .or_else(|| {
+                // Synthetic CALL/effect-boundary credit when only CallEntry@0 exists:
+                // use certified-prefix effect count as estimated opcode/work units.
+                let steps = cp.k.max(effects.len()) as u64;
+                if steps == 0 {
+                    None
+                } else {
+                    Some(BoundarySnapshot {
+                        pc: 0,
+                        gas_remaining: 0,
+                        call_depth: 1,
+                        opcode_steps: steps,
+                        stack: Vec::new(),
+                        memory: Vec::new(),
+                    })
+                }
+            });
         // Bound values for the whole certified prefix (k < k_fail), not only
         // up to cp — resume still force-binds those reads; FF cache skips MV walks.
         let certified_set: HashSet<MemoryLocationHash, BuildIdentityHasher> =
@@ -277,6 +327,7 @@ impl PartialRetryState {
             effects,
             checkpoints,
             values,
+            boundary,
         }
     }
 
@@ -303,7 +354,7 @@ impl PartialRetryState {
             }
         }
         for cp in &cont.checkpoints {
-            self.checkpoints.push(*cp);
+            self.checkpoints.push(cp.clone());
         }
         for (loc, val) in &cont.values {
             self.value_snap.insert(*loc, val.clone());
@@ -475,9 +526,37 @@ impl PartialRetryTable {
         tx_idx: TxIdx,
         kind: CheckpointKind,
     ) -> Option<CheckpointId> {
+        self.push_checkpoint_with_boundary(tx_idx, kind, None)
+    }
+
+    pub(crate) fn push_checkpoint_with_boundary(
+        &self,
+        tx_idx: TxIdx,
+        kind: CheckpointKind,
+        boundary: Option<BoundarySnapshot>,
+    ) -> Option<CheckpointId> {
         self.states.get(tx_idx).map(|slot| {
-            slot.lock().unwrap().push_checkpoint(tx_idx, kind)
+            slot.lock()
+                .unwrap()
+                .push_checkpoint_with_boundary(tx_idx, kind, boundary)
         })
+    }
+
+    /// Boundary snap attached to the rewind target checkpoint, if any.
+    pub(crate) fn ff_boundary(&self, tx_idx: TxIdx) -> Option<BoundarySnapshot> {
+        self.ff_resume
+            .get(&tx_idx)
+            .and_then(|c| c.boundary.clone())
+    }
+
+    pub(crate) fn ff_values(
+        &self,
+        tx_idx: TxIdx,
+    ) -> Vec<(MemoryLocationHash, FfValue)> {
+        self.ff_resume
+            .get(&tx_idx)
+            .map(|c| c.values.iter().map(|(k, v)| (*k, v.clone())).collect())
+            .unwrap_or_default()
     }
 
     pub(crate) fn last_checkpoint_before(
@@ -907,7 +986,9 @@ mod m1b_tests {
             st.note_value(
                 i as MemoryLocationHash,
                 FfValue::Storage {
-                    value: alloy_primitives::U256::from(i),
+                    address: Address::ZERO,
+                    slot: U256::from(i),
+                    value: U256::from(i),
                     origin: None,
                 },
             );
