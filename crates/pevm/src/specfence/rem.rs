@@ -142,6 +142,14 @@ pub(crate) struct StorageWriteReplay {
     pub gas_remaining_after: u64,
 }
 
+/// M1j: a LOG* event with the interpreter PC *after* the LOG opcode (step_end).
+/// Restored on absolute jump only when `jump_snap.pc >= pc` (jump past that LOG).
+#[derive(Debug, Clone)]
+pub(crate) struct LogReplay {
+    pub pc: usize,
+    pub log: alloy_primitives::Log,
+}
+
 /// Serialized continuation for M1b/M1c/M1e RewindTo: restore SpecFence journal to
 /// `cp`, FF certified-prefix reads, optionally PC-resume at `boundary`, and
 /// restore revm journal blob for write-prefix SSTORE when absolute-jumping.
@@ -169,6 +177,9 @@ pub(crate) struct ResumeContinuation {
     pub call_outcomes: Vec<CachedCallOutcome>,
     /// M1h: storage writes in certified prefix for controlled journal slot replay.
     pub write_replays: Vec<StorageWriteReplay>,
+    /// M1j: LOG* events from certified prefix (restore on absolute jump past LOG;
+    /// not stored in live_boundaries JournalBlob — that path hung inspect_run).
+    pub log_replays: Vec<LogReplay>,
 }
 
 /// Decision after classifying a validation failure for PartialRetry / M1 repair.
@@ -231,6 +242,8 @@ pub(crate) struct PartialRetryState {
     write_replays: Vec<(MemoryLocationHash, StorageWriteReplay)>,
     /// M1i: post-SSTORE gas.remaining values captured in Inspector step_end order.
     post_sstore_gases: Vec<u64>,
+    /// M1j: LOG* events captured this incarnation for jump-past-LOG replay.
+    log_replays: Vec<LogReplay>,
 }
 
 impl PartialRetryState {
@@ -246,6 +259,7 @@ impl PartialRetryState {
         self.call_outcomes.clear();
         self.write_replays.clear();
         self.post_sstore_gases.clear();
+        self.log_replays.clear();
     }
 
     pub(crate) fn note_access(
@@ -321,6 +335,11 @@ impl PartialRetryState {
         }
         self.write_replays.retain(|(l, _)| *l != location);
         self.write_replays.push((location, replay));
+    }
+
+    /// M1j: replace captured LOG* events for this incarnation (jump-past-LOG replay).
+    pub(crate) fn note_log_replays(&mut self, logs: Vec<LogReplay>) {
+        self.log_replays = logs;
     }
 
     /// Build an M1b resume continuation for RewindTo(`cp`) with fail at `k_fail`.
@@ -442,6 +461,8 @@ impl PartialRetryState {
             journal_blob,
             call_outcomes,
             write_replays,
+            // All logs from this incarnation's certified run — jump may skip LOG*.
+            log_replays: self.log_replays.clone(),
         }
     }
 
@@ -633,6 +654,13 @@ impl PartialRetryTable {
     ) {
         if let Some(slot) = self.states.get(tx_idx) {
             slot.lock().unwrap().note_write_replay(location, replay);
+        }
+    }
+
+    /// M1j: record LOG* events for absolute-jump past LOG (hang-free vs blob path).
+    pub(crate) fn note_log_replays(&self, tx_idx: TxIdx, logs: Vec<LogReplay>) {
+        if let Some(slot) = self.states.get(tx_idx) {
+            slot.lock().unwrap().note_log_replays(logs);
         }
     }
 
