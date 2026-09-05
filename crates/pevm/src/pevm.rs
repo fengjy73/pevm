@@ -28,8 +28,9 @@ use crate::{
     scheduler::Scheduler,
     specfence::{
         AccountHints, BayesMap, ConcurrencyMode, DEFAULT_TAU, HeatMap, MetricsInner,
-        PartialRetryTable, RemCounters, RepairPlan, SpecDag, SpecFenceCtx, SpecFenceMetrics,
-        WaveParkTable, seed_wait_regions, update_bayes, update_heat,
+        PartialRetryTable, RemCounters, RepairPlan, RwPriorMap, SpecDag, SpecFenceCtx,
+        SpecFenceMetrics, WaveParkTable, seed_wait_regions, update_bayes, update_heat,
+        update_rw_prior,
     },
     storage::StorageWrapper,
     vm::{
@@ -156,6 +157,7 @@ pub struct Pevm {
     concurrency_mode: ConcurrencyMode,
     heat: HeatMap,
     bayes: BayesMap,
+    rw_prior: RwPriorMap,
     last_metrics: SpecFenceMetrics,
     last_initial_wait_accounts: std::collections::HashSet<alloy_primitives::Address>,
 }
@@ -169,6 +171,7 @@ impl Default for Pevm {
             concurrency_mode: ConcurrencyMode::Occ,
             heat: HeatMap::new(),
             bayes: BayesMap::new(),
+            rw_prior: RwPriorMap::new(),
             last_metrics: SpecFenceMetrics::default(),
             last_initial_wait_accounts: std::collections::HashSet::new(),
         }
@@ -210,7 +213,13 @@ impl Pevm {
     pub fn reset_heat(&mut self) {
         self.heat.reset();
         self.bayes.reset();
+        self.rw_prior.reset();
         self.last_initial_wait_accounts.clear();
+    }
+
+    /// M3: number of locations with process-local write prior (diagnostics).
+    pub fn rw_prior_hot_writes(&self) -> usize {
+        self.rw_prior.hot_write_count()
     }
 
     /// Conflict probability for an account-level region (tests / diagnostics).
@@ -333,6 +342,7 @@ impl Pevm {
             rem: &rem,
             partial_retry: &partial_retry,
             wave: &wave,
+            rw_prior: &self.rw_prior,
         };
 
         // TODO: Better thread handling
@@ -377,6 +387,7 @@ impl Pevm {
         let (mean_wait, mean_p_at_wait, mean_p_at_spec) =
             if self.concurrency_mode == ConcurrencyMode::SpecFence {
                 update_bayes(&self.bayes);
+                update_rw_prior(&self.rw_prior);
                 // mean_wait_posterior keeps historical Wait-decision mean;
                 // cost-aware means are taken after (same accumulators for wait).
                 let mean_wait = self.bayes.take_mean_wait_posterior();
@@ -685,9 +696,21 @@ fn try_validate(
             let _ = specfence
                 .partial_retry
                 .disable_jump_after_failed_resume(tx_version.tx_idx);
+            // M3: learn WŜ from aborted incarnation + first-pass miss metrics.
+            specfence
+                .rw_prior
+                .observe_write_set(&write_locations, None);
+            let mut first_pass = 0usize;
             for location in &invalid {
                 specfence.bayes.observe_conflict_location_always(*location);
                 specfence.metrics.record_bayes_conflict();
+                specfence.rw_prior.observe_co_access(*location);
+                if specfence.rw_prior.predicts_write(*location)
+                    || mv_memory.residual_writer_before(*location, tx_version.tx_idx).is_some()
+                {
+                    first_pass += 1;
+                    specfence.metrics.record_prior_bind_miss();
+                }
                 for address in specfence.hints.accounts() {
                     if address == specfence.beneficiary {
                         continue;
@@ -697,6 +720,11 @@ fn try_validate(
                     }
                 }
                 specfence.promote_from_bayes(&mv_memory.regions, *location, None);
+            }
+            if first_pass > 0 {
+                specfence
+                    .metrics
+                    .record_first_pass_validate_fail(first_pass);
             }
 
             // M1: RewindTo (L1 resume) when certified prefix + checkpoint;
@@ -829,6 +857,11 @@ fn try_validate(
         specfence
             .partial_retry
             .clear_jump_disabled(tx_version.tx_idx);
+        // M3: fold completed WŜ into process prior (inter-block Bind-before-touch).
+        // Block-local residual remains abort/ESTIMATE-driven (Bohm-lite); publishing
+        // successful WS into residual caused WaitHard storms / M2 hangs on ERC-20.
+        let writes = mv_memory.write_locations(tx_version.tx_idx);
+        specfence.rw_prior.observe_write_set(&writes, None);
         // Successful SpecRead validation → success++; try revoke sticky Waits.
         for location in &read_locations {
             if *location

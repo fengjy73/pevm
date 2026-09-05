@@ -353,6 +353,16 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return Ok(());
         }
 
+        let residual_predicts = self
+            .mv_memory
+            .residual_writer_before(location_hash, self.tx_idx)
+            .is_some();
+        // M3: process-local WŜ prior (inter-block) + residual (intra-block / reincarnation).
+        let process_prior = self.specfence.rw_prior.predicts_write(location_hash);
+        let prior_ws_predicts = residual_predicts || process_prior;
+        // Concrete writer: MV published/ESTIMATE entry, else residual WŜ(t) of a lower tx.
+        // Do NOT fall back to AccountHints.prev here — that can WaitHard on a tx that
+        // never writes ℓ (ERC-20 address vs slot) and inflate park chains under M3.
         let writer = self
             .mv_memory
             .last_writer_before(location_hash, self.tx_idx)
@@ -365,10 +375,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 tx_idx,
                 tx_incarnation,
             });
-        let residual_predicts = self
-            .mv_memory
-            .residual_writer_before(location_hash, self.tx_idx)
-            .is_some();
+        if prior_ws_predicts && writer.is_some() {
+            self.specfence.rw_prior.observe_co_access(location_hash);
+        }
 
         // P2: certified-prefix from prior PartialRetry → force Bind/WaitHard.
         let force_prefix = self
@@ -403,18 +412,22 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 writer_done,
                 bind_version.clone(),
                 residual_predicts,
+                prior_ws_predicts,
             );
             // Safety valve only: escalate SpecRead when P is very high.
             // (Old EarlyVal@0.35 WaitHard bias removed — cost model owns π.)
-            if matches!(a, ResolveAction::SpecRead)
-                && posterior >= TAU_VERY_HIGH
-                && (writer.is_some() || residual_predicts)
-            {
-                a = if let Some(v) = bind_version {
-                    ResolveAction::Bind(v)
-                } else {
-                    ResolveAction::WaitHard
-                };
+            // M3: also escalate when process/residual WŜ predicts a writer.
+            // M3: if WŜ prior + published Data → Bind before SpecRead.
+            // Keep WaitHard escalate at very-high P only (pre-M3 safety valve).
+            // Residual unfinished writers already flow through cost π / writer_known.
+            if matches!(a, ResolveAction::SpecRead) {
+                if let Some(v) = bind_version.clone() {
+                    if prior_ws_predicts || posterior >= TAU_VERY_HIGH {
+                        a = ResolveAction::Bind(v);
+                    }
+                } else if posterior >= TAU_VERY_HIGH && writer.is_some() {
+                    a = ResolveAction::WaitHard;
+                }
             }
             a
         };
@@ -432,8 +445,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                         .set_pending_park_location(location_hash);
                     return Err(ReadError::Blocking(prev));
                 }
-                // Cold-start account hint predecessor — skip when posterior is cold
-                // (secondary: don't WaitHard on cold posteriors).
+                // Cold-start: skip WaitHard when posterior is cold.
                 if posterior < crate::specfence::TAU_REVOKE {
                     let _ = self.specfence.try_revoke(
                         &self.mv_memory.regions,
@@ -457,6 +469,15 @@ impl<'a, S: Storage> VmDb<'a, S> {
             ResolveAction::Bind(v) => {
                 self.specfence.metrics.record_bind_hit();
                 self.specfence.bayes.observe_bind_hit(location_hash);
+                // M3: Bind-before-touch credit when WŜ prior (re-check process map —
+                // may have been learned mid-block) or residual / force-prefix.
+                let prior_now = prior_ws_predicts
+                    || force_prefix
+                    || self.specfence.rw_prior.predicts_write(location_hash)
+                    || residual_predicts;
+                if prior_now {
+                    self.specfence.metrics.record_prior_bind_hit();
+                }
                 if !self.specfence.scheduler.is_done(v.tx_idx) {
                     self.specfence.metrics.record_wait_hard();
                     self.specfence.metrics.record_wait(address);
@@ -479,6 +500,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
             }
             ResolveAction::SpecRead => {
                 self.specfence.metrics.record_spec_read();
+                // M3: SpecRead despite WŜ prior — bayes bind-useful miss signal (validate
+                // may still succeed; hard prior_bind_miss counted on validate fail).
+                if prior_ws_predicts {
+                    self.specfence.bayes.observe_bind_miss(location_hash);
+                }
                 // M1f/M1g: EffectBoundary so RewindTo can leave CallEntry with a live
                 // jump_snap. Absolute jump gated by jump_is_safe (Storage reads OK;
                 // no journal-blob restore; nested CALL via CallOutcome cache).
@@ -1517,6 +1543,11 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
 
                 let (wrote_new_location, contended) =
                     self.mv_memory.record(tx_version, read_set, write_set);
+                // M3: learn process WŜ from this incarnation's writes (no residual publish).
+                if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+                    let locs: Vec<_> = self.mv_memory.write_locations(tx_version.tx_idx);
+                    self.specfence.rw_prior.observe_write_set(&locs, None);
+                }
                 if wrote_new_location {
                     flags |= FinishExecFlags::WroteNewLocation;
                 }

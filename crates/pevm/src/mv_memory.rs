@@ -133,6 +133,14 @@ impl MvMemory {
             .unwrap_or_default()
     }
 
+    /// M3: optional block-local WŜ publish (kept for experiments; default path
+    /// uses process `RwPriorMap` + abort residual only — see pevm validate success).
+    #[allow(dead_code)]
+    pub(crate) fn publish_ws_prior(&self, tx_idx: TxIdx) {
+        let writes = self.write_locations(tx_idx);
+        self.residual_write_sets.insert(tx_idx, writes);
+    }
+
     /// True if some prior tx `t_w < me` lists `location` in its residual write-set.
     pub(crate) fn residual_writer_before(
         &self,
@@ -228,6 +236,9 @@ impl MvMemory {
                 wrote_new_location = true;
             }
         }
+
+        // M3: residual WŜ publish moved to pevm success path for SpecFence only
+        // (avoid OCC/PCC behavior change). See MvMemory::publish_ws_prior.
 
         (wrote_new_location, contended)
     }

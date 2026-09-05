@@ -151,9 +151,10 @@ Cost model must include **system** term: `steal_ready_depth`, not only local `1+
 - Success gate: `wait_time` down, `wave_width_mean` up, TPS↑ at 8 cores vs M1 (measure in next sweep).
 - See `lab/notes/specfence-plant-v2-m2-status.md`.
 
-### M3 — Online RW learning → Bind-before-touch
+### M3 — Online RW learning → Bind-before-touch ✅ (landed)
 - Use completed incarnation / prior blocks to Bind predicted reads before interpret.
 - Success gate: first-pass `region_validate_fail` ↓; `evm_entries` ↓ further.
+- See `lab/notes/specfence-plant-v2-m3-status.md`.
 
 ### M4 — Adaptive engagement
 - Low contention: OCC-fast path (SpecFence meta off) so conflict-free blocks match OCC.

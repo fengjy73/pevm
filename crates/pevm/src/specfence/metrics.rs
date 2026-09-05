@@ -127,6 +127,14 @@ pub struct SpecFenceMetrics {
     pub journal_blob_ff_accounts: usize,
     /// M1g: nested CALL short-circuits served from CallOutcome cache on resume.
     pub call_outcome_cache_hits: usize,
+    /// M3: Bind chosen because residual / process WŜ prior predicted the writer.
+    pub prior_bind_hits: usize,
+    /// M3: prior WŜ predicted a writer but SpecRead was taken and later failed,
+    /// or Bind placeholder missed (writer ESTIMATE / wrong version).
+    pub prior_bind_miss: usize,
+    /// M3: validation failures attributed to first-incarnation SpecRead waste
+    /// (best-effort; counted when invalid reads overlap prior-predicted locations).
+    pub first_pass_validate_fail: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -179,6 +187,9 @@ pub(crate) struct MetricsInner {
     absolute_jump_fallback: AtomicUsize,
     journal_blob_ff_accounts: AtomicUsize,
     call_outcome_cache_hits: AtomicUsize,
+    prior_bind_hits: AtomicUsize,
+    prior_bind_miss: AtomicUsize,
+    first_pass_validate_fail: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -438,6 +449,24 @@ impl MetricsInner {
         }
     }
 
+    /// M3: Bind from learned / residual WŜ prior.
+    pub(crate) fn record_prior_bind_hit(&self) {
+        self.prior_bind_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// M3: prior WŜ did not prevent a bad SpecRead / failed Bind.
+    pub(crate) fn record_prior_bind_miss(&self) {
+        self.prior_bind_miss.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// M3: first-incarnation validate fail overlapping prior-predicted locs.
+    pub(crate) fn record_first_pass_validate_fail(&self, n: usize) {
+        if n > 0 {
+            self.first_pass_validate_fail
+                .fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn mark_hot(&self, address: Address) {
         self.hot_accounts.insert(address, ());
     }
@@ -521,6 +550,9 @@ impl MetricsInner {
             absolute_jump_fallback: self.absolute_jump_fallback.load(Ordering::Relaxed),
             journal_blob_ff_accounts: self.journal_blob_ff_accounts.load(Ordering::Relaxed),
             call_outcome_cache_hits: self.call_outcome_cache_hits.load(Ordering::Relaxed),
+            prior_bind_hits: self.prior_bind_hits.load(Ordering::Relaxed),
+            prior_bind_miss: self.prior_bind_miss.load(Ordering::Relaxed),
+            first_pass_validate_fail: self.first_pass_validate_fail.load(Ordering::Relaxed),
         }
     }
 }

@@ -349,7 +349,6 @@ impl BayesMap {
             });
     }
 
-    #[allow(dead_code)]
     pub(crate) fn observe_bind_miss(&self, location: MemoryLocationHash) {
         self.bind_useful
             .entry(location)

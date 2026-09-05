@@ -16,6 +16,7 @@
 //! M1h: write-prefix jump scaffold (gated) + valued CallOutcome (opt-in SPECFENCE_VALUED_CALL_CACHE).
 //! suffix-only InvalidateSelective when safe.
 //! M2: WaitHard parks (tx-level) + ready-queue steal (lower TxIdx first); worker never spins.
+//! M3: online WŜ/RŜ prior → Bind-before-touch on first incarnation when writer version known.
 
 use crate::{
     BuildSuffixHasher, MemoryLocation, TxIdx, chain::PevmChain, hash_deterministic,
@@ -25,6 +26,7 @@ use alloy_primitives::Address;
 use hashbrown::HashMap;
 
 mod bayes;
+mod prior;
 mod boundary;
 mod dag;
 mod heat;
@@ -34,6 +36,7 @@ mod rem;
 mod resolve;
 
 pub(crate) use bayes::{BayesMap, DEFAULT_TAU};
+pub(crate) use prior::RwPriorMap;
 pub(crate) use dag::SpecDag;
 pub(crate) use heat::HeatMap;
 pub(crate) use metrics::MetricsInner;
@@ -142,6 +145,8 @@ pub(crate) struct SpecFenceCtx<'a> {
     pub partial_retry: &'a PartialRetryTable,
     /// M2 wave park / ready deque (SpecFence only; unused by OCC/PCC).
     pub wave: &'a WaveParkTable,
+    /// M3 process-local online WŜ/RŜ prior (Bind-before-touch).
+    pub rw_prior: &'a RwPriorMap,
 }
 
 impl<'a> SpecFenceCtx<'a> {
@@ -258,9 +263,13 @@ impl<'a> SpecFenceCtx<'a> {
         writer_done: bool,
         bind_version: Option<crate::TxVersion>,
         residual_predicts: bool,
+        prior_ws_predicts: bool,
     ) -> ResolveAction {
         let posterior_conflict = self.bayes.conflict_probability(location, Some(address));
-        let posterior_bind = self.bayes.bind_useful_probability(location);
+        let posterior_bind = self.bayes.bind_useful_probability(location)
+            .max(self.rw_prior.write_confidence(location));
+        // M3: residual / process prior makes a published version a Bind placeholder.
+        let prior = residual_predicts || prior_ws_predicts;
         let ctx = PolicyCtx {
             location,
             writer_known: writer.is_some(),
@@ -268,9 +277,10 @@ impl<'a> SpecFenceCtx<'a> {
             writer_done,
             posterior_conflict,
             posterior_bind_success: posterior_bind,
-            placeholder_ready: residual_predicts && (writer_done || bind_version.is_some()),
+            placeholder_ready: prior && (writer_done || bind_version.is_some()),
             // Bind only against a published writer version.
             bind_version: if writer_done { bind_version } else { None },
+            prior_ws_predicts: prior,
         };
         let action = choose_action(ctx);
         match &action {
@@ -396,4 +406,9 @@ pub(crate) fn update_heat(
 /// End-of-block Bayesian maintenance for SpecFence.
 pub(crate) fn update_bayes(bayes: &BayesMap) {
     bayes.decay_block();
+}
+
+/// End-of-block RW prior decay (M3).
+pub(crate) fn update_rw_prior(rw_prior: &RwPriorMap) {
+    rw_prior.decay_block();
 }

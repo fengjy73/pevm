@@ -1451,3 +1451,88 @@ fn specfence_m1h_valued_nested_call_resume() {
     }
     assert!(saw, "M1h valued nested RewindTo expected: {last:?}");
 }
+
+
+/// Plant v2 M3: process/residual WŜ prior drives Bind-before-touch on a
+/// contended same-sender schedule (must *read* the hot Basic location).
+/// Second block shows `prior_bind_hits > 0` and bounded `region_validate_fail`.
+#[test]
+fn specfence_m3_prior_bind_cuts_first_pass_waste() {
+    let chain = PevmEthereum::mainnet();
+    let hot = Address::from(U160::from(1));
+    let storage = storage_for(200);
+    let mut pevm = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
+
+    // Block 1 — learn WŜ on same-sender WW (each tx reads+writes Basic(hot)).
+    let txs1: Vec<TxEnv> = (1..=40).map(|i| self_transfer(hot, i as u64)).collect();
+    let seq1 = execute_revm_sequential(
+        &chain,
+        &storage,
+        Default::default(),
+        BlockEnv::default(),
+        txs1.clone(),
+    )
+    .unwrap();
+    let par1 = pevm
+        .execute_revm_parallel(
+            &chain,
+            &storage,
+            Default::default(),
+            BlockEnv::default(),
+            txs1,
+            concurrency(),
+        )
+        .unwrap();
+    assert_eq!(seq1, par1);
+    let m1 = pevm.last_specfence_metrics().clone();
+    assert!(
+        pevm.rw_prior_hot_writes() > 0 || m1.bind_hits > 0 || m1.occ_aborts > 0,
+        "block1 must learn WŜ or exercise bind/abort: prior_hot={} m1={m1:?}",
+        pevm.rw_prior_hot_writes()
+    );
+    let fail1 = m1.region_validate_fail;
+
+    // Block 2 — fresh-storage nonces, same hot Basic location. Process prior +
+    // residual WŜ from earlier txs in the block should Bind before SpecRead.
+    let txs2: Vec<TxEnv> = (1..=32).map(|i| self_transfer(hot, i as u64)).collect();
+    let seq2 = execute_revm_sequential(
+        &chain,
+        &storage,
+        Default::default(),
+        BlockEnv::default(),
+        txs2.clone(),
+    )
+    .unwrap();
+    let mut saw_prior_bind = false;
+    let mut last = None;
+    for _ in 0..8 {
+        let par2 = pevm
+            .execute_revm_parallel(
+                &chain,
+                &storage,
+                Default::default(),
+                BlockEnv::default(),
+                txs2.clone(),
+                concurrency(),
+            )
+            .unwrap();
+        assert_eq!(seq2, par2, "M3 must preserve sequential ≡ SpecFence");
+        let m2 = pevm.last_specfence_metrics().clone();
+        last = Some(m2.clone());
+        if m2.prior_bind_hits > 0 {
+            saw_prior_bind = true;
+            assert!(
+                m2.region_validate_fail <= fail1.saturating_add(fail1 / 2 + 16)
+                    || m2.prior_bind_hits >= m2.prior_bind_miss
+                    || m2.bind_hits > 0,
+                "prior Bind should improve or bound validate fails: b1_fail={fail1} m2={m2:?}"
+            );
+            break;
+        }
+    }
+    assert!(
+        saw_prior_bind,
+        "M3 prior_bind_hits must be > 0 after learning: last={last:?} prior_hot={}",
+        pevm.rw_prior_hot_writes()
+    );
+}

@@ -29,6 +29,8 @@ pub(crate) struct PolicyCtx {
     pub posterior_bind_success: f64,
     pub placeholder_ready: bool,
     pub bind_version: Option<TxVersion>,
+    /// M3: residual / process WŜ predicts a lower writer on this location.
+    pub prior_ws_predicts: bool,
 }
 
 /// Legacy Spec v1 §7.3 thresholds (kept for revoke / seed docs; live π is cost-aware).
@@ -72,6 +74,8 @@ pub(crate) fn cost_prefers_wait(
 
 /// Cost-aware π: Bind if ready; else WaitHard only when wait is clearly
 /// cheaper than SpecRead (or P ≥ τ_very_high); else SpecRead.
+/// M3: when WŜ prior predicts a writer, prefer Bind (if published) or WaitHard
+/// over SpecRead so the *first* incarnation avoids OrderedDirtyRead waste.
 pub(crate) fn choose_action(ctx: PolicyCtx) -> ResolveAction {
     // Bind when a concrete published version is ready.
     if let Some(v) = ctx.bind_version.clone() {
@@ -84,6 +88,10 @@ pub(crate) fn choose_action(ctx: PolicyCtx) -> ResolveAction {
             return ResolveAction::Bind(v);
         }
     }
+
+    // M3 Bind-before-touch is handled when bind_version is ready (above).
+    // Unfinished writers stay under the cost model / residual WaitHard escalate in vm
+    // (avoid process-prior WaitHard storms that serialize ERC-20 schedules).
 
     if cost_prefers_wait(ctx.writer_known, ctx.writer_done, ctx.posterior_conflict) {
         return ResolveAction::WaitHard;
@@ -132,7 +140,20 @@ mod tests {
             posterior_bind_success: 0.1,
             placeholder_ready,
             bind_version: bind,
+            prior_ws_predicts: false,
         }
+    }
+
+    #[test]
+    fn m3_prior_ws_binds_when_version_ready() {
+        // Prior WŜ + published version → Bind (iron-law B).
+        let v = TxVersion {
+            tx_idx: 0,
+            tx_incarnation: 0,
+        };
+        let mut c = ctx(0.2, true, true, Some(v.clone()), true);
+        c.prior_ws_predicts = true;
+        assert_eq!(choose_action(c), ResolveAction::Bind(v));
     }
 
     #[test]
