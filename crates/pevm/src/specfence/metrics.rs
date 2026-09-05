@@ -135,6 +135,12 @@ pub struct SpecFenceMetrics {
     /// M3: validation failures attributed to first-incarnation SpecRead waste
     /// (best-effort; counted when invalid reads overlap prior-predicted locations).
     pub first_pass_validate_fail: usize,
+    /// M4: Tx incarnations that ran the lean OCC-fast path (meta off).
+    pub lean_mode_txs: usize,
+    /// M4: Tx incarnations that ran the full SpecFence plant.
+    pub full_mode_txs: usize,
+    /// M4: Times engagement flipped lean → full within a block.
+    pub engagement_switches: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -190,6 +196,9 @@ pub(crate) struct MetricsInner {
     prior_bind_hits: AtomicUsize,
     prior_bind_miss: AtomicUsize,
     first_pass_validate_fail: AtomicUsize,
+    lean_mode_txs: AtomicUsize,
+    full_mode_txs: AtomicUsize,
+    engagement_switches: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -467,6 +476,19 @@ impl MetricsInner {
         }
     }
 
+    /// M4: copy engagement counters at snapshot time.
+    pub(crate) fn set_engagement_metrics(
+        &self,
+        lean_mode_txs: usize,
+        full_mode_txs: usize,
+        engagement_switches: usize,
+    ) {
+        self.lean_mode_txs.store(lean_mode_txs, Ordering::Relaxed);
+        self.full_mode_txs.store(full_mode_txs, Ordering::Relaxed);
+        self.engagement_switches
+            .store(engagement_switches, Ordering::Relaxed);
+    }
+
     pub(crate) fn mark_hot(&self, address: Address) {
         self.hot_accounts.insert(address, ());
     }
@@ -553,6 +575,9 @@ impl MetricsInner {
             prior_bind_hits: self.prior_bind_hits.load(Ordering::Relaxed),
             prior_bind_miss: self.prior_bind_miss.load(Ordering::Relaxed),
             first_pass_validate_fail: self.first_pass_validate_fail.load(Ordering::Relaxed),
+            lean_mode_txs: self.lean_mode_txs.load(Ordering::Relaxed),
+            full_mode_txs: self.full_mode_txs.load(Ordering::Relaxed),
+            engagement_switches: self.engagement_switches.load(Ordering::Relaxed),
         }
     }
 }

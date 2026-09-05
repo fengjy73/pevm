@@ -17,6 +17,7 @@
 //! suffix-only InvalidateSelective when safe.
 //! M2: WaitHard parks (tx-level) + ready-queue steal (lower TxIdx first); worker never spins.
 //! M3: online WŜ/RŜ prior → Bind-before-touch on first incarnation when writer version known.
+//! M4: adaptive engagement — lean OCC-fast path when conflict prior low; full plant under contention.
 
 use crate::{
     BuildSuffixHasher, MemoryLocation, TxIdx, chain::PevmChain, hash_deterministic,
@@ -26,6 +27,7 @@ use alloy_primitives::Address;
 use hashbrown::HashMap;
 
 mod bayes;
+mod engagement;
 mod prior;
 mod boundary;
 mod dag;
@@ -36,6 +38,7 @@ mod rem;
 mod resolve;
 
 pub(crate) use bayes::{BayesMap, DEFAULT_TAU};
+pub(crate) use engagement::AdaptiveEngagement;
 pub(crate) use prior::RwPriorMap;
 pub(crate) use dag::SpecDag;
 pub(crate) use heat::HeatMap;
@@ -147,6 +150,8 @@ pub(crate) struct SpecFenceCtx<'a> {
     pub wave: &'a WaveParkTable,
     /// M3 process-local online WŜ/RŜ prior (Bind-before-touch).
     pub rw_prior: &'a RwPriorMap,
+    /// M4 adaptive lean/full engagement (SpecFence only).
+    pub engagement: &'a AdaptiveEngagement,
 }
 
 impl<'a> SpecFenceCtx<'a> {
@@ -156,6 +161,10 @@ impl<'a> SpecFenceCtx<'a> {
         }
         if self.mode == ConcurrencyMode::Pcc {
             return true;
+        }
+        // M4 lean: no Bayes Wait admission (OCC-fast).
+        if self.engagement.is_lean() {
+            return false;
         }
         // SpecFence: revoke sticky account Wait when posterior low.
         if regions.account_mode(address) == RegionMode::Wait {
@@ -194,6 +203,10 @@ impl<'a> SpecFenceCtx<'a> {
         }
         if self.mode == ConcurrencyMode::Pcc {
             return true;
+        }
+        // M4 lean: skip Bayes WaitHard decisions.
+        if self.engagement.is_lean() {
+            return false;
         }
         // Revoke sticky Wait when posterior < τ_revoke.
         if regions.location_mode(location) == RegionMode::Wait

@@ -27,10 +27,10 @@ use crate::{
     mv_memory::MvMemory,
     scheduler::Scheduler,
     specfence::{
-        AccountHints, BayesMap, ConcurrencyMode, DEFAULT_TAU, HeatMap, MetricsInner,
-        PartialRetryTable, RemCounters, RepairPlan, RwPriorMap, SpecDag, SpecFenceCtx,
-        SpecFenceMetrics, WaveParkTable, seed_wait_regions, update_bayes, update_heat,
-        update_rw_prior,
+        AccountHints, AdaptiveEngagement, BayesMap, ConcurrencyMode, DEFAULT_TAU, HeatMap,
+        MetricsInner, PartialRetryTable, RemCounters, RepairPlan, RwPriorMap, SpecDag,
+        SpecFenceCtx, SpecFenceMetrics, WaveParkTable, seed_wait_regions, update_bayes,
+        update_heat, update_rw_prior,
     },
     storage::StorageWrapper,
     vm::{
@@ -160,6 +160,8 @@ pub struct Pevm {
     rw_prior: RwPriorMap,
     last_metrics: SpecFenceMetrics,
     last_initial_wait_accounts: std::collections::HashSet<alloy_primitives::Address>,
+    /// M4: abort rate from the previous SpecFence block (`occ_aborts / n_tx`).
+    last_abort_rate: f64,
 }
 
 impl Default for Pevm {
@@ -174,6 +176,7 @@ impl Default for Pevm {
             rw_prior: RwPriorMap::new(),
             last_metrics: SpecFenceMetrics::default(),
             last_initial_wait_accounts: std::collections::HashSet::new(),
+            last_abort_rate: 0.0,
         }
     }
 }
@@ -215,6 +218,7 @@ impl Pevm {
         self.bayes.reset();
         self.rw_prior.reset();
         self.last_initial_wait_accounts.clear();
+        self.last_abort_rate = 0.0;
     }
 
     /// M3: number of locations with process-local write prior (diagnostics).
@@ -309,15 +313,27 @@ impl Pevm {
         let hints = AccountHints::build(chain, &txs);
         let metrics_inner = MetricsInner::default();
         let mut initial_wait = std::collections::HashSet::new();
-        seed_wait_regions(
-            &mv_memory.regions,
-            &hints,
-            &self.bayes,
-            self.concurrency_mode,
-            block_env.beneficiary,
-            DEFAULT_TAU,
-            &mut initial_wait,
-        );
+        // M4: decide lean before seeding Wait so quiet blocks skip sticky Wait tax.
+        let start_lean = self.concurrency_mode == ConcurrencyMode::SpecFence
+            && AdaptiveEngagement::should_start_lean(
+                self.last_abort_rate,
+                &self.bayes,
+                DEFAULT_TAU,
+                &hints,
+                block_env.beneficiary,
+            );
+        // Lean SpecFence skips seed; OCC no-ops inside; PCC/full SpecFence seed Wait.
+        if !(self.concurrency_mode == ConcurrencyMode::SpecFence && start_lean) {
+            seed_wait_regions(
+                &mv_memory.regions,
+                &hints,
+                &self.bayes,
+                self.concurrency_mode,
+                block_env.beneficiary,
+                DEFAULT_TAU,
+                &mut initial_wait,
+            );
+        }
 
         self.execution_results.grow_to(block_size);
 
@@ -329,6 +345,11 @@ impl Pevm {
             Some(&wave)
         } else {
             None
+        };
+        let engagement = if self.concurrency_mode == ConcurrencyMode::SpecFence {
+            AdaptiveEngagement::new(block_size, start_lean)
+        } else {
+            AdaptiveEngagement::disabled(block_size)
         };
         let specfence = SpecFenceCtx {
             mode: self.concurrency_mode,
@@ -343,6 +364,7 @@ impl Pevm {
             partial_retry: &partial_retry,
             wave: &wave,
             rw_prior: &self.rw_prior,
+            engagement: &engagement,
         };
 
         // TODO: Better thread handling
@@ -403,6 +425,11 @@ impl Pevm {
             wave.wait_park_ns(),
             wave.ready_steal_on_wait(),
         );
+        metrics_inner.set_engagement_metrics(
+            engagement.lean_mode_txs(),
+            engagement.full_mode_txs(),
+            engagement.engagement_switches(),
+        );
         self.last_metrics = metrics_inner.snapshot(
             wave_id,
             mean_wait,
@@ -410,6 +437,10 @@ impl Pevm {
             mean_p_at_spec,
             wave.wave_width_mean(),
         );
+        if self.concurrency_mode == ConcurrencyMode::SpecFence {
+            self.last_abort_rate =
+                self.last_metrics.occ_aborts as f64 / (block_size as f64).max(1.0);
+        }
         self.last_initial_wait_accounts = initial_wait;
 
         if let Some(abort_reason) = self.abort_reason.take() {
@@ -651,40 +682,78 @@ fn try_validate(
     } else {
         mv_memory.validate_read_locations(tx_version.tx_idx)
     };
+    let lean_tx = specfence.mode == ConcurrencyMode::SpecFence
+        && specfence.engagement.tx_was_lean(tx_version.tx_idx);
     if specfence.mode == ConcurrencyMode::SpecFence && !invalid.is_empty() {
         specfence
             .metrics
             .record_region_validate_fail(invalid.len());
-        // Per-location validate opportunities for Phase-2 checkpoint prep.
-        for _ in &read_locations {
-            specfence.rem.note_checkpoint_opportunity();
-            specfence.metrics.record_checkpoint_opportunity();
-        }
+        // M4 lean: skip RebindOnly / checkpoint meta (OCC-fast abort below).
+        if !lean_tx {
+            // Per-location validate opportunities for Phase-2 checkpoint prep.
+            for _ in &read_locations {
+                specfence.rem.note_checkpoint_opportunity();
+                specfence.metrics.record_checkpoint_opportunity();
+            }
 
-        // M1 RebindOnly: patch origins in place when certified prefix has no
-        // poisoned suffix writes — must NOT abort / must NOT call Vm::execute.
-        let write_locations = mv_memory.write_locations(tx_version.tx_idx);
-        if let Some(plan) = specfence.partial_retry.plan_partial_retry(
-            tx_version.tx_idx,
-            &read_locations,
-            &invalid,
-            &write_locations,
-        ) {
-            if plan.suffix_writes.is_empty()
-                && mv_memory.try_rebind_invalid_reads(tx_version.tx_idx, &invalid)
-            {
-                specfence.metrics.record_partial_retry();
-                specfence.metrics.record_rebind_only();
-                specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
-                specfence.partial_retry.clear_repair(tx_version.tx_idx);
-                read_set_valid = true;
-                // Fall through to success path below (no abort).
+            // M1 RebindOnly: patch origins in place when certified prefix has no
+            // poisoned suffix writes — must NOT abort / must NOT call Vm::execute.
+            let write_locations = mv_memory.write_locations(tx_version.tx_idx);
+            if let Some(plan) = specfence.partial_retry.plan_partial_retry(
+                tx_version.tx_idx,
+                &read_locations,
+                &invalid,
+                &write_locations,
+            ) {
+                if plan.suffix_writes.is_empty()
+                    && mv_memory.try_rebind_invalid_reads(tx_version.tx_idx, &invalid)
+                {
+                    specfence.metrics.record_partial_retry();
+                    specfence.metrics.record_rebind_only();
+                    specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
+                    specfence.partial_retry.clear_repair(tx_version.tx_idx);
+                    read_set_valid = true;
+                    // Fall through to success path below (no abort).
+                }
             }
         }
     }
 
     let aborted = !read_set_valid && scheduler.try_validation_abort(tx_version);
     if aborted {
+        // M4 lean abort: OCC-fast ESTIMATE (no RewindTo / selective), but keep
+        // SpecFence fence cascade so independents are not force-revalidated.
+        if lean_tx {
+            let write_locations = mv_memory.write_locations(tx_version.tx_idx);
+            mv_memory.convert_writes_to_estimates(tx_version.tx_idx);
+            specfence.metrics.record_occ_abort();
+            specfence.metrics.record_full_restart();
+            specfence.rw_prior.observe_write_set(&write_locations, None);
+            for location in &invalid {
+                specfence.bayes.observe_conflict_location_always(*location);
+                specfence.metrics.record_bayes_conflict();
+                specfence.rw_prior.observe_co_access(*location);
+                // Learn Wait sticky for post-escalate / next block; lean path ignores it.
+                specfence.promote_from_bayes(&mv_memory.regions, *location, None);
+            }
+            let rewind_to =
+                mv_memory.min_higher_reader_of(tx_version.tx_idx, &write_locations);
+            let block_size = scheduler.block_size();
+            let cascade_from = tx_version.tx_idx + 1;
+            let (cascade, skipped) = match rewind_to {
+                Some(to) => {
+                    let to = to.min(block_size);
+                    (
+                        block_size.saturating_sub(to),
+                        to.saturating_sub(cascade_from),
+                    )
+                }
+                None => (0, block_size.saturating_sub(cascade_from)),
+            };
+            specfence.metrics.record_fence_cascade(cascade, skipped);
+            specfence.engagement.note_abort();
+            return scheduler.finish_validation_fenced(tx_version, true, rewind_to);
+        }
         // Snapshot write locations before invalidate (same set).
         let write_locations = if specfence.mode == ConcurrencyMode::SpecFence {
             mv_memory.write_locations(tx_version.tx_idx)
@@ -693,6 +762,7 @@ fn try_validate(
         };
         if specfence.mode == ConcurrencyMode::SpecFence {
             specfence.metrics.record_occ_abort();
+            specfence.engagement.note_abort();
             let _ = specfence
                 .partial_retry
                 .disable_jump_after_failed_resume(tx_version.tx_idx);

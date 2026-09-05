@@ -156,9 +156,10 @@ Cost model must include **system** term: `steal_ready_depth`, not only local `1+
 - Success gate: first-pass `region_validate_fail` ↓; `evm_entries` ↓ further.
 - See `lab/notes/specfence-plant-v2-m3-status.md`.
 
-### M4 — Adaptive engagement
+### M4 — Adaptive engagement ✅ (landed)
 - Low contention: OCC-fast path (SpecFence meta off) so conflict-free blocks match OCC.
 - High contention: full REM plant.
+- See `lab/notes/specfence-plant-v2-m4-status.md`.
 
 **Do not** ship more τ-only Bayes without M1.
 

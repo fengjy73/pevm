@@ -410,7 +410,38 @@ impl BayesMap {
         self.conflict_seen.clear();
     }
 
+    /// Mean excess conflict mass above the Beta prior (M4 lean trigger).
+    /// `mean_ℓ max(0, P_ℓ − prior_mean)`; 0 when no locations tracked.
+    pub(crate) fn conflict_mass(&self) -> f64 {
+        let prior = PRIOR_ALPHA / (PRIOR_ALPHA + PRIOR_BETA);
+        let mut sum = 0.0;
+        let mut n = 0usize;
+        for entry in self.locations.iter() {
+            sum += (entry.mean() - prior).max(0.0);
+            n += 1;
+        }
+        if n == 0 {
+            0.0
+        } else {
+            sum / n as f64
+        }
+    }
+
+    /// Locations (or accounts if locations empty) with P ≥ `tau` (seed-Wait proxy).
+    pub(crate) fn hot_conflict_count(&self, tau: f64) -> usize {
+        let loc_hot = self
+            .locations
+            .iter()
+            .filter(|e| e.mean() >= tau)
+            .count();
+        if loc_hot > 0 || !self.locations.is_empty() {
+            return loc_hot;
+        }
+        self.accounts.iter().filter(|e| e.mean() >= tau).count()
+    }
+
     pub(crate) fn reset(&self) {
+
         self.locations.clear();
         self.accounts.clear();
         self.bind_useful.clear();

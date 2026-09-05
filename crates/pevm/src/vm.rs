@@ -313,7 +313,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
         address: Address,
         location_hash: MemoryLocationHash,
     ) -> Result<(), ReadError> {
-        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+        if self.specfence.mode == crate::ConcurrencyMode::SpecFence
+            && !self.specfence.engagement.is_lean()
+        {
             let _ = self.specfence.rem.note_effect();
             self.specfence.partial_retry.note_access(
                 self.tx_idx,
@@ -349,6 +351,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
 
         // --- SpecFence path ---
         if address == self.specfence.beneficiary {
+            self.specfence.metrics.record_spec_read();
+            return Ok(());
+        }
+        // M4 lean: SpecRead-only (skip Bayes π / WaitHard / Bind / rem cps).
+        if self.specfence.engagement.is_lean() {
             self.specfence.metrics.record_spec_read();
             return Ok(());
         }
@@ -521,6 +528,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
         location_hash: MemoryLocationHash,
     ) -> Result<(), ReadError> {
         if self.specfence.mode != crate::ConcurrencyMode::SpecFence {
+            return Ok(());
+        }
+        // M4 lean: no EarlyVal / checkpoint meta.
+        if self.specfence.engagement.is_lean() {
             return Ok(());
         }
         if address == self.specfence.beneficiary {
@@ -1083,6 +1094,12 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         if !self.specfence.mode.uses_regions() {
             return None;
         }
+        // M4 lean: no proactive Wait admission.
+        if self.specfence.mode == crate::ConcurrencyMode::SpecFence
+            && self.specfence.engagement.is_lean()
+        {
+            return None;
+        }
         let tx = self.chain.tx_env(unsafe { self.txs.get_unchecked(tx_idx) });
         if let Some(prev) = self
             .specfence
@@ -1214,7 +1231,10 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
 
         // Plant v2 M1: RewindTo resume must NOT call record_evm_entry / head path.
         // Fresh starts (incl. FullRestart) still count as evm_entries.
+        let lean = self.specfence.mode == crate::ConcurrencyMode::SpecFence
+            && self.specfence.engagement.begin_tx(tx_version.tx_idx);
         let rewind_resume = self.specfence.mode == crate::ConcurrencyMode::SpecFence
+            && !lean
             && self
                 .specfence
                 .partial_retry
@@ -1227,7 +1247,8 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             // CallEntry/CallExit come from SpecFenceInspector on the inspect path.
             // OCC/PCC keep a synthetic CallEntry for PartialRetry bookkeeping only
             // when SpecFence mode... (SpecFence uses inspector hooks instead).
-            if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            // M4 lean: no checkpoints (OCC-fast Handler::run).
+            if self.specfence.mode == crate::ConcurrencyMode::SpecFence && !lean {
                 // Still record a k=0 CallEntry so plan_repair has a floor cp when
                 // the inspector call hook is delayed; inspector may add richer cps.
                 let _ = self.specfence.partial_retry.push_checkpoint(
@@ -1260,7 +1281,8 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             }
         }
 
-        let use_inspect = self.specfence.mode == crate::ConcurrencyMode::SpecFence;
+        // M4 lean: Handler::run like OCC (skip SpecFenceInspector step tax).
+        let use_inspect = self.specfence.mode == crate::ConcurrencyMode::SpecFence && !lean;
         let run_result = if use_inspect {
             let partial_retry = self.specfence.partial_retry;
             let metrics = self.specfence.metrics;

@@ -1536,3 +1536,114 @@ fn specfence_m3_prior_bind_cuts_first_pass_waste() {
         pevm.rw_prior_hot_writes()
     );
 }
+
+/// M4: low-conflict independent schedule engages lean OCC-fast path.
+#[test]
+fn specfence_m4_low_conflict_engages_lean() {
+    let n = 128;
+    let txs: Vec<TxEnv> = (1..=n)
+        .map(|i| self_transfer(Address::from(U160::from(i)), 1))
+        .collect();
+    let storage = storage_for(n);
+    let chain = PevmEthereum::mainnet();
+    let seq = execute_revm_sequential(
+        &chain,
+        &storage,
+        Default::default(),
+        BlockEnv::default(),
+        txs.clone(),
+    )
+    .unwrap();
+    let mut pevm = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
+    pevm.reset_heat();
+    let par = pevm
+        .execute_revm_parallel(
+            &chain,
+            &storage,
+            Default::default(),
+            BlockEnv::default(),
+            txs,
+            concurrency(),
+        )
+        .unwrap();
+    assert_eq!(seq, par, "M4 lean must preserve seq≡par");
+    let m = pevm.last_specfence_metrics();
+    assert!(
+        m.lean_mode_txs > 0,
+        "independent block must engage lean: {m:?}"
+    );
+    assert_eq!(
+        m.engagement_switches, 0,
+        "quiet block should not escalate: {m:?}"
+    );
+    assert_eq!(m.wait_admissions, 0, "lean must not Wait-admit: {m:?}");
+    assert_eq!(m.wait_hard_count, 0, "lean must not WaitHard: {m:?}");
+    // Inspector tax off → no inspector_steps on lean-only block.
+    assert_eq!(
+        m.inspector_steps, 0,
+        "lean skips inspect_run: {m:?}"
+    );
+}
+
+/// M4: high-conflict same-sender still uses full plant after escalate; seq≡par.
+#[test]
+fn specfence_m4_high_conflict_uses_full_plant() {
+    let n = 48;
+    let sender = Address::from(U160::from(1));
+    let txs: Vec<TxEnv> = (1..=n).map(|i| self_transfer(sender, i as u64)).collect();
+    let storage = storage_for(n + 1);
+    let chain = PevmEthereum::mainnet();
+    let seq = execute_revm_sequential(
+        &chain,
+        &storage,
+        Default::default(),
+        BlockEnv::default(),
+        txs.clone(),
+    )
+    .unwrap();
+    let mut pevm = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
+    pevm.reset_heat();
+    let mut last = None;
+    let mut saw_full = false;
+    for _ in 0..6 {
+        let par = pevm
+            .execute_revm_parallel(
+                &chain,
+                &storage,
+                Default::default(),
+                BlockEnv::default(),
+                txs.clone(),
+                concurrency(),
+            )
+            .unwrap();
+        assert_eq!(seq, par, "M4 full plant must preserve seq≡par");
+        let m = pevm.last_specfence_metrics().clone();
+        last = Some(m.clone());
+        // Either started full (after learning) or escalated mid-block / used full txs.
+        if m.full_mode_txs > 0 || m.engagement_switches > 0 || m.wait_hard_count > 0
+            || m.bind_hits > 0
+            || m.inspector_steps > 0
+        {
+            saw_full = true;
+            break;
+        }
+    }
+    assert!(
+        saw_full,
+        "contended same-sender must engage full plant: last={last:?}"
+    );
+    let m = last.unwrap();
+    assert!(
+        m.full_mode_txs > 0 && m.lean_mode_txs == 0,
+        "multi-writer hints must start full (not lean): {m:?}"
+    );
+    // Full plant may Wait-serialize (0 aborts) or abort/repair — either is engagement.
+    assert!(
+        m.wait_admissions > 0
+            || m.bind_hits > 0
+            || m.wait_hard_count > 0
+            || m.occ_aborts > 0
+            || m.inspector_steps > 0,
+        "full-plant signal expected: {m:?}"
+    );
+}
