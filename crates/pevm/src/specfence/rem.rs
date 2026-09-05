@@ -127,6 +127,21 @@ pub(crate) enum FfValue {
     },
 }
 
+/// M1h: certified-prefix storage write to re-apply into revm journal on absolute jump
+/// without dumping a full journal-blob (avoids present_values Db/MV poison).
+///
+/// Only the changed slot is mutated after `load_account`; residual MvMemory
+/// republish remains the source of truth for pevm write-set publish.
+#[derive(Debug, Clone)]
+pub(crate) struct StorageWriteReplay {
+    pub address: Address,
+    pub slot: U256,
+    pub original: U256,
+    pub present: U256,
+    /// Interpreter gas.remaining when this write was flushed (post-SSTORE).
+    pub gas_remaining_after: u64,
+}
+
 /// Serialized continuation for M1b/M1c/M1e RewindTo: restore SpecFence journal to
 /// `cp`, FF certified-prefix reads, optionally PC-resume at `boundary`, and
 /// restore revm journal blob for write-prefix SSTORE when absolute-jumping.
@@ -136,6 +151,8 @@ pub(crate) struct ResumeContinuation {
     pub k_fail: usize,
     pub certified: Vec<MemoryLocationHash>,
     pub suffix_writes: Vec<MemoryLocationHash>,
+    /// Write locations certified in the prefix (kept in MvMemory; not ESTIMATEd).
+    pub prefix_writes: Vec<MemoryLocationHash>,
     /// Effect journal prefix `[0..=cp.k]` (empty if cp.k==0).
     pub effects: Vec<RegionAccess>,
     /// Checkpoints with `k <= cp.k`.
@@ -150,6 +167,8 @@ pub(crate) struct ResumeContinuation {
     pub journal_blob: Option<JournalBlob>,
     /// M1g: nested CallOutcomes completed at `k_end <= cp.k` (resume short-circuit).
     pub call_outcomes: Vec<CachedCallOutcome>,
+    /// M1h: storage writes in certified prefix for controlled journal slot replay.
+    pub write_replays: Vec<StorageWriteReplay>,
 }
 
 /// Decision after classifying a validation failure for PartialRetry / M1 repair.
@@ -208,6 +227,8 @@ pub(crate) struct PartialRetryState {
     live_boundaries: HashMap<usize, (BoundarySnapshot, JournalBlob), BuildIdentityHasher>,
     /// M1g: nested CallOutcomes captured this incarnation (ordered by call_seq).
     call_outcomes: Vec<CachedCallOutcome>,
+    /// M1h: storage writes observed at finalize (for jump replay).
+    write_replays: Vec<(MemoryLocationHash, StorageWriteReplay)>,
 }
 
 impl PartialRetryState {
@@ -221,6 +242,7 @@ impl PartialRetryState {
         self.value_snap.clear();
         self.live_boundaries.clear();
         self.call_outcomes.clear();
+        self.write_replays.clear();
     }
 
     pub(crate) fn note_access(
@@ -273,6 +295,16 @@ impl PartialRetryState {
         self.value_snap.insert(location, value);
     }
 
+    /// M1h: record a storage write present/original for absolute-jump journal replay.
+    pub(crate) fn note_write_replay(
+        &mut self,
+        location: MemoryLocationHash,
+        replay: StorageWriteReplay,
+    ) {
+        self.write_replays.retain(|(l, _)| *l != location);
+        self.write_replays.push((location, replay));
+    }
+
     /// Build an M1b resume continuation for RewindTo(`cp`) with fail at `k_fail`.
     pub(crate) fn build_continuation(
         &self,
@@ -280,6 +312,7 @@ impl PartialRetryState {
         k_fail: usize,
         certified: Vec<MemoryLocationHash>,
         suffix_writes: Vec<MemoryLocationHash>,
+        prefix_writes: Vec<MemoryLocationHash>,
     ) -> ResumeContinuation {
         let effects: Vec<RegionAccess> = self
             .journal
@@ -361,11 +394,27 @@ impl PartialRetryState {
             .filter(|c| c.k_end <= cp.k && c.depth > 1)
             .cloned()
             .collect();
+        let prefix_set: HashSet<MemoryLocationHash, BuildIdentityHasher> =
+            prefix_writes.iter().copied().collect();
+        // Include writes whose first touch was before k_fail (effect order), even
+        // when PartialRetry classified them as suffix due to missing certify.
+        let write_replays: Vec<StorageWriteReplay> = self
+            .write_replays
+            .iter()
+            .filter(|(loc, _)| {
+                let fk = self.first_k.get(loc).copied().unwrap_or(usize::MAX);
+                fk < k_fail
+                    || prefix_set.contains(loc)
+                    || (fk <= cp.k && certified_set.contains(loc))
+            })
+            .map(|(_, r)| r.clone())
+            .collect();
         ResumeContinuation {
             cp,
             k_fail,
             certified,
             suffix_writes,
+            prefix_writes,
             effects,
             checkpoints,
             values,
@@ -373,6 +422,7 @@ impl PartialRetryState {
             jump_snap,
             journal_blob,
             call_outcomes,
+            write_replays,
         }
     }
 
@@ -548,6 +598,33 @@ impl PartialRetryTable {
         }
     }
 
+    /// M1h: record storage write present/original for absolute-jump journal replay.
+    pub(crate) fn note_write_replay(
+        &self,
+        tx_idx: TxIdx,
+        location: MemoryLocationHash,
+        replay: StorageWriteReplay,
+    ) {
+        if let Some(slot) = self.states.get(tx_idx) {
+            slot.lock().unwrap().note_write_replay(location, replay);
+        }
+    }
+
+    /// Locations with flushed write_replays in the live incarnation journal.
+    pub(crate) fn write_replay_locations(&self, tx_idx: TxIdx) -> Vec<MemoryLocationHash> {
+        self.states
+            .get(tx_idx)
+            .map(|s| {
+                s.lock()
+                    .unwrap()
+                    .write_replays
+                    .iter()
+                    .map(|(l, _)| *l)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Arm RewindTo + build M1b FF continuation from the failed incarnation's journal.
     pub(crate) fn arm_rewind_to(
         &self,
@@ -556,12 +633,14 @@ impl PartialRetryTable {
         k_fail: usize,
         certified: Vec<MemoryLocationHash>,
         suffix_writes: Vec<MemoryLocationHash>,
+        prefix_writes: Vec<MemoryLocationHash>,
     ) {
         let cont = self.states[tx_idx].lock().unwrap().build_continuation(
             cp,
             k_fail,
             certified.clone(),
             suffix_writes.clone(),
+            prefix_writes,
         );
         self.ff_resume.insert(tx_idx, cont);
         self.repair.insert(
@@ -1172,7 +1251,7 @@ mod m1b_tests {
         }
         let cp = st.last_checkpoint_before(4).expect("cp");
         assert_eq!(cp.k, 2);
-        let cont = st.build_continuation(cp, 4, vec![1, 2], vec![3, 4]);
+        let cont = st.build_continuation(cp, 4, vec![1, 2], vec![3, 4], vec![]);
         assert_eq!(cont.effects.len(), 2);
         assert!(cont.values.contains_key(&1));
         assert!(cont.values.contains_key(&2));

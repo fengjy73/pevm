@@ -13,6 +13,8 @@
 //! gas refunds so post-jump expansion/refunds ≡ sequential prefix.
 //! M1g: Storage-prefix jumps (never journal-blob restore) + nested CALL via
 //! CallOutcome cache; `bytecode_len` relaxed carefully for storage/CALL-boundary.
+//! M1h: valued CallOutcome short-circuit (opt-in SPECFENCE_VALUED_CALL_CACHE=1);
+//! write-prefix jump infra in rem (gated — see status note).
 //! Disable with `SPECFENCE_ABSOLUTE_JUMP=0`.
 
 #![allow(dead_code)]
@@ -74,6 +76,8 @@ pub(crate) struct CachedCallOutcome {
     pub caller: Address,
     pub gas_limit: u64,
     pub is_static: bool,
+    /// Transferred call value (M1h valued CallOutcome).
+    pub value: U256,
     /// SpecFence effect ordinal when `call_end` fired.
     pub k_end: usize,
     pub outcome: CallOutcome,
@@ -289,6 +293,7 @@ struct PendingCallMeta {
     caller: Address,
     gas_limit: u64,
     is_static: bool,
+    value: U256,
 }
 
 /// Install plant TLS for the duration of `f` (SpecFence `Vm::execute` body).
@@ -645,6 +650,7 @@ where
         CALL_DEPTH.set(depth);
         let seq = CALL_SEQ.get().saturating_add(1);
         CALL_SEQ.set(seq);
+        let call_value = inputs.value.transfer().unwrap_or(U256::ZERO);
         PENDING_CALL_STACK.with(|s| {
             s.borrow_mut().push(PendingCallMeta {
                 call_seq: seq,
@@ -654,9 +660,10 @@ where
                 caller: inputs.caller,
                 gas_limit: inputs.gas_limit,
                 is_static: inputs.is_static,
+                value: call_value,
             });
         });
-        // M1g: short-circuit certified nested CALLs from resume cache.
+        // M1g/M1h: short-circuit certified nested CALLs from resume cache.
         // Never override the top-level tx call (parent_depth == 0).
         if parent_depth >= 1 {
             let hit = RESUME_CALL_CACHE.with(|c| {
@@ -672,31 +679,57 @@ where
                     && cached.bytecode_address == inputs.bytecode_address
                     && cached.caller == inputs.caller
                 {
-                    Some(cached.outcome.clone())
+                    Some((cached.outcome.clone(), cached.value))
                 } else {
                     None
                 }
             });
-            if let Some(mut outcome) = hit {
-                // Inspector override skips make_call_frame — replicate journal
-                // checkpoint + touch/transfer so pevm state ≡ sequential CALL.
-                // Refuse short-circuit if value transfer is non-zero (needs loaded bals).
-                if inputs.transfers_value() {
-                    // Non-zero value transfer: need full make_call_frame.
+            if let Some((mut outcome, cached_value)) = hit {
+                let value = if !cached_value.is_zero() {
+                    cached_value
                 } else {
+                    call_value
+                };
+                // M1h valued short-circuit opt-in (SPECFENCE_VALUED_CALL_CACHE=1).
+                // Default: non-zero falls through to make_call_frame (avoids hang).
+                let allow_valued = std::env::var_os("SPECFENCE_VALUED_CALL_CACHE")
+                    .is_some_and(|v| v == "1");
+                if value.is_zero() || allow_valued {
                     let journal = context.journal_mut();
-                    // Ensure callee is loaded into pevm Db / journal (read-set).
-                    let _ = journal.load_account(inputs.target_address);
                     let _ = journal.load_account_with_code(inputs.bytecode_address);
                     let checkpoint = journal.checkpoint();
-                    let value = inputs.value.transfer().unwrap_or(U256::ZERO);
-                    if let Some(_err) =
-                        journal.transfer_loaded(inputs.caller, inputs.target_address, value)
-                    {
-                        journal.checkpoint_revert(checkpoint);
+                    let ok = if value.is_zero() {
+                        let loads = journal.load_account(inputs.caller).is_ok()
+                            && journal.load_account(inputs.target_address).is_ok();
+                        if loads {
+                            if let Some(_err) = journal.transfer_loaded(
+                                inputs.caller,
+                                inputs.target_address,
+                                value,
+                            ) {
+                                journal.checkpoint_revert(checkpoint);
+                                false
+                            } else {
+                                journal.checkpoint_commit();
+                                true
+                            }
+                        } else {
+                            journal.checkpoint_revert(checkpoint);
+                            false
+                        }
                     } else {
-                        journal.checkpoint_commit();
-                        // Match empty-bytecode STOP: full stipend remaining.
+                        match journal.transfer(inputs.caller, inputs.target_address, value) {
+                            Ok(None) => {
+                                journal.checkpoint_commit();
+                                true
+                            }
+                            _ => {
+                                journal.checkpoint_revert(checkpoint);
+                                false
+                            }
+                        }
+                    };
+                    if ok {
                         outcome.result.gas = revm::interpreter::Gas::new(inputs.gas_limit);
                         RESUME_CALL_IDX.set(RESUME_CALL_IDX.get().saturating_add(1));
                         record_call_outcome_hit();
@@ -726,6 +759,7 @@ where
                     caller: meta.caller,
                     gas_limit: meta.gas_limit,
                     is_static: meta.is_static,
+                    value: meta.value,
                     k_end: current_effect_k(),
                     outcome: outcome.clone(),
                 };
@@ -898,6 +932,8 @@ mod m1c_tests {
             jump_snap: None,
             journal_blob: None,
             call_outcomes: vec![],
+            prefix_writes: vec![],
+            write_replays: vec![],
         };
         assert!(!jump_is_safe(&lite), "lite snap must not jump");
 
@@ -959,6 +995,8 @@ mod m1c_tests {
                 logs: vec![],
             }),
             call_outcomes: vec![],
+            prefix_writes: vec![],
+            write_replays: vec![],
         };
         assert!(
             jump_is_safe(&cont),
@@ -1006,6 +1044,8 @@ mod m1c_tests {
                 logs: vec![],
             }),
             call_outcomes: vec![],
+            prefix_writes: vec![],
+            write_replays: vec![],
         };
         assert!(
             !jump_is_safe(&cont),
@@ -1045,6 +1085,8 @@ mod m1c_tests {
             }),
             journal_blob: None,
             call_outcomes: vec![],
+            prefix_writes: vec![],
+            write_replays: vec![],
         };
         assert!(
             jump_is_safe(&cont),
@@ -1106,6 +1148,8 @@ mod m1c_tests {
             }),
             journal_blob: None,
             call_outcomes: vec![],
+            prefix_writes: vec![],
+            write_replays: vec![],
         };
         assert!(
             jump_is_safe(&cont),
@@ -1145,6 +1189,8 @@ mod m1c_tests {
             }),
             journal_blob: None,
             call_outcomes: vec![],
+            prefix_writes: vec![],
+            write_replays: vec![],
         };
         assert!(
             jump_is_safe(&cont),
@@ -1193,6 +1239,8 @@ mod m1c_tests {
             jump_snap: Some(snap.clone()),
             journal_blob: None,
             call_outcomes: vec![],
+            prefix_writes: vec![],
+            write_replays: vec![],
         };
         assert!(jump_is_safe(&cont), "Basic-only live snap is M1f-safe");
         assert!(

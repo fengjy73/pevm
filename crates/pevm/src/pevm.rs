@@ -726,6 +726,7 @@ fn try_validate(
                             k_fail,
                             certified.clone(),
                             suffix_writes.clone(),
+                            plan.prefix_writes.clone(),
                         );
                         specfence
                             .partial_retry

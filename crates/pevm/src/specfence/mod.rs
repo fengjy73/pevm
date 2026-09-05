@@ -13,6 +13,7 @@
 //! M1e: journal-blob FF + safety-gated absolute PC jump on RewindTo resume.
 //! M1f: absolute PC jump default-on when safe (MemoryGas+refund restore); `SPECFENCE_ABSOLUTE_JUMP=0` disables.
 //! M1g: Storage-prefix jump (no Db poison) + nested CallOutcome cache; bytecode_len relaxed carefully.
+//! M1h: write-prefix jump scaffold (gated) + valued CallOutcome (opt-in SPECFENCE_VALUED_CALL_CACHE).
 //! suffix-only InvalidateSelective when safe.
 //! M2: WaitHard parks (tx-level) + ready-queue steal (lower TxIdx first); worker never spins.
 
@@ -53,6 +54,7 @@ pub use boundary::SpecFenceInspector;
 pub(crate) use rem::{
     AccessMode, Checkpoint, CheckpointId, CheckpointKind, EffectOrdinal, FfValue, ParkedWait,
     PartialRetryPlan, PartialRetryState, RegionAccess, RemTask, RepairPlan, ResumeContinuation,
+    StorageWriteReplay,
 };
 pub(crate) use resolve::{PolicyCtx, ResolveAction, choose_action};
 #[allow(unused_imports)]

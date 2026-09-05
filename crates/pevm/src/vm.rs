@@ -18,7 +18,7 @@ use crate::{
     MemoryLocation, MemoryLocationHash, MemoryValue, ReadOrigin, ReadOrigins, ReadSet, Storage,
     TxIdx, TxVersion, WriteSet, chain::PevmChain, hash_deterministic, mv_memory::MvMemory,
     specfence::{
-        AccessMode, CheckpointKind, FfValue, ResolveAction, SpecFenceCtx,
+        AccessMode, CheckpointKind, FfValue, ResolveAction, SpecFenceCtx, StorageWriteReplay,
         TAU_VERY_HIGH, early_val_probability, note_pending_effect_boundary,
         arm_call_outcome_cache, resume_was_applied, steps_this_run, try_arm_safe_absolute_jump, with_plant_tls,
     },
@@ -565,6 +565,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 cp,
                 k_fail,
                 certified.clone(),
+                Vec::new(),
                 Vec::new(),
             );
             self.specfence
@@ -1365,16 +1366,31 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
 
                     // TODO: We should move this changed check to our read set like for account info?
                     for (slot, value) in account.changed_storage_slots() {
-                        write_set.push((
-                            hash_deterministic(MemoryLocation::Storage(*address, *slot)),
-                            MemoryValue::Storage(value.present_value),
-                        ));
+                        let loc = hash_deterministic(MemoryLocation::Storage(*address, *slot));
+                        write_set.push((loc, MemoryValue::Storage(value.present_value)));
+                        // M1h: capture storage presents for RewindTo residual republish
+                        // (never journal-blob poison). gas_remaining_after=0 at finalize;
+                        // live post-SSTORE capture needed before default-on write jump.
+                        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+                            self.specfence.partial_retry.note_write_replay(
+                                tx_version.tx_idx,
+                                loc,
+                                StorageWriteReplay {
+                                    address: *address,
+                                    slot: *slot,
+                                    original: value.original_value,
+                                    present: value.present_value,
+                                    gas_remaining_after: 0,
+                                },
+                            );
+                        }
                     }
                 }
 
-                // M1d/M1e: when live PC jump omitted prefix SSTORE/account writes from the
-                // revm journal (or journal-blob FF missed a location), re-publish
-                // certified-prefix Data still held in MvMemory so record() does not drop them.
+                // M1d/M1e/M1h: when live PC jump omitted prefix SSTORE/account writes from
+                // the revm journal, re-publish certified-prefix writes so record() does
+                // not drop them — from MvMemory residual Data and/or SpecFence
+                // write_replays (never journal-blob present_values).
                 if rewind_resume {
                     let suffix: hashbrown::HashSet<_, BuildIdentityHasher> = self
                         .specfence
@@ -1393,6 +1409,24 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                             self.mv_memory.published_data_value(tx_version.tx_idx, loc)
                         {
                             write_set.push((loc, value));
+                        }
+                    }
+                    // M1h: SpecFence-captured write presents (source of truth when
+                    // residual was ESTIMATEd or jump skipped SSTORE in revm journal).
+                    if let Some(cont) = self.specfence.partial_retry.ff_continuation(tx_version.tx_idx)
+                    {
+                        for wr in &cont.write_replays {
+                            let loc = hash_deterministic(MemoryLocation::Storage(
+                                wr.address,
+                                wr.slot,
+                            ));
+                            if suffix.contains(&loc) {
+                                continue;
+                            }
+                            if write_set.iter().any(|(l, _)| *l == loc) {
+                                continue;
+                            }
+                            write_set.push((loc, MemoryValue::Storage(wr.present)));
                         }
                     }
                 }
