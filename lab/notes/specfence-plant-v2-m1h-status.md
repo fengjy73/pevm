@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-05 (Asia/Shanghai)  
 **Branch:** `specfence` @ fengjy73/pevm  
-**Tip parent:** M1g `e793a97`  
+**Tip:** `60d0cae` (parent M1g `e793a97`)  
 **Scope:** SpecFence path only; OCC/PCC unchanged; M2 park/steal intact
 
 ## Dual goals — honest outcomes
