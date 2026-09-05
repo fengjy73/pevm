@@ -11,6 +11,7 @@
 //! RebindOnly demote head PartialRetry when a certified prefix exists.
 //! M1b: journal fast-forward + bound-value cache on RewindTo resume — SpecFence
 //! M1e: journal-blob side channel + jump_snap for safe absolute PC jump (opt-in).
+//! M1g: Storage-prefix jump (no journal poison) + nested CallOutcome cache.
 //! effect journal restored to `cp`, certified-prefix DB reads served from FF
 //! cache (skip MV lazy walks).
 //! M1c: CALL/effect-boundary PC resume via stock Inspector — skip prefix opcodes
@@ -32,7 +33,7 @@ use hashbrown::{HashMap, HashSet};
 
 use alloy_primitives::{Address, U256};
 use crate::{BuildIdentityHasher, MemoryLocationHash, TxIdx, TxIncarnation};
-use super::boundary::{BoundarySnapshot, JournalBlob};
+use super::boundary::{BoundarySnapshot, CachedCallOutcome, JournalBlob};
 
 /// Spec v1 REM task kinds (plant vocabulary).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +148,8 @@ pub(crate) struct ResumeContinuation {
     pub jump_snap: Option<BoundarySnapshot>,
     /// M1e: revm journal blob (touched state + logs) at certified-prefix boundary.
     pub journal_blob: Option<JournalBlob>,
+    /// M1g: nested CallOutcomes completed at `k_end <= cp.k` (resume short-circuit).
+    pub call_outcomes: Vec<CachedCallOutcome>,
 }
 
 /// Decision after classifying a validation failure for PartialRetry / M1 repair.
@@ -203,6 +206,8 @@ pub(crate) struct PartialRetryState {
     value_snap: HashMap<MemoryLocationHash, FfValue, BuildIdentityHasher>,
     /// M1e: live Inspector snap + journal blob keyed by effect ordinal `k`.
     live_boundaries: HashMap<usize, (BoundarySnapshot, JournalBlob), BuildIdentityHasher>,
+    /// M1g: nested CallOutcomes captured this incarnation (ordered by call_seq).
+    call_outcomes: Vec<CachedCallOutcome>,
 }
 
 impl PartialRetryState {
@@ -215,6 +220,7 @@ impl PartialRetryState {
         self.checkpoints.clear();
         self.value_snap.clear();
         self.live_boundaries.clear();
+        self.call_outcomes.clear();
     }
 
     pub(crate) fn note_access(
@@ -309,15 +315,16 @@ impl PartialRetryState {
                     Some(BoundarySnapshot {
                         pc: 0,
                         gas_remaining: 0,
-            gas_refunded: 0,
-            memory_words: 0,
-            memory_expansion_cost: 0,
+                        gas_refunded: 0,
+                        memory_words: 0,
+                        memory_expansion_cost: 0,
                         call_depth: 1,
                         opcode_steps: steps,
                         stack: Vec::new(),
                         memory: Vec::new(),
                         code_hash: None,
                         bytecode_len: 0,
+                        at_call_boundary: false,
                     })
                 }
             });
@@ -348,6 +355,12 @@ impl PartialRetryState {
                 values.insert(*loc, val.clone());
             }
         }
+        let call_outcomes: Vec<CachedCallOutcome> = self
+            .call_outcomes
+            .iter()
+            .filter(|c| c.k_end <= cp.k && c.depth > 1)
+            .cloned()
+            .collect();
         ResumeContinuation {
             cp,
             k_fail,
@@ -359,6 +372,7 @@ impl PartialRetryState {
             boundary,
             jump_snap,
             journal_blob,
+            call_outcomes,
         }
     }
 
@@ -373,6 +387,15 @@ impl PartialRetryState {
     ) {
         let k = self.k;
         self.live_boundaries.insert(k, (snap, blob));
+    }
+
+    /// M1g: record nested CallOutcomes captured during inspect_run.
+    pub(crate) fn note_call_outcomes(&mut self, calls: Vec<CachedCallOutcome>) {
+        if calls.is_empty() {
+            return;
+        }
+        // Replace with latest capture for this incarnation (inspect_run end).
+        self.call_outcomes = calls;
     }
 
     /// Restore SpecFence journal/checkpoints/values from an FF continuation
@@ -634,6 +657,22 @@ impl PartialRetryTable {
     ) {
         if let Some(slot) = self.states.get(tx_idx) {
             slot.lock().unwrap().attach_live_boundary(snap, blob);
+        }
+    }
+
+    /// M1g: persist nested CallOutcomes from Inspector capture into tx state.
+    /// Also patch an already-armed RewindTo continuation (EarlyVal may arm mid-run
+    /// before `with_plant_tls` ends and flushes captures).
+    pub(crate) fn note_call_outcomes(&self, tx_idx: TxIdx, calls: Vec<CachedCallOutcome>) {
+        if let Some(slot) = self.states.get(tx_idx) {
+            slot.lock().unwrap().note_call_outcomes(calls.clone());
+        }
+        if let Some(mut cont) = self.ff_resume.get_mut(&tx_idx) {
+            let cp_k = cont.cp.k;
+            cont.call_outcomes = calls
+                .into_iter()
+                .filter(|c| c.k_end <= cp_k && c.depth > 1)
+                .collect();
         }
     }
 

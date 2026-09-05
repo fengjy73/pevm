@@ -10,15 +10,16 @@
 //! M1d: production SpecFence uses stock `inspect_run`.
 //! M1e: journal-blob FF + safety-gated absolute PC jump (opt-in).
 //! M1f: absolute jump **default-on** when [`jump_is_safe`]; restore MemoryGas +
-//! gas refunds so post-jump expansion/refunds ≡ sequential prefix. Nested CALL
-//! (call_depth > 1) still falls back — CallOutcome cache TODO.
+//! gas refunds so post-jump expansion/refunds ≡ sequential prefix.
+//! M1g: Storage-prefix jumps (never journal-blob restore) + nested CALL via
+//! CallOutcome cache; `bytecode_len` relaxed carefully for storage/CALL-boundary.
 //! Disable with `SPECFENCE_ABSOLUTE_JUMP=0`.
 
 #![allow(dead_code)]
 
 use std::cell::{Cell, RefCell};
 
-use alloy_primitives::{B256, U256};
+use alloy_primitives::{Address, B256, U256};
 use revm::context::{ContextTr, JournalTr};
 use revm::inspector::JournalExt;
 use revm::interpreter::{
@@ -58,6 +59,26 @@ impl JournalBlob {
     }
 }
 
+/// Cached nested CALL outcome for M1g resume short-circuit.
+///
+/// Top-level tx call is never cached. Only nested frames (`depth > 1` after enter)
+/// that completed before the RewindTo tip may be replayed via `Inspector::call`.
+#[derive(Debug, Clone)]
+pub(crate) struct CachedCallOutcome {
+    /// Monotonic call ordinal within the incarnation (1 = first call hook = top-level).
+    pub call_seq: u32,
+    /// `CALL_DEPTH` after entering this call.
+    pub depth: u16,
+    pub target: Address,
+    pub bytecode_address: Address,
+    pub caller: Address,
+    pub gas_limit: u64,
+    pub is_static: bool,
+    /// SpecFence effect ordinal when `call_end` fired.
+    pub k_end: usize,
+    pub outcome: CallOutcome,
+}
+
 /// Interpreter boundary snapshot for M1c/M1e PC resume.
 #[derive(Debug, Clone)]
 pub(crate) struct BoundarySnapshot {
@@ -79,6 +100,8 @@ pub(crate) struct BoundarySnapshot {
     pub code_hash: Option<B256>,
     /// Bytecode length at capture (PC range check).
     pub bytecode_len: usize,
+    /// True when snap was refreshed at `call_end` (CALL-boundary preference for M1g).
+    pub at_call_boundary: bool,
 }
 
 impl BoundarySnapshot {
@@ -102,6 +125,7 @@ impl BoundarySnapshot {
             memory: interp.memory.context_memory().to_vec(),
             code_hash,
             bytecode_len,
+            at_call_boundary: false,
         }
     }
 
@@ -146,11 +170,15 @@ impl BoundarySnapshot {
     }
 }
 
-/// M1f safety gate: when true, production may absolute-jump PC on RewindTo resume.
+/// M1g safety gate: when true, production may absolute-jump PC on RewindTo resume.
 ///
-/// Live capture, depth≤1, in-range PC, non-empty read-only prefix with ≥1 Basic FF
-/// and **no Storage FF**. Storage jumps livelock; write prefixes need blob FF.
-/// Restore PC/stack/memory/MemoryGas only — never journal blob (poisons pevm Db).
+/// Live capture, in-range PC, non-empty **read-only** prefix with ≥1 Basic and/or
+/// Storage FF. Storage correctness stays via SpecFence FF + force-bind / MV origins —
+/// **never** journal-blob `present_values` restore (poisons pevm Db / shadows MvMemory).
+/// Writes in certified prefix still fall back (mid-SSTORE unsafe). Nested depth>1
+/// allowed when CallOutcome cache covers nested frames or depth is shallow (≤2).
+/// `bytecode_len≤256` always eligible; larger (≤4096) only with Storage FF and/or
+/// CALL-boundary snap. Restore PC/stack/memory/MemoryGas/refund only.
 pub(crate) fn jump_is_safe(cont: &ResumeContinuation) -> bool {
     let Some(snap) = cont.jump_snap.as_ref() else {
         return false;
@@ -158,17 +186,36 @@ pub(crate) fn jump_is_safe(cont: &ResumeContinuation) -> bool {
     if !snap.is_live_capture() {
         return false;
     }
-    if snap.call_depth > 1 {
+    // Nested CALL absolute jump is unsafe: PC-skip past CALL omits EIP-158
+    // touch / transfer that make_call_frame would apply → seq≠par. Use
+    // CallOutcome cache short-circuit (with journal side effects) instead.
+    if !cont.call_outcomes.is_empty() {
+        return false;
+    }
+    // depth>1 without nested cache: allow shallow re-enter+jump (≤2).
+    if snap.call_depth > 2 {
         return false;
     }
     if snap.bytecode_len > 0 && snap.pc >= snap.bytecode_len {
         return false;
     }
-    // Cap bytecode size: ERC-20-scale contracts can have Basic-only certified
-    // prefixes mid-frame; absolute jump there still livelocks under pevm MV.
-    // Balance-probe / tiny contracts (≤256 bytes) are the default-safe set.
-    if snap.bytecode_len > 256 {
-        return false;
+    let has_storage = cont.values.values().any(|v| {
+        matches!(v, crate::specfence::rem::FfValue::Storage { .. })
+    });
+    let has_basic = cont.values.values().any(|v| {
+        matches!(v, crate::specfence::rem::FfValue::Basic { .. })
+    });
+    // Tiny Basic-only (M1f) always OK. Larger bytecode only when Storage FF
+    // and/or CALL-boundary make post-jump ≡ sequential under pevm MV.
+    const MAX_TINY: usize = 256;
+    const MAX_STORAGE: usize = 4096;
+    if snap.bytecode_len > MAX_TINY {
+        if snap.bytecode_len > MAX_STORAGE {
+            return false;
+        }
+        if !has_storage && !snap.at_call_boundary {
+            return false;
+        }
     }
     if cont.cp.k == 0 && cont.effects.is_empty() && snap.opcode_steps == 0 {
         return false;
@@ -179,22 +226,11 @@ pub(crate) fn jump_is_safe(cont: &ResumeContinuation) -> bool {
     if cont.effects.is_empty() {
         return false;
     }
+    // Write-prefix (mid-SSTORE) still unsafe without blob FF that does not poison Db.
     if cont.effects.iter().any(|e| e.mode == AccessMode::Write) {
         return false;
     }
-    // Storage absolute-jump livelocks under pevm MV — Basic-only (or unbound) FF.
-    for e in &cont.effects {
-        if matches!(
-            cont.values.get(&e.location),
-            Some(crate::specfence::rem::FfValue::Storage { .. })
-        ) {
-            return false;
-        }
-    }
-    let has_basic = cont.values.values().any(|v| {
-        matches!(v, crate::specfence::rem::FfValue::Basic { .. })
-    });
-    if !has_basic {
+    if !has_basic && !has_storage {
         return false;
     }
     if let Some(blob) = cont.journal_blob.as_ref() {
@@ -225,13 +261,34 @@ thread_local! {
     static PLANT: Cell<Option<PlantTls>> = const { Cell::new(None) };
     static OPCODE_STEPS: Cell<u64> = const { Cell::new(0) };
     static CALL_DEPTH: Cell<u16> = const { Cell::new(0) };
+    static CALL_SEQ: Cell<u32> = const { Cell::new(0) };
     static LAST_SNAP: RefCell<Option<BoundarySnapshot>> = const { RefCell::new(None) };
     static PENDING_EFFECT_CP: Cell<bool> = const { Cell::new(false) };
     static PENDING_RESUME: RefCell<Option<BoundarySnapshot>> = const { RefCell::new(None) };
     static PENDING_JOURNAL_BLOB: RefCell<Option<JournalBlob>> = const { RefCell::new(None) };
+    /// Nested calls entered but not yet `call_end` (metadata for cache store).
+    static PENDING_CALL_STACK: RefCell<Vec<PendingCallMeta>> = const { RefCell::new(Vec::new()) };
+    /// Completed nested CallOutcomes captured this incarnation (for continuation).
+    static CAPTURED_CALLS: RefCell<Vec<CachedCallOutcome>> = const { RefCell::new(Vec::new()) };
+    /// On RewindTo resume: queue of certified nested outcomes to short-circuit.
+    static RESUME_CALL_CACHE: RefCell<Vec<CachedCallOutcome>> = const { RefCell::new(Vec::new()) };
+    static RESUME_CALL_IDX: Cell<usize> = const { Cell::new(0) };
     static RESUME_APPLIED: Cell<bool> = const { Cell::new(false) };
     static STEPS_THIS_RUN: Cell<u64> = const { Cell::new(0) };
     static LAST_SKIPPED: Cell<u64> = const { Cell::new(0) };
+    /// Set in call_end; consumed in parent frame step_end to mark CALL-boundary.
+    static PENDING_PARENT_CALL_BOUNDARY: Cell<bool> = const { Cell::new(false) };
+}
+
+#[derive(Debug, Clone)]
+struct PendingCallMeta {
+    call_seq: u32,
+    depth: u16,
+    target: Address,
+    bytecode_address: Address,
+    caller: Address,
+    gas_limit: u64,
+    is_static: bool,
 }
 
 /// Install plant TLS for the duration of `f` (SpecFence `Vm::execute` body).
@@ -248,14 +305,33 @@ pub(crate) fn with_plant_tls<R>(
     }));
     OPCODE_STEPS.set(0);
     CALL_DEPTH.set(0);
+    CALL_SEQ.set(0);
     LAST_SNAP.with(|c| *c.borrow_mut() = None);
     PENDING_EFFECT_CP.set(false);
+    PENDING_CALL_STACK.with(|c| c.borrow_mut().clear());
+    CAPTURED_CALLS.with(|c| c.borrow_mut().clear());
+    RESUME_CALL_CACHE.with(|c| c.borrow_mut().clear());
+    RESUME_CALL_IDX.set(0);
     RESUME_APPLIED.set(false);
     STEPS_THIS_RUN.set(0);
     LAST_SKIPPED.set(0);
+    PENDING_PARENT_CALL_BOUNDARY.set(false);
     let out = f();
+    // Persist captured nested CallOutcomes into PartialRetry for next RewindTo.
+    let captured = CAPTURED_CALLS.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    if !captured.is_empty() {
+        PLANT.with(|p| {
+            if let Some(plant) = p.get() {
+                let table = unsafe { &*plant.partial_retry };
+                table.note_call_outcomes(plant.tx_idx, captured);
+            }
+        });
+    }
     PENDING_RESUME.with(|c| *c.borrow_mut() = None);
     PENDING_JOURNAL_BLOB.with(|c| *c.borrow_mut() = None);
+    PENDING_CALL_STACK.with(|c| c.borrow_mut().clear());
+    RESUME_CALL_CACHE.with(|c| c.borrow_mut().clear());
+    RESUME_CALL_IDX.set(0);
     RESUME_APPLIED.set(false);
     PLANT.set(prev);
     out
@@ -276,7 +352,33 @@ pub(crate) fn arm_pc_resume_with_blob(snap: BoundarySnapshot, blob: Option<Journ
 pub(crate) fn clear_pc_resume() {
     PENDING_RESUME.with(|c| *c.borrow_mut() = None);
     PENDING_JOURNAL_BLOB.with(|c| *c.borrow_mut() = None);
+    RESUME_CALL_CACHE.with(|c| c.borrow_mut().clear());
+    RESUME_CALL_IDX.set(0);
     RESUME_APPLIED.set(false);
+}
+
+/// Arm nested CallOutcome short-circuit queue for the next inspect_run (RewindTo).
+pub(crate) fn arm_call_outcome_cache(calls: Vec<CachedCallOutcome>) {
+    RESUME_CALL_IDX.set(0);
+    RESUME_CALL_CACHE.with(|c| *c.borrow_mut() = calls);
+}
+
+fn record_call_outcome_hit() {
+    PLANT.with(|p| {
+        if let Some(plant) = p.get() {
+            let metrics = unsafe { &*plant.metrics };
+            metrics.record_call_outcome_cache_hit();
+        }
+    });
+}
+
+fn current_effect_k() -> usize {
+    PLANT.with(|p| {
+        p.get().map(|plant| {
+            let table = unsafe { &*plant.partial_retry };
+            table.current_k(plant.tx_idx)
+        }).unwrap_or(0)
+    })
 }
 
 /// M1e: if continuation passes [`jump_is_safe`] and jump is not disabled for this
@@ -298,12 +400,13 @@ pub(crate) fn try_arm_safe_absolute_jump(
         return false;
     }
     let snap = cont.jump_snap.clone().expect("jump_is_safe implies jump_snap");
-    // Read-only jump (M1f): never restore journal blob. Blob storage present_values
-    // from the prior incarnation short-circuit revm SLOAD into stale journal
-    // entries instead of pevm Db/force-bind — wrong stack/control-flow → hang.
-    // MemoryGas + gas_remaining + stack/memory/PC restore are sufficient; prefix
-    // reads are covered by FF seed + force-bind on the read set.
+    // Read-only jump (M1f/M1g): never restore journal blob — including Storage
+    // prefixes. Blob storage present_values poison pevm Db / shadow MvMemory.
+    // Storage correctness = SpecFence FF cache + force-bind / MV origins only.
+    // MemoryGas + refund + stack/memory/PC restore are sufficient.
     arm_pc_resume_with_blob(snap, None);
+    // Arm nested CallOutcome short-circuit queue for this resume.
+    arm_call_outcome_cache(cont.call_outcomes.clone());
     true
 }
 
@@ -343,6 +446,7 @@ pub(crate) fn note_pending_effect_boundary(
         memory: Vec::new(),
         code_hash: None,
         bytecode_len: 0,
+        at_call_boundary: false,
     };
     let _ = partial_retry.push_checkpoint_with_boundary(
         tx_idx,
@@ -503,9 +607,14 @@ where
     fn step_end(&mut self, interp: &mut Interpreter<EthInterpreter>, context: &mut CTX) {
         let depth = CALL_DEPTH.get();
         let n = OPCODE_STEPS.get();
-        let snap = BoundarySnapshot::capture_from_interp(interp, depth, n);
+        let mut snap = BoundarySnapshot::capture_from_interp(interp, depth, n);
+        let call_boundary = PENDING_PARENT_CALL_BOUNDARY.replace(false);
+        if call_boundary {
+            snap.at_call_boundary = true;
+        }
         LAST_SNAP.with(|c| *c.borrow_mut() = Some(snap.clone()));
-        if PENDING_EFFECT_CP.replace(false) {
+        // Attach on EffectBoundary *or* CALL-boundary so RewindTo can jump post-CALL.
+        if PENDING_EFFECT_CP.replace(false) || call_boundary {
             // Snap-only by default (no EvmState clone). Full blob = research flag.
             let blob = if std::env::var_os("SPECFENCE_ABSOLUTE_JUMP").is_some_and(|v| v == "blob") {
                 let full = context.journal().evm_state();
@@ -528,10 +637,74 @@ where
 
     fn call(
         &mut self,
-        _context: &mut CTX,
-        _inputs: &mut CallInputs,
+        context: &mut CTX,
+        inputs: &mut CallInputs,
     ) -> Option<CallOutcome> {
-        CALL_DEPTH.set(CALL_DEPTH.get().saturating_add(1));
+        let parent_depth = CALL_DEPTH.get();
+        let depth = parent_depth.saturating_add(1);
+        CALL_DEPTH.set(depth);
+        let seq = CALL_SEQ.get().saturating_add(1);
+        CALL_SEQ.set(seq);
+        PENDING_CALL_STACK.with(|s| {
+            s.borrow_mut().push(PendingCallMeta {
+                call_seq: seq,
+                depth,
+                target: inputs.target_address,
+                bytecode_address: inputs.bytecode_address,
+                caller: inputs.caller,
+                gas_limit: inputs.gas_limit,
+                is_static: inputs.is_static,
+            });
+        });
+        // M1g: short-circuit certified nested CALLs from resume cache.
+        // Never override the top-level tx call (parent_depth == 0).
+        if parent_depth >= 1 {
+            let hit = RESUME_CALL_CACHE.with(|c| {
+                let cache = c.borrow();
+                let idx = RESUME_CALL_IDX.get();
+                if idx >= cache.len() {
+                    return None;
+                }
+                let cached = &cache[idx];
+                if cached.call_seq == seq
+                    && cached.depth == depth
+                    && cached.target == inputs.target_address
+                    && cached.bytecode_address == inputs.bytecode_address
+                    && cached.caller == inputs.caller
+                {
+                    Some(cached.outcome.clone())
+                } else {
+                    None
+                }
+            });
+            if let Some(mut outcome) = hit {
+                // Inspector override skips make_call_frame — replicate journal
+                // checkpoint + touch/transfer so pevm state ≡ sequential CALL.
+                // Refuse short-circuit if value transfer is non-zero (needs loaded bals).
+                if inputs.transfers_value() {
+                    // Non-zero value transfer: need full make_call_frame.
+                } else {
+                    let journal = context.journal_mut();
+                    // Ensure callee is loaded into pevm Db / journal (read-set).
+                    let _ = journal.load_account(inputs.target_address);
+                    let _ = journal.load_account_with_code(inputs.bytecode_address);
+                    let checkpoint = journal.checkpoint();
+                    let value = inputs.value.transfer().unwrap_or(U256::ZERO);
+                    if let Some(_err) =
+                        journal.transfer_loaded(inputs.caller, inputs.target_address, value)
+                    {
+                        journal.checkpoint_revert(checkpoint);
+                    } else {
+                        journal.checkpoint_commit();
+                        // Match empty-bytecode STOP: full stipend remaining.
+                        outcome.result.gas = revm::interpreter::Gas::new(inputs.gas_limit);
+                        RESUME_CALL_IDX.set(RESUME_CALL_IDX.get().saturating_add(1));
+                        record_call_outcome_hit();
+                        return Some(outcome);
+                    }
+                }
+            }
+        }
         None
     }
 
@@ -539,8 +712,28 @@ where
         &mut self,
         _context: &mut CTX,
         _inputs: &CallInputs,
-        _outcome: &mut CallOutcome,
+        outcome: &mut CallOutcome,
     ) {
+        let meta = PENDING_CALL_STACK.with(|s| s.borrow_mut().pop());
+        if let Some(meta) = meta {
+            // Cache successful nested calls (depth > 1) for RewindTo short-circuit.
+            if meta.depth > 1 && outcome.result.is_ok() {
+                let cached = CachedCallOutcome {
+                    call_seq: meta.call_seq,
+                    depth: meta.depth,
+                    target: meta.target,
+                    bytecode_address: meta.bytecode_address,
+                    caller: meta.caller,
+                    gas_limit: meta.gas_limit,
+                    is_static: meta.is_static,
+                    k_end: current_effect_k(),
+                    outcome: outcome.clone(),
+                };
+                CAPTURED_CALLS.with(|c| c.borrow_mut().push(cached));
+            }
+        }
+        // Parent frame's next step_end marks at_call_boundary (not nested snap).
+        PENDING_PARENT_CALL_BOUNDARY.set(true);
         CALL_DEPTH.set(CALL_DEPTH.get().saturating_sub(1));
     }
 
@@ -612,6 +805,7 @@ mod m1c_tests {
             memory: Vec::new(),
             code_hash: None,
             bytecode_len: 0,
+            at_call_boundary: false,
         }
     }
 
@@ -629,6 +823,7 @@ mod m1c_tests {
             memory: vec![0xab, 0xcd],
             code_hash: None,
             bytecode_len: 64,
+            at_call_boundary: false,
         };
         assert_eq!(snap.pc, 42);
         assert_eq!(snap.opcode_steps, 17);
@@ -652,6 +847,7 @@ mod m1c_tests {
             memory: vec![1, 2, 3, 4],
             code_hash: None,
             bytecode_len: 5,
+            at_call_boundary: false,
         };
         interp.bytecode = ExtBytecode::new(code);
         interp.gas = Gas::new(100_000);
@@ -677,6 +873,7 @@ mod m1c_tests {
             memory: vec![],
             code_hash: None,
             bytecode_len: 1,
+            at_call_boundary: false,
         };
         arm_pc_resume(snap);
         assert!(!resume_was_applied());
@@ -700,6 +897,7 @@ mod m1c_tests {
             boundary: Some(lite_snap(0, 2)),
             jump_snap: None,
             journal_blob: None,
+            call_outcomes: vec![],
         };
         assert!(!jump_is_safe(&lite), "lite snap must not jump");
 
@@ -716,11 +914,12 @@ mod m1c_tests {
                 memory: vec![],
                 code_hash: Some(B256::ZERO),
                 bytecode_len: 32,
+                at_call_boundary: false,
             }),
             journal_blob: None,
             ..lite.clone()
         };
-        assert!(!jump_is_safe(&nested), "nested CALL must fall back");
+        assert!(!jump_is_safe(&nested), "nested without effects/FF must fall back");
     }
 
     #[test]
@@ -753,11 +952,13 @@ mod m1c_tests {
                 memory: vec![0],
                 code_hash: Some(B256::ZERO),
                 bytecode_len: 64,
+                at_call_boundary: false,
             }),
             journal_blob: Some(JournalBlob {
                 state,
                 logs: vec![],
             }),
+            call_outcomes: vec![],
         };
         assert!(
             jump_is_safe(&cont),
@@ -798,11 +999,13 @@ mod m1c_tests {
                 memory: vec![0],
                 code_hash: Some(B256::ZERO),
                 bytecode_len: 64,
+                at_call_boundary: false,
             }),
             journal_blob: Some(JournalBlob {
                 state: EvmState::default(),
                 logs: vec![],
             }),
+            call_outcomes: vec![],
         };
         assert!(
             !jump_is_safe(&cont),
@@ -838,8 +1041,10 @@ mod m1c_tests {
                 memory: vec![0],
                 code_hash: Some(B256::ZERO),
                 bytecode_len: 64,
+                at_call_boundary: false,
             }),
             journal_blob: None,
+            call_outcomes: vec![],
         };
         assert!(
             jump_is_safe(&cont),
@@ -847,8 +1052,108 @@ mod m1c_tests {
         );
     }
 
+    fn storage_read_effect() -> (Vec<RegionAccess>, hashbrown::HashMap<u64, FfValue, BuildIdentityHasher>) {
+        let mut values = HashMap::with_hasher(BuildIdentityHasher::default());
+        values.insert(
+            7u64,
+            FfValue::Storage {
+                address: Address::ZERO,
+                slot: U256::ZERO,
+                value: U256::from(1),
+                origin: None,
+            },
+        );
+        (
+            vec![RegionAccess {
+                tx_idx: 0,
+                k: 1,
+                location: 7,
+                mode: AccessMode::Read,
+            }],
+            values,
+        )
+    }
+
     #[test]
-        fn m1f_arm_applies_absolute_jump_metric() {
+    fn jump_is_safe_accepts_storage_read_prefix() {
+        let (effects, values) = storage_read_effect();
+        let cont = ResumeContinuation {
+            cp: CheckpointId {
+                tx_idx: 0,
+                incarnation: 1,
+                k: 2,
+            },
+            k_fail: 4,
+            certified: vec![7],
+            suffix_writes: vec![],
+            effects,
+            checkpoints: vec![],
+            values,
+            boundary: Some(lite_snap(0, 2)),
+            jump_snap: Some(BoundarySnapshot {
+                pc: 4,
+                gas_remaining: 50_000,
+                gas_refunded: 0,
+                memory_words: 0,
+                memory_expansion_cost: 0,
+                call_depth: 1,
+                opcode_steps: 12,
+                stack: vec![U256::from(9)],
+                memory: vec![0],
+                code_hash: Some(B256::ZERO),
+                bytecode_len: 64,
+                at_call_boundary: false,
+            }),
+            journal_blob: None,
+            call_outcomes: vec![],
+        };
+        assert!(
+            jump_is_safe(&cont),
+            "M1g: Storage-read certified prefix may absolute-jump"
+        );
+    }
+
+    #[test]
+    fn jump_is_safe_accepts_depth2_with_call_cache() {
+        let (effects, values) = basic_read_effect();
+        let cont = ResumeContinuation {
+            cp: CheckpointId {
+                tx_idx: 0,
+                incarnation: 1,
+                k: 2,
+            },
+            k_fail: 4,
+            certified: vec![1],
+            suffix_writes: vec![],
+            effects,
+            checkpoints: vec![],
+            values,
+            boundary: Some(lite_snap(0, 2)),
+            jump_snap: Some(BoundarySnapshot {
+                pc: 4,
+                gas_remaining: 50_000,
+                gas_refunded: 0,
+                memory_words: 0,
+                memory_expansion_cost: 0,
+                call_depth: 2,
+                opcode_steps: 12,
+                stack: vec![U256::from(9)],
+                memory: vec![0],
+                code_hash: Some(B256::ZERO),
+                bytecode_len: 64,
+                at_call_boundary: true,
+            }),
+            journal_blob: None,
+            call_outcomes: vec![],
+        };
+        assert!(
+            jump_is_safe(&cont),
+            "M1g: depth=2 live snap may jump (parent re-enters; nested init jumps)"
+        );
+    }
+
+        #[test]
+    fn m1f_arm_applies_absolute_jump_metric() {
         use crate::specfence::metrics::MetricsInner;
         use crate::specfence::rem::{CheckpointId, PartialRetryTable};
         use hashbrown::HashMap;
@@ -869,6 +1174,7 @@ mod m1c_tests {
             memory: vec![],
             code_hash: None,
             bytecode_len: 8,
+            at_call_boundary: false,
         };
         let (effects, values) = basic_read_effect();
         let cont = ResumeContinuation {
@@ -886,6 +1192,7 @@ mod m1c_tests {
             boundary: Some(lite_snap(0, 3)),
             jump_snap: Some(snap.clone()),
             journal_blob: None,
+            call_outcomes: vec![],
         };
         assert!(jump_is_safe(&cont), "Basic-only live snap is M1f-safe");
         assert!(

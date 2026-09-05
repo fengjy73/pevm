@@ -12,6 +12,7 @@
 //! M1d: live `inspect_run` on SpecFence production path (Ethereum) — real PC skip.
 //! M1e: journal-blob FF + safety-gated absolute PC jump on RewindTo resume.
 //! M1f: absolute PC jump default-on when safe (MemoryGas+refund restore); `SPECFENCE_ABSOLUTE_JUMP=0` disables.
+//! M1g: Storage-prefix jump (no Db poison) + nested CallOutcome cache; bytecode_len relaxed carefully.
 //! suffix-only InvalidateSelective when safe.
 //! M2: WaitHard parks (tx-level) + ready-queue steal (lower TxIdx first); worker never spins.
 
@@ -43,9 +44,9 @@ pub(crate) use rem::PartialRetryTable;
 pub(crate) use rem::WaveParkTable;
 #[allow(unused_imports)]
 pub(crate) use boundary::{
-    arm_pc_resume, clear_pc_resume, jump_is_safe, last_boundary_snap,
+    arm_call_outcome_cache, arm_pc_resume, clear_pc_resume, jump_is_safe, last_boundary_snap,
     attach_current_live_snap, note_pending_effect_boundary, resume_was_applied, steps_this_run,
-    try_arm_safe_absolute_jump, with_plant_tls, BoundarySnapshot, JournalBlob,
+    try_arm_safe_absolute_jump, with_plant_tls, BoundarySnapshot, CachedCallOutcome, JournalBlob,
 };
 pub use boundary::SpecFenceInspector;
 #[allow(unused_imports)]

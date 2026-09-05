@@ -20,7 +20,7 @@ use crate::{
     specfence::{
         AccessMode, CheckpointKind, FfValue, ResolveAction, SpecFenceCtx,
         TAU_VERY_HIGH, early_val_probability, note_pending_effect_boundary,
-        resume_was_applied, steps_this_run, try_arm_safe_absolute_jump, with_plant_tls,
+        arm_call_outcome_cache, resume_was_applied, steps_this_run, try_arm_safe_absolute_jump, with_plant_tls,
     },
 };
 
@@ -479,9 +479,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
             }
             ResolveAction::SpecRead => {
                 self.specfence.metrics.record_spec_read();
-                // M1f: EffectBoundary so RewindTo can leave CallEntry with a live
-                // jump_snap. Absolute jump remains narrowly gated (Basic-only,
-                // bytecode_len<=256, no Storage) — ERC-20 stays credit-only.
+                // M1f/M1g: EffectBoundary so RewindTo can leave CallEntry with a live
+                // jump_snap. Absolute jump gated by jump_is_safe (Storage reads OK;
+                // no journal-blob restore; nested CALL via CallOutcome cache).
                 note_pending_effect_boundary(self.tx_idx, self.specfence.partial_retry);
                 Ok(())
             }
@@ -1244,6 +1244,13 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         try_arm_safe_absolute_jump(tx_idx, partial_retry, &cont, metrics)
                     });
                     if !jumped {
+                        // M1g: still arm CallOutcome cache on fallback resume so
+                        // certified nested CALLs short-circuit without absolute jump.
+                        if let Some(cont) = partial_retry.ff_continuation(tx_idx) {
+                            if !cont.call_outcomes.is_empty() {
+                                arm_call_outcome_cache(cont.call_outcomes);
+                            }
+                        }
                         if let Some(snap) = partial_retry.ff_boundary(tx_idx) {
                             if snap.opcode_steps > 0 {
                                 metrics.record_pc_resume(snap.opcode_steps);

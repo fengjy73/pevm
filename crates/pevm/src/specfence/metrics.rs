@@ -125,6 +125,8 @@ pub struct SpecFenceMetrics {
     pub absolute_jump_fallback: usize,
     /// M1e: accounts restored from revm journal blob on jump resume.
     pub journal_blob_ff_accounts: usize,
+    /// M1g: nested CALL short-circuits served from CallOutcome cache on resume.
+    pub call_outcome_cache_hits: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -176,6 +178,7 @@ pub(crate) struct MetricsInner {
     absolute_jump_applied: AtomicUsize,
     absolute_jump_fallback: AtomicUsize,
     journal_blob_ff_accounts: AtomicUsize,
+    call_outcome_cache_hits: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -417,6 +420,11 @@ impl MetricsInner {
         }
     }
 
+    /// M1g: nested CALL short-circuited from CallOutcome cache on resume.
+    pub(crate) fn record_call_outcome_cache_hit(&self) {
+        self.call_outcome_cache_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// M1d: accumulate Inspector::step counts for this execute.
     pub(crate) fn record_inspector_steps(&self, steps: u64, is_resume: bool) {
         if steps == 0 {
@@ -512,6 +520,7 @@ impl MetricsInner {
             absolute_jump_applied: self.absolute_jump_applied.load(Ordering::Relaxed),
             absolute_jump_fallback: self.absolute_jump_fallback.load(Ordering::Relaxed),
             journal_blob_ff_accounts: self.journal_blob_ff_accounts.load(Ordering::Relaxed),
+            call_outcome_cache_hits: self.call_outcome_cache_hits.load(Ordering::Relaxed),
         }
     }
 }

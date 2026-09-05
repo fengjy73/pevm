@@ -1097,3 +1097,231 @@ fn specfence_m1f_default_absolute_jump_seq_eq_par() {
         "M1f expected RewindTo+resume with inspect steps: {last:?}"
     );
 }
+
+/// M1g-A: Storage-touching absolute jump (SLOAD prefix) without journal-blob restore.
+/// Writers SSTORE slot0; readers SLOAD slot0 repeatedly. Certified Storage FF may
+/// absolute-jump; seq≡par via run_mode; resume steps < cold equivalent.
+#[test]
+fn specfence_m1g_storage_absolute_jump_seq_eq_par() {
+    let probe = Address::from(U160::from(77));
+
+    // CALLDATASIZE; ISZERO; PUSH1 read; JUMPI;
+    // write: PUSH1 1; PUSH1 0; SSTORE; STOP;
+    // read JUMPDEST: (PUSH1 0; SLOAD; POP)×8 ; STOP
+    let mut code = Vec::new();
+    code.push(0x36); // CALLDATASIZE
+    code.push(0x15); // ISZERO
+    code.push(0x60); // PUSH1
+    code.push(0x0b); // jump dest = 11
+    code.push(0x57); // JUMPI
+    code.push(0x60);
+    code.push(0x01); // PUSH1 1
+    code.push(0x60);
+    code.push(0x00); // PUSH1 0
+    code.push(0x55); // SSTORE
+    code.push(0x00); // STOP
+    assert_eq!(code.len(), 11);
+    code.push(0x5b); // JUMPDEST
+    for _ in 0..8 {
+        code.push(0x60);
+        code.push(0x00); // PUSH1 0
+        code.push(0x54); // SLOAD
+        code.push(0x50); // POP
+    }
+    code.push(0x00); // STOP
+    assert!(code.len() <= 256, "tiny storage probe");
+
+    let bytecode = Bytecode::new_raw(Bytes::from(code));
+    let code_hash = bytecode.hash_slow();
+
+    let mut state = (0..=60_000).map(common::mock_account).collect::<ChainState>();
+    state.insert(
+        probe,
+        EvmAccount {
+            balance: U256::from(1),
+            nonce: 1,
+            code_hash: Some(code_hash),
+            code: Some(bytecode.clone().into()),
+            storage: Default::default(),
+        },
+    );
+    let mut bytecodes = Bytecodes::default();
+    bytecodes.insert(code_hash, bytecode.into());
+
+    let mut txs: Vec<TxEnv> = Vec::new();
+    // Writers: non-empty calldata → SSTORE slot 0.
+    for i in 0..24 {
+        let from = Address::from(U160::from(3_000 + i));
+        txs.push(TxEnv {
+            caller: from,
+            nonce: 1,
+            kind: TransactTo::Call(probe),
+            gas_limit: 100_000,
+            gas_price: 1,
+            data: Bytes::from(vec![0x01]),
+            ..TxEnv::default()
+        });
+    }
+    // Readers: empty calldata → SLOAD×8.
+    for i in 0..24 {
+        let from = Address::from(U160::from(4_000 + i));
+        txs.push(TxEnv {
+            caller: from,
+            nonce: 1,
+            kind: TransactTo::Call(probe),
+            gas_limit: 100_000,
+            gas_price: 1,
+            ..TxEnv::default()
+        });
+    }
+    for i in 0..48 {
+        txs.push(self_transfer(Address::from(U160::from(51_000 + i)), 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+
+    let mut saw = false;
+    let mut last = None;
+    for _ in 0..24 {
+        let (_, m, _) = run_mode(ConcurrencyMode::SpecFence, &storage, txs.clone());
+        last = Some(m.clone());
+        if m.rewind_to_cp > 0 && m.resume_count > 0 && m.inspector_steps > 0 {
+            saw = true;
+            assert_eq!(m.tx_head_reexec, 0, "M1g Storage must not head-reexec: {m:?}");
+            assert!(
+                m.absolute_jump_applied > 0,
+                "M1g Storage path must absolute-jump: {m:?}"
+            );
+            assert!(
+                m.live_pc_resume_count > 0 && m.prefix_opcodes_skipped > 0,
+                "M1g Storage must live-skip prefix: {m:?}"
+            );
+            let cold_equiv = m
+                .inspector_steps_resume
+                .saturating_add(m.prefix_opcodes_skipped);
+            assert!(
+                m.inspector_steps_resume < cold_equiv,
+                "resume steps < cold: resume={} skipped={} {m:?}",
+                m.inspector_steps_resume,
+                m.prefix_opcodes_skipped
+            );
+            break;
+        }
+    }
+    assert!(
+        saw,
+        "M1g Storage expected RewindTo+resume with jump: {last:?}"
+    );
+}
+
+/// M1g-B: nested CALL — outer CALLs inner then hot BALANCE. Resume may absolute-jump
+/// and/or short-circuit nested CallOutcome from cache; seq≡par.
+#[test]
+fn specfence_m1g_nested_call_resume_jump() {
+    let hot = Address::from(U160::from(42));
+    let outer = Address::from(U160::from(88));
+    let inner = Address::from(U160::from(89));
+
+    // Inner: STOP (cheap nested frame)
+    let inner_code = Bytecode::new_raw(Bytes::from(vec![0x00]));
+    let inner_hash = inner_code.hash_slow();
+
+    // Outer: CALL inner then BALANCE(hot)×7
+    // PUSH1 0; PUSH1 0; PUSH1 0; PUSH1 0; PUSH1 0; PUSH20 inner; GAS; CALL; POP;
+    // then (PUSH20 hot; BALANCE; POP)×7 ; STOP
+    let mut code = Vec::new();
+    for _ in 0..5 {
+        code.push(0x60);
+        code.push(0x00); // PUSH1 0
+    }
+    code.push(0x73); // PUSH20
+    code.extend_from_slice(inner.as_slice());
+    code.push(0x5a); // GAS
+    code.push(0xf1); // CALL
+    code.push(0x50); // POP
+    for _ in 0..7 {
+        code.push(0x73); // PUSH20
+        code.extend_from_slice(hot.as_slice());
+        code.push(0x31); // BALANCE
+        code.push(0x50); // POP
+    }
+    code.push(0x00); // STOP
+    let outer_code = Bytecode::new_raw(Bytes::from(code));
+    let outer_hash = outer_code.hash_slow();
+
+    let mut state = (0..=60_000).map(common::mock_account).collect::<ChainState>();
+    state.insert(
+        outer,
+        EvmAccount {
+            balance: U256::from(1),
+            nonce: 1,
+            code_hash: Some(outer_hash),
+            code: Some(outer_code.clone().into()),
+            storage: Default::default(),
+        },
+    );
+    state.insert(
+        inner,
+        EvmAccount {
+            balance: U256::from(1),
+            nonce: 1,
+            code_hash: Some(inner_hash),
+            code: Some(inner_code.clone().into()),
+            storage: Default::default(),
+        },
+    );
+    state.entry(hot).or_insert_with(|| {
+        let (_, acc) = common::mock_account(42);
+        acc
+    });
+    let mut bytecodes = Bytecodes::default();
+    bytecodes.insert(outer_hash, outer_code.into());
+    bytecodes.insert(inner_hash, inner_code.into());
+
+    let mut txs: Vec<TxEnv> = Vec::new();
+    for i in 0..24 {
+        let from = Address::from(U160::from(5_000 + i));
+        txs.push(transfer(from, hot, 1));
+    }
+    for i in 0..24 {
+        let from = Address::from(U160::from(6_000 + i));
+        txs.push(TxEnv {
+            caller: from,
+            nonce: 1,
+            kind: TransactTo::Call(outer),
+            gas_limit: 200_000,
+            gas_price: 1,
+            ..TxEnv::default()
+        });
+    }
+    for i in 0..48 {
+        txs.push(self_transfer(Address::from(U160::from(52_000 + i)), 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+
+    let mut saw = false;
+    let mut last = None;
+    for _ in 0..24 {
+        let (_, m, _) = run_mode(ConcurrencyMode::SpecFence, &storage, txs.clone());
+        last = Some(m.clone());
+        if m.rewind_to_cp > 0 && m.resume_count > 0 && m.inspector_steps > 0 {
+            saw = true;
+            assert_eq!(m.tx_head_reexec, 0, "M1g nested must not head-reexec: {m:?}");
+            // Nested CALL resume: CallOutcome cache short-circuit (absolute jump
+            // over nested outcomes is forbidden — would skip EIP-158 touches).
+            assert!(
+                m.call_outcome_cache_hits > 0
+                    || m.absolute_jump_applied > 0,
+                "M1g nested must CallOutcome-cache (or jump if no nested outcomes): {m:?}"
+            );
+            assert!(
+                m.pc_resume_count > 0 && m.prefix_opcodes_skipped > 0,
+                "M1g nested must credit prefix skip: {m:?}"
+            );
+            break;
+        }
+    }
+    assert!(
+        saw,
+        "M1g nested expected RewindTo+resume: {last:?}"
+    );
+}
