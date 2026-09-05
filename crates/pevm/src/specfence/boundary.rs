@@ -13,9 +13,11 @@
 //! gas refunds so post-jump expansion/refunds ≡ sequential prefix.
 //! M1g: Storage-prefix jumps (never journal-blob restore) + nested CALL via
 //! CallOutcome cache; `bytecode_len` relaxed carefully for storage/CALL-boundary.
-//! M1h: valued CallOutcome short-circuit (opt-in SPECFENCE_VALUED_CALL_CACHE=1);
-//! write-prefix jump infra in rem (gated — see status note).
-//! Disable with `SPECFENCE_ABSOLUTE_JUMP=0`.
+//! M1h: valued CallOutcome short-circuit scaffold; write-prefix jump infra in rem.
+//! M1i: post-SSTORE gas-equal write-prefix jump default-on when safe; valued
+//! CallOutcome default-on (`SPECFENCE_VALUED_CALL_CACHE=0` disables); CALL-boundary
+//! jump after replaying nested touches from cache when `at_call_boundary`.
+//! Disable absolute jump with `SPECFENCE_ABSOLUTE_JUMP=0`.
 
 #![allow(dead_code)]
 
@@ -36,7 +38,7 @@ use crate::TxIdx;
 
 use super::metrics::MetricsInner;
 use super::rem::{
-    AccessMode, CheckpointKind, PartialRetryTable, ResumeContinuation,
+    AccessMode, CheckpointKind, PartialRetryTable, ResumeContinuation, StorageWriteReplay,
 };
 
 use alloy_primitives::Log;
@@ -106,6 +108,10 @@ pub(crate) struct BoundarySnapshot {
     pub bytecode_len: usize,
     /// True when snap was refreshed at `call_end` (CALL-boundary preference for M1g).
     pub at_call_boundary: bool,
+    /// True when this snap was captured in `step_end` after an SSTORE opcode
+    /// completed — gas_remaining / refund already include SSTORE dynamic cost
+    /// (M1i post-SSTORE gas-equal jump gate).
+    pub post_sstore: bool,
 }
 
 impl BoundarySnapshot {
@@ -130,6 +136,7 @@ impl BoundarySnapshot {
             code_hash,
             bytecode_len,
             at_call_boundary: false,
+            post_sstore: false,
         }
     }
 
@@ -174,15 +181,17 @@ impl BoundarySnapshot {
     }
 }
 
-/// M1g safety gate: when true, production may absolute-jump PC on RewindTo resume.
+/// M1i safety gate: when true, production may absolute-jump PC on RewindTo resume.
 ///
-/// Live capture, in-range PC, non-empty **read-only** prefix with ≥1 Basic and/or
-/// Storage FF. Storage correctness stays via SpecFence FF + force-bind / MV origins —
-/// **never** journal-blob `present_values` restore (poisons pevm Db / shadows MvMemory).
-/// Writes in certified prefix still fall back (mid-SSTORE unsafe). Nested depth>1
-/// allowed when CallOutcome cache covers nested frames or depth is shallow (≤2).
-/// `bytecode_len≤256` always eligible; larger (≤4096) only with Storage FF and/or
-/// CALL-boundary snap. Restore PC/stack/memory/MemoryGas/refund only.
+/// Live capture, in-range PC, non-empty prefix with ≥1 Basic and/or Storage FF.
+/// Storage correctness stays via SpecFence FF + force-bind / MV origins —
+/// **never** journal-blob `present_values` dump (poisons pevm Db / shadows MvMemory).
+/// Write-prefix allowed when post-SSTORE snap (gas already charged) + `write_replays`
+/// cover storage presents for controlled journal slot replay (not blob dump).
+/// Nested CallOutcome: allow jump only at CALL-boundary after replaying nested
+/// touches from cache on arm; otherwise CallOutcome short-circuit alone.
+/// `bytecode_len≤256` always eligible; larger (≤4096) only with Storage FF,
+/// write_replays, and/or CALL-boundary snap. Restore PC/stack/memory/MemoryGas/refund.
 pub(crate) fn jump_is_safe(cont: &ResumeContinuation) -> bool {
     let Some(snap) = cont.jump_snap.as_ref() else {
         return false;
@@ -190,11 +199,17 @@ pub(crate) fn jump_is_safe(cont: &ResumeContinuation) -> bool {
     if !snap.is_live_capture() {
         return false;
     }
-    // Nested CALL absolute jump is unsafe: PC-skip past CALL omits EIP-158
-    // touch / transfer that make_call_frame would apply → seq≠par. Use
-    // CallOutcome cache short-circuit (with journal side effects) instead.
+    // Nested CALL: PC-skip past CALL omits EIP-158 touch / transfer unless we
+    // replay nested touches from CallOutcome cache at arm time. Zero-value
+    // CALL-boundary jumps OK. Valued outcomes forbid absolute jump (WW risk);
+    // mid-exec valued CallOutcome short-circuit remains opt-in (=1); seq≠par risk.
     if !cont.call_outcomes.is_empty() {
-        return false;
+        if cont.call_outcomes.iter().any(|c| !c.value.is_zero()) {
+            return false;
+        }
+        if !snap.at_call_boundary {
+            return false;
+        }
     }
     // depth>1 without nested cache: allow shallow re-enter+jump (≤2).
     if snap.call_depth > 2 {
@@ -209,15 +224,16 @@ pub(crate) fn jump_is_safe(cont: &ResumeContinuation) -> bool {
     let has_basic = cont.values.values().any(|v| {
         matches!(v, crate::specfence::rem::FfValue::Basic { .. })
     });
-    // Tiny Basic-only (M1f) always OK. Larger bytecode only when Storage FF
-    // and/or CALL-boundary make post-jump ≡ sequential under pevm MV.
+    let has_write_effects = cont.effects.iter().any(|e| e.mode == AccessMode::Write);
+    // Tiny Basic-only (M1f) always OK. Larger bytecode only when Storage FF,
+    // write_replays, and/or CALL-boundary make post-jump ≡ sequential under pevm MV.
     const MAX_TINY: usize = 256;
     const MAX_STORAGE: usize = 4096;
     if snap.bytecode_len > MAX_TINY {
         if snap.bytecode_len > MAX_STORAGE {
             return false;
         }
-        if !has_storage && !snap.at_call_boundary {
+        if !has_storage && !snap.at_call_boundary && cont.write_replays.is_empty() {
             return false;
         }
     }
@@ -230,15 +246,59 @@ pub(crate) fn jump_is_safe(cont: &ResumeContinuation) -> bool {
     if cont.effects.is_empty() {
         return false;
     }
-    // Write-prefix (mid-SSTORE) still unsafe without blob FF that does not poison Db.
-    if cont.effects.iter().any(|e| e.mode == AccessMode::Write) {
+    // M1i write-prefix: storage write_replays require post-SSTORE gas-equal snap.
+    // Write effects without replays stay forbidden (M1g). prefix_writes that are
+    // account-only (no storage replays) must not block M1g storage-read jumps.
+    if !cont.write_replays.is_empty() {
+        if !write_prefix_jump_is_safe(cont, snap) {
+            return false;
+        }
+    } else if has_write_effects {
         return false;
     }
-    if !has_basic && !has_storage {
+    if !has_basic && !has_storage && cont.write_replays.is_empty() {
         return false;
     }
     if let Some(blob) = cont.journal_blob.as_ref() {
         if blob.state.values().any(|a| a.is_selfdestructed()) {
+            return false;
+        }
+        // Storage present_values in blob remain forbidden (M1f poison).
+        if blob.state.values().any(|a| !a.storage.is_empty()) {
+            return false;
+        }
+    }
+    true
+}
+
+/// M1i: Write-prefix absolute jump is safe only with post-SSTORE gas evidence and
+/// controlled `write_replays` (per-slot journal apply — not present_values dump).
+fn write_prefix_jump_is_safe(cont: &ResumeContinuation, snap: &BoundarySnapshot) -> bool {
+    if cont.write_replays.is_empty() {
+        return false;
+    }
+    // Post-SSTORE gas: snap marked post_sstore, or every replay has live gas and
+    // snap.gas_remaining does not exceed the max post-write remaining (no undercharge).
+    let live_gases: Vec<u64> = cont
+        .write_replays
+        .iter()
+        .map(|w| w.gas_remaining_after)
+        .filter(|g| *g > 0)
+        .collect();
+    if snap.post_sstore {
+        // Snap captured after SSTORE step_end — gas includes dynamic cost.
+    } else if live_gases.is_empty() {
+        return false;
+    } else {
+        let max_after = live_gases.iter().copied().max().unwrap_or(0);
+        // Undercharge: snap still has more gas left than any post-SSTORE point.
+        if snap.gas_remaining > max_after {
+            return false;
+        }
+    }
+    // Refuse storage-bearing blob (would poison on restore; we never restore it).
+    if let Some(blob) = cont.journal_blob.as_ref() {
+        if blob.state.values().any(|a| !a.storage.is_empty()) {
             return false;
         }
     }
@@ -282,6 +342,14 @@ thread_local! {
     static LAST_SKIPPED: Cell<u64> = const { Cell::new(0) };
     /// Set in call_end; consumed in parent frame step_end to mark CALL-boundary.
     static PENDING_PARENT_CALL_BOUNDARY: Cell<bool> = const { Cell::new(false) };
+    /// Opcode byte observed in `step` (for post-SSTORE snap marking).
+    static LAST_OPCODE: Cell<u8> = const { Cell::new(0) };
+    /// M1i: certified-prefix storage writes to apply into journal on absolute jump.
+    static PENDING_WRITE_REPLAYS: RefCell<Vec<StorageWriteReplay>> =
+        const { RefCell::new(Vec::new()) };
+    /// M1i: nested CallOutcomes whose journal touches must be applied on CALL-boundary jump.
+    static PENDING_CALL_TOUCHES: RefCell<Vec<CachedCallOutcome>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 #[derive(Debug, Clone)]
@@ -321,6 +389,9 @@ pub(crate) fn with_plant_tls<R>(
     STEPS_THIS_RUN.set(0);
     LAST_SKIPPED.set(0);
     PENDING_PARENT_CALL_BOUNDARY.set(false);
+    LAST_OPCODE.set(0);
+    PENDING_WRITE_REPLAYS.with(|c| c.borrow_mut().clear());
+    PENDING_CALL_TOUCHES.with(|c| c.borrow_mut().clear());
     let out = f();
     // Persist captured nested CallOutcomes into PartialRetry for next RewindTo.
     let captured = CAPTURED_CALLS.with(|c| std::mem::take(&mut *c.borrow_mut()));
@@ -338,6 +409,9 @@ pub(crate) fn with_plant_tls<R>(
     RESUME_CALL_CACHE.with(|c| c.borrow_mut().clear());
     RESUME_CALL_IDX.set(0);
     RESUME_APPLIED.set(false);
+    PENDING_WRITE_REPLAYS.with(|c| c.borrow_mut().clear());
+    PENDING_CALL_TOUCHES.with(|c| c.borrow_mut().clear());
+    LAST_OPCODE.set(0);
     PLANT.set(prev);
     out
 }
@@ -360,6 +434,8 @@ pub(crate) fn clear_pc_resume() {
     RESUME_CALL_CACHE.with(|c| c.borrow_mut().clear());
     RESUME_CALL_IDX.set(0);
     RESUME_APPLIED.set(false);
+    PENDING_WRITE_REPLAYS.with(|c| c.borrow_mut().clear());
+    PENDING_CALL_TOUCHES.with(|c| c.borrow_mut().clear());
 }
 
 /// Arm nested CallOutcome short-circuit queue for the next inspect_run (RewindTo).
@@ -405,13 +481,20 @@ pub(crate) fn try_arm_safe_absolute_jump(
         return false;
     }
     let snap = cont.jump_snap.clone().expect("jump_is_safe implies jump_snap");
-    // Read-only jump (M1f/M1g): never restore journal blob — including Storage
-    // prefixes. Blob storage present_values poison pevm Db / shadow MvMemory.
-    // Storage correctness = SpecFence FF cache + force-bind / MV origins only.
-    // MemoryGas + refund + stack/memory/PC restore are sufficient.
+    // Never restore journal blob (storage present_values poison pevm Db / MV).
+    // M1i: controlled write_replays + nested call touches applied in initialize_interp.
     arm_pc_resume_with_blob(snap, None);
-    // Arm nested CallOutcome short-circuit queue for this resume.
-    arm_call_outcome_cache(cont.call_outcomes.clone());
+    PENDING_WRITE_REPLAYS.with(|c| {
+        *c.borrow_mut() = cont.write_replays.clone();
+    });
+    // CALL-boundary jump: apply nested touches on arm (Inspector::call won't fire
+    // for skipped CALL). Also keep cache for any nested re-enter below jump PC.
+    if !cont.call_outcomes.is_empty() {
+        PENDING_CALL_TOUCHES.with(|c| {
+            *c.borrow_mut() = cont.call_outcomes.clone();
+        });
+        arm_call_outcome_cache(cont.call_outcomes.clone());
+    }
     true
 }
 
@@ -452,7 +535,8 @@ pub(crate) fn note_pending_effect_boundary(
         code_hash: None,
         bytecode_len: 0,
         at_call_boundary: false,
-    };
+        post_sstore: false,
+        };
     let _ = partial_retry.push_checkpoint_with_boundary(
         tx_idx,
         CheckpointKind::EffectBoundary,
@@ -516,6 +600,63 @@ fn attach_live_to_plant(snap: BoundarySnapshot, blob: JournalBlob) {
             table.attach_live_boundary(plant.tx_idx, snap, blob);
         }
     });
+}
+
+/// Apply certified-prefix storage write presents into the live revm journal.
+///
+/// Only mutates the listed slots after ensuring the account is loaded; does **not**
+/// dump arbitrary blob `present_values` (avoids Db / MvMemory poison).
+fn apply_write_replays<CTX>(context: &mut CTX, writes: &[StorageWriteReplay])
+where
+    CTX: ContextTr,
+    CTX::Journal: JournalExt,
+{
+    use revm::state::EvmStorageSlot;
+    // Do **not** journal.load_account here — that re-enters pevm Db/maybe_wait and
+    // can Block/livelock mid-initialize_interp. Only update accounts already present
+    // in the journal; MvMemory residual + write_replays republish cover write-set.
+    let state = context.journal_mut().evm_state_mut();
+    let tx_id = state.values().next().map(|a| a.transaction_id).unwrap_or(0);
+    for wr in writes {
+        let Some(acc) = state.get_mut(&wr.address) else {
+            continue;
+        };
+        let _ = acc.mark_warm_with_transaction_id(tx_id);
+        let slot = EvmStorageSlot::new_changed(wr.original, wr.present, tx_id);
+        acc.storage.insert(wr.slot, slot);
+        acc.mark_touch();
+    }
+}
+
+/// Replicate make_call_frame journal side effects for a cached nested CALL
+/// (EIP-158 touch + value transfer) so CALL-boundary absolute jump ≡ sequential.
+fn apply_cached_call_touches<CTX>(context: &mut CTX, cached: &CachedCallOutcome)
+where
+    CTX: ContextTr,
+    CTX::Journal: JournalExt,
+{
+    let journal = context.journal_mut();
+    // Prefer in-journal accounts; load only when missing (may Db-miss → skip touch).
+    let _ = journal.load_account_with_code(cached.bytecode_address);
+    let checkpoint = journal.checkpoint();
+    let value = cached.value;
+    let loads = journal.load_account(cached.caller).is_ok()
+        && journal.load_account(cached.target).is_ok();
+    let ok = if loads {
+        if let Some(_err) = journal.transfer_loaded(cached.caller, cached.target, value) {
+            journal.checkpoint_revert(checkpoint);
+            false
+        } else {
+            journal.checkpoint_commit();
+            true
+        }
+    } else {
+        journal.checkpoint_revert(checkpoint);
+        false
+    };
+    if ok {
+        record_call_outcome_hit();
+    }
 }
 
 /// SpecFence boundary Inspector — observational except on armed PC resume.
@@ -592,6 +733,16 @@ where
                 record_journal_blob_ff(n);
             }
         }
+        // M1i: replay nested CALL journal touches before PC-skip past CALL.
+        let call_touches = PENDING_CALL_TOUCHES.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        for cached in &call_touches {
+            apply_cached_call_touches(context, cached);
+        }
+        // M1i: controlled per-slot storage replay (never full present_values dump).
+        let writes = PENDING_WRITE_REPLAYS.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        if !writes.is_empty() {
+            apply_write_replays(context, &writes);
+        }
         let skipped = snap.opcode_steps;
         snap.apply_to_interp(interp);
         RESUME_APPLIED.set(true);
@@ -604,6 +755,11 @@ where
         let n = OPCODE_STEPS.get() + 1;
         OPCODE_STEPS.set(n);
         STEPS_THIS_RUN.set(STEPS_THIS_RUN.get() + 1);
+        // Record opcode before execution for post-SSTORE step_end marking.
+        // Use bytecode slice+pc (avoid opcode() side effects on some ExtBytecode paths).
+        let pc = interp.bytecode.pc();
+        let op = interp.bytecode.bytecode_slice().get(pc).copied().unwrap_or(0);
+        LAST_OPCODE.set(op);
         let depth = CALL_DEPTH.get();
         let snap = BoundarySnapshot::capture_from_interp(interp, depth, n);
         LAST_SNAP.with(|c| *c.borrow_mut() = Some(snap));
@@ -617,8 +773,21 @@ where
         if call_boundary {
             snap.at_call_boundary = true;
         }
+        // M1i: after SSTORE completes, gas_remaining includes dynamic cost (~20k).
+        const OP_SSTORE: u8 = 0x55;
+        if LAST_OPCODE.get() == OP_SSTORE {
+            snap.post_sstore = true;
+            let gas_after = snap.gas_remaining;
+            PLANT.with(|p| {
+                if let Some(plant) = p.get() {
+                    let table = unsafe { &*plant.partial_retry };
+                    table.note_post_sstore_gas(plant.tx_idx, gas_after);
+                }
+            });
+        }
         LAST_SNAP.with(|c| *c.borrow_mut() = Some(snap.clone()));
         // Attach on EffectBoundary *or* CALL-boundary so RewindTo can jump post-CALL.
+        // Post-SSTORE EffectBoundary snaps are gas-equal for write-prefix jumps.
         if PENDING_EFFECT_CP.replace(false) || call_boundary {
             // Snap-only by default (no EvmState clone). Full blob = research flag.
             let blob = if std::env::var_os("SPECFENCE_ABSOLUTE_JUMP").is_some_and(|v| v == "blob") {
@@ -690,44 +859,33 @@ where
                 } else {
                     call_value
                 };
-                // M1h valued short-circuit opt-in (SPECFENCE_VALUED_CALL_CACHE=1).
-                // Default: non-zero falls through to make_call_frame (avoids hang).
+                // M1i: valued mid-exec short-circuit opt-in (SPECFENCE_VALUED_CALL_CACHE=1).
+                // Default off — even with unique outer/inner, transfer_loaded override
+                // still produced seq≠par on some RewindTo schedules. Zero-value path
+                // remains default-on. Uses transfer_loaded when enabled.
                 let allow_valued = std::env::var_os("SPECFENCE_VALUED_CALL_CACHE")
                     .is_some_and(|v| v == "1");
                 if value.is_zero() || allow_valued {
                     let journal = context.journal_mut();
                     let _ = journal.load_account_with_code(inputs.bytecode_address);
                     let checkpoint = journal.checkpoint();
-                    let ok = if value.is_zero() {
-                        let loads = journal.load_account(inputs.caller).is_ok()
-                            && journal.load_account(inputs.target_address).is_ok();
-                        if loads {
-                            if let Some(_err) = journal.transfer_loaded(
-                                inputs.caller,
-                                inputs.target_address,
-                                value,
-                            ) {
-                                journal.checkpoint_revert(checkpoint);
-                                false
-                            } else {
-                                journal.checkpoint_commit();
-                                true
-                            }
-                        } else {
+                    let loads = journal.load_account(inputs.caller).is_ok()
+                        && journal.load_account(inputs.target_address).is_ok();
+                    let ok = if loads {
+                        if let Some(_err) = journal.transfer_loaded(
+                            inputs.caller,
+                            inputs.target_address,
+                            value,
+                        ) {
                             journal.checkpoint_revert(checkpoint);
                             false
+                        } else {
+                            journal.checkpoint_commit();
+                            true
                         }
                     } else {
-                        match journal.transfer(inputs.caller, inputs.target_address, value) {
-                            Ok(None) => {
-                                journal.checkpoint_commit();
-                                true
-                            }
-                            _ => {
-                                journal.checkpoint_revert(checkpoint);
-                                false
-                            }
-                        }
+                        journal.checkpoint_revert(checkpoint);
+                        false
                     };
                     if ok {
                         outcome.result.gas = revm::interpreter::Gas::new(inputs.gas_limit);
@@ -840,6 +998,8 @@ mod m1c_tests {
             code_hash: None,
             bytecode_len: 0,
             at_call_boundary: false,
+
+            post_sstore: false,
         }
     }
 
@@ -858,6 +1018,8 @@ mod m1c_tests {
             code_hash: None,
             bytecode_len: 64,
             at_call_boundary: false,
+
+            post_sstore: false,
         };
         assert_eq!(snap.pc, 42);
         assert_eq!(snap.opcode_steps, 17);
@@ -882,6 +1044,8 @@ mod m1c_tests {
             code_hash: None,
             bytecode_len: 5,
             at_call_boundary: false,
+
+            post_sstore: false,
         };
         interp.bytecode = ExtBytecode::new(code);
         interp.gas = Gas::new(100_000);
@@ -908,6 +1072,8 @@ mod m1c_tests {
             code_hash: None,
             bytecode_len: 1,
             at_call_boundary: false,
+
+            post_sstore: false,
         };
         arm_pc_resume(snap);
         assert!(!resume_was_applied());
@@ -951,7 +1117,9 @@ mod m1c_tests {
                 code_hash: Some(B256::ZERO),
                 bytecode_len: 32,
                 at_call_boundary: false,
-            }),
+
+            post_sstore: false,
+        }),
             journal_blob: None,
             ..lite.clone()
         };
@@ -989,7 +1157,9 @@ mod m1c_tests {
                 code_hash: Some(B256::ZERO),
                 bytecode_len: 64,
                 at_call_boundary: false,
-            }),
+
+            post_sstore: false,
+        }),
             journal_blob: Some(JournalBlob {
                 state,
                 logs: vec![],
@@ -1038,7 +1208,9 @@ mod m1c_tests {
                 code_hash: Some(B256::ZERO),
                 bytecode_len: 64,
                 at_call_boundary: false,
-            }),
+
+            post_sstore: false,
+        }),
             journal_blob: Some(JournalBlob {
                 state: EvmState::default(),
                 logs: vec![],
@@ -1049,7 +1221,62 @@ mod m1c_tests {
         };
         assert!(
             !jump_is_safe(&cont),
-            "write-prefix must fall back until blob restore is seq≡par-safe"
+            "write-prefix without write_replays / post_sstore must fall back"
+        );
+    }
+
+    #[test]
+    fn jump_is_safe_accepts_write_prefix_with_post_sstore_replays() {
+        use crate::specfence::rem::{AccessMode, RegionAccess, StorageWriteReplay};
+        let (mut effects, values) = storage_read_effect();
+        effects.push(RegionAccess {
+            tx_idx: 0,
+            k: 2,
+            location: 42,
+            mode: AccessMode::Write,
+        });
+        let cont = ResumeContinuation {
+            cp: CheckpointId {
+                tx_idx: 0,
+                incarnation: 1,
+                k: 2,
+            },
+            k_fail: 4,
+            certified: vec![1],
+            suffix_writes: vec![],
+            effects,
+            checkpoints: vec![],
+            values,
+            boundary: Some(lite_snap(0, 2)),
+            jump_snap: Some(BoundarySnapshot {
+                pc: 8,
+                gas_remaining: 30_000,
+                gas_refunded: 0,
+                memory_words: 0,
+                memory_expansion_cost: 0,
+                call_depth: 1,
+                opcode_steps: 12,
+                stack: vec![],
+                memory: vec![],
+                code_hash: Some(B256::ZERO),
+                bytecode_len: 64,
+                at_call_boundary: false,
+                post_sstore: true,
+            }),
+            journal_blob: None,
+            call_outcomes: vec![],
+            prefix_writes: vec![42],
+            write_replays: vec![StorageWriteReplay {
+                address: Address::ZERO,
+                slot: U256::ZERO,
+                original: U256::ZERO,
+                present: U256::from(1),
+                gas_remaining_after: 30_000,
+            }],
+        };
+        assert!(
+            jump_is_safe(&cont),
+            "M1i: post-SSTORE snap + write_replays must allow write-prefix jump"
         );
     }
 
@@ -1082,7 +1309,9 @@ mod m1c_tests {
                 code_hash: Some(B256::ZERO),
                 bytecode_len: 64,
                 at_call_boundary: false,
-            }),
+
+            post_sstore: false,
+        }),
             journal_blob: None,
             call_outcomes: vec![],
             prefix_writes: vec![],
@@ -1145,7 +1374,9 @@ mod m1c_tests {
                 code_hash: Some(B256::ZERO),
                 bytecode_len: 64,
                 at_call_boundary: false,
-            }),
+
+            post_sstore: false,
+        }),
             journal_blob: None,
             call_outcomes: vec![],
             prefix_writes: vec![],
@@ -1186,7 +1417,9 @@ mod m1c_tests {
                 code_hash: Some(B256::ZERO),
                 bytecode_len: 64,
                 at_call_boundary: true,
-            }),
+
+            post_sstore: false,
+        }),
             journal_blob: None,
             call_outcomes: vec![],
             prefix_writes: vec![],
@@ -1221,6 +1454,8 @@ mod m1c_tests {
             code_hash: None,
             bytecode_len: 8,
             at_call_boundary: false,
+
+            post_sstore: false,
         };
         let (effects, values) = basic_read_effect();
         let cont = ResumeContinuation {

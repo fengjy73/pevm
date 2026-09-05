@@ -1416,9 +1416,9 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     for (slot, value) in account.changed_storage_slots() {
                         let loc = hash_deterministic(MemoryLocation::Storage(*address, *slot));
                         write_set.push((loc, MemoryValue::Storage(value.present_value)));
-                        // M1h: capture storage presents for RewindTo residual republish
-                        // (never journal-blob poison). gas_remaining_after=0 at finalize;
-                        // live post-SSTORE capture needed before default-on write jump.
+                        // M1i: capture storage presents for RewindTo residual republish
+                        // + absolute-jump journal slot replay (never journal-blob poison).
+                        // gas_remaining_after filled from Inspector post-SSTORE captures.
                         if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
                             self.specfence.partial_retry.note_write_replay(
                                 tx_version.tx_idx,
@@ -1428,7 +1428,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                                     slot: *slot,
                                     original: value.original_value,
                                     present: value.present_value,
-                                    gas_remaining_after: 0,
+                                    gas_remaining_after: 0, // filled via post_sstore_gases
                                 },
                             );
                         }

@@ -229,6 +229,8 @@ pub(crate) struct PartialRetryState {
     call_outcomes: Vec<CachedCallOutcome>,
     /// M1h: storage writes observed at finalize (for jump replay).
     write_replays: Vec<(MemoryLocationHash, StorageWriteReplay)>,
+    /// M1i: post-SSTORE gas.remaining values captured in Inspector step_end order.
+    post_sstore_gases: Vec<u64>,
 }
 
 impl PartialRetryState {
@@ -243,6 +245,7 @@ impl PartialRetryState {
         self.live_boundaries.clear();
         self.call_outcomes.clear();
         self.write_replays.clear();
+        self.post_sstore_gases.clear();
     }
 
     pub(crate) fn note_access(
@@ -295,12 +298,27 @@ impl PartialRetryState {
         self.value_snap.insert(location, value);
     }
 
-    /// M1h: record a storage write present/original for absolute-jump journal replay.
+    /// M1i: record post-SSTORE gas.remaining from Inspector step_end.
+    pub(crate) fn note_post_sstore_gas(&mut self, gas_remaining_after: u64) {
+        if gas_remaining_after > 0 {
+            self.post_sstore_gases.push(gas_remaining_after);
+        }
+    }
+
+    /// Last post-SSTORE gas (sticky — finalize may note several slots after one SSTORE).
+    pub(crate) fn last_post_sstore_gas(&self) -> u64 {
+        self.post_sstore_gases.last().copied().unwrap_or(0)
+    }
+
+    /// M1h/M1i: record a storage write present/original for absolute-jump journal replay.
     pub(crate) fn note_write_replay(
         &mut self,
         location: MemoryLocationHash,
-        replay: StorageWriteReplay,
+        mut replay: StorageWriteReplay,
     ) {
+        if replay.gas_remaining_after == 0 {
+            replay.gas_remaining_after = self.last_post_sstore_gas();
+        }
         self.write_replays.retain(|(l, _)| *l != location);
         self.write_replays.push((location, replay));
     }
@@ -358,6 +376,7 @@ impl PartialRetryState {
                         code_hash: None,
                         bytecode_len: 0,
                         at_call_boundary: false,
+                        post_sstore: false,
                     })
                 }
             });
@@ -598,7 +617,14 @@ impl PartialRetryTable {
         }
     }
 
-    /// M1h: record storage write present/original for absolute-jump journal replay.
+    /// M1i: Inspector post-SSTORE gas capture for write-prefix jump gas-equality.
+    pub(crate) fn note_post_sstore_gas(&self, tx_idx: TxIdx, gas_remaining_after: u64) {
+        if let Some(slot) = self.states.get(tx_idx) {
+            slot.lock().unwrap().note_post_sstore_gas(gas_remaining_after);
+        }
+    }
+
+    /// M1h/M1i: record storage write present/original for absolute-jump journal replay.
     pub(crate) fn note_write_replay(
         &self,
         tx_idx: TxIdx,
