@@ -467,3 +467,83 @@ pub fn kind_histogram(snap: &FineGrainSnapshot) -> std::collections::HashMap<Str
     }
     h
 }
+
+/// One RAW producer→consumer edge with location kind + program/handler class.
+#[derive(Debug, Clone, Serialize)]
+pub struct RawEdge {
+    pub producer_tx: usize,
+    pub consumer_tx: usize,
+    pub location: u64,
+    pub kind: String,
+    /// `program` = storage/code_hash/selfdestruct; `handler` = basic/basic_lazy/unknown.
+    pub class: String,
+    pub producer_lag: usize,
+}
+
+fn edge_class(kind: &str) -> &'static str {
+    match kind {
+        "storage" | "code_hash" | "selfdestruct" => "program",
+        _ => "handler",
+    }
+}
+
+/// RAW edges only (effective G*: exclude beneficiary + basic_lazy by default).
+pub fn classify_raw_edges(
+    snap: &FineGrainSnapshot,
+    exclude_beneficiary: bool,
+    exclude_basic_lazy: bool,
+) -> Vec<RawEdge> {
+    use std::collections::HashMap;
+
+    let kind_map: HashMap<u64, String> = snap.location_kinds.iter().cloned().collect();
+    let edges = dependency_edges(snap, exclude_beneficiary, exclude_basic_lazy);
+    edges
+        .into_iter()
+        .filter(|(_, _, _, t)| *t == "raw")
+        .map(|(p, c, loc, _)| {
+            let kind = kind_map
+                .get(&loc)
+                .cloned()
+                .unwrap_or_else(|| LocationKind::Unknown.as_str().to_string());
+            let class = edge_class(&kind).to_string();
+            RawEdge {
+                producer_tx: p,
+                consumer_tx: c,
+                location: loc,
+                kind,
+                class,
+                producer_lag: c.saturating_sub(p),
+            }
+        })
+        .collect()
+}
+
+/// Longest dependency path using only program-class RAW edges (unit weight).
+pub fn program_raw_longest_chain(raw: &[RawEdge]) -> usize {
+    if raw.is_empty() {
+        return 0;
+    }
+    let mut max_tx = 0usize;
+    for e in raw {
+        max_tx = max_tx.max(e.producer_tx).max(e.consumer_tx);
+    }
+    let n = max_tx + 1;
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for e in raw {
+        if e.class != "program" {
+            continue;
+        }
+        preds[e.consumer_tx].push(e.producer_tx);
+    }
+    for p in &mut preds {
+        p.sort_unstable();
+        p.dedup();
+    }
+    let mut dist = vec![1usize; n];
+    for b in 0..n {
+        for &a in &preds[b] {
+            dist[b] = dist[b].max(dist[a] + 1);
+        }
+    }
+    dist.into_iter().max().unwrap_or(0)
+}

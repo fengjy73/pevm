@@ -57,7 +57,8 @@ pub(crate) use metrics::MetricsInner;
 pub use metrics::SpecFenceMetrics;
 pub use finegrain::{
     AbortEvent, DagStats, FineGrainCollector, FineGrainSnapshot, HotLocation, LocationKind,
-    TxRw, analyze_dag, dependency_edges, hot_locations, kind_histogram,
+    TxRw, RawEdge, analyze_dag, classify_raw_edges, dependency_edges, hot_locations,
+    kind_histogram, program_raw_longest_chain,
 };
 pub use region::RegionMode;
 pub(crate) use region::RegionTable;

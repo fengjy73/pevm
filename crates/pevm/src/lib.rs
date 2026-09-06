@@ -223,7 +223,8 @@ mod scheduler;
 pub mod specfence;
 pub use specfence::{
     AbortEvent, ConcurrencyMode, DagStats, FineGrainCollector, FineGrainSnapshot, HotLocation,
-    LocationKind, SpecFenceMetrics, TxRw, analyze_dag, hot_locations, kind_histogram,
+    LocationKind, RawEdge, SpecFenceMetrics, TxRw, analyze_dag, dependency_edges,
+    hot_locations, kind_histogram, classify_raw_edges, program_raw_longest_chain,
 };
 mod storage;
 pub use storage::{
