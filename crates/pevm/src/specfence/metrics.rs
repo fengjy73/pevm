@@ -141,6 +141,10 @@ pub struct SpecFenceMetrics {
     pub full_mode_txs: usize,
     /// M4: Times engagement flipped lean → full within a block.
     pub engagement_switches: usize,
+    /// R1: HotLocal resolve invocations (ℓ ∈ HotSet).
+    pub hot_local_reads: usize,
+    /// R1: |HotSet| at block end.
+    pub hotset_size: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -199,6 +203,8 @@ pub(crate) struct MetricsInner {
     lean_mode_txs: AtomicUsize,
     full_mode_txs: AtomicUsize,
     engagement_switches: AtomicUsize,
+    hot_local_reads: AtomicUsize,
+    hotset_size: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -476,17 +482,21 @@ impl MetricsInner {
         }
     }
 
-    /// M4: copy engagement counters at snapshot time.
+    /// M4/R1: copy engagement + HotSet counters at snapshot time.
     pub(crate) fn set_engagement_metrics(
         &self,
         lean_mode_txs: usize,
         full_mode_txs: usize,
         engagement_switches: usize,
+        hot_local_reads: usize,
+        hotset_size: usize,
     ) {
         self.lean_mode_txs.store(lean_mode_txs, Ordering::Relaxed);
         self.full_mode_txs.store(full_mode_txs, Ordering::Relaxed);
         self.engagement_switches
             .store(engagement_switches, Ordering::Relaxed);
+        self.hot_local_reads.store(hot_local_reads, Ordering::Relaxed);
+        self.hotset_size.store(hotset_size, Ordering::Relaxed);
     }
 
     pub(crate) fn mark_hot(&self, address: Address) {
@@ -578,6 +588,8 @@ impl MetricsInner {
             lean_mode_txs: self.lean_mode_txs.load(Ordering::Relaxed),
             full_mode_txs: self.full_mode_txs.load(Ordering::Relaxed),
             engagement_switches: self.engagement_switches.load(Ordering::Relaxed),
+            hot_local_reads: self.hot_local_reads.load(Ordering::Relaxed),
+            hotset_size: self.hotset_size.load(Ordering::Relaxed),
         }
     }
 }

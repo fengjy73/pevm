@@ -84,6 +84,8 @@ struct RunRow {
     lean_mode_txs: usize,
     full_mode_txs: usize,
     engagement_switches: usize,
+    hot_local_reads: usize,
+    hotset_size: usize,
     inspector_steps: usize,
     inspector_steps_resume: usize,
     ok: bool,
@@ -228,6 +230,8 @@ fn zeros_row(
         lean_mode_txs: 0,
         full_mode_txs: 0,
         engagement_switches: 0,
+        hot_local_reads: 0,
+        hotset_size: 0,
         inspector_steps: 0,
         inspector_steps_resume: 0,
         ok,
@@ -400,6 +404,8 @@ fn measure(
                 } else {
                     m.engagement_switches
                 },
+                hot_local_reads: if sequential { 0 } else { m.hot_local_reads },
+                hotset_size: if sequential { 0 } else { m.hotset_size },
                 inspector_steps: if sequential { 0 } else { m.inspector_steps },
                 inspector_steps_resume: if sequential {
                     0
@@ -486,6 +492,8 @@ fn write_outputs(out: &Path, rows: &[RunRow]) {
                 "lean_mode_txs": r.lean_mode_txs,
                 "full_mode_txs": r.full_mode_txs,
                 "engagement_switches": r.engagement_switches,
+                "hot_local_reads": r.hot_local_reads,
+                "hotset_size": r.hotset_size,
                 "inspector_steps": r.inspector_steps,
                 "inspector_steps_resume": r.inspector_steps_resume,
                 "ok": r.ok,
@@ -501,14 +509,14 @@ fn write_outputs(out: &Path, rows: &[RunRow]) {
     let mut csv = File::create(&csv_path).expect("write csv");
     writeln!(
         csv,
-        "block,n_tx,gas_used,mode,cores,repeat,elapsed_ms,tps,occ_aborts,abort_rate,wait_admissions,speculate_executions,region_promotions,cascade_validations_scheduled,independent_txs_skipped_by_fence,bayes_wait_decisions,bayes_speculate_decisions,bayes_conflict_updates,bayes_success_updates,wave_promotions,mean_wait_posterior,bind_hits,wait_hard_count,spec_read_count,selective_invalidate_count,tx_full_retry,region_validate_fail,soft_edge_revokes,selective_fallback_full,partial_retry_count,partial_retry_fallback_full,cost_chose_wait,cost_chose_spec,cost_chose_bind,mean_p_at_wait,mean_p_at_spec,evm_entries,resume_count,rebind_only,rewind_to_cp,full_restart,tx_head_reexec,absolute_jump_applied,absolute_jump_fallback,prior_bind_hits,prior_bind_miss,journal_ff_entries,journal_ff_hits,prefix_opcodes_skipped,ready_steal_on_wait,lean_mode_txs,full_mode_txs,engagement_switches,inspector_steps,inspector_steps_resume,ok,error"
+        "block,n_tx,gas_used,mode,cores,repeat,elapsed_ms,tps,occ_aborts,abort_rate,wait_admissions,speculate_executions,region_promotions,cascade_validations_scheduled,independent_txs_skipped_by_fence,bayes_wait_decisions,bayes_speculate_decisions,bayes_conflict_updates,bayes_success_updates,wave_promotions,mean_wait_posterior,bind_hits,wait_hard_count,spec_read_count,selective_invalidate_count,tx_full_retry,region_validate_fail,soft_edge_revokes,selective_fallback_full,partial_retry_count,partial_retry_fallback_full,cost_chose_wait,cost_chose_spec,cost_chose_bind,mean_p_at_wait,mean_p_at_spec,evm_entries,resume_count,rebind_only,rewind_to_cp,full_restart,tx_head_reexec,absolute_jump_applied,absolute_jump_fallback,prior_bind_hits,prior_bind_miss,journal_ff_entries,journal_ff_hits,prefix_opcodes_skipped,ready_steal_on_wait,lean_mode_txs,full_mode_txs,engagement_switches,hot_local_reads,hotset_size,inspector_steps,inspector_steps_resume,ok,error"
     )
     .unwrap();
     for r in rows {
         let err = r.error.as_deref().unwrap_or("").replace(',', ";");
         writeln!(
             csv,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             r.block,
             r.n_tx,
             r.gas_used,
@@ -562,6 +570,8 @@ fn write_outputs(out: &Path, rows: &[RunRow]) {
             r.lean_mode_txs,
             r.full_mode_txs,
             r.engagement_switches,
+            r.hot_local_reads,
+            r.hotset_size,
             r.inspector_steps,
             r.inspector_steps_resume,
             r.ok,

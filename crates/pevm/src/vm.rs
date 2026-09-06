@@ -314,7 +314,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
         location_hash: MemoryLocationHash,
     ) -> Result<(), ReadError> {
         if self.specfence.mode == crate::ConcurrencyMode::SpecFence
-            && !self.specfence.engagement.is_lean()
+            && self.specfence.hotset.contains(location_hash)
         {
             let _ = self.specfence.rem.note_effect();
             self.specfence.partial_retry.note_access(
@@ -354,11 +354,13 @@ impl<'a, S: Storage> VmDb<'a, S> {
             self.specfence.metrics.record_spec_read();
             return Ok(());
         }
-        // M4 lean: SpecRead-only (skip Bayes π / WaitHard / Bind / rem cps).
-        if self.specfence.engagement.is_lean() {
+        // R1 LeanOCC: ℓ ∉ HotSet → OCC-style SpecRead only (no Bayes WaitHard).
+        if !self.specfence.hotset.contains(location_hash) {
             self.specfence.metrics.record_spec_read();
             return Ok(());
         }
+        // R2 HotLocal: Bind / WaitHard+park / SpecRead for ℓ ∈ HotSet.
+        self.specfence.hotset.record_hot_local_read();
 
         let residual_predicts = self
             .mv_memory
@@ -530,8 +532,8 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if self.specfence.mode != crate::ConcurrencyMode::SpecFence {
             return Ok(());
         }
-        // M4 lean: no EarlyVal / checkpoint meta.
-        if self.specfence.engagement.is_lean() {
+        // R0/R1: EarlyVal only on HotSet under research inspect (default path: off).
+        if self.specfence.engagement.is_lean() || !self.specfence.hotset.contains(location_hash) {
             return Ok(());
         }
         if address == self.specfence.beneficiary {
@@ -1094,12 +1096,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         if !self.specfence.mode.uses_regions() {
             return None;
         }
-        // M4 lean: no proactive Wait admission.
-        if self.specfence.mode == crate::ConcurrencyMode::SpecFence
-            && self.specfence.engagement.is_lean()
-        {
-            return None;
-        }
+        // R1: proactive Wait only via should_wait_account (HotSet-gated). No block-wide lean skip.
         let tx = self.chain.tx_env(unsafe { self.txs.get_unchecked(tx_idx) });
         if let Some(prev) = self
             .specfence
@@ -1281,8 +1278,10 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             }
         }
 
-        // M4 lean: Handler::run like OCC (skip SpecFenceInspector step tax).
-        let use_inspect = self.specfence.mode == crate::ConcurrencyMode::SpecFence && !lean;
+        // R0: Handler::run by default; inspect_run only with SPECFENCE_ENABLE_INSPECT=1.
+        let use_inspect = self.specfence.mode == crate::ConcurrencyMode::SpecFence
+            && !lean
+            && crate::specfence::research_inspect_enabled();
         let run_result = if use_inspect {
             let partial_retry = self.specfence.partial_retry;
             let metrics = self.specfence.metrics;
@@ -1566,9 +1565,15 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 let (wrote_new_location, contended) =
                     self.mv_memory.record(tx_version, read_set, write_set);
                 // M3: learn process WŜ from this incarnation's writes (no residual publish).
+                // R1: feed HotSet writer counts (H_w).
                 if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
                     let locs: Vec<_> = self.mv_memory.write_locations(tx_version.tx_idx);
                     self.specfence.rw_prior.observe_write_set(&locs, None);
+                    for &loc in &locs {
+                        if loc != self.beneficiary_location_hash {
+                            self.specfence.hotset.note_writer(loc, tx_version.tx_idx);
+                        }
+                    }
                 }
                 if wrote_new_location {
                     flags |= FinishExecFlags::WroteNewLocation;

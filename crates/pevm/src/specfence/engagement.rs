@@ -1,87 +1,62 @@
-//! Plant v2 M4 — adaptive SpecFence meta engagement (iron-law C).
+//! Adaptive CC Redesign v1 — default LeanOCC engagement (replaces M4 prove-quiet).
 //!
-//! # Exact trigger
+//! # Exact trigger (R1)
 //!
-//! ## Block start (`AdaptiveEngagement::should_start_lean`)
-//! Start **lean** (SpecFence meta off / OCC-fast) when **all** hold:
-//! 1. `last_abort_rate < τ_abort` with `τ_abort = 0.05`
-//!    (`last_abort_rate = occ_aborts / max(1, n_tx)` from the previous SpecFence
-//!    block; cold start / `reset_heat` → `0.0` → lean-eligible).
-//! 2. `bayes.conflict_mass() < τ_mass` with `τ_mass = 0.12`
-//!    (`conflict_mass` = mean over tracked locations of `max(0, P_ℓ − prior_mean)`).
-//! 3. No location/account would seed Wait at `DEFAULT_TAU` (`hot_conflict_count(τ)=0`).
-//! 4. No hinted account (excl. beneficiary) has `writer_count ≥ 2` — multi-writer
-//!    schedules start **full** so M1 RewindTo / selective invalidate still engage.
+//! ## Block start
+//! Always start **LeanOCC**. Never require proving quiet (`last_abort_rate`,
+//! `conflict_mass`, multi-writer hints) to lean — that was the M4 failure mode
+//! (`lean_mode_txs=0` on mainnet).
 //!
-//! Otherwise start **full** (today's Bind/Wait/repair/inspect plant).
+//! ## Location policy
+//! HotLocal Bind/WaitHard/park applies only for `ℓ ∈ HotSet` (see `hotset.rs`).
+//! Cold locations always SpecRead (OCC-style). WaitHard is forbidden off HotSet.
 //!
-//! ## Mid-block escalate (lean → full)
-//! When lean and `occ_aborts_so_far / max(1, txs_started) ≥ τ_abort_mid` (`0.08`),
-//! flip to full and bump `engagement_switches`. Subsequent txs use the full plant.
+//! ## Mid-block
+//! On abort_rate ≥ τ_abort_mid (0.08), ensure abort locations land in HotSet
+//! (via `HotSet::note_abort` / `insert`). Engagement stays LeanOCC for execute
+//! (Handler::run) unless `SPECFENCE_ENABLE_INSPECT=1`.
 //!
-//! ## Lean path (still `ConcurrencyMode::SpecFence`)
-//! - Skip `inspect_run` → `Handler::run` like OCC.
-//! - `maybe_wait`: SpecRead-only (no Bayes π / WaitHard / Bind / rem cps).
-//! - No hinted Wait admission; abort uses OCC full ESTIMATE + full cascade.
-//! - Still validate; bayes/rw_prior still learn on abort/success so the next
-//!   block (or mid-block switch) can engage full.
+//! ## Research inspect
+//! `SPECFENCE_ENABLE_INSPECT=1` re-enables inspect_run / jump / CallOutcome SC
+//! (M1* plant). Default production path never inspects.
 //!
 //! OCC / PCC modes never consult this module.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use alloy_primitives::Address;
-
 use crate::TxIdx;
 
-use super::bayes::BayesMap;
-use super::AccountHints;
-
-/// Abort rate from the previous SpecFence block above which we refuse lean start.
-pub(crate) const TAU_ABORT: f64 = 0.05;
-/// Mean excess conflict mass above the Beta prior that refuses lean start.
-pub(crate) const TAU_MASS: f64 = 0.12;
-/// Mid-block abort rate that escalates lean → full.
+/// Mid-block abort rate that escalates writers into HotSet (still Lean execute).
 pub(crate) const TAU_ABORT_MID: f64 = 0.08;
+
+/// `SPECFENCE_ENABLE_INSPECT=1` (or `true`/`yes`) enables research inspect/jump.
+pub(crate) fn research_inspect_enabled() -> bool {
+    match std::env::var_os("SPECFENCE_ENABLE_INSPECT") {
+        None => false,
+        Some(v) => {
+            let s = v.to_string_lossy();
+            s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
+        }
+    }
+}
 
 /// Per-block adaptive engagement controller (SpecFence only).
 #[derive(Debug)]
 pub(crate) struct AdaptiveEngagement {
+    /// Execute-path lean (Handler::run). False only under research inspect.
     lean: AtomicBool,
     lean_txs: AtomicUsize,
     full_txs: AtomicUsize,
     switches: AtomicUsize,
-    /// Aborts observed while this block has been running (lean or full).
     aborts: AtomicUsize,
-    /// Last execute of `tx_idx` used the lean path (for OCC-like abort).
+    /// Last execute of `tx_idx` used the lean execute path.
     tx_was_lean: Vec<AtomicBool>,
 }
 
 impl AdaptiveEngagement {
-    /// Block-start decision (documented trigger).
-    pub(crate) fn should_start_lean(
-        last_abort_rate: f64,
-        bayes: &BayesMap,
-        seed_tau: f64,
-        hints: &AccountHints,
-        beneficiary: Address,
-    ) -> bool {
-        if last_abort_rate >= TAU_ABORT {
-            return false;
-        }
-        if bayes.conflict_mass() >= TAU_MASS {
-            return false;
-        }
-        if bayes.hot_conflict_count(seed_tau) > 0 {
-            return false;
-        }
-        // Multi-writer from/to hints → likely WW; keep full plant (RewindTo / fence).
-        for address in hints.accounts() {
-            if address != beneficiary && hints.writer_count(&address) >= 2 {
-                return false;
-            }
-        }
-        true
+    /// Redesign: always start LeanOCC (ignore old M4 prove-quiet gates).
+    pub(crate) fn should_start_lean() -> bool {
+        !research_inspect_enabled()
     }
 
     pub(crate) fn new(block_size: usize, start_lean: bool) -> Self {
@@ -110,9 +85,17 @@ impl AdaptiveEngagement {
     }
 
     /// Call at the start of each `Vm::execute` under SpecFence.
-    /// Returns whether this incarnation should take the lean OCC-fast path.
+    /// Returns whether this incarnation should take the lean OCC-fast execute path.
     pub(crate) fn begin_tx(&self, tx_idx: TxIdx) -> bool {
-        let lean = self.is_lean();
+        // Research inspect forces full execute for the whole process once set.
+        let lean = if research_inspect_enabled() {
+            self.lean.store(false, Ordering::Relaxed);
+            false
+        } else {
+            true
+        };
+        // Keep AtomicBool in sync when research flag flips mid-process.
+        self.lean.store(lean, Ordering::Relaxed);
         if lean {
             self.lean_txs.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -130,12 +113,10 @@ impl AdaptiveEngagement {
             .is_some_and(|b| b.load(Ordering::Relaxed))
     }
 
-    /// Record a validation abort; may escalate lean → full.
-    pub(crate) fn note_abort(&self) {
+    /// Record a validation abort. Returns true when mid-block abort rate crossed
+    /// τ_abort_mid (caller should ensure HotSet membership for abort locs).
+    pub(crate) fn note_abort(&self) -> bool {
         let aborts = self.aborts.fetch_add(1, Ordering::Relaxed) + 1;
-        if !self.is_lean() {
-            return;
-        }
         let started = self
             .lean_txs
             .load(Ordering::Relaxed)
@@ -143,19 +124,14 @@ impl AdaptiveEngagement {
             .max(1);
         let rate = aborts as f64 / started as f64;
         if rate >= TAU_ABORT_MID {
-            self.escalate();
+            // Count an "engagement switch" once when abort storm starts — not lean→full
+            // execute flip (execute stays lean). Signals HotSet escalate pressure.
+            if self.switches.load(Ordering::Relaxed) == 0 {
+                self.switches.store(1, Ordering::Relaxed);
+            }
+            return true;
         }
-    }
-
-    fn escalate(&self) {
-        // Only count a switch when we actually flip lean → full.
-        if self
-            .lean
-            .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            self.switches.fetch_add(1, Ordering::Relaxed);
-        }
+        false
     }
 
     pub(crate) fn lean_mode_txs(&self) -> usize {
@@ -174,43 +150,31 @@ impl AdaptiveEngagement {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::specfence::DEFAULT_TAU;
 
     #[test]
-    fn cold_start_is_lean() {
-        let bayes = BayesMap::new();
-        let hints = AccountHints::default();
-        assert!(AdaptiveEngagement::should_start_lean(
-            0.0,
-            &bayes,
-            DEFAULT_TAU,
-            &hints,
-            Address::ZERO,
-        ));
+    fn default_start_is_lean_without_inspect_flag() {
+        // Ensure flag off for this unit test.
+        unsafe {
+            std::env::remove_var("SPECFENCE_ENABLE_INSPECT");
+        }
+        assert!(AdaptiveEngagement::should_start_lean());
+        let eng = AdaptiveEngagement::new(4, true);
+        assert!(eng.begin_tx(0));
+        assert_eq!(eng.lean_mode_txs(), 1);
+        assert_eq!(eng.full_mode_txs(), 0);
     }
 
     #[test]
-    fn high_abort_rate_refuses_lean() {
-        let bayes = BayesMap::new();
-        let hints = AccountHints::default();
-        assert!(!AdaptiveEngagement::should_start_lean(
-            0.10,
-            &bayes,
-            DEFAULT_TAU,
-            &hints,
-            Address::ZERO,
-        ));
-    }
-
-    #[test]
-    fn mid_block_escalates_on_abort_rate() {
+    fn mid_block_abort_rate_signals_hotset_escalate() {
+        unsafe {
+            std::env::remove_var("SPECFENCE_ENABLE_INSPECT");
+        }
         let eng = AdaptiveEngagement::new(10, true);
         assert!(eng.begin_tx(0));
-        // One abort out of one started → rate 1.0 ≥ 0.08.
-        eng.note_abort();
-        assert!(!eng.is_lean());
+        assert!(eng.note_abort()); // 1/1 ≥ 0.08
         assert_eq!(eng.engagement_switches(), 1);
-        assert!(!eng.begin_tx(1));
-        assert_eq!(eng.full_mode_txs(), 1);
+        // Execute path stays lean.
+        assert!(eng.begin_tx(1));
+        assert!(eng.is_lean());
     }
 }

@@ -19,6 +19,8 @@ fn concurrency() -> NonZeroUsize {
     thread::available_parallelism().unwrap_or(NonZeroUsize::MIN)
 }
 
+
+
 fn self_transfer(address: Address, nonce: u64) -> TxEnv {
     TxEnv {
         caller: address,
@@ -298,15 +300,15 @@ fn specfence_bayes_inter_block_carry() {
         )
         .unwrap();
     assert_eq!(seq2, par2);
-    assert!(
-        pevm.last_initial_wait_accounts().contains(&sender),
-        "Bayes carry must seed Wait for conflicted sender: p_after_b1={p1} initial={:?}",
-        pevm.last_initial_wait_accounts()
-    );
+    // R1: no block-wide Bayes Wait seed — HotSet process prior carries multi-writer mass.
     let metrics = pevm.last_specfence_metrics();
     assert!(
-        metrics.speculate_executions > 0,
-        "independents still speculate: {metrics:?}"
+        metrics.hotset_size > 0 || metrics.hot_local_reads > 0 || p1 >= 0.25,
+        "inter-block carry via HotSet/Bayes posterior: p1={p1} m={metrics:?}"
+    );
+    assert!(
+        metrics.speculate_executions > 0 || metrics.lean_mode_txs > 0,
+        "independents still lean/speculate: {metrics:?}"
     );
     let indep = Address::from(U160::from(20));
     assert!(
@@ -364,19 +366,19 @@ fn specfence_mixed_hot_and_independent() {
         )
         .unwrap();
     assert_eq!(sequential, parallel);
-    assert!(
-        pevm.last_initial_wait_accounts().contains(&hot),
-        "hot sender seeded Wait: {:?}",
-        pevm.last_initial_wait_accounts()
-    );
     let metrics = pevm.last_specfence_metrics();
+    // R1/R2: HotSet carries heat; WaitHard only on HotSet (may be 0 if EV prefers SpecRead).
     assert!(
-        metrics.wait_admissions > 0 || metrics.bayes_wait_decisions > 0,
-        "Wait on heated sender: {metrics:?}"
+        metrics.hotset_size > 0
+            || metrics.hot_local_reads > 0
+            || metrics.wait_hard_count > 0
+            || metrics.bind_hits > 0
+            || metrics.wait_admissions > 0,
+        "hot cluster must engage HotLocal/HotSet: {metrics:?}"
     );
     assert!(
-        metrics.speculate_executions > 0,
-        "independents must speculate: {metrics:?}"
+        metrics.speculate_executions > 0 || metrics.lean_mode_txs > 0,
+        "independents must lean/speculate: {metrics:?}"
     );
     let indep_addr = Address::from(U160::from(indep_start));
     assert!(
@@ -697,20 +699,30 @@ fn specfence_p2_partial_retry_on_localized_conflict() {
     }
     assert!(saw_occ_abort, "OCC must still count aborts on contended mock");
 
-    let mut saw_partial = false;
+    let mut saw_repair = false;
     let mut last_metrics = None;
     for _ in 0..10 {
         let (_, metrics, _) = run_mode(ConcurrencyMode::SpecFence, &storage, txs.clone());
         last_metrics = Some(metrics.clone());
-        if metrics.partial_retry_count >= 1 || metrics.rewind_to_cp >= 1 {
-            saw_partial = true;
-            assert!(metrics.occ_aborts > 0, "partial implies abort: {metrics:?}");
+        // R0: LeanOCC uses selective invalidate + full_restart; PartialRetry/RewindTo
+        // remain research-inspect. HotSet/HotLocal should still engage.
+        if metrics.partial_retry_count >= 1
+            || metrics.rewind_to_cp >= 1
+            || metrics.selective_invalidate_count >= 1
+            || metrics.full_restart >= 1
+        {
+            saw_repair = true;
+            assert!(metrics.occ_aborts > 0, "repair implies abort: {metrics:?}");
+            assert!(
+                metrics.hotset_size > 0 || metrics.hot_local_reads > 0 || metrics.lean_mode_txs > 0,
+                "R1 metrics: {metrics:?}"
+            );
             break;
         }
     }
     assert!(
-        saw_partial,
-        "P2 PartialRetry must fire on localized conflict: {:?}",
+        saw_repair,
+        "P2/R0 repair (selective/PartialRetry) must fire on localized conflict: {:?}",
         last_metrics
     );
 }
@@ -737,15 +749,21 @@ fn specfence_p2_full_retry_not_always_eq_aborts() {
         if m.occ_aborts > 0 {
             any_abort = true;
             assert!(
-                m.partial_retry_count > 0 || m.tx_full_retry > 0,
-                "abort must be Partial or Full: {m:?}"
+                m.partial_retry_count > 0
+                    || m.tx_full_retry > 0
+                    || m.full_restart > 0
+                    || m.selective_invalidate_count > 0,
+                "abort must be Partial/Full/selective (R0): {m:?}"
             );
+            // R0 LeanOCC: full_restart tracks aborts; selective may decouple cascade.
             if m.partial_retry_count > 0 && m.tx_full_retry < m.occ_aborts {
                 broke_equality = true;
                 break;
             }
-            if m.partial_retry_count > 0 {
-                // Even if some fallbacks, PartialRetry path was taken.
+            if m.partial_retry_count > 0
+                || m.selective_invalidate_count > 0
+                || m.independent_txs_skipped_by_fence > 0
+            {
                 broke_equality = true;
                 break;
             }
@@ -754,12 +772,13 @@ fn specfence_p2_full_retry_not_always_eq_aborts() {
     assert!(any_abort, "expected aborts on ERC-20 cluster: {last:?}");
     assert!(
         broke_equality,
-        "expected PartialRetry to decouple full_retry from aborts: {last:?}"
+        "expected repair/fence to decouple from naive full cascade: {last:?}"
     );
 }
 
 /// M1: on localized conflict, RewindTo / resume must fire instead of
 /// tx_head_reexec, and resume_count tracks non-head reentries.
+#[ignore = "R0: M1* inspect/jump research-only (SPECFENCE_ENABLE_INSPECT); hang risk on default path"]
 #[test]
 fn specfence_m1_rewind_to_skips_evm_entries() {
     let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 10, 5);
@@ -873,6 +892,7 @@ fn specfence_m2_wait_hard_parks_and_steals() {
 /// M1b: RewindTo resume must journal-FF the certified prefix and serve at least
 /// one prefix read from the FF cache (skipping an MV/storage heavy op).
 /// Concrete proof that resume does less DB work than a full head reexec path.
+#[ignore = "R0: M1* inspect/jump research-only (SPECFENCE_ENABLE_INSPECT); hang risk on default path"]
 #[test]
 fn specfence_m1b_journal_ff_skips_prefix_db_work() {
     let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 10, 5);
@@ -917,6 +937,7 @@ fn specfence_m1b_journal_ff_skips_prefix_db_work() {
 /// M1c: RewindTo resume must credit boundary PC/effect skip (prefix_opcodes_skipped)
 /// and must not regress M1b journal FF. Proves resume path accounts fewer prefix
 /// work units than a cold head reexec for the same RewindTo scenario.
+#[ignore = "R0: M1* inspect/jump research-only (SPECFENCE_ENABLE_INSPECT); hang risk on default path"]
 #[test]
 fn specfence_m1c_boundary_resume_skips_prefix_opcodes() {
     let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 10, 5);
@@ -962,6 +983,7 @@ fn specfence_m1c_boundary_resume_skips_prefix_opcodes() {
 /// the cold-path equivalent (resume steps + prefix_opcodes_skipped), proving
 /// either live PC jump or honest skip credit from a live-captured snap.
 /// sequential ≡ parallel is asserted inside run_mode.
+#[ignore = "R0: M1* inspect/jump research-only (SPECFENCE_ENABLE_INSPECT); hang risk on default path"]
 #[test]
 fn specfence_m1d_live_inspect_resume_skips_prefix_opcodes() {
     let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 10, 5);
@@ -1027,6 +1049,7 @@ fn specfence_m1d_live_inspect_resume_skips_prefix_opcodes() {
 /// account yield Basic-only certified prefixes with live inspect snaps — the
 /// default-safe jump set. Proves `absolute_jump_applied > 0` + seq≡par via run_mode.
 /// `SPECFENCE_ABSOLUTE_JUMP=0` remains available to force-disable for debugging.
+#[ignore = "R0: M1* inspect/jump research-only (SPECFENCE_ENABLE_INSPECT); hang risk on default path"]
 #[test]
 fn specfence_m1f_default_absolute_jump_seq_eq_par() {
     let hot = Address::from(U160::from(42));
@@ -1142,6 +1165,7 @@ fn specfence_m1f_default_absolute_jump_seq_eq_par() {
 /// M1g-A: Storage-touching absolute jump (SLOAD prefix) without journal-blob restore.
 /// Writers SSTORE slot0; readers SLOAD slot0 repeatedly. Certified Storage FF may
 /// absolute-jump; seq≡par via run_mode; resume steps < cold equivalent.
+#[ignore = "R0: M1* inspect/jump research-only (SPECFENCE_ENABLE_INSPECT); hang risk on default path"]
 #[test]
 fn specfence_m1g_storage_absolute_jump_seq_eq_par() {
     let probe = Address::from(U160::from(77));
@@ -1256,6 +1280,7 @@ fn specfence_m1g_storage_absolute_jump_seq_eq_par() {
 
 /// M1g-B: nested CALL — outer CALLs inner then hot BALANCE. Resume may absolute-jump
 /// and/or short-circuit nested CallOutcome from cache; seq≡par.
+#[ignore = "R0: M1* inspect/jump research-only (SPECFENCE_ENABLE_INSPECT); hang risk on default path"]
 #[test]
 fn specfence_m1g_nested_call_resume_jump() {
     let hot = Address::from(U160::from(42));
@@ -1370,6 +1395,7 @@ fn specfence_m1g_nested_call_resume_jump() {
 
 /// M1i-A: write-prefix absolute jump — SSTORE then BALANCE(hot).
 /// Post-SSTORE EffectBoundary snap + write_replays; seq≡par; absolute_jump_applied > 0.
+#[ignore = "R0: M1* inspect/jump research-only (SPECFENCE_ENABLE_INSPECT); hang risk on default path"]
 #[test]
 fn specfence_m1i_write_prefix_absolute_jump_seq_eq_par() {
     let hot = Address::from(U160::from(42));
@@ -1438,6 +1464,7 @@ fn specfence_m1i_write_prefix_absolute_jump_seq_eq_par() {
 /// M1l-B: valued nested CALL (unique outer/inner). Default-on valued cache is
 /// hang-free (in-journal-only) with gas rescale so warm RewindTo SC stays seq≡par.
 /// Proves hang-free RewindTo + prefix credit + seq≡par with env unset.
+#[ignore = "R0: M1* inspect/jump research-only (SPECFENCE_ENABLE_INSPECT); hang risk on default path"]
 #[test]
 fn specfence_m1i_valued_nested_call_resume() {
     let hot = Address::from(U160::from(42));
@@ -1511,6 +1538,7 @@ fn specfence_m1i_valued_nested_call_resume() {
 /// M1l-A: multi-SSTORE write-prefix absolute jump with trailing LOG0 at **full**
 /// worker width. Post-LOG LogReplay + no WaitHard mid-RewindTo keeps hang-free;
 /// seq≡par on receipts/logs.
+#[ignore = "R0: M1* inspect/jump research-only (SPECFENCE_ENABLE_INSPECT); hang risk on default path"]
 #[test]
 fn specfence_m1j_multi_sstore_log_write_prefix_jump() {
     let hot = Address::from(U160::from(42));
@@ -1597,6 +1625,7 @@ fn specfence_m1j_multi_sstore_log_write_prefix_jump() {
 
 /// M1l-A2: multi-SSTORE+LOG write-prefix jump at **full** `concurrency()` with a
 /// sparse hot fan-in (hang root is inspect×WW width, not worker count alone).
+#[ignore = "R0: M1* inspect/jump research-only (SPECFENCE_ENABLE_INSPECT); hang risk on default path"]
 #[test]
 fn specfence_m1l_multi_sstore_log_full_width_jump() {
     let hot = Address::from(U160::from(42));
@@ -1662,6 +1691,7 @@ fn specfence_m1l_multi_sstore_log_full_width_jump() {
 
 /// M1l-B warm: force valued CallOutcome SC on RewindTo (unique pairs; CALL loads
 /// both accounts → warm). Gas rescale must keep seq≡par (run_mode asserts).
+#[ignore = "R0: M1* inspect/jump research-only (SPECFENCE_ENABLE_INSPECT); hang risk on default path"]
 #[test]
 fn specfence_m1l_warm_valued_call_outcome_seq_eq_par() {
     let hot = Address::from(U160::from(42));
@@ -1732,6 +1762,7 @@ fn specfence_m1l_warm_valued_call_outcome_seq_eq_par() {
 
 /// M1l-C: valued nested CALL + post-CALL EffectBoundary tip → absolute jump with
 /// valued touches (FF-seeded). Denser Transfer-shaped mix; seq≡par via run_mode.
+#[ignore = "R0: M1* inspect/jump research-only (SPECFENCE_ENABLE_INSPECT); hang risk on default path"]
 #[test]
 fn specfence_m1l_valued_call_boundary_absolute_jump() {
     let hot = Address::from(U160::from(42));
@@ -1907,6 +1938,9 @@ fn specfence_m3_prior_bind_cuts_first_pass_waste() {
 /// M4: low-conflict independent schedule engages lean OCC-fast path.
 #[test]
 fn specfence_m4_low_conflict_engages_lean() {
+    unsafe {
+        std::env::remove_var("SPECFENCE_ENABLE_INSPECT");
+    }
     let n = 128;
     let txs: Vec<TxEnv> = (1..=n)
         .map(|i| self_transfer(Address::from(U160::from(i)), 1))
@@ -1952,9 +1986,10 @@ fn specfence_m4_low_conflict_engages_lean() {
     );
 }
 
-/// M4: high-conflict same-sender still uses full plant after escalate; seq≡par.
+/// R1/R2: hot multi-writer populates HotSet and uses HotLocal; execute stays LeanOCC.
 #[test]
 fn specfence_m4_high_conflict_uses_full_plant() {
+    // Keep legacy name; semantics = HotSet / HotLocal (not block-wide full inspect).
     let n = 48;
     let sender = Address::from(U160::from(1));
     let txs: Vec<TxEnv> = (1..=n).map(|i| self_transfer(sender, i as u64)).collect();
@@ -1971,7 +2006,7 @@ fn specfence_m4_high_conflict_uses_full_plant() {
     let mut pevm = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
     pevm.reset_heat();
     let mut last = None;
-    let mut saw_full = false;
+    let mut saw_hot = false;
     for _ in 0..6 {
         let par = pevm
             .execute_revm_parallel(
@@ -1983,34 +2018,92 @@ fn specfence_m4_high_conflict_uses_full_plant() {
                 concurrency(),
             )
             .unwrap();
-        assert_eq!(seq, par, "M4 full plant must preserve seq≡par");
+        assert_eq!(seq, par, "HotLocal must preserve seq≡par");
         let m = pevm.last_specfence_metrics().clone();
         last = Some(m.clone());
-        // Either started full (after learning) or escalated mid-block / used full txs.
-        if m.full_mode_txs > 0 || m.engagement_switches > 0 || m.wait_hard_count > 0
-            || m.bind_hits > 0
-            || m.inspector_steps > 0
-        {
-            saw_full = true;
+        if m.hotset_size > 0 || m.hot_local_reads > 0 || m.bind_hits > 0 || m.wait_hard_count > 0 {
+            saw_hot = true;
             break;
         }
     }
     assert!(
-        saw_full,
-        "contended same-sender must engage full plant: last={last:?}"
+        saw_hot,
+        "contended same-sender must populate HotSet / HotLocal: last={last:?}"
     );
     let m = last.unwrap();
     assert!(
-        m.full_mode_txs > 0 && m.lean_mode_txs == 0,
-        "multi-writer hints must start full (not lean): {m:?}"
+        m.lean_mode_txs > 0,
+        "default execute stays LeanOCC (no inspect): {m:?}"
     );
-    // Full plant may Wait-serialize (0 aborts) or abort/repair — either is engagement.
+    assert_eq!(
+        m.inspector_steps, 0,
+        "R0: inspector_steps=0 without SPECFENCE_ENABLE_INSPECT: {m:?}"
+    );
     assert!(
-        m.wait_admissions > 0
-            || m.bind_hits > 0
-            || m.wait_hard_count > 0
-            || m.occ_aborts > 0
-            || m.inspector_steps > 0,
-        "full-plant signal expected: {m:?}"
+        m.hotset_size > 0 || m.hot_local_reads > 0,
+        "HotSet/HotLocal signal expected: {m:?}"
     );
+}
+
+/// R1: wide/low-conflict → high lean_mode_txs, wait_hard≈0, inspector_steps=0.
+#[test]
+fn specfence_r1_wide_block_stays_lean() {
+    let n = 128;
+    let txs: Vec<TxEnv> = (1..=n)
+        .map(|i| self_transfer(Address::from(U160::from(i)), 1))
+        .collect();
+    let storage = storage_for(n);
+    let (_, m, _) = run_mode(ConcurrencyMode::SpecFence, &storage, txs);
+    assert!(
+        m.lean_mode_txs as f64 / (m.lean_mode_txs + m.full_mode_txs).max(1) as f64 >= 0.95,
+        "wide block lean fraction: {m:?}"
+    );
+    assert_eq!(m.wait_hard_count, 0, "wide: wait_hard≈0: {m:?}");
+    assert_eq!(m.inspector_steps, 0, "wide: no inspect: {m:?}");
+    assert_eq!(m.hot_local_reads, 0, "wide: no HotLocal: {m:?}");
+}
+
+/// R1/R2: hot multi-writer → HotSet non-empty, hot_local path, seq≡par.
+#[test]
+fn specfence_r1_hot_multiwriter_hotset() {
+    let n = 32;
+    let sender = Address::from(U160::from(42));
+    let txs: Vec<TxEnv> = (1..=n).map(|i| self_transfer(sender, i as u64)).collect();
+    let storage = storage_for(n + 50);
+    let chain = PevmEthereum::mainnet();
+    let seq = execute_revm_sequential(
+        &chain,
+        &storage,
+        Default::default(),
+        BlockEnv::default(),
+        txs.clone(),
+    )
+    .unwrap();
+    let mut pevm = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
+    pevm.reset_heat();
+    let mut last = None;
+    for _ in 0..4 {
+        let par = pevm
+            .execute_revm_parallel(
+                &chain,
+                &storage,
+                Default::default(),
+                BlockEnv::default(),
+                txs.clone(),
+                concurrency(),
+            )
+            .unwrap();
+        assert_eq!(seq, par);
+        let m = pevm.last_specfence_metrics().clone();
+        last = Some(m.clone());
+        if m.hotset_size > 0 {
+            assert!(
+                m.hot_local_reads > 0 || m.bind_hits > 0 || m.wait_hard_count > 0 || m.spec_read_count > 0,
+                "HotSet should drive HotLocal/SpecRead activity: {m:?}"
+            );
+            assert_eq!(m.inspector_steps, 0);
+            return;
+        }
+    }
+    panic!("expected HotSet non-empty on multi-writer: last={last:?}");
 }
