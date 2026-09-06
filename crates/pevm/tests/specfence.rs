@@ -1433,8 +1433,10 @@ fn specfence_m1i_write_prefix_absolute_jump_seq_eq_par() {
     assert!(saw, "M1i write-prefix RewindTo+jump expected: {last:?}");
 }
 
-/// M1i-B: valued nested CALL schedule (unique outer/inner). Mid-exec valued
-/// CallOutcome stays opt-in. Proves hang-free RewindTo + prefix credit + seq≡par.
+/// M1k-B: valued nested CALL (unique outer/inner). Default-on valued cache is
+/// hang-free (in-journal-only); cold callee falls through to make_call_frame.
+/// Warm RewindTo SC still residual seq≠par on some schedules — not forced here.
+/// Proves hang-free RewindTo + prefix credit + seq≡par with env unset.
 #[test]
 fn specfence_m1i_valued_nested_call_resume() {
     let hot = Address::from(U160::from(42));
@@ -1494,27 +1496,27 @@ fn specfence_m1i_valued_nested_call_resume() {
             saw = true;
             assert_eq!(m.tx_head_reexec, 0, "{m:?}");
             assert!(m.pc_resume_count > 0 && m.prefix_opcodes_skipped > 0, "{m:?}");
-            // M1j: hang-free default valued path — SC and/or jump may fire; credit OK.
+            // Default-on valued SC and/or jump may fire; credit OK. Shared-slot
+            // cases still fall through to make_call_frame when cold.
             let _ = (m.call_outcome_cache_hits, m.absolute_jump_applied);
             break;
         }
     }
-    assert!(saw, "M1i valued nested RewindTo expected: {last:?}");
+    assert!(saw, "M1k valued nested RewindTo expected: {last:?}");
 }
 
 
 
 
-/// M1j-A: multi-SSTORE write-prefix absolute jump with trailing LOG0.
-/// Jump lands post-SSTORE (before LOG); both write_replays apply; LOG runs
-/// after the tip so receipts stay seq≡par (jump-past-LOG restore not claimed).
+/// M1k-A: multi-SSTORE write-prefix absolute jump with trailing LOG0.
+/// Post-LOG live tip + LogReplay restore enables hang-free jump-past-LOG;
+/// seq≡par on receipts/logs at conc=2 (full-width multi-SSTORE still WW-flaky).
 #[test]
 fn specfence_m1j_multi_sstore_log_write_prefix_jump() {
     let hot = Address::from(U160::from(42));
     let probe = Address::from(U160::from(77));
     let mut code = Vec::new();
-    // SSTORE slot0=1, slot1=2 then hot BALANCE probes (multi-SSTORE write-prefix).
-    // LOG0 after probes: Transfer-shaped side effect after jump tip.
+    // SSTORE slot0=1, slot1=2 then hot BALANCE probes, then LOG0 (jump-past-LOG).
     code.extend_from_slice(&[0x60, 0x01, 0x60, 0x00, 0x55]);
     code.extend_from_slice(&[0x60, 0x02, 0x60, 0x01, 0x55]);
     for _ in 0..6 {
@@ -1523,6 +1525,10 @@ fn specfence_m1j_multi_sstore_log_write_prefix_jump() {
         code.extend_from_slice(&[0x31, 0x50]);
     }
     code.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0xa0]);
+    // One more hot BALANCE after LOG so EffectBoundary can also tip post-LOG.
+    code.push(0x73);
+    code.extend_from_slice(hot.as_slice());
+    code.extend_from_slice(&[0x31, 0x50]);
     code.push(0x00);
     let bytecode = Bytecode::new_raw(Bytes::from(code));
     let code_hash = bytecode.hash_slow();
@@ -1551,9 +1557,9 @@ fn specfence_m1j_multi_sstore_log_write_prefix_jump() {
     let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
     let mut saw = false;
     let mut last = None;
+    // Hang-free jump-past-LOG at conc=2 (full worker width still WW-flaky on
+    // multi-SSTORE — same class as M1i/M1j; not claimed hang-free here).
     for _ in 0..24 {
-        // Narrow concurrency: multi-SSTORE write-prefix schedules hang more often
-        // under full parallel inspect_run (same WW class as M1i notes).
         let (results, m, _) = run_mode_conc(
             ConcurrencyMode::SpecFence,
             &storage,
@@ -1561,14 +1567,13 @@ fn specfence_m1j_multi_sstore_log_write_prefix_jump() {
             NonZeroUsize::new(2).unwrap(),
         );
         last = Some(m.clone());
-        // Receipts must carry the LOG from probe txs when they succeed.
         let probe_logs: usize = results.iter().map(|r| r.receipt.logs.len()).sum();
         if m.rewind_to_cp > 0 && m.resume_count > 0 && m.inspector_steps > 0 {
             saw = true;
             assert_eq!(m.tx_head_reexec, 0, "{m:?}");
             assert!(
                 m.absolute_jump_applied > 0,
-                "M1j multi-SSTORE+LOG must absolute-jump: {m:?}"
+                "M1k multi-SSTORE+LOG must absolute-jump: {m:?}"
             );
             assert!(m.pc_resume_count > 0 && m.prefix_opcodes_skipped > 0, "{m:?}");
             let cold_equiv = m
@@ -1580,18 +1585,17 @@ fn specfence_m1j_multi_sstore_log_write_prefix_jump() {
                 m.inspector_steps_resume,
                 m.prefix_opcodes_skipped
             );
-            // Best-effort LOG presence (seq≡par already enforces receipt logs).
-            let _ = probe_logs;
+            // seq≡par already enforces receipt logs; require at least one LOG.
+            assert!(probe_logs > 0, "expected LOG receipts, metrics={m:?}");
             break;
         }
     }
-    assert!(saw, "M1j multi-SSTORE+LOG RewindTo+jump expected: {last:?}");
+    assert!(saw, "M1k multi-SSTORE+LOG RewindTo+jump expected: {last:?}");
 }
 
-/// M1j-D note: full ERC-20 `transfer` L1 is **not** claimed. Plant coverage for
-/// multi-SSTORE + LOG is `specfence_m1j_multi_sstore_log_write_prefix_jump`.
-/// A denser Transfer-shaped schedule intermittently hangs inspect_run (same class
-/// as M1i notes) — left out of the default suite; re-measure after hang fix.
+/// M1k note: full ERC-20 `transfer` L1 still **not** claimed. Plant covers
+/// multi-SSTORE + jump-past-LOG + default-on valued SC (unique pairs / warm
+/// journal). Shared-slot valued + denser Transfer schedules remain gaps.
 
 /// Plant v2 M3: process/residual WŜ prior drives Bind-before-touch on a
 /// contended same-sender schedule (must *read* the hot Basic location).

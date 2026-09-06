@@ -13,8 +13,9 @@
 //! M1e: journal-blob FF + safety-gated absolute PC jump on RewindTo resume.
 //! M1f: absolute PC jump default-on when safe (MemoryGas+refund restore); `SPECFENCE_ABSOLUTE_JUMP=0` disables.
 //! M1g: Storage-prefix jump (no Db poison) + nested CallOutcome cache; bytecode_len relaxed carefully.
-//! M1i: post-SSTORE write-prefix jump default-on when safe; valued CallOutcome opt-in (=1).
-//! M1j: multi-SSTORE write-prefix jump (+ LOG after tip); valued CallOutcome opt-in hang-free; jump+CallOutcome combine refused.
+//! M1i: post-SSTORE write-prefix jump default-on when safe; valued CallOutcome hang-free.
+//! M1j: multi-SSTORE write-prefix jump (+ LOG after tip).
+//! M1k: hang-free jump-past-LOG (LogReplay) + valued CallOutcome default-on; zero-value+write combine at CALL-boundary.
 //! suffix-only InvalidateSelective when safe.
 //! M2: WaitHard parks (tx-level) + ready-queue steal (lower TxIdx first); worker never spins.
 //! M3: online WŜ/RŜ prior → Bind-before-touch on first incarnation when writer version known.

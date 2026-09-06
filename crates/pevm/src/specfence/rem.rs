@@ -180,6 +180,9 @@ pub(crate) struct ResumeContinuation {
     /// M1j: LOG* events from certified prefix (restore on absolute jump past LOG;
     /// not stored in live_boundaries JournalBlob — that path hung inspect_run).
     pub log_replays: Vec<LogReplay>,
+    /// M1k: incarnation captured a valued nested CALL (even if filtered from
+    /// `call_outcomes`). Absolute jump must not skip that CALL without touches.
+    pub valued_blocks_jump: bool,
 }
 
 /// Decision after classifying a validation failure for PartialRetry / M1 repair.
@@ -426,6 +429,10 @@ impl PartialRetryState {
                 values.insert(*loc, val.clone());
             }
         }
+        let valued_blocks_jump = self
+            .call_outcomes
+            .iter()
+            .any(|c| c.depth > 1 && !c.value.is_zero());
         let call_outcomes: Vec<CachedCallOutcome> = self
             .call_outcomes
             .iter()
@@ -447,6 +454,14 @@ impl PartialRetryState {
             })
             .map(|(_, r)| r.clone())
             .collect();
+        // M1k: only LOG* with pc ≤ jump tip — restore those skipped by absolute jump.
+        let tip_pc = jump_snap.as_ref().map(|s| s.pc);
+        let log_replays: Vec<LogReplay> = self
+            .log_replays
+            .iter()
+            .filter(|lr| tip_pc.map(|pc| lr.pc <= pc).unwrap_or(false))
+            .cloned()
+            .collect();
         ResumeContinuation {
             cp,
             k_fail,
@@ -461,8 +476,8 @@ impl PartialRetryState {
             journal_blob,
             call_outcomes,
             write_replays,
-            // All logs from this incarnation's certified run — jump may skip LOG*.
-            log_replays: self.log_replays.clone(),
+            log_replays,
+            valued_blocks_jump,
         }
     }
 

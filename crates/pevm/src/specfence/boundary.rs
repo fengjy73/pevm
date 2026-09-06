@@ -16,10 +16,12 @@
 //! M1h: valued CallOutcome short-circuit scaffold; write-prefix jump infra in rem.
 //! M1i: post-SSTORE gas-equal write-prefix jump default-on when safe; valued
 //! CallOutcome scaffold (opt-in in M1i).
-//! M1j: multi-SSTORE + LOG write-prefix jump (log replay, no storage blob poison);
-//! valued CallOutcome **opt-in** hang-free via in-journal-only transfer
-//! (`SPECFENCE_VALUED_CALL_CACHE=1`); CALL-boundary jump does not combine with
-//! write_replays; valued still forbids absolute jump.
+//! M1j: multi-SSTORE + LOG write-prefix jump (log replay, no storage blob poison).
+//! M1k: hang-free **jump-past-LOG** via LogReplay arm/restore (never live_boundaries
+//! blob logs); valued CallOutcome **default-on** hang-free in-journal-only
+//! (`SPECFENCE_VALUED_CALL_CACHE=0` disables); zero-value CallOutcome may combine
+//! with write_replays at CALL-boundary (abort jump if touches cold); valued still
+//! forbids absolute jump.
 //! Disable absolute jump with `SPECFENCE_ABSOLUTE_JUMP=0`.
 
 #![allow(dead_code)]
@@ -194,10 +196,12 @@ impl BoundarySnapshot {
 /// cover storage presents for controlled journal slot replay (not blob dump).
 /// Nested CallOutcome: allow jump only at CALL-boundary after replaying nested
 /// touches from cache on arm; otherwise CallOutcome short-circuit alone.
-/// M1j: valued nested outcomes allowed at CALL-boundary — touches applied
-/// in-journal-only (no Db `load_account` / WaitHard). `bytecode_len≤256`
-/// always eligible; larger (≤4096) only with Storage FF, write_replays,
-/// and/or CALL-boundary snap. Restore PC/stack/memory/MemoryGas/refund + logs.
+/// M1k: valued nested mid-exec SC default-on (in-journal-only). Absolute jump
+/// still forbids valued outcomes (cold target at initialize_interp). Zero-value
+/// CallOutcome may combine with write_replays at CALL-boundary — arm applies
+/// touches in-journal-only and aborts jump if cold. `bytecode_len≤256` always
+/// eligible; larger (≤4096) only with Storage FF, write_replays, and/or
+/// CALL-boundary snap. Restore PC/stack/memory/MemoryGas/refund + LogReplay.
 pub(crate) fn jump_is_safe(cont: &ResumeContinuation) -> bool {
     let Some(snap) = cont.jump_snap.as_ref() else {
         return false;
@@ -207,12 +211,13 @@ pub(crate) fn jump_is_safe(cont: &ResumeContinuation) -> bool {
     }
     // Nested CALL: PC-skip past CALL omits EIP-158 touch / transfer unless we
     // replay nested touches from CallOutcome cache at arm time. Zero-value
-    // CALL-boundary jumps OK. Valued outcomes still forbid absolute jump
-    // (target often not in-journal at initialize_interp → missing transfer);
-    // mid-exec valued CallOutcome short-circuit is opt-in + hang-free when enabled.
-    // M1j: do NOT combine write_replays jump + nested CallOutcome on one resume
-    // — in-journal touch at initialize_interp is unreliable → flaky seq≠par.
-    if !cont.write_replays.is_empty() && !cont.call_outcomes.is_empty() {
+    // CALL-boundary jumps OK (incl. with write_replays — abort if touches cold).
+    // Valued outcomes still forbid absolute jump; mid-exec valued SC is
+    // default-on hang-free via in-journal-only transfer_loaded.
+    // M1k: any valued nested CALL in the incarnation blocks absolute jump
+    // (even when filtered from call_outcomes) — otherwise tip-past-CALL without
+    // touches drops the transfer (seq≠par).
+    if cont.valued_blocks_jump {
         return false;
     }
     if !cont.call_outcomes.is_empty() {
@@ -350,11 +355,15 @@ pub(crate) fn absolute_jump_env_enabled() -> bool {
     }
 }
 
-/// M1j: valued CallOutcome short-circuit is **opt-in** (`SPECFENCE_VALUED_CALL_CACHE=1`).
-/// Hang-free via in-journal-only transfer when enabled. Default-off after residual
-/// seq≠par on some RewindTo schedules even with unique pairs + warm BALANCE.
+/// M1k: valued CallOutcome short-circuit is **default-on**; set
+/// `SPECFENCE_VALUED_CALL_CACHE=0` to disable. Hang-free via in-journal-only
+/// `transfer_loaded` (never `load_account` / WaitHard). If accounts are not warm
+/// yet, mid-exec SC falls through to `make_call_frame` (shared-slot safe).
 pub(crate) fn valued_call_cache_env_enabled() -> bool {
-    std::env::var_os("SPECFENCE_VALUED_CALL_CACHE").is_some_and(|v| v == "1")
+    match std::env::var_os("SPECFENCE_VALUED_CALL_CACHE") {
+        None => true,
+        Some(v) => v != "0",
+    }
 }
 
 /// Scoped plant pointers for Inspector → PartialRetry / metrics (execute duration only).
@@ -545,10 +554,9 @@ pub(crate) fn try_arm_safe_absolute_jump(
     }
     let snap = cont.jump_snap.clone().expect("jump_is_safe implies jump_snap");
     // Never restore storage present_values (poison pevm Db / MV).
-    // M1j: jump-past-LOG + log_replay restore intermittently hangs inspect_run /
-    // seq≠par. Refuse absolute jump when the tip is past certified LOG*; fall
-    // back to credit-only (LOG still executes). Multi-SSTORE write-prefix jump
-    // before LOG remains allowed (log filter empty).
+    // M1k: jump-past-LOG is hang-free when LogReplay restores receipt logs on
+    // initialize_interp (snap-only tip — never live_boundaries blob logs, which
+    // hung under concurrency). Arm skipped LOG* for PC ≤ jump tip.
     let jump_pc = snap.pc;
     let skipped_logs: Vec<_> = cont
         .log_replays
@@ -556,11 +564,9 @@ pub(crate) fn try_arm_safe_absolute_jump(
         .filter(|lr| lr.pc <= jump_pc)
         .map(|lr| lr.log.clone())
         .collect();
-    if !skipped_logs.is_empty() {
-        metrics.record_absolute_jump_fallback();
-        return false;
-    }
-    PENDING_LOG_REPLAYS.with(|c| c.borrow_mut().clear());
+    PENDING_LOG_REPLAYS.with(|c| {
+        *c.borrow_mut() = skipped_logs;
+    });
     arm_pc_resume_with_blob(snap, None);
     PENDING_WRITE_REPLAYS.with(|c| {
         *c.borrow_mut() = cont.write_replays.clone();
@@ -903,7 +909,7 @@ where
                 }
             });
         } else if (OP_LOG0..=OP_LOG4).contains(&op) {
-            // M1j: record new journal logs with post-LOG PC (filter on jump).
+            // M1j/M1k: record new journal logs with post-LOG PC (filter on jump).
             let pc = snap.pc;
             let jlogs = context.journal().logs();
             PREFIX_LOGS.with(|c| {
@@ -916,11 +922,22 @@ where
                     });
                 }
             });
+            // M1k: eager flush LogReplay (same mid-abort race as CallOutcome).
+            PLANT.with(|p| {
+                if let Some(plant) = p.get() {
+                    let table = unsafe { &*plant.partial_retry };
+                    let logs = PREFIX_LOGS.with(|c| c.borrow().clone());
+                    table.note_log_replays(plant.tx_idx, logs);
+                }
+            });
+            // M1k: attach post-LOG live tip (snap-only — never blob logs) so
+            // RewindTo can absolute-jump past LOG; LogReplay restores receipts.
+            attach_live_to_plant(snap.clone(), JournalBlob::default());
         }
         LAST_SNAP.with(|c| *c.borrow_mut() = Some(snap.clone()));
         // Attach on EffectBoundary *or* CALL-boundary so RewindTo can jump post-CALL.
         // Post-SSTORE EffectBoundary snaps are gas-equal for write-prefix jumps.
-        // Snap-only by default (M1i) — never put logs in live_boundaries (hang).
+        // Snap-only by default (M1i/M1k) — never put logs in live_boundaries (hang).
         if PENDING_EFFECT_CP.replace(false) || call_boundary {
             let blob = if std::env::var_os("SPECFENCE_ABSOLUTE_JUMP").is_some_and(|v| v == "blob") {
                 let full = context.journal().evm_state();
@@ -993,11 +1010,11 @@ where
                 } else {
                     call_value
                 };
-                // M1j: valued mid-exec short-circuit opt-in (SPECFENCE_VALUED_CALL_CACHE=1).
-                // Hang-free: in-journal-only transfer — never load_account
-                // (Db maybe_wait WW-livelock on shared outer/inner). If accounts not
-                // warm yet, skip SC and fall through to make_call_frame. Keep cached
-                // outcome gas (do not wipe) for seq≡par.
+                // M1k: valued mid-exec short-circuit default-on
+                // (SPECFENCE_VALUED_CALL_CACHE=0 disables). Hang-free: in-journal-only
+                // transfer — never load_account (Db maybe_wait WW-livelock on shared
+                // outer/inner). If accounts not warm yet, skip SC and fall through
+                // to make_call_frame. Keep cached outcome gas for seq≡par.
                 let allow_valued = valued_call_cache_env_enabled();
                 if value.is_zero() || allow_valued {
                     if try_transfer_in_journal(
@@ -1039,6 +1056,16 @@ where
                     outcome: outcome.clone(),
                 };
                 CAPTURED_CALLS.with(|c| c.borrow_mut().push(cached));
+                // M1k: eager flush — mid-exec abort before with_plant_tls end
+                // previously lost CallOutcomes while live tips sat past CALL
+                // (absolute jump skipped valued transfer → seq≠par).
+                PLANT.with(|p| {
+                    if let Some(plant) = p.get() {
+                        let table = unsafe { &*plant.partial_retry };
+                        let snap = CAPTURED_CALLS.with(|c| c.borrow().clone());
+                        table.note_call_outcomes(plant.tx_idx, snap);
+                    }
+                });
             }
         }
         // Parent frame's next step_end marks at_call_boundary (not nested snap).
@@ -1218,6 +1245,7 @@ mod m1c_tests {
             prefix_writes: vec![],
             write_replays: vec![],
             log_replays: vec![],
+            valued_blocks_jump: false,
         };
         assert!(!jump_is_safe(&lite), "lite snap must not jump");
 
@@ -1286,6 +1314,7 @@ mod m1c_tests {
             prefix_writes: vec![],
             write_replays: vec![],
             log_replays: vec![],
+            valued_blocks_jump: false,
         };
         assert!(
             jump_is_safe(&cont),
@@ -1338,6 +1367,7 @@ mod m1c_tests {
             prefix_writes: vec![],
             write_replays: vec![],
             log_replays: vec![],
+            valued_blocks_jump: false,
         };
         assert!(
             !jump_is_safe(&cont),
@@ -1394,6 +1424,7 @@ mod m1c_tests {
                 gas_remaining_after: 30_000,
             }],
             log_replays: vec![],
+            valued_blocks_jump: false,
         };
         assert!(
             jump_is_safe(&cont),
@@ -1438,6 +1469,7 @@ mod m1c_tests {
             prefix_writes: vec![],
             write_replays: vec![],
             log_replays: vec![],
+            valued_blocks_jump: false,
         };
         assert!(
             jump_is_safe(&cont),
@@ -1504,6 +1536,7 @@ mod m1c_tests {
             prefix_writes: vec![],
             write_replays: vec![],
             log_replays: vec![],
+            valued_blocks_jump: false,
         };
         assert!(
             jump_is_safe(&cont),
@@ -1548,6 +1581,7 @@ mod m1c_tests {
             prefix_writes: vec![],
             write_replays: vec![],
             log_replays: vec![],
+            valued_blocks_jump: false,
         };
         assert!(
             jump_is_safe(&cont),
@@ -1601,6 +1635,7 @@ mod m1c_tests {
             prefix_writes: vec![],
             write_replays: vec![],
             log_replays: vec![],
+            valued_blocks_jump: false,
         };
         assert!(jump_is_safe(&cont), "Basic-only live snap is M1f-safe");
         assert!(
@@ -1705,6 +1740,7 @@ mod m1c_tests {
                 },
             ],
             log_replays: vec![],
+            valued_blocks_jump: false,
         };
         assert!(
             jump_is_safe(&cont),
@@ -1783,6 +1819,7 @@ mod m1c_tests {
                 gas_remaining_after: 40_000,
             }],
             log_replays: vec![],
+            valued_blocks_jump: false,
         };
         assert!(
             !jump_is_safe(&cont),
@@ -1791,7 +1828,7 @@ mod m1c_tests {
     }
 
     #[test]
-    fn jump_is_safe_rejects_write_prefix_plus_call_outcome_combine() {
+    fn jump_is_safe_accepts_write_prefix_plus_zero_value_call_outcome_combine() {
         use crate::specfence::rem::{AccessMode, RegionAccess, StorageWriteReplay};
         use revm::interpreter::{Gas, InstructionResult, InterpreterResult};
         let (mut effects, values) = storage_read_effect();
@@ -1861,18 +1898,23 @@ mod m1c_tests {
                 gas_remaining_after: 40_000,
             }],
             log_replays: vec![],
+            valued_blocks_jump: false,
         };
         assert!(
-            !jump_is_safe(&cont),
-            "M1j: write_replays + CallOutcome must not combine on one absolute jump"
+            jump_is_safe(&cont),
+            "M1k: write_replays + zero-value CallOutcome OK at CALL-boundary"
         );
     }
 
     #[test]
-    fn valued_call_cache_env_opt_in() {
+    fn valued_call_cache_env_default_on() {
         // SAFETY: test-only env mutation; single-threaded lib test.
         unsafe {
             std::env::remove_var("SPECFENCE_VALUED_CALL_CACHE");
+        }
+        assert!(valued_call_cache_env_enabled(), "M1k default-on when unset");
+        unsafe {
+            std::env::set_var("SPECFENCE_VALUED_CALL_CACHE", "0");
         }
         assert!(!valued_call_cache_env_enabled());
         unsafe {
@@ -1882,7 +1924,7 @@ mod m1c_tests {
         unsafe {
             std::env::remove_var("SPECFENCE_VALUED_CALL_CACHE");
         }
-        assert!(!valued_call_cache_env_enabled());
+        assert!(valued_call_cache_env_enabled());
     }
 
 }
