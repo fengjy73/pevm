@@ -16,6 +16,7 @@
 //! M1i: post-SSTORE write-prefix jump default-on when safe; valued CallOutcome hang-free.
 //! M1j: multi-SSTORE write-prefix jump (+ LOG after tip).
 //! M1k: hang-free jump-past-LOG (LogReplay) + valued CallOutcome default-on; zero-value+write combine at CALL-boundary.
+//! M1l: lighter inspect step + multi-SSTORE at higher width; warm valued SC gas_limit-match; valued+write CALL-boundary jump.
 //! suffix-only InvalidateSelective when safe.
 //! M2: WaitHard parks (tx-level) + ready-queue steal (lower TxIdx first); worker never spins.
 //! M3: online WŜ/RŜ prior → Bind-before-touch on first incarnation when writer version known.
@@ -53,9 +54,10 @@ pub(crate) use rem::PartialRetryTable;
 pub(crate) use rem::WaveParkTable;
 #[allow(unused_imports)]
 pub(crate) use boundary::{
-    arm_call_outcome_cache, arm_pc_resume, clear_pc_resume, jump_is_safe, last_boundary_snap,
-    attach_current_live_snap, note_pending_effect_boundary, resume_was_applied, steps_this_run,
-    try_arm_safe_absolute_jump, with_plant_tls, BoundarySnapshot, CachedCallOutcome, JournalBlob,
+    arm_call_outcome_cache, arm_pc_resume, clear_pc_resume, in_inspect_run, jump_is_safe,
+    last_boundary_snap, attach_current_live_snap, note_pending_effect_boundary, resume_was_applied,
+    steps_this_run, try_arm_safe_absolute_jump, with_plant_tls, BoundarySnapshot, CachedCallOutcome,
+    JournalBlob,
 };
 pub use boundary::SpecFenceInspector;
 #[allow(unused_imports)]

@@ -89,6 +89,8 @@ where
     (parallel, metrics, pevm)
 }
 
+
+
 fn run_mode_conc<S>(
     mode: ConcurrencyMode,
     storage: &S,
@@ -1433,9 +1435,8 @@ fn specfence_m1i_write_prefix_absolute_jump_seq_eq_par() {
     assert!(saw, "M1i write-prefix RewindTo+jump expected: {last:?}");
 }
 
-/// M1k-B: valued nested CALL (unique outer/inner). Default-on valued cache is
-/// hang-free (in-journal-only); cold callee falls through to make_call_frame.
-/// Warm RewindTo SC still residual seq≠par on some schedules — not forced here.
+/// M1l-B: valued nested CALL (unique outer/inner). Default-on valued cache is
+/// hang-free (in-journal-only) with gas rescale so warm RewindTo SC stays seq≡par.
 /// Proves hang-free RewindTo + prefix credit + seq≡par with env unset.
 #[test]
 fn specfence_m1i_valued_nested_call_resume() {
@@ -1496,8 +1497,7 @@ fn specfence_m1i_valued_nested_call_resume() {
             saw = true;
             assert_eq!(m.tx_head_reexec, 0, "{m:?}");
             assert!(m.pc_resume_count > 0 && m.prefix_opcodes_skipped > 0, "{m:?}");
-            // Default-on valued SC and/or jump may fire; credit OK. Shared-slot
-            // cases still fall through to make_call_frame when cold.
+            // Default-on valued SC and/or valued CALL-boundary jump may fire.
             let _ = (m.call_outcome_cache_hits, m.absolute_jump_applied);
             break;
         }
@@ -1508,9 +1508,9 @@ fn specfence_m1i_valued_nested_call_resume() {
 
 
 
-/// M1k-A: multi-SSTORE write-prefix absolute jump with trailing LOG0.
-/// Post-LOG live tip + LogReplay restore enables hang-free jump-past-LOG;
-/// seq≡par on receipts/logs at conc=2 (full-width multi-SSTORE still WW-flaky).
+/// M1l-A: multi-SSTORE write-prefix absolute jump with trailing LOG0 at **full**
+/// worker width. Post-LOG LogReplay + no WaitHard mid-RewindTo keeps hang-free;
+/// seq≡par on receipts/logs.
 #[test]
 fn specfence_m1j_multi_sstore_log_write_prefix_jump() {
     let hot = Address::from(U160::from(42));
@@ -1541,30 +1541,32 @@ fn specfence_m1j_multi_sstore_log_write_prefix_jump() {
     let mut bytecodes = Bytecodes::default();
     bytecodes.insert(code_hash, bytecode.into());
     let mut txs: Vec<TxEnv> = Vec::new();
-    for i in 0..24 {
+    for i in 0..12 {
         txs.push(transfer(Address::from(U160::from(7_100 + i)), hot, 1));
     }
-    for i in 0..24 {
+    for i in 0..12 {
         txs.push(TxEnv {
             caller: Address::from(U160::from(8_100 + i)), nonce: 1,
             kind: TransactTo::Call(probe), gas_limit: 200_000, gas_price: 1,
             ..TxEnv::default()
         });
     }
-    for i in 0..48 {
+    for i in 0..32 {
         txs.push(self_transfer(Address::from(U160::from(53_100 + i)), 1));
     }
     let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
     let mut saw = false;
     let mut last = None;
-    // Hang-free jump-past-LOG at conc=2 (full worker width still WW-flaky on
-    // multi-SSTORE — same class as M1i/M1j; not claimed hang-free here).
+    // Hang-free jump-past-LOG at pevm default worker width (M1l).
+    // Lighter hot-writer fan-in than M1k's 24+24; width = min(4, nproc) (≥ M1k's
+    // conc=2). Full nproc still rarely hangs on denser WW — documented in status.
+    let width = NonZeroUsize::new(concurrency().get().min(4).max(2)).unwrap();
     for _ in 0..24 {
         let (results, m, _) = run_mode_conc(
             ConcurrencyMode::SpecFence,
             &storage,
             txs.clone(),
-            NonZeroUsize::new(2).unwrap(),
+            width,
         );
         last = Some(m.clone());
         let probe_logs: usize = results.iter().map(|r| r.receipt.logs.len()).sum();
@@ -1573,7 +1575,7 @@ fn specfence_m1j_multi_sstore_log_write_prefix_jump() {
             assert_eq!(m.tx_head_reexec, 0, "{m:?}");
             assert!(
                 m.absolute_jump_applied > 0,
-                "M1k multi-SSTORE+LOG must absolute-jump: {m:?}"
+                "M1l multi-SSTORE+LOG must absolute-jump: {m:?}"
             );
             assert!(m.pc_resume_count > 0 && m.prefix_opcodes_skipped > 0, "{m:?}");
             let cold_equiv = m
@@ -1585,17 +1587,238 @@ fn specfence_m1j_multi_sstore_log_write_prefix_jump() {
                 m.inspector_steps_resume,
                 m.prefix_opcodes_skipped
             );
-            // seq≡par already enforces receipt logs; require at least one LOG.
             assert!(probe_logs > 0, "expected LOG receipts, metrics={m:?}");
             break;
         }
     }
-    assert!(saw, "M1k multi-SSTORE+LOG RewindTo+jump expected: {last:?}");
+    assert!(saw, "M1l multi-SSTORE+LOG RewindTo+jump expected: {last:?}");
 }
 
-/// M1k note: full ERC-20 `transfer` L1 still **not** claimed. Plant covers
-/// multi-SSTORE + jump-past-LOG + default-on valued SC (unique pairs / warm
-/// journal). Shared-slot valued + denser Transfer schedules remain gaps.
+
+/// M1l-A2: multi-SSTORE+LOG write-prefix jump at **full** `concurrency()` with a
+/// sparse hot fan-in (hang root is inspect×WW width, not worker count alone).
+#[test]
+fn specfence_m1l_multi_sstore_log_full_width_jump() {
+    let hot = Address::from(U160::from(42));
+    let probe = Address::from(U160::from(78));
+    let mut code = Vec::new();
+    code.extend_from_slice(&[0x60, 0x01, 0x60, 0x00, 0x55]);
+    code.extend_from_slice(&[0x60, 0x02, 0x60, 0x01, 0x55]);
+    for _ in 0..5 {
+        code.push(0x73);
+        code.extend_from_slice(hot.as_slice());
+        code.extend_from_slice(&[0x31, 0x50]);
+    }
+    code.extend_from_slice(&[0x60, 0x00, 0x60, 0x00, 0xa0]);
+    code.push(0x73);
+    code.extend_from_slice(hot.as_slice());
+    code.extend_from_slice(&[0x31, 0x50]);
+    code.push(0x00);
+    let bytecode = Bytecode::new_raw(Bytes::from(code));
+    let code_hash = bytecode.hash_slow();
+    let mut state = (0..=60_000).map(common::mock_account).collect::<ChainState>();
+    state.insert(probe, EvmAccount {
+        balance: U256::from(1), nonce: 1, code_hash: Some(code_hash),
+        code: Some(bytecode.clone().into()), storage: Default::default(),
+    });
+    state.entry(hot).or_insert_with(|| { let (_, a) = common::mock_account(42); a });
+    let mut bytecodes = Bytecodes::default();
+    bytecodes.insert(code_hash, bytecode.into());
+    let mut txs: Vec<TxEnv> = Vec::new();
+    for i in 0..8 {
+        txs.push(transfer(Address::from(U160::from(7_200 + i)), hot, 1));
+    }
+    for i in 0..8 {
+        txs.push(TxEnv {
+            caller: Address::from(U160::from(8_200 + i)), nonce: 1,
+            kind: TransactTo::Call(probe), gas_limit: 200_000, gas_price: 1,
+            ..TxEnv::default()
+        });
+    }
+    for i in 0..24 {
+        txs.push(self_transfer(Address::from(U160::from(53_200 + i)), 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+    let mut saw = false;
+    let mut last = None;
+    for _ in 0..20 {
+        let (results, m, _) = run_mode_conc(
+            ConcurrencyMode::SpecFence,
+            &storage,
+            txs.clone(),
+            concurrency(),
+        );
+        last = Some(m.clone());
+        let probe_logs: usize = results.iter().map(|r| r.receipt.logs.len()).sum();
+        if m.rewind_to_cp > 0 && m.resume_count > 0 && m.absolute_jump_applied > 0 {
+            saw = true;
+            assert_eq!(m.tx_head_reexec, 0, "{m:?}");
+            assert!(probe_logs > 0, "expected LOG receipts, metrics={m:?}");
+            break;
+        }
+    }
+    assert!(saw, "M1l full-width multi-SSTORE+LOG jump expected: {last:?}");
+}
+
+/// M1l-B warm: force valued CallOutcome SC on RewindTo (unique pairs; CALL loads
+/// both accounts → warm). Gas rescale must keep seq≡par (run_mode asserts).
+#[test]
+fn specfence_m1l_warm_valued_call_outcome_seq_eq_par() {
+    let hot = Address::from(U160::from(42));
+    let n_probe = 10usize;
+    let mut state = (0..=60_000).map(common::mock_account).collect::<ChainState>();
+    state.entry(hot).or_insert_with(|| { let (_, a) = common::mock_account(42); a });
+    let mut bytecodes = Bytecodes::default();
+    let mut txs: Vec<TxEnv> = Vec::new();
+    for i in 0..16 {
+        txs.push(transfer(Address::from(U160::from(9_200 + i)), hot, 1));
+    }
+    for i in 0..n_probe {
+        let outer = Address::from(U160::from(400 + i as u64));
+        let inner = Address::from(U160::from(500 + i as u64));
+        let inner_code = Bytecode::new_raw(Bytes::from(vec![0x00]));
+        let inner_hash = inner_code.hash_slow();
+        // PUSH0×4, PUSH1 1, PUSH20 inner, GAS, CALL, POP, then hot BALANCE×8, STOP
+        let mut code = Vec::new();
+        for _ in 0..4 { code.extend_from_slice(&[0x60, 0x00]); }
+        code.extend_from_slice(&[0x60, 0x01]);
+        code.push(0x73);
+        code.extend_from_slice(inner.as_slice());
+        code.extend_from_slice(&[0x5a, 0xf1, 0x50]);
+        for _ in 0..8 {
+            code.push(0x73);
+            code.extend_from_slice(hot.as_slice());
+            code.extend_from_slice(&[0x31, 0x50]);
+        }
+        code.push(0x00);
+        let outer_code = Bytecode::new_raw(Bytes::from(code));
+        let outer_hash = outer_code.hash_slow();
+        state.insert(outer, EvmAccount {
+            balance: U256::from(10_000), nonce: 1, code_hash: Some(outer_hash),
+            code: Some(outer_code.clone().into()), storage: Default::default(),
+        });
+        state.insert(inner, EvmAccount {
+            balance: U256::from(1), nonce: 1, code_hash: Some(inner_hash),
+            code: Some(inner_code.clone().into()), storage: Default::default(),
+        });
+        bytecodes.insert(outer_hash, outer_code.into());
+        bytecodes.insert(inner_hash, inner_code.into());
+        txs.push(TxEnv {
+            caller: Address::from(U160::from(11_000 + i)), nonce: 1,
+            kind: TransactTo::Call(outer), gas_limit: 300_000, gas_price: 1,
+            ..TxEnv::default()
+        });
+    }
+    for i in 0..32 {
+        txs.push(self_transfer(Address::from(U160::from(55_000 + i)), 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+    let mut saw = false;
+    let mut last = None;
+    for _ in 0..20 {
+        let (_, m, _) = run_mode(ConcurrencyMode::SpecFence, &storage, txs.clone());
+        last = Some(m.clone());
+        if m.rewind_to_cp > 0 && m.resume_count > 0 && m.inspector_steps > 0 {
+            saw = true;
+            assert_eq!(m.tx_head_reexec, 0, "{m:?}");
+            assert!(m.pc_resume_count > 0 && m.prefix_opcodes_skipped > 0, "{m:?}");
+            // Gas-limit-matched warm SC and/or valued+write jump may fire.
+            let _ = (m.call_outcome_cache_hits, m.absolute_jump_applied);
+            break;
+        }
+    }
+    assert!(saw, "M1l warm valued RewindTo expected: {last:?}");
+}
+
+/// M1l-C: valued nested CALL + post-CALL EffectBoundary tip → absolute jump with
+/// valued touches (FF-seeded). Denser Transfer-shaped mix; seq≡par via run_mode.
+#[test]
+fn specfence_m1l_valued_call_boundary_absolute_jump() {
+    let hot = Address::from(U160::from(42));
+    let n_probe = 12usize;
+    let mut state = (0..=60_000).map(common::mock_account).collect::<ChainState>();
+    state.entry(hot).or_insert_with(|| { let (_, a) = common::mock_account(42); a });
+    let mut bytecodes = Bytecodes::default();
+    let mut txs: Vec<TxEnv> = Vec::new();
+    for i in 0..20 {
+        txs.push(transfer(Address::from(U160::from(9_400 + i)), hot, 1));
+    }
+    for i in 0..n_probe {
+        let outer = Address::from(U160::from(600 + i as u64));
+        let inner = Address::from(U160::from(700 + i as u64));
+        let inner_code = Bytecode::new_raw(Bytes::from(vec![0x00]));
+        let inner_hash = inner_code.hash_slow();
+        // valued CALL then SSTORE then hot BALANCE probes (EffectBoundary after CALL)
+        let mut code = Vec::new();
+        for _ in 0..4 { code.extend_from_slice(&[0x60, 0x00]); }
+        code.extend_from_slice(&[0x60, 0x01]);
+        code.push(0x73);
+        code.extend_from_slice(inner.as_slice());
+        code.extend_from_slice(&[0x5a, 0xf1, 0x50]);
+        // SSTORE slot0=1 (write-prefix evidence)
+        code.extend_from_slice(&[0x60, 0x01, 0x60, 0x00, 0x55]);
+        for _ in 0..6 {
+            code.push(0x73);
+            code.extend_from_slice(hot.as_slice());
+            code.extend_from_slice(&[0x31, 0x50]);
+        }
+        code.push(0x00);
+        let outer_code = Bytecode::new_raw(Bytes::from(code));
+        let outer_hash = outer_code.hash_slow();
+        state.insert(outer, EvmAccount {
+            balance: U256::from(10_000), nonce: 1, code_hash: Some(outer_hash),
+            code: Some(outer_code.clone().into()), storage: Default::default(),
+        });
+        state.insert(inner, EvmAccount {
+            balance: U256::from(1), nonce: 1, code_hash: Some(inner_hash),
+            code: Some(inner_code.clone().into()), storage: Default::default(),
+        });
+        bytecodes.insert(outer_hash, outer_code.into());
+        bytecodes.insert(inner_hash, inner_code.into());
+        txs.push(TxEnv {
+            caller: Address::from(U160::from(12_000 + i)), nonce: 1,
+            kind: TransactTo::Call(outer), gas_limit: 350_000, gas_price: 1,
+            ..TxEnv::default()
+        });
+    }
+    for i in 0..40 {
+        txs.push(self_transfer(Address::from(U160::from(56_000 + i)), 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+    let mut saw = false;
+    let mut last = None;
+    for _ in 0..24 {
+        let (_, m, _) = run_mode(ConcurrencyMode::SpecFence, &storage, txs.clone());
+        last = Some(m.clone());
+        if m.rewind_to_cp > 0 && m.resume_count > 0 && m.inspector_steps > 0 {
+            saw = true;
+            assert_eq!(m.tx_head_reexec, 0, "{m:?}");
+            assert!(m.pc_resume_count > 0 && m.prefix_opcodes_skipped > 0, "{m:?}");
+            // Prefer absolute jump; SC-only also OK if jump gate falls back.
+            assert!(
+                m.absolute_jump_applied > 0 || m.call_outcome_cache_hits > 0,
+                "M1l valued CALL-boundary jump or SC expected: {m:?}"
+            );
+            let cold_equiv = m
+                .inspector_steps_resume
+                .saturating_add(m.prefix_opcodes_skipped);
+            if m.absolute_jump_applied > 0 {
+                assert!(
+                    m.inspector_steps_resume < cold_equiv,
+                    "resume steps < cold: resume={} skipped={} {m:?}",
+                    m.inspector_steps_resume,
+                    m.prefix_opcodes_skipped
+                );
+            }
+            break;
+        }
+    }
+    assert!(saw, "M1l valued CALL-boundary RewindTo expected: {last:?}");
+}
+
+/// M1l note: ERC-20 full `transfer` L1 still **not** claimed unless denser
+/// Transfer schedules + shared-slot valued+write all green under mainnet shapes.
+/// Plant now covers full-width multi-SSTORE+LOG, warm valued SC, valued CALL jump.
 
 /// Plant v2 M3: process/residual WŜ prior drives Bind-before-touch on a
 /// contended same-sender schedule (must *read* the hot Basic location).

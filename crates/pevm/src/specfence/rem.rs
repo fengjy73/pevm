@@ -180,8 +180,10 @@ pub(crate) struct ResumeContinuation {
     /// M1j: LOG* events from certified prefix (restore on absolute jump past LOG;
     /// not stored in live_boundaries JournalBlob — that path hung inspect_run).
     pub log_replays: Vec<LogReplay>,
-    /// M1k: incarnation captured a valued nested CALL (even if filtered from
-    /// `call_outcomes`). Absolute jump must not skip that CALL without touches.
+    /// M1l: valued nested CALL completed at/before tip but is missing from
+    /// `call_outcomes` (cache miss). Absolute jump would drop the transfer.
+    /// When valued outcomes are present in `call_outcomes`, jump is allowed at
+    /// CALL-boundary (arm FF-seeds + transfer_loaded).
     pub valued_blocks_jump: bool,
 }
 
@@ -429,16 +431,20 @@ impl PartialRetryState {
                 values.insert(*loc, val.clone());
             }
         }
-        let valued_blocks_jump = self
-            .call_outcomes
-            .iter()
-            .any(|c| c.depth > 1 && !c.value.is_zero());
         let call_outcomes: Vec<CachedCallOutcome> = self
             .call_outcomes
             .iter()
             .filter(|c| c.k_end <= cp.k && c.depth > 1)
             .cloned()
             .collect();
+        // Valued before tip with no cached outcome → refuse absolute jump (would
+        // drop transfer). Valued present in call_outcomes → allowed at CALL-boundary.
+        let valued_before_tip = self
+            .call_outcomes
+            .iter()
+            .any(|c| c.depth > 1 && !c.value.is_zero() && c.k_end <= cp.k);
+        let valued_blocks_jump = valued_before_tip
+            && !call_outcomes.iter().any(|c| !c.value.is_zero());
         let prefix_set: HashSet<MemoryLocationHash, BuildIdentityHasher> =
             prefix_writes.iter().copied().collect();
         // Include writes whose first touch was before k_fail (effect order), even

@@ -20,8 +20,10 @@
 //! M1k: hang-free **jump-past-LOG** via LogReplay arm/restore (never live_boundaries
 //! blob logs); valued CallOutcome **default-on** hang-free in-journal-only
 //! (`SPECFENCE_VALUED_CALL_CACHE=0` disables); zero-value CallOutcome may combine
-//! with write_replays at CALL-boundary (abort jump if touches cold); valued still
-//! forbids absolute jump.
+//! with write_replays at CALL-boundary (abort jump if touches cold).
+//! M1l: lighter inspect `step` (no per-opcode full snap); warm valued CallOutcome
+//! SC seq≡par via gas_limit match; valued + write_replays CALL-boundary absolute
+//! jump after FF-seeded nested touches.
 //! Disable absolute jump with `SPECFENCE_ABSOLUTE_JUMP=0`.
 
 #![allow(dead_code)]
@@ -196,10 +198,10 @@ impl BoundarySnapshot {
 /// cover storage presents for controlled journal slot replay (not blob dump).
 /// Nested CallOutcome: allow jump only at CALL-boundary after replaying nested
 /// touches from cache on arm; otherwise CallOutcome short-circuit alone.
-/// M1k: valued nested mid-exec SC default-on (in-journal-only). Absolute jump
-/// still forbids valued outcomes (cold target at initialize_interp). Zero-value
-/// CallOutcome may combine with write_replays at CALL-boundary — arm applies
-/// touches in-journal-only and aborts jump if cold. `bytecode_len≤256` always
+/// M1l: valued nested CallOutcome OK at CALL-boundary when cached — arm FF-seeds
+/// missing Basics then `transfer_loaded` (abort jump if still cold). Mid-exec
+/// valued SC is default-on with gas rescale (warm seq≡par). `valued_blocks_jump`
+/// refuses tip-past-valued-CALL when cache missed. `bytecode_len≤256` always
 /// eligible; larger (≤4096) only with Storage FF, write_replays, and/or
 /// CALL-boundary snap. Restore PC/stack/memory/MemoryGas/refund + LogReplay.
 pub(crate) fn jump_is_safe(cont: &ResumeContinuation) -> bool {
@@ -210,18 +212,18 @@ pub(crate) fn jump_is_safe(cont: &ResumeContinuation) -> bool {
         return false;
     }
     // Nested CALL: PC-skip past CALL omits EIP-158 touch / transfer unless we
-    // replay nested touches from CallOutcome cache at arm time. Zero-value
-    // CALL-boundary jumps OK (incl. with write_replays — abort if touches cold).
-    // Valued outcomes still forbid absolute jump; mid-exec valued SC is
-    // default-on hang-free via in-journal-only transfer_loaded.
-    // M1k: any valued nested CALL in the incarnation blocks absolute jump
-    // (even when filtered from call_outcomes) — otherwise tip-past-CALL without
-    // touches drops the transfer (seq≠par).
+    // replay nested touches from CallOutcome cache at arm time.
+    // M1l: valued + zero-value CallOutcome OK at CALL-boundary (arm FF-seeds +
+    // transfer_loaded; abort if cold). Mid-exec valued SC remains default-on.
+    // valued_blocks_jump: valued CALL before tip but missing from call_outcomes.
     if cont.valued_blocks_jump {
         return false;
     }
     if !cont.call_outcomes.is_empty() {
-        if cont.call_outcomes.iter().any(|c| !c.value.is_zero()) {
+        // M1l: valued CallOutcome absolute jump allowed only with write_replays
+        // (post-CALL SSTORE tip) + CALL-boundary; FF-seed + transfer_loaded on arm.
+        let has_valued = cont.call_outcomes.iter().any(|c| !c.value.is_zero());
+        if has_valued && cont.write_replays.is_empty() {
             return false;
         }
         if !snap.at_call_boundary {
@@ -375,6 +377,9 @@ struct PlantTls {
 }
 
 thread_local! {
+    /// M1l: true for the duration of inspect_run (with_plant_tls). WaitHard mid-inspect
+    /// parks the whole tx and livelocks multi-SSTORE at full worker width.
+    static IN_INSPECT: Cell<bool> = const { Cell::new(false) };
     static PLANT: Cell<Option<PlantTls>> = const { Cell::new(None) };
     static OPCODE_STEPS: Cell<u64> = const { Cell::new(0) };
     static CALL_DEPTH: Cell<u16> = const { Cell::new(0) };
@@ -402,6 +407,9 @@ thread_local! {
         const { RefCell::new(Vec::new()) };
     /// M1i: nested CallOutcomes whose journal touches must be applied on CALL-boundary jump.
     static PENDING_CALL_TOUCHES: RefCell<Vec<CachedCallOutcome>> =
+        const { RefCell::new(Vec::new()) };
+    /// M1l: FfValue::Basic snapshots to seed journal for valued CALL touches (no Db).
+    static PENDING_CALL_TOUCH_BASICS: RefCell<Vec<(Address, crate::AccountBasic, Option<B256>)>> =
         const { RefCell::new(Vec::new()) };
     /// M1j: LOG* events observed this incarnation (finalize → note_log_replays).
     static PREFIX_LOGS: RefCell<Vec<LogReplay>> = const { RefCell::new(Vec::new()) };
@@ -449,9 +457,12 @@ pub(crate) fn with_plant_tls<R>(
     LAST_OPCODE.set(0);
     PENDING_WRITE_REPLAYS.with(|c| c.borrow_mut().clear());
     PENDING_CALL_TOUCHES.with(|c| c.borrow_mut().clear());
+    PENDING_CALL_TOUCH_BASICS.with(|c| c.borrow_mut().clear());
     PREFIX_LOGS.with(|c| c.borrow_mut().clear());
     PENDING_LOG_REPLAYS.with(|c| c.borrow_mut().clear());
+    IN_INSPECT.set(true);
     let out = f();
+    IN_INSPECT.set(false);
     // Persist captured nested CallOutcomes into PartialRetry for next RewindTo.
     let captured = CAPTURED_CALLS.with(|c| std::mem::take(&mut *c.borrow_mut()));
     if !captured.is_empty() {
@@ -480,12 +491,20 @@ pub(crate) fn with_plant_tls<R>(
     RESUME_APPLIED.set(false);
     PENDING_WRITE_REPLAYS.with(|c| c.borrow_mut().clear());
     PENDING_CALL_TOUCHES.with(|c| c.borrow_mut().clear());
+    PENDING_CALL_TOUCH_BASICS.with(|c| c.borrow_mut().clear());
     PENDING_LOG_REPLAYS.with(|c| c.borrow_mut().clear());
     PREFIX_LOGS.with(|c| c.borrow_mut().clear());
     LAST_OPCODE.set(0);
     PLANT.set(prev);
     out
 }
+
+/// True while SpecFenceInspector inspect_run is active on this worker.
+#[allow(dead_code)]
+pub(crate) fn in_inspect_run() -> bool {
+    IN_INSPECT.get()
+}
+
 
 /// Arm PC resume for the next matching-depth interpreter init (RewindTo path).
 pub(crate) fn arm_pc_resume(snap: BoundarySnapshot) {
@@ -508,6 +527,7 @@ pub(crate) fn clear_pc_resume() {
     PENDING_WRITE_REPLAYS.with(|c| c.borrow_mut().clear());
     PENDING_LOG_REPLAYS.with(|c| c.borrow_mut().clear());
     PENDING_CALL_TOUCHES.with(|c| c.borrow_mut().clear());
+    PENDING_CALL_TOUCH_BASICS.with(|c| c.borrow_mut().clear());
 }
 
 /// Arm nested CallOutcome short-circuit queue for the next inspect_run (RewindTo).
@@ -573,9 +593,32 @@ pub(crate) fn try_arm_safe_absolute_jump(
     });
     // CALL-boundary jump: apply nested touches on arm (Inspector::call won't fire
     // for skipped CALL). Also keep cache for any nested re-enter below jump PC.
+    // M1l: seed Basics from FF values so valued transfer_loaded can succeed without
+    // load_account / WaitHard (inner often absent at top-level initialize_interp).
     if !cont.call_outcomes.is_empty() {
         PENDING_CALL_TOUCHES.with(|c| {
             *c.borrow_mut() = cont.call_outcomes.clone();
+        });
+        let mut basics = Vec::new();
+        for cached in &cont.call_outcomes {
+            for addr in [cached.caller, cached.target] {
+                for v in cont.values.values() {
+                    if let crate::specfence::rem::FfValue::Basic {
+                        address,
+                        basic,
+                        code_hash,
+                        ..
+                    } = v
+                    {
+                        if *address == addr {
+                            basics.push((*address, basic.clone(), *code_hash));
+                        }
+                    }
+                }
+            }
+        }
+        PENDING_CALL_TOUCH_BASICS.with(|c| {
+            *c.borrow_mut() = basics;
         });
         arm_call_outcome_cache(cont.call_outcomes.clone());
     }
@@ -744,6 +787,41 @@ where
     }
 }
 
+/// M1l: insert FfValue::Basic into revm journal without `load_account` / WaitHard.
+/// Used so valued CALL-boundary jump can `transfer_loaded` when the nested target
+/// was never loaded at top-level `initialize_interp`.
+fn seed_journal_basic_if_missing<CTX>(
+    context: &mut CTX,
+    address: Address,
+    basic: &crate::AccountBasic,
+    code_hash: Option<B256>,
+) where
+    CTX: ContextTr,
+    CTX::Journal: JournalExt,
+{
+    use revm::primitives::KECCAK_EMPTY;
+    use revm::state::{Account, AccountInfo};
+    let state = context.journal_mut().evm_state_mut();
+    if state.contains_key(&address) {
+        return;
+    }
+    let tx_id = state.values().next().map(|a| a.transaction_id).unwrap_or(0);
+    // Never publish a non-empty code_hash with code=None — finalize unwraps
+    // new_bytecodes and panics. Transfer-only seed uses empty code_hash; the
+    // real code is loaded via Db when the CALL frame needs it (SC/jump skip).
+    let _ = code_hash;
+    let info = AccountInfo {
+        balance: basic.balance,
+        nonce: basic.nonce,
+        code_hash: KECCAK_EMPTY,
+        code: None,
+        account_id: None,
+    };
+    let mut acc = Account::from(info);
+    let _ = acc.mark_warm_with_transaction_id(tx_id);
+    state.insert(address, acc);
+}
+
 /// Replicate make_call_frame journal side effects for a cached nested CALL
 /// (EIP-158 touch + value transfer) so CALL-boundary absolute jump ≡ sequential.
 /// M1j: in-journal-only — skip (no panic / no WaitHard) if accounts not warm yet.
@@ -831,9 +909,15 @@ where
                 record_journal_blob_ff(n);
             }
         }
-        // M1i/M1j: replay nested CALL journal touches before PC-skip past CALL.
-        // Zero-value needs EIP-158 touch; valued needs transfer. Both must apply
-        // in-journal-only — otherwise abort jump (hang-free, seq≡par).
+        // M1i/M1j/M1l: replay nested CALL journal touches before PC-skip past CALL.
+        // Zero-value needs EIP-158 touch; valued needs transfer. FF-seed Basics
+        // first (no Db) so valued targets absent at top-level init can transfer.
+        // Abort jump if still cold (hang-free, seq≡par via mid-exec SC fallback).
+        let seed_basics =
+            PENDING_CALL_TOUCH_BASICS.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        for (addr, basic, code_hash) in &seed_basics {
+            seed_journal_basic_if_missing(context, *addr, basic, *code_hash);
+        }
         let call_touches = PENDING_CALL_TOUCHES.with(|c| std::mem::take(&mut *c.borrow_mut()));
         for cached in &call_touches {
             if try_transfer_in_journal(
@@ -849,6 +933,7 @@ where
                 // !jumped arm path because try_arm returned true).
                 clear_pc_resume();
                 PENDING_WRITE_REPLAYS.with(|c| c.borrow_mut().clear());
+                PENDING_CALL_TOUCH_BASICS.with(|c| c.borrow_mut().clear());
                 arm_call_outcome_cache(call_touches.clone());
                 return;
             }
@@ -875,14 +960,12 @@ where
         let n = OPCODE_STEPS.get() + 1;
         OPCODE_STEPS.set(n);
         STEPS_THIS_RUN.set(STEPS_THIS_RUN.get() + 1);
-        // Record opcode before execution for post-SSTORE step_end marking.
-        // Use bytecode slice+pc (avoid opcode() side effects on some ExtBytecode paths).
+        // M1l: do **not** full-capture stack/memory every opcode — that alloc tax
+        // widened the WW conflict window and hung multi-SSTORE at full width.
+        // step_end captures live snaps at EffectBoundary / CALL / SSTORE / LOG.
         let pc = interp.bytecode.pc();
         let op = interp.bytecode.bytecode_slice().get(pc).copied().unwrap_or(0);
         LAST_OPCODE.set(op);
-        let depth = CALL_DEPTH.get();
-        let snap = BoundarySnapshot::capture_from_interp(interp, depth, n);
-        LAST_SNAP.with(|c| *c.borrow_mut() = Some(snap));
     }
 
     fn step_end(&mut self, interp: &mut Interpreter<EthInterpreter>, context: &mut CTX) {
@@ -999,24 +1082,28 @@ where
                     && cached.bytecode_address == inputs.bytecode_address
                     && cached.caller == inputs.caller
                 {
-                    Some((cached.outcome.clone(), cached.value))
+                    Some(cached.clone())
                 } else {
                     None
                 }
             });
-            if let Some((outcome, cached_value)) = hit {
-                let value = if !cached_value.is_zero() {
-                    cached_value
+            if let Some(cached) = hit {
+                let value = if !cached.value.is_zero() {
+                    cached.value
                 } else {
                     call_value
                 };
-                // M1k: valued mid-exec short-circuit default-on
+                // M1k/M1l: valued mid-exec short-circuit default-on
                 // (SPECFENCE_VALUED_CALL_CACHE=0 disables). Hang-free: in-journal-only
-                // transfer — never load_account (Db maybe_wait WW-livelock on shared
-                // outer/inner). If accounts not warm yet, skip SC and fall through
-                // to make_call_frame. Keep cached outcome gas for seq≡par.
+                // transfer — never load_account. M1l warm seq≡par: only SC when the
+                // current gas_limit matches the cached call (stipend-stable). On
+                // mismatch fall through to make_call_frame (correct fresh gas).
                 let allow_valued = valued_call_cache_env_enabled();
                 if value.is_zero() || allow_valued {
+                    if inputs.gas_limit != cached.gas_limit {
+                        // Stipend changed across RewindTo — do not reuse cached Gas.
+                        return None;
+                    }
                     if try_transfer_in_journal(
                         context,
                         inputs.caller,
@@ -1025,7 +1112,7 @@ where
                     ) {
                         RESUME_CALL_IDX.set(RESUME_CALL_IDX.get().saturating_add(1));
                         record_call_outcome_hit();
-                        return Some(outcome);
+                        return Some(cached.outcome.clone());
                     }
                 }
             }
@@ -1749,7 +1836,7 @@ mod m1c_tests {
     }
 
     #[test]
-    fn jump_is_safe_rejects_valued_call_even_with_writes() {
+    fn jump_is_safe_accepts_valued_call_at_call_boundary() {
         use crate::specfence::rem::{AccessMode, RegionAccess, StorageWriteReplay};
         use revm::interpreter::{Gas, InstructionResult, InterpreterResult};
         let (mut effects, values) = storage_read_effect();
@@ -1822,8 +1909,52 @@ mod m1c_tests {
             valued_blocks_jump: false,
         };
         assert!(
+            jump_is_safe(&cont),
+            "M1l: valued CallOutcome OK at CALL-boundary with write_replays"
+        );
+    }
+
+    #[test]
+    fn jump_is_safe_rejects_valued_blocks_jump_cache_miss() {
+        let (effects, values) = storage_read_effect();
+        let cont = ResumeContinuation {
+            cp: CheckpointId {
+                tx_idx: 0,
+                incarnation: 1,
+                k: 2,
+            },
+            k_fail: 4,
+            certified: vec![1],
+            suffix_writes: vec![],
+            effects,
+            checkpoints: vec![],
+            values,
+            boundary: Some(lite_snap(0, 2)),
+            jump_snap: Some(BoundarySnapshot {
+                pc: 12,
+                gas_remaining: 40_000,
+                gas_refunded: 0,
+                memory_words: 0,
+                memory_expansion_cost: 0,
+                call_depth: 1,
+                opcode_steps: 18,
+                stack: vec![],
+                memory: vec![],
+                code_hash: Some(B256::ZERO),
+                bytecode_len: 64,
+                at_call_boundary: true,
+                post_sstore: true,
+            }),
+            journal_blob: None,
+            call_outcomes: vec![],
+            prefix_writes: vec![],
+            write_replays: vec![],
+            log_replays: vec![],
+            valued_blocks_jump: true,
+        };
+        assert!(
             !jump_is_safe(&cont),
-            "M1j: valued CallOutcome still forbids absolute jump (mid-exec SC only)"
+            "M1l: valued_blocks_jump (cache miss) still forbids absolute jump"
         );
     }
 
