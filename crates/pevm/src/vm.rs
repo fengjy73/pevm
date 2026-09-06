@@ -128,6 +128,7 @@ pub(crate) struct VmDb<'a, S: Storage> {
     mv_memory: &'a MvMemory,
     specfence: SpecFenceCtx<'a>,
     tx_idx: TxIdx,
+    tx_incarnation: crate::TxIncarnation,
     tx: &'a TxEnv,
     from_hash: MemoryLocationHash,
     to_hash: Option<MemoryLocationHash>,
@@ -156,6 +157,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
         incarnation: crate::TxIncarnation,
     ) -> Result<(), ReadError> {
         self.tx_idx = tx_idx;
+        self.tx_incarnation = incarnation;
         self.tx = tx;
         self.from_hash = from_hash;
         self.to_hash = to_hash;
@@ -164,6 +166,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.has_nonce = has_nonce;
         self.read_set.clear();
         self.read_accounts.clear();
+        if let Some(fg) = self.specfence.finegrain {
+            fg.deep_begin_consumer(tx_idx, incarnation);
+        }
         if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
             self.specfence
                 .partial_retry
@@ -630,6 +635,33 @@ impl<'a, S: Storage> VmDb<'a, S> {
         Ok(())
     }
 
+    /// Deep finegrain: count DB read + emit RawEffectEdge on cross-tx MV origin.
+    fn deep_trace_read(
+        &self,
+        location: MemoryLocationHash,
+        kind: crate::specfence::LocationKind,
+        origin: Option<&ReadOrigin>,
+    ) {
+        let Some(fg) = self.specfence.finegrain else {
+            return;
+        };
+        if !fg.deep_enabled() {
+            return;
+        }
+        let producer = match origin {
+            Some(ReadOrigin::MvMemory(v)) => Some((v.tx_idx, v.tx_incarnation)),
+            _ => None,
+        };
+        fg.deep_note_db_read(
+            self.tx_idx,
+            self.tx_incarnation,
+            producer,
+            location,
+            kind,
+            true,
+        );
+    }
+
     fn get_code_hash(&mut self, address: Address) -> Result<Option<B256>, ReadError> {
         let location_hash = hash_deterministic(MemoryLocation::CodeHash(address));
         let read_origins = self.read_set.entry(location_hash).or_default();
@@ -652,13 +684,16 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     return Err(ReadError::SelfDestructedAccount);
                 }
                 MemoryValue::CodeHash(code_hash) => {
-                    Self::push_origin(
-                        read_origins,
-                        ReadOrigin::MvMemory(TxVersion {
-                            tx_idx: *tx_idx,
-                            tx_incarnation: *tx_incarnation,
-                        }),
-                    )?;
+                    let origin = ReadOrigin::MvMemory(TxVersion {
+                        tx_idx: *tx_idx,
+                        tx_incarnation: *tx_incarnation,
+                    });
+                    Self::push_origin(read_origins, origin.clone())?;
+                    self.deep_trace_read(
+                        location_hash,
+                        crate::specfence::LocationKind::CodeHash,
+                        Some(&origin),
+                    );
                     return Ok(Some(*code_hash));
                 }
                 _ => {}
@@ -667,6 +702,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
 
         // Fallback to storage
         Self::push_origin(read_origins, ReadOrigin::Storage)?;
+        self.deep_trace_read(
+            location_hash,
+            crate::specfence::LocationKind::CodeHash,
+            Some(&ReadOrigin::Storage),
+        );
         self.storage
             .code_hash(&address)
             .map_err(|err| ReadError::StorageError(err.to_string()))
@@ -701,7 +741,12 @@ impl<S: Storage> Database for VmDb<'_, S> {
             && let Some((account, code_hash, origin)) = self.try_ff_basic(location_hash)
         {
             let read_origins = self.read_set.entry(location_hash).or_default();
-            Self::push_origin(read_origins, origin)?;
+            Self::push_origin(read_origins, origin.clone())?;
+            self.deep_trace_read(
+                location_hash,
+                crate::specfence::LocationKind::Basic,
+                Some(&origin),
+            );
             self.specfence.metrics.record_journal_ff_hit();
             self.read_accounts
                 .insert(location_hash, (account.clone(), code_hash));
@@ -841,6 +886,46 @@ impl<S: Storage> Database for VmDb<'_, S> {
             *read_origins = new_origins;
         }
 
+        // Deep: one DB-effect for this basic() call; emit edge per MV origin observed.
+        if let Some(fg) = self.specfence.finegrain {
+            if fg.deep_enabled() {
+                let origins_now = self.read_set.get(&location_hash).cloned().unwrap_or_default();
+                let mv_origins: Vec<_> = origins_now
+                    .iter()
+                    .filter_map(|o| match o {
+                        ReadOrigin::MvMemory(v) => Some((v.tx_idx, v.tx_incarnation)),
+                        _ => None,
+                    })
+                    .collect();
+                if mv_origins.is_empty() {
+                    fg.deep_note_db_read(
+                        self.tx_idx,
+                        self.tx_incarnation,
+                        None,
+                        location_hash,
+                        crate::specfence::LocationKind::Basic,
+                        true,
+                    );
+                } else {
+                    for (i, (ptx, pinc)) in mv_origins.into_iter().enumerate() {
+                        let kind = if i == 0 {
+                            crate::specfence::LocationKind::Basic
+                        } else {
+                            crate::specfence::LocationKind::BasicLazy
+                        };
+                        fg.deep_note_db_read(
+                            self.tx_idx,
+                            self.tx_incarnation,
+                            Some((ptx, pinc)),
+                            location_hash,
+                            kind,
+                            i == 0,
+                        );
+                    }
+                }
+            }
+        }
+
         if let Some(mut account) = final_account {
             // Check sender nonce
             account.nonce += nonce_addition;
@@ -936,7 +1021,12 @@ impl<S: Storage> Database for VmDb<'_, S> {
         // M1b: certified-prefix FF cache — skip MV/storage heavy path when origin stable.
         if let Some((value, origin)) = self.try_ff_storage(location_hash) {
             let read_origins = self.read_set.entry(location_hash).or_default();
-            Self::push_origin(read_origins, origin)?;
+            Self::push_origin(read_origins, origin.clone())?;
+            self.deep_trace_read(
+                location_hash,
+                crate::specfence::LocationKind::Storage,
+                Some(&origin),
+            );
             self.specfence.metrics.record_journal_ff_hit();
             if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
                 self.specfence.partial_retry.note_value(
@@ -974,13 +1064,16 @@ impl<S: Storage> Database for VmDb<'_, S> {
                         return Err(ReadError::Blocking(*closest_idx));
                     }
                     self.specfence.metrics.record_db_heavy_op();
-                    Self::push_origin(
-                        read_origins,
-                        ReadOrigin::MvMemory(TxVersion {
-                            tx_idx: *closest_idx,
-                            tx_incarnation: *tx_incarnation,
-                        }),
-                    )?;
+                    let origin = ReadOrigin::MvMemory(TxVersion {
+                        tx_idx: *closest_idx,
+                        tx_incarnation: *tx_incarnation,
+                    });
+                    Self::push_origin(read_origins, origin.clone())?;
+                    self.deep_trace_read(
+                        location_hash,
+                        crate::specfence::LocationKind::Storage,
+                        Some(&origin),
+                    );
                     if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
                         self.specfence.partial_retry.note_value(
                             self.tx_idx,
@@ -1007,6 +1100,11 @@ impl<S: Storage> Database for VmDb<'_, S> {
         // Fall back to storage
         self.specfence.metrics.record_db_heavy_op();
         Self::push_origin(read_origins, ReadOrigin::Storage)?;
+        self.deep_trace_read(
+            location_hash,
+            crate::specfence::LocationKind::Storage,
+            Some(&ReadOrigin::Storage),
+        );
         let value = self
             .storage
             .storage(&address, &index)
@@ -1065,6 +1163,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             mv_memory,
             specfence,
             tx_idx: 0,
+            tx_incarnation: 0,
             // SAFETY: txs is non-empty (checked by the caller before spawning threads).
             tx: chain.tx_env(unsafe { txs.get_unchecked(0) }),
             from_hash: 0,
@@ -1578,6 +1677,19 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         }
                     })
                     .collect();
+                if let Some(fg) = self.specfence.finegrain {
+                    fg.deep_register_writes(
+                        tx_version.tx_idx,
+                        tx_version.tx_incarnation,
+                        &write_set,
+                    );
+                    fg.deep_finish_consumer(
+                        tx_version.tx_idx,
+                        tx_version.tx_incarnation,
+                        Some(exec_result.tx_gas_used()),
+                        Some(tx.gas_limit),
+                    );
+                }
                 let (wrote_new_location, contended) =
                     self.mv_memory.record(tx_version, read_set, write_set);
                 // M3: learn process WŜ from this incarnation's writes (no residual publish).

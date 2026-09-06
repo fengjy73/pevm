@@ -218,6 +218,20 @@ impl Pevm {
         self.finegrain_enabled = enabled;
         if enabled {
             self.finegrain.clear();
+        } else {
+            self.finegrain.set_deep(false);
+        }
+    }
+
+    /// Enable/disable deep effect-RAW instrumentation (implies finegrain_trace).
+    /// Research flag only — production default remains off.
+    pub fn set_finegrain_deep(&mut self, enabled: bool) {
+        if enabled {
+            self.finegrain_enabled = true;
+            self.finegrain.clear();
+            self.finegrain.set_deep(true);
+        } else {
+            self.finegrain.set_deep(false);
         }
     }
 

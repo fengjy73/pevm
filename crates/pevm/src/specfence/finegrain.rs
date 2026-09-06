@@ -4,6 +4,11 @@
 //! Disabled by default: zero cost on production paths when `Pevm::finegrain_trace`
 //! is off. When enabled, parallel execution snapshots final RW sets (≈ G*),
 //! location kinds, per-tx incarnation highs, and OCC abort events.
+//!
+//! **Deep mode** (`set_finegrain_deep(true)`): additionally records every
+//! producer-effect → consumer-read `RawEffectEdge` observed during MV reads,
+//! with per-tx effect ordinals and first cross-tx program-read depth. Research
+//! only — default path unchanged when flag off.
 
 use std::sync::Mutex;
 
@@ -60,6 +65,72 @@ pub struct AbortEvent {
     pub cascade_validations: usize,
 }
 
+/// Program vs handler class at effect grain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectClass {
+    Program,
+    Handler,
+}
+
+impl EffectClass {
+    pub fn from_kind(kind: LocationKind) -> Self {
+        match kind {
+            LocationKind::Storage | LocationKind::CodeHash | LocationKind::SelfDestructed => {
+                Self::Program
+            }
+            LocationKind::Basic | LocationKind::BasicLazy | LocationKind::Unknown => Self::Handler,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Program => "program",
+            Self::Handler => "handler",
+        }
+    }
+}
+
+/// One producer-effect → consumer-read observation (deep mode).
+#[derive(Debug, Clone, Serialize)]
+pub struct RawEffectEdge {
+    pub producer_tx: usize,
+    pub producer_effect_k: usize,
+    pub producer_incarnation: usize,
+    pub consumer_tx: usize,
+    pub consumer_effect_k: usize,
+    pub consumer_incarnation: usize,
+    pub location: u64,
+    pub kind: String,
+    /// `program` | `handler`
+    pub class: String,
+    /// Optional mid-tx gas proxy at discovery (None unless inspect supplies it).
+    pub gas_used_so_far: Option<u64>,
+    /// Opcode/step counter if available (else mirrors consumer_effect_k).
+    pub opcode_steps: Option<usize>,
+}
+
+/// Per-consumer depth of first cross-tx program read (deep mode).
+#[derive(Debug, Clone, Serialize)]
+pub struct ConsumerFirstCross {
+    pub tx_idx: usize,
+    pub incarnation: usize,
+    /// Effect ordinal of first program-class cross-tx MV read (None if none).
+    pub first_program_cross_k: Option<usize>,
+    pub first_program_cross_location: Option<u64>,
+    pub first_program_producer_tx: Option<usize>,
+    /// Total world-state DB effects observed this incarnation (read calls).
+    pub total_db_effects: usize,
+    /// Total journal write effects registered for this incarnation.
+    pub total_write_effects: usize,
+    pub gas_used: Option<u64>,
+    pub gas_limit: Option<u64>,
+    /// `first_program_cross_k / total_db_effects` when defined.
+    pub depth_frac_effects: Option<f64>,
+    /// `gas_used_so_far/gas_limit` when mid-tx gas known; else None.
+    pub depth_frac_gas: Option<f64>,
+}
+
 /// Per-transaction final RW (last committed incarnation).
 #[derive(Debug, Clone, Serialize)]
 pub struct TxRw {
@@ -82,6 +153,12 @@ pub struct FineGrainSnapshot {
     pub abort_events: Vec<AbortEvent>,
     /// Final incarnation index per tx (0 = first success, k = k reexecs before success).
     pub final_incarnations: Vec<usize>,
+    /// Deep-mode effect edges (empty when deep off).
+    pub effect_edges: Vec<RawEffectEdge>,
+    /// Deep-mode per-consumer first cross-tx program depth (empty when deep off).
+    pub consumer_first_cross: Vec<ConsumerFirstCross>,
+    /// Whether deep instrumentation was active for this capture.
+    pub deep_mode: bool,
 }
 
 /// Opt-in collector living on [`crate::Pevm`].
@@ -89,6 +166,32 @@ pub struct FineGrainSnapshot {
 pub struct FineGrainCollector {
     abort_events: Mutex<Vec<AbortEvent>>,
     last_snapshot: Mutex<Option<FineGrainSnapshot>>,
+    /// Research deep mode: effect-level RAW edges + depth (off by default).
+    deep: std::sync::atomic::AtomicBool,
+    deep_state: Mutex<DeepRuntimeState>,
+}
+
+/// Mutable deep-mode runtime state (research path only).
+#[derive(Debug, Default)]
+struct DeepRuntimeState {
+    /// (tx, incarnation, location) → effect_k of that write in write_set order.
+    write_effects: std::collections::HashMap<(usize, usize, u64), (usize, LocationKind)>,
+    /// Per executing consumer: (incarnation, db_effect_counter, first_prog, first_loc, first_prod, write_effects).
+    consumers: std::collections::HashMap<usize, ConsumerLive>,
+    edges: Vec<RawEffectEdge>,
+    finished: Vec<ConsumerFirstCross>,
+}
+
+#[derive(Debug, Clone)]
+struct ConsumerLive {
+    incarnation: usize,
+    db_effects: usize,
+    first_program_cross_k: Option<usize>,
+    first_program_cross_location: Option<u64>,
+    first_program_producer_tx: Option<usize>,
+    write_effects: usize,
+    gas_used: Option<u64>,
+    gas_limit: Option<u64>,
 }
 
 impl FineGrainCollector {
@@ -96,9 +199,19 @@ impl FineGrainCollector {
         Self::default()
     }
 
+    pub fn set_deep(&self, enabled: bool) {
+        self.deep
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn deep_enabled(&self) -> bool {
+        self.deep.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn clear(&self) {
         self.abort_events.lock().unwrap().clear();
         *self.last_snapshot.lock().unwrap() = None;
+        *self.deep_state.lock().unwrap() = DeepRuntimeState::default();
     }
 
     pub fn record_abort(
@@ -113,6 +226,177 @@ impl FineGrainCollector {
             incarnation,
             n_write_locs,
             cascade_validations,
+        });
+    }
+
+    /// Start (or reset) deep counters for a consumer incarnation.
+    pub(crate) fn deep_begin_consumer(&self, tx_idx: TxIdx, incarnation: usize) {
+        if !self.deep_enabled() {
+            return;
+        }
+        let mut st = self.deep_state.lock().unwrap();
+        st.consumers.insert(
+            tx_idx,
+            ConsumerLive {
+                incarnation,
+                db_effects: 0,
+                first_program_cross_k: None,
+                first_program_cross_location: None,
+                first_program_producer_tx: None,
+                write_effects: 0,
+                gas_used: None,
+                gas_limit: None,
+            },
+        );
+    }
+
+    /// Register write-set effects for a producer incarnation (write_set order = k).
+    pub(crate) fn deep_register_writes(
+        &self,
+        tx_idx: TxIdx,
+        incarnation: usize,
+        write_set: &[(crate::MemoryLocationHash, crate::MemoryValue)],
+    ) {
+        if !self.deep_enabled() {
+            return;
+        }
+        let mut st = self.deep_state.lock().unwrap();
+        for (k, (loc, value)) in write_set.iter().enumerate() {
+            let kind = LocationKind::from_value(value);
+            st.write_effects
+                .insert((tx_idx, incarnation, *loc), (k, kind));
+        }
+        if let Some(c) = st.consumers.get_mut(&tx_idx) {
+            if c.incarnation == incarnation {
+                c.write_effects = write_set.len();
+            }
+        }
+    }
+
+    /// Observe one world-state DB read; emit RawEffectEdge if origin is prior tx.
+    /// When `bump_depth` is false, emit edge only (lazy-chain extra producers).
+    pub(crate) fn deep_note_db_read(
+        &self,
+        consumer_tx: TxIdx,
+        consumer_incarnation: usize,
+        producer: Option<(TxIdx, usize)>,
+        location: crate::MemoryLocationHash,
+        kind_hint: LocationKind,
+        bump_depth: bool,
+    ) {
+        if !self.deep_enabled() {
+            return;
+        }
+        let mut st = self.deep_state.lock().unwrap();
+
+        // Resolve producer write meta before mutably borrowing consumers.
+        let producer_meta = producer.and_then(|(producer_tx, producer_inc)| {
+            if producer_tx >= consumer_tx {
+                return None;
+            }
+            let (producer_k, kind) = st
+                .write_effects
+                .get(&(producer_tx, producer_inc, location))
+                .copied()
+                .unwrap_or((0, kind_hint));
+            Some((producer_tx, producer_inc, producer_k, kind))
+        });
+
+        let c = st.consumers.entry(consumer_tx).or_insert_with(|| ConsumerLive {
+            incarnation: consumer_incarnation,
+            db_effects: 0,
+            first_program_cross_k: None,
+            first_program_cross_location: None,
+            first_program_producer_tx: None,
+            write_effects: 0,
+            gas_used: None,
+            gas_limit: None,
+        });
+        if c.incarnation != consumer_incarnation {
+            *c = ConsumerLive {
+                incarnation: consumer_incarnation,
+                db_effects: 0,
+                first_program_cross_k: None,
+                first_program_cross_location: None,
+                first_program_producer_tx: None,
+                write_effects: 0,
+                gas_used: None,
+                gas_limit: None,
+            };
+        }
+        let consumer_k = if bump_depth {
+            let k = c.db_effects;
+            c.db_effects += 1;
+            k
+        } else {
+            c.db_effects.saturating_sub(1)
+        };
+
+        let Some((producer_tx, producer_inc, producer_k, kind)) = producer_meta else {
+            return;
+        };
+        let class = EffectClass::from_kind(kind);
+        if class == EffectClass::Program && c.first_program_cross_k.is_none() {
+            c.first_program_cross_k = Some(consumer_k);
+            c.first_program_cross_location = Some(location);
+            c.first_program_producer_tx = Some(producer_tx);
+        }
+        let edge = RawEffectEdge {
+            producer_tx,
+            producer_effect_k: producer_k,
+            producer_incarnation: producer_inc,
+            consumer_tx,
+            consumer_effect_k: consumer_k,
+            consumer_incarnation,
+            location,
+            kind: kind.as_str().to_string(),
+            class: class.as_str().to_string(),
+            gas_used_so_far: None,
+            opcode_steps: Some(consumer_k),
+        };
+        // `c` ends here; push after NLL ends the consumers borrow.
+        let _ = c;
+        st.edges.push(edge);
+    }
+
+    /// Finalize consumer depth row after a successful (or aborted) incarnation.
+    pub(crate) fn deep_finish_consumer(
+        &self,
+        tx_idx: TxIdx,
+        incarnation: usize,
+        gas_used: Option<u64>,
+        gas_limit: Option<u64>,
+    ) {
+        if !self.deep_enabled() {
+            return;
+        }
+        let mut st = self.deep_state.lock().unwrap();
+        let Some(c) = st.consumers.remove(&tx_idx) else {
+            return;
+        };
+        if c.incarnation != incarnation {
+            // Stale — ignore.
+            return;
+        }
+        let depth_frac_effects = c.first_program_cross_k.map(|k| {
+            if c.db_effects == 0 {
+                0.0
+            } else {
+                k as f64 / c.db_effects as f64
+            }
+        });
+        st.finished.push(ConsumerFirstCross {
+            tx_idx,
+            incarnation,
+            first_program_cross_k: c.first_program_cross_k,
+            first_program_cross_location: c.first_program_cross_location,
+            first_program_producer_tx: c.first_program_producer_tx,
+            total_db_effects: c.db_effects,
+            total_write_effects: c.write_effects,
+            gas_used: gas_used.or(c.gas_used),
+            gas_limit: gas_limit.or(c.gas_limit),
+            depth_frac_effects,
+            depth_frac_gas: None, // true mid-tx gas needs inspect; see architecture note
         });
     }
 
@@ -156,6 +440,13 @@ impl FineGrainCollector {
         location_kinds.sort_by_key(|(h, _)| *h);
 
         let abort_events = self.abort_events.lock().unwrap().clone();
+        let deep_mode = self.deep_enabled();
+        let (effect_edges, consumer_first_cross) = if deep_mode {
+            let st = self.deep_state.lock().unwrap();
+            (st.edges.clone(), st.finished.clone())
+        } else {
+            (Vec::new(), Vec::new())
+        };
         *self.last_snapshot.lock().unwrap() = Some(FineGrainSnapshot {
             n_tx,
             beneficiary_hash,
@@ -163,6 +454,9 @@ impl FineGrainCollector {
             location_kinds,
             abort_events,
             final_incarnations,
+            effect_edges,
+            consumer_first_cross,
+            deep_mode,
         });
     }
 
@@ -546,4 +840,173 @@ pub fn program_raw_longest_chain(raw: &[RawEdge]) -> usize {
         }
     }
     dist.into_iter().max().unwrap_or(0)
+}
+
+
+/// Summarize deep effect-RAW edges (exclude beneficiary / basic_lazy when requested).
+pub fn filter_effect_edges(
+    snap: &FineGrainSnapshot,
+    exclude_beneficiary: bool,
+    exclude_basic_lazy: bool,
+) -> Vec<&RawEffectEdge> {
+    snap.effect_edges
+        .iter()
+        .filter(|e| {
+            if exclude_beneficiary && e.location == snap.beneficiary_hash {
+                return false;
+            }
+            if exclude_basic_lazy && e.kind == "basic_lazy" {
+                return false;
+            }
+            true
+        })
+        .collect()
+}
+
+/// Longest path on effect-edge DAG projected to txs (program-only option).
+pub fn effect_raw_longest_chain(edges: &[&RawEffectEdge], program_only: bool) -> usize {
+    if edges.is_empty() {
+        return 0;
+    }
+    let mut max_tx = 0usize;
+    for e in edges {
+        if program_only && e.class != "program" {
+            continue;
+        }
+        max_tx = max_tx.max(e.producer_tx).max(e.consumer_tx);
+    }
+    let n = max_tx + 1;
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for e in edges {
+        if program_only && e.class != "program" {
+            continue;
+        }
+        preds[e.consumer_tx].push(e.producer_tx);
+    }
+    for p in &mut preds {
+        p.sort_unstable();
+        p.dedup();
+    }
+    let mut dist = vec![1usize; n];
+    for b in 0..n {
+        for &a in &preds[b] {
+            dist[b] = dist[b].max(dist[a] + 1);
+        }
+    }
+    dist.into_iter().max().unwrap_or(0)
+}
+
+/// Max outbound fan-out (distinct consumers) from any producer on effect edges.
+pub fn effect_raw_max_fanout(edges: &[&RawEffectEdge], program_only: bool) -> usize {
+    use std::collections::{HashMap, HashSet};
+    let mut m: HashMap<usize, HashSet<usize>> = HashMap::new();
+    for e in edges {
+        if program_only && e.class != "program" {
+            continue;
+        }
+        m.entry(e.producer_tx).or_default().insert(e.consumer_tx);
+    }
+    m.values().map(|s| s.len()).max().unwrap_or(0)
+}
+
+/// Percentile of a sorted f64 slice.
+pub fn percentile_f64(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let idx = ((sorted.len() as f64 - 1.0) * p).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+/// M-A vs M-D style redo/wait proxies from deep consumer depths + effect edges.
+///
+/// Units are **normalized consumer-work** (1.0 = full consumer db-effect budget).
+/// Rough: not wall-clock calibrated.
+#[derive(Debug, Clone, Serialize)]
+pub struct MaMdProxy {
+    pub n_consumers_with_program_cross: usize,
+    /// M-A: always SpecRead → conflict pays full remaining = 1.0 per such consumer.
+    pub ma_redo_cost: f64,
+    /// M-D: redo ∝ (1 − d) using depth_frac_effects at first program cross.
+    pub md_redo_cost: f64,
+    /// Estimated redo saved vs M-A: sum(d) over consumers.
+    pub redo_saved: f64,
+    /// Wait added proxy: sum over unique program pairs of lag_norm * (1 − steal).
+    pub wait_added: f64,
+    pub depth_p10: f64,
+    pub depth_p50: f64,
+    pub depth_p90: f64,
+    pub depth_mean: f64,
+    pub frac_depth_lt_0_01: f64,
+}
+
+pub fn estimate_ma_md(
+    snap: &FineGrainSnapshot,
+    edges: &[&RawEffectEdge],
+    n_tx: usize,
+) -> MaMdProxy {
+    use std::collections::{HashMap, HashSet};
+
+    let mut best: HashMap<usize, &ConsumerFirstCross> = HashMap::new();
+    for c in &snap.consumer_first_cross {
+        best.entry(c.tx_idx)
+            .and_modify(|e| {
+                if c.incarnation >= e.incarnation {
+                    *e = c;
+                }
+            })
+            .or_insert(c);
+    }
+    let mut depths: Vec<f64> = best
+        .values()
+        .filter_map(|c| c.depth_frac_effects)
+        .collect();
+    depths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let n_c = depths.len();
+    let ma_redo = n_c as f64;
+    let md_redo: f64 = depths.iter().map(|d| (1.0 - d).max(0.0)).sum();
+    let redo_saved = ma_redo - md_redo;
+    let mean = if n_c == 0 {
+        0.0
+    } else {
+        depths.iter().sum::<f64>() / n_c as f64
+    };
+    let lt01 = if n_c == 0 {
+        0.0
+    } else {
+        depths.iter().filter(|&&d| d < 0.01).count() as f64 / n_c as f64
+    };
+
+    let mut pairs: HashSet<(usize, usize)> = HashSet::new();
+    let mut wait = 0.0;
+    let steal = 0.5f64;
+    for e in edges {
+        if e.class != "program" {
+            continue;
+        }
+        if !pairs.insert((e.producer_tx, e.consumer_tx)) {
+            continue;
+        }
+        let lag = e.consumer_tx.saturating_sub(e.producer_tx) as f64;
+        let lag_norm = if n_tx == 0 {
+            0.0
+        } else {
+            (lag / n_tx as f64).min(1.0)
+        };
+        wait += lag_norm * (1.0 - steal);
+    }
+
+    MaMdProxy {
+        n_consumers_with_program_cross: n_c,
+        ma_redo_cost: ma_redo,
+        md_redo_cost: md_redo,
+        redo_saved,
+        wait_added: wait,
+        depth_p10: percentile_f64(&depths, 0.1),
+        depth_p50: percentile_f64(&depths, 0.5),
+        depth_p90: percentile_f64(&depths, 0.9),
+        depth_mean: mean,
+        frac_depth_lt_0_01: lt01,
+    }
 }

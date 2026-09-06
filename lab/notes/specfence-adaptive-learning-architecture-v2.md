@@ -7,6 +7,8 @@
 **Keeps:** sequential ≡ parallel TCB; opt-in finegrain/inspect research flags off by default; LeanOCC default execute path (`Handler::run`); location as concurrency object
 
 ---
+> **Update (2026-09-06):** Effect-level RAW deep traces supersede the “proxies without inspect” subsection for control-law design. See [`specfence-evm-cc-first-principles-from-effect-raw.md`](specfence-evm-cc-first-principles-from-effect-raw.md) (v3-style first principles constrained by `lab/results/effect-raw-deep.*`). HotSet remains a feature/cache hint only.
+
 
 ## 0. Critique of Adaptive CC v1 (why thresholds ≠ adaptive)
 

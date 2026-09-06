@@ -56,9 +56,11 @@ pub(crate) use heat::HeatMap;
 pub(crate) use metrics::MetricsInner;
 pub use metrics::SpecFenceMetrics;
 pub use finegrain::{
-    AbortEvent, DagStats, FineGrainCollector, FineGrainSnapshot, HotLocation, LocationKind,
-    TxRw, RawEdge, analyze_dag, classify_raw_edges, dependency_edges, hot_locations,
-    kind_histogram, program_raw_longest_chain,
+    AbortEvent, ConsumerFirstCross, DagStats, EffectClass, FineGrainCollector, FineGrainSnapshot,
+    HotLocation, LocationKind, MaMdProxy, RawEffectEdge, TxRw, RawEdge, analyze_dag,
+    classify_raw_edges, dependency_edges, effect_raw_longest_chain, effect_raw_max_fanout,
+    estimate_ma_md, filter_effect_edges, hot_locations, kind_histogram, percentile_f64,
+    program_raw_longest_chain,
 };
 pub use region::RegionMode;
 pub(crate) use region::RegionTable;

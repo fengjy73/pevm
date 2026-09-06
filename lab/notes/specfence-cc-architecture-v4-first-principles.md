@@ -1,3 +1,5 @@
+> **Related (2026-09-06):** Empirical effect-RAW constraints — `specfence-evm-cc-first-principles-from-effect-raw.md`.
+
 # SpecFence v4 — first principles (blockchain execution × concurrency control)
 
 **Status: design revision. Supersedes v3’s “PEVM action menu” framing. No code.**
