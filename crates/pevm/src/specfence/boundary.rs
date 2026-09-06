@@ -35,14 +35,15 @@ use revm::context::{ContextTr, JournalTr};
 use revm::inspector::JournalExt;
 use revm::interpreter::{
     interpreter::EthInterpreter,
-    interpreter_types::{Jumps, LegacyBytecode, StackTr},
+    interpreter_types::{InputsTr, Jumps, LegacyBytecode, StackTr},
     CallInputs, CallOutcome, CreateInputs, CreateOutcome, Interpreter,
 };
 use revm::state::EvmState;
 use revm::Inspector;
 
-use crate::TxIdx;
+use crate::{hash_deterministic, MemoryLocation, TxIdx};
 
+use super::finegrain::{FineGrainCollector, LocationKind};
 use super::metrics::MetricsInner;
 use super::rem::{
     AccessMode, CheckpointKind, LogReplay, PartialRetryTable, ResumeContinuation,
@@ -384,12 +385,16 @@ pub(crate) fn valued_call_cache_env_enabled() -> bool {
     }
 }
 
-/// Scoped plant pointers for Inspector → PartialRetry / metrics (execute duration only).
+/// Scoped plant pointers for Inspector → PartialRetry / metrics / journal stream.
 #[derive(Clone, Copy)]
 struct PlantTls {
     tx_idx: TxIdx,
+    incarnation: usize,
     partial_retry: *const PartialRetryTable,
     metrics: *const MetricsInner,
+    /// Research journal RAW stream (None = disabled).
+    finegrain: Option<*const FineGrainCollector>,
+    tx_gas_limit: Option<u64>,
 }
 
 thread_local! {
@@ -452,10 +457,26 @@ pub(crate) fn with_plant_tls<R>(
     metrics: &MetricsInner,
     f: impl FnOnce() -> R,
 ) -> R {
+    with_plant_tls_journal(tx_idx, 0, None, None, partial_retry, metrics, f)
+}
+
+/// Plant TLS with optional FineGrain journal stream (research inspect path).
+pub(crate) fn with_plant_tls_journal<R>(
+    tx_idx: TxIdx,
+    incarnation: usize,
+    finegrain: Option<&FineGrainCollector>,
+    tx_gas_limit: Option<u64>,
+    partial_retry: &PartialRetryTable,
+    metrics: &MetricsInner,
+    f: impl FnOnce() -> R,
+) -> R {
     let prev = PLANT.replace(Some(PlantTls {
         tx_idx,
+        incarnation,
         partial_retry: partial_retry as *const _,
         metrics: metrics as *const _,
+        finegrain: finegrain.map(|fg| fg as *const _),
+        tx_gas_limit,
     }));
     OPCODE_STEPS.set(0);
     CALL_DEPTH.set(0);
@@ -851,6 +872,106 @@ where
     }
 }
 
+
+fn u256_to_address(v: U256) -> Address {
+    Address::from_word(B256::from(v))
+}
+
+/// Opt-in journal RAW stream (FineGrain journal mode). Zero cost when finegrain TLS unset.
+fn maybe_note_journal_effect(interp: &Interpreter<EthInterpreter>, op: u8, opcode_steps: u64) {
+    const OP_BALANCE: u8 = 0x31;
+    const OP_EXTCODESIZE: u8 = 0x3b;
+    const OP_EXTCODECOPY: u8 = 0x3c;
+    const OP_EXTCODEHASH: u8 = 0x3f;
+    const OP_SELFBALANCE: u8 = 0x47;
+    const OP_SLOAD: u8 = 0x54;
+    const OP_SSTORE: u8 = 0x55;
+
+    PLANT.with(|p| {
+        let Some(plant) = p.get() else { return };
+        let Some(fg_ptr) = plant.finegrain else { return };
+        let fg = unsafe { &*fg_ptr };
+        if !fg.journal_enabled() {
+            return;
+        }
+        let gas_limit = plant.tx_gas_limit.or(Some(interp.gas.limit()));
+        let gas_used = gas_limit.map(|lim| lim.saturating_sub(interp.gas.remaining()));
+        let steps = Some(opcode_steps as usize);
+        let target = interp.input.target_address();
+
+        match op {
+            OP_SLOAD => {
+                let Ok(key) = interp.stack.peek(0) else { return };
+                let loc = hash_deterministic(MemoryLocation::Storage(target, key));
+                fg.deep_note_journal_read(
+                    plant.tx_idx,
+                    plant.incarnation,
+                    loc,
+                    LocationKind::Storage,
+                    gas_used,
+                    gas_limit,
+                    steps,
+                );
+            }
+            OP_SSTORE => {
+                // stack: [value, key] — key is peek(1)
+                let Ok(key) = interp.stack.peek(1) else { return };
+                let loc = hash_deterministic(MemoryLocation::Storage(target, key));
+                fg.deep_note_journal_write(
+                    plant.tx_idx,
+                    plant.incarnation,
+                    loc,
+                    LocationKind::Storage,
+                    gas_used,
+                    gas_limit,
+                    steps,
+                );
+            }
+            OP_BALANCE => {
+                let Ok(addr_u) = interp.stack.peek(0) else { return };
+                let addr = u256_to_address(addr_u);
+                let loc = hash_deterministic(MemoryLocation::Basic(addr));
+                fg.deep_note_journal_read(
+                    plant.tx_idx,
+                    plant.incarnation,
+                    loc,
+                    LocationKind::Basic,
+                    gas_used,
+                    gas_limit,
+                    steps,
+                );
+            }
+            OP_SELFBALANCE => {
+                let loc = hash_deterministic(MemoryLocation::Basic(target));
+                fg.deep_note_journal_read(
+                    plant.tx_idx,
+                    plant.incarnation,
+                    loc,
+                    LocationKind::Basic,
+                    gas_used,
+                    gas_limit,
+                    steps,
+                );
+            }
+            OP_EXTCODESIZE | OP_EXTCODEHASH | OP_EXTCODECOPY => {
+                let Ok(addr_u) = interp.stack.peek(0) else { return };
+                let addr = u256_to_address(addr_u);
+                let loc = hash_deterministic(MemoryLocation::CodeHash(addr));
+                fg.deep_note_journal_read(
+                    plant.tx_idx,
+                    plant.incarnation,
+                    loc,
+                    LocationKind::CodeHash,
+                    gas_used,
+                    gas_limit,
+                    steps,
+                );
+            }
+            _ => {}
+        }
+    });
+}
+
 /// SpecFence boundary Inspector — observational except on armed PC resume.
 #[derive(Debug, Default, Clone)]
 pub struct SpecFenceInspector;
@@ -982,6 +1103,9 @@ where
         let pc = interp.bytecode.pc();
         let op = interp.bytecode.bytecode_slice().get(pc).copied().unwrap_or(0);
         LAST_OPCODE.set(op);
+        // Research journal stream: log every storage/basic world-state opcode
+        // (including journal-cached repeats that never re-enter pevm Db).
+        maybe_note_journal_effect(interp, op, n);
     }
 
     fn step_end(&mut self, interp: &mut Interpreter<EthInterpreter>, context: &mut CTX) {

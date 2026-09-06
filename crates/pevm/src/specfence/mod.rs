@@ -71,7 +71,8 @@ pub(crate) use rem::WaveParkTable;
 pub(crate) use boundary::{
     arm_call_outcome_cache, arm_pc_resume, clear_pc_resume, in_inspect_run, jump_is_safe,
     last_boundary_snap, attach_current_live_snap, note_pending_effect_boundary, resume_was_applied,
-    steps_this_run, try_arm_safe_absolute_jump, with_plant_tls, BoundarySnapshot, CachedCallOutcome,
+    steps_this_run, try_arm_safe_absolute_jump, with_plant_tls, with_plant_tls_journal,
+    BoundarySnapshot, CachedCallOutcome,
     JournalBlob,
 };
 pub use boundary::SpecFenceInspector;

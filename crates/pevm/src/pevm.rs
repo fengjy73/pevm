@@ -220,6 +220,7 @@ impl Pevm {
             self.finegrain.clear();
         } else {
             self.finegrain.set_deep(false);
+            self.finegrain.set_journal(false);
         }
     }
 
@@ -232,6 +233,21 @@ impl Pevm {
             self.finegrain.set_deep(true);
         } else {
             self.finegrain.set_deep(false);
+            self.finegrain.set_journal(false);
+        }
+    }
+
+    /// Enable/disable interpreter/journal effect stream (implies deep).
+    /// Research flag only — forces opt-in inspect_run for SLOAD/SSTORE logging;
+    /// production default remains off (Handler::run, zero overhead).
+    pub fn set_finegrain_journal(&mut self, enabled: bool) {
+        if enabled {
+            self.finegrain_enabled = true;
+            self.finegrain.clear();
+            self.finegrain.set_deep(true);
+            self.finegrain.set_journal(true);
+        } else {
+            self.finegrain.set_journal(false);
         }
     }
 

@@ -20,7 +20,8 @@ use crate::{
     specfence::{
         AccessMode, CheckpointKind, FfValue, ResolveAction, SpecFenceCtx, StorageWriteReplay,
         TAU_VERY_HIGH, early_val_probability, note_pending_effect_boundary,
-        arm_call_outcome_cache, resume_was_applied, steps_this_run, try_arm_safe_absolute_jump, with_plant_tls,
+        arm_call_outcome_cache, resume_was_applied, steps_this_run, try_arm_safe_absolute_jump,
+        with_plant_tls_journal,
     },
 };
 
@@ -1377,47 +1378,66 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             }
         }
 
-        // R0: Handler::run by default; inspect_run only with SPECFENCE_ENABLE_INSPECT=1.
-        let use_inspect = self.specfence.mode == crate::ConcurrencyMode::SpecFence
-            && !lean
-            && crate::specfence::research_inspect_enabled();
+        // R0: Handler::run by default.
+        // Research: SPECFENCE_ENABLE_INSPECT=1 (SpecFence plant) OR finegrain journal stream.
+        let journal_stream = self
+            .specfence
+            .finegrain
+            .is_some_and(|fg| fg.journal_enabled());
+        let use_inspect = journal_stream
+            || (self.specfence.mode == crate::ConcurrencyMode::SpecFence
+                && !lean
+                && crate::specfence::research_inspect_enabled());
         let run_result = if use_inspect {
             let partial_retry = self.specfence.partial_retry;
             let metrics = self.specfence.metrics;
             let tx_idx = tx_version.tx_idx;
-            with_plant_tls(tx_idx, partial_retry, metrics, || {
-                if rewind_resume {
-                    let jumped = partial_retry.ff_continuation(tx_idx).is_some_and(|cont| {
-                        try_arm_safe_absolute_jump(tx_idx, partial_retry, &cont, metrics)
-                    });
-                    if !jumped {
-                        // M1g: still arm CallOutcome cache on fallback resume so
-                        // certified nested CALLs short-circuit without absolute jump.
-                        if let Some(cont) = partial_retry.ff_continuation(tx_idx) {
-                            if !cont.call_outcomes.is_empty() {
-                                arm_call_outcome_cache(cont.call_outcomes);
+            let incarnation = tx_version.tx_incarnation;
+            let fg = self.specfence.finegrain.filter(|f| f.journal_enabled());
+            let gas_limit = Some(tx.gas_limit);
+            with_plant_tls_journal(
+                tx_idx,
+                incarnation,
+                fg,
+                gas_limit,
+                partial_retry,
+                metrics,
+                || {
+                    // SpecFence plant jump/resume only on non-journal-only research inspect.
+                    let plant_jump = self.specfence.mode == crate::ConcurrencyMode::SpecFence
+                        && !lean
+                        && crate::specfence::research_inspect_enabled();
+                    if plant_jump && rewind_resume {
+                        let jumped = partial_retry.ff_continuation(tx_idx).is_some_and(|cont| {
+                            try_arm_safe_absolute_jump(tx_idx, partial_retry, &cont, metrics)
+                        });
+                        if !jumped {
+                            if let Some(cont) = partial_retry.ff_continuation(tx_idx) {
+                                if !cont.call_outcomes.is_empty() {
+                                    arm_call_outcome_cache(cont.call_outcomes);
+                                }
                             }
-                        }
-                        if let Some(snap) = partial_retry.ff_boundary(tx_idx) {
-                            if snap.opcode_steps > 0 {
-                                metrics.record_pc_resume(snap.opcode_steps);
-                            }
-                        } else {
-                            let n = partial_retry.ff_entries(tx_idx) as u64;
-                            if n > 0 {
-                                metrics.record_pc_resume(n);
+                            if let Some(snap) = partial_retry.ff_boundary(tx_idx) {
+                                if snap.opcode_steps > 0 {
+                                    metrics.record_pc_resume(snap.opcode_steps);
+                                }
+                            } else {
+                                let n = partial_retry.ff_entries(tx_idx) as u64;
+                                if n > 0 {
+                                    metrics.record_pc_resume(n);
+                                }
                             }
                         }
                     }
-                }
-                let result = self.chain.run_pevm_tx(&mut self.evm, true);
-                if rewind_resume {
-                    partial_retry.note_jump_applied(tx_idx, resume_was_applied());
-                }
-                let steps = steps_this_run();
-                metrics.record_inspector_steps(steps, rewind_resume);
-                result
-            })
+                    let result = self.chain.run_pevm_tx(&mut self.evm, true);
+                    if plant_jump && rewind_resume {
+                        partial_retry.note_jump_applied(tx_idx, resume_was_applied());
+                    }
+                    let steps = steps_this_run();
+                    metrics.record_inspector_steps(steps, rewind_resume);
+                    result
+                },
+            )
         } else {
             self.chain.run_pevm_tx(&mut self.evm, false)
         };

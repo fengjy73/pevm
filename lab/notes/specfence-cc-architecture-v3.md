@@ -177,3 +177,30 @@ Maximize useful work / wall time ≈ approach OPT (Bohm-with-perfect-write-sets 
 ## 8. Immediate next coding milestone (only after sign-off on this design)
 
 **Milestone M1:** Bohm-lite version bind + safe selective invalidate + early region validation, with Bayes choosing Wait vs Bind vs Speculate. Success criterion: on the 7 mainnet blocks, SpecFence @8 **≥ OCC @8 on average** *or* clear metric proof that remaining gap is only full-reexec (abort_rate↓, reexec_count↓, wait not exploding). If gap remains with aborts already near zero, revisit wave scheduler next—not more ESTIMATE tweaks.
+
+---
+
+## Addendum — gas-depth discovery (2026-09-06, journal stream)
+
+**Evidence:** `lab/results/effect-raw-journal-stream.*` on 14689597 et al.
+
+### What changed in the EV story
+
+Db-hook effect ordinals put first program cross at **d_eff≈0.86** on 14689597 (late). Interpreter journal stream with mid-tx gas puts the same discovery at **d_gas≈0.11** (early in billed work; **not** ≪1%).
+
+Implications for §3 action selection:
+
+| Action | Under d_eff≈0.86 (old proxy) | Under d_gas≈0.11 (measured) |
+|--------|------------------------------|-----------------------------|
+| **EarlyAbort** | Sunk prefix huge; residual redo small → looked attractive on paper if confusing prefix with suffix | Sunk prefix **small** (~10% gas); residual redo still **~90%** unless Bind/Wait prevents stale |
+| **Wait / Bind** | Needed for fan-out; wait tax compared to tiny residual | **Still primary** on 597-like fan-out; Bind-when-Data-ready wins more often because discovery is gas-early |
+| **SpecRead** | Default when Wait tax high | Only when P(stale) low; gas-early stale discovery makes blind SpecRead worse |
+
+**Control-law delta (no full rewrite yet):**
+
+1. Score EV with **gas depth**, never effect-ordinal depth alone.
+2. On fan-out morphology: first program writer(s) → **WaitHard/Bind** on that ℓ; do not wait for HotSet H_w≥8.
+3. EarlyAbort only if stale already known **and** d_gas small **and** residual ESTIMATE fan-in is high — not as the default discovery response.
+4. RAW **count** vs user ≈3802 remains open (~647 journal); do not retune plant on count parity until grammar aligns.
+
+Flag-off production path unchanged (no inspect / no journal stream).
