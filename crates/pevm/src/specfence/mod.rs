@@ -34,6 +34,8 @@ mod engagement;
 mod prior;
 mod boundary;
 mod dag;
+#[allow(missing_docs)]
+mod finegrain;
 mod heat;
 mod metrics;
 mod region;
@@ -47,6 +49,10 @@ pub(crate) use dag::SpecDag;
 pub(crate) use heat::HeatMap;
 pub(crate) use metrics::MetricsInner;
 pub use metrics::SpecFenceMetrics;
+pub use finegrain::{
+    AbortEvent, DagStats, FineGrainCollector, FineGrainSnapshot, HotLocation, LocationKind,
+    TxRw, analyze_dag, dependency_edges, hot_locations, kind_histogram,
+};
 pub use region::RegionMode;
 pub(crate) use region::RegionTable;
 pub(crate) use rem::RemCounters;
@@ -156,6 +162,8 @@ pub(crate) struct SpecFenceCtx<'a> {
     pub rw_prior: &'a RwPriorMap,
     /// M4 adaptive lean/full engagement (SpecFence only).
     pub engagement: &'a AdaptiveEngagement,
+    /// Opt-in lab fine-grain OCC/RW tracer (None = disabled, zero cost).
+    pub finegrain: Option<&'a crate::specfence::FineGrainCollector>,
 }
 
 impl<'a> SpecFenceCtx<'a> {

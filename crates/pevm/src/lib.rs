@@ -221,7 +221,10 @@ mod pevm;
 pub use pevm::{Pevm, PevmError, PevmResult, execute_revm_sequential};
 mod scheduler;
 pub mod specfence;
-pub use specfence::{ConcurrencyMode, SpecFenceMetrics};
+pub use specfence::{
+    AbortEvent, ConcurrencyMode, DagStats, FineGrainCollector, FineGrainSnapshot, HotLocation,
+    LocationKind, SpecFenceMetrics, TxRw, analyze_dag, hot_locations, kind_histogram,
+};
 mod storage;
 pub use storage::{
     AccountBasic, BlockHashes, Bytecodes, ChainState, EvmAccount, EvmCode, InMemoryStorage,

@@ -98,6 +98,16 @@ impl Scheduler {
         self.aborted.store(true, Ordering::Relaxed);
     }
 
+    /// Final incarnation index per tx after the block (0 = succeeded on first try).
+    pub(crate) fn incarnation_snapshot(&self) -> Vec<usize> {
+        (0..self.block_size)
+            .map(|tx_idx| {
+                let tx = index_mutex!(self.transactions_status, tx_idx);
+                tx.incarnation
+            })
+            .collect()
+    }
+
     fn try_execute(&self, tx_idx: TxIdx) -> Option<TxVersion> {
         if tx_idx < self.block_size {
             let mut tx = index_mutex!(self.transactions_status, tx_idx);

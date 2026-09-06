@@ -27,10 +27,10 @@ use crate::{
     mv_memory::MvMemory,
     scheduler::Scheduler,
     specfence::{
-        AccountHints, AdaptiveEngagement, BayesMap, ConcurrencyMode, DEFAULT_TAU, HeatMap,
-        MetricsInner, PartialRetryTable, RemCounters, RepairPlan, RwPriorMap, SpecDag,
-        SpecFenceCtx, SpecFenceMetrics, WaveParkTable, seed_wait_regions, update_bayes,
-        update_heat, update_rw_prior,
+        AccountHints, AdaptiveEngagement, BayesMap, ConcurrencyMode, DEFAULT_TAU,
+        FineGrainCollector, FineGrainSnapshot, HeatMap, MetricsInner, PartialRetryTable,
+        RemCounters, RepairPlan, RwPriorMap, SpecDag, SpecFenceCtx, SpecFenceMetrics,
+        WaveParkTable, seed_wait_regions, update_bayes, update_heat, update_rw_prior,
     },
     storage::StorageWrapper,
     vm::{
@@ -162,6 +162,9 @@ pub struct Pevm {
     last_initial_wait_accounts: std::collections::HashSet<alloy_primitives::Address>,
     /// M4: abort rate from the previous SpecFence block (`occ_aborts / n_tx`).
     last_abort_rate: f64,
+    /// Lab-only fine-grain RW/abort tracer (off by default).
+    finegrain_enabled: bool,
+    finegrain: FineGrainCollector,
 }
 
 impl Default for Pevm {
@@ -177,6 +180,8 @@ impl Default for Pevm {
             last_metrics: SpecFenceMetrics::default(),
             last_initial_wait_accounts: std::collections::HashSet::new(),
             last_abort_rate: 0.0,
+            finegrain_enabled: false,
+            finegrain: FineGrainCollector::new(),
         }
     }
 }
@@ -203,6 +208,19 @@ impl Pevm {
     /// Metrics from the last parallel execution (OCC/PCC/`SpecFence`).
     pub const fn last_specfence_metrics(&self) -> &SpecFenceMetrics {
         &self.last_metrics
+    }
+
+    /// Enable/disable lab fine-grain RW + abort tracing for subsequent parallel blocks.
+    pub fn set_finegrain_trace(&mut self, enabled: bool) {
+        self.finegrain_enabled = enabled;
+        if enabled {
+            self.finegrain.clear();
+        }
+    }
+
+    /// Take the fine-grain snapshot captured at the end of the last traced parallel block.
+    pub fn take_finegrain_snapshot(&self) -> Option<FineGrainSnapshot> {
+        self.finegrain.take_snapshot()
     }
 
     /// Accounts seeded in Wait at the start of the last parallel block.
@@ -351,6 +369,10 @@ impl Pevm {
         } else {
             AdaptiveEngagement::disabled(block_size)
         };
+        if self.finegrain_enabled {
+            self.finegrain.clear();
+        }
+        let finegrain_ref = self.finegrain_enabled.then_some(&self.finegrain);
         let specfence = SpecFenceCtx {
             mode: self.concurrency_mode,
             hints: &hints,
@@ -365,6 +387,7 @@ impl Pevm {
             wave: &wave,
             rw_prior: &self.rw_prior,
             engagement: &engagement,
+            finegrain: finegrain_ref,
         };
 
         // TODO: Better thread handling
@@ -583,6 +606,10 @@ impl Pevm {
             }
         }
 
+        if self.finegrain_enabled {
+            self.finegrain
+                .capture(&mv_memory, &scheduler, block_env.beneficiary);
+        }
         self.dropper.drop((mv_memory, scheduler));
 
         Ok(fully_evaluated_results)
@@ -907,10 +934,22 @@ fn try_validate(
             return scheduler.finish_validation_fenced(tx_version, true, rewind_to);
         }
         // OCC / PCC: full write-set ESTIMATE (unchanged).
+        let occ_write_locs = mv_memory.write_locations(tx_version.tx_idx);
         mv_memory.convert_writes_to_estimates(tx_version.tx_idx);
         specfence.metrics.record_occ_abort();
         // OCC/PCC abort always restarts interpreter from tx head on next incarnation.
         specfence.metrics.record_full_restart();
+        if let Some(fg) = specfence.finegrain {
+            let cascade = scheduler
+                .block_size()
+                .saturating_sub(tx_version.tx_idx.saturating_add(1));
+            fg.record_abort(
+                tx_version.tx_idx,
+                tx_version.tx_incarnation,
+                occ_write_locs.len(),
+                cascade,
+            );
+        }
         if specfence.mode.uses_regions() {
             for location in &invalid {
                 if mv_memory.regions.promote_location(*location) {
