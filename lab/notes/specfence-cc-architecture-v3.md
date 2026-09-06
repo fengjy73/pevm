@@ -180,27 +180,30 @@ Maximize useful work / wall time ≈ approach OPT (Bohm-with-perfect-write-sets 
 
 ---
 
-## Addendum — gas-depth discovery (2026-09-06, journal stream)
+## Addendum — gross-work discovery (2026-09-06, journal stream)
 
-**Evidence:** `lab/results/effect-raw-journal-stream.*` on 14689597 et al.
+**Evidence:** `lab/results/effect-raw-journal-stream.*` on 14689597 et al.  
+**Detail:** `specfence-evm-cc-first-principles-from-effect-raw.md`
 
 ### What changed in the EV story
 
-Db-hook effect ordinals put first program cross at **d_eff≈0.86** on 14689597 (late). Interpreter journal stream with mid-tx gas puts the same discovery at **d_gas≈0.11** (early in billed work; **not** ≪1%).
+Db-hook effect ordinals: first program cross **d_eff≈0.86** on 14689597 (late).  
+Gas/**limit** fraction: **d_lim≈0.11** — looked “early,” but is an artifact of oversized limits on simple fan-out txs.  
+**Gross-work** `gas_at_cross / tx_gas_used` (preferred): **d_gw p50≈0.94** on 597 — discovery is **late** for the fan-out majority (~448 consumers). Heavy minority (tx38-class) still sees **d_gw≈0.11** / opcode≈0.05. **No ≪1%** gross-work or opcode depth in plant sample.
 
 Implications for §3 action selection:
 
-| Action | Under d_eff≈0.86 (old proxy) | Under d_gas≈0.11 (measured) |
-|--------|------------------------------|-----------------------------|
-| **EarlyAbort** | Sunk prefix huge; residual redo small → looked attractive on paper if confusing prefix with suffix | Sunk prefix **small** (~10% gas); residual redo still **~90%** unless Bind/Wait prevents stale |
-| **Wait / Bind** | Needed for fan-out; wait tax compared to tiny residual | **Still primary** on 597-like fan-out; Bind-when-Data-ready wins more often because discovery is gas-early |
-| **SpecRead** | Default when Wait tax high | Only when P(stale) low; gas-early stale discovery makes blind SpecRead worse |
+| Action | Under d_lim≈0.11 (misleading) | Under d_gw≈0.94 fan-out majority (measured) |
+|--------|-------------------------------|-----------------------------------------------|
+| **EarlyAbort** | Sunk prefix looked small | Sunk prefix **~94%** of billed work → EarlyAbort EV **weak** for majority |
+| **Wait / Bind** | Primary on fan-out | **Still primary**; Bind-when-Data-ready on hot ℓ |
+| **SpecRead** | Risky if “early” stale | Residual redo small after late discovery; still prefer Wait/Bind on hot ℓ |
 
 **Control-law delta (no full rewrite yet):**
 
-1. Score EV with **gas depth**, never effect-ordinal depth alone.
+1. Score EV with **gross-work depth** (`gas_at_cross/tx_gas_used`), never gas/limit or effect-ordinal alone; opcode depth as secondary.
 2. On fan-out morphology: first program writer(s) → **WaitHard/Bind** on that ℓ; do not wait for HotSet H_w≥8.
-3. EarlyAbort only if stale already known **and** d_gas small **and** residual ESTIMATE fan-in is high — not as the default discovery response.
-4. RAW **count** vs user ≈3802 remains open (~647 journal); do not retune plant on count parity until grammar aligns.
+3. EarlyAbort only if stale known **and** d_gw small (heavy-tx class) **and** residual ESTIMATE fan-in high — not default for simple fan-out consumers.
+4. Plant RAW counts are location last-writer instances; do **not** retune plant to match external count tables.
 
 Flag-off production path unchanged (no inspect / no journal stream).

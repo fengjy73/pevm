@@ -8,8 +8,8 @@
     "serial_forced_occ1": {
       "mode": "occ_journal",
       "cores": 1,
-      "elapsed_ms": 18.306852,
-      "tps": 4970.816391589336,
+      "elapsed_ms": 20.144985000000002,
+      "tps": 4517.253301504072,
       "ok": true,
       "error": null,
       "occ_aborts": 0,
@@ -21,14 +21,14 @@
     "occ8": {
       "mode": "occ_journal",
       "cores": 8,
-      "elapsed_ms": 11.490910999999999,
-      "tps": 7919.302481761455,
+      "elapsed_ms": 11.120073,
+      "tps": 8183.399515452822,
       "ok": true,
       "error": null,
       "occ_aborts": 11,
       "abort_rate": 0.12087912087912088,
-      "evm_entries": 373,
-      "reexec_entry_frac": 0.7560321715817694,
+      "evm_entries": 127,
+      "reexec_entry_frac": 0.28346456692913385,
       "max_incarnation": 4
     },
     "effect": {
@@ -46,8 +46,8 @@
       "depth_mean": 0.4179017488876644,
       "frac_depth_lt_0_01": 0.0,
       "ma_redo_cost": 12.0,
-      "md_redo_cost": 7.212349525901599,
-      "redo_saved": 4.787650474098401,
+      "md_redo_cost": 5.144839343428989,
+      "redo_saved": 6.855160656571011,
       "wait_added": 1.3681318681318684,
       "n_consumers_with_program_cross": 12,
       "n_unique_pcl": 27,
@@ -58,6 +58,20 @@
       "gas_depth_mean": 0.39897087284153354,
       "frac_gas_depth_lt_0_01": 0.0,
       "n_consumers_with_gas_depth": 12,
+      "gross_work_depth_p10": 0.3520736743832777,
+      "gross_work_depth_p50": 0.5387800566627116,
+      "gross_work_depth_p90": 0.9282249915796564,
+      "gross_work_depth_mean": 0.571263388047584,
+      "frac_gross_work_lt_0_01": 0.0,
+      "n_consumers_with_gross_work": 12,
+      "opcode_depth_p50": 0.2819614711033275,
+      "frac_opcode_lt_0_01": 0.0,
+      "journal_reads": 833,
+      "journal_reads_cross": 32,
+      "journal_reads_no_prior": 801,
+      "sload_account_grain_cross": 83,
+      "journal_sstore": 248,
+      "journal_account_writes": 86,
       "journal_mode": true
     },
     "effect_occ8": {
@@ -75,8 +89,8 @@
       "depth_mean": 0.45097881205435625,
       "frac_depth_lt_0_01": 0.0,
       "ma_redo_cost": 11.0,
-      "md_redo_cost": 7.0876765259016,
-      "redo_saved": 3.9123234740984003,
+      "md_redo_cost": 5.144839343428989,
+      "redo_saved": 5.855160656571011,
       "wait_added": 1.3681318681318682,
       "n_consumers_with_program_cross": 11,
       "n_unique_pcl": 28,
@@ -87,6 +101,20 @@
       "gas_depth_mean": 0.355665770372582,
       "frac_gas_depth_lt_0_01": 0.0,
       "n_consumers_with_gas_depth": 11,
+      "gross_work_depth_p10": 0.3520736743832777,
+      "gross_work_depth_p50": 0.48281246611290635,
+      "gross_work_depth_p90": 0.9281669250994404,
+      "gross_work_depth_mean": 0.5322873324155463,
+      "frac_gross_work_lt_0_01": 0.0,
+      "n_consumers_with_gross_work": 11,
+      "opcode_depth_p50": 0.2819614711033275,
+      "frac_opcode_lt_0_01": 0.0,
+      "journal_reads": 1254,
+      "journal_reads_cross": 32,
+      "journal_reads_no_prior": 1222,
+      "sload_account_grain_cross": 93,
+      "journal_sstore": 377,
+      "journal_account_writes": 152,
       "journal_mode": true
     },
     "kind_hist": {
@@ -107,7 +135,8 @@
       "kind": "basic",
       "class": "handler",
       "gas_used_so_far": null,
-      "opcode_steps": 1
+      "opcode_steps": 1,
+      "gross_work_so_far": null
     },
     {
       "producer_tx": 1,
@@ -120,7 +149,8 @@
       "kind": "basic",
       "class": "handler",
       "gas_used_so_far": null,
-      "opcode_steps": 1
+      "opcode_steps": 1,
+      "gross_work_so_far": null
     },
     {
       "producer_tx": 22,
@@ -133,11 +163,12 @@
       "kind": "basic",
       "class": "handler",
       "gas_used_so_far": null,
-      "opcode_steps": 1
+      "opcode_steps": 1,
+      "gross_work_so_far": null
     },
     {
       "producer_tx": 18,
-      "producer_effect_k": 52,
+      "producer_effect_k": 58,
       "producer_incarnation": 0,
       "consumer_tx": 25,
       "consumer_effect_k": 4,
@@ -146,11 +177,12 @@
       "kind": "storage",
       "class": "program",
       "gas_used_so_far": 25148,
-      "opcode_steps": 165
+      "opcode_steps": 165,
+      "gross_work_so_far": 25148
     },
     {
       "producer_tx": 18,
-      "producer_effect_k": 62,
+      "producer_effect_k": 70,
       "producer_incarnation": 0,
       "consumer_tx": 25,
       "consumer_effect_k": 7,
@@ -159,11 +191,12 @@
       "kind": "basic",
       "class": "handler",
       "gas_used_so_far": null,
-      "opcode_steps": 7
+      "opcode_steps": 7,
+      "gross_work_so_far": null
     },
     {
       "producer_tx": 18,
-      "producer_effect_k": 52,
+      "producer_effect_k": 58,
       "producer_incarnation": 0,
       "consumer_tx": 25,
       "consumer_effect_k": 10,
@@ -172,11 +205,12 @@
       "kind": "storage",
       "class": "program",
       "gas_used_so_far": 65444,
-      "opcode_steps": 849
+      "opcode_steps": 849,
+      "gross_work_so_far": 65444
     },
     {
       "producer_tx": 18,
-      "producer_effect_k": 52,
+      "producer_effect_k": 58,
       "producer_incarnation": 0,
       "consumer_tx": 25,
       "consumer_effect_k": 70,
@@ -185,11 +219,12 @@
       "kind": "storage",
       "class": "program",
       "gas_used_so_far": 187828,
-      "opcode_steps": 5882
+      "opcode_steps": 5882,
+      "gross_work_so_far": 187828
     },
     {
       "producer_tx": 25,
-      "producer_effect_k": 17,
+      "producer_effect_k": 2,
       "producer_incarnation": 0,
       "consumer_tx": 28,
       "consumer_effect_k": 84,
@@ -198,7 +233,8 @@
       "kind": "basic",
       "class": "handler",
       "gas_used_so_far": null,
-      "opcode_steps": 84
+      "opcode_steps": 84,
+      "gross_work_so_far": null
     },
     {
       "producer_tx": 16,
@@ -211,7 +247,8 @@
       "kind": "storage",
       "class": "program",
       "gas_used_so_far": 22262,
-      "opcode_steps": 161
+      "opcode_steps": 161,
+      "gross_work_so_far": 22262
     },
     {
       "producer_tx": 16,
@@ -224,11 +261,12 @@
       "kind": "storage",
       "class": "program",
       "gas_used_so_far": 22262,
-      "opcode_steps": 161
+      "opcode_steps": 161,
+      "gross_work_so_far": 22262
     },
     {
       "producer_tx": 28,
-      "producer_effect_k": 38,
+      "producer_effect_k": 46,
       "producer_incarnation": 0,
       "consumer_tx": 45,
       "consumer_effect_k": 3,
@@ -237,7 +275,8 @@
       "kind": "basic",
       "class": "handler",
       "gas_used_so_far": null,
-      "opcode_steps": 3
+      "opcode_steps": 3,
+      "gross_work_so_far": null
     },
     {
       "producer_tx": 16,
@@ -250,7 +289,8 @@
       "kind": "storage",
       "class": "program",
       "gas_used_so_far": 22262,
-      "opcode_steps": 161
+      "opcode_steps": 161,
+      "gross_work_so_far": 22262
     },
     {
       "producer_tx": 16,
@@ -263,7 +303,8 @@
       "kind": "storage",
       "class": "program",
       "gas_used_so_far": 22262,
-      "opcode_steps": 161
+      "opcode_steps": 161,
+      "gross_work_so_far": 22262
     },
     {
       "producer_tx": 54,
@@ -276,7 +317,8 @@
       "kind": "basic",
       "class": "handler",
       "gas_used_so_far": null,
-      "opcode_steps": 1
+      "opcode_steps": 1,
+      "gross_work_so_far": null
     },
     {
       "producer_tx": 16,
@@ -289,11 +331,12 @@
       "kind": "storage",
       "class": "program",
       "gas_used_so_far": 22250,
-      "opcode_steps": 161
+      "opcode_steps": 161,
+      "gross_work_so_far": 22250
     },
     {
       "producer_tx": 62,
-      "producer_effect_k": 0,
+      "producer_effect_k": 9,
       "producer_incarnation": 0,
       "consumer_tx": 64,
       "consumer_effect_k": 3,
@@ -302,7 +345,8 @@
       "kind": "basic",
       "class": "handler",
       "gas_used_so_far": null,
-      "opcode_steps": 3
+      "opcode_steps": 3,
+      "gross_work_so_far": null
     },
     {
       "producer_tx": 65,
@@ -315,7 +359,8 @@
       "kind": "storage",
       "class": "program",
       "gas_used_so_far": 27535,
-      "opcode_steps": 220
+      "opcode_steps": 220,
+      "gross_work_so_far": 27535
     },
     {
       "producer_tx": 66,
@@ -328,7 +373,8 @@
       "kind": "storage",
       "class": "program",
       "gas_used_so_far": 27559,
-      "opcode_steps": 220
+      "opcode_steps": 220,
+      "gross_work_so_far": 27559
     },
     {
       "producer_tx": 16,
@@ -341,11 +387,12 @@
       "kind": "storage",
       "class": "program",
       "gas_used_so_far": 22274,
-      "opcode_steps": 161
+      "opcode_steps": 161,
+      "gross_work_so_far": 22274
     },
     {
       "producer_tx": 64,
-      "producer_effect_k": 23,
+      "producer_effect_k": 46,
       "producer_incarnation": 0,
       "consumer_tx": 75,
       "consumer_effect_k": 1,
@@ -354,11 +401,12 @@
       "kind": "basic",
       "class": "handler",
       "gas_used_so_far": null,
-      "opcode_steps": 1
+      "opcode_steps": 1,
+      "gross_work_so_far": null
     },
     {
       "producer_tx": 64,
-      "producer_effect_k": 13,
+      "producer_effect_k": 48,
       "producer_incarnation": 0,
       "consumer_tx": 75,
       "consumer_effect_k": 3,
@@ -367,7 +415,8 @@
       "kind": "basic",
       "class": "handler",
       "gas_used_so_far": null,
-      "opcode_steps": 3
+      "opcode_steps": 3,
+      "gross_work_so_far": null
     },
     {
       "producer_tx": 72,
@@ -380,7 +429,8 @@
       "kind": "storage",
       "class": "program",
       "gas_used_so_far": 1750654,
-      "opcode_steps": 622
+      "opcode_steps": 622,
+      "gross_work_so_far": 1750654
     },
     {
       "producer_tx": 72,
@@ -393,7 +443,8 @@
       "kind": "storage",
       "class": "program",
       "gas_used_so_far": 1762108,
-      "opcode_steps": 858
+      "opcode_steps": 858,
+      "gross_work_so_far": 1762108
     },
     {
       "producer_tx": 72,
@@ -406,7 +457,8 @@
       "kind": "storage",
       "class": "program",
       "gas_used_so_far": 1750654,
-      "opcode_steps": 1577
+      "opcode_steps": 1577,
+      "gross_work_so_far": 1750654
     },
     {
       "producer_tx": 72,
@@ -419,7 +471,8 @@
       "kind": "storage",
       "class": "program",
       "gas_used_so_far": 1752108,
-      "opcode_steps": 1813
+      "opcode_steps": 1813,
+      "gross_work_so_far": 1752108
     },
     {
       "producer_tx": 72,
@@ -432,7 +485,8 @@
       "kind": "storage",
       "class": "program",
       "gas_used_so_far": 1750654,
-      "opcode_steps": 2532
+      "opcode_steps": 2532,
+      "gross_work_so_far": 1750654
     },
     {
       "producer_tx": 72,
@@ -445,7 +499,8 @@
       "kind": "storage",
       "class": "program",
       "gas_used_so_far": 1752108,
-      "opcode_steps": 2768
+      "opcode_steps": 2768,
+      "gross_work_so_far": 1752108
     },
     {
       "producer_tx": 72,
@@ -458,7 +513,8 @@
       "kind": "storage",
       "class": "program",
       "gas_used_so_far": 1750654,
-      "opcode_steps": 3487
+      "opcode_steps": 3487,
+      "gross_work_so_far": 1750654
     },
     {
       "producer_tx": 72,
@@ -471,7 +527,8 @@
       "kind": "storage",
       "class": "program",
       "gas_used_so_far": 1752108,
-      "opcode_steps": 3723
+      "opcode_steps": 3723,
+      "gross_work_so_far": 1752108
     },
     {
       "producer_tx": 72,
@@ -484,7 +541,8 @@
       "kind": "storage",
       "class": "program",
       "gas_used_so_far": 1750654,
-      "opcode_steps": 4442
+      "opcode_steps": 4442,
+      "gross_work_so_far": 1750654
     },
     {
       "producer_tx": 72,
@@ -497,7 +555,8 @@
       "kind": "storage",
       "class": "program",
       "gas_used_so_far": 1752108,
-      "opcode_steps": 4678
+      "opcode_steps": 4678,
+      "gross_work_so_far": 1752108
     },
     {
       "producer_tx": 68,
@@ -510,7 +569,8 @@
       "kind": "storage",
       "class": "program",
       "gas_used_so_far": 1763586,
-      "opcode_steps": 11536
+      "opcode_steps": 11536,
+      "gross_work_so_far": 1763586
     },
     {
       "producer_tx": 68,
@@ -523,7 +583,8 @@
       "kind": "storage",
       "class": "program",
       "gas_used_so_far": 1768126,
-      "opcode_steps": 11614
+      "opcode_steps": 11614,
+      "gross_work_so_far": 1768126
     },
     {
       "producer_tx": 68,
@@ -536,7 +597,8 @@
       "kind": "storage",
       "class": "program",
       "gas_used_so_far": 1768372,
-      "opcode_steps": 11647
+      "opcode_steps": 11647,
+      "gross_work_so_far": 1768372
     },
     {
       "producer_tx": 68,
@@ -549,7 +611,8 @@
       "kind": "storage",
       "class": "program",
       "gas_used_so_far": 1768685,
-      "opcode_steps": 11698
+      "opcode_steps": 11698,
+      "gross_work_so_far": 1768685
     },
     {
       "producer_tx": 68,
@@ -562,7 +625,8 @@
       "kind": "storage",
       "class": "program",
       "gas_used_so_far": 1755187,
-      "opcode_steps": 12559
+      "opcode_steps": 12559,
+      "gross_work_so_far": 1755187
     },
     {
       "producer_tx": 68,
@@ -575,7 +639,8 @@
       "kind": "storage",
       "class": "program",
       "gas_used_so_far": 1757727,
-      "opcode_steps": 12637
+      "opcode_steps": 12637,
+      "gross_work_so_far": 1757727
     },
     {
       "producer_tx": 68,
@@ -588,7 +653,8 @@
       "kind": "storage",
       "class": "program",
       "gas_used_so_far": 1757973,
-      "opcode_steps": 12670
+      "opcode_steps": 12670,
+      "gross_work_so_far": 1757973
     },
     {
       "producer_tx": 68,
@@ -601,11 +667,12 @@
       "kind": "storage",
       "class": "program",
       "gas_used_so_far": 1758286,
-      "opcode_steps": 12721
+      "opcode_steps": 12721,
+      "gross_work_so_far": 1758286
     },
     {
       "producer_tx": 45,
-      "producer_effect_k": 1,
+      "producer_effect_k": 3,
       "producer_incarnation": 0,
       "consumer_tx": 85,
       "consumer_effect_k": 21,
@@ -614,7 +681,8 @@
       "kind": "basic",
       "class": "handler",
       "gas_used_so_far": null,
-      "opcode_steps": 21
+      "opcode_steps": 21,
+      "gross_work_so_far": null
     },
     {
       "producer_tx": 85,
@@ -627,11 +695,12 @@
       "kind": "storage",
       "class": "program",
       "gas_used_so_far": 79261,
-      "opcode_steps": 5645
+      "opcode_steps": 5645,
+      "gross_work_so_far": 79261
     },
     {
       "producer_tx": 45,
-      "producer_effect_k": 1,
+      "producer_effect_k": 3,
       "producer_incarnation": 0,
       "consumer_tx": 88,
       "consumer_effect_k": 21,
@@ -640,7 +709,8 @@
       "kind": "basic",
       "class": "handler",
       "gas_used_so_far": null,
-      "opcode_steps": 21
+      "opcode_steps": 21,
+      "gross_work_so_far": null
     },
     {
       "producer_tx": 85,
@@ -653,7 +723,8 @@
       "kind": "storage",
       "class": "program",
       "gas_used_so_far": 108580,
-      "opcode_steps": 6591
+      "opcode_steps": 6591,
+      "gross_work_so_far": 108580
     },
     {
       "producer_tx": 72,
@@ -666,7 +737,8 @@
       "kind": "storage",
       "class": "program",
       "gas_used_so_far": 22250,
-      "opcode_steps": 161
+      "opcode_steps": 161,
+      "gross_work_so_far": 22250
     }
   ],
   "sample_consumer_first_cross": [
@@ -680,8 +752,13 @@
       "total_write_effects": 6,
       "gas_used": 72505,
       "gas_limit": 414417,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 1312,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 1,
@@ -693,8 +770,13 @@
       "total_write_effects": 6,
       "gas_used": 34623,
       "gas_limit": 52473,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 317,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 2,
@@ -706,8 +788,13 @@
       "total_write_effects": 6,
       "gas_used": 51800,
       "gas_limit": 78289,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 358,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 3,
@@ -719,8 +806,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 50000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 4,
@@ -732,8 +824,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 22000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 5,
@@ -745,8 +842,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 100000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 6,
@@ -758,8 +860,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 100000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 7,
@@ -771,8 +878,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 100000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 8,
@@ -784,8 +896,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 100000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 9,
@@ -797,8 +914,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 100000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 10,
@@ -810,8 +932,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 100000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 11,
@@ -823,8 +950,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 100000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 12,
@@ -836,8 +968,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 21000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 13,
@@ -849,8 +986,13 @@
       "total_write_effects": 5,
       "gas_used": 39848,
       "gas_limit": 44934,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 506,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 14,
@@ -862,8 +1004,13 @@
       "total_write_effects": 16,
       "gas_used": 121782,
       "gas_limit": 491696,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 3619,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 15,
@@ -875,8 +1022,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 29400,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 16,
@@ -888,8 +1040,13 @@
       "total_write_effects": 6,
       "gas_used": 58409,
       "gas_limit": 94813,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 571,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 17,
@@ -901,8 +1058,13 @@
       "total_write_effects": 2,
       "gas_used": 21004,
       "gas_limit": 28000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 18,
@@ -911,11 +1073,16 @@
       "first_program_cross_location": null,
       "first_program_producer_tx": null,
       "total_db_effects": 227,
-      "total_write_effects": 69,
+      "total_write_effects": 76,
       "gas_used": 398389,
       "gas_limit": 589104,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 32467,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 19,
@@ -927,8 +1094,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 21000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 20,
@@ -940,8 +1112,13 @@
       "total_write_effects": 4,
       "gas_used": 46595,
       "gas_limit": 56373,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 216,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 21,
@@ -953,8 +1130,13 @@
       "total_write_effects": 4,
       "gas_used": 76054,
       "gas_limit": 1786064,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 2172,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 22,
@@ -966,8 +1148,13 @@
       "total_write_effects": 5,
       "gas_used": 40316,
       "gas_limit": 220976,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 607,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 23,
@@ -979,8 +1166,13 @@
       "total_write_effects": 4,
       "gas_used": 37977,
       "gas_limit": 220976,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 574,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 24,
@@ -992,8 +1184,13 @@
       "total_write_effects": 6,
       "gas_used": 108910,
       "gas_limit": 1778896,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 1573,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 25,
@@ -1005,8 +1202,13 @@
       "total_write_effects": 21,
       "gas_used": 162540,
       "gas_limit": 217035,
+      "first_program_cross_gas": 25148,
+      "first_program_cross_opcode_steps": 165,
+      "total_opcode_steps": 5888,
       "depth_frac_effects": 0.056338028169014086,
-      "depth_frac_gas": 0.1158707120971272
+      "depth_frac_gas": 0.1158707120971272,
+      "depth_frac_gross_work": 0.15471883843976866,
+      "depth_frac_opcode": 0.028023097826086956
     },
     {
       "tx_idx": 26,
@@ -1015,11 +1217,16 @@
       "first_program_cross_location": null,
       "first_program_producer_tx": null,
       "total_db_effects": 27,
-      "total_write_effects": 7,
+      "total_write_effects": 8,
       "gas_used": 90785,
       "gas_limit": 347008,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 2092,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 27,
@@ -1031,8 +1238,13 @@
       "total_write_effects": 4,
       "gas_used": 46719,
       "gas_limit": 56523,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 253,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 28,
@@ -1041,11 +1253,16 @@
       "first_program_cross_location": null,
       "first_program_producer_tx": null,
       "total_db_effects": 164,
-      "total_write_effects": 48,
+      "total_write_effects": 55,
       "gas_used": 255191,
       "gas_limit": 545977,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 14928,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 29,
@@ -1057,8 +1274,13 @@
       "total_write_effects": 6,
       "gas_used": 62260,
       "gas_limit": 94117,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 601,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 30,
@@ -1070,8 +1292,13 @@
       "total_write_effects": 6,
       "gas_used": 44284,
       "gas_limit": 310000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 1046,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 31,
@@ -1083,8 +1310,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 21000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 32,
@@ -1096,8 +1328,13 @@
       "total_write_effects": 6,
       "gas_used": 30177,
       "gas_limit": 41979,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 315,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 33,
@@ -1109,8 +1346,13 @@
       "total_write_effects": 6,
       "gas_used": 51405,
       "gas_limit": 100000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 238,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 34,
@@ -1122,8 +1364,13 @@
       "total_write_effects": 6,
       "gas_used": 44601,
       "gas_limit": 44980,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 1142,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 35,
@@ -1135,8 +1382,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 21000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 36,
@@ -1148,8 +1400,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 21000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 37,
@@ -1161,8 +1418,13 @@
       "total_write_effects": 6,
       "gas_used": 51478,
       "gas_limit": 78000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 261,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 38,
@@ -1174,8 +1436,13 @@
       "total_write_effects": 6,
       "gas_used": 46109,
       "gas_limit": 84000,
+      "first_program_cross_gas": 22262,
+      "first_program_cross_opcode_steps": 161,
+      "total_opcode_steps": 571,
       "depth_frac_effects": 0.36363636363636365,
-      "depth_frac_gas": 0.26502380952380955
+      "depth_frac_gas": 0.26502380952380955,
+      "depth_frac_gross_work": 0.48281246611290635,
+      "depth_frac_opcode": 0.2819614711033275
     },
     {
       "tx_idx": 39,
@@ -1187,8 +1454,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 21000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 40,
@@ -1200,8 +1472,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 21000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 41,
@@ -1213,8 +1490,13 @@
       "total_write_effects": 6,
       "gas_used": 57460,
       "gas_limit": 63044,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 601,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 42,
@@ -1226,8 +1508,13 @@
       "total_write_effects": 6,
       "gas_used": 51945,
       "gas_limit": 52734,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 354,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 43,
@@ -1239,8 +1526,13 @@
       "total_write_effects": 6,
       "gas_used": 63209,
       "gas_limit": 64043,
+      "first_program_cross_gas": 22262,
+      "first_program_cross_opcode_steps": 161,
+      "total_opcode_steps": 571,
       "depth_frac_effects": 0.36363636363636365,
-      "depth_frac_gas": 0.34761019939727994
+      "depth_frac_gas": 0.34761019939727994,
+      "depth_frac_gross_work": 0.35219668085241024,
+      "depth_frac_opcode": 0.2819614711033275
     },
     {
       "tx_idx": 44,
@@ -1252,8 +1544,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 21000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 45,
@@ -1262,11 +1559,16 @@
       "first_program_cross_location": null,
       "first_program_producer_tx": null,
       "total_db_effects": 6,
-      "total_write_effects": 5,
+      "total_write_effects": 6,
       "gas_used": 30404,
       "gas_limit": 41601,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 180,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 46,
@@ -1278,8 +1580,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 90000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 47,
@@ -1291,8 +1598,13 @@
       "total_write_effects": 6,
       "gas_used": 63209,
       "gas_limit": 128086,
+      "first_program_cross_gas": 22262,
+      "first_program_cross_opcode_steps": 161,
+      "total_opcode_steps": 571,
       "depth_frac_effects": 0.36363636363636365,
-      "depth_frac_gas": 0.17380509969863997
+      "depth_frac_gas": 0.17380509969863997,
+      "depth_frac_gross_work": 0.35219668085241024,
+      "depth_frac_opcode": 0.2819614711033275
     },
     {
       "tx_idx": 48,
@@ -1304,8 +1616,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 24150,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 49,
@@ -1317,8 +1634,13 @@
       "total_write_effects": 12,
       "gas_used": 63150,
       "gas_limit": 89051,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 1536,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 50,
@@ -1330,8 +1652,13 @@
       "total_write_effects": 6,
       "gas_used": 46109,
       "gas_limit": 70000,
+      "first_program_cross_gas": 22262,
+      "first_program_cross_opcode_steps": 161,
+      "total_opcode_steps": 571,
       "depth_frac_effects": 0.36363636363636365,
-      "depth_frac_gas": 0.31802857142857144
+      "depth_frac_gas": 0.31802857142857144,
+      "depth_frac_gross_work": 0.48281246611290635,
+      "depth_frac_opcode": 0.2819614711033275
     },
     {
       "tx_idx": 51,
@@ -1343,8 +1670,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 24150,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 52,
@@ -1356,8 +1688,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 21000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 53,
@@ -1369,8 +1706,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 207128,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 54,
@@ -1382,8 +1724,13 @@
       "total_write_effects": 6,
       "gas_used": 34752,
       "gas_limit": 207128,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 366,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 55,
@@ -1395,8 +1742,13 @@
       "total_write_effects": 6,
       "gas_used": 63197,
       "gas_limit": 220436,
+      "first_program_cross_gas": 22250,
+      "first_program_cross_opcode_steps": 161,
+      "total_opcode_steps": 571,
       "depth_frac_effects": 0.36363636363636365,
-      "depth_frac_gas": 0.10093632618991454
+      "depth_frac_gas": 0.10093632618991454,
+      "depth_frac_gross_work": 0.3520736743832777,
+      "depth_frac_opcode": 0.2819614711033275
     },
     {
       "tx_idx": 56,
@@ -1408,8 +1760,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 105000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 57,
@@ -1421,8 +1778,13 @@
       "total_write_effects": 4,
       "gas_used": 46723,
       "gas_limit": 54171,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 253,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 58,
@@ -1434,8 +1796,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 24150,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 59,
@@ -1447,8 +1814,13 @@
       "total_write_effects": 2,
       "gas_used": 21000,
       "gas_limit": 21000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 60,
@@ -1460,8 +1832,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 53793,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 61,
@@ -1473,8 +1850,13 @@
       "total_write_effects": 24,
       "gas_used": 238665,
       "gas_limit": 250651,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 4865,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 62,
@@ -1483,11 +1865,16 @@
       "first_program_cross_location": null,
       "first_program_producer_tx": null,
       "total_db_effects": 33,
-      "total_write_effects": 8,
+      "total_write_effects": 17,
       "gas_used": 118519,
       "gas_limit": 2000000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 6672,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 63,
@@ -1499,8 +1886,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 21000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 64,
@@ -1509,11 +1901,16 @@
       "first_program_cross_location": null,
       "first_program_producer_tx": null,
       "total_db_effects": 54,
-      "total_write_effects": 27,
+      "total_write_effects": 50,
       "gas_used": 273782,
       "gas_limit": 2000000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 3477,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 65,
@@ -1525,8 +1922,13 @@
       "total_write_effects": 6,
       "gas_used": 29678,
       "gas_limit": 34479,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 278,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 66,
@@ -1538,8 +1940,13 @@
       "total_write_effects": 6,
       "gas_used": 29666,
       "gas_limit": 34467,
+      "first_program_cross_gas": 27535,
+      "first_program_cross_opcode_steps": 220,
+      "total_opcode_steps": 278,
       "depth_frac_effects": 0.8333333333333334,
-      "depth_frac_gas": 0.7988800882003075
+      "depth_frac_gas": 0.7988800882003075,
+      "depth_frac_gross_work": 0.9281669250994404,
+      "depth_frac_opcode": 0.7913669064748201
     },
     {
       "tx_idx": 67,
@@ -1551,8 +1958,13 @@
       "total_write_effects": 6,
       "gas_used": 29690,
       "gas_limit": 34491,
+      "first_program_cross_gas": 27559,
+      "first_program_cross_opcode_steps": 220,
+      "total_opcode_steps": 278,
       "depth_frac_effects": 0.8333333333333334,
-      "depth_frac_gas": 0.7990200342118233
+      "depth_frac_gas": 0.7990200342118233,
+      "depth_frac_gross_work": 0.9282249915796564,
+      "depth_frac_opcode": 0.7913669064748201
     },
     {
       "tx_idx": 68,
@@ -1564,8 +1976,13 @@
       "total_write_effects": 6,
       "gas_used": 40384,
       "gas_limit": 45782,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 601,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 69,
@@ -1577,8 +1994,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 21000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 70,
@@ -1590,8 +2012,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 21000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 71,
@@ -1603,8 +2030,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 21000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 72,
@@ -1616,8 +2048,13 @@
       "total_write_effects": 6,
       "gas_used": 41321,
       "gas_limit": 46237,
+      "first_program_cross_gas": 22274,
+      "first_program_cross_opcode_steps": 161,
+      "total_opcode_steps": 571,
       "depth_frac_effects": 0.36363636363636365,
-      "depth_frac_gas": 0.4817354067089128
+      "depth_frac_gas": 0.4817354067089128,
+      "depth_frac_gross_work": 0.5390479417245468,
+      "depth_frac_opcode": 0.2819614711033275
     },
     {
       "tx_idx": 73,
@@ -1629,8 +2066,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 21000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 74,
@@ -1642,8 +2084,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 21000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 75,
@@ -1655,8 +2102,13 @@
       "total_write_effects": 80,
       "gas_used": 652302,
       "gas_limit": 2000000,
+      "first_program_cross_gas": 1750654,
+      "first_program_cross_opcode_steps": 622,
+      "total_opcode_steps": 18759,
       "depth_frac_effects": 0.05405405405405406,
-      "depth_frac_gas": 0.875327
+      "depth_frac_gas": 0.875327,
+      "depth_frac_gross_work": 1.0,
+      "depth_frac_opcode": 0.033157417772802386
     },
     {
       "tx_idx": 76,
@@ -1668,8 +2120,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 21000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 77,
@@ -1681,8 +2138,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 21000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 78,
@@ -1694,8 +2156,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 21000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 79,
@@ -1707,8 +2174,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 21000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 80,
@@ -1720,8 +2192,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 21000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 81,
@@ -1733,8 +2210,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 21000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 82,
@@ -1746,8 +2228,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 21000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 83,
@@ -1759,8 +2246,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 21000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 84,
@@ -1772,8 +2264,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 21000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 85,
@@ -1785,8 +2282,13 @@
       "total_write_effects": 18,
       "gas_used": 97390,
       "gas_limit": 300014,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 3664,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 86,
@@ -1798,8 +2300,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 21000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 87,
@@ -1811,8 +2318,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 21000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 88,
@@ -1824,8 +2336,13 @@
       "total_write_effects": 16,
       "gas_used": 106515,
       "gas_limit": 300014,
+      "first_program_cross_gas": 79261,
+      "first_program_cross_opcode_steps": 5645,
+      "total_opcode_steps": 6968,
       "depth_frac_effects": 0.6923076923076923,
-      "depth_frac_gas": 0.26419100441979376
+      "depth_frac_gas": 0.26419100441979376,
+      "depth_frac_gross_work": 0.744129934750974,
+      "depth_frac_opcode": 0.8101320321469575
     },
     {
       "tx_idx": 89,
@@ -1837,8 +2354,13 @@
       "total_write_effects": 3,
       "gas_used": 21000,
       "gas_limit": 90000,
+      "first_program_cross_gas": null,
+      "first_program_cross_opcode_steps": null,
+      "total_opcode_steps": 0,
       "depth_frac_effects": null,
-      "depth_frac_gas": null
+      "depth_frac_gas": null,
+      "depth_frac_gross_work": null,
+      "depth_frac_opcode": null
     },
     {
       "tx_idx": 90,
@@ -1850,10 +2372,15 @@
       "total_write_effects": 6,
       "gas_used": 41297,
       "gas_limit": 90000,
+      "first_program_cross_gas": 22250,
+      "first_program_cross_opcode_steps": 161,
+      "total_opcode_steps": 571,
       "depth_frac_effects": 0.36363636363636365,
-      "depth_frac_gas": 0.24722222222222223
+      "depth_frac_gas": 0.24722222222222223,
+      "depth_frac_gross_work": 0.5387800566627116,
+      "depth_frac_opcode": 0.2819614711033275
     }
   ],
   "abort_events_sample": [],
-  "gap_note": "block 19606598: effect_RAW=44 prog=32 hand=12; final_RW=3; fanout_prog=6; depth_p50=0.3636"
+  "gap_note": "block 19606598: pevm/revm journal_RAW=44 (prog=32 hand=12); final_RW=3; unique_pcl=27; mean_effects/pcl=1.63; journal_reads=833 cross=32 no_prior=801 acct_grain=83; sstore=248 acct_writes=86; gross_work_p50=0.5388 frac≪1%=0.000; gas/limit_p50=0.3180; opcode_p50=0.2820. Counts are plant-observed (location last-writer RAW); external tables are not targets."
 }

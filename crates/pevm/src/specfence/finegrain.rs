@@ -11,7 +11,9 @@
 //! **Journal stream** (`set_finegrain_journal(true)`): implies deep + drives
 //! opt-in `inspect_run` so every interpreter SLOAD/SSTORE/BALANCE/EXT* is
 //! logged (including journal-cached repeats invisible to Db hooks), with live
-//! write ordinals and mid-tx gas. Research only — production default off.
+//! write ordinals and mid-tx **gross-work** (gas_used_so_far / tx_gas_used).
+//! Emits **one RawEffectEdge per cross-tx read instance** — no (p,c,ℓ) dedupe.
+//! Research only — production default off.
 
 use std::sync::Mutex;
 
@@ -94,7 +96,11 @@ impl EffectClass {
     }
 }
 
-/// One producer-effect → consumer-read observation (deep mode).
+/// One producer-effect → consumer-read observation (deep / journal mode).
+///
+/// **Instance semantics:** each cross-tx read that observes a foreign version
+/// yields its own edge — including repeated reads of the same `(p,c,ℓ)`.
+/// Collectors must never HashSet-dedupe on `(producer,consumer,location)`.
 #[derive(Debug, Clone, Serialize)]
 pub struct RawEffectEdge {
     pub producer_tx: usize,
@@ -107,10 +113,12 @@ pub struct RawEffectEdge {
     pub kind: String,
     /// `program` | `handler`
     pub class: String,
-    /// Optional mid-tx gas proxy at discovery (None unless inspect supplies it).
+    /// Cumulative gas billed in the consumer tx at this opcode (limit − remaining).
     pub gas_used_so_far: Option<u64>,
     /// Opcode/step counter if available (else mirrors consumer_effect_k).
     pub opcode_steps: Option<usize>,
+    /// `gas_used_so_far` at this read — alias for gross-work numerator when set.
+    pub gross_work_so_far: Option<u64>,
 }
 
 /// Per-consumer depth of first cross-tx program read (deep mode).
@@ -122,16 +130,28 @@ pub struct ConsumerFirstCross {
     pub first_program_cross_k: Option<usize>,
     pub first_program_cross_location: Option<u64>,
     pub first_program_producer_tx: Option<usize>,
-    /// Total world-state DB effects observed this incarnation (read calls).
+    /// Total world-state DB / journal read effects observed this incarnation.
     pub total_db_effects: usize,
     /// Total journal write effects registered for this incarnation.
     pub total_write_effects: usize,
     pub gas_used: Option<u64>,
     pub gas_limit: Option<u64>,
+    /// Gas billed at first program cross (numerator for gross-work depth).
+    pub first_program_cross_gas: Option<u64>,
+    /// Opcode steps at first program cross.
+    pub first_program_cross_opcode_steps: Option<usize>,
+    /// Total interpreter opcode steps this incarnation (inspect path).
+    pub total_opcode_steps: Option<usize>,
     /// `first_program_cross_k / total_db_effects` when defined.
     pub depth_frac_effects: Option<f64>,
-    /// `gas_used_so_far/gas_limit` when mid-tx gas known; else None.
+    /// Legacy: `gas_at_cross / gas_limit` (can dwarf true work fraction).
     pub depth_frac_gas: Option<f64>,
+    /// **Preferred gross-work depth:** `gas_at_cross / tx_gas_used`.
+    /// Formula: cumulative gas billed at first program-cross opcode
+    /// divided by the tx's final billed gas (`exec_result.gas_used`).
+    pub depth_frac_gross_work: Option<f64>,
+    /// `opcode_steps_at_cross / total_opcode_steps` when both known.
+    pub depth_frac_opcode: Option<f64>,
 }
 
 /// Per-transaction final RW (last committed incarnation).
@@ -164,6 +184,34 @@ pub struct FineGrainSnapshot {
     pub deep_mode: bool,
     /// Whether interpreter/journal stream (vs Db-hook-only) was active.
     pub journal_mode: bool,
+    /// Definitional-gap counters (journal/deep research).
+    pub stream_diag: EffectStreamDiag,
+}
+
+/// Instrumentation for RAW count / depth definitional gaps (research).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct EffectStreamDiag {
+    /// Inspector SLOAD/BALANCE/EXT*/SELFBALANCE instances.
+    pub journal_reads: usize,
+    /// Of which: emitted a cross-tx RawEffectEdge (slot/account location RAW).
+    pub journal_reads_cross: usize,
+    /// Journal reads with no prior writer on that exact location.
+    pub journal_reads_no_prior_writer: usize,
+    /// SLOAD instances where account had a prior writer but slot did not
+    /// (candidate user-count inflation under account-grain RAW).
+    pub sload_account_grain_cross: usize,
+    /// Live SSTORE instances.
+    pub journal_sstore: usize,
+    /// Live account-write instances (valued CALL / CREATE / SELFDESTRUCT).
+    pub journal_account_writes: usize,
+    /// Finalize write_set fills for locations not live-noted.
+    pub finalize_write_fills: usize,
+    /// Edges pushed (pre filter); should equal journal_reads_cross + db-hook edges.
+    pub edges_pushed: usize,
+    /// Max repeats of the same (producer_tx, consumer_tx, location) in edges.
+    pub max_pcl_repeats: usize,
+    /// Mean edges / unique (p,c,ℓ); ≈1 implies few repeated foreign reads.
+    pub mean_effects_per_pcl: f64,
 }
 
 /// Opt-in collector living on [`crate::Pevm`].
@@ -181,16 +229,21 @@ pub struct FineGrainCollector {
 /// Mutable deep-mode runtime state (research path only).
 #[derive(Debug, Default)]
 struct DeepRuntimeState {
-    /// (tx, incarnation, location) → effect_k (live SSTORE ordinal when journal; else finalize write_set).
+    /// (tx, incarnation, location) → **latest** effect_k (live ordinal when journal; else finalize).
+    /// Multiple writes to the same ℓ keep distinct live ordinals via `live_write_counters`;
+    /// this map only stores the latest version for producer resolve (not edge dedupe).
     write_effects: std::collections::HashMap<(usize, usize, u64), (usize, LocationKind)>,
     /// Last writer per location across the block (live map for journal producer resolve).
     last_writer: std::collections::HashMap<u64, (usize, usize, usize, LocationKind)>,
-    /// Next live write ordinal per (tx, incarnation).
+    /// Last writer per account address (any Basic/Storage touch) — account-grain diag.
+    last_account_writer: std::collections::HashMap<[u8; 20], (usize, usize, usize)>,
+    /// Next live write ordinal per (tx, incarnation) — increments on **every** write instance.
     live_write_counters: std::collections::HashMap<(usize, usize), usize>,
     /// Per executing consumer live depth state.
     consumers: std::collections::HashMap<usize, ConsumerLive>,
     edges: Vec<RawEffectEdge>,
     finished: Vec<ConsumerFirstCross>,
+    diag: EffectStreamDiag,
 }
 
 #[derive(Debug, Clone)]
@@ -202,9 +255,27 @@ struct ConsumerLive {
     first_program_producer_tx: Option<usize>,
     /// Gas used (limit - remaining) at first program cross, when known.
     first_program_cross_gas: Option<u64>,
+    first_program_cross_opcode_steps: Option<usize>,
     write_effects: usize,
     gas_used: Option<u64>,
     gas_limit: Option<u64>,
+}
+
+impl ConsumerLive {
+    fn new(incarnation: usize, gas_limit: Option<u64>) -> Self {
+        Self {
+            incarnation,
+            db_effects: 0,
+            first_program_cross_k: None,
+            first_program_cross_location: None,
+            first_program_producer_tx: None,
+            first_program_cross_gas: None,
+            first_program_cross_opcode_steps: None,
+            write_effects: 0,
+            gas_used: None,
+            gas_limit,
+        }
+    }
 }
 
 impl FineGrainCollector {
@@ -261,24 +332,12 @@ impl FineGrainCollector {
             return;
         }
         let mut st = self.deep_state.lock().unwrap();
-        st.consumers.insert(
-            tx_idx,
-            ConsumerLive {
-                incarnation,
-                db_effects: 0,
-                first_program_cross_k: None,
-                first_program_cross_location: None,
-                first_program_producer_tx: None,
-                first_program_cross_gas: None,
-                write_effects: 0,
-                gas_used: None,
-                gas_limit: None,
-            },
-        );
+        st.consumers
+            .insert(tx_idx, ConsumerLive::new(incarnation, None));
     }
 
     /// Register write-set effects for a producer incarnation.
-    /// Journal mode: keep live SSTORE ordinals; only fill missing Basic/CodeHash etc.
+    /// Journal mode: keep live SSTORE/account ordinals; only fill missing finalize locs.
     pub(crate) fn deep_register_writes(
         &self,
         tx_idx: TxIdx,
@@ -300,7 +359,6 @@ impl FineGrainCollector {
             let key = (tx_idx, incarnation, *loc);
             if journal {
                 if let Some(&(k, _)) = st.write_effects.get(&key) {
-                    // Live SSTORE already recorded — refresh last_writer with live k.
                     st.last_writer.insert(*loc, (tx_idx, incarnation, k, kind));
                     continue;
                 }
@@ -308,6 +366,7 @@ impl FineGrainCollector {
                 next_k += 1;
                 st.write_effects.insert(key, (k, kind));
                 st.last_writer.insert(*loc, (tx_idx, incarnation, k, kind));
+                st.diag.finalize_write_fills += 1;
             } else {
                 st.write_effects.insert(key, (finalize_k, kind));
                 st.last_writer
@@ -331,6 +390,7 @@ impl FineGrainCollector {
 
     /// Observe one world-state DB read; emit RawEffectEdge if origin is prior tx.
     /// When `bump_depth` is false, emit edge only (lazy-chain extra producers).
+    /// **No (p,c,ℓ) dedupe** — every observing read instance pushes an edge.
     pub(crate) fn deep_note_db_read(
         &self,
         consumer_tx: TxIdx,
@@ -343,14 +403,11 @@ impl FineGrainCollector {
         if !self.deep_enabled() {
             return;
         }
-        // Journal/inspector stream owns Storage RAW (SLOAD). Keep Basic/CodeHash
-        // Db observes — those often happen without BALANCE/EXT* opcodes.
         if self.journal_enabled() && kind_hint == LocationKind::Storage {
             return;
         }
         let mut st = self.deep_state.lock().unwrap();
 
-        // Resolve producer write meta before mutably borrowing consumers.
         let producer_meta = producer.and_then(|(producer_tx, producer_inc)| {
             if producer_tx >= consumer_tx {
                 return None;
@@ -363,29 +420,12 @@ impl FineGrainCollector {
             Some((producer_tx, producer_inc, producer_k, kind))
         });
 
-        let c = st.consumers.entry(consumer_tx).or_insert_with(|| ConsumerLive {
-            incarnation: consumer_incarnation,
-            db_effects: 0,
-            first_program_cross_k: None,
-            first_program_cross_location: None,
-            first_program_producer_tx: None,
-            first_program_cross_gas: None,
-            write_effects: 0,
-            gas_used: None,
-            gas_limit: None,
-        });
+        let c = st
+            .consumers
+            .entry(consumer_tx)
+            .or_insert_with(|| ConsumerLive::new(consumer_incarnation, None));
         if c.incarnation != consumer_incarnation {
-            *c = ConsumerLive {
-                incarnation: consumer_incarnation,
-                db_effects: 0,
-                first_program_cross_k: None,
-                first_program_cross_location: None,
-                first_program_producer_tx: None,
-                first_program_cross_gas: None,
-                write_effects: 0,
-                gas_used: None,
-                gas_limit: None,
-            };
+            *c = ConsumerLive::new(consumer_incarnation, None);
         }
         let consumer_k = if bump_depth {
             let k = c.db_effects;
@@ -416,14 +456,14 @@ impl FineGrainCollector {
             class: class.as_str().to_string(),
             gas_used_so_far: None,
             opcode_steps: Some(consumer_k),
+            gross_work_so_far: None,
         };
-        // `c` ends here; push after NLL ends the consumers borrow.
         let _ = c;
         st.edges.push(edge);
+        st.diag.edges_pushed += 1;
     }
 
-
-    /// Live SSTORE (or other write opcode): bump live effect ordinal + last_writer.
+    /// Live SSTORE / account write: bump live effect ordinal + last_writer every instance.
     pub(crate) fn deep_note_journal_write(
         &self,
         tx_idx: TxIdx,
@@ -433,6 +473,7 @@ impl FineGrainCollector {
         gas_used_so_far: Option<u64>,
         gas_limit: Option<u64>,
         opcode_steps: Option<usize>,
+        account: Option<[u8; 20]>,
     ) -> usize {
         if !self.journal_enabled() {
             return 0;
@@ -448,6 +489,17 @@ impl FineGrainCollector {
             .insert((tx_idx, incarnation, location), (k, kind));
         st.last_writer
             .insert(location, (tx_idx, incarnation, k, kind));
+        if let Some(acct) = account {
+            st.last_account_writer
+                .insert(acct, (tx_idx, incarnation, k));
+        }
+        match kind {
+            LocationKind::Storage => st.diag.journal_sstore += 1,
+            LocationKind::Basic | LocationKind::BasicLazy | LocationKind::CodeHash => {
+                st.diag.journal_account_writes += 1
+            }
+            _ => {}
+        }
         if let Some(c) = st.consumers.get_mut(&tx_idx) {
             if c.incarnation == incarnation {
                 c.write_effects = k + 1;
@@ -460,7 +512,33 @@ impl FineGrainCollector {
         k
     }
 
-    /// Interpreter/journal read (SLOAD/BALANCE/EXT*): emit RAW edge via last_writer map.
+    /// Live account write (valued CALL / CREATE / SELFDESTRUCT).
+    pub(crate) fn deep_note_journal_account_write(
+        &self,
+        tx_idx: TxIdx,
+        incarnation: usize,
+        address: Address,
+        kind: LocationKind,
+        gas_used_so_far: Option<u64>,
+        gas_limit: Option<u64>,
+        opcode_steps: Option<usize>,
+    ) -> usize {
+        let loc = hash_deterministic(MemoryLocation::Basic(address));
+        let mut acct = [0u8; 20];
+        acct.copy_from_slice(address.as_slice());
+        self.deep_note_journal_write(
+            tx_idx,
+            incarnation,
+            loc,
+            kind,
+            gas_used_so_far,
+            gas_limit,
+            opcode_steps,
+            Some(acct),
+        )
+    }
+
+    /// Interpreter/journal read: one RawEffectEdge per foreign observe instance (no pcl dedupe).
     pub(crate) fn deep_note_journal_read(
         &self,
         consumer_tx: TxIdx,
@@ -470,11 +548,13 @@ impl FineGrainCollector {
         gas_used_so_far: Option<u64>,
         gas_limit: Option<u64>,
         opcode_steps: Option<usize>,
+        account: Option<[u8; 20]>,
     ) {
         if !self.journal_enabled() {
             return;
         }
         let mut st = self.deep_state.lock().unwrap();
+        st.diag.journal_reads += 1;
 
         let producer_meta = st.last_writer.get(&location).and_then(|&(ptx, pinc, pk, kind)| {
             if ptx >= consumer_tx {
@@ -489,29 +569,22 @@ impl FineGrainCollector {
             }
         });
 
-        let c = st.consumers.entry(consumer_tx).or_insert_with(|| ConsumerLive {
-            incarnation: consumer_incarnation,
-            db_effects: 0,
-            first_program_cross_k: None,
-            first_program_cross_location: None,
-            first_program_producer_tx: None,
-            first_program_cross_gas: None,
-            write_effects: 0,
-            gas_used: None,
-            gas_limit,
-        });
+        if producer_meta.is_none() {
+            if let Some(acct) = account {
+                if let Some(&(ptx, _, _)) = st.last_account_writer.get(&acct) {
+                    if ptx < consumer_tx {
+                        st.diag.sload_account_grain_cross += 1;
+                    }
+                }
+            }
+        }
+
+        let c = st
+            .consumers
+            .entry(consumer_tx)
+            .or_insert_with(|| ConsumerLive::new(consumer_incarnation, gas_limit));
         if c.incarnation != consumer_incarnation {
-            *c = ConsumerLive {
-                incarnation: consumer_incarnation,
-                db_effects: 0,
-                first_program_cross_k: None,
-                first_program_cross_location: None,
-                first_program_producer_tx: None,
-                first_program_cross_gas: None,
-                write_effects: 0,
-                gas_used: None,
-                gas_limit,
-            };
+            *c = ConsumerLive::new(consumer_incarnation, gas_limit);
         }
         if c.gas_limit.is_none() {
             c.gas_limit = gas_limit;
@@ -520,6 +593,7 @@ impl FineGrainCollector {
         c.db_effects += 1;
 
         let Some((producer_tx, producer_inc, producer_k, kind)) = producer_meta else {
+            st.diag.journal_reads_no_prior_writer += 1;
             return;
         };
         let class = EffectClass::from_kind(kind);
@@ -528,6 +602,7 @@ impl FineGrainCollector {
             c.first_program_cross_location = Some(location);
             c.first_program_producer_tx = Some(producer_tx);
             c.first_program_cross_gas = gas_used_so_far;
+            c.first_program_cross_opcode_steps = opcode_steps;
         }
         let edge = RawEffectEdge {
             producer_tx,
@@ -541,18 +616,23 @@ impl FineGrainCollector {
             class: class.as_str().to_string(),
             gas_used_so_far,
             opcode_steps: opcode_steps.or(Some(consumer_k)),
+            gross_work_so_far: gas_used_so_far,
         };
         let _ = c;
+        st.diag.journal_reads_cross += 1;
         st.edges.push(edge);
+        st.diag.edges_pushed += 1;
     }
 
-    /// Finalize consumer depth row after a successful (or aborted) incarnation.
+    /// Finalize consumer depth after incarnation.
+    /// Gross-work depth = gas_at_first_program_cross / tx_gas_used (preferred for EV).
     pub(crate) fn deep_finish_consumer(
         &self,
         tx_idx: TxIdx,
         incarnation: usize,
         gas_used: Option<u64>,
         gas_limit: Option<u64>,
+        total_opcode_steps: Option<usize>,
     ) {
         if !self.deep_enabled() {
             return;
@@ -562,7 +642,6 @@ impl FineGrainCollector {
             return;
         };
         if c.incarnation != incarnation {
-            // Stale — ignore.
             return;
         }
         let depth_frac_effects = c.first_program_cross_k.map(|k| {
@@ -573,8 +652,17 @@ impl FineGrainCollector {
             }
         });
         let gl = gas_limit.or(c.gas_limit);
+        let gu = gas_used.or(c.gas_used);
         let depth_frac_gas = match (c.first_program_cross_gas, gl) {
             (Some(g), Some(limit)) if limit > 0 => Some((g as f64 / limit as f64).min(1.0)),
+            _ => None,
+        };
+        let depth_frac_gross_work = match (c.first_program_cross_gas, gu) {
+            (Some(g), Some(total)) if total > 0 => Some((g as f64 / total as f64).min(1.0)),
+            _ => None,
+        };
+        let depth_frac_opcode = match (c.first_program_cross_opcode_steps, total_opcode_steps) {
+            (Some(s), Some(total)) if total > 0 => Some((s as f64 / total as f64).min(1.0)),
             _ => None,
         };
         st.finished.push(ConsumerFirstCross {
@@ -585,10 +673,15 @@ impl FineGrainCollector {
             first_program_producer_tx: c.first_program_producer_tx,
             total_db_effects: c.db_effects,
             total_write_effects: c.write_effects,
-            gas_used: gas_used.or(c.gas_used),
+            gas_used: gu,
             gas_limit: gl,
+            first_program_cross_gas: c.first_program_cross_gas,
+            first_program_cross_opcode_steps: c.first_program_cross_opcode_steps,
+            total_opcode_steps,
             depth_frac_effects,
             depth_frac_gas,
+            depth_frac_gross_work,
+            depth_frac_opcode,
         });
     }
 
@@ -634,12 +727,27 @@ impl FineGrainCollector {
         let abort_events = self.abort_events.lock().unwrap().clone();
         let deep_mode = self.deep_enabled();
         let journal_mode = self.journal_enabled();
-        let (effect_edges, consumer_first_cross) = if deep_mode {
+        let (effect_edges, consumer_first_cross, mut stream_diag) = if deep_mode {
             let st = self.deep_state.lock().unwrap();
-            (st.edges.clone(), st.finished.clone())
+            (st.edges.clone(), st.finished.clone(), st.diag.clone())
         } else {
-            (Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), EffectStreamDiag::default())
         };
+        if !effect_edges.is_empty() {
+            use std::collections::HashMap;
+            let mut pcl: HashMap<(usize, usize, u64), usize> = HashMap::new();
+            for e in &effect_edges {
+                *pcl.entry((e.producer_tx, e.consumer_tx, e.location))
+                    .or_default() += 1;
+            }
+            stream_diag.max_pcl_repeats = pcl.values().copied().max().unwrap_or(0);
+            let n_pcl = pcl.len();
+            stream_diag.mean_effects_per_pcl = if n_pcl == 0 {
+                0.0
+            } else {
+                effect_edges.len() as f64 / n_pcl as f64
+            };
+        }
         *self.last_snapshot.lock().unwrap() = Some(FineGrainSnapshot {
             n_tx,
             beneficiary_hash,
@@ -651,6 +759,7 @@ impl FineGrainCollector {
             consumer_first_cross,
             deep_mode,
             journal_mode,
+            stream_diag,
         });
     }
 
@@ -1151,10 +1260,14 @@ pub fn estimate_ma_md(
             })
             .or_insert(c);
     }
-    // Prefer gas-fraction depth when journal stream supplied it; else DB-effect proxy.
+    // Prefer gross-work (gas_at_cross/tx_gas_used), then gas/limit, then effect ordinal.
     let mut depths: Vec<f64> = best
         .values()
-        .filter_map(|c| c.depth_frac_gas.or(c.depth_frac_effects))
+        .filter_map(|c| {
+            c.depth_frac_gross_work
+                .or(c.depth_frac_gas)
+                .or(c.depth_frac_effects)
+        })
         .collect();
     depths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 

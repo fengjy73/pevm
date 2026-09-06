@@ -880,6 +880,13 @@ fn u256_to_address(v: U256) -> Address {
 /// Opt-in journal RAW stream (FineGrain journal mode). Zero cost when finegrain TLS unset.
 fn maybe_note_journal_effect(interp: &Interpreter<EthInterpreter>, op: u8, opcode_steps: u64) {
     const OP_BALANCE: u8 = 0x31;
+    const OP_CALL: u8 = 0xf1;
+    const OP_CALLCODE: u8 = 0xf2;
+    const OP_DELEGATECALL: u8 = 0xf4;
+    const OP_STATICCALL: u8 = 0xfa;
+    const OP_CREATE: u8 = 0xf0;
+    const OP_CREATE2: u8 = 0xf5;
+    const OP_SELFDESTRUCT: u8 = 0xff;
     const OP_EXTCODESIZE: u8 = 0x3b;
     const OP_EXTCODECOPY: u8 = 0x3c;
     const OP_EXTCODEHASH: u8 = 0x3f;
@@ -898,6 +905,8 @@ fn maybe_note_journal_effect(interp: &Interpreter<EthInterpreter>, op: u8, opcod
         let gas_used = gas_limit.map(|lim| lim.saturating_sub(interp.gas.remaining()));
         let steps = Some(opcode_steps as usize);
         let target = interp.input.target_address();
+        let mut target_acct = [0u8; 20];
+        target_acct.copy_from_slice(target.as_slice());
 
         match op {
             OP_SLOAD => {
@@ -911,6 +920,7 @@ fn maybe_note_journal_effect(interp: &Interpreter<EthInterpreter>, op: u8, opcod
                     gas_used,
                     gas_limit,
                     steps,
+                    Some(target_acct),
                 );
             }
             OP_SSTORE => {
@@ -925,12 +935,15 @@ fn maybe_note_journal_effect(interp: &Interpreter<EthInterpreter>, op: u8, opcod
                     gas_used,
                     gas_limit,
                     steps,
+                    Some(target_acct),
                 );
             }
             OP_BALANCE => {
                 let Ok(addr_u) = interp.stack.peek(0) else { return };
                 let addr = u256_to_address(addr_u);
                 let loc = hash_deterministic(MemoryLocation::Basic(addr));
+                let mut acct = [0u8; 20];
+                acct.copy_from_slice(addr.as_slice());
                 fg.deep_note_journal_read(
                     plant.tx_idx,
                     plant.incarnation,
@@ -939,6 +952,7 @@ fn maybe_note_journal_effect(interp: &Interpreter<EthInterpreter>, op: u8, opcod
                     gas_used,
                     gas_limit,
                     steps,
+                    Some(acct),
                 );
             }
             OP_SELFBALANCE => {
@@ -951,12 +965,15 @@ fn maybe_note_journal_effect(interp: &Interpreter<EthInterpreter>, op: u8, opcod
                     gas_used,
                     gas_limit,
                     steps,
+                    Some(target_acct),
                 );
             }
             OP_EXTCODESIZE | OP_EXTCODEHASH | OP_EXTCODECOPY => {
                 let Ok(addr_u) = interp.stack.peek(0) else { return };
                 let addr = u256_to_address(addr_u);
                 let loc = hash_deterministic(MemoryLocation::CodeHash(addr));
+                let mut acct = [0u8; 20];
+                acct.copy_from_slice(addr.as_slice());
                 fg.deep_note_journal_read(
                     plant.tx_idx,
                     plant.incarnation,
@@ -965,8 +982,73 @@ fn maybe_note_journal_effect(interp: &Interpreter<EthInterpreter>, op: u8, opcod
                     gas_used,
                     gas_limit,
                     steps,
+                    Some(acct),
                 );
             }
+            // Live account-write instances (producer_effect_k), not finalize-only.
+            OP_CALL | OP_CALLCODE => {
+                // stack: [gas, addr, value, argsOffset, argsLength, retOffset, retLength]
+                let Ok(value) = interp.stack.peek(2) else { return };
+                if value.is_zero() {
+                    return;
+                }
+                let Ok(addr_u) = interp.stack.peek(1) else { return };
+                let to = u256_to_address(addr_u);
+                let caller = interp.input.caller_address();
+                fg.deep_note_journal_account_write(
+                    plant.tx_idx,
+                    plant.incarnation,
+                    caller,
+                    LocationKind::Basic,
+                    gas_used,
+                    gas_limit,
+                    steps,
+                );
+                fg.deep_note_journal_account_write(
+                    plant.tx_idx,
+                    plant.incarnation,
+                    to,
+                    LocationKind::Basic,
+                    gas_used,
+                    gas_limit,
+                    steps,
+                );
+            }
+            OP_CREATE | OP_CREATE2 => {
+                let caller = interp.input.caller_address();
+                fg.deep_note_journal_account_write(
+                    plant.tx_idx,
+                    plant.incarnation,
+                    caller,
+                    LocationKind::Basic,
+                    gas_used,
+                    gas_limit,
+                    steps,
+                );
+            }
+            OP_SELFDESTRUCT => {
+                let Ok(addr_u) = interp.stack.peek(0) else { return };
+                let beneficiary = u256_to_address(addr_u);
+                fg.deep_note_journal_account_write(
+                    plant.tx_idx,
+                    plant.incarnation,
+                    target,
+                    LocationKind::Basic,
+                    gas_used,
+                    gas_limit,
+                    steps,
+                );
+                fg.deep_note_journal_account_write(
+                    plant.tx_idx,
+                    plant.incarnation,
+                    beneficiary,
+                    LocationKind::Basic,
+                    gas_used,
+                    gas_limit,
+                    steps,
+                );
+            }
+            OP_DELEGATECALL | OP_STATICCALL => {}
             _ => {}
         }
     });

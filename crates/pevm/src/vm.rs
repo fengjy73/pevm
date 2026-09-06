@@ -1703,11 +1703,17 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         tx_version.tx_incarnation,
                         &write_set,
                     );
+                    let total_steps = if journal_stream {
+                        Some(steps_this_run() as usize)
+                    } else {
+                        None
+                    };
                     fg.deep_finish_consumer(
                         tx_version.tx_idx,
                         tx_version.tx_incarnation,
                         Some(exec_result.tx_gas_used()),
                         Some(tx.gas_limit),
+                        total_steps,
                     );
                 }
                 let (wrote_new_location, contended) =

@@ -86,13 +86,29 @@ struct EffectRawStats {
     n_unique_pcl: usize,
     /// Mean effect edges per unique final-style RAW pair (pcl).
     mean_effects_per_pcl: f64,
-    /// Gas-based depth percentiles (None→0 when unavailable).
+    /// Legacy gas/limit depth percentiles.
     gas_depth_p10: f64,
     gas_depth_p50: f64,
     gas_depth_p90: f64,
     gas_depth_mean: f64,
     frac_gas_depth_lt_0_01: f64,
     n_consumers_with_gas_depth: usize,
+    /// Preferred gross-work depth: gas_at_cross / tx_gas_used.
+    gross_work_depth_p10: f64,
+    gross_work_depth_p50: f64,
+    gross_work_depth_p90: f64,
+    gross_work_depth_mean: f64,
+    frac_gross_work_lt_0_01: f64,
+    n_consumers_with_gross_work: usize,
+    opcode_depth_p50: f64,
+    frac_opcode_lt_0_01: f64,
+    /// Stream diagnostics from FineGrainSnapshot.stream_diag.
+    journal_reads: usize,
+    journal_reads_cross: usize,
+    journal_reads_no_prior: usize,
+    sload_account_grain_cross: usize,
+    journal_sstore: usize,
+    journal_account_writes: usize,
     journal_mode: bool,
 }
 
@@ -272,6 +288,30 @@ fn effect_stats(snap: &FineGrainSnapshot) -> EffectRawStats {
     } else {
         gas_depths.iter().filter(|&&d| d < 0.01).count() as f64 / n_g as f64
     };
+    let mut gw_depths: Vec<f64> = best
+        .values()
+        .filter_map(|c| c.depth_frac_gross_work)
+        .collect();
+    gw_depths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n_gw = gw_depths.len();
+    let gwmean = if n_gw == 0 {
+        0.0
+    } else {
+        gw_depths.iter().sum::<f64>() / n_gw as f64
+    };
+    let gwlt = if n_gw == 0 {
+        0.0
+    } else {
+        gw_depths.iter().filter(|&&d| d < 0.01).count() as f64 / n_gw as f64
+    };
+    let mut op_depths: Vec<f64> = best.values().filter_map(|c| c.depth_frac_opcode).collect();
+    op_depths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n_op = op_depths.len();
+    let oplt = if n_op == 0 {
+        0.0
+    } else {
+        op_depths.iter().filter(|&&d| d < 0.01).count() as f64 / n_op as f64
+    };
     let mut effect_depths: Vec<f64> = best
         .values()
         .filter_map(|c| c.depth_frac_effects)
@@ -288,6 +328,7 @@ fn effect_stats(snap: &FineGrainSnapshot) -> EffectRawStats {
     } else {
         effect_depths.iter().filter(|&&d| d < 0.01).count() as f64 / n_e as f64
     };
+    let d = &snap.stream_diag;
 
     EffectRawStats {
         n_raw_effect_total: n_total,
@@ -316,6 +357,20 @@ fn effect_stats(snap: &FineGrainSnapshot) -> EffectRawStats {
         gas_depth_mean: gmean,
         frac_gas_depth_lt_0_01: glt,
         n_consumers_with_gas_depth: n_g,
+        gross_work_depth_p10: pevm::percentile_f64(&gw_depths, 0.10),
+        gross_work_depth_p50: pevm::percentile_f64(&gw_depths, 0.50),
+        gross_work_depth_p90: pevm::percentile_f64(&gw_depths, 0.90),
+        gross_work_depth_mean: gwmean,
+        frac_gross_work_lt_0_01: gwlt,
+        n_consumers_with_gross_work: n_gw,
+        opcode_depth_p50: pevm::percentile_f64(&op_depths, 0.50),
+        frac_opcode_lt_0_01: oplt,
+        journal_reads: d.journal_reads,
+        journal_reads_cross: d.journal_reads_cross,
+        journal_reads_no_prior: d.journal_reads_no_prior_writer,
+        sload_account_grain_cross: d.sload_account_grain_cross,
+        journal_sstore: d.journal_sstore,
+        journal_account_writes: d.journal_account_writes,
         journal_mode: snap.journal_mode,
     }
 }
@@ -358,32 +413,25 @@ fn run_occ_deep(
 }
 
 fn gap_note(bn: u64, stats: &EffectRawStats) -> String {
-    let user = match bn {
-        14_689_597 => Some(3802),
-        _ => None,
-    };
-    if let Some(u) = user {
-        format!(
-            "block {bn}: journal_RAW={} (prog={}) vs user≈{u}; prior Db-deep=593; final_RW={}; unique_pcl={}; mean_effects/pcl={:.2}; gas_depth_p50={:.4}; frac_gas≪1%={:.3}. Remaining gap: location-hash / producer-effect definition / WAW vs RAW / aborted incarnations.",
-            stats.n_raw_effect_total,
-            stats.n_raw_effect_program,
-            stats.n_raw_final_rw,
-            stats.n_unique_pcl,
-            stats.mean_effects_per_pcl,
-            stats.gas_depth_p50,
-            stats.frac_gas_depth_lt_0_01
-        )
-    } else {
-        format!(
-            "block {bn}: effect_RAW={} prog={} hand={}; final_RW={}; fanout_prog={}; depth_p50={:.4}",
-            stats.n_raw_effect_total,
-            stats.n_raw_effect_program,
-            stats.n_raw_effect_handler,
-            stats.n_raw_final_rw,
-            stats.max_program_fanout,
-            stats.depth_p50
-        )
-    }
+    format!(
+        "block {bn}: pevm/revm journal_RAW={} (prog={} hand={}); final_RW={}; unique_pcl={}; mean_effects/pcl={:.2}; journal_reads={} cross={} no_prior={} acct_grain={}; sstore={} acct_writes={}; gross_work_p50={:.4} frac≪1%={:.3}; gas/limit_p50={:.4}; opcode_p50={:.4}. Counts are plant-observed (location last-writer RAW); external tables are not targets.",
+        stats.n_raw_effect_total,
+        stats.n_raw_effect_program,
+        stats.n_raw_effect_handler,
+        stats.n_raw_final_rw,
+        stats.n_unique_pcl,
+        stats.mean_effects_per_pcl,
+        stats.journal_reads,
+        stats.journal_reads_cross,
+        stats.journal_reads_no_prior,
+        stats.sload_account_grain_cross,
+        stats.journal_sstore,
+        stats.journal_account_writes,
+        stats.gross_work_depth_p50,
+        stats.frac_gross_work_lt_0_01,
+        stats.gas_depth_p50,
+        stats.opcode_depth_p50,
+    )
 }
 
 fn main() {
@@ -436,15 +484,20 @@ fn main() {
         let effect = effect_stats(&snap);
         let effect_occ8 = snap8.as_ref().map(effect_stats);
         eprintln!(
-            "  journal_RAW={} (prog={} hand={}) final_RW={} mean/pcl={:.2} depth_p50={:.4} gas_p50={:.4} frac_gas≪1%={:.3} redo_saved={:.1} wait_added={:.1}",
+            "  journal_RAW={} (prog={} hand={}) final_RW={} mean/pcl={:.2} depth_p50={:.4} gw_p50={:.4} frac_gw≪1%={:.3} gas_lim_p50={:.4} op_p50={:.4} reads={}/{} acct_grain={} redo_saved={:.1} wait_added={:.1}",
             effect.n_raw_effect_total,
             effect.n_raw_effect_program,
             effect.n_raw_effect_handler,
             effect.n_raw_final_rw,
             effect.mean_effects_per_pcl,
             effect.depth_p50,
+            effect.gross_work_depth_p50,
+            effect.frac_gross_work_lt_0_01,
             effect.gas_depth_p50,
-            effect.frac_gas_depth_lt_0_01,
+            effect.opcode_depth_p50,
+            effect.journal_reads_cross,
+            effect.journal_reads,
+            effect.sload_account_grain_cross,
             effect.redo_saved,
             effect.wait_added
         );
@@ -498,16 +551,17 @@ fn main() {
     let mut user_gap = StdHashMap::new();
     user_gap.insert(
         "14689597".into(),
-        "user≈3802; prior final-RW=449; prior Db-deep=593; this run=journal stream".into(),
+        "plant-observed journal RAW (this run); prior final-RW≈449 / Db-deep≈593 for history only — not targets".into(),
     );
     let payload = Out {
         generated: chrono_lite_now(),
         method_notes: vec![
             "OCC@1 preferred for clean G* effect stream (serial-forced parallel path).".into(),
-            "Journal mode: SpecFenceInspector step logs SLOAD/SSTORE/BALANCE/EXT*/SELFBALANCE.".into(),
-            "producer_effect_k = live SSTORE ordinal (fallback finalize for Basic/CodeHash).".into(),
-            "depth_frac_effects = first_program_cross_k / total_journal_reads; depth_frac_gas = gas_used/gas_limit.".into(),
-            "M-A/M-D proxies prefer gas depth when present.".into(),
+            "Journal mode: SpecFenceInspector logs SLOAD/SSTORE/BALANCE/EXT*/SELFBALANCE + live valued-CALL/CREATE/SELFDESTRUCT account writes.".into(),
+            "One RawEffectEdge per cross-tx read instance (no (p,c,ℓ) dedupe); producer_effect_k increments on every live write instance.".into(),
+            "gross_work depth (preferred) = gas_used_so_far_at_first_program_cross / tx_gas_used; also report gas/limit and opcode-step fractions.".into(),
+            "M-A/M-D proxies prefer gross-work depth when present.".into(),
+            "Control-law inputs are OUR measured distributions — external RAW tables are definitional references only, not calibration targets.".into(),
             "Production default unchanged: finegrain_journal off (Handler::run, zero overhead).".into(),
         ],
         user_gap_reference: user_gap,
@@ -524,14 +578,14 @@ fn main() {
     let mut csv = File::create(&csv_path).expect("csv");
     writeln!(
         csv,
-        "seg,block,n_tx,occ1_tps,occ8_tps,occ8_abort,n_raw_effect,n_prog,n_hand,n_final_rw,unique_pcl,mean_eff_per_pcl,depth_p10,depth_p50,depth_p90,frac_lt_1pct,gas_p10,gas_p50,gas_p90,frac_gas_lt_1pct,redo_saved,wait_added,eff_prog_path,final_rw_chain,fanout"
+        "seg,block,n_tx,occ1_tps,occ8_tps,occ8_abort,n_raw_effect,n_prog,n_hand,n_final_rw,unique_pcl,mean_eff_per_pcl,depth_p10,depth_p50,depth_p90,frac_lt_1pct,gas_p10,gas_p50,gas_p90,frac_gas_lt_1pct,gw_p10,gw_p50,gw_p90,frac_gw_lt_1pct,opcode_p50,journal_reads,journal_cross,acct_grain,redo_saved,wait_added,eff_prog_path,final_rw_chain,fanout"
     )
     .unwrap();
     for s in &summaries {
         let e = &s.effect;
         writeln!(
             csv,
-            "{},{},{},{:.1},{:.1},{:.4},{},{},{},{},{},{:.3},{:.5},{:.5},{:.5},{:.4},{:.5},{:.5},{:.5},{:.4},{:.2},{:.2},{},{},{}",
+            "{},{},{},{:.1},{:.1},{:.4},{},{},{},{},{},{:.3},{:.5},{:.5},{:.5},{:.4},{:.5},{:.5},{:.5},{:.4},{:.5},{:.5},{:.5},{:.4},{:.5},{},{},{},{:.2},{:.2},{},{},{}",
             s.segment,
             s.block,
             s.n_tx,
@@ -552,6 +606,14 @@ fn main() {
             e.gas_depth_p50,
             e.gas_depth_p90,
             e.frac_gas_depth_lt_0_01,
+            e.gross_work_depth_p10,
+            e.gross_work_depth_p50,
+            e.gross_work_depth_p90,
+            e.frac_gross_work_lt_0_01,
+            e.opcode_depth_p50,
+            e.journal_reads,
+            e.journal_reads_cross,
+            e.sload_account_grain_cross,
             e.redo_saved,
             e.wait_added,
             e.longest_effect_program_path,
