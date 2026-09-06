@@ -222,7 +222,7 @@ pub use pevm::{Pevm, PevmError, PevmResult, execute_revm_sequential};
 mod scheduler;
 pub mod specfence;
 pub use specfence::{
-    AbortEvent, ConcurrencyMode, ConsumerFirstCross, DagStats, EffectClass, FineGrainCollector,
+    AbortEvent, AccountGrainObserve, ConcurrencyMode, ConsumerFirstCross, DagStats, EffectClass, FineGrainCollector,
     FineGrainSnapshot, EffectStreamDiag, HotLocation, LocationKind, MaMdProxy, RawEdge, RawEffectEdge,
     SpecFenceMetrics, TxRw, analyze_dag, classify_raw_edges, dependency_edges,
     effect_raw_longest_chain, effect_raw_max_fanout, estimate_ma_md, filter_effect_edges,

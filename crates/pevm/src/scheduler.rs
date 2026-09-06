@@ -350,6 +350,21 @@ impl Scheduler {
         )
     }
 
+    /// Research label for producer readiness at discovery (finegrain journal).
+    pub(crate) fn status_label(&self, tx_idx: TxIdx) -> &'static str {
+        if tx_idx >= self.block_size {
+            return "oob";
+        }
+        let tx = index_mutex!(self.transactions_status, tx_idx);
+        match tx.status {
+            IncarnationStatus::ReadyToExecute => "ready",
+            IncarnationStatus::Executing => "executing",
+            IncarnationStatus::Executed => "executed",
+            IncarnationStatus::Validated => "validated",
+            IncarnationStatus::Aborting => "aborting",
+        }
+    }
+
     pub(crate) fn finish_validation(&self, tx_version: &TxVersion, aborted: bool) -> Option<Task> {
         // Classic Block-STM: abort cascades validation from aborted_idx+1 through
         // the rest of the block.

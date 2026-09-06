@@ -381,6 +381,22 @@ impl MvMemory {
             .and_then(|written| written.range(..tx_idx).next_back().map(|(idx, _)| *idx))
     }
 
+    /// Research: MV entry kind for a concrete writer at `location` (`data`/`estimate`/`absent`).
+    pub(crate) fn entry_kind_at(
+        &self,
+        location: MemoryLocationHash,
+        tx_idx: TxIdx,
+    ) -> &'static str {
+        let Some(written) = self.data.get(&location) else {
+            return "absent";
+        };
+        match written.get(&tx_idx) {
+            Some(MemoryEntry::Data(_, _)) => "data",
+            Some(MemoryEntry::Estimate) => "estimate",
+            None => "absent",
+        }
+    }
+
     /// Last non-ESTIMATE Data version strictly below `tx_idx` (OrderedDirtyRead).
     /// Skips ESTIMATE and aborted incarnations.
     pub(crate) fn last_data_before(

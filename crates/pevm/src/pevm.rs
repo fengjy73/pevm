@@ -405,6 +405,8 @@ impl Pevm {
         };
         if self.finegrain_enabled {
             self.finegrain.clear();
+            // Producer-readiness sampling for journal/deep research.
+            self.finegrain.attach_runtime(&mv_memory, &scheduler);
         }
         let finegrain_ref = self.finegrain_enabled.then_some(&self.finegrain);
         let specfence = SpecFenceCtx {
@@ -649,6 +651,7 @@ impl Pevm {
         if self.finegrain_enabled {
             self.finegrain
                 .capture(&mv_memory, &scheduler, block_env.beneficiary);
+            self.finegrain.detach_runtime();
         }
         self.dropper.drop((mv_memory, scheduler));
 

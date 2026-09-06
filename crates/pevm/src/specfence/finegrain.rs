@@ -16,6 +16,7 @@
 //! Research only — production default off.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 use alloy_primitives::Address;
 use serde::Serialize;
@@ -119,6 +120,12 @@ pub struct RawEffectEdge {
     pub opcode_steps: Option<usize>,
     /// `gas_used_so_far` at this read — alias for gross-work numerator when set.
     pub gross_work_so_far: Option<u64>,
+    /// Producer readiness at discovery: validated|executed|data|estimate|running|aborting|unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer_ready: Option<String>,
+    /// MV entry at producer for this location: data|estimate|absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer_mv: Option<String>,
 }
 
 /// Per-consumer depth of first cross-tx program read (deep mode).
@@ -152,6 +159,11 @@ pub struct ConsumerFirstCross {
     pub depth_frac_gross_work: Option<f64>,
     /// `opcode_steps_at_cross / total_opcode_steps` when both known.
     pub depth_frac_opcode: Option<f64>,
+    /// Producer readiness at first program-cross discovery (journal/deep).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer_ready_at_discovery: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer_mv_at_discovery: Option<String>,
 }
 
 /// Per-transaction final RW (last committed incarnation).
@@ -186,6 +198,33 @@ pub struct FineGrainSnapshot {
     pub journal_mode: bool,
     /// Definitional-gap counters (journal/deep research).
     pub stream_diag: EffectStreamDiag,
+    /// Structured account-grain observes (slot cold, account hot) — research.
+    pub account_grain_edges: Vec<AccountGrainObserve>,
+}
+
+/// Account-grain cross-tx observe: slot/location had no prior writer, but the
+/// account did (SLOAD/BALANCE/EXT*). Not primary RAW — EV-change diagnostic.
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountGrainObserve {
+    pub consumer_tx: usize,
+    pub consumer_incarnation: usize,
+    pub consumer_effect_k: usize,
+    pub account_producer_tx: usize,
+    pub account_producer_incarnation: usize,
+    pub location: u64,
+    /// storage | basic | code_hash
+    pub kind: String,
+    /// sload | balance | ext | other
+    pub opcode_class: String,
+    pub gas_used_so_far: Option<u64>,
+    pub opcode_steps: Option<usize>,
+    /// Account producer readiness at observe time.
+    pub account_producer_ready: String,
+    pub account_producer_mv: String,
+    /// True if Wait EV would fire under account-keyed policy.
+    pub would_wait: bool,
+    /// True if Bind EV would fire under account-keyed policy.
+    pub would_bind: bool,
 }
 
 /// Instrumentation for RAW count / depth definitional gaps (research).
@@ -212,6 +251,27 @@ pub struct EffectStreamDiag {
     pub max_pcl_repeats: usize,
     /// Mean edges / unique (p,c,ℓ); ≈1 implies few repeated foreign reads.
     pub mean_effects_per_pcl: f64,
+    /// Account-grain observes by opcode class (SLOAD / BALANCE / EXT*).
+    pub account_grain_sload: usize,
+    pub account_grain_balance: usize,
+    pub account_grain_ext: usize,
+    /// Of account-grain observes: account producer running/estimate → Wait EV would fire if account-keyed.
+    pub account_grain_would_wait: usize,
+    /// Account producer already Data/Executed/Validated → Bind EV if account-keyed.
+    pub account_grain_would_bind: usize,
+    /// Slot-grain RAW edges that also had account prior (informational).
+    pub slot_and_account_both: usize,
+    /// WAW-only multi-writer locs with no location RAW (HotLocal writer-count spurious Wait proxy).
+    pub waw_only_multi_writer_locs: usize,
+    pub multi_writer_locs: usize,
+    pub spurious_hotlocal_writer_count_waits: usize,
+    pub max_waw_chain_no_raw: usize,
+    /// Consecutive writer pairs on multi-writer locations (final-RW WAW links).
+    pub waw_pairs: usize,
+    /// WAW pairs with no reader of ℓ between the two writers (pure WAW step).
+    pub waw_pairs_no_intervening_raw: usize,
+    /// Multi-writer locs whose only final-RW deps are WAW (no RAW readers at all).
+    pub multi_writer_no_readers: usize,
 }
 
 /// Opt-in collector living on [`crate::Pevm`].
@@ -224,6 +284,10 @@ pub struct FineGrainCollector {
     /// Research journal/inspector stream (implies deep; off by default).
     journal: std::sync::atomic::AtomicBool,
     deep_state: Mutex<DeepRuntimeState>,
+    /// Block-scoped MvMemory pointer for producer readiness (journal research).
+    runtime_mv: AtomicPtr<MvMemory>,
+    /// Block-scoped Scheduler pointer for producer status labels.
+    runtime_sched: AtomicPtr<Scheduler>,
 }
 
 /// Mutable deep-mode runtime state (research path only).
@@ -242,6 +306,7 @@ struct DeepRuntimeState {
     /// Per executing consumer live depth state.
     consumers: std::collections::HashMap<usize, ConsumerLive>,
     edges: Vec<RawEffectEdge>,
+    account_grain_edges: Vec<AccountGrainObserve>,
     finished: Vec<ConsumerFirstCross>,
     diag: EffectStreamDiag,
 }
@@ -256,6 +321,8 @@ struct ConsumerLive {
     /// Gas used (limit - remaining) at first program cross, when known.
     first_program_cross_gas: Option<u64>,
     first_program_cross_opcode_steps: Option<usize>,
+    first_program_producer_ready: Option<String>,
+    first_program_producer_mv: Option<String>,
     write_effects: usize,
     gas_used: Option<u64>,
     gas_limit: Option<u64>,
@@ -271,10 +338,36 @@ impl ConsumerLive {
             first_program_producer_tx: None,
             first_program_cross_gas: None,
             first_program_cross_opcode_steps: None,
+            first_program_producer_ready: None,
+            first_program_producer_mv: None,
             write_effects: 0,
             gas_used: None,
             gas_limit,
         }
+    }
+}
+
+fn classify_producer_ready(status: &str, mv_kind: &str) -> &'static str {
+    match (status, mv_kind) {
+        ("validated", _) => "validated",
+        ("executed", _) => "executed",
+        (_, "data") => "data",
+        (_, "estimate") => "estimate",
+        ("executing", _) | ("ready", _) => "running",
+        ("aborting", _) => "aborting",
+        ("unknown", "unknown") => "unknown",
+        ("unknown", _) => "unknown",
+        (_, "absent") => "running",
+        _ => "unknown",
+    }
+}
+
+fn opcode_class_from_kind(kind: LocationKind) -> &'static str {
+    match kind {
+        LocationKind::Storage => "sload",
+        LocationKind::Basic | LocationKind::BasicLazy => "balance",
+        LocationKind::CodeHash => "ext",
+        _ => "other",
     }
 }
 
@@ -302,13 +395,30 @@ impl FineGrainCollector {
     }
 
     pub fn journal_enabled(&self) -> bool {
-        self.journal.load(std::sync::atomic::Ordering::Relaxed)
+        self.journal.load(Ordering::Relaxed)
     }
+
+    /// Attach block-scoped MV + scheduler for producer-readiness sampling (research).
+    /// Call before worker scope; pointers must outlive all journal notes.
+    pub(crate) fn attach_runtime(&self, mv: &MvMemory, sched: &Scheduler) {
+        self.runtime_mv
+            .store(mv as *const MvMemory as *mut MvMemory, Ordering::Release);
+        self.runtime_sched
+            .store(sched as *const Scheduler as *mut Scheduler, Ordering::Release);
+    }
+
+    pub(crate) fn detach_runtime(&self) {
+        self.runtime_mv.store(std::ptr::null_mut(), Ordering::Release);
+        self.runtime_sched
+            .store(std::ptr::null_mut(), Ordering::Release);
+    }
+
 
     pub fn clear(&self) {
         self.abort_events.lock().unwrap().clear();
         *self.last_snapshot.lock().unwrap() = None;
         *self.deep_state.lock().unwrap() = DeepRuntimeState::default();
+        self.detach_runtime();
     }
 
     pub fn record_abort(
@@ -439,10 +549,27 @@ impl FineGrainCollector {
             return;
         };
         let class = EffectClass::from_kind(kind);
+        let mv_ptr = self.runtime_mv.load(Ordering::Acquire);
+        let sched_ptr = self.runtime_sched.load(Ordering::Acquire);
+        let mv_kind = if mv_ptr.is_null() {
+            "unknown".to_string()
+        } else {
+            let mv = unsafe { &*mv_ptr };
+            mv.entry_kind_at(location, producer_tx).to_string()
+        };
+        let status = if sched_ptr.is_null() {
+            "unknown".to_string()
+        } else {
+            let sched = unsafe { &*sched_ptr };
+            sched.status_label(producer_tx).to_string()
+        };
+        let ready = classify_producer_ready(&status, &mv_kind).to_string();
         if class == EffectClass::Program && c.first_program_cross_k.is_none() {
             c.first_program_cross_k = Some(consumer_k);
             c.first_program_cross_location = Some(location);
             c.first_program_producer_tx = Some(producer_tx);
+            c.first_program_producer_ready = Some(ready.clone());
+            c.first_program_producer_mv = Some(mv_kind.clone());
         }
         let edge = RawEffectEdge {
             producer_tx,
@@ -457,6 +584,8 @@ impl FineGrainCollector {
             gas_used_so_far: None,
             opcode_steps: Some(consumer_k),
             gross_work_so_far: None,
+            producer_ready: Some(ready),
+            producer_mv: Some(mv_kind),
         };
         let _ = c;
         st.edges.push(edge);
@@ -569,40 +698,135 @@ impl FineGrainCollector {
             }
         });
 
-        if producer_meta.is_none() {
+        // Account-grain diag when slot/location has no prior writer.
+        let account_grain = if producer_meta.is_none() {
+            account.and_then(|acct| {
+                st.last_account_writer
+                    .get(&acct)
+                    .copied()
+                    .filter(|&(ptx, _, _)| ptx < consumer_tx)
+            })
+        } else {
             if let Some(acct) = account {
                 if let Some(&(ptx, _, _)) = st.last_account_writer.get(&acct) {
                     if ptx < consumer_tx {
-                        st.diag.sload_account_grain_cross += 1;
+                        st.diag.slot_and_account_both += 1;
                     }
                 }
             }
-        }
+            None
+        };
 
-        let c = st
-            .consumers
-            .entry(consumer_tx)
-            .or_insert_with(|| ConsumerLive::new(consumer_incarnation, gas_limit));
-        if c.incarnation != consumer_incarnation {
-            *c = ConsumerLive::new(consumer_incarnation, gas_limit);
+        let consumer_k = {
+            let c = st
+                .consumers
+                .entry(consumer_tx)
+                .or_insert_with(|| ConsumerLive::new(consumer_incarnation, gas_limit));
+            if c.incarnation != consumer_incarnation {
+                *c = ConsumerLive::new(consumer_incarnation, gas_limit);
+            }
+            if c.gas_limit.is_none() {
+                c.gas_limit = gas_limit;
+            }
+            let k = c.db_effects;
+            c.db_effects += 1;
+            k
+        };
+
+        if let Some((aptx, apinc, _)) = account_grain {
+            // Slot cold, account hot — structured observe (not primary RAW).
+            st.diag.sload_account_grain_cross += 1;
+            let opc = opcode_class_from_kind(kind_hint);
+            match opc {
+                "sload" => st.diag.account_grain_sload += 1,
+                "balance" => st.diag.account_grain_balance += 1,
+                "ext" => st.diag.account_grain_ext += 1,
+                _ => {}
+            }
+            let acct_basic_loc = account
+                .map(|a| {
+                    let addr = Address::from_slice(&a);
+                    hash_deterministic(MemoryLocation::Basic(addr))
+                })
+                .unwrap_or(0);
+            let mv_ptr = self.runtime_mv.load(Ordering::Acquire);
+            let sched_ptr = self.runtime_sched.load(Ordering::Acquire);
+            let mv_kind = if mv_ptr.is_null() {
+                "unknown".to_string()
+            } else {
+                let mv = unsafe { &*mv_ptr };
+                let k = mv.entry_kind_at(acct_basic_loc, aptx);
+                if k == "absent" {
+                    mv.entry_kind_at(location, aptx).to_string()
+                } else {
+                    k.to_string()
+                }
+            };
+            let status = if sched_ptr.is_null() {
+                "unknown".to_string()
+            } else {
+                let sched = unsafe { &*sched_ptr };
+                sched.status_label(aptx).to_string()
+            };
+            let ready = classify_producer_ready(&status, &mv_kind).to_string();
+            let would_wait = matches!(ready.as_str(), "running" | "estimate" | "aborting");
+            let would_bind = matches!(ready.as_str(), "validated" | "executed" | "data");
+            if would_wait {
+                st.diag.account_grain_would_wait += 1;
+            }
+            if would_bind {
+                st.diag.account_grain_would_bind += 1;
+            }
+            st.account_grain_edges.push(AccountGrainObserve {
+                consumer_tx,
+                consumer_incarnation,
+                consumer_effect_k: consumer_k,
+                account_producer_tx: aptx,
+                account_producer_incarnation: apinc,
+                location,
+                kind: kind_hint.as_str().to_string(),
+                opcode_class: opc.to_string(),
+                gas_used_so_far,
+                opcode_steps,
+                account_producer_ready: ready,
+                account_producer_mv: mv_kind,
+                would_wait,
+                would_bind,
+            });
         }
-        if c.gas_limit.is_none() {
-            c.gas_limit = gas_limit;
-        }
-        let consumer_k = c.db_effects;
-        c.db_effects += 1;
 
         let Some((producer_tx, producer_inc, producer_k, kind)) = producer_meta else {
             st.diag.journal_reads_no_prior_writer += 1;
             return;
         };
+        let mv_ptr = self.runtime_mv.load(Ordering::Acquire);
+        let sched_ptr = self.runtime_sched.load(Ordering::Acquire);
+        let mv_kind = if mv_ptr.is_null() {
+            "unknown".to_string()
+        } else {
+            let mv = unsafe { &*mv_ptr };
+            mv.entry_kind_at(location, producer_tx).to_string()
+        };
+        let status = if sched_ptr.is_null() {
+            "unknown".to_string()
+        } else {
+            let sched = unsafe { &*sched_ptr };
+            sched.status_label(producer_tx).to_string()
+        };
+        let ready = classify_producer_ready(&status, &mv_kind).to_string();
         let class = EffectClass::from_kind(kind);
-        if class == EffectClass::Program && c.first_program_cross_k.is_none() {
-            c.first_program_cross_k = Some(consumer_k);
-            c.first_program_cross_location = Some(location);
-            c.first_program_producer_tx = Some(producer_tx);
-            c.first_program_cross_gas = gas_used_so_far;
-            c.first_program_cross_opcode_steps = opcode_steps;
+        if class == EffectClass::Program {
+            if let Some(c) = st.consumers.get_mut(&consumer_tx) {
+                if c.incarnation == consumer_incarnation && c.first_program_cross_k.is_none() {
+                    c.first_program_cross_k = Some(consumer_k);
+                    c.first_program_cross_location = Some(location);
+                    c.first_program_producer_tx = Some(producer_tx);
+                    c.first_program_cross_gas = gas_used_so_far;
+                    c.first_program_cross_opcode_steps = opcode_steps;
+                    c.first_program_producer_ready = Some(ready.clone());
+                    c.first_program_producer_mv = Some(mv_kind.clone());
+                }
+            }
         }
         let edge = RawEffectEdge {
             producer_tx,
@@ -617,8 +841,9 @@ impl FineGrainCollector {
             gas_used_so_far,
             opcode_steps: opcode_steps.or(Some(consumer_k)),
             gross_work_so_far: gas_used_so_far,
+            producer_ready: Some(ready),
+            producer_mv: Some(mv_kind),
         };
-        let _ = c;
         st.diag.journal_reads_cross += 1;
         st.edges.push(edge);
         st.diag.edges_pushed += 1;
@@ -682,6 +907,8 @@ impl FineGrainCollector {
             depth_frac_gas,
             depth_frac_gross_work,
             depth_frac_opcode,
+            producer_ready_at_discovery: c.first_program_producer_ready,
+            producer_mv_at_discovery: c.first_program_producer_mv,
         });
     }
 
@@ -727,12 +954,23 @@ impl FineGrainCollector {
         let abort_events = self.abort_events.lock().unwrap().clone();
         let deep_mode = self.deep_enabled();
         let journal_mode = self.journal_enabled();
-        let (effect_edges, consumer_first_cross, mut stream_diag) = if deep_mode {
-            let st = self.deep_state.lock().unwrap();
-            (st.edges.clone(), st.finished.clone(), st.diag.clone())
-        } else {
-            (Vec::new(), Vec::new(), EffectStreamDiag::default())
-        };
+        let (effect_edges, consumer_first_cross, mut stream_diag, account_grain_edges) =
+            if deep_mode {
+                let st = self.deep_state.lock().unwrap();
+                (
+                    st.edges.clone(),
+                    st.finished.clone(),
+                    st.diag.clone(),
+                    st.account_grain_edges.clone(),
+                )
+            } else {
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    EffectStreamDiag::default(),
+                    Vec::new(),
+                )
+            };
         if !effect_edges.is_empty() {
             use std::collections::HashMap;
             let mut pcl: HashMap<(usize, usize, u64), usize> = HashMap::new();
@@ -748,6 +986,93 @@ impl FineGrainCollector {
                 effect_edges.len() as f64 / n_pcl as f64
             };
         }
+        // WAW / multi-writer HotLocal writer-count proxy.
+        {
+            use std::collections::{HashMap, HashSet};
+            let lazy: HashSet<u64> = location_kinds
+                .iter()
+                .filter(|(_, k)| k == "basic_lazy")
+                .map(|(h, _)| *h)
+                .collect();
+            let mut writers: HashMap<u64, Vec<usize>> = HashMap::new();
+            let mut readers: HashMap<u64, Vec<usize>> = HashMap::new();
+            for tx in &txs {
+                for &w in &tx.writes {
+                    if w == beneficiary_hash || lazy.contains(&w) {
+                        continue;
+                    }
+                    writers.entry(w).or_default().push(tx.tx_idx);
+                }
+                for &r in &tx.reads {
+                    if r == beneficiary_hash || lazy.contains(&r) {
+                        continue;
+                    }
+                    readers.entry(r).or_default().push(tx.tx_idx);
+                }
+            }
+            for v in writers.values_mut() {
+                v.sort_unstable();
+                v.dedup();
+            }
+            for v in readers.values_mut() {
+                v.sort_unstable();
+                v.dedup();
+            }
+            let raw_locs: HashSet<u64> = effect_edges.iter().map(|e| e.location).collect();
+            let mut final_raw_locs: HashSet<u64> = HashSet::new();
+            for (loc, ws) in &writers {
+                if let Some(rs) = readers.get(loc) {
+                    for &w in ws {
+                        if rs.iter().any(|&r| r > w) {
+                            final_raw_locs.insert(*loc);
+                            break;
+                        }
+                    }
+                }
+            }
+            let multi: Vec<_> = writers
+                .iter()
+                .filter(|(_, ws)| ws.len() >= 2)
+                .collect();
+            stream_diag.multi_writer_locs = multi.len();
+            let mut waw_only = 0usize;
+            let mut no_readers = 0usize;
+            let mut spurious = 0usize;
+            let mut max_chain = 0usize;
+            let mut waw_pairs = 0usize;
+            let mut waw_pairs_no_raw = 0usize;
+            for (loc, ws) in &multi {
+                let rs = readers.get(loc).cloned().unwrap_or_default();
+                if rs.is_empty() {
+                    no_readers += 1;
+                }
+                let has_effect_raw = raw_locs.contains(loc);
+                let has_final_raw = final_raw_locs.contains(loc);
+                if !has_effect_raw && !has_final_raw {
+                    waw_only += 1;
+                    // Writer-count≥2 with no RAW → HotLocal Wait keyed only on count is spurious
+                    // for RAW-EV; WAW still needs ordering via schedule/validate.
+                    spurious += 1;
+                    max_chain = max_chain.max(ws.len());
+                } else if !has_effect_raw {
+                    max_chain = max_chain.max(ws.len());
+                }
+                for pair in ws.windows(2) {
+                    waw_pairs += 1;
+                    let (a, b) = (pair[0], pair[1]);
+                    let intervening = rs.iter().any(|&r| r > a && r < b);
+                    if !intervening {
+                        waw_pairs_no_raw += 1;
+                    }
+                }
+            }
+            stream_diag.waw_only_multi_writer_locs = waw_only;
+            stream_diag.spurious_hotlocal_writer_count_waits = spurious;
+            stream_diag.max_waw_chain_no_raw = max_chain;
+            stream_diag.waw_pairs = waw_pairs;
+            stream_diag.waw_pairs_no_intervening_raw = waw_pairs_no_raw;
+            stream_diag.multi_writer_no_readers = no_readers;
+        }
         *self.last_snapshot.lock().unwrap() = Some(FineGrainSnapshot {
             n_tx,
             beneficiary_hash,
@@ -760,6 +1085,7 @@ impl FineGrainCollector {
             deep_mode,
             journal_mode,
             stream_diag,
+            account_grain_edges,
         });
     }
 

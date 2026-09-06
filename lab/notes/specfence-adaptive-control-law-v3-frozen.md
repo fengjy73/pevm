@@ -60,3 +60,14 @@ HotSet / writer counts = **tracking cache only**, not the decision.
 ## Bottom line
 
 True adaptive on **this** plant = **gross-work-aware per-edge EV**, Wait/Bind on fan-out program storms, SpecRead on handler chatter, morphology-conditioned EarlyAbort for the heavy minority — learned online and across contiguous blocks, not retuned thresholds.
+
+---
+
+## Deeper instrumentation addendum (design-only)
+
+**Evidence:** `lab/notes/specfence-instrumentation-deeper-pass.md` + `lab/results/effect-raw-deeper.*`
+
+- **No change** to the control-law bullets above for `choose_action`.
+- Confirmed: gross-work Wait/Bind + EarlyAbort minority; account-grain must **not** become primary RAW (OCC@8 account-keyed would_wait up to ~0.94 on 597).
+- Strengthened: WAW pairs without intervening RAW ≈0.92–1.00 → schedule/steal over writer-count WaitHard.
+- Producer readiness must be sampled **at discovery incarnation** (OCC@8 edge waitish up to ~0.29; final-incarnation first-cross overstates readiness).
