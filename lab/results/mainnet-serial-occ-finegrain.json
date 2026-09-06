@@ -1,0 +1,1902 @@
+{
+  "generated": "2026-09-06 Asia/Shanghai",
+  "blocks": [
+    {
+      "block": 19807137,
+      "n_tx": 712,
+      "gas_used": 29981386,
+      "serial": {
+        "mode": "sequential",
+        "cores": 1,
+        "elapsed_ms": 2854.2151329999997,
+        "tps": 249.45561803241972,
+        "ok": true,
+        "error": null,
+        "occ_aborts": 0,
+        "abort_rate": 0.0,
+        "cascade_validations_scheduled": 0,
+        "evm_entries": 0,
+        "full_restart": 0,
+        "total_incarnations": 0,
+        "max_incarnation": 0,
+        "txs_with_abort": 0,
+        "abort_events": 0,
+        "mean_cascade_on_abort": 0.0,
+        "reexec_entry_frac": 0.0
+      },
+      "occ": [
+        {
+          "mode": "occ",
+          "cores": 1,
+          "elapsed_ms": 25.64033,
+          "tps": 27768.753366278826,
+          "ok": true,
+          "error": null,
+          "occ_aborts": 0,
+          "abort_rate": 0.0,
+          "cascade_validations_scheduled": 0,
+          "evm_entries": 712,
+          "full_restart": 0,
+          "total_incarnations": 712,
+          "max_incarnation": 0,
+          "txs_with_abort": 0,
+          "abort_events": 0,
+          "mean_cascade_on_abort": 0.0,
+          "reexec_entry_frac": 0.0
+        },
+        {
+          "mode": "occ",
+          "cores": 8,
+          "elapsed_ms": 14.734411,
+          "tps": 48322.25733353033,
+          "ok": true,
+          "error": null,
+          "occ_aborts": 814,
+          "abort_rate": 1.1432584269662922,
+          "cascade_validations_scheduled": 0,
+          "evm_entries": 4238,
+          "full_restart": 814,
+          "total_incarnations": 4235,
+          "max_incarnation": 13,
+          "txs_with_abort": 601,
+          "abort_events": 814,
+          "mean_cascade_on_abort": 302.94963144963145,
+          "reexec_entry_frac": 0.8319962246342615
+        }
+      ],
+      "dag": {
+        "n_edges": 637,
+        "n_raw": 9,
+        "n_waw": 628,
+        "longest_chain": 571,
+        "independent_txs": 95,
+        "independent_frac": 0.13342696629213482,
+        "max_wave_width": 106,
+        "mean_wave_width": 1.2469352014010509,
+        "n_levels": 571,
+        "multi_writer_locs": 30,
+        "max_writers_on_loc": 571,
+        "conflict_component_sizes_top10": [
+          571,
+          35,
+          3,
+          3,
+          3,
+          2
+        ],
+        "max_conflict_component": 571
+      },
+      "dag_with_lazy": {
+        "n_edges": 645,
+        "n_raw": 9,
+        "n_waw": 636,
+        "longest_chain": 571,
+        "independent_txs": 82,
+        "independent_frac": 0.1151685393258427,
+        "max_wave_width": 98,
+        "mean_wave_width": 1.2469352014010509,
+        "n_levels": 571,
+        "multi_writer_locs": 35,
+        "max_writers_on_loc": 571,
+        "conflict_component_sizes_top10": [
+          571,
+          35,
+          3,
+          3,
+          3,
+          3,
+          3,
+          3,
+          2,
+          2
+        ],
+        "max_conflict_component": 571
+      },
+      "kind_hist": {
+        "storage": 1006,
+        "basic": 745,
+        "basic_lazy": 12
+      },
+      "hot_top20": [
+        {
+          "location": 6996519588683120047,
+          "kind": "storage",
+          "n_writers": 571,
+          "n_readers": 571,
+          "touches": 1142
+        },
+        {
+          "location": 11299050903170838323,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 573,
+          "touches": 573
+        },
+        {
+          "location": 316062990106050706,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 573,
+          "touches": 573
+        },
+        {
+          "location": 13758554269703882113,
+          "kind": "basic",
+          "n_writers": 21,
+          "n_readers": 31,
+          "touches": 52
+        },
+        {
+          "location": 2775566356639094496,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 31,
+          "touches": 31
+        },
+        {
+          "location": 7054062116746368461,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 14,
+          "touches": 14
+        },
+        {
+          "location": 15368894169142028,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 14,
+          "touches": 14
+        },
+        {
+          "location": 10998356807233929645,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 14,
+          "touches": 14
+        },
+        {
+          "location": 15848773572098056360,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 13,
+          "touches": 13
+        },
+        {
+          "location": 18259930397649560290,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 13,
+          "touches": 13
+        },
+        {
+          "location": 8385017411453292362,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 13,
+          "touches": 13
+        },
+        {
+          "location": 10657587388766081695,
+          "kind": "storage",
+          "n_writers": 6,
+          "n_readers": 6,
+          "touches": 12
+        },
+        {
+          "location": 8088459443191023883,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 10,
+          "touches": 10
+        },
+        {
+          "location": 7583066627660513345,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 10,
+          "touches": 10
+        },
+        {
+          "location": 16054086245033129796,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 10,
+          "touches": 10
+        },
+        {
+          "location": 3928718027635953483,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 10,
+          "touches": 10
+        },
+        {
+          "location": 7764523871591522314,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 10,
+          "touches": 10
+        },
+        {
+          "location": 8590330084455474662,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 10,
+          "touches": 10
+        },
+        {
+          "location": 15046822788305277343,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 10,
+          "touches": 10
+        },
+        {
+          "location": 11319150051839231679,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 10,
+          "touches": 10
+        }
+      ],
+      "mean_reads": 8.28370786516854,
+      "mean_writes": 4.367977528089888,
+      "v7_sf_occ_ratio": 0.085,
+      "v7_wait_hard": 7292,
+      "v7_inspector_steps": 1467978,
+      "v7_lean_mode_txs": 0,
+      "v7_absolute_jump_applied": 0
+    },
+    {
+      "block": 14683600,
+      "n_tx": 660,
+      "gas_used": 30021734,
+      "serial": {
+        "mode": "sequential",
+        "cores": 1,
+        "elapsed_ms": 13.478508,
+        "tps": 48966.844104703574,
+        "ok": true,
+        "error": null,
+        "occ_aborts": 0,
+        "abort_rate": 0.0,
+        "cascade_validations_scheduled": 0,
+        "evm_entries": 0,
+        "full_restart": 0,
+        "total_incarnations": 0,
+        "max_incarnation": 0,
+        "txs_with_abort": 0,
+        "abort_events": 0,
+        "mean_cascade_on_abort": 0.0,
+        "reexec_entry_frac": 0.0
+      },
+      "occ": [
+        {
+          "mode": "occ",
+          "cores": 1,
+          "elapsed_ms": 19.786497999999998,
+          "tps": 33356.07948410072,
+          "ok": true,
+          "error": null,
+          "occ_aborts": 0,
+          "abort_rate": 0.0,
+          "cascade_validations_scheduled": 0,
+          "evm_entries": 660,
+          "full_restart": 0,
+          "total_incarnations": 660,
+          "max_incarnation": 0,
+          "txs_with_abort": 0,
+          "abort_events": 0,
+          "mean_cascade_on_abort": 0.0,
+          "reexec_entry_frac": 0.0
+        },
+        {
+          "mode": "occ",
+          "cores": 8,
+          "elapsed_ms": 6.672034,
+          "tps": 98920.35921879295,
+          "ok": true,
+          "error": null,
+          "occ_aborts": 70,
+          "abort_rate": 0.10606060606060606,
+          "cascade_validations_scheduled": 0,
+          "evm_entries": 996,
+          "full_restart": 70,
+          "total_incarnations": 875,
+          "max_incarnation": 6,
+          "txs_with_abort": 119,
+          "abort_events": 70,
+          "mean_cascade_on_abort": 335.9142857142857,
+          "reexec_entry_frac": 0.3373493975903614
+        }
+      ],
+      "dag": {
+        "n_edges": 377,
+        "n_raw": 70,
+        "n_waw": 307,
+        "longest_chain": 83,
+        "independent_txs": 424,
+        "independent_frac": 0.6424242424242425,
+        "max_wave_width": 449,
+        "mean_wave_width": 7.951807228915663,
+        "n_levels": 83,
+        "multi_writer_locs": 87,
+        "max_writers_on_loc": 83,
+        "conflict_component_sizes_top10": [
+          85,
+          41,
+          36,
+          15,
+          14,
+          8,
+          4,
+          4,
+          3,
+          3
+        ],
+        "max_conflict_component": 85
+      },
+      "dag_with_lazy": {
+        "n_edges": 493,
+        "n_raw": 70,
+        "n_waw": 423,
+        "longest_chain": 83,
+        "independent_txs": 290,
+        "independent_frac": 0.4393939393939394,
+        "max_wave_width": 333,
+        "mean_wave_width": 7.951807228915663,
+        "n_levels": 83,
+        "multi_writer_locs": 106,
+        "max_writers_on_loc": 83,
+        "conflict_component_sizes_top10": [
+          85,
+          41,
+          36,
+          18,
+          18,
+          16,
+          15,
+          15,
+          14,
+          14
+        ],
+        "max_conflict_component": 85
+      },
+      "kind_hist": {
+        "unknown": 1,
+        "basic": 317,
+        "storage": 687,
+        "basic_lazy": 368
+      },
+      "hot_top20": [
+        {
+          "location": 6862687449829067442,
+          "kind": "basic",
+          "n_writers": 83,
+          "n_readers": 4,
+          "touches": 87
+        },
+        {
+          "location": 12771183284214112110,
+          "kind": "storage",
+          "n_writers": 36,
+          "n_readers": 36,
+          "touches": 72
+        },
+        {
+          "location": 15046822788305277343,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 69,
+          "touches": 69
+        },
+        {
+          "location": 3928718027635953483,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 69,
+          "touches": 69
+        },
+        {
+          "location": 7583066627660513345,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 69,
+          "touches": 69
+        },
+        {
+          "location": 10034531736206172616,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 68,
+          "touches": 68
+        },
+        {
+          "location": 6178880340109498315,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 68,
+          "touches": 68
+        },
+        {
+          "location": 696528483244174500,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 68,
+          "touches": 68
+        },
+        {
+          "location": 13758554269703882113,
+          "kind": "basic",
+          "n_writers": 18,
+          "n_readers": 28,
+          "touches": 46
+        },
+        {
+          "location": 4660786334524726478,
+          "kind": "basic",
+          "n_writers": 15,
+          "n_readers": 15,
+          "touches": 30
+        },
+        {
+          "location": 7570100118471372200,
+          "kind": "storage",
+          "n_writers": 15,
+          "n_readers": 15,
+          "touches": 30
+        },
+        {
+          "location": 4166530666821512575,
+          "kind": "storage",
+          "n_writers": 15,
+          "n_readers": 15,
+          "touches": 30
+        },
+        {
+          "location": 5204584229706170905,
+          "kind": "basic",
+          "n_writers": 14,
+          "n_readers": 14,
+          "touches": 28
+        },
+        {
+          "location": 2775566356639094496,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 28,
+          "touches": 28
+        },
+        {
+          "location": 5292505809433916233,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 25,
+          "touches": 25
+        },
+        {
+          "location": 12756261970011571367,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 25,
+          "touches": 25
+        },
+        {
+          "location": 16798590704507500515,
+          "kind": "basic_lazy",
+          "n_writers": 18,
+          "n_readers": 1,
+          "touches": 19
+        },
+        {
+          "location": 4937142373135763981,
+          "kind": "basic_lazy",
+          "n_writers": 18,
+          "n_readers": 1,
+          "touches": 19
+        },
+        {
+          "location": 8088459443191023883,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 19,
+          "touches": 19
+        },
+        {
+          "location": 11808355706680833035,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 19,
+          "touches": 19
+        }
+      ],
+      "mean_reads": 6.8121212121212125,
+      "mean_writes": 3.7181818181818183,
+      "v7_sf_occ_ratio": 0.135,
+      "v7_wait_hard": 1034,
+      "v7_inspector_steps": 1270650,
+      "v7_lean_mode_txs": 0,
+      "v7_absolute_jump_applied": 0
+    },
+    {
+      "block": 13217637,
+      "n_tx": 1100,
+      "gas_used": 29985362,
+      "serial": {
+        "mode": "sequential",
+        "cores": 1,
+        "elapsed_ms": 7.178656,
+        "tps": 153232.02560479287,
+        "ok": true,
+        "error": null,
+        "occ_aborts": 0,
+        "abort_rate": 0.0,
+        "cascade_validations_scheduled": 0,
+        "evm_entries": 0,
+        "full_restart": 0,
+        "total_incarnations": 0,
+        "max_incarnation": 0,
+        "txs_with_abort": 0,
+        "abort_events": 0,
+        "mean_cascade_on_abort": 0.0,
+        "reexec_entry_frac": 0.0
+      },
+      "occ": [
+        {
+          "mode": "occ",
+          "cores": 1,
+          "elapsed_ms": 11.149743,
+          "tps": 98656.98249726473,
+          "ok": true,
+          "error": null,
+          "occ_aborts": 0,
+          "abort_rate": 0.0,
+          "cascade_validations_scheduled": 0,
+          "evm_entries": 1100,
+          "full_restart": 0,
+          "total_incarnations": 1100,
+          "max_incarnation": 0,
+          "txs_with_abort": 0,
+          "abort_events": 0,
+          "mean_cascade_on_abort": 0.0,
+          "reexec_entry_frac": 0.0
+        },
+        {
+          "mode": "occ",
+          "cores": 8,
+          "elapsed_ms": 5.038156,
+          "tps": 218333.85071839776,
+          "ok": true,
+          "error": null,
+          "occ_aborts": 7,
+          "abort_rate": 0.006363636363636364,
+          "cascade_validations_scheduled": 0,
+          "evm_entries": 1167,
+          "full_restart": 7,
+          "total_incarnations": 1118,
+          "max_incarnation": 2,
+          "txs_with_abort": 17,
+          "abort_events": 7,
+          "mean_cascade_on_abort": 611.8571428571429,
+          "reexec_entry_frac": 0.05741216795201371
+        }
+      ],
+      "dag": {
+        "n_edges": 65,
+        "n_raw": 21,
+        "n_waw": 44,
+        "longest_chain": 6,
+        "independent_txs": 1045,
+        "independent_frac": 0.95,
+        "max_wave_width": 1060,
+        "mean_wave_width": 183.33333333333334,
+        "n_levels": 6,
+        "multi_writer_locs": 28,
+        "max_writers_on_loc": 5,
+        "conflict_component_sizes_top10": [
+          22,
+          5,
+          4,
+          4,
+          3,
+          3,
+          2,
+          2,
+          2,
+          2
+        ],
+        "max_conflict_component": 22
+      },
+      "dag_with_lazy": {
+        "n_edges": 1028,
+        "n_raw": 21,
+        "n_waw": 1007,
+        "longest_chain": 934,
+        "independent_txs": 85,
+        "independent_frac": 0.07727272727272727,
+        "max_wave_width": 104,
+        "mean_wave_width": 1.177730192719486,
+        "n_levels": 934,
+        "multi_writer_locs": 36,
+        "max_writers_on_loc": 934,
+        "conflict_component_sizes_top10": [
+          934,
+          22,
+          14,
+          8,
+          6,
+          5,
+          4,
+          3,
+          3,
+          2
+        ],
+        "max_conflict_component": 934
+      },
+      "kind_hist": {
+        "storage": 347,
+        "code_hash": 1,
+        "basic_lazy": 964,
+        "basic": 155
+      },
+      "hot_top20": [
+        {
+          "location": 14020337404169679390,
+          "kind": "basic_lazy",
+          "n_writers": 934,
+          "n_readers": 2,
+          "touches": 936
+        },
+        {
+          "location": 3037349491037782909,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 934,
+          "touches": 934
+        },
+        {
+          "location": 3928718027635953483,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 37,
+          "touches": 37
+        },
+        {
+          "location": 7583066627660513345,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 37,
+          "touches": 37
+        },
+        {
+          "location": 15046822788305277343,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 37,
+          "touches": 37
+        },
+        {
+          "location": 696528483244174500,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 35,
+          "touches": 35
+        },
+        {
+          "location": 6178880340109498315,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 35,
+          "touches": 35
+        },
+        {
+          "location": 10034531736206172616,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 35,
+          "touches": 35
+        },
+        {
+          "location": 13758554269703882113,
+          "kind": "basic",
+          "n_writers": 5,
+          "n_readers": 18,
+          "touches": 23
+        },
+        {
+          "location": 8898878514797201221,
+          "kind": "basic_lazy",
+          "n_writers": 14,
+          "n_readers": 7,
+          "touches": 21
+        },
+        {
+          "location": 2775566356639094496,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 18,
+          "touches": 18
+        },
+        {
+          "location": 13798989972748114961,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 15,
+          "touches": 15
+        },
+        {
+          "location": 8088459443191023883,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 15,
+          "touches": 15
+        },
+        {
+          "location": 300767711013867180,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 15,
+          "touches": 15
+        },
+        {
+          "location": 7764523871591522314,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 15,
+          "touches": 15
+        },
+        {
+          "location": 11808355706680833035,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 15,
+          "touches": 15
+        },
+        {
+          "location": 2816002059683327344,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 15,
+          "touches": 15
+        },
+        {
+          "location": 11319150051839231679,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 15,
+          "touches": 15
+        },
+        {
+          "location": 238884258749349807,
+          "kind": "basic_lazy",
+          "n_writers": 8,
+          "n_readers": 6,
+          "touches": 14
+        },
+        {
+          "location": 4374904034207278638,
+          "kind": "basic",
+          "n_writers": 5,
+          "n_readers": 3,
+          "touches": 8
+        }
+      ],
+      "mean_reads": 2.5272727272727273,
+      "mean_writes": 3.248181818181818,
+      "v7_sf_occ_ratio": 0.101,
+      "v7_wait_hard": 113,
+      "v7_inspector_steps": 405348,
+      "v7_lean_mode_txs": 0,
+      "v7_absolute_jump_applied": 0
+    },
+    {
+      "block": 14383540,
+      "n_tx": 722,
+      "gas_used": 30059751,
+      "serial": {
+        "mode": "sequential",
+        "cores": 1,
+        "elapsed_ms": 10.951577,
+        "tps": 65926.57842792869,
+        "ok": true,
+        "error": null,
+        "occ_aborts": 0,
+        "abort_rate": 0.0,
+        "cascade_validations_scheduled": 0,
+        "evm_entries": 0,
+        "full_restart": 0,
+        "total_incarnations": 0,
+        "max_incarnation": 0,
+        "txs_with_abort": 0,
+        "abort_events": 0,
+        "mean_cascade_on_abort": 0.0,
+        "reexec_entry_frac": 0.0
+      },
+      "occ": [
+        {
+          "mode": "occ",
+          "cores": 1,
+          "elapsed_ms": 16.421129999999998,
+          "tps": 43967.74156224328,
+          "ok": true,
+          "error": null,
+          "occ_aborts": 0,
+          "abort_rate": 0.0,
+          "cascade_validations_scheduled": 0,
+          "evm_entries": 722,
+          "full_restart": 0,
+          "total_incarnations": 722,
+          "max_incarnation": 0,
+          "txs_with_abort": 0,
+          "abort_events": 0,
+          "mean_cascade_on_abort": 0.0,
+          "reexec_entry_frac": 0.0
+        },
+        {
+          "mode": "occ",
+          "cores": 8,
+          "elapsed_ms": 6.910683,
+          "tps": 104475.92517266383,
+          "ok": true,
+          "error": null,
+          "occ_aborts": 35,
+          "abort_rate": 0.04847645429362881,
+          "cascade_validations_scheduled": 0,
+          "evm_entries": 941,
+          "full_restart": 35,
+          "total_incarnations": 793,
+          "max_incarnation": 5,
+          "txs_with_abort": 43,
+          "abort_events": 35,
+          "mean_cascade_on_abort": 511.42857142857144,
+          "reexec_entry_frac": 0.23273113708820403
+        }
+      ],
+      "dag": {
+        "n_edges": 133,
+        "n_raw": 16,
+        "n_waw": 117,
+        "longest_chain": 21,
+        "independent_txs": 637,
+        "independent_frac": 0.8822714681440443,
+        "max_wave_width": 655,
+        "mean_wave_width": 34.38095238095238,
+        "n_levels": 21,
+        "multi_writer_locs": 44,
+        "max_writers_on_loc": 19,
+        "conflict_component_sizes_top10": [
+          32,
+          12,
+          7,
+          6,
+          4,
+          3,
+          3,
+          3,
+          3,
+          2
+        ],
+        "max_conflict_component": 32
+      },
+      "dag_with_lazy": {
+        "n_edges": 660,
+        "n_raw": 16,
+        "n_waw": 644,
+        "longest_chain": 436,
+        "independent_txs": 103,
+        "independent_frac": 0.14265927977839335,
+        "max_wave_width": 130,
+        "mean_wave_width": 1.6559633027522935,
+        "n_levels": 436,
+        "multi_writer_locs": 55,
+        "max_writers_on_loc": 436,
+        "conflict_component_sizes_top10": [
+          436,
+          70,
+          32,
+          12,
+          7,
+          7,
+          6,
+          6,
+          4,
+          4
+        ],
+        "max_conflict_component": 436
+      },
+      "kind_hist": {
+        "code_hash": 2,
+        "storage": 582,
+        "basic_lazy": 530,
+        "basic": 237
+      },
+      "hot_top20": [
+        {
+          "location": 14562814392964356195,
+          "kind": "basic_lazy",
+          "n_writers": 436,
+          "n_readers": 1,
+          "touches": 437
+        },
+        {
+          "location": 3579826479899568578,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 436,
+          "touches": 436
+        },
+        {
+          "location": 4478764255479675304,
+          "kind": "basic_lazy",
+          "n_writers": 70,
+          "n_readers": 3,
+          "touches": 73
+        },
+        {
+          "location": 13758554269703882113,
+          "kind": "basic",
+          "n_writers": 19,
+          "n_readers": 31,
+          "touches": 50
+        },
+        {
+          "location": 2775566356639094496,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 31,
+          "touches": 31
+        },
+        {
+          "location": 15046822788305277343,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 27,
+          "touches": 27
+        },
+        {
+          "location": 7583066627660513345,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 27,
+          "touches": 27
+        },
+        {
+          "location": 3928718027635953483,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 27,
+          "touches": 27
+        },
+        {
+          "location": 10034531736206172616,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 25,
+          "touches": 25
+        },
+        {
+          "location": 6178880340109498315,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 25,
+          "touches": 25
+        },
+        {
+          "location": 696528483244174500,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 25,
+          "touches": 25
+        },
+        {
+          "location": 18415319284473798932,
+          "kind": "storage",
+          "n_writers": 12,
+          "n_readers": 12,
+          "touches": 24
+        },
+        {
+          "location": 17412376173616165010,
+          "kind": "basic",
+          "n_writers": 12,
+          "n_readers": 12,
+          "touches": 24
+        },
+        {
+          "location": 586555039204401241,
+          "kind": "storage",
+          "n_writers": 12,
+          "n_readers": 12,
+          "touches": 24
+        },
+        {
+          "location": 8385017411453292362,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 15,
+          "touches": 15
+        },
+        {
+          "location": 15848773572098056360,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 15,
+          "touches": 15
+        },
+        {
+          "location": 5204584229706170905,
+          "kind": "basic",
+          "n_writers": 7,
+          "n_readers": 6,
+          "touches": 13
+        },
+        {
+          "location": 16295988775718570894,
+          "kind": "storage",
+          "n_writers": 6,
+          "n_readers": 6,
+          "touches": 12
+        },
+        {
+          "location": 15678008947345525834,
+          "kind": "storage",
+          "n_writers": 6,
+          "n_readers": 6,
+          "touches": 12
+        },
+        {
+          "location": 6519965916094438857,
+          "kind": "basic",
+          "n_writers": 6,
+          "n_readers": 6,
+          "touches": 12
+        }
+      ],
+      "mean_reads": 5.351800554016621,
+      "mean_writes": 3.7617728531855956,
+      "v7_sf_occ_ratio": 0.123,
+      "v7_wait_hard": 800,
+      "v7_inspector_steps": 814046,
+      "v7_lean_mode_txs": 0,
+      "v7_absolute_jump_applied": 0
+    },
+    {
+      "block": 15199017,
+      "n_tx": 866,
+      "gas_used": 30028395,
+      "serial": {
+        "mode": "sequential",
+        "cores": 1,
+        "elapsed_ms": 8.028011999999999,
+        "tps": 107872.28519339534,
+        "ok": true,
+        "error": null,
+        "occ_aborts": 0,
+        "abort_rate": 0.0,
+        "cascade_validations_scheduled": 0,
+        "evm_entries": 0,
+        "full_restart": 0,
+        "total_incarnations": 0,
+        "max_incarnation": 0,
+        "txs_with_abort": 0,
+        "abort_events": 0,
+        "mean_cascade_on_abort": 0.0,
+        "reexec_entry_frac": 0.0
+      },
+      "occ": [
+        {
+          "mode": "occ",
+          "cores": 1,
+          "elapsed_ms": 15.016032000000001,
+          "tps": 57671.693826971066,
+          "ok": true,
+          "error": null,
+          "occ_aborts": 0,
+          "abort_rate": 0.0,
+          "cascade_validations_scheduled": 0,
+          "evm_entries": 866,
+          "full_restart": 0,
+          "total_incarnations": 866,
+          "max_incarnation": 0,
+          "txs_with_abort": 0,
+          "abort_events": 0,
+          "mean_cascade_on_abort": 0.0,
+          "reexec_entry_frac": 0.0
+        },
+        {
+          "mode": "occ",
+          "cores": 8,
+          "elapsed_ms": 4.589492,
+          "tps": 188691.90751394708,
+          "ok": true,
+          "error": null,
+          "occ_aborts": 11,
+          "abort_rate": 0.012702078521939953,
+          "cascade_validations_scheduled": 0,
+          "evm_entries": 901,
+          "full_restart": 11,
+          "total_incarnations": 897,
+          "max_incarnation": 3,
+          "txs_with_abort": 25,
+          "abort_events": 11,
+          "mean_cascade_on_abort": 796.0,
+          "reexec_entry_frac": 0.038845726970033294
+        }
+      ],
+      "dag": {
+        "n_edges": 55,
+        "n_raw": 12,
+        "n_waw": 43,
+        "longest_chain": 7,
+        "independent_txs": 813,
+        "independent_frac": 0.9387990762124712,
+        "max_wave_width": 830,
+        "mean_wave_width": 123.71428571428571,
+        "n_levels": 7,
+        "multi_writer_locs": 26,
+        "max_writers_on_loc": 7,
+        "conflict_component_sizes_top10": [
+          13,
+          5,
+          5,
+          4,
+          3,
+          3,
+          3,
+          3,
+          2,
+          2
+        ],
+        "max_conflict_component": 13
+      },
+      "dag_with_lazy": {
+        "n_edges": 752,
+        "n_raw": 12,
+        "n_waw": 740,
+        "longest_chain": 459,
+        "independent_txs": 102,
+        "independent_frac": 0.11778290993071594,
+        "max_wave_width": 133,
+        "mean_wave_width": 1.8867102396514162,
+        "n_levels": 459,
+        "multi_writer_locs": 40,
+        "max_writers_on_loc": 459,
+        "conflict_component_sizes_top10": [
+          459,
+          169,
+          16,
+          16,
+          13,
+          11,
+          9,
+          8,
+          5,
+          5
+        ],
+        "max_conflict_component": 459
+      },
+      "kind_hist": {
+        "code_hash": 1,
+        "basic": 202,
+        "storage": 479,
+        "unknown": 1,
+        "basic_lazy": 711
+      },
+      "hot_top20": [
+        {
+          "location": 6509387228596508080,
+          "kind": "basic_lazy",
+          "n_writers": 459,
+          "n_readers": 1,
+          "touches": 460
+        },
+        {
+          "location": 13973143389241272078,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 459,
+          "touches": 459
+        },
+        {
+          "location": 11181477507518635332,
+          "kind": "basic_lazy",
+          "n_writers": 169,
+          "n_readers": 1,
+          "touches": 170
+        },
+        {
+          "location": 198489594386738851,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 169,
+          "touches": 169
+        },
+        {
+          "location": 13758554269703882113,
+          "kind": "basic",
+          "n_writers": 7,
+          "n_readers": 11,
+          "touches": 18
+        },
+        {
+          "location": 14476036925195257868,
+          "kind": "basic_lazy",
+          "n_writers": 16,
+          "n_readers": 1,
+          "touches": 17
+        },
+        {
+          "location": 12960885164707752850,
+          "kind": "basic_lazy",
+          "n_writers": 16,
+          "n_readers": 1,
+          "touches": 17
+        },
+        {
+          "location": 15848773572098056360,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 15,
+          "touches": 15
+        },
+        {
+          "location": 8385017411453292362,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 15,
+          "touches": 15
+        },
+        {
+          "location": 17951153645096425929,
+          "kind": "basic_lazy",
+          "n_writers": 11,
+          "n_readers": 1,
+          "touches": 12
+        },
+        {
+          "location": 15046822788305277343,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 12,
+          "touches": 12
+        },
+        {
+          "location": 3928718027635953483,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 12,
+          "touches": 12
+        },
+        {
+          "location": 7583066627660513345,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 12,
+          "touches": 12
+        },
+        {
+          "location": 13798989972748114961,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 11,
+          "touches": 11
+        },
+        {
+          "location": 8088459443191023883,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 11,
+          "touches": 11
+        },
+        {
+          "location": 11319150051839231679,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 11,
+          "touches": 11
+        },
+        {
+          "location": 2816002059683327344,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 11,
+          "touches": 11
+        },
+        {
+          "location": 7764523871591522314,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 11,
+          "touches": 11
+        },
+        {
+          "location": 2775566356639094496,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 11,
+          "touches": 11
+        },
+        {
+          "location": 11808355706680833035,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 11,
+          "touches": 11
+        }
+      ],
+      "mean_reads": 4.200923787528868,
+      "mean_writes": 3.4618937644341803,
+      "v7_sf_occ_ratio": 0.067,
+      "v7_wait_hard": 270,
+      "v7_inspector_steps": 506622,
+      "v7_lean_mode_txs": 0,
+      "v7_absolute_jump_applied": 0
+    },
+    {
+      "block": 14029313,
+      "n_tx": 724,
+      "gas_used": 30074554,
+      "serial": {
+        "mode": "sequential",
+        "cores": 1,
+        "elapsed_ms": 6.5838659999999996,
+        "tps": 109965.78605943681,
+        "ok": true,
+        "error": null,
+        "occ_aborts": 0,
+        "abort_rate": 0.0,
+        "cascade_validations_scheduled": 0,
+        "evm_entries": 0,
+        "full_restart": 0,
+        "total_incarnations": 0,
+        "max_incarnation": 0,
+        "txs_with_abort": 0,
+        "abort_events": 0,
+        "mean_cascade_on_abort": 0.0,
+        "reexec_entry_frac": 0.0
+      },
+      "occ": [
+        {
+          "mode": "occ",
+          "cores": 1,
+          "elapsed_ms": 13.131556000000002,
+          "tps": 55134.364884100556,
+          "ok": true,
+          "error": null,
+          "occ_aborts": 0,
+          "abort_rate": 0.0,
+          "cascade_validations_scheduled": 0,
+          "evm_entries": 724,
+          "full_restart": 0,
+          "total_incarnations": 724,
+          "max_incarnation": 0,
+          "txs_with_abort": 0,
+          "abort_events": 0,
+          "mean_cascade_on_abort": 0.0,
+          "reexec_entry_frac": 0.0
+        },
+        {
+          "mode": "occ",
+          "cores": 8,
+          "elapsed_ms": 3.9516999999999998,
+          "tps": 183212.28838221525,
+          "ok": true,
+          "error": null,
+          "occ_aborts": 28,
+          "abort_rate": 0.03867403314917127,
+          "cascade_validations_scheduled": 0,
+          "evm_entries": 1292,
+          "full_restart": 28,
+          "total_incarnations": 793,
+          "max_incarnation": 4,
+          "txs_with_abort": 54,
+          "abort_events": 28,
+          "mean_cascade_on_abort": 236.25,
+          "reexec_entry_frac": 0.43962848297213625
+        }
+      ],
+      "dag": {
+        "n_edges": 92,
+        "n_raw": 6,
+        "n_waw": 86,
+        "longest_chain": 14,
+        "independent_txs": 606,
+        "independent_frac": 0.8370165745856354,
+        "max_wave_width": 643,
+        "mean_wave_width": 51.714285714285715,
+        "n_levels": 14,
+        "multi_writer_locs": 40,
+        "max_writers_on_loc": 14,
+        "conflict_component_sizes_top10": [
+          14,
+          13,
+          13,
+          6,
+          6,
+          4,
+          4,
+          3,
+          3,
+          3
+        ],
+        "max_conflict_component": 14
+      },
+      "dag_with_lazy": {
+        "n_edges": 389,
+        "n_raw": 6,
+        "n_waw": 383,
+        "longest_chain": 146,
+        "independent_txs": 305,
+        "independent_frac": 0.4212707182320442,
+        "max_wave_width": 355,
+        "mean_wave_width": 4.958904109589041,
+        "n_levels": 146,
+        "multi_writer_locs": 55,
+        "max_writers_on_loc": 146,
+        "conflict_component_sizes_top10": [
+          162,
+          137,
+          14,
+          13,
+          13,
+          6,
+          6,
+          4,
+          4,
+          3
+        ],
+        "max_conflict_component": 162
+      },
+      "kind_hist": {
+        "basic": 440,
+        "basic_lazy": 289,
+        "storage": 709
+      },
+      "hot_top20": [
+        {
+          "location": 11056878108444968802,
+          "kind": "basic_lazy",
+          "n_writers": 146,
+          "n_readers": 1,
+          "touches": 147
+        },
+        {
+          "location": 73890195313072321,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 146,
+          "touches": 146
+        },
+        {
+          "location": 9675755340023118863,
+          "kind": "basic_lazy",
+          "n_writers": 134,
+          "n_readers": 1,
+          "touches": 135
+        },
+        {
+          "location": 17139511500600773997,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 134,
+          "touches": 134
+        },
+        {
+          "location": 7583066627660513345,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 114,
+          "touches": 114
+        },
+        {
+          "location": 3928718027635953483,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 114,
+          "touches": 114
+        },
+        {
+          "location": 15046822788305277343,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 114,
+          "touches": 114
+        },
+        {
+          "location": 11808355706680833035,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 31,
+          "touches": 31
+        },
+        {
+          "location": 7764523871591522314,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 31,
+          "touches": 31
+        },
+        {
+          "location": 2816002059683327344,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 31,
+          "touches": 31
+        },
+        {
+          "location": 11319150051839231679,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 31,
+          "touches": 31
+        },
+        {
+          "location": 300767711013867180,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 31,
+          "touches": 31
+        },
+        {
+          "location": 13798989972748114961,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 31,
+          "touches": 31
+        },
+        {
+          "location": 8088459443191023883,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 31,
+          "touches": 31
+        },
+        {
+          "location": 4359866719951170718,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 30,
+          "touches": 30
+        },
+        {
+          "location": 11298015165437299159,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 30,
+          "touches": 30
+        },
+        {
+          "location": 11823622880528825852,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 30,
+          "touches": 30
+        },
+        {
+          "location": 10241978305297857843,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 29,
+          "touches": 29
+        },
+        {
+          "location": 11756208780895105488,
+          "kind": "storage",
+          "n_writers": 14,
+          "n_readers": 14,
+          "touches": 28
+        },
+        {
+          "location": 2755032348823048239,
+          "kind": "storage",
+          "n_writers": 13,
+          "n_readers": 13,
+          "touches": 26
+        }
+      ],
+      "mean_reads": 5.5220994475138125,
+      "mean_writes": 3.5138121546961325,
+      "v7_sf_occ_ratio": 0.045,
+      "v7_wait_hard": 167,
+      "v7_inspector_steps": 443585,
+      "v7_lean_mode_txs": 0,
+      "v7_absolute_jump_applied": 0
+    },
+    {
+      "block": 19434587,
+      "n_tx": 390,
+      "gas_used": 28904241,
+      "serial": {
+        "mode": "sequential",
+        "cores": 1,
+        "elapsed_ms": 20.134938000000002,
+        "tps": 19369.31715409305,
+        "ok": true,
+        "error": null,
+        "occ_aborts": 0,
+        "abort_rate": 0.0,
+        "cascade_validations_scheduled": 0,
+        "evm_entries": 0,
+        "full_restart": 0,
+        "total_incarnations": 0,
+        "max_incarnation": 0,
+        "txs_with_abort": 0,
+        "abort_events": 0,
+        "mean_cascade_on_abort": 0.0,
+        "reexec_entry_frac": 0.0
+      },
+      "occ": [
+        {
+          "mode": "occ",
+          "cores": 1,
+          "elapsed_ms": 26.050544,
+          "tps": 14970.896577054207,
+          "ok": true,
+          "error": null,
+          "occ_aborts": 0,
+          "abort_rate": 0.0,
+          "cascade_validations_scheduled": 0,
+          "evm_entries": 390,
+          "full_restart": 0,
+          "total_incarnations": 390,
+          "max_incarnation": 0,
+          "txs_with_abort": 0,
+          "abort_events": 0,
+          "mean_cascade_on_abort": 0.0,
+          "reexec_entry_frac": 0.0
+        },
+        {
+          "mode": "occ",
+          "cores": 8,
+          "elapsed_ms": 11.102021,
+          "tps": 35128.739172804664,
+          "ok": true,
+          "error": null,
+          "occ_aborts": 164,
+          "abort_rate": 0.4205128205128205,
+          "cascade_validations_scheduled": 0,
+          "evm_entries": 1385,
+          "full_restart": 164,
+          "total_incarnations": 1113,
+          "max_incarnation": 12,
+          "txs_with_abort": 165,
+          "abort_events": 164,
+          "mean_cascade_on_abort": 231.1829268292683,
+          "reexec_entry_frac": 0.7184115523465704
+        }
+      ],
+      "dag": {
+        "n_edges": 321,
+        "n_raw": 65,
+        "n_waw": 256,
+        "longest_chain": 62,
+        "independent_txs": 186,
+        "independent_frac": 0.47692307692307695,
+        "max_wave_width": 207,
+        "mean_wave_width": 6.290322580645161,
+        "n_levels": 62,
+        "multi_writer_locs": 69,
+        "max_writers_on_loc": 62,
+        "conflict_component_sizes_top10": [
+          91,
+          63,
+          10,
+          6,
+          5,
+          4,
+          3,
+          3,
+          3,
+          2
+        ],
+        "max_conflict_component": 91
+      },
+      "dag_with_lazy": {
+        "n_edges": 341,
+        "n_raw": 65,
+        "n_waw": 276,
+        "longest_chain": 62,
+        "independent_txs": 159,
+        "independent_frac": 0.4076923076923077,
+        "max_wave_width": 188,
+        "mean_wave_width": 6.290322580645161,
+        "n_levels": 62,
+        "multi_writer_locs": 77,
+        "max_writers_on_loc": 62,
+        "conflict_component_sizes_top10": [
+          91,
+          63,
+          13,
+          6,
+          6,
+          6,
+          5,
+          4,
+          3,
+          3
+        ],
+        "max_conflict_component": 91
+      },
+      "kind_hist": {
+        "basic_lazy": 28,
+        "basic": 439,
+        "storage": 838
+      },
+      "hot_top20": [
+        {
+          "location": 13758554269703882113,
+          "kind": "basic",
+          "n_writers": 55,
+          "n_readers": 86,
+          "touches": 141
+        },
+        {
+          "location": 15128534048206632394,
+          "kind": "storage",
+          "n_writers": 62,
+          "n_readers": 63,
+          "touches": 125
+        },
+        {
+          "location": 2775566356639094496,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 86,
+          "touches": 86
+        },
+        {
+          "location": 13848439878105916377,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 68,
+          "touches": 68
+        },
+        {
+          "location": 2865451964974019896,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 68,
+          "touches": 68
+        },
+        {
+          "location": 7054062116746368461,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 46,
+          "touches": 46
+        },
+        {
+          "location": 10998356807233929645,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 46,
+          "touches": 46
+        },
+        {
+          "location": 15368894169142028,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 46,
+          "touches": 46
+        },
+        {
+          "location": 7583066627660513345,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 42,
+          "touches": 42
+        },
+        {
+          "location": 18259930397649560290,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 42,
+          "touches": 42
+        },
+        {
+          "location": 15046822788305277343,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 42,
+          "touches": 42
+        },
+        {
+          "location": 3928718027635953483,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 42,
+          "touches": 42
+        },
+        {
+          "location": 696528483244174500,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 39,
+          "touches": 39
+        },
+        {
+          "location": 10034531736206172616,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 39,
+          "touches": 39
+        },
+        {
+          "location": 6178880340109498315,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 39,
+          "touches": 39
+        },
+        {
+          "location": 5240750072915126637,
+          "kind": "storage",
+          "n_writers": 11,
+          "n_readers": 20,
+          "touches": 31
+        },
+        {
+          "location": 4432550207863775364,
+          "kind": "storage",
+          "n_writers": 11,
+          "n_readers": 20,
+          "touches": 31
+        },
+        {
+          "location": 3136403394186661372,
+          "kind": "storage",
+          "n_writers": 11,
+          "n_readers": 20,
+          "touches": 31
+        },
+        {
+          "location": 15848773572098056360,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 25,
+          "touches": 25
+        },
+        {
+          "location": 8385017411453292362,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 25,
+          "touches": 25
+        }
+      ],
+      "mean_reads": 13.774358974358975,
+      "mean_writes": 5.051282051282051,
+      "v7_sf_occ_ratio": 0.044,
+      "v7_wait_hard": 2185,
+      "v7_inspector_steps": 1689283,
+      "v7_lean_mode_txs": 0,
+      "v7_absolute_jump_applied": 1
+    }
+  ],
+  "deep_dive_blocks": [
+    19807137,
+    15199017,
+    19434587
+  ],
+  "notes": "Final OCC RW sets ≈ true G* (beneficiary excluded from DAG). v7_* fields cite mainnet-sweep-v7-status.md."
+}

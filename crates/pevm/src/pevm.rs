@@ -26,6 +26,12 @@ use crate::{
     hash_deterministic,
     mv_memory::MvMemory,
     scheduler::Scheduler,
+    specfence::{
+        AccountHints, AdaptiveEngagement, BayesMap, ConcurrencyMode, DEFAULT_TAU, HotSet,
+        FineGrainCollector, FineGrainSnapshot, HeatMap, MetricsInner, PartialRetryTable,
+        RemCounters, RepairPlan, RwPriorMap, SpecDag, SpecFenceCtx, SpecFenceMetrics,
+        WaveParkTable, seed_wait_regions, update_bayes, update_heat, update_rw_prior,
+    },
     storage::StorageWrapper,
     vm::{
         ExecutionError, PevmTxExecutionResult, Vm, VmExecutionError, receipt_from_revm,
@@ -142,15 +148,146 @@ impl ExecutionResults {
 }
 
 // TODO: Port more recyclable resources into here.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 /// The main pevm struct that executes blocks.
 pub struct Pevm {
     execution_results: ExecutionResults,
     abort_reason: OnceLock<AbortReason>,
     dropper: AsyncDropper<(MvMemory, Scheduler)>,
+    concurrency_mode: ConcurrencyMode,
+    heat: HeatMap,
+    bayes: BayesMap,
+    rw_prior: RwPriorMap,
+    /// R1: process-persistent HotSet (per-block members + multi-writer prior).
+    hotset: HotSet,
+    last_metrics: SpecFenceMetrics,
+    last_initial_wait_accounts: std::collections::HashSet<alloy_primitives::Address>,
+    /// M4: abort rate from the previous SpecFence block (`occ_aborts / n_tx`).
+    last_abort_rate: f64,
+    /// Lab-only fine-grain RW/abort tracer (off by default).
+    finegrain_enabled: bool,
+    finegrain: FineGrainCollector,
+}
+
+impl Default for Pevm {
+    fn default() -> Self {
+        Self {
+            execution_results: ExecutionResults::default(),
+            abort_reason: OnceLock::new(),
+            dropper: AsyncDropper::default(),
+            concurrency_mode: ConcurrencyMode::Occ,
+            heat: HeatMap::new(),
+            bayes: BayesMap::new(),
+            rw_prior: RwPriorMap::new(),
+            hotset: HotSet::new(),
+            last_metrics: SpecFenceMetrics::default(),
+            last_initial_wait_accounts: std::collections::HashSet::new(),
+            last_abort_rate: 0.0,
+            finegrain_enabled: false,
+            finegrain: FineGrainCollector::new(),
+        }
+    }
 }
 
 impl Pevm {
+    /// Create an executor with a concurrency-control mode. Default is OCC.
+    pub fn with_concurrency_mode(mode: ConcurrencyMode) -> Self {
+        Self {
+            concurrency_mode: mode,
+            ..Self::default()
+        }
+    }
+
+    /// Set the concurrency-control mode for subsequent blocks.
+    pub const fn set_concurrency_mode(&mut self, mode: ConcurrencyMode) {
+        self.concurrency_mode = mode;
+    }
+
+    /// Current concurrency-control mode.
+    pub const fn concurrency_mode(&self) -> ConcurrencyMode {
+        self.concurrency_mode
+    }
+
+    /// Metrics from the last parallel execution (OCC/PCC/`SpecFence`).
+    pub const fn last_specfence_metrics(&self) -> &SpecFenceMetrics {
+        &self.last_metrics
+    }
+
+    /// Enable/disable lab fine-grain RW + abort tracing for subsequent parallel blocks.
+    pub fn set_finegrain_trace(&mut self, enabled: bool) {
+        self.finegrain_enabled = enabled;
+        if enabled {
+            self.finegrain.clear();
+        } else {
+            self.finegrain.set_deep(false);
+            self.finegrain.set_journal(false);
+        }
+    }
+
+    /// Enable/disable deep effect-RAW instrumentation (implies finegrain_trace).
+    /// Research flag only — production default remains off.
+    pub fn set_finegrain_deep(&mut self, enabled: bool) {
+        if enabled {
+            self.finegrain_enabled = true;
+            self.finegrain.clear();
+            self.finegrain.set_deep(true);
+        } else {
+            self.finegrain.set_deep(false);
+            self.finegrain.set_journal(false);
+        }
+    }
+
+    /// Enable/disable interpreter/journal effect stream (implies deep).
+    /// Research flag only — forces opt-in inspect_run for SLOAD/SSTORE logging;
+    /// production default remains off (Handler::run, zero overhead).
+    pub fn set_finegrain_journal(&mut self, enabled: bool) {
+        if enabled {
+            self.finegrain_enabled = true;
+            self.finegrain.clear();
+            self.finegrain.set_deep(true);
+            self.finegrain.set_journal(true);
+        } else {
+            self.finegrain.set_journal(false);
+        }
+    }
+
+    /// Take the fine-grain snapshot captured at the end of the last traced parallel block.
+    pub fn take_finegrain_snapshot(&self) -> Option<FineGrainSnapshot> {
+        self.finegrain.take_snapshot()
+    }
+
+    /// Accounts seeded in Wait at the start of the last parallel block.
+    pub const fn last_initial_wait_accounts(
+        &self,
+    ) -> &std::collections::HashSet<alloy_primitives::Address> {
+        &self.last_initial_wait_accounts
+    }
+
+    /// Clear inter-block heat and Bayesian posteriors (test / replay).
+    pub fn reset_heat(&mut self) {
+        self.heat.reset();
+        self.bayes.reset();
+        self.rw_prior.reset();
+        self.hotset.reset();
+        self.last_initial_wait_accounts.clear();
+        self.last_abort_rate = 0.0;
+    }
+
+    /// M3: number of locations with process-local write prior (diagnostics).
+    pub fn rw_prior_hot_writes(&self) -> usize {
+        self.rw_prior.hot_write_count()
+    }
+
+    /// Conflict probability for an account-level region (tests / diagnostics).
+    pub fn bayes_account_conflict_prob(&self, address: &alloy_primitives::Address) -> f64 {
+        self.bayes.account_wait_probability(address)
+    }
+
+    /// Conflict probability for a location hash (tests / diagnostics).
+    pub fn bayes_location_conflict_prob(&self, location: u64) -> f64 {
+        self.bayes.prior_wait_probability(location)
+    }
+
     /// Execute an Alloy block, which is becoming the "standard" format in Rust.
     /// TODO: Better error handling.
     pub fn execute<S, C>(
@@ -225,22 +362,86 @@ impl Pevm {
         let scheduler = Scheduler::new(block_size);
 
         let mv_memory = chain.build_mv_memory(&block_env, &txs);
+        let hints = AccountHints::build(chain, &txs);
+        let metrics_inner = MetricsInner::default();
+        let mut initial_wait = std::collections::HashSet::new();
+        // R1: always LeanOCC unless research inspect; seed HotSet from process prior.
+        if self.concurrency_mode == ConcurrencyMode::SpecFence {
+            self.hotset.begin_block();
+        }
+        let start_lean = self.concurrency_mode == ConcurrencyMode::SpecFence
+            && AdaptiveEngagement::should_start_lean();
+        // SpecFence default: skip block-wide Bayes Wait seed (HotSet gates WaitHard).
+        // PCC still seeds; research-inspect SpecFence may seed for M1* experiments.
+        if self.concurrency_mode == ConcurrencyMode::Pcc
+            || (self.concurrency_mode == ConcurrencyMode::SpecFence && !start_lean)
+        {
+            seed_wait_regions(
+                &mv_memory.regions,
+                &hints,
+                &self.bayes,
+                self.concurrency_mode,
+                block_env.beneficiary,
+                DEFAULT_TAU,
+                &mut initial_wait,
+            );
+        }
 
         self.execution_results.grow_to(block_size);
+
+        let dag = SpecDag::new();
+        let rem = RemCounters::default();
+        let partial_retry = PartialRetryTable::new(block_size);
+        let wave = WaveParkTable::new();
+        let wave_ref = if self.concurrency_mode == ConcurrencyMode::SpecFence {
+            Some(&wave)
+        } else {
+            None
+        };
+        let engagement = if self.concurrency_mode == ConcurrencyMode::SpecFence {
+            AdaptiveEngagement::new(block_size, start_lean)
+        } else {
+            AdaptiveEngagement::disabled(block_size)
+        };
+        if self.finegrain_enabled {
+            self.finegrain.clear();
+            // Producer-readiness sampling for journal/deep research.
+            self.finegrain.attach_runtime(&mv_memory, &scheduler);
+        }
+        let finegrain_ref = self.finegrain_enabled.then_some(&self.finegrain);
+        let specfence = SpecFenceCtx {
+            mode: self.concurrency_mode,
+            hints: &hints,
+            metrics: &metrics_inner,
+            scheduler: &scheduler,
+            beneficiary: block_env.beneficiary,
+            bayes: &self.bayes,
+            tau: DEFAULT_TAU,
+            dag: &dag,
+            rem: &rem,
+            partial_retry: &partial_retry,
+            wave: &wave,
+            rw_prior: &self.rw_prior,
+            engagement: &engagement,
+            hotset: &self.hotset,
+            finegrain: finegrain_ref,
+        };
 
         // TODO: Better thread handling
         thread::scope(|scope| {
             for _ in 0..concurrency_level.into() {
                 scope.spawn(|| {
-                    let mut vm = Vm::new(chain, spec_id, &block_env, &txs, storage, &mv_memory);
-                    let mut task = scheduler.next_task();
+                    let mut vm = Vm::new(
+                        chain, spec_id, &block_env, &txs, storage, &mv_memory, specfence,
+                    );
+                    let mut task = scheduler.next_task_with_wave(wave_ref);
                     while task.is_some() {
                         task = match task.unwrap() {
                             Task::Execution(tx_version) => {
-                                self.try_execute(&mut vm, &scheduler, tx_version)
+                                self.try_execute(&mut vm, &scheduler, tx_version, wave_ref)
                             }
                             Task::Validation(tx_version) => {
-                                try_validate(&mv_memory, &scheduler, &tx_version)
+                                try_validate(&mv_memory, &scheduler, &tx_version, specfence)
                             }
                         };
 
@@ -255,12 +456,57 @@ impl Pevm {
                         }
 
                         if task.is_none() {
-                            task = scheduler.next_task();
+                            task = scheduler.next_task_with_wave(wave_ref);
                         }
                     }
                 });
             }
         });
+
+        if self.concurrency_mode == ConcurrencyMode::Pcc {
+            update_heat(&self.heat, &hints, &metrics_inner, block_env.beneficiary);
+        }
+        let (mean_wait, mean_p_at_wait, mean_p_at_spec) =
+            if self.concurrency_mode == ConcurrencyMode::SpecFence {
+                update_bayes(&self.bayes);
+                update_rw_prior(&self.rw_prior);
+                // mean_wait_posterior keeps historical Wait-decision mean;
+                // cost-aware means are taken after (same accumulators for wait).
+                let mean_wait = self.bayes.take_mean_wait_posterior();
+                let mean_spec = self.bayes.take_mean_spec_posterior();
+                (mean_wait, mean_wait, mean_spec)
+            } else {
+                (0.0, 0.0, 0.0)
+            };
+        let wave_id = self.bayes.wave_id();
+        metrics_inner.set_checkpoint_opportunities(rem.checkpoint_opportunities());
+        metrics_inner.set_wave_metrics(
+            wave.wait_park_count(),
+            wave.wait_park_ns(),
+            wave.ready_steal_on_wait(),
+        );
+        if self.concurrency_mode == ConcurrencyMode::SpecFence {
+            self.hotset.end_block();
+        }
+        metrics_inner.set_engagement_metrics(
+            engagement.lean_mode_txs(),
+            engagement.full_mode_txs(),
+            engagement.engagement_switches(),
+            self.hotset.hot_local_reads(),
+            self.hotset.len(),
+        );
+        self.last_metrics = metrics_inner.snapshot(
+            wave_id,
+            mean_wait,
+            mean_p_at_wait,
+            mean_p_at_spec,
+            wave.wave_width_mean(),
+        );
+        if self.concurrency_mode == ConcurrencyMode::SpecFence {
+            self.last_abort_rate =
+                self.last_metrics.occ_aborts as f64 / (block_size as f64).max(1.0);
+        }
+        self.last_initial_wait_accounts = initial_wait;
 
         if let Some(abort_reason) = self.abort_reason.take() {
             match abort_reason {
@@ -402,6 +648,11 @@ impl Pevm {
             }
         }
 
+        if self.finegrain_enabled {
+            self.finegrain
+                .capture(&mv_memory, &scheduler, block_env.beneficiary);
+            self.finegrain.detach_runtime();
+        }
         self.dropper.drop((mv_memory, scheduler));
 
         Ok(fully_evaluated_results)
@@ -412,11 +663,25 @@ impl Pevm {
         vm: &mut Vm<'a, S, C>,
         scheduler: &Scheduler,
         tx_version: TxVersion,
+        wave: Option<&WaveParkTable>,
     ) -> Option<Task> {
         let result_slot = self.execution_results.slot_mut(tx_version.tx_idx);
         loop {
+            // Proactive Wait admission (per-region PCC), before optimistic execute.
+            if let Some((blocking_tx_idx, address)) = vm.hinted_wait_blocker(tx_version.tx_idx) {
+                if !scheduler.add_dependency(tx_version.tx_idx, blocking_tx_idx)
+                    && self.abort_reason.get().is_none()
+                {
+                    continue;
+                }
+                vm.record_wait_admission(address);
+                return None;
+            }
             return match vm.execute(&tx_version, result_slot) {
-                Ok(flags) => scheduler.finish_execution(tx_version, flags),
+                Ok(flags) => {
+                    // PublishWrite ≈ incarnation finished: wake location waiters + ready.
+                    scheduler.finish_execution_with_wave(tx_version, flags, wave)
+                }
                 Err(VmExecutionError::Retry) => {
                     if self.abort_reason.get().is_none() {
                         continue;
@@ -430,13 +695,29 @@ impl Pevm {
                     None
                 }
                 Err(VmExecutionError::Blocking(blocking_tx_idx)) => {
+                    // M2: WaitHard already registered park+location in Vm (SpecFence).
+                    // add_dependency parks the tx (Aborting); worker returns to steal.
+                    let park_loc = vm.take_pending_park_location();
+                    if let Some(wave) = wave {
+                        if let Some(loc) = park_loc {
+                            wave.park(tx_version.tx_idx, blocking_tx_idx, loc);
+                        } else {
+                            // Blocking without location (lazy/ESTIMATE) — still park by writer.
+                            wave.park(tx_version.tx_idx, blocking_tx_idx, 0);
+                        }
+                    }
                     if !scheduler.add_dependency(tx_version.tx_idx, blocking_tx_idx)
                         && self.abort_reason.get().is_none()
                     {
                         // Retry the execution immediately if the blocking transaction was
                         // re-executed by the time we can add it as a dependency.
+                        if let Some(wave) = wave {
+                            let loc = park_loc.unwrap_or(0);
+                            wave.unpark(tx_version.tx_idx, blocking_tx_idx, loc);
+                        }
                         continue;
                     }
+                    // Worker-free Wait: return None → next_task_with_wave steals.
                     None
                 }
                 Err(VmExecutionError::ExecutionError(err)) => {
@@ -454,11 +735,328 @@ fn try_validate(
     mv_memory: &MvMemory,
     scheduler: &Scheduler,
     tx_version: &TxVersion,
+    specfence: SpecFenceCtx<'_>,
 ) -> Option<Task> {
-    let read_set_valid = mv_memory.validate_read_locations(tx_version.tx_idx);
+    let read_locations = if specfence.mode == ConcurrencyMode::SpecFence {
+        mv_memory.read_locations(tx_version.tx_idx)
+    } else {
+        Vec::new()
+    };
+    let invalid = if specfence.mode.uses_regions() {
+        mv_memory.collect_invalid_reads(tx_version.tx_idx)
+    } else {
+        Vec::new()
+    };
+    let mut read_set_valid = if specfence.mode.uses_regions() {
+        invalid.is_empty()
+    } else {
+        mv_memory.validate_read_locations(tx_version.tx_idx)
+    };
+    let lean_tx = specfence.mode == ConcurrencyMode::SpecFence
+        && specfence.engagement.tx_was_lean(tx_version.tx_idx);
+    if specfence.mode == ConcurrencyMode::SpecFence && !invalid.is_empty() {
+        specfence
+            .metrics
+            .record_region_validate_fail(invalid.len());
+        // R0/R2: RebindOnly needs no inspect — keep it on LeanOCC. RewindTo/jump
+        // still requires research inspect (lean abort path below).
+        for _ in &read_locations {
+            specfence.rem.note_checkpoint_opportunity();
+            specfence.metrics.record_checkpoint_opportunity();
+        }
+        let write_locations = mv_memory.write_locations(tx_version.tx_idx);
+        if let Some(plan) = specfence.partial_retry.plan_partial_retry(
+            tx_version.tx_idx,
+            &read_locations,
+            &invalid,
+            &write_locations,
+        ) {
+            if plan.suffix_writes.is_empty()
+                && mv_memory.try_rebind_invalid_reads(tx_version.tx_idx, &invalid)
+            {
+                specfence.metrics.record_partial_retry();
+                specfence.metrics.record_rebind_only();
+                specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
+                specfence.partial_retry.clear_repair(tx_version.tx_idx);
+                read_set_valid = true;
+                // Fall through to success path below (no abort).
+            }
+        }
+        let _ = lean_tx; // execute lean still gates RewindTo on abort
+    }
+
     let aborted = !read_set_valid && scheduler.try_validation_abort(tx_version);
     if aborted {
+        // R0/R2 lean abort: no RewindTo/inspect resume; selective invalidate when
+        // HotSet non-empty (retained), else full ESTIMATE. Fence cascade kept.
+        if lean_tx {
+            let write_locations = mv_memory.write_locations(tx_version.tx_idx);
+            // Prefer selective invalidate (R2); fall back to full ESTIMATE inside helper.
+            let (estimated, fallback) = mv_memory.invalidate_selective(
+                tx_version.tx_idx,
+                Some(tx_version.tx_incarnation),
+            );
+            if fallback {
+                specfence.metrics.record_selective_fallback_full();
+            } else if !estimated.is_empty() {
+                specfence
+                    .metrics
+                    .record_selective_invalidate(estimated.len());
+            }
+            specfence.metrics.record_occ_abort();
+            specfence.metrics.record_full_restart();
+            specfence.rw_prior.observe_write_set(&write_locations, None);
+            for location in &invalid {
+                specfence.bayes.observe_conflict_location_always(*location);
+                specfence.metrics.record_bayes_conflict();
+                specfence.rw_prior.observe_co_access(*location);
+                // R1/R3: abort@ℓ → HotSet (H_a) only for conflict locations.
+                // Do NOT note_abort the whole write-set — that inflated HotSet on
+                // wide blocks (Bind tax). Storm escalate still insert()s write-set.
+                specfence.hotset.note_abort(*location);
+                // Learn Wait sticky for HotLocal; cold path ignores until HotSet.
+                specfence.promote_from_bayes(&mv_memory.regions, *location, None);
+            }
+            let rewind_to =
+                mv_memory.min_higher_reader_of(tx_version.tx_idx, &write_locations);
+            let block_size = scheduler.block_size();
+            let cascade_from = tx_version.tx_idx + 1;
+            let (cascade, skipped) = match rewind_to {
+                Some(to) => {
+                    let to = to.min(block_size);
+                    (
+                        block_size.saturating_sub(to),
+                        to.saturating_sub(cascade_from),
+                    )
+                }
+                None => (0, block_size.saturating_sub(cascade_from)),
+            };
+            specfence.metrics.record_fence_cascade(cascade, skipped);
+            if specfence.engagement.note_abort() {
+                for &loc in &write_locations {
+                    specfence.hotset.insert(loc);
+                }
+                for location in &invalid {
+                    specfence.hotset.insert(*location);
+                }
+            }
+            return scheduler.finish_validation_fenced(tx_version, true, rewind_to);
+        }
+        // Snapshot write locations before invalidate (same set).
+        let write_locations = if specfence.mode == ConcurrencyMode::SpecFence {
+            mv_memory.write_locations(tx_version.tx_idx)
+        } else {
+            Vec::new()
+        };
+        if specfence.mode == ConcurrencyMode::SpecFence {
+            specfence.metrics.record_occ_abort();
+            if specfence.engagement.note_abort() {
+                for &loc in &write_locations {
+                    specfence.hotset.insert(loc);
+                }
+                for location in &invalid {
+                    specfence.hotset.insert(*location);
+                }
+            }
+            let _ = specfence
+                .partial_retry
+                .disable_jump_after_failed_resume(tx_version.tx_idx);
+            // M3: learn WŜ from aborted incarnation + first-pass miss metrics.
+            specfence
+                .rw_prior
+                .observe_write_set(&write_locations, None);
+            let mut first_pass = 0usize;
+            for location in &invalid {
+                specfence.bayes.observe_conflict_location_always(*location);
+                specfence.metrics.record_bayes_conflict();
+                specfence.rw_prior.observe_co_access(*location);
+                specfence.hotset.note_abort(*location);
+                if specfence.rw_prior.predicts_write(*location)
+                    || mv_memory.residual_writer_before(*location, tx_version.tx_idx).is_some()
+                {
+                    first_pass += 1;
+                    specfence.metrics.record_prior_bind_miss();
+                }
+                for address in specfence.hints.accounts() {
+                    if address == specfence.beneficiary {
+                        continue;
+                    }
+                    if hash_deterministic(MemoryLocation::Basic(address)) == *location {
+                        specfence.bayes.observe_conflict_account(address);
+                    }
+                }
+                specfence.promote_from_bayes(&mv_memory.regions, *location, None);
+            }
+            if first_pass > 0 {
+                specfence
+                    .metrics
+                    .record_first_pass_validate_fail(first_pass);
+            }
+
+            // M1: RewindTo (L1 resume) when certified prefix + checkpoint;
+            // FullRestart from head only when prefix empty / control-flow broken.
+            // Demotes semantic PartialRetry-from-head (`tx_head_reexec`).
+            let plan = specfence.partial_retry.plan_partial_retry(
+                tx_version.tx_idx,
+                &read_locations,
+                &invalid,
+                &write_locations,
+            );
+            let fence_locs = if let Some(plan) = plan {
+                let repair = specfence.partial_retry.plan_repair(tx_version.tx_idx, &plan);
+                match repair {
+                    RepairPlan::RewindTo {
+                        certified,
+                        suffix_writes,
+                        cp,
+                        k_fail,
+                    } => {
+                        specfence.metrics.record_partial_retry();
+                        specfence.metrics.record_rewind_to_cp();
+                        // M1b: arm journal FF continuation from failed incarnation snap.
+                        specfence.partial_retry.arm_rewind_to(
+                            tx_version.tx_idx,
+                            cp,
+                            k_fail,
+                            certified.clone(),
+                            suffix_writes.clone(),
+                            plan.prefix_writes.clone(),
+                        );
+                        specfence
+                            .partial_retry
+                            .set_force_bind(tx_version.tx_idx, certified);
+                        let estimated = mv_memory
+                            .invalidate_partial_suffix(tx_version.tx_idx, &suffix_writes);
+                        if !estimated.is_empty() {
+                            specfence
+                                .metrics
+                                .record_selective_invalidate(estimated.len());
+                        }
+                        if estimated.is_empty() {
+                            suffix_writes
+                        } else {
+                            estimated
+                        }
+                    }
+                    RepairPlan::RebindOnly { .. } | RepairPlan::FullRestart => {
+                        // No usable checkpoint → FullRestart from tx head.
+                        specfence.metrics.record_tx_full_retry();
+                        specfence.metrics.record_full_restart();
+                        specfence.metrics.record_partial_retry_fallback_full();
+                        specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
+                        specfence.partial_retry.clear_repair(tx_version.tx_idx);
+                        let (estimated, fallback) = mv_memory.invalidate_selective(
+                            tx_version.tx_idx,
+                            Some(tx_version.tx_incarnation),
+                        );
+                        if fallback {
+                            specfence.metrics.record_selective_fallback_full();
+                        } else {
+                            specfence
+                                .metrics
+                                .record_selective_invalidate(estimated.len().max(1));
+                        }
+                        if estimated.is_empty() {
+                            write_locations.clone()
+                        } else {
+                            estimated
+                        }
+                    }
+                }
+            } else {
+                // Unsafe / no certified prefix → FullRetry / FullRestart from tx head.
+                specfence.metrics.record_tx_full_retry();
+                specfence.metrics.record_full_restart();
+                specfence.metrics.record_partial_retry_fallback_full();
+                specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
+                specfence.partial_retry.clear_repair(tx_version.tx_idx);
+                let (estimated, fallback) = mv_memory
+                    .invalidate_selective(tx_version.tx_idx, Some(tx_version.tx_incarnation));
+                if fallback {
+                    specfence.metrics.record_selective_fallback_full();
+                } else {
+                    specfence
+                        .metrics
+                        .record_selective_invalidate(estimated.len().max(1));
+                }
+                if estimated.is_empty() {
+                    write_locations.clone()
+                } else {
+                    estimated
+                }
+            };
+
+            let rewind_to = mv_memory.min_higher_reader_of(tx_version.tx_idx, &fence_locs);
+            let block_size = scheduler.block_size();
+            let cascade_from = tx_version.tx_idx + 1;
+            let (cascade, skipped) = match rewind_to {
+                Some(to) => {
+                    let to = to.min(block_size);
+                    (
+                        block_size.saturating_sub(to),
+                        to.saturating_sub(cascade_from),
+                    )
+                }
+                None => (0, block_size.saturating_sub(cascade_from)),
+            };
+            specfence.metrics.record_fence_cascade(cascade, skipped);
+            return scheduler.finish_validation_fenced(tx_version, true, rewind_to);
+        }
+        // OCC / PCC: full write-set ESTIMATE (unchanged).
+        let occ_write_locs = mv_memory.write_locations(tx_version.tx_idx);
         mv_memory.convert_writes_to_estimates(tx_version.tx_idx);
+        specfence.metrics.record_occ_abort();
+        // OCC/PCC abort always restarts interpreter from tx head on next incarnation.
+        specfence.metrics.record_full_restart();
+        if let Some(fg) = specfence.finegrain {
+            let cascade = scheduler
+                .block_size()
+                .saturating_sub(tx_version.tx_idx.saturating_add(1));
+            fg.record_abort(
+                tx_version.tx_idx,
+                tx_version.tx_incarnation,
+                occ_write_locs.len(),
+                cascade,
+            );
+        }
+        if specfence.mode.uses_regions() {
+            for location in &invalid {
+                if mv_memory.regions.promote_location(*location) {
+                    specfence.metrics.record_promotion(None);
+                }
+            }
+        }
+    } else if !aborted && specfence.mode == ConcurrencyMode::SpecFence && read_set_valid {
+        // Successful validation clears PartialRetry / RewindTo state for this tx.
+        specfence
+            .partial_retry
+            .clear_force_bind(tx_version.tx_idx);
+        specfence.partial_retry.clear_repair(tx_version.tx_idx);
+        specfence
+            .partial_retry
+            .clear_jump_disabled(tx_version.tx_idx);
+        // M3: fold completed WŜ into process prior (inter-block Bind-before-touch).
+        // Block-local residual remains abort/ESTIMATE-driven (Bohm-lite); publishing
+        // successful WS into residual caused WaitHard storms / M2 hangs on ERC-20.
+        let writes = mv_memory.write_locations(tx_version.tx_idx);
+        specfence.rw_prior.observe_write_set(&writes, None);
+        // Successful SpecRead validation → success++; try revoke sticky Waits.
+        for location in &read_locations {
+            if *location
+                == hash_deterministic(MemoryLocation::Basic(specfence.beneficiary))
+            {
+                continue;
+            }
+            specfence.rem.note_checkpoint_opportunity();
+            if mv_memory.regions.location_mode(*location) == crate::specfence::RegionMode::Wait {
+                // Revoke when posterior dropped below τ_revoke.
+                let _ = specfence.try_revoke(&mv_memory.regions, *location, None);
+                continue;
+            }
+            specfence.bayes.observe_speculate_ok_location(*location);
+            specfence.metrics.record_bayes_success();
+            let _ = specfence.try_revoke(&mv_memory.regions, *location, None);
+        }
     }
     scheduler.finish_validation(tx_version, aborted)
 }

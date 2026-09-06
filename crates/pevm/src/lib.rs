@@ -220,11 +220,20 @@ mod mv_memory;
 mod pevm;
 pub use pevm::{Pevm, PevmError, PevmResult, execute_revm_sequential};
 mod scheduler;
+pub mod specfence;
+pub use specfence::{
+    AbortEvent, AccountGrainObserve, ConcurrencyMode, ConsumerFirstCross, DagStats, EffectClass, FineGrainCollector,
+    FineGrainSnapshot, EffectStreamDiag, HotLocation, LocationKind, MaMdProxy, RawEdge, RawEffectEdge,
+    SpecFenceMetrics, TxRw, analyze_dag, classify_raw_edges, dependency_edges,
+    effect_raw_longest_chain, effect_raw_max_fanout, estimate_ma_md, filter_effect_edges,
+    hot_locations, kind_histogram, percentile_f64, program_raw_longest_chain,
+};
 mod storage;
 pub use storage::{
     AccountBasic, BlockHashes, Bytecodes, ChainState, EvmAccount, EvmCode, InMemoryStorage,
     Storage, StorageWrapper,
 };
+mod tx_runner;
 mod vm;
 pub use vm::{ExecutionError, PevmTxExecutionResult};
 

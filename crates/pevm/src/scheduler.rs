@@ -9,7 +9,10 @@ use std::{
 
 use smallvec::SmallVec;
 
-use crate::{FinishExecFlags, IncarnationStatus, Task, TxIdx, TxStatus, TxVersion};
+use crate::{
+    FinishExecFlags, IncarnationStatus, Task, TxIdx, TxStatus, TxVersion,
+    specfence::WaveParkTable,
+};
 
 // The Pevm collaborative scheduler coordinates execution & validation
 // tasks among work threads.
@@ -87,8 +90,22 @@ impl Scheduler {
         }
     }
 
+    pub(crate) fn block_size(&self) -> usize {
+        self.block_size
+    }
+
     pub(crate) fn abort(&self) {
         self.aborted.store(true, Ordering::Relaxed);
+    }
+
+    /// Final incarnation index per tx after the block (0 = succeeded on first try).
+    pub(crate) fn incarnation_snapshot(&self) -> Vec<usize> {
+        (0..self.block_size)
+            .map(|tx_idx| {
+                let tx = index_mutex!(self.transactions_status, tx_idx);
+                tx.incarnation
+            })
+            .collect()
     }
 
     fn try_execute(&self, tx_idx: TxIdx) -> Option<TxVersion> {
@@ -105,7 +122,21 @@ impl Scheduler {
         None
     }
 
+    /// Prefer SpecFence wave ready deque (lower TxIdx first), then collaborative indices.
+    #[allow(dead_code)]
     pub(crate) fn next_task(&self) -> Option<Task> {
+        self.next_task_with_wave(None)
+    }
+
+    pub(crate) fn next_task_with_wave(&self, wave: Option<&WaveParkTable>) -> Option<Task> {
+        if let Some(wave) = wave {
+            while let Some(tx_idx) = wave.pop_ready() {
+                if let Some(tx_version) = self.try_execute(tx_idx) {
+                    wave.note_ready_steal_if_after_park();
+                    return Some(Task::Execution(tx_version));
+                }
+            }
+        }
         while !self.aborted.load(Ordering::Relaxed) {
             let execution_idx = self.execution_idx.load(Ordering::Relaxed);
             let validation_idx = self.validation_idx.load(Ordering::Relaxed);
@@ -196,20 +227,44 @@ impl Scheduler {
         tx.incarnation += 1;
     }
 
+    #[allow(dead_code)]
     pub(crate) fn finish_execution(
         &self,
         tx_version: TxVersion,
         flags: FinishExecFlags,
     ) -> Option<Task> {
+        self.finish_execution_with_wave(tx_version, flags, None)
+    }
+
+    /// Like [`finish_execution`], and on SpecFence push woken waiters onto the
+    /// wave ready deque (lower TxIdx first). Also runs `wake_writer_done` so
+    /// location-keyed parks accumulate `wait_park_ns`.
+    pub(crate) fn finish_execution_with_wave(
+        &self,
+        tx_version: TxVersion,
+        flags: FinishExecFlags,
+        wave: Option<&WaveParkTable>,
+    ) -> Option<Task> {
         let mut tx = index_mutex!(self.transactions_status, tx_version.tx_idx);
         debug_assert_eq!(tx.status, IncarnationStatus::Executing);
         debug_assert_eq!(tx.incarnation, tx_version.tx_incarnation);
 
-        // Resume dependent transactions
+        // Resume dependent transactions (Block-STM Blocking waiters).
         let mut dependents = index_mutex!(self.transactions_dependents, tx_version.tx_idx);
         for tx_idx in dependents.drain(..) {
             self.set_ready_status(tx_idx);
             self.execution_idx.fetch_min(tx_idx, Ordering::Relaxed);
+            if let Some(wave) = wave {
+                wave.push_ready(tx_idx);
+            }
+        }
+        // Location-keyed WaitHard parks: wake → ready deque + park_ns.
+        if let Some(wave) = wave {
+            for waiter in wave.wake_writer_done(tx_version.tx_idx) {
+                // Dependents path already set Ready; location-only waiters still
+                // need Ready (should not happen if park always used add_dependency).
+                let _ = waiter;
+            }
         }
 
         // TODO: Simplify or better document this logic.
@@ -282,11 +337,56 @@ impl Scheduler {
     // When there is a successful abort, schedule the transaction for re-execution
     // and the higher transactions for validation. The re-execution task is returned
     // for the aborted transaction.
+    /// True when this transaction has finished the current incarnation enough
+    /// for a Wait-mode reader to consume its writes (`Executed` or `Validated`).
+    pub(crate) fn is_done(&self, tx_idx: TxIdx) -> bool {
+        if tx_idx >= self.block_size {
+            return true;
+        }
+        let tx = index_mutex!(self.transactions_status, tx_idx);
+        matches!(
+            tx.status,
+            IncarnationStatus::Executed | IncarnationStatus::Validated
+        )
+    }
+
+    /// Research label for producer readiness at discovery (finegrain journal).
+    pub(crate) fn status_label(&self, tx_idx: TxIdx) -> &'static str {
+        if tx_idx >= self.block_size {
+            return "oob";
+        }
+        let tx = index_mutex!(self.transactions_status, tx_idx);
+        match tx.status {
+            IncarnationStatus::ReadyToExecute => "ready",
+            IncarnationStatus::Executing => "executing",
+            IncarnationStatus::Executed => "executed",
+            IncarnationStatus::Validated => "validated",
+            IncarnationStatus::Aborting => "aborting",
+        }
+    }
+
     pub(crate) fn finish_validation(&self, tx_version: &TxVersion, aborted: bool) -> Option<Task> {
+        // Classic Block-STM: abort cascades validation from aborted_idx+1 through
+        // the rest of the block.
+        self.finish_validation_fenced(tx_version, aborted, aborted.then_some(tx_version.tx_idx + 1))
+    }
+
+    /// Like [`finish_validation`], but on abort only rewinds `validation_idx` to
+    /// `rewind_to` (the first higher tx that read an aborted write). `None` means
+    /// no higher dependent reader was found — do not force a suffix cascade.
+    pub(crate) fn finish_validation_fenced(
+        &self,
+        tx_version: &TxVersion,
+        aborted: bool,
+        rewind_to: Option<TxIdx>,
+    ) -> Option<Task> {
         if aborted {
             self.set_ready_status(tx_version.tx_idx);
-            self.validation_idx
-                .fetch_min(tx_version.tx_idx + 1, Ordering::Relaxed);
+            if let Some(to) = rewind_to {
+                // Never rewind past the aborted tx itself; clamp to [tx_idx+1, block_size].
+                let to = to.clamp(tx_version.tx_idx + 1, self.block_size);
+                self.validation_idx.fetch_min(to, Ordering::Relaxed);
+            }
             if self.execution_idx.load(Ordering::Relaxed) > tx_version.tx_idx {
                 return self.try_execute(tx_version.tx_idx).map(Task::Execution);
             }
