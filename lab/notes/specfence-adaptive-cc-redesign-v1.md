@@ -45,8 +45,8 @@ Block start → classify RegimeHint
 
 A location enters HotSet when any holds (online, revocable):
 
-1. Observed **≥ H_w writers** in-block so far (default **H_w=3**), or  
-2. Abort/ESTIMATE involving `ℓ` ≥ **H_a** times (default **H_a=2**), or  
+1. Observed **≥ H_w writers** in-block so far (default **H_w=8**, R3; LazyRecipient excluded from H_w), or  
+2. Abort/ESTIMATE involving `ℓ` ≥ **H_a** times (default **H_a=3**, R3), or  
 3. Process prior: historical multi-writer mass for `ℓ` (from fine-grain / prior map) above threshold.
 
 Block RegimeHint = Hot if `|HotSet|≥1` **and** (abort_rate rising **or** prior says storm block); else Wide.

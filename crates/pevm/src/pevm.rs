@@ -777,13 +777,12 @@ fn try_validate(
                 specfence.bayes.observe_conflict_location_always(*location);
                 specfence.metrics.record_bayes_conflict();
                 specfence.rw_prior.observe_co_access(*location);
-                // R1: abort@ℓ → HotSet (H_a); also note writers' write-set locs.
+                // R1/R3: abort@ℓ → HotSet (H_a) only for conflict locations.
+                // Do NOT note_abort the whole write-set — that inflated HotSet on
+                // wide blocks (Bind tax). Storm escalate still insert()s write-set.
                 specfence.hotset.note_abort(*location);
                 // Learn Wait sticky for HotLocal; cold path ignores until HotSet.
                 specfence.promote_from_bayes(&mv_memory.regions, *location, None);
-            }
-            for &loc in &write_locations {
-                specfence.hotset.note_abort(loc);
             }
             let rewind_to =
                 mv_memory.min_higher_reader_of(tx_version.tx_idx, &write_locations);

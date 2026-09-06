@@ -1562,17 +1562,31 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     );
                 }
 
+                // R3: HotSet H_w ignores LazyRecipient multi-writer noise (popular
+                // payees on wide blocks; fine-grain G* drops basic_lazy). Keep
+                // LazySender so same-sender RAW storms still escalate. Storage/Basic
+                // full writes always count. Still learn full WŜ for M3 prior.
+                let hotset_writer_locs: Vec<MemoryLocationHash> = write_set
+                    .iter()
+                    .filter_map(|(loc, val)| {
+                        if *loc == self.beneficiary_location_hash {
+                            return None;
+                        }
+                        match val {
+                            MemoryValue::LazyRecipient(_) => None,
+                            _ => Some(*loc),
+                        }
+                    })
+                    .collect();
                 let (wrote_new_location, contended) =
                     self.mv_memory.record(tx_version, read_set, write_set);
                 // M3: learn process WŜ from this incarnation's writes (no residual publish).
-                // R1: feed HotSet writer counts (H_w).
+                // R1/R3: feed HotSet writer counts (H_w) from non-lazy writes only.
                 if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
                     let locs: Vec<_> = self.mv_memory.write_locations(tx_version.tx_idx);
                     self.specfence.rw_prior.observe_write_set(&locs, None);
-                    for &loc in &locs {
-                        if loc != self.beneficiary_location_hash {
-                            self.specfence.hotset.note_writer(loc, tx_version.tx_idx);
-                        }
+                    for loc in hotset_writer_locs {
+                        self.specfence.hotset.note_writer(loc, tx_version.tx_idx);
                     }
                 }
                 if wrote_new_location {

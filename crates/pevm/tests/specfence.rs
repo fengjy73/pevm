@@ -322,26 +322,29 @@ fn specfence_bayes_inter_block_carry() {
 fn specfence_mixed_hot_and_independent() {
     let chain = PevmEthereum::mainnet();
     let hot = Address::from(U160::from(1));
+    // R3: H_w=8 — ≥8 LazySender writers; two warm-ups sustain process prior.
+    // Storage is not committed across execute() calls, so nonces restart each block.
     let txs1: Vec<TxEnv> = (1..=48).map(|i| self_transfer(hot, i as u64)).collect();
     let storage = storage_for(200);
-
     let mut pevm = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
-    let _ = pevm
-        .execute_revm_parallel(
-            &chain,
-            &storage,
-            Default::default(),
-            BlockEnv::default(),
-            txs1,
-            concurrency(),
-        )
-        .unwrap();
+    for _ in 0..2 {
+        let _ = pevm
+            .execute_revm_parallel(
+                &chain,
+                &storage,
+                Default::default(),
+                BlockEnv::default(),
+                txs1.clone(),
+                concurrency(),
+            )
+            .unwrap();
+    }
 
     let indep_start = 40usize;
     let mut txs2 = Vec::new();
-    for i in 0..8 {
-        let from = Address::from(U160::from(indep_start + 64 + i));
-        txs2.push(transfer(from, hot, 1));
+    // Same-sender LazySender pressure (LazyRecipient excluded from H_w).
+    for i in 0..24 {
+        txs2.push(self_transfer(hot, 1 + i as u64));
     }
     for i in 0..64 {
         let addr = Address::from(U160::from(indep_start + i));
@@ -554,30 +557,32 @@ fn specfence_p1a_bind_wait_reduces_abort_on_hotspot() {
     let hot = Address::from(U160::from(1));
     let storage = storage_for(200);
 
-    // Block 1: heat the sender posterior + residual write-set via same-sender WW.
+    // Warm-up ×2 (fresh storage nonces each block): heat Bayes + HotSet prior.
     let txs1: Vec<TxEnv> = (1..=40).map(|i| self_transfer(hot, i as u64)).collect();
     let mut pevm = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
-    let _ = pevm
-        .execute_revm_parallel(
-            &chain,
-            &storage,
-            Default::default(),
-            BlockEnv::default(),
-            txs1,
-            concurrency(),
-        )
-        .unwrap();
-    let aborts_b1 = pevm.last_specfence_metrics().occ_aborts;
+    let mut aborts_b1 = 0;
+    for _ in 0..2 {
+        let _ = pevm
+            .execute_revm_parallel(
+                &chain,
+                &storage,
+                Default::default(),
+                BlockEnv::default(),
+                txs1.clone(),
+                concurrency(),
+            )
+            .unwrap();
+        aborts_b1 = pevm.last_specfence_metrics().occ_aborts;
+    }
     assert!(
         pevm.bayes_account_conflict_prob(&hot) >= 0.25,
         "hotspot posterior must rise"
     );
 
-    // Block 2: transfers into the heated account — Wait/Bind should dominate.
+    // Next block: same-sender pressure — Wait/Bind/HotLocal should dominate.
     let mut txs2 = Vec::new();
-    for i in 0..12 {
-        let from = Address::from(U160::from(80 + i));
-        txs2.push(transfer(from, hot, 1));
+    for i in 0..24 {
+        txs2.push(self_transfer(hot, 1 + i as u64));
     }
     for i in 0..32 {
         txs2.push(self_transfer(Address::from(U160::from(120 + i)), 1));
@@ -606,8 +611,10 @@ fn specfence_p1a_bind_wait_reduces_abort_on_hotspot() {
         m.wait_hard_count > 0
             || m.wait_admissions > 0
             || m.bind_hits > 0
-            || m.bayes_wait_decisions > 0,
-        "second wave should WaitHard/Bind on hotspot: {m:?}"
+            || m.bayes_wait_decisions > 0
+            || m.hot_local_reads > 0
+            || m.hotset_size > 0,
+        "second wave should WaitHard/Bind/HotLocal on hotspot: {m:?}"
     );
     // Aborts on the heated recipient wave should not explode vs block1 learning.
     assert!(

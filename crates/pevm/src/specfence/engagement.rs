@@ -28,6 +28,11 @@ use crate::TxIdx;
 
 /// Mid-block abort rate that escalates writers into HotSet (still Lean execute).
 pub(crate) const TAU_ABORT_MID: f64 = 0.08;
+/// R3: require a real window — `aborts/started` at started=1 is always ≥ τ and
+/// was force-inserting entire abort write-sets into HotSet on the first conflict
+/// of wide blocks (Bind tax with wait_hard=0).
+pub(crate) const MIN_STARTED_FOR_ABORT_ESCALATE: usize = 32;
+pub(crate) const MIN_ABORTS_FOR_ESCALATE: usize = 4;
 
 /// `SPECFENCE_ENABLE_INSPECT=1` (or `true`/`yes`) enables research inspect/jump.
 pub(crate) fn research_inspect_enabled() -> bool {
@@ -123,7 +128,10 @@ impl AdaptiveEngagement {
             .saturating_add(self.full_txs.load(Ordering::Relaxed))
             .max(1);
         let rate = aborts as f64 / started as f64;
-        if rate >= TAU_ABORT_MID {
+        if aborts >= MIN_ABORTS_FOR_ESCALATE
+            && started >= MIN_STARTED_FOR_ABORT_ESCALATE
+            && rate >= TAU_ABORT_MID
+        {
             // Count an "engagement switch" once when abort storm starts — not lean→full
             // execute flip (execute stays lean). Signals HotSet escalate pressure.
             if self.switches.load(Ordering::Relaxed) == 0 {
@@ -169,12 +177,33 @@ mod tests {
         unsafe {
             std::env::remove_var("SPECFENCE_ENABLE_INSPECT");
         }
-        let eng = AdaptiveEngagement::new(10, true);
-        assert!(eng.begin_tx(0));
-        assert!(eng.note_abort()); // 1/1 ≥ 0.08
+        let eng = AdaptiveEngagement::new(64, true);
+        // Fill a real window before rate can escalate.
+        for i in 0..MIN_STARTED_FOR_ABORT_ESCALATE {
+            assert!(eng.begin_tx(i));
+        }
+        // First few aborts under the min-abort floor must not escalate.
+        for _ in 0..(MIN_ABORTS_FOR_ESCALATE - 1) {
+            assert!(!eng.note_abort());
+        }
+        assert!(eng.note_abort()); // floor met and rate ≥ τ
         assert_eq!(eng.engagement_switches(), 1);
         // Execute path stays lean.
-        assert!(eng.begin_tx(1));
+        assert!(eng.begin_tx(MIN_STARTED_FOR_ABORT_ESCALATE));
         assert!(eng.is_lean());
+    }
+
+    #[test]
+    fn first_abort_does_not_escalate_hotset() {
+        unsafe {
+            std::env::remove_var("SPECFENCE_ENABLE_INSPECT");
+        }
+        let eng = AdaptiveEngagement::new(4, true);
+        assert!(eng.begin_tx(0));
+        assert!(
+            !eng.note_abort(),
+            "1/1 must not force-insert HotSet (wide-block Bind tax)"
+        );
+        assert_eq!(eng.engagement_switches(), 0);
     }
 }
