@@ -1,9 +1,9 @@
 //! Multi-core mainnet sweep: Sequential / OCC / PCC / SpecFence.
-
-#![recursion_limit = "256"]
 //!
 //! Writes JSON for `lab/experiments/scripts/plot_vldb.py`.
+//! Checkpoints JSON+CSV after each block so a later hang does not lose prior rows.
 
+#![recursion_limit = "256"]
 #![allow(missing_docs)]
 
 use std::{
@@ -73,6 +73,19 @@ struct RunRow {
     rewind_to_cp: usize,
     full_restart: usize,
     tx_head_reexec: usize,
+    absolute_jump_applied: usize,
+    absolute_jump_fallback: usize,
+    prior_bind_hits: usize,
+    prior_bind_miss: usize,
+    journal_ff_entries: usize,
+    journal_ff_hits: usize,
+    prefix_opcodes_skipped: usize,
+    ready_steal_on_wait: usize,
+    lean_mode_txs: usize,
+    full_mode_txs: usize,
+    engagement_switches: usize,
+    inspector_steps: usize,
+    inspector_steps_resume: usize,
     ok: bool,
     error: Option<String>,
 }
@@ -149,6 +162,79 @@ fn n_tx(block: &Block<<PevmEthereum as PevmChain>::Transaction>) -> usize {
     }
 }
 
+fn zeros_row(
+    loaded: &LoadedBlock,
+    mode: &str,
+    cores: usize,
+    repeat: usize,
+    n_tx: usize,
+    gas_used: u64,
+    elapsed_ms: f64,
+    tps: f64,
+    ok: bool,
+    error: Option<String>,
+) -> RunRow {
+    RunRow {
+        block: loaded.number,
+        n_tx,
+        gas_used,
+        mode: mode.to_string(),
+        cores: if mode == "sequential" { 1 } else { cores },
+        repeat,
+        elapsed_ms,
+        tps,
+        occ_aborts: 0,
+        abort_rate: 0.0,
+        wait_admissions: 0,
+        speculate_executions: 0,
+        region_promotions: 0,
+        cascade_validations_scheduled: 0,
+        independent_txs_skipped_by_fence: 0,
+        bayes_wait_decisions: 0,
+        bayes_speculate_decisions: 0,
+        bayes_conflict_updates: 0,
+        bayes_success_updates: 0,
+        wave_promotions: 0,
+        mean_wait_posterior: 0.0,
+        bind_hits: 0,
+        wait_hard_count: 0,
+        spec_read_count: 0,
+        selective_invalidate_count: 0,
+        tx_full_retry: 0,
+        region_validate_fail: 0,
+        soft_edge_revokes: 0,
+        selective_fallback_full: 0,
+        partial_retry_count: 0,
+        partial_retry_fallback_full: 0,
+        cost_chose_wait: 0,
+        cost_chose_spec: 0,
+        cost_chose_bind: 0,
+        mean_p_at_wait: 0.0,
+        mean_p_at_spec: 0.0,
+        evm_entries: 0,
+        resume_count: 0,
+        rebind_only: 0,
+        rewind_to_cp: 0,
+        full_restart: 0,
+        tx_head_reexec: 0,
+        absolute_jump_applied: 0,
+        absolute_jump_fallback: 0,
+        prior_bind_hits: 0,
+        prior_bind_miss: 0,
+        journal_ff_entries: 0,
+        journal_ff_hits: 0,
+        prefix_opcodes_skipped: 0,
+        ready_steal_on_wait: 0,
+        lean_mode_txs: 0,
+        full_mode_txs: 0,
+        engagement_switches: 0,
+        inspector_steps: 0,
+        inspector_steps_resume: 0,
+        ok,
+        error,
+    }
+}
+
 fn measure(
     chain: &PevmEthereum,
     loaded: &LoadedBlock,
@@ -171,7 +257,11 @@ fn measure(
     let result = pevm.execute(chain, &loaded.storage, &loaded.block, cores_nz, sequential);
     let elapsed = t0.elapsed().as_secs_f64();
     let elapsed_ms = elapsed * 1000.0;
-    let tps = if elapsed > 0.0 { n_tx as f64 / elapsed } else { 0.0 };
+    let tps = if elapsed > 0.0 {
+        n_tx as f64 / elapsed
+    } else {
+        0.0
+    };
     match result {
         Ok(_) => {
             let m = pevm.last_specfence_metrics();
@@ -186,9 +276,17 @@ fn measure(
                 elapsed_ms,
                 tps,
                 occ_aborts,
-                abort_rate: if n_tx == 0 { 0.0 } else { occ_aborts as f64 / n_tx as f64 },
+                abort_rate: if n_tx == 0 {
+                    0.0
+                } else {
+                    occ_aborts as f64 / n_tx as f64
+                },
                 wait_admissions: if sequential { 0 } else { m.wait_admissions },
-                speculate_executions: if sequential { 0 } else { m.speculate_executions },
+                speculate_executions: if sequential {
+                    0
+                } else {
+                    m.speculate_executions
+                },
                 region_promotions: if sequential { 0 } else { m.region_promotions },
                 cascade_validations_scheduled: if sequential {
                     0
@@ -200,16 +298,32 @@ fn measure(
                 } else {
                     m.independent_txs_skipped_by_fence
                 },
-                bayes_wait_decisions: if sequential { 0 } else { m.bayes_wait_decisions },
+                bayes_wait_decisions: if sequential {
+                    0
+                } else {
+                    m.bayes_wait_decisions
+                },
                 bayes_speculate_decisions: if sequential {
                     0
                 } else {
                     m.bayes_speculate_decisions
                 },
-                bayes_conflict_updates: if sequential { 0 } else { m.bayes_conflict_updates },
-                bayes_success_updates: if sequential { 0 } else { m.bayes_success_updates },
+                bayes_conflict_updates: if sequential {
+                    0
+                } else {
+                    m.bayes_conflict_updates
+                },
+                bayes_success_updates: if sequential {
+                    0
+                } else {
+                    m.bayes_success_updates
+                },
                 wave_promotions: if sequential { 0 } else { m.wave_promotions },
-                mean_wait_posterior: if sequential { 0.0 } else { m.mean_wait_posterior },
+                mean_wait_posterior: if sequential {
+                    0.0
+                } else {
+                    m.mean_wait_posterior
+                },
                 bind_hits: if sequential { 0 } else { m.bind_hits },
                 wait_hard_count: if sequential { 0 } else { m.wait_hard_count },
                 spec_read_count: if sequential { 0 } else { m.spec_read_count },
@@ -219,14 +333,22 @@ fn measure(
                     m.selective_invalidate_count
                 },
                 tx_full_retry: if sequential { 0 } else { m.tx_full_retry },
-                region_validate_fail: if sequential { 0 } else { m.region_validate_fail },
+                region_validate_fail: if sequential {
+                    0
+                } else {
+                    m.region_validate_fail
+                },
                 soft_edge_revokes: if sequential { 0 } else { m.soft_edge_revokes },
                 selective_fallback_full: if sequential {
                     0
                 } else {
                     m.selective_fallback_full
                 },
-                partial_retry_count: if sequential { 0 } else { m.partial_retry_count },
+                partial_retry_count: if sequential {
+                    0
+                } else {
+                    m.partial_retry_count
+                },
                 partial_retry_fallback_full: if sequential {
                     0
                 } else {
@@ -243,140 +365,67 @@ fn measure(
                 rewind_to_cp: if sequential { 0 } else { m.rewind_to_cp },
                 full_restart: if sequential { 0 } else { m.full_restart },
                 tx_head_reexec: if sequential { 0 } else { m.tx_head_reexec },
+                absolute_jump_applied: if sequential {
+                    0
+                } else {
+                    m.absolute_jump_applied
+                },
+                absolute_jump_fallback: if sequential {
+                    0
+                } else {
+                    m.absolute_jump_fallback
+                },
+                prior_bind_hits: if sequential { 0 } else { m.prior_bind_hits },
+                prior_bind_miss: if sequential { 0 } else { m.prior_bind_miss },
+                journal_ff_entries: if sequential {
+                    0
+                } else {
+                    m.journal_ff_entries
+                },
+                journal_ff_hits: if sequential { 0 } else { m.journal_ff_hits },
+                prefix_opcodes_skipped: if sequential {
+                    0
+                } else {
+                    m.prefix_opcodes_skipped
+                },
+                ready_steal_on_wait: if sequential {
+                    0
+                } else {
+                    m.ready_steal_on_wait
+                },
+                lean_mode_txs: if sequential { 0 } else { m.lean_mode_txs },
+                full_mode_txs: if sequential { 0 } else { m.full_mode_txs },
+                engagement_switches: if sequential {
+                    0
+                } else {
+                    m.engagement_switches
+                },
+                inspector_steps: if sequential { 0 } else { m.inspector_steps },
+                inspector_steps_resume: if sequential {
+                    0
+                } else {
+                    m.inspector_steps_resume
+                },
                 ok: true,
                 error: None,
             }
         }
-        Err(err) => RunRow {
-            block: loaded.number,
+        Err(err) => zeros_row(
+            loaded,
+            mode,
+            cores,
+            repeat,
             n_tx,
             gas_used,
-            mode: mode.to_string(),
-            cores: if sequential { 1 } else { cores },
-            repeat,
             elapsed_ms,
-            tps: 0.0,
-            occ_aborts: 0,
-            abort_rate: 0.0,
-            wait_admissions: 0,
-            speculate_executions: 0,
-            region_promotions: 0,
-            cascade_validations_scheduled: 0,
-            independent_txs_skipped_by_fence: 0,
-            bayes_wait_decisions: 0,
-            bayes_speculate_decisions: 0,
-            bayes_conflict_updates: 0,
-            bayes_success_updates: 0,
-            wave_promotions: 0,
-            mean_wait_posterior: 0.0,
-            bind_hits: 0,
-            wait_hard_count: 0,
-            spec_read_count: 0,
-            selective_invalidate_count: 0,
-            tx_full_retry: 0,
-            region_validate_fail: 0,
-            soft_edge_revokes: 0,
-            selective_fallback_full: 0,
-            partial_retry_count: 0,
-            partial_retry_fallback_full: 0,
-            cost_chose_wait: 0,
-            cost_chose_spec: 0,
-            cost_chose_bind: 0,
-            mean_p_at_wait: 0.0,
-            mean_p_at_spec: 0.0,
-            evm_entries: 0,
-            resume_count: 0,
-            rebind_only: 0,
-            rewind_to_cp: 0,
-            full_restart: 0,
-            tx_head_reexec: 0,
-            ok: false,
-            error: Some(format!("{err:?}")),
-        },
+            0.0,
+            false,
+            Some(format!("{err:?}")),
+        ),
     }
 }
 
-fn main() {
-    let mut blocks: Vec<u64> = DEFAULT_BLOCKS.to_vec();
-    let mut cores: Vec<usize> = DEFAULT_CORES.to_vec();
-    let mut repeats = DEFAULT_REPEATS;
-    let mut out = repo_root().join("lab/results/mainnet-sweep.json");
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--blocks" => {
-                i += 1;
-                blocks = parse_csv_u64(&args[i]);
-            }
-            "--cores" => {
-                i += 1;
-                cores = parse_csv_usize(&args[i]);
-            }
-            "--repeats" => {
-                i += 1;
-                repeats = args[i].parse().unwrap();
-            }
-            "--out" => {
-                i += 1;
-                out = PathBuf::from(&args[i]);
-            }
-            other => panic!("unknown arg {other}"),
-        }
-        i += 1;
-    }
-
-    let data_dir = repo_root().join("data/ethereum");
-    let (bytecodes, block_hashes) = load_shared(&data_dir);
-    let chain = PevmEthereum::mainnet();
-    let mut rows = Vec::new();
-
-    for number in blocks {
-        let Some(loaded) = load_block(
-            &data_dir,
-            number,
-            Arc::clone(&bytecodes),
-            Arc::clone(&block_hashes),
-        ) else {
-            continue;
-        };
-        eprintln!(
-            "block {}  txs={}  gas={}",
-            loaded.number,
-            n_tx(&loaded.block),
-            loaded.block.header.gas_used
-        );
-        for repeat in 0..repeats {
-            rows.push(measure(&chain, &loaded, "sequential", 1, repeat));
-        }
-        for mode in ["occ", "pcc", "specfence"] {
-            for &c in &cores {
-                for repeat in 0..repeats {
-                    let row = measure(&chain, &loaded, mode, c, repeat);
-                    eprintln!(
-                        "  {mode:10} cores={c} r{repeat} tps={:.0} abort={:.3} wait={} full_retry={} partial={} pr_fb={} bind={} wait_hard={} spec_read={} cost_w/s/b={}/{}/{} sel_inv={} sel_fb={} ok={}",
-                        row.tps,
-                        row.abort_rate,
-                        row.wait_admissions,
-                        row.tx_full_retry,
-                        row.partial_retry_count,
-                        row.partial_retry_fallback_full,
-                        row.bind_hits,
-                        row.wait_hard_count,
-                        row.spec_read_count,
-                        row.cost_chose_wait,
-                        row.cost_chose_spec,
-                        row.cost_chose_bind,
-                        row.selective_invalidate_count,
-                        row.selective_fallback_full,
-                        row.ok
-                    );
-                    rows.push(row);
-                }
-            }
-        }
-    }
-
+fn write_outputs(out: &Path, rows: &[RunRow]) {
     if let Some(parent) = out.parent() {
         fs::create_dir_all(parent).expect("mkdir out");
     }
@@ -426,29 +475,40 @@ fn main() {
                 "rewind_to_cp": r.rewind_to_cp,
                 "full_restart": r.full_restart,
                 "tx_head_reexec": r.tx_head_reexec,
+                "absolute_jump_applied": r.absolute_jump_applied,
+                "absolute_jump_fallback": r.absolute_jump_fallback,
+                "prior_bind_hits": r.prior_bind_hits,
+                "prior_bind_miss": r.prior_bind_miss,
+                "journal_ff_entries": r.journal_ff_entries,
+                "journal_ff_hits": r.journal_ff_hits,
+                "prefix_opcodes_skipped": r.prefix_opcodes_skipped,
+                "ready_steal_on_wait": r.ready_steal_on_wait,
+                "lean_mode_txs": r.lean_mode_txs,
+                "full_mode_txs": r.full_mode_txs,
+                "engagement_switches": r.engagement_switches,
+                "inspector_steps": r.inspector_steps,
+                "inspector_steps_resume": r.inspector_steps_resume,
                 "ok": r.ok,
                 "error": r.error,
             })
         })
         .collect();
-    let mut f = File::create(&out).expect("write out");
+    let mut f = File::create(out).expect("write out");
     serde_json::to_writer_pretty(&mut f, &values).expect("json");
     f.write_all(b"\n").ok();
-    eprintln!("wrote {} rows to {}", rows.len(), out.display());
 
-    // Companion CSV next to JSON (same stem).
     let csv_path = out.with_extension("csv");
     let mut csv = File::create(&csv_path).expect("write csv");
     writeln!(
         csv,
-        "block,n_tx,gas_used,mode,cores,repeat,elapsed_ms,tps,occ_aborts,abort_rate,wait_admissions,speculate_executions,region_promotions,cascade_validations_scheduled,independent_txs_skipped_by_fence,bayes_wait_decisions,bayes_speculate_decisions,bayes_conflict_updates,bayes_success_updates,wave_promotions,mean_wait_posterior,bind_hits,wait_hard_count,spec_read_count,selective_invalidate_count,tx_full_retry,region_validate_fail,soft_edge_revokes,selective_fallback_full,partial_retry_count,partial_retry_fallback_full,cost_chose_wait,cost_chose_spec,cost_chose_bind,mean_p_at_wait,mean_p_at_spec,evm_entries,resume_count,rebind_only,rewind_to_cp,full_restart,tx_head_reexec,ok,error"
+        "block,n_tx,gas_used,mode,cores,repeat,elapsed_ms,tps,occ_aborts,abort_rate,wait_admissions,speculate_executions,region_promotions,cascade_validations_scheduled,independent_txs_skipped_by_fence,bayes_wait_decisions,bayes_speculate_decisions,bayes_conflict_updates,bayes_success_updates,wave_promotions,mean_wait_posterior,bind_hits,wait_hard_count,spec_read_count,selective_invalidate_count,tx_full_retry,region_validate_fail,soft_edge_revokes,selective_fallback_full,partial_retry_count,partial_retry_fallback_full,cost_chose_wait,cost_chose_spec,cost_chose_bind,mean_p_at_wait,mean_p_at_spec,evm_entries,resume_count,rebind_only,rewind_to_cp,full_restart,tx_head_reexec,absolute_jump_applied,absolute_jump_fallback,prior_bind_hits,prior_bind_miss,journal_ff_entries,journal_ff_hits,prefix_opcodes_skipped,ready_steal_on_wait,lean_mode_txs,full_mode_txs,engagement_switches,inspector_steps,inspector_steps_resume,ok,error"
     )
     .unwrap();
-    for r in &rows {
-        let err = r.error.as_deref().unwrap_or("").replace(",", ";");
+    for r in rows {
+        let err = r.error.as_deref().unwrap_or("").replace(',', ";");
         writeln!(
             csv,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             r.block,
             r.n_tx,
             r.gas_used,
@@ -491,10 +551,140 @@ fn main() {
             r.rewind_to_cp,
             r.full_restart,
             r.tx_head_reexec,
+            r.absolute_jump_applied,
+            r.absolute_jump_fallback,
+            r.prior_bind_hits,
+            r.prior_bind_miss,
+            r.journal_ff_entries,
+            r.journal_ff_hits,
+            r.prefix_opcodes_skipped,
+            r.ready_steal_on_wait,
+            r.lean_mode_txs,
+            r.full_mode_txs,
+            r.engagement_switches,
+            r.inspector_steps,
+            r.inspector_steps_resume,
             r.ok,
             err
         )
         .unwrap();
     }
-    eprintln!("wrote {} rows to {}", rows.len(), csv_path.display());
+}
+
+fn main() {
+    let mut blocks: Vec<u64> = DEFAULT_BLOCKS.to_vec();
+    let mut cores: Vec<usize> = DEFAULT_CORES.to_vec();
+    let mut repeats = DEFAULT_REPEATS;
+    let mut modes: Vec<String> = vec![
+        "sequential".into(),
+        "occ".into(),
+        "pcc".into(),
+        "specfence".into(),
+    ];
+    let mut out = repo_root().join("lab/results/mainnet-sweep.json");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--blocks" => {
+                i += 1;
+                blocks = parse_csv_u64(&args[i]);
+            }
+            "--cores" => {
+                i += 1;
+                cores = parse_csv_usize(&args[i]);
+            }
+            "--repeats" => {
+                i += 1;
+                repeats = args[i].parse().unwrap();
+            }
+            "--modes" => {
+                i += 1;
+                modes = args[i]
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+            "--out" => {
+                i += 1;
+                out = PathBuf::from(&args[i]);
+            }
+            other => panic!("unknown arg {other}"),
+        }
+        i += 1;
+    }
+
+    let data_dir = repo_root().join("data/ethereum");
+    let (bytecodes, block_hashes) = load_shared(&data_dir);
+    let chain = PevmEthereum::mainnet();
+    let mut rows = Vec::new();
+
+    for number in blocks {
+        let Some(loaded) = load_block(
+            &data_dir,
+            number,
+            Arc::clone(&bytecodes),
+            Arc::clone(&block_hashes),
+        ) else {
+            continue;
+        };
+        eprintln!(
+            "block {}  txs={}  gas={}",
+            loaded.number,
+            n_tx(&loaded.block),
+            loaded.block.header.gas_used
+        );
+        for mode in &modes {
+            if mode == "sequential" {
+                for repeat in 0..repeats {
+                    rows.push(measure(&chain, &loaded, "sequential", 1, repeat));
+                }
+                continue;
+            }
+            for &c in &cores {
+                for repeat in 0..repeats {
+                    let row = measure(&chain, &loaded, mode, c, repeat);
+                    eprintln!(
+                        "  {mode:10} cores={c} r{repeat} tps={:.0} abort={:.3} wait={} full_retry={} partial={} pr_fb={} bind={} wait_hard={} spec_read={} cost_w/s/b={}/{}/{} sel_inv={} sel_fb={} jump={} prior_bind={} lean={} resume={} ok={}",
+                        row.tps,
+                        row.abort_rate,
+                        row.wait_admissions,
+                        row.tx_full_retry,
+                        row.partial_retry_count,
+                        row.partial_retry_fallback_full,
+                        row.bind_hits,
+                        row.wait_hard_count,
+                        row.spec_read_count,
+                        row.cost_chose_wait,
+                        row.cost_chose_spec,
+                        row.cost_chose_bind,
+                        row.selective_invalidate_count,
+                        row.selective_fallback_full,
+                        row.absolute_jump_applied,
+                        row.prior_bind_hits,
+                        row.lean_mode_txs,
+                        row.resume_count,
+                        row.ok
+                    );
+                    rows.push(row);
+                }
+            }
+        }
+        write_outputs(&out, &rows);
+        eprintln!(
+            "checkpointed {} rows after block {} -> {}",
+            rows.len(),
+            loaded.number,
+            out.display()
+        );
+    }
+
+    write_outputs(&out, &rows);
+    eprintln!("wrote {} rows to {}", rows.len(), out.display());
+    eprintln!(
+        "wrote {} rows to {}",
+        rows.len(),
+        out.with_extension("csv").display()
+    );
 }
