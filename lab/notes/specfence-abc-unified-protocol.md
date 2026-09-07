@@ -109,3 +109,8 @@ Diagnosed early-tip + clobbered plant write_replays as seq≠par cause; landed t
 597 N=5 med **17.4** / N=10 **19.4** (no wall win vs Iter8d 13.4 — jump stayed OFF).  
 See `specfence-abc-iter9-status.md`. Iter 10 cause: multi-SSTORE Handler abs jump ≡ sequential under pevm MV (or cut resume opcode-seconds without abs jump).
 
+### Iter 10 — restore Iter9 wall tax; jump still OFF
+Diagnosed Iter9 accidental hot-path tax (fat SSTORE wrap always installed; first_k-from-gas; gas>0 write_replay keep). Stock SSTORE unless plant wanted; rem first_k restore. Value-stable FF falsified. SoftWait Soft=0; aj=0.  
+597 N=5 med **13.3**; N=10 med **13.8** (restored vs Iter9 19.4 / approx Iter8d 13.4).  
+See `specfence-abc-iter10-status.md`. Iter 11 cause: multi-SSTORE Handler abs jump == sequential under pevm MV (or new evidence for resume without abs jump).
+

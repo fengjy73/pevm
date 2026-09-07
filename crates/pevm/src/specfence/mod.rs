@@ -24,13 +24,11 @@
 //! Escalate FullRestart after depth≥2 when RewindTo/FF armed (one extra
 //! SuffixRepair vs classic fb escalate-at-1; depth≥3 measured wall↑). Iter7:
 //! after first SuffixRepair fail, sticky BO Await on fail locs (+ force_bind
-//! extend) until writers Validated before 2nd resume. Iter9: Handler jump restore
-//! gates (tip-embedded write_replays, plant gas, refuse early/multi-SSTORE);
-//! production jump/capture OFF until multi-SSTORE seq≡par. Iter8: hang-free Handler
-//! memory snap (≤8KiB) + run_exec_loop PENDING_RESUME apply landed; production
-//! jump/capture OFF (seq≠par / capture tax). Escalation retains **head-FF**
-//! (Iter5). Serial-barrier / hot-ℓ clique barrier (capped). Never ESTIMATE-poison
-//! certified prefix. SoftWait Soft ~0.
+//! extend) until writers Validated before 2nd resume. Iter10: strip Iter9 hot-path
+//! tax (stock SSTORE unless plant install wanted; no first_k-from-gas on finalize).
+//! Iter9 jump restore gates retained; production jump/capture OFF. Iter8 memory snap
+//! + run_exec_loop PENDING_RESUME apply retained. Escalation retains **head-FF**
+//! (Iter5). SoftWait Soft ~0.
 //!
 //! **Learn (C):** Inter morph selects Quiet (598 OCC-lite) vs Storm (597 Await-ready).
 //! Intra `choose_action` / learner updates only on hot candidates.
@@ -108,7 +106,7 @@ pub(crate) use boundary::{
     arm_pending_effect_cp_only,
     resume_was_applied, steps_this_run, try_arm_safe_absolute_jump, try_arm_safe_absolute_jump_gated,
     with_plant_tls, with_plant_tls_journal, BoundarySnapshot, CachedCallOutcome, JournalBlob,
-    plant_tls_active, pending_resume_armed, try_apply_pending_pc_resume, install_handler_sstore_plant_capture,
+    plant_tls_active, pending_resume_armed, try_apply_pending_pc_resume, handler_sstore_plant_install_wanted, install_handler_sstore_plant_capture,
 };
 pub use boundary::SpecFenceInspector;
 #[allow(unused_imports)]

@@ -451,7 +451,9 @@ impl PartialRetryState {
         location: MemoryLocationHash,
         mut replay: StorageWriteReplay,
     ) {
-        // Iter9: preserve Handler-plant per-SSTORE gas when finalize re-notes with 0.
+        // Iter10: restore Iter8 hot-path — do NOT touch first_k here (journal owns
+        // first_k; Iter9 first_k-from-gas changed true_suffix/RebindOnly). Preserve
+        // plant tip gas when finalize re-notes with 0 (jump restore correctness).
         let mut prior_gas = 0u64;
         self.write_replays.retain(|(l, r)| {
             if *l == location {
@@ -467,10 +469,6 @@ impl PartialRetryState {
             } else {
                 self.last_post_sstore_gas()
             };
-        }
-        // Only plant-time notes (gas>0) touch first_k.
-        if replay.gas_remaining_after > 0 {
-            self.first_k.entry(location).or_insert(self.k.max(1));
         }
         self.write_replays.push((location, replay));
     }
@@ -596,12 +594,7 @@ impl PartialRetryState {
         let write_replays: Vec<StorageWriteReplay> = self
             .write_replays
             .iter()
-            .filter(|(loc, r)| {
-                // Iter9: keep Handler-plant replays with live tip gas even when
-                // first_k was missing / late (Lean notes Write only at finalize).
-                if r.gas_remaining_after > 0 {
-                    return true;
-                }
+            .filter(|(loc, _)| {
                 let fk = self.first_k.get(loc).copied().unwrap_or(usize::MAX);
                 fk < k_fail
                     || prefix_set.contains(loc)

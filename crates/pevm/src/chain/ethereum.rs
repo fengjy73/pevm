@@ -24,7 +24,7 @@ use super::{CalculateReceiptRootError, PevmChain};
 use crate::{
     BuildIdentityHasher, MemoryLocation, MemoryLocationHash, PevmTxExecutionResult, TxIdx,
     hash_deterministic, mv_memory::MvMemory,
-    specfence::{install_handler_sstore_plant_capture, SpecFenceInspector},
+    specfence::{handler_sstore_plant_install_wanted, install_handler_sstore_plant_capture, SpecFenceInspector},
 
 };
 
@@ -133,8 +133,11 @@ impl PevmChain for PevmEthereum {
             .with_block(block_env)
             .with_db(db)
             .build_mainnet_with_inspector(SpecFenceInspector::new());
-        // Iter4: hang-free post-SSTORE PC/gas plant on Handler::run (no inspect_run).
-        install_handler_sstore_plant_capture(&mut evm.instruction);
+        // Iter4/10: hang-free post-SSTORE plant only when capture/jump/inspect may arm.
+        // Production jump/capture OFF → stock SSTORE (no per-opcode TLS tax).
+        if handler_sstore_plant_install_wanted() {
+            install_handler_sstore_plant_capture(&mut evm.instruction);
+        }
         evm
     }
 

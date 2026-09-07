@@ -1270,7 +1270,28 @@ pub(crate) fn try_apply_pending_pc_resume<CTX>(
     record_pc_resume(skipped);
 }
 
+/// Iter10: install Handler SSTORE plant only when capture/jump/inspect may arm TLS.
+/// Production jump/capture OFF → stock SSTORE (no per-opcode TLS tax). Enable with
+/// `SPECFENCE_HANDLER_CAPTURE=1`, `SPECFENCE_ABSOLUTE_JUMP=1`, or research inspect.
+pub(crate) fn handler_sstore_plant_install_wanted() -> bool {
+    if crate::specfence::research_inspect_enabled() {
+        return true;
+    }
+    if absolute_jump_env_enabled() {
+        return true;
+    }
+    match std::env::var_os("SPECFENCE_HANDLER_CAPTURE") {
+        None => false,
+        Some(v) => {
+            let s = v.to_string_lossy();
+            s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
+        }
+    }
+}
+
 /// EthInterpreter SSTORE plant capture (installed on Mainnet EVM instruction table).
+/// Iter10: thin fast path + #[cold] plant body so production I-cache stays stock-like.
+#[inline(always)]
 pub(crate) fn sstore_plant_capture_eth<H: revm::interpreter::Host + ?Sized>(
     context: revm::interpreter::InstructionContext<'_, H, EthInterpreter>,
 ) {
@@ -1279,6 +1300,13 @@ pub(crate) fn sstore_plant_capture_eth<H: revm::interpreter::Host + ?Sized>(
         revm::interpreter::instructions::host::sstore(context);
         return;
     }
+    sstore_plant_capture_eth_slow(context);
+}
+
+#[cold]
+fn sstore_plant_capture_eth_slow<H: revm::interpreter::Host + ?Sized>(
+    context: revm::interpreter::InstructionContext<'_, H, EthInterpreter>,
+) {
     // Plant path: peek operands + original before stock pops stack.
     let interp_ptr = context.interpreter as *mut Interpreter<EthInterpreter>;
     let host_ptr = context.host as *mut H;
