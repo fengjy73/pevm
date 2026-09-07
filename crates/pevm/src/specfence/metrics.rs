@@ -112,6 +112,18 @@ pub struct SpecFenceMetrics {
     pub wait_park_ns: u64,
     /// M2: worker stole other ready work immediately after a WaitHard park.
     pub ready_steal_on_wait: usize,
+    /// Park idle subtype: SoftWait Soft arm park count.
+    pub park_count_softwait: usize,
+    /// Park idle subtype: SoftWait Soft arm park ns (worker sum).
+    pub park_ns_softwait: u64,
+    /// Park idle subtype: EarlyAbort Blocking park count.
+    pub park_count_early_abort: usize,
+    /// Park idle subtype: EarlyAbort Blocking park ns (worker sum).
+    pub park_ns_early_abort: u64,
+    /// Park idle subtype: other Blocking (cold/hint/ESTIMATE) park count.
+    pub park_count_blocking_other: usize,
+    /// Park idle subtype: other Blocking park ns (worker sum).
+    pub park_ns_blocking_other: u64,
     /// M2: mean ready-queue depth sampled at park/push (best-effort wave width).
     pub wave_width_mean: f64,
     /// M1b: SpecFence journal effects / bound values restored on RewindTo resume.
@@ -225,6 +237,12 @@ pub(crate) struct MetricsInner {
     wait_park_count: AtomicUsize,
     wait_park_ns: std::sync::atomic::AtomicU64,
     ready_steal_on_wait: AtomicUsize,
+    park_count_softwait: AtomicUsize,
+    park_ns_softwait: std::sync::atomic::AtomicU64,
+    park_count_early_abort: AtomicUsize,
+    park_ns_early_abort: std::sync::atomic::AtomicU64,
+    park_count_blocking_other: AtomicUsize,
+    park_ns_blocking_other: std::sync::atomic::AtomicU64,
     journal_ff_entries: AtomicUsize,
     journal_ff_hits: AtomicUsize,
     db_heavy_ops: AtomicUsize,
@@ -516,6 +534,29 @@ impl MetricsInner {
             .store(ready_steal_on_wait, Ordering::Relaxed);
     }
 
+    pub(crate) fn set_park_subtype_metrics(
+        &self,
+        park_count_softwait: usize,
+        park_ns_softwait: u64,
+        park_count_early_abort: usize,
+        park_ns_early_abort: u64,
+        park_count_blocking_other: usize,
+        park_ns_blocking_other: u64,
+    ) {
+        self.park_count_softwait
+            .store(park_count_softwait, Ordering::Relaxed);
+        self.park_ns_softwait
+            .store(park_ns_softwait, Ordering::Relaxed);
+        self.park_count_early_abort
+            .store(park_count_early_abort, Ordering::Relaxed);
+        self.park_ns_early_abort
+            .store(park_ns_early_abort, Ordering::Relaxed);
+        self.park_count_blocking_other
+            .store(park_count_blocking_other, Ordering::Relaxed);
+        self.park_ns_blocking_other
+            .store(park_ns_blocking_other, Ordering::Relaxed);
+    }
+
     pub(crate) fn set_park_resume_metrics(
         &self,
         park_resume_at_k: usize,
@@ -714,6 +755,12 @@ impl MetricsInner {
             wait_park_count: self.wait_park_count.load(Ordering::Relaxed),
             wait_park_ns: self.wait_park_ns.load(Ordering::Relaxed),
             ready_steal_on_wait: self.ready_steal_on_wait.load(Ordering::Relaxed),
+            park_count_softwait: self.park_count_softwait.load(Ordering::Relaxed),
+            park_ns_softwait: self.park_ns_softwait.load(Ordering::Relaxed),
+            park_count_early_abort: self.park_count_early_abort.load(Ordering::Relaxed),
+            park_ns_early_abort: self.park_ns_early_abort.load(Ordering::Relaxed),
+            park_count_blocking_other: self.park_count_blocking_other.load(Ordering::Relaxed),
+            park_ns_blocking_other: self.park_ns_blocking_other.load(Ordering::Relaxed),
             wave_width_mean,
             journal_ff_entries: self.journal_ff_entries.load(Ordering::Relaxed),
             journal_ff_hits: self.journal_ff_hits.load(Ordering::Relaxed),

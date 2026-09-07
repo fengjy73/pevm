@@ -99,8 +99,9 @@ pub use boundary::SpecFenceInspector;
 #[allow(unused_imports)]
 pub(crate) use rem::{
     AccessMode, Checkpoint, CheckpointId, CheckpointKind, EffectOrdinal, FfValue, LeanAbortRepair,
-    ParkedWait, ParkResumeIntent, ParkResumeKind, PartialRetryPlan, PartialRetryState, PendingPark,
-    RegionAccess, RemTask, RepairPlan, ResearchAbortRepair, ResumeContinuation, StorageWriteReplay,
+    ParkedWait, ParkKind, ParkResumeIntent, ParkResumeKind, PartialRetryPlan, PartialRetryState,
+    PendingPark, RegionAccess, RemTask, RepairPlan, ResearchAbortRepair, ResumeContinuation,
+    StorageWriteReplay,
 };
 pub(crate) use resolve::{PolicyCtx, ResolveAction, choose_action, early_abort_candidate};
 #[allow(unused_imports)]

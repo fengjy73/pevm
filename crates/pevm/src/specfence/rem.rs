@@ -1591,6 +1591,19 @@ pub(crate) struct ParkResumeIntent {
     pub location: MemoryLocationHash,
 }
 
+/// Which resolve path parked the worker (breaks `wait_park_ns` into subtypes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub(crate) enum ParkKind {
+    /// FenceGraph SoftWait Soft arm (π WaitHard / Bind→Await).
+    SoftWaitSoft = 0,
+    /// P3 EarlyAbort Blocking (no SoftWait arm).
+    EarlyAbort = 1,
+    /// Cold/hint WaitHard, ESTIMATE Blocking, or validation Blocking without Soft arm.
+    #[default]
+    BlockingOther = 2,
+}
+
 /// One WaitHard park entry. Carries SoftWait `(t,k)` for P4 wake resume intent.
 ///
 /// Still **not** a live mid-effect Interpreter continuation — PEVM tasks remain
@@ -1602,6 +1615,7 @@ pub(crate) struct ParkedWait {
     pub location: MemoryLocationHash,
     /// SoftWait observe ordinal (per-tx PartialRetry `k`, else 0).
     pub armed_at_k: u64,
+    pub kind: ParkKind,
 }
 
 /// Pending WaitHard park location + SoftWait `k` (thread-local until pevm parks).
@@ -1609,6 +1623,7 @@ pub(crate) struct ParkedWait {
 pub(crate) struct PendingPark {
     pub location: MemoryLocationHash,
     pub armed_at_k: u64,
+    pub kind: ParkKind,
 }
 
 /// M2/P4 wave ready-queue + WaitHard park table.
@@ -1634,6 +1649,15 @@ pub(crate) struct WaveParkTable {
     resume_intents: DashMap<TxIdx, ParkResumeIntent, BuildIdentityHasher>,
     wait_park_count: AtomicUsize,
     wait_park_ns: AtomicU64,
+    /// Subtype split of `wait_park_ns` / counts (SoftWait Soft vs EarlyAbort vs other Blocking).
+    park_ns_softwait: AtomicU64,
+    park_ns_early_abort: AtomicU64,
+    park_ns_blocking_other: AtomicU64,
+    park_count_softwait: AtomicUsize,
+    park_count_early_abort: AtomicUsize,
+    park_count_blocking_other: AtomicUsize,
+    /// Kind of the in-flight park for this waiter (for finish_park_ns split).
+    park_kind_by_waiter: DashMap<TxIdx, ParkKind, BuildIdentityHasher>,
     ready_steal_on_wait: AtomicUsize,
     wave_width_sum: AtomicU64,
     wave_width_samples: AtomicUsize,
@@ -1648,19 +1672,39 @@ impl WaveParkTable {
         Self::default()
     }
 
-    /// Record location + SoftWait `k` for the WaitHard about to return `Blocking`.
-    pub(crate) fn set_pending_park(&self, location: MemoryLocationHash, armed_at_k: u64) {
+    /// Record location + SoftWait `k` + kind for the WaitHard about to return `Blocking`.
+    pub(crate) fn set_pending_park(
+        &self,
+        location: MemoryLocationHash,
+        armed_at_k: u64,
+        kind: ParkKind,
+    ) {
         PENDING_PARK.with(|c| {
             c.set(Some(PendingPark {
                 location,
                 armed_at_k,
+                kind,
             }))
         });
     }
 
+    /// SoftWait Soft arm pending park (FenceGraph arm present).
+    pub(crate) fn set_pending_park_softwait(
+        &self,
+        location: MemoryLocationHash,
+        armed_at_k: u64,
+    ) {
+        self.set_pending_park(location, armed_at_k, ParkKind::SoftWaitSoft);
+    }
+
     /// Backward-compatible: pending park with `k=0` (tx-grain FullRetry on wake).
     pub(crate) fn set_pending_park_location(&self, location: MemoryLocationHash) {
-        self.set_pending_park(location, 0);
+        self.set_pending_park(location, 0, ParkKind::BlockingOther);
+    }
+
+    /// EarlyAbort Blocking pending park (no SoftWait SoT arm).
+    pub(crate) fn set_pending_park_early_abort(&self, location: MemoryLocationHash) {
+        self.set_pending_park(location, 0, ParkKind::EarlyAbort);
     }
 
     pub(crate) fn take_pending_park(&self) -> Option<PendingPark> {
@@ -1685,11 +1729,30 @@ impl WaveParkTable {
         location: MemoryLocationHash,
         armed_at_k: u64,
     ) {
+        self.park_with_kind(
+            waiter,
+            writer,
+            location,
+            armed_at_k,
+            ParkKind::BlockingOther,
+        );
+    }
+
+    /// Park with subtype so `wait_park_ns` can be split by SoftWait / EarlyAbort / other.
+    pub(crate) fn park_with_kind(
+        &self,
+        waiter: TxIdx,
+        writer: TxIdx,
+        location: MemoryLocationHash,
+        armed_at_k: u64,
+        kind: ParkKind,
+    ) {
         let entry = ParkedWait {
             waiter,
             writer,
             location,
             armed_at_k,
+            kind,
         };
         self.waiters_by_loc
             .entry(location)
@@ -1700,7 +1763,19 @@ impl WaveParkTable {
             .or_default()
             .push(entry);
         self.park_started.insert(waiter, Instant::now());
+        self.park_kind_by_waiter.insert(waiter, kind);
         self.wait_park_count.fetch_add(1, Ordering::Relaxed);
+        match kind {
+            ParkKind::SoftWaitSoft => {
+                self.park_count_softwait.fetch_add(1, Ordering::Relaxed);
+            }
+            ParkKind::EarlyAbort => {
+                self.park_count_early_abort.fetch_add(1, Ordering::Relaxed);
+            }
+            ParkKind::BlockingOther => {
+                self.park_count_blocking_other.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         let depth = self.ready.lock().unwrap().len();
         self.sample_wave_width_locked(depth);
         STEAL_AFTER_PARK.with(|c| c.set(true));
@@ -1715,6 +1790,7 @@ impl WaveParkTable {
             v.retain(|p| p.waiter != waiter);
         }
         self.park_started.remove(&waiter);
+        self.park_kind_by_waiter.remove(&waiter);
         self.resume_intents.remove(&waiter);
         STEAL_AFTER_PARK.with(|c| c.set(false));
     }
@@ -1772,7 +1848,7 @@ impl WaveParkTable {
         self.ready.lock().unwrap().pop().map(|Reverse(t)| t)
     }
 
-    /// Mark that a steal after park succeeded.
+    /// Mark that a steal after park succeeded (wave ready **or** collaborative Ready).
     pub(crate) fn note_ready_steal_if_after_park(&self) {
         STEAL_AFTER_PARK.with(|c| {
             if c.get() {
@@ -1865,6 +1941,22 @@ impl WaveParkTable {
         if let Some((_, started)) = self.park_started.remove(&waiter) {
             let ns = started.elapsed().as_nanos() as u64;
             self.wait_park_ns.fetch_add(ns, Ordering::Relaxed);
+            let kind = self
+                .park_kind_by_waiter
+                .remove(&waiter)
+                .map(|(_, k)| k)
+                .unwrap_or(ParkKind::BlockingOther);
+            match kind {
+                ParkKind::SoftWaitSoft => {
+                    self.park_ns_softwait.fetch_add(ns, Ordering::Relaxed);
+                }
+                ParkKind::EarlyAbort => {
+                    self.park_ns_early_abort.fetch_add(ns, Ordering::Relaxed);
+                }
+                ParkKind::BlockingOther => {
+                    self.park_ns_blocking_other.fetch_add(ns, Ordering::Relaxed);
+                }
+            }
         }
     }
 
@@ -1878,6 +1970,30 @@ impl WaveParkTable {
 
     pub(crate) fn ready_steal_on_wait(&self) -> usize {
         self.ready_steal_on_wait.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn park_ns_softwait(&self) -> u64 {
+        self.park_ns_softwait.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn park_ns_early_abort(&self) -> u64 {
+        self.park_ns_early_abort.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn park_ns_blocking_other(&self) -> u64 {
+        self.park_ns_blocking_other.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn park_count_softwait(&self) -> usize {
+        self.park_count_softwait.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn park_count_early_abort(&self) -> usize {
+        self.park_count_early_abort.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn park_count_blocking_other(&self) -> usize {
+        self.park_count_blocking_other.load(Ordering::Relaxed)
     }
 
     pub(crate) fn wave_width_mean(&self) -> f64 {
@@ -1944,8 +2060,9 @@ mod p4_tk_park_tests {
     #[test]
     fn park_stores_armed_at_k_and_wake_restores_intent() {
         let wave = WaveParkTable::new();
-        wave.park(5, 2, 99, 7);
+        wave.park_with_kind(5, 2, 99, 7, ParkKind::SoftWaitSoft);
         assert_eq!(wave.wait_park_count(), 1);
+        assert_eq!(wave.park_count_softwait(), 1);
         let intents = wave.wake_writer_done_intents(2);
         assert_eq!(intents.len(), 1);
         assert_eq!(intents[0].waiter, 5);
@@ -1955,6 +2072,23 @@ mod p4_tk_park_tests {
         assert_eq!(taken.armed_at_k, 7);
         assert!(wave.take_resume_intent(5).is_none());
         assert_eq!(wave.pop_ready(), Some(5));
+        assert!(wave.park_ns_softwait() > 0 || wave.wait_park_ns() > 0);
+    }
+
+    #[test]
+    fn park_kind_splits_idle_ns() {
+        let wave = WaveParkTable::new();
+        wave.park_with_kind(1, 0, 10, 3, ParkKind::SoftWaitSoft);
+        wave.park_with_kind(2, 0, 11, 0, ParkKind::EarlyAbort);
+        wave.park_with_kind(3, 0, 12, 0, ParkKind::BlockingOther);
+        assert_eq!(wave.park_count_softwait(), 1);
+        assert_eq!(wave.park_count_early_abort(), 1);
+        assert_eq!(wave.park_count_blocking_other(), 1);
+        let _ = wave.wake_writer_done(0);
+        assert_eq!(
+            wave.wait_park_ns(),
+            wave.park_ns_softwait() + wave.park_ns_early_abort() + wave.park_ns_blocking_other()
+        );
     }
 
     #[test]
@@ -2015,7 +2149,7 @@ mod p4_tk_park_tests {
     #[test]
     fn pending_park_carries_k() {
         let wave = WaveParkTable::new();
-        wave.set_pending_park(42, 9);
+        wave.set_pending_park(42, 9, ParkKind::SoftWaitSoft);
         let p = wave.take_pending_park().expect("pending");
         assert_eq!(p.location, 42);
         assert_eq!(p.armed_at_k, 9);

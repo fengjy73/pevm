@@ -536,7 +536,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     let _ = self.mv_memory.regions.promote_location(location_hash);
                     self.specfence
                         .wave
-                        .set_pending_park(location_hash, k);
+                        .set_pending_park_softwait(location_hash, k);
                     return Err(ReadError::Blocking(prev));
                 }
                 // Cold-start: skip WaitHard when posterior is cold.
@@ -601,7 +601,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     self.specfence.partial_retry.mark_softwait_parked(self.tx_idx);
                     self.specfence
                         .wave
-                        .set_pending_park(location_hash, k);
+                        .set_pending_park_softwait(location_hash, k);
                     return Err(ReadError::Blocking(v.tx_idx));
                 }
                 self.specfence.dag.note_hard_edge();
@@ -676,7 +676,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     // Park tracking for M2 steal — no FenceGraph SoftWait arm.
                     self.specfence
                         .wave
-                        .set_pending_park_location(location_hash);
+                        .set_pending_park_early_abort(location_hash);
                     return Err(ReadError::Blocking(prev));
                 }
                 // Writer raced to done — do not SpecRead the stale cross; retry incarnation.

@@ -551,6 +551,14 @@ impl Pevm {
             wave.wait_park_ns(),
             wave.ready_steal_on_wait(),
         );
+        metrics_inner.set_park_subtype_metrics(
+            wave.park_count_softwait(),
+            wave.park_ns_softwait(),
+            wave.park_count_early_abort(),
+            wave.park_ns_early_abort(),
+            wave.park_count_blocking_other(),
+            wave.park_ns_blocking_other(),
+        );
         // AEC: best-effort steal/idle / park duration proxies → learner (∉ TCB).
         if self.concurrency_mode == ConcurrencyMode::SpecFence {
             let steals = wave.ready_steal_on_wait();
@@ -795,12 +803,21 @@ impl Pevm {
                 }
                 Err(VmExecutionError::Blocking(blocking_tx_idx)) => {
                     // M2/P4: WaitHard registered park+(location,k) in Vm (SpecFence).
-                    // add_dependency parks the tx (Aborting); worker returns to steal.
+                    // add_dependency parks the tx (Aborting); worker must steal ready work.
                     let pending = vm.take_pending_park();
                     let park_loc = pending.map(|p| p.location).unwrap_or(0);
                     let park_k = pending.map(|p| p.armed_at_k).unwrap_or(0);
+                    let park_kind = pending
+                        .map(|p| p.kind)
+                        .unwrap_or(crate::specfence::ParkKind::BlockingOther);
                     if let Some(wave) = wave {
-                        wave.park(tx_version.tx_idx, blocking_tx_idx, park_loc, park_k);
+                        wave.park_with_kind(
+                            tx_version.tx_idx,
+                            blocking_tx_idx,
+                            park_loc,
+                            park_k,
+                            park_kind,
+                        );
                     }
                     if !scheduler.add_dependency(tx_version.tx_idx, blocking_tx_idx)
                         && self.abort_reason.get().is_none()
@@ -811,6 +828,12 @@ impl Pevm {
                             wave.unpark(tx_version.tx_idx, blocking_tx_idx, park_loc);
                         }
                         continue;
+                    }
+                    // Park→steal: immediately try ready work before returning to outer loop.
+                    if let Some(wave) = wave {
+                        if let Some(stolen) = scheduler.next_task_steal_after_park(wave) {
+                            return Some(stolen);
+                        }
                     }
                     // Worker-free Wait: return None → next_task_with_wave steals.
                     None

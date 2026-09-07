@@ -130,6 +130,13 @@ impl Scheduler {
 
     pub(crate) fn next_task_with_wave(&self, wave: Option<&WaveParkTable>) -> Option<Task> {
         if let Some(wave) = wave {
+            // After park: prefer wave ready + one cautious execution steal so the core
+            // does not idle when Ready work exists (avoid validation-first stampede).
+            if wave.steal_after_park_pending() {
+                if let Some(task) = self.next_task_steal_after_park(wave) {
+                    return Some(task);
+                }
+            }
             while let Some(tx_idx) = wave.pop_ready() {
                 if let Some(tx_version) = self.try_execute(tx_idx) {
                     wave.note_ready_steal_if_after_park();
@@ -146,6 +153,15 @@ impl Scheduler {
                 {
                     break;
                 }
+                // Re-check wave ready before yield — a producer may have just pushed.
+                if let Some(wave) = wave {
+                    while let Some(tx_idx) = wave.pop_ready() {
+                        if let Some(tx_version) = self.try_execute(tx_idx) {
+                            wave.note_ready_steal_if_after_park();
+                            return Some(Task::Execution(tx_version));
+                        }
+                    }
+                }
                 thread::yield_now();
                 continue;
             }
@@ -158,6 +174,9 @@ impl Scheduler {
                     // "Steal" execution job while holding the lock
                     if tx.status == IncarnationStatus::ReadyToExecute {
                         tx.status = IncarnationStatus::Executing;
+                        if let Some(wave) = wave {
+                            wave.note_ready_steal_if_after_park();
+                        }
                         return Some(Task::Execution(TxVersion {
                             tx_idx,
                             tx_incarnation: tx.incarnation,
@@ -189,8 +208,32 @@ impl Scheduler {
             if let Some(tx_version) =
                 self.try_execute(self.execution_idx.fetch_add(1, Ordering::Relaxed))
             {
+                if let Some(wave) = wave {
+                    wave.note_ready_steal_if_after_park();
+                }
                 return Some(Task::Execution(tx_version));
             }
+        }
+        if let Some(wave) = wave {
+            wave.clear_steal_flag();
+        }
+        None
+    }
+
+    /// Park→steal: wave ready first, then one cautious `execution_idx` fetch_add.
+    /// Counts `ready_steal_on_wait` only for Execution steals (not validation).
+    pub(crate) fn next_task_steal_after_park(&self, wave: &WaveParkTable) -> Option<Task> {
+        while let Some(tx_idx) = wave.pop_ready() {
+            if let Some(tx_version) = self.try_execute(tx_idx) {
+                wave.note_ready_steal_if_after_park();
+                return Some(Task::Execution(tx_version));
+            }
+        }
+        // One collaborative execution attempt — no whole-block scan / no tip CAX stampede.
+        let idx = self.execution_idx.fetch_add(1, Ordering::Relaxed);
+        if let Some(tx_version) = self.try_execute(idx) {
+            wave.note_ready_steal_if_after_park();
+            return Some(Task::Execution(tx_version));
         }
         None
     }
@@ -260,9 +303,67 @@ impl Scheduler {
         debug_assert_eq!(tx.status, IncarnationStatus::Executing);
         debug_assert_eq!(tx.incarnation, tx_version.tx_incarnation);
 
-        // Resume dependent transactions (Block-STM Blocking waiters).
-        let mut dependents = index_mutex!(self.transactions_dependents, tx_version.tx_idx);
-        for tx_idx in dependents.drain(..) {
+        // Drain dependents first; set Executed/Validated *before* waking so SoftWait
+        // `is_done` is true as soon as the writer lock is released / waiters proceed.
+        let mut drained: SmallVec<[TxIdx; 4]> = SmallVec::new();
+        {
+            let mut dependents = index_mutex!(self.transactions_dependents, tx_version.tx_idx);
+            drained.extend(dependents.drain(..));
+        }
+
+        // TODO: Simplify or better document this logic.
+        // Decide where to validate from next
+        let min_validation_idx = if flags.contains(FinishExecFlags::NeedValidation) {
+            min(
+                self.min_validation_idx
+                    .fetch_min(tx_version.tx_idx, Ordering::Relaxed),
+                tx_version.tx_idx,
+            )
+        } else {
+            self.min_validation_idx.load(Ordering::Relaxed)
+        };
+
+        let mut early_return_validation = false;
+        // Have found a min validation index to even bother
+        if min_validation_idx < self.block_size {
+            // Must re-validate from min as this transaction is lower
+            if tx_version.tx_idx < min_validation_idx {
+                if flags.contains(FinishExecFlags::WroteNewLocation) {
+                    self.validation_idx
+                        .fetch_min(min_validation_idx, Ordering::Relaxed);
+                }
+            }
+            // Validate from this transaction as it's in between min and the current
+            // validation index.
+            else if tx_version.tx_idx < self.validation_idx.load(Ordering::Relaxed) {
+                if flags.contains(FinishExecFlags::WroteNewLocation) {
+                    self.validation_idx
+                        .fetch_min(tx_version.tx_idx + 1, Ordering::Relaxed);
+                }
+                if flags.contains(FinishExecFlags::NeedValidation) {
+                    tx.status = IncarnationStatus::Executed;
+                    early_return_validation = true;
+                } else {
+                    tx.status = IncarnationStatus::Validated;
+                    self.num_validated.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            // Don't need to validate anything if the current validation index is
+            // lower or equal -- it will catch up later.
+        }
+
+        if !early_return_validation {
+            if flags.contains(FinishExecFlags::NeedValidation) {
+                tx.status = IncarnationStatus::Executed;
+            } else {
+                tx.status = IncarnationStatus::Validated;
+                self.num_validated.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        // Wake after status is Data-ready (`is_done`), still under writer lock so
+        // add_dependency cannot lose a waiter between drain and Ready.
+        for tx_idx in drained {
             self.set_ready_status(tx_idx);
             self.execution_idx.fetch_min(tx_idx, Ordering::Relaxed);
             if let Some(wave) = wave {
@@ -282,51 +383,11 @@ impl Scheduler {
             let _ = fence.clear_for_writer(tx_version.tx_idx);
         }
 
-        // TODO: Simplify or better document this logic.
-        // Decide where to validate from next
-        let min_validation_idx = if flags.contains(FinishExecFlags::NeedValidation) {
-            min(
-                self.min_validation_idx
-                    .fetch_min(tx_version.tx_idx, Ordering::Relaxed),
-                tx_version.tx_idx,
-            )
+        if early_return_validation {
+            Some(Task::Validation(tx_version))
         } else {
-            self.min_validation_idx.load(Ordering::Relaxed)
-        };
-        // Have found a min validation index to even bother
-        if min_validation_idx < self.block_size {
-            // Must re-validate from min as this transaction is lower
-            if tx_version.tx_idx < min_validation_idx {
-                if flags.contains(FinishExecFlags::WroteNewLocation) {
-                    self.validation_idx
-                        .fetch_min(min_validation_idx, Ordering::Relaxed);
-                }
-            }
-            // Validate from this transaction as it's in between min and the current
-            // validation index.
-            else if tx_version.tx_idx < self.validation_idx.load(Ordering::Relaxed) {
-                if flags.contains(FinishExecFlags::WroteNewLocation) {
-                    self.validation_idx
-                        .fetch_min(tx_version.tx_idx + 1, Ordering::Relaxed);
-                }
-                if flags.contains(FinishExecFlags::NeedValidation) {
-                    tx.status = IncarnationStatus::Executed;
-                    return Some(Task::Validation(tx_version));
-                }
-                tx.status = IncarnationStatus::Validated;
-                self.num_validated.fetch_add(1, Ordering::Relaxed);
-            }
-            // Don't need to validate anything if the current validation index is
-            // lower or equal -- it will catch up later.
+            None
         }
-
-        if flags.contains(FinishExecFlags::NeedValidation) {
-            tx.status = IncarnationStatus::Executed;
-        } else {
-            tx.status = IncarnationStatus::Validated;
-            self.num_validated.fetch_add(1, Ordering::Relaxed);
-        }
-        None
     }
 
     // Return whether the abort was successful. A successful abort leads to

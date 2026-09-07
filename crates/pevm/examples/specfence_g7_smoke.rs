@@ -240,7 +240,7 @@ fn main() {
                 aborts_v.push(aborts as f64);
                 if iters == 1 || i + 1 == iters {
                     println!(
-                        "  block={bn} mode={mode:10} iter={}/{} ok={ok} tps={tps:.0} wall_ms={wall_ms:.1} soft={soft} wait_hard={wh} abort_rate={:.3} lean={} evm={} reexec={} fb_reabort={} rebind={} cold={} occ_fast={} steal={} park_k={} mw_ms={:.1} h_ms={:.1} v_ms={:.1} park_ms={:.1}",
+                        "  block={bn} mode={mode:10} iter={}/{} ok={ok} tps={tps:.0} wall_ms={wall_ms:.1} soft={soft} wait_hard={wh} abort_rate={:.3} lean={} evm={} reexec={} fb_reabort={} rebind={} cold={} occ_fast={} steal={} park_k={} mw_ms={:.1} h_ms={:.1} v_ms={:.1} park_ms={:.1} sw_ms={:.1} ea_ms={:.1} bo_ms={:.1} parks={}",
                         i + 1,
                         iters,
                         if n == 0 { 0.0 } else { aborts as f64 / n as f64 },
@@ -257,6 +257,10 @@ fn main() {
                         m.profile_handler_ns as f64 / 1e6,
                         m.profile_validate_ns as f64 / 1e6,
                         m.wait_park_ns as f64 / 1e6,
+                        m.park_ns_softwait as f64 / 1e6,
+                        m.park_ns_early_abort as f64 / 1e6,
+                        m.park_ns_blocking_other as f64 / 1e6,
+                        m.wait_park_count,
                     );
                 }
                 last_row = Some(serde_json::json!({
@@ -299,8 +303,16 @@ fn main() {
                     "tx_full_retry": m.tx_full_retry,
                     "wait_park_count": m.wait_park_count,
                     "wait_park_ns": m.wait_park_ns,
-                    "ready_steal_on_wait": m.ready_steal_on_wait,
+                    "ready_steal_on_wait": m.ready_steal_on_wait
                 }));
+                if let Some(row) = last_row.as_mut() {
+                    row["park_count_softwait"] = serde_json::json!(m.park_count_softwait);
+                    row["park_ns_softwait"] = serde_json::json!(m.park_ns_softwait);
+                    row["park_count_early_abort"] = serde_json::json!(m.park_count_early_abort);
+                    row["park_ns_early_abort"] = serde_json::json!(m.park_ns_early_abort);
+                    row["park_count_blocking_other"] = serde_json::json!(m.park_count_blocking_other);
+                    row["park_ns_blocking_other"] = serde_json::json!(m.park_ns_blocking_other);
+                }
             }
             let (wall_med, wall_p90, wall_min, wall_mean) = summarize_f64(&mut walls);
             let (soft_med, _, _, _) = summarize_f64(&mut softs);
