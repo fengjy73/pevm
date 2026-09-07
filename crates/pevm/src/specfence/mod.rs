@@ -19,11 +19,11 @@
 //! Await until Executed/Validated, then Bind. Fence intent at first-cross `a`
 //! records `armed_at_k`. SoftWait Soft stays ~0 unless wake EV re-proven.
 //!
-//! **Resolve (B):** RebindOnly when value-stable; else SuffixRepair + hang-free
-//! absolute jump when `jump_is_safe` (Iter4: Handler SSTORE plant capture, no
-//! inspect_run). Escalate FullRestart after depth≥2, then **serial-barrier** /
-//! **hot-ℓ clique barrier** (capped) so head reexec runs once against Data.
-//! Never ESTIMATE-poison certified prefix. No Lean live_prime.
+//! **Resolve (B):** RebindOnly when value-stable; else SuffixRepair + journal FF.
+//! Escalate FullRestart after depth≥2 / fb_reabort retains **head-FF** bound
+//! values for certified-prefix DB skip (Iter5 — no plant TLS / no Lean absolute
+//! jump). Then serial-barrier / hot-ℓ clique barrier (capped). Never
+//! ESTIMATE-poison certified prefix. No Lean live_prime / unlimited sibling barrier.
 //!
 //! **Learn (C):** Inter morph selects Quiet (598 OCC-lite) vs Storm (597 Await-ready).
 //! Intra `choose_action` / learner updates only on hot candidates.

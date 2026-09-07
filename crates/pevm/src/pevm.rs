@@ -970,6 +970,7 @@ fn try_validate(
             specfence.metrics.record_rebind_only();
             specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
             specfence.partial_retry.clear_repair(tx_version.tx_idx);
+            specfence.partial_retry.clear_ff_head(tx_version.tx_idx);
             specfence
                 .partial_retry
                 .clear_suffix_repair_depth(tx_version.tx_idx);
@@ -1005,6 +1006,11 @@ fn try_validate(
             if was_force_bind {
                 specfence.metrics.record_force_bind_reabort();
             }
+            // Iter5: anti-livelock — jumped capture/jump resume that still aborted
+            // disables further absolute jumps for this tx.
+            let _ = specfence
+                .partial_retry
+                .disable_jump_after_failed_resume(tx_version.tx_idx);
             if specfence
                 .partial_retry
                 .take_post_softwait_wake(tx_version.tx_idx)
@@ -1024,10 +1030,11 @@ fn try_validate(
             let repair_depth = specfence
                 .partial_retry
                 .suffix_repair_depth(tx_version.tx_idx);
-            // Classic fb escalate (Iter2: delay-for-jump hung under concurrency).
+            // Classic fb escalate. Iter5: escalate retains head-FF (DB skip) inside
+            // escalate_full_restart — no jump_defer (Lean absolute jump OFF).
             let escalate = was_force_bind || repair_depth >= 2;
             let repair = if escalate {
-                // Drop sticky force_bind for this incarnation; no RewindTo.
+                // Drop sticky force_bind; retain certified FF values for head reexec.
                 specfence.partial_retry.escalate_full_restart(tx_version.tx_idx)
             } else {
                 let plan = cached_plan.clone().unwrap_or_else(|| {
@@ -1430,6 +1437,7 @@ fn try_validate(
             .partial_retry
             .clear_force_bind(tx_version.tx_idx);
         specfence.partial_retry.clear_repair(tx_version.tx_idx);
+        specfence.partial_retry.clear_ff_head(tx_version.tx_idx);
         specfence
             .partial_retry
             .clear_suffix_repair_depth(tx_version.tx_idx);
@@ -1475,6 +1483,7 @@ fn research_full_restart_invalidate(
     specfence.learner.note_reexec_cost(2.0);
     specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
     specfence.partial_retry.clear_repair(tx_version.tx_idx);
+    specfence.partial_retry.clear_ff_head(tx_version.tx_idx);
     let (estimated, fallback) =
         mv_memory.invalidate_selective(tx_version.tx_idx, Some(tx_version.tx_incarnation));
     if fallback {

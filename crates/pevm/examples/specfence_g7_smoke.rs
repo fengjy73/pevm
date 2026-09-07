@@ -240,7 +240,7 @@ fn main() {
                 aborts_v.push(aborts as f64);
                 if iters == 1 || i + 1 == iters {
                     println!(
-                        "  block={bn} mode={mode:10} iter={}/{} ok={ok} tps={tps:.0} wall_ms={wall_ms:.1} soft={soft} wait_hard={wh} abort_rate={:.3} lean={} evm={} reexec={} fb_reabort={} sb_res={} sb_def={} hsstore={} sb_clique={} rebind={} cold={} occ_fast={} steal={} park_k={} mw_ms={:.1} h_ms={:.1} v_ms={:.1} park_ms={:.1} sw_ms={:.1} ea_ms={:.1} bo_ms={:.1} parks={}",
+                        "  block={bn} mode={mode:10} iter={}/{} ok={ok} tps={tps:.0} wall_ms={wall_ms:.1} soft={soft} wait_hard={wh} abort_rate={:.3} lean={} evm={} reexec={} fb_reabort={} sb_res={} sb_def={} hsstore={} sb_clique={} jdef={} aj={} rebind={} cold={} occ_fast={} steal={} park_k={} mw_ms={:.1} h_ms={:.1} v_ms={:.1} park_ms={:.1} sw_ms={:.1} ea_ms={:.1} bo_ms={:.1} parks={}",
                         i + 1,
                         iters,
                         if n == 0 { 0.0 } else { aborts as f64 / n as f64 },
@@ -252,6 +252,8 @@ fn main() {
                         m.serial_barrier_defer,
                         m.handler_sstore_capture,
                         m.serial_barrier_clique,
+                        m.jump_defer,
+                        m.absolute_jump_applied,
                         m.rebind_only,
                         m.cold_spec_fast,
                         m.occ_fast_first,
@@ -303,6 +305,7 @@ fn main() {
                     "profile_validate_ns": m.profile_validate_ns,
                     "profile_scheduler_ns": m.profile_scheduler_ns,
                     "absolute_jump_applied": m.absolute_jump_applied,
+                    "jump_defer": m.jump_defer,
                     "absolute_jump_fallback": m.absolute_jump_fallback,
                     "tx_full_retry": m.tx_full_retry,
                     "wait_park_count": m.wait_park_count,

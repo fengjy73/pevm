@@ -199,6 +199,8 @@ pub struct SpecFenceMetrics {
     pub handler_sstore_capture: usize,
     /// Iter4: sibling consumers parked in hot-ℓ clique barrier.
     pub serial_barrier_clique: usize,
+    /// Iter5: fb escalate deferred once for jump_is_safe after capture window.
+    pub jump_defer: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -286,6 +288,7 @@ pub(crate) struct MetricsInner {
     serial_barrier_defer: AtomicUsize,
     handler_sstore_capture: AtomicUsize,
     serial_barrier_clique: AtomicUsize,
+    jump_defer: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -609,6 +612,10 @@ impl MetricsInner {
         self.serial_barrier_clique.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_jump_defer(&self) {
+        self.jump_defer.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_journal_ff_entries(&self, n: usize) {
         if n > 0 {
             self.journal_ff_entries.fetch_add(n, Ordering::Relaxed);
@@ -826,6 +833,7 @@ impl MetricsInner {
             serial_barrier_defer: self.serial_barrier_defer.load(Ordering::Relaxed),
             handler_sstore_capture: self.handler_sstore_capture.load(Ordering::Relaxed),
             serial_barrier_clique: self.serial_barrier_clique.load(Ordering::Relaxed),
+            jump_defer: self.jump_defer.load(Ordering::Relaxed),
         }
     }
 }

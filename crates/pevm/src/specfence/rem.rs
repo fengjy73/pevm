@@ -753,6 +753,14 @@ pub(crate) struct PartialRetryTable {
     suffix_repair_depth: Vec<AtomicUsize>,
     /// Iter3: serial-barrier park count this block (cap in try_claim).
     serial_barrier_count: Vec<AtomicUsize>,
+    /// Iter5: delay fb escalate once when jump_is_safe after serial capture window.
+    jump_defer_count: Vec<AtomicUsize>,
+    /// Iter5: certified-prefix FF values retained across escalate FullRestart (DB skip).
+    ff_head: DashMap<
+        TxIdx,
+        HashMap<MemoryLocationHash, FfValue, BuildIdentityHasher>,
+        BuildIdentityHasher,
+    >,
 }
 
 // SAFETY: scheduler runs ≤1 executor per tx; validate after execute returns.
@@ -784,6 +792,8 @@ impl PartialRetryTable {
             needs_live_capture: DashMap::default(),
             suffix_repair_depth: (0..block_size).map(|_| AtomicUsize::new(0)).collect(),
             serial_barrier_count: (0..block_size).map(|_| AtomicUsize::new(0)).collect(),
+            jump_defer_count: (0..block_size).map(|_| AtomicUsize::new(0)).collect(),
+            ff_head: DashMap::default(),
         }
     }
 
@@ -1049,9 +1059,28 @@ impl PartialRetryTable {
         tx_idx: TxIdx,
         location: MemoryLocationHash,
     ) -> Option<FfValue> {
-        self.ff_resume
+        if let Some(v) = self
+            .ff_resume
             .get(&tx_idx)
             .and_then(|c| c.values.get(&location).cloned())
+        {
+            return Some(v);
+        }
+        // Iter5: head-FF after escalate FullRestart (origin-checked in try_ff_*).
+        self.ff_head
+            .get(&tx_idx)
+            .and_then(|m| m.get(&location).cloned())
+    }
+
+    /// True when escalate retained certified-prefix FF for head reexec DB skip.
+    pub(crate) fn has_ff_head(&self, tx_idx: TxIdx) -> bool {
+        self.ff_head
+            .get(&tx_idx)
+            .is_some_and(|m| !m.is_empty())
+    }
+
+    pub(crate) fn clear_ff_head(&self, tx_idx: TxIdx) {
+        self.ff_head.remove(&tx_idx);
     }
 
     pub(crate) fn ff_entries(&self, tx_idx: TxIdx) -> usize {
@@ -1063,6 +1092,7 @@ impl PartialRetryTable {
 
     pub(crate) fn clear_ff(&self, tx_idx: TxIdx) {
         self.ff_resume.remove(&tx_idx);
+        self.ff_head.remove(&tx_idx);
     }
 
     pub(crate) fn push_checkpoint(
@@ -1323,7 +1353,30 @@ impl PartialRetryTable {
             .is_some_and(|a| a.load(Ordering::Relaxed) >= MAX_BARRIERS)
     }
 
+    /// Iter5: claim one fb-escalate defer for hang-free absolute jump after capture.
+    /// Cap 1/tx/block — anti-storm (Iter2 blind defer hung under concurrency).
+    pub(crate) fn try_claim_jump_defer(&self, tx_idx: TxIdx) -> bool {
+        const MAX_DEFER: usize = 1;
+        let Some(a) = self.jump_defer_count.get(tx_idx) else {
+            return false;
+        };
+        let cur = a.load(Ordering::Relaxed);
+        if cur >= MAX_DEFER {
+            return false;
+        }
+        a.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
     pub(crate) fn escalate_full_restart(&self, tx_idx: TxIdx) -> LeanAbortRepair {
+        // Iter5 write-prefix skip: retain **armed continuation** FF values only for
+        // head reexec DB skip (origin-checked in try_ff_*). Do **not** merge live
+        // value_snap — that included post-fail reads and caused seq≠par / outliers.
+        if let Some(cont) = self.ff_resume.get(&tx_idx) {
+            if !cont.values.is_empty() {
+                self.ff_head.insert(tx_idx, cont.values.clone());
+            }
+        }
         self.clear_force_bind(tx_idx);
         self.clear_repair(tx_idx);
         self.clear_suffix_repair_depth(tx_idx);
@@ -2679,6 +2732,41 @@ mod abort_cheapening_tests {
         assert!(!table.has_force_bind(0));
         assert_eq!(table.suffix_repair_depth(0), 0);
         assert!(!table.is_rewind_resume(0));
+    }
+
+
+    #[test]
+    fn escalate_full_restart_retains_ff_head_for_db_skip() {
+        let table = PartialRetryTable::new(1);
+        table.reset_incarnation(0, 0);
+        let _ = table.push_checkpoint(0, CheckpointKind::CallEntry);
+        let loc = 0xabc_u64;
+        unsafe { table.state_mut(0) }.note_value(
+            loc,
+            FfValue::Storage {
+                address: Address::ZERO,
+                slot: U256::ZERO,
+                value: U256::from(7),
+                origin: None,
+            },
+        );
+        let _ = table.note_access(0, loc, AccessMode::Read);
+        let _ = table.push_checkpoint(0, CheckpointKind::EffectBoundary);
+        // Arm SuffixRepair-like RewindTo so ff_resume has values.
+        let cp = table.last_checkpoint_before(0, 2).expect("cp");
+        table.arm_rewind_to(0, cp, 2, vec![loc], vec![], vec![loc]);
+        table.set_force_bind(0, vec![loc]);
+        assert!(table.ff_value(0, loc).is_some());
+        match table.escalate_full_restart(0) {
+            LeanAbortRepair::FullRestart { .. } => {}
+            other => panic!("expected FullRestart, got {other:?}"),
+        }
+        assert!(!table.has_force_bind(0), "force_bind cleared");
+        assert!(!table.is_rewind_resume(0), "RewindTo cleared");
+        assert!(table.has_ff_head(0), "head FF retained");
+        assert!(table.ff_value(0, loc).is_some(), "ff_value via ff_head");
+        table.clear_ff_head(0);
+        assert!(table.ff_value(0, loc).is_none());
     }
 
     #[test]

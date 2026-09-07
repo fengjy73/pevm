@@ -83,3 +83,9 @@ See `specfence-abc-iter3-status.md`. Iter 4 cause: hang-free PC ≠ inspect_run 
 Hang-free SSTORE lite capture plumbing landed but Lean plant TLS livelocks WaitHard (same family as inspect). Production: plant OFF on Lean; hot-ℓ fanout writer select for serial-barrier.  
 597 N=10 med **14.2** SoftWait=0 (no win vs Iter3 13.4); aj=0; hsstore=0.  
 See `specfence-abc-iter4-status.md`. Iter 5 cause: serial one-tx capture window or write-prefix skip without plant TLS.
+
+### Iter 5 — head-FF retain on escalate (modest)
+Write-prefix DB skip: escalate FullRestart keeps certified FF values (`ff_head`) for try_ff_* without plant TLS / Lean jump.  
+597 N=5 med **13.1** SoftWait=0 (↓ vs Iter3 13.4 / Iter4 14.1); N=10 med **14.1** (↓ vs Iter4 14.2, not vs Iter3 13.4). ff_hits↑~2.4×; aj=0. Lean absolute jump falsified (seq≠par).  
+See `specfence-abc-iter5-status.md`. Iter 6 cause: opcode-skip hang-free jump (memory-safe) or fewer FullRestarts via RebindOnly/longer SuffixRepair.
+

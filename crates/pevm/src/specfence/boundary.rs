@@ -1235,6 +1235,10 @@ pub(crate) fn sstore_plant_capture_eth<H: revm::interpreter::Host + ?Sized>(
     let bytecode_len = interp.bytecode.bytecode_slice().len();
     let code_hash = Some(interp.bytecode.get_or_calculate_hash());
     let mem_gas = *interp.gas.memory();
+    // Iter5 serial capture window: WaitHard demoted while plant_tls_active, so
+    // stack clone is hang-free (Iter4 empty-stack lite could not absolute-jump).
+    // Memory stays empty (clone cost); write_replays restore storage presents.
+    let stack: Vec<_> = interp.stack.data().to_vec();
     let snap = BoundarySnapshot {
         pc,
         gas_remaining,
@@ -1243,7 +1247,7 @@ pub(crate) fn sstore_plant_capture_eth<H: revm::interpreter::Host + ?Sized>(
         memory_expansion_cost: mem_gas.expansion_cost,
         call_depth: CALL_DEPTH.get(),
         opcode_steps: n,
-        stack: Vec::new(), // lite — jump_is_safe needs stack for full jump; rem tip OK
+        stack,
         memory: Vec::new(),
         code_hash,
         bytecode_len,
