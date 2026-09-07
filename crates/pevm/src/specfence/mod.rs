@@ -52,6 +52,10 @@
 //! live_fanout≥8 unfinished writers (no BO park). Falsified: 17a/f BO park,
 //! 17b true_suffix defer, 17d long RebindOnly wait, 17g cut vs_spin. Keep
 //! Iter16 absorb-no-sticky. Jump/capture OFF. SoftWait Soft ~0.
+//! Iter18: diagnose hang-free opcode skip on successful SuffixRepair. Falsified:
+//! Handler plant+capture (hsstore>0, aj=0 — SSTORE snaps at k≥k_fail on RAW-read
+//! fails); synthetic mid RewindTo; late-k yield192; ForceBind/park ff_head seed
+//! (599 wall↑). Production remains Iter17 tip. Jump/capture OFF. SoftWait Soft ~0.
 //! Iter8 memory snap retained. Head-FF (Iter5). SoftWait Soft ~0.
 //!
 //! **Learn (C):** Inter morph selects Quiet (598 OCC-lite) vs Storm (597 Await-ready).

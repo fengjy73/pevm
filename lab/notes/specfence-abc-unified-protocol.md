@@ -167,3 +167,10 @@ wait falsified. Keep Iter16 absorb-no-sticky. Jump/capture OFF. SoftWait Soft=0.
 597 N5 med **12.7–12.8**; N10 **13.0** (≤ Iter16 N10 13.5). Stretch <10 unmet.
 See `specfence-abc-iter17-status.md`. Iter 18 cause: hang-free opcode skip on
 successful SuffixRepair / later RewindTo without mass-path tax — not fan BO park.
+
+### Iter 18 — opcode-skip diagnosis (plateau; SoftWait Soft=0)
+Plant+capture → aj=0 (SSTORE snaps after k_fail on RAW-read fails). Synthetic mid
+RewindTo / late-k yield / ForceBind·park ff_head falsified (599 wall↑). Production
+= Iter17 tip. SoftWait Soft=0; 597 N10 **12.6**; N5 hits **12.3** in quiet samples.
+See `specfence-abc-iter18-status.md`. Iter 19 cause: hang-free live snap at
+certified-prefix end (not post-SSTORE plant) or 599-safe critical-path schedule.
