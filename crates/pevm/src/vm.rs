@@ -381,12 +381,13 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return Ok(());
         }
 
-        // Thin hot π: force_prefix / sticky Bind before HotSet/learner/revoke DashMap.
+        // Thin hot π: MV Bind-on-Data first (skip sticky/HotSet/prior DashMap), then
+        // EV-aligned SoftWait / cold SpecRead. Force-prefix is local atomic; sticky
+        // only when Data absent (Bind-on-Data does not need sticky to choose Bind).
         let force_prefix = self
             .specfence
             .partial_retry
             .must_force_bind(self.tx_idx, location_hash);
-        let sticky = self.specfence.learner.is_sticky_resolve(location_hash);
         // Concrete writer: MV published/ESTIMATE entry, else residual WŜ(t) of a lower tx.
         // Do NOT fall back to AccountHints.prev here — that can WaitHard on a tx that
         // never writes ℓ (ERC-20 address vs slot) and inflate park chains under M3.
@@ -403,28 +404,39 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 tx_incarnation,
             });
 
-        let residual_predicts = self
-            .mv_memory
-            .residual_writer_before(location_hash, self.tx_idx)
-            .is_some();
-        let process_prior = self.specfence.rw_prior.predicts_write(location_hash);
-        let prior_ws_predicts = residual_predicts || process_prior;
-        if prior_ws_predicts && writer.is_some() {
-            self.specfence.rw_prior.observe_co_access(location_hash);
-        }
+        // Bind-on-Data BEFORE sticky/HotSet/prior/learner DashMap tax (profile: maybe_wait).
+        // SoftWait only if force/sticky and writer still running — see Bind arm.
+        let (action, sticky, residual_predicts, prior_ws_predicts) = if let Some(v) =
+            bind_version.clone()
+        {
+            // Bind-on-Data: skip sticky/HotSet/prior DashMap entirely (SoftWait if
+            // writer unfinished is independent of sticky; prior re-checked for M3).
+            (
+                ResolveAction::Bind(v),
+                false,
+                false,
+                false,
+            )
+        } else {
+            let sticky = self.specfence.learner.is_sticky_resolve(location_hash);
+            let residual_predicts = self
+                .mv_memory
+                .residual_writer_before(location_hash, self.tx_idx)
+                .is_some();
+            let process_prior = self.specfence.rw_prior.predicts_write(location_hash);
+            let prior_ws_predicts = residual_predicts || process_prior;
+            if prior_ws_predicts && writer.is_some() {
+                self.specfence.rw_prior.observe_co_access(location_hash);
+            }
 
-        let hotset_hint = self.specfence.hotset.contains(location_hash);
+            let hotset_hint = self.specfence.hotset.contains(location_hash);
 
-        // Structural strip (profile-backed):
-        // 1) Bind-on-Data BEFORE π only when writer is done (true Bind — no SoftWait).
-        //    Data while producer still running → SpecRead (OCC-like), not Bind→park.
-        //    Profile: park idle owns the ~26ms wall gap; SoftWait-as-Bind inflated idle.
-        // 2) First-incarnation OCC-fast when no writer/prior/sticky/force.
-        let action = if let Some(v) = bind_version.clone() {
-            // Bind-on-Data before π (native). SoftWait only if force/sticky and writer
-            // still running — see Bind arm. Else SpecRead (profile: park idle = gap).
-            ResolveAction::Bind(v)
-        } else if self.tx_incarnation == 0
+            // Structural strip (profile-backed):
+            // 1) Bind-on-Data handled above (no SoftWait when writer_done).
+            // 2) First-incarnation OCC-fast when no writer/prior/sticky/force.
+            // 3) SoftWait scarce: EV_Wait=∞ for !is_program / WAW / HotSet-alone —
+            //    unfinished-writer Await only for program sticky|prior (not HotSet).
+            let action = if self.tx_incarnation == 0
             && !force_prefix
             && !sticky
             && !self.specfence.partial_retry.has_force_bind(self.tx_idx)
@@ -459,10 +471,41 @@ impl<'a, S: Storage> VmDb<'a, S> {
         } else if writer.is_some()
             && !writer_done
             && !force_prefix
-            && (sticky || prior_ws_predicts || hotset_hint)
+            && sticky
+            && !self.specfence.learner.waw_spine_hint(
+                location_hash,
+                is_program,
+                self.specfence.params,
+            )
         {
-            // Known unfinished live writer + sticky/prior/hot: Await without
-            // note_observe / try_revoke / choose_action DashMap tax (profile: maybe_wait).
+            // Cheap Await: sticky (post force_bind_reabort) without π DashMap.
+            ResolveAction::WaitHard
+        } else if writer.is_some()
+            && !writer_done
+            && !force_prefix
+            && hotset_hint
+            && !sticky
+            && !prior_ws_predicts
+        {
+            // HotSet-alone unfinished (no sticky/prior): SpecRead — EV_Wait rises
+            // with fanout. Prior unfinished falls through to sticky Await or full π.
+            self.specfence.metrics.record_spec_read();
+            note_pending_effect_boundary(self.tx_idx, self.specfence.partial_retry);
+            return Ok(());
+        } else if writer.is_some()
+            && !writer_done
+            && !force_prefix
+            && prior_ws_predicts
+            && !sticky
+            && is_program
+            && !self.specfence.learner.waw_spine_hint(
+                location_hash,
+                is_program,
+                self.specfence.params,
+            )
+        {
+            // Program prior unfinished without sticky: cheap Await (EV-aligned)
+            // without choose_action DashMap — was Always-WaitHard+HotSet before.
             ResolveAction::WaitHard
         } else if force_prefix {
             ResolveAction::SpecRead
@@ -521,6 +564,8 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 waw_spine_hint,
                 tx_heavy_hint,
             )
+            };
+            (action, sticky, residual_predicts, prior_ws_predicts)
         };
 
         // Dig A/B: SPECFENCE_DISABLE_SOFTWAIT → never arm SoftWait (π SpecRead-only).
@@ -538,7 +583,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     && !self.specfence.scheduler.is_done(prev)
                 {
                     self.specfence.metrics.record_wait(address);
-                    // P2/P4: FenceGraph SoftWait SoT; k = per-tx PartialRetry ordinal.
+                    // Sticky/prior Await without published Data: FenceGraph SoftWait
+                    // Soft + (t,k) resume. Bind-on-Data unfinished uses BlockingOther
+                    // steal instead (see Bind arm) — that path owned Soft Soft idle.
                     let k = self.specfence.partial_retry.current_k(self.tx_idx) as u64;
                     if self.specfence.dag.arm_soft(
                         location_hash,
@@ -549,8 +596,6 @@ impl<'a, S: Storage> VmDb<'a, S> {
                         self.specfence.metrics.record_soft_wait_arm();
                     }
                     self.specfence.partial_retry.mark_softwait_parked(self.tx_idx);
-                    // Mirror RegionTable Wait bit (facade).
-                    let _ = self.mv_memory.regions.promote_location(location_hash);
                     self.specfence
                         .wave
                         .set_pending_park_softwait(location_hash, k);
@@ -583,14 +628,17 @@ impl<'a, S: Storage> VmDb<'a, S> {
             }
             ResolveAction::Bind(v) => {
                 self.specfence.metrics.record_bind_hit();
-                self.specfence.bayes.observe_bind_hit(location_hash);
-                self.specfence.learner.note_bind_success(location_hash);
-                // M3: Bind-before-touch credit when WŜ prior (re-check process map —
-                // may have been learned mid-block) or residual / force-prefix.
+                // Skip Bayes/learner DashMap on writer_done Bind — publish already
+                // credited bind_hits via note_publish (profile: maybe_wait meta).
+                if !writer_done {
+                    self.specfence.bayes.observe_bind_hit(location_hash);
+                    self.specfence.learner.note_bind_success(location_hash);
+                }
+                // M3: Bind-before-touch credit when WŜ prior / residual / force-prefix.
                 let prior_now = prior_ws_predicts
                     || force_prefix
-                    || self.specfence.rw_prior.predicts_write(location_hash)
-                    || residual_predicts;
+                    || residual_predicts
+                    || self.specfence.rw_prior.predicts_write(location_hash);
                 if prior_now {
                     self.specfence.metrics.record_prior_bind_hit();
                 }
@@ -604,21 +652,15 @@ impl<'a, S: Storage> VmDb<'a, S> {
                         note_pending_effect_boundary(self.tx_idx, self.specfence.partial_retry);
                         return Ok(());
                     }
+                    // Bind-on-Data while producer still Executing: dependency +
+                    // BlockingOther steal-prefer — NOT FenceGraph SoftWait Soft.
+                    // SoftWait Soft wake_reabort ≫ wake_ok; SpecRead-without-park
+                    // abort-stormed / re-sticky SoftWait. Steal-convert cuts Soft idle.
                     self.specfence.metrics.record_wait_hard();
                     self.specfence.metrics.record_wait(address);
-                    let k = self.specfence.partial_retry.current_k(self.tx_idx) as u64;
-                    if self.specfence.dag.arm_soft(
-                        location_hash,
-                        self.tx_idx,
-                        k,
-                        Some(v.tx_idx),
-                    ) {
-                        self.specfence.metrics.record_soft_wait_arm();
-                    }
-                    self.specfence.partial_retry.mark_softwait_parked(self.tx_idx);
                     self.specfence
                         .wave
-                        .set_pending_park_softwait(location_hash, k);
+                        .set_pending_park_location(location_hash);
                     return Err(ReadError::Blocking(v.tx_idx));
                 }
                 self.specfence.dag.note_hard_edge();

@@ -1,0 +1,45 @@
+{
+  "block": 14689597,
+  "cores": 8,
+  "base_tip": "97071cc",
+  "softwait_diagnosis": {
+    "tip_soft_med": 125,
+    "tip_wake_ok_vs_reabort": "20 vs 48 (meta capture) \u2014 SoftWait Soft mostly useless",
+    "root": "Bind-on-Data while producer still Executing SoftWait Soft-armed; HotSet Alone WaitHard short-circuit fought EV (fanout raises EV_Wait)"
+  },
+  "cuts": [
+    "Bind-on-Data before sticky/HotSet/prior DashMap (maybe_wait meta)",
+    "Bind unfinished \u2192 BlockingOther steal-prefer (no FenceGraph SoftWait Soft)",
+    "Cheap Await: sticky SoftWait Soft; program-prior WaitHard; HotSet-alone SpecRead",
+    "Skip Bayes/learner bind credits on writer_done Bind"
+  ],
+  "wall_ms": {
+    "tip_n7_median": 22.1,
+    "tip_n11_median": 22.6,
+    "this_n7_median": 21.3,
+    "this_n11_median": 22.2,
+    "this_n7_min": 21.0,
+    "occ_median_n7": 3.5
+  },
+  "soft_wait_arms_median": {
+    "tip": 125,
+    "this_n7": 1,
+    "this_n11": 1
+  },
+  "profile_buckets_last_iter_approx_ms": {
+    "maybe_wait_tip": 91,
+    "maybe_wait_this": 77.6,
+    "park_total_tip": 19.5,
+    "softwait_soft_idle_tip": 18.8,
+    "softwait_soft_idle_this": 0.5,
+    "bo_idle_this": 7.1
+  },
+  "validation": {
+    "lib_tests": 92,
+    "specfence_tests": "23 passed, 13 ignored",
+    "hang": false,
+    "abort_storm": false
+  },
+  "stretch_lt15": false,
+  "note": "SoftWait Soft scarce; meta modestly down; wall N=7 ~21.3 vs tip 22.1. Stretch <15 not met \u2014 residual BO steal idle + maybe_wait meta + validate."
+}
