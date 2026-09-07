@@ -103,3 +103,9 @@ See `specfence-abc-iter7-status.md`. Iter 8 cause: remaining SuffixRepair opcode
 Handler SSTORE memory clone (≤8KiB) + run_exec_loop PENDING_RESUME apply (no inspect). Broad memory-lite jump **seq≠par**; capture-without-jump wall↑; RebindOnly widen / first-repair Estimate park falsified. Production jump/capture OFF. SoftWait=0; aj=0; hsstore proof off-path.  
 597 N=5 med **13.4**; N=10 med **13.4** (↓ vs Iter7 13.9).  
 See `specfence-abc-iter8-status.md`. Iter 9 cause: correct Handler jump restore → aj>0 seq≡par then enable capture+jump.
+
+### Iter 9 — Handler jump restore gates; multi-SSTORE still unsafe
+Diagnosed early-tip + clobbered plant write_replays as seq≠par cause; landed tip embedding + plant-gas preserve + refuse multi-SSTORE/`sstore_index!=1`. Multi-SSTORE last tip still seq≠par; single-SSTORE safe but aj≈0 on ERC-20. Production jump/capture OFF. SoftWait Soft=0; aj=0; hsstore=0.  
+597 N=5 med **17.4** / N=10 **19.4** (no wall win vs Iter8d 13.4 — jump stayed OFF).  
+See `specfence-abc-iter9-status.md`. Iter 10 cause: multi-SSTORE Handler abs jump ≡ sequential under pevm MV (or cut resume opcode-seconds without abs jump).
+

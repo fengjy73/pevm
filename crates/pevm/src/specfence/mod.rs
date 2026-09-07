@@ -24,7 +24,9 @@
 //! Escalate FullRestart after depth≥2 when RewindTo/FF armed (one extra
 //! SuffixRepair vs classic fb escalate-at-1; depth≥3 measured wall↑). Iter7:
 //! after first SuffixRepair fail, sticky BO Await on fail locs (+ force_bind
-//! extend) until writers Validated before 2nd resume. Iter8: hang-free Handler
+//! extend) until writers Validated before 2nd resume. Iter9: Handler jump restore
+//! gates (tip-embedded write_replays, plant gas, refuse early/multi-SSTORE);
+//! production jump/capture OFF until multi-SSTORE seq≡par. Iter8: hang-free Handler
 //! memory snap (≤8KiB) + run_exec_loop PENDING_RESUME apply landed; production
 //! jump/capture OFF (seq≠par / capture tax). Escalation retains **head-FF**
 //! (Iter5). Serial-barrier / hot-ℓ clique barrier (capped). Never ESTIMATE-poison

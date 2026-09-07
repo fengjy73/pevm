@@ -451,10 +451,27 @@ impl PartialRetryState {
         location: MemoryLocationHash,
         mut replay: StorageWriteReplay,
     ) {
+        // Iter9: preserve Handler-plant per-SSTORE gas when finalize re-notes with 0.
+        let mut prior_gas = 0u64;
+        self.write_replays.retain(|(l, r)| {
+            if *l == location {
+                prior_gas = r.gas_remaining_after;
+                false
+            } else {
+                true
+            }
+        });
         if replay.gas_remaining_after == 0 {
-            replay.gas_remaining_after = self.last_post_sstore_gas();
+            replay.gas_remaining_after = if prior_gas > 0 {
+                prior_gas
+            } else {
+                self.last_post_sstore_gas()
+            };
         }
-        self.write_replays.retain(|(l, _)| *l != location);
+        // Only plant-time notes (gas>0) touch first_k.
+        if replay.gas_remaining_after > 0 {
+            self.first_k.entry(location).or_insert(self.k.max(1));
+        }
         self.write_replays.push((location, replay));
     }
 
@@ -517,31 +534,31 @@ impl PartialRetryState {
                         bytecode_len: 0,
                         at_call_boundary: false,
                         post_sstore: false,
-                    })
+                        sstore_index: 0,
+            write_replays_at_tip: Vec::new(),
+        })
                 }
             });
         // M1f side channel: prefer exact `cp.k` *live* snap; else nearest live
-        // k ≤ cp.k. Never let a lite/non-live entry at exact k shadow a real
-        // Inspector capture (Iter2: that left jump_snap non-live → jump_ready=0).
+        // k ≤ cp.k. Prefer highest Handler sstore_index among ties (Iter9).
         let (jump_snap, journal_blob) = self
             .live_boundaries
             .get(&cp.k)
             .filter(|(s, _)| s.is_live_capture())
             .map(|(s, b)| (Some(s.clone()), Some(b.clone())))
             .or_else(|| {
-                // Prefer live snaps with real opcode_steps (Iter2: steps=0 shadows).
                 self.live_boundaries
                     .iter()
                     .filter(|(k, (s, _))| {
                         **k <= cp.k && s.is_live_capture() && s.opcode_steps > 0
                     })
-                    .max_by_key(|(k, _)| *k)
+                    .max_by_key(|(k, (s, _))| (s.sstore_index, *k))
                     .map(|(_, (s, b))| (Some(s.clone()), Some(b.clone())))
                     .or_else(|| {
                         self.live_boundaries
                             .iter()
                             .filter(|(k, (s, _))| **k <= cp.k && s.is_live_capture())
-                            .max_by_key(|(k, _)| *k)
+                            .max_by_key(|(k, (s, _))| (s.sstore_index, *k))
                             .map(|(_, (s, b))| (Some(s.clone()), Some(b.clone())))
                     })
             })
@@ -579,7 +596,12 @@ impl PartialRetryState {
         let write_replays: Vec<StorageWriteReplay> = self
             .write_replays
             .iter()
-            .filter(|(loc, _)| {
+            .filter(|(loc, r)| {
+                // Iter9: keep Handler-plant replays with live tip gas even when
+                // first_k was missing / late (Lean notes Write only at finalize).
+                if r.gas_remaining_after > 0 {
+                    return true;
+                }
                 let fk = self.first_k.get(loc).copied().unwrap_or(usize::MAX);
                 fk < k_fail
                     || prefix_set.contains(loc)
@@ -920,6 +942,21 @@ impl PartialRetryTable {
         if tx_idx < self.states.len() {
             // SAFETY: single-executor invariant
             unsafe { self.state_mut(tx_idx) }.note_log_replays(logs);
+        }
+    }
+
+    /// Ordered write_replay values for Handler tip embedding (Iter9).
+    pub(crate) fn write_replay_values(&self, tx_idx: TxIdx) -> Vec<StorageWriteReplay> {
+        if tx_idx >= self.states.len() {
+            return Vec::new();
+        }
+        // SAFETY: single-executor invariant
+        unsafe {
+            self.state_ref(tx_idx)
+                .write_replays
+                .iter()
+                .map(|(_, r)| r.clone())
+                .collect()
         }
     }
 

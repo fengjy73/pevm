@@ -121,6 +121,12 @@ pub(crate) struct BoundarySnapshot {
     /// completed — gas_remaining / refund already include SSTORE dynamic cost
     /// (M1i post-SSTORE gas-equal jump gate).
     pub post_sstore: bool,
+    /// Handler-plant SSTORE ordinal (1 = first SSTORE this plant TLS). 0 = Inspector.
+    /// Iter9: require write_replays.len() >= this so we never jump past unreplayed SSTORE.
+    pub sstore_index: u64,
+    /// Iter9: exact storage presents at this Handler tip (ordered plant notes).
+    /// Empty for Inspector snaps. Armed jump applies these instead of full cont wr.
+    pub write_replays_at_tip: Vec<StorageWriteReplay>,
 }
 
 impl BoundarySnapshot {
@@ -146,6 +152,8 @@ impl BoundarySnapshot {
             bytecode_len,
             at_call_boundary: false,
             post_sstore: false,
+            sstore_index: 0,
+            write_replays_at_tip: Vec::new(),
         }
     }
 
@@ -275,11 +283,52 @@ pub(crate) fn jump_is_safe(cont: &ResumeContinuation) -> bool {
     if cont.effects.is_empty() {
         return false;
     }
+    // Iter9: post-SSTORE tip without write_replays skips SSTORE in the journal
+    // (Lean notes Write effects only at finalize → effects_w often 0).
+    if snap.post_sstore && cont.write_replays.is_empty() {
+        return false;
+    }
+    // Iter9 Handler: tip-scoped replays (gas >= tip) must cover sstore_index.
+    if snap.sstore_index > 0 {
+        // Exact tip replays embedded at plant time.
+        if snap.write_replays_at_tip.is_empty() {
+            return false;
+        }
+        if (snap.write_replays_at_tip.len() as u64) != snap.sstore_index {
+            return false;
+        }
+        if !snap
+            .write_replays_at_tip
+            .iter()
+            .any(|w| w.gas_remaining_after == snap.gas_remaining)
+        {
+            return false;
+        }
+        // Refuse early tip if cont still has plant replays from later SSTOREs
+        // (lower gas_remaining_after). Apply those only at a later tip.
+        if cont.write_replays.iter().any(|w| {
+            w.gas_remaining_after > 0 && w.gas_remaining_after < snap.gas_remaining
+        }) {
+            return false;
+        }
+        // Iter9: multi-SSTORE Handler tips still seq≠par on pevm fixtures even with
+        // exact tip embedding (stack/MV). Allow only single-SSTORE tips until Iter10.
+        if snap.sstore_index != 1 {
+            return false;
+        }
+    }
     // M1i write-prefix: storage write_replays require post-SSTORE gas-equal snap.
     // Write effects without replays stay forbidden (M1g). prefix_writes that are
     // account-only (no storage replays) must not block M1g storage-read jumps.
     if !cont.write_replays.is_empty() {
-        if !write_prefix_jump_is_safe(cont, snap) {
+        if snap.sstore_index > 0 {
+            // Handler tip already gas-matched above; still refuse storage blob poison.
+            if let Some(blob) = cont.journal_blob.as_ref() {
+                if blob.state.values().any(|a| !a.storage.is_empty()) {
+                    return false;
+                }
+            }
+        } else if !write_prefix_jump_is_safe(cont, snap) {
             return false;
         }
     } else if has_write_effects {
@@ -306,44 +355,28 @@ fn write_prefix_jump_is_safe(cont: &ResumeContinuation, snap: &BoundarySnapshot)
     if cont.write_replays.is_empty() {
         return false;
     }
-    // Multi-SSTORE: finalize fills gas_remaining_after from sticky last post-SSTORE
-    // capture, so every replay shares the last-boundary gas. Prefer that min/max.
+    // Sticky last post-SSTORE gas is copied onto every replay at finalize.
     let live_gases: Vec<u64> = cont
         .write_replays
         .iter()
         .map(|w| w.gas_remaining_after)
         .filter(|g| *g > 0)
         .collect();
-    if snap.post_sstore {
-        // Snap after an SSTORE. Multi-slot: sticky last-SSTORE gas on all replays.
-        // Refuse *early* SSTORE tips (gas still above last post-SSTORE capture) so
-        // we do not apply all write_replays then re-exec later SSTOREs.
-        if cont.write_replays.len() > 1 && !live_gases.is_empty() {
-            let min_after = live_gases.iter().copied().min().unwrap_or(0);
-            if snap.gas_remaining > min_after {
-                return false;
-            }
-        }
-    } else if live_gases.is_empty() {
+    // Iter9: always require live post-SSTORE gas evidence. Empty gases previously
+    // skipped the early-tip check on post_sstore snaps (Handler first-SSTORE tip
+    // with sticky-last replay gas → seq≠par on ERC-20 fixtures).
+    if live_gases.is_empty() {
         return false;
-    } else {
-        let max_after = live_gases.iter().copied().max().unwrap_or(0);
-        let min_after = live_gases.iter().copied().min().unwrap_or(0);
-        // Undercharge: snap still has more gas left than any post-SSTORE point.
-        if snap.gas_remaining > max_after {
-            return false;
-        }
-        // Post-LOG / later boundary: gas may be below last SSTORE (LOG cost). OK.
-        // Refuse wildly inconsistent replay gases (different incarnation mix).
-        if max_after.saturating_sub(min_after) > 50_000 {
-            return false;
-        }
-        // Multi-SSTORE at non-post_sstore tip: also refuse early relative to last.
-        if cont.write_replays.len() > 1 && snap.gas_remaining > min_after {
-            return false;
-        }
     }
-    // Refuse storage-bearing blob (would poison on restore; we restore logs only).
+    let max_after = live_gases.iter().copied().max().unwrap_or(0);
+    let min_after = live_gases.iter().copied().min().unwrap_or(0);
+    // Tip must not have *more* gas left than last post-SSTORE replay gas.
+    if snap.gas_remaining > min_after {
+        return false;
+    }
+    if max_after.saturating_sub(min_after) > 50_000 {
+        return false;
+    }
     if let Some(blob) = cont.journal_blob.as_ref() {
         if blob.state.values().any(|a| !a.storage.is_empty()) {
             return false;
@@ -351,6 +384,7 @@ fn write_prefix_jump_is_safe(cont: &ResumeContinuation, snap: &BoundarySnapshot)
     }
     true
 }
+
 
 /// Adaptive CC R0: absolute jump **off by default**. Enable with
 /// `SPECFENCE_ABSOLUTE_JUMP=1` or research `SPECFENCE_ENABLE_INSPECT=1`.
@@ -665,9 +699,14 @@ pub(crate) fn try_arm_safe_absolute_jump_gated(
     PENDING_LOG_REPLAYS.with(|c| {
         *c.borrow_mut() = skipped_logs;
     });
-    arm_pc_resume_with_blob(snap, None);
+    arm_pc_resume_with_blob(snap.clone(), None);
+    let tip_writes: Vec<StorageWriteReplay> = if snap.sstore_index > 0 {
+        snap.write_replays_at_tip.clone()
+    } else {
+        cont.write_replays.clone()
+    };
     PENDING_WRITE_REPLAYS.with(|c| {
-        *c.borrow_mut() = cont.write_replays.clone();
+        *c.borrow_mut() = tip_writes;
     });
     // CALL-boundary jump: apply nested touches on arm (Inspector::call won't fire
     // for skipped CALL). Also keep cache for any nested re-enter below jump PC.
@@ -747,6 +786,8 @@ pub(crate) fn note_pending_effect_boundary(
         bytecode_len: 0,
         at_call_boundary: false,
         post_sstore: false,
+            sstore_index: 0,
+            write_replays_at_tip: Vec::new(),
         };
     let _ = partial_retry.push_checkpoint_with_boundary(
         tx_idx,
@@ -822,13 +863,27 @@ where
     CTX: ContextTr,
     CTX::Journal: JournalExt,
 {
-    use revm::state::EvmStorageSlot;
+    use revm::primitives::KECCAK_EMPTY;
+    use revm::state::{Account, AccountInfo, EvmStorageSlot};
     // Do **not** journal.load_account here — that re-enters pevm Db/maybe_wait and
-    // can Block/livelock mid-initialize_interp. Only update accounts already present
-    // in the journal; MvMemory residual + write_replays republish cover write-set.
+    // can Block/livelock mid-initialize_interp. Iter9: if the account is missing,
+    // insert a minimal warm shell so Handler tip replays are not silently skipped
+    // (frame_init usually loaded the callee; nested/storage-only tips may not).
     let state = context.journal_mut().evm_state_mut();
     let tx_id = state.values().next().map(|a| a.transaction_id).unwrap_or(0);
     for wr in writes {
+        if !state.contains_key(&wr.address) {
+            let mut acc = Account::new_not_existing(tx_id);
+            acc.info = AccountInfo {
+                balance: Default::default(),
+                nonce: 0,
+                code_hash: KECCAK_EMPTY,
+                code: None,
+                ..Default::default()
+            };
+            let _ = acc.mark_warm_with_transaction_id(tx_id);
+            state.insert(wr.address, acc);
+        }
         let Some(acc) = state.get_mut(&wr.address) else {
             continue;
         };
@@ -1219,16 +1274,36 @@ pub(crate) fn try_apply_pending_pc_resume<CTX>(
 pub(crate) fn sstore_plant_capture_eth<H: revm::interpreter::Host + ?Sized>(
     context: revm::interpreter::InstructionContext<'_, H, EthInterpreter>,
 ) {
-    // Call stock SSTORE first.
-    let interp_ptr = context.interpreter as *mut Interpreter<EthInterpreter>;
-    revm::interpreter::instructions::host::sstore(context);
+    // Fast path: identical to stock SSTORE when plant TLS is off (597 wall).
     if !plant_tls_active() {
+        revm::interpreter::instructions::host::sstore(context);
         return;
     }
-    // Hang-free lite capture: gas+pc only (no stack/memory clone — WaitHard livelock).
-    let interp = unsafe { &mut *interp_ptr };
+    // Plant path: peek operands + original before stock pops stack.
+    let interp_ptr = context.interpreter as *mut Interpreter<EthInterpreter>;
+    let host_ptr = context.host as *mut H;
+    let (slot, present, target) = {
+        let interp = unsafe { &mut *interp_ptr };
+        let data = interp.stack.data();
+        if data.len() >= 2 {
+            let present = data[data.len() - 1];
+            let slot = data[data.len() - 2];
+            let target = interp.input.target_address();
+            (slot, present, target)
+        } else {
+            (U256::ZERO, U256::ZERO, Address::ZERO)
+        }
+    };
+    let original = unsafe { &mut *host_ptr }
+        .sload(target, slot)
+        .map(|v| v.data)
+        .unwrap_or(U256::ZERO);
+    revm::interpreter::instructions::host::sstore(context);
+
     let n = HANDLER_SSTORE_STEPS.get().saturating_add(1);
     HANDLER_SSTORE_STEPS.set(n);
+    // context moved into stock sstore; re-borrow interpreter via saved ptr.
+    let interp = unsafe { &mut *interp_ptr };
     let pc = interp.bytecode.pc();
     let gas_remaining = interp.gas.remaining();
     let gas_refunded = interp.gas.refunded();
@@ -1247,7 +1322,7 @@ pub(crate) fn sstore_plant_capture_eth<H: revm::interpreter::Host + ?Sized>(
     } else {
         Vec::new()
     };
-    let snap = BoundarySnapshot {
+    let mut snap = BoundarySnapshot {
         pc,
         gas_remaining,
         gas_refunded,
@@ -1261,11 +1336,31 @@ pub(crate) fn sstore_plant_capture_eth<H: revm::interpreter::Host + ?Sized>(
         bytecode_len,
         at_call_boundary: false,
         post_sstore: true,
+        sstore_index: n,
+        write_replays_at_tip: Vec::new(),
     };
     PLANT.with(|p| {
         if let Some(plant) = p.get() {
             let table = unsafe { &*plant.partial_retry };
             table.note_post_sstore_gas(plant.tx_idx, gas_remaining);
+            // Iter9: per-SSTORE write_replay with tip gas so jump_is_safe can require
+            // exact sstore_index coverage (finalize must not clobber plant gas).
+            if target != Address::ZERO {
+                let loc = hash_deterministic(MemoryLocation::Storage(target, slot));
+                table.note_write_replay(
+                    plant.tx_idx,
+                    loc,
+                    StorageWriteReplay {
+                        address: target,
+                        slot,
+                        original,
+                        present,
+                        gas_remaining_after: gas_remaining,
+                    },
+                );
+            }
+            // Snapshot exact replays at this tip (ordered, post-note).
+            snap.write_replays_at_tip = table.write_replay_values(plant.tx_idx);
             let metrics = unsafe { &*plant.metrics };
             metrics.record_handler_sstore_capture();
             // Record tip for resume decisions without full jump snap clone storms.
@@ -1592,6 +1687,8 @@ mod m1c_tests {
             at_call_boundary: false,
 
             post_sstore: false,
+            sstore_index: 0,
+            write_replays_at_tip: Vec::new(),
         }
     }
 
@@ -1612,6 +1709,8 @@ mod m1c_tests {
             at_call_boundary: false,
 
             post_sstore: false,
+            sstore_index: 0,
+            write_replays_at_tip: Vec::new(),
         };
         assert_eq!(snap.pc, 42);
         assert_eq!(snap.opcode_steps, 17);
@@ -1638,6 +1737,8 @@ mod m1c_tests {
             at_call_boundary: false,
 
             post_sstore: false,
+            sstore_index: 0,
+            write_replays_at_tip: Vec::new(),
         };
         interp.bytecode = ExtBytecode::new(code);
         interp.gas = Gas::new(100_000);
@@ -1666,6 +1767,8 @@ mod m1c_tests {
             at_call_boundary: false,
 
             post_sstore: false,
+            sstore_index: 0,
+            write_replays_at_tip: Vec::new(),
         };
         arm_pc_resume(snap);
         assert!(!resume_was_applied());
@@ -1713,6 +1816,8 @@ mod m1c_tests {
                 at_call_boundary: false,
 
             post_sstore: false,
+            sstore_index: 0,
+            write_replays_at_tip: Vec::new(),
         }),
             journal_blob: None,
             ..lite.clone()
@@ -1753,6 +1858,8 @@ mod m1c_tests {
                 at_call_boundary: false,
 
             post_sstore: false,
+            sstore_index: 0,
+            write_replays_at_tip: Vec::new(),
         }),
             journal_blob: Some(JournalBlob {
                 state,
@@ -1806,6 +1913,8 @@ mod m1c_tests {
                 at_call_boundary: false,
 
             post_sstore: false,
+            sstore_index: 0,
+            write_replays_at_tip: Vec::new(),
         }),
             journal_blob: Some(JournalBlob {
                 state: EvmState::default(),
@@ -1860,7 +1969,9 @@ mod m1c_tests {
                 bytecode_len: 64,
                 at_call_boundary: false,
                 post_sstore: true,
-            }),
+                sstore_index: 0,
+            write_replays_at_tip: Vec::new(),
+        }),
             journal_blob: None,
             call_outcomes: vec![],
             prefix_writes: vec![42],
@@ -1911,6 +2022,8 @@ mod m1c_tests {
                 at_call_boundary: false,
 
             post_sstore: false,
+            sstore_index: 0,
+            write_replays_at_tip: Vec::new(),
         }),
             journal_blob: None,
             call_outcomes: vec![],
@@ -1978,6 +2091,8 @@ mod m1c_tests {
                 at_call_boundary: false,
 
             post_sstore: false,
+            sstore_index: 0,
+            write_replays_at_tip: Vec::new(),
         }),
             journal_blob: None,
             call_outcomes: vec![],
@@ -2023,6 +2138,8 @@ mod m1c_tests {
                 at_call_boundary: true,
 
             post_sstore: false,
+            sstore_index: 0,
+            write_replays_at_tip: Vec::new(),
         }),
             journal_blob: None,
             call_outcomes: vec![],
@@ -2066,6 +2183,8 @@ mod m1c_tests {
             at_call_boundary: false,
 
             post_sstore: false,
+            sstore_index: 0,
+            write_replays_at_tip: Vec::new(),
         };
         let (effects, values) = basic_read_effect();
         let cont = ResumeContinuation {
@@ -2162,7 +2281,9 @@ mod m1c_tests {
                 bytecode_len: 64,
                 at_call_boundary: false,
                 post_sstore: true,
-            }),
+                sstore_index: 0,
+            write_replays_at_tip: Vec::new(),
+        }),
             journal_blob: Some(JournalBlob {
                 state: EvmState::default(),
                 logs: vec![alloy_primitives::Log {
@@ -2248,7 +2369,9 @@ mod m1c_tests {
                 bytecode_len: 64,
                 at_call_boundary: true,
                 post_sstore: true,
-            }),
+                sstore_index: 0,
+            write_replays_at_tip: Vec::new(),
+        }),
             journal_blob: None,
             call_outcomes: vec![CachedCallOutcome {
                 call_seq: 2,
@@ -2309,7 +2432,9 @@ mod m1c_tests {
                 bytecode_len: 64,
                 at_call_boundary: true,
                 post_sstore: true,
-            }),
+                sstore_index: 0,
+            write_replays_at_tip: Vec::new(),
+        }),
             journal_blob: None,
             call_outcomes: vec![],
             prefix_writes: vec![],
@@ -2371,7 +2496,9 @@ mod m1c_tests {
                 bytecode_len: 64,
                 at_call_boundary: true,
                 post_sstore: true,
-            }),
+                sstore_index: 0,
+            write_replays_at_tip: Vec::new(),
+        }),
             journal_blob: None,
             call_outcomes: vec![CachedCallOutcome {
                 call_seq: 2,
