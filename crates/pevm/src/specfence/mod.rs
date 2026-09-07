@@ -56,6 +56,11 @@
 //! Handler plant+capture (hsstore>0, aj=0 — SSTORE snaps at k≥k_fail on RAW-read
 //! fails); synthetic mid RewindTo; late-k yield192; ForceBind/park ff_head seed
 //! (599 wall↑). Production remains Iter17 tip. Jump/capture OFF. SoftWait Soft ~0.
+//! Iter19: hang-free Bind/SLOAD snap at certified-prefix end (not post-SSTORE).
+//! Opt-in `SPECFENCE_BIND_SNAP=1` → bsnap>0 with k<k_fail on 597 RAW-read fails.
+//! Absolute jump (`SPECFENCE_BIND_SNAP_JUMP=1`) hung Lean fixtures — production OFF.
+//! Capture-without-jump wall↑/599↑ — default capture OFF. Keep Iter17 yield-spin +
+//! Iter16 absorb; stock SSTORE; SoftWait Soft ~0.
 //! Iter8 memory snap retained. Head-FF (Iter5). SoftWait Soft ~0.
 //!
 //! **Learn (C):** Inter morph selects Quiet (598 OCC-lite) vs Storm (597 Await-ready).
@@ -135,6 +140,7 @@ pub(crate) use boundary::{
     resume_was_applied, steps_this_run, try_arm_safe_absolute_jump, try_arm_safe_absolute_jump_gated,
     with_plant_tls, with_plant_tls_journal, BoundarySnapshot, CachedCallOutcome, JournalBlob,
     plant_tls_active, pending_resume_armed, try_apply_pending_pc_resume, handler_sstore_plant_install_wanted, install_handler_sstore_plant_capture,
+    handler_bind_snap_install_wanted, install_handler_bind_snap_capture, with_bind_snap_tls, note_pending_bind_snap, bind_snap_env_enabled,
 };
 pub use boundary::SpecFenceInspector;
 #[allow(unused_imports)]

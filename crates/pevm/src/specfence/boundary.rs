@@ -502,6 +502,13 @@ thread_local! {
     static PENDING_EFFECT_CP: Cell<bool> = const { Cell::new(false) };
     /// Iter4: SSTORE count on Handler::run plant path (hang-free, no Inspector).
     static HANDLER_SSTORE_STEPS: Cell<u64> = const { Cell::new(0) };
+    /// Iter19: hang-free Bind/EffectBoundary snap context (no IN_INSPECT / WaitHard demote).
+    /// Distinct from PLANT so stock SSTORE + SoftWait Soft~0 stay unchanged.
+    static BIND_SNAP: Cell<Option<PlantTls>> = const { Cell::new(None) };
+    /// Set by Bind-on-Data; consumed after stock SLOAD returns in Handler wrap.
+    static PENDING_BIND_SNAP: Cell<bool> = const { Cell::new(false) };
+    /// Bind-snap ordinal this incarnation (opcode_steps proxy for jump credit).
+    static BIND_SNAP_STEPS: Cell<u64> = const { Cell::new(0) };
     static PENDING_RESUME: RefCell<Option<BoundarySnapshot>> = const { RefCell::new(None) };
     static PENDING_JOURNAL_BLOB: RefCell<Option<JournalBlob>> = const { RefCell::new(None) };
     /// Nested calls entered but not yet `call_end` (metadata for cache store).
@@ -1316,6 +1323,151 @@ pub(crate) fn try_apply_pending_pc_resume<CTX>(
     PENDING_RESUME.with(|c| *c.borrow_mut() = None);
     OPCODE_STEPS.set(0);
     record_pc_resume(skipped);
+}
+
+/// Iter19: true while `with_bind_snap_tls` is active (Hang-free Bind snap, no plant).
+pub(crate) fn bind_snap_tls_active() -> bool {
+    BIND_SNAP.with(|c| c.get().is_some())
+}
+
+/// Arm Bind-snap capture after Bind-on-Data / EffectBoundary certify (SLOAD wrap consumes).
+pub(crate) fn note_pending_bind_snap() {
+    if bind_snap_tls_active() {
+        PENDING_BIND_SNAP.set(true);
+    }
+}
+
+/// Env gate: `SPECFENCE_BIND_SNAP=1` enables hang-free Bind/SLOAD snap capture.
+/// Default **off** — capture-without-jump wall-taxes 597/599 (Iter19); absolute jump
+/// behind `SPECFENCE_BIND_SNAP_JUMP=1` hung Lean fixtures (same family as Iter13).
+pub(crate) fn bind_snap_env_enabled() -> bool {
+    match std::env::var_os("SPECFENCE_BIND_SNAP") {
+        None => false,
+        Some(v) => {
+            let s = v.to_string_lossy();
+            s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
+        }
+    }
+}
+
+/// Install SLOAD Bind-snap wrap when Iter19 capture may run (default on).
+pub(crate) fn handler_bind_snap_install_wanted() -> bool {
+    if crate::specfence::research_inspect_enabled() {
+        return true;
+    }
+    bind_snap_env_enabled()
+}
+
+/// Scoped Bind-snap TLS for Lean SpecFence execute (no IN_INSPECT / no WaitHard demote).
+pub(crate) fn with_bind_snap_tls<R>(
+    tx_idx: TxIdx,
+    partial_retry: &PartialRetryTable,
+    metrics: &MetricsInner,
+    mut f: impl FnMut() -> R,
+) -> R {
+    if !bind_snap_env_enabled() {
+        return f();
+    }
+    let prev = BIND_SNAP.replace(Some(PlantTls {
+        tx_idx,
+        incarnation: 0,
+        partial_retry: partial_retry as *const _,
+        metrics: metrics as *const _,
+        finegrain: None,
+        tx_gas_limit: None,
+    }));
+    PENDING_BIND_SNAP.set(false);
+    BIND_SNAP_STEPS.set(0);
+    let out = f();
+    BIND_SNAP.set(prev);
+    PENDING_BIND_SNAP.set(false);
+    out
+}
+
+/// EthInterpreter SLOAD wrap: stock SLOAD; after Bind-on-Data, capture live tip at
+/// certified-prefix end (k < k_fail on RAW-read fails). Hang-free — no inspect_run.
+#[inline(always)]
+pub(crate) fn sload_bind_snap_eth<H: revm::interpreter::Host + ?Sized>(
+    context: revm::interpreter::InstructionContext<'_, H, EthInterpreter>,
+) {
+    if !bind_snap_tls_active() {
+        revm::interpreter::instructions::host::sload(context);
+        return;
+    }
+    sload_bind_snap_eth_slow(context);
+}
+
+#[cold]
+fn sload_bind_snap_eth_slow<H: revm::interpreter::Host + ?Sized>(
+    context: revm::interpreter::InstructionContext<'_, H, EthInterpreter>,
+) {
+    let interp_ptr = context.interpreter as *mut Interpreter<EthInterpreter>;
+    revm::interpreter::instructions::host::sload(context);
+    if !PENDING_BIND_SNAP.replace(false) {
+        return;
+    }
+    let n = BIND_SNAP_STEPS.get().saturating_add(1);
+    BIND_SNAP_STEPS.set(n);
+    let interp = unsafe { &mut *interp_ptr };
+    let pc = interp.bytecode.pc();
+    let gas_remaining = interp.gas.remaining();
+    let gas_refunded = interp.gas.refunded();
+    let bytecode_len = interp.bytecode.bytecode_slice().len();
+    let code_hash = Some(interp.bytecode.get_or_calculate_hash());
+    let mem_gas = *interp.gas.memory();
+    let stack: Vec<_> = interp.stack.data().to_vec();
+    // Read-prefix jump may still need pre-SLOAD memory (CALLDATACOPY etc.).
+    const MEMORY_SNAP_CAP: usize = 8 * 1024;
+    let mem_slice = interp.memory.context_memory();
+    let memory = if !mem_slice.is_empty() && mem_slice.len() <= MEMORY_SNAP_CAP {
+        mem_slice.to_vec()
+    } else {
+        Vec::new()
+    };
+    // Prefer rem current_k as honest-ish step credit when available.
+    let rem_k = BIND_SNAP.with(|b| {
+        b.get().map(|ctx| {
+            let table = unsafe { &*ctx.partial_retry };
+            table.current_k(ctx.tx_idx) as u64
+        })
+    }).unwrap_or(0);
+    let snap = BoundarySnapshot {
+        pc,
+        gas_remaining,
+        gas_refunded,
+        memory_words: mem_gas.words_num,
+        memory_expansion_cost: mem_gas.expansion_cost,
+        call_depth: CALL_DEPTH.get(),
+        opcode_steps: rem_k.max(n).max(1),
+        stack,
+        memory,
+        code_hash,
+        bytecode_len,
+        at_call_boundary: false,
+        post_sstore: false,
+        sstore_index: 0,
+        write_replays_at_tip: Vec::new(),
+    };
+    LAST_SNAP.with(|c| *c.borrow_mut() = Some(snap.clone()));
+    BIND_SNAP.with(|b| {
+        if let Some(ctx) = b.get() {
+            let table = unsafe { &*ctx.partial_retry };
+            table.attach_live_boundary(ctx.tx_idx, snap, JournalBlob::default());
+            let metrics = unsafe { &*ctx.metrics };
+            metrics.record_handler_bind_snap_capture();
+        }
+    });
+}
+
+/// Install SLOAD Bind-snap capture on Mainnet instruction table (Iter19).
+pub(crate) fn install_handler_bind_snap_capture<H: revm::interpreter::Host>(
+    instructions: &mut revm::handler::instructions::EthInstructions<EthInterpreter, H>,
+) {
+    const OP_SLOAD: u8 = 0x54;
+    instructions.insert_instruction(
+        OP_SLOAD,
+        revm::interpreter::Instruction::new(sload_bind_snap_eth::<H>, 0),
+    );
 }
 
 /// Iter10: install Handler SSTORE plant only when capture/jump/inspect may arm TLS.

@@ -174,3 +174,13 @@ RewindTo / late-k yield / ForceBind·park ff_head falsified (599 wall↑). Produ
 = Iter17 tip. SoftWait Soft=0; 597 N10 **12.6**; N5 hits **12.3** in quiet samples.
 See `specfence-abc-iter18-status.md`. Iter 19 cause: hang-free live snap at
 certified-prefix end (not post-SSTORE plant) or 599-safe critical-path schedule.
+
+### Iter 19 — Bind-snap capture proven; jump hung (plateau)
+Hang-free Handler SLOAD Bind-snap at certified-prefix end (not post-SSTORE):
+opt-in `SPECFENCE_BIND_SNAP=1` → bsnap≈850 on 597. Absolute jump
+(`SPECFENCE_BIND_SNAP_JUMP=1`) hung Lean fixtures — production OFF.
+Capture-without-jump wall↑; mega-fan yield falsified. Production = Iter17 tip.
+SoftWait Soft=0; 597 N5 ~14.9 / N10 ~16.3 under high load.
+See `specfence-abc-iter19-status.md`. Iter 20 cause: hang-free Bind-snap consume
+≠ full abs jump, or fix jump hang with seq≡par, or 599-safe critical-path
+without yield-deepening.

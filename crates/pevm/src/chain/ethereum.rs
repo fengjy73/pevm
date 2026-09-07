@@ -24,7 +24,7 @@ use super::{CalculateReceiptRootError, PevmChain};
 use crate::{
     BuildIdentityHasher, MemoryLocation, MemoryLocationHash, PevmTxExecutionResult, TxIdx,
     hash_deterministic, mv_memory::MvMemory,
-    specfence::{handler_sstore_plant_install_wanted, install_handler_sstore_plant_capture, SpecFenceInspector},
+    specfence::{handler_bind_snap_install_wanted, handler_sstore_plant_install_wanted, install_handler_bind_snap_capture, install_handler_sstore_plant_capture, SpecFenceInspector},
 
 };
 
@@ -133,6 +133,11 @@ impl PevmChain for PevmEthereum {
             .with_block(block_env)
             .with_db(db)
             .build_mainnet_with_inspector(SpecFenceInspector::new());
+        // Iter19: hang-free SLOAD Bind-snap (certified-prefix end) — default on.
+        // Distinct from SSTORE plant; stock SSTORE unless capture/jump/inspect arms.
+        if handler_bind_snap_install_wanted() {
+            install_handler_bind_snap_capture(&mut evm.instruction);
+        }
         // Iter4/10: hang-free post-SSTORE plant only when capture/jump/inspect may arm.
         // Production jump/capture OFF → stock SSTORE (no per-opcode TLS tax).
         if handler_sstore_plant_install_wanted() {

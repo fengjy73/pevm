@@ -23,7 +23,7 @@ use crate::{
         early_val_probability, note_pending_effect_boundary,
         absolute_jump_eligible, attach_current_live_snap, arm_call_outcome_cache, resume_was_applied, steps_this_run,
         suffix_repair_jump_env_ok, try_arm_safe_absolute_jump, try_arm_safe_absolute_jump_gated,
-        with_plant_tls_journal,
+        with_plant_tls_journal, with_bind_snap_tls, note_pending_bind_snap,
     },
 };
 
@@ -563,6 +563,8 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     && is_program
                     && self.specfence.learner.live_fanout_hot(location_hash)
                 {
+                    // Iter17 yield-spin (Iter19 mega-fan 128/64 falsified under
+                    // load — yield tax↑; 599-safe schedule still open).
                     for _ in 0..64 {
                         if self.specfence.scheduler.is_done(v.tx_idx) {
                             break;
@@ -984,6 +986,8 @@ impl<'a, S: Storage> VmDb<'a, S> {
             .note_access_certified_checkpoint(self.tx_idx, location_hash);
         self.specfence.rem.note_checkpoint_opportunity();
         crate::specfence::arm_pending_effect_cp_only();
+        // Iter19: arm Handler SLOAD Bind-snap at certified-prefix end (k < k_fail).
+        note_pending_bind_snap();
         Ok(())
     }
 
@@ -2001,33 +2005,57 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 .partial_retry
                 .ff_continuation(tx_version.tx_idx);
         }
-        // Iter7/8 memory-lite jump: only when live jump_snap has non-empty memory
-        // (empty-memory abs jump falsified seq≠par). SoftWait Soft=0. No live_prime
-        // inspect_run — memory comes from Handler SSTORE plant under capture_window.
+        // Iter7/8 memory-lite jump: non-empty memory (SSTORE plant path).
         let memory_lite_ok = ff_cont.as_ref().is_some_and(|cont| {
             cont.jump_snap
                 .as_ref()
                 .is_some_and(|s| s.is_live_capture() && !s.memory.is_empty())
+        });
+        // Iter19: read-only Bind/EffectBoundary snap (sstore_index=0, !post_sstore,
+        // no write_replays) — certified-prefix end before k_fail on RAW-read fails.
+        // Empty memory OK when jump_is_safe read-prefix gates pass (memory may still
+        // be present from thin Bind-snap clone ≤8KiB).
+        let read_prefix_ok = ff_cont.as_ref().is_some_and(|cont| {
+            cont.jump_snap.as_ref().is_some_and(|s| {
+                s.is_live_capture()
+                    && s.sstore_index == 0
+                    && !s.post_sstore
+                    && cont.write_replays.is_empty()
+                    && !cont
+                        .effects
+                        .iter()
+                        .any(|e| e.mode == AccessMode::Write)
+            })
         });
         let suffix_jump_eligible = lean
             && rewind_resume
             && suffix_repair_jump_env_ok()
             && !jump_disabled
             && ff_prefix
-            && memory_lite_ok
+            && (memory_lite_ok || read_prefix_ok)
             && ff_cont.as_ref().is_some_and(|cont| {
                 absolute_jump_eligible(tx_version.tx_idx, self.specfence.partial_retry, cont)
             });
-        // Iter11/13: multi-SSTORE still refused. Iter13: env-gated single-SSTORE
-        // capture+jump (`SPECFENCE_ABSOLUTE_JUMP=1`) **hung** iter9 Lean fixture
-        // (same family as prior jump/capture hangs) — keep production OFF.
+        // Iter19: Bind-snap capture lands (bsnap>0, k<k_fail). Production absolute
+        // jump stays OFF — enabling read-prefix jump hung iter9 Lean fixture
+        // (same family as Iter13 JUMP=1). Opt-in: SPECFENCE_BIND_SNAP_JUMP=1.
         // SoftWait Soft=0. No live_prime / inspect_run. Stock SSTORE on mass path.
+        let bind_snap_jump_env = match std::env::var_os("SPECFENCE_BIND_SNAP_JUMP") {
+            None => false,
+            Some(v) => {
+                let s = v.to_string_lossy();
+                s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
+            }
+        };
+        let suffix_jump = bind_snap_jump_env
+            && suffix_jump_eligible
+            && read_prefix_ok
+            && !memory_lite_ok;
         let _ = suffix_jump_eligible;
-        let suffix_jump = false;
         let live_prime = false;
         let _ = live_prime;
         let capture_window = false;
-        let _ = (needs_capture, rewind_resume);
+        let _ = (needs_capture, rewind_resume, memory_lite_ok);
 
         let journal_stream = self
             .specfence
@@ -2063,11 +2091,13 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         }
         let profile = crate::specfence::profile_timing_enabled();
         let handler_t0 = profile.then(Instant::now);
-        // Iter5/8: plant TLS on Lean SuffixRepair capture/jump window (WaitHard
-        // demoted above). Discovery / quiet OCC-lite stays plant-free. Research
-        // inspect keeps prior plant path.
+        // Iter19: read-prefix Bind-snap jump arms WITHOUT plant TLS (no WaitHard
+        // demote / SSTORE plant). Plant TLS only for research inspect / capture_window.
         let plant_handler = self.specfence.mode == crate::ConcurrencyMode::SpecFence
-            && (use_inspect || capture_window || suffix_jump);
+            && (use_inspect || capture_window);
+        // Iter19: hang-free Bind-snap TLS on every Lean SpecFence execute so
+        // discovery incarnations plant k < k_fail tips for the next SuffixRepair.
+        let use_bind_snap = self.specfence.mode == crate::ConcurrencyMode::SpecFence && lean;
         let run_result = if plant_handler {
             let partial_retry = self.specfence.partial_retry;
             let metrics = self.specfence.metrics;
@@ -2083,23 +2113,11 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 partial_retry,
                 metrics,
                 || {
-                    // Iter8: Lean memory-lite jump arms here; Handler run_exec_loop
-                    // applies PENDING_RESUME (no inspect_run). Research inspect too.
-                    let plant_jump = (suffix_jump || research_inspect) && rewind_resume;
+                    // Research inspect jump arm (Iter8 path).
+                    let plant_jump = research_inspect && rewind_resume;
                     if plant_jump {
                         let jumped = partial_retry.ff_continuation(tx_idx).is_some_and(|cont| {
-                            // Lean SuffixRepair: env_ok via gated arm (honor JUMP=0).
-                            if suffix_jump {
-                                try_arm_safe_absolute_jump_gated(
-                                    tx_idx,
-                                    partial_retry,
-                                    &cont,
-                                    metrics,
-                                    true,
-                                )
-                            } else {
-                                try_arm_safe_absolute_jump(tx_idx, partial_retry, &cont, metrics)
-                            }
+                            try_arm_safe_absolute_jump(tx_idx, partial_retry, &cont, metrics)
                         });
                         if !jumped {
                             if let Some(cont) = partial_retry.ff_continuation(tx_idx) {
@@ -2141,7 +2159,38 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 },
             )
         } else {
-            self.chain.run_pevm_tx(&mut self.evm, use_inspect && self.specfence.mode == crate::ConcurrencyMode::SpecFence)
+            let partial_retry = self.specfence.partial_retry;
+            let metrics = self.specfence.metrics;
+            let tx_idx = tx_version.tx_idx;
+            let mut run_body = || {
+                // Iter19: arm read-prefix absolute jump hang-free (Handler run_exec_loop
+                // applies PENDING_RESUME; no plant TLS / inspect_run).
+                let mut did_jump = false;
+                if suffix_jump && rewind_resume {
+                    did_jump = partial_retry.ff_continuation(tx_idx).is_some_and(|cont| {
+                        try_arm_safe_absolute_jump_gated(
+                            tx_idx,
+                            partial_retry,
+                            &cont,
+                            metrics,
+                            true,
+                        )
+                    });
+                }
+                let result = self.chain.run_pevm_tx(
+                    &mut self.evm,
+                    use_inspect && self.specfence.mode == crate::ConcurrencyMode::SpecFence,
+                );
+                if did_jump {
+                    partial_retry.note_jump_applied(tx_idx, resume_was_applied());
+                }
+                result
+            };
+            if use_bind_snap {
+                with_bind_snap_tls(tx_idx, partial_retry, metrics, run_body)
+            } else {
+                run_body()
+            }
         };
         if let Some(t0) = handler_t0 {
             self.specfence

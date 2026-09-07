@@ -199,6 +199,8 @@ pub struct SpecFenceMetrics {
     pub serial_barrier_defer: usize,
     /// Iter4: hang-free Handler::run post-SSTORE plant captures.
     pub handler_sstore_capture: usize,
+    /// Iter19: Handler SLOAD Bind/EffectBoundary live snaps.
+    pub bind_snap_capture: usize,
     /// Iter4: sibling consumers parked in hot-ℓ clique barrier.
     pub serial_barrier_clique: usize,
     /// Iter5: fb escalate deferred once for jump_is_safe after capture window.
@@ -301,6 +303,7 @@ pub(crate) struct MetricsInner {
     serial_barrier_resolve: AtomicUsize,
     serial_barrier_defer: AtomicUsize,
     handler_sstore_capture: AtomicUsize,
+    bind_snap_capture: AtomicUsize,
     serial_barrier_clique: AtomicUsize,
     jump_defer: AtomicUsize,
     second_repair_await: AtomicUsize,
@@ -627,6 +630,10 @@ impl MetricsInner {
         self.handler_sstore_capture.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_handler_bind_snap_capture(&self) {
+        self.bind_snap_capture.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_serial_barrier_clique(&self) {
         self.serial_barrier_clique.fetch_add(1, Ordering::Relaxed);
     }
@@ -876,6 +883,7 @@ impl MetricsInner {
             serial_barrier_resolve: self.serial_barrier_resolve.load(Ordering::Relaxed),
             serial_barrier_defer: self.serial_barrier_defer.load(Ordering::Relaxed),
             handler_sstore_capture: self.handler_sstore_capture.load(Ordering::Relaxed),
+            bind_snap_capture: self.bind_snap_capture.load(Ordering::Relaxed),
             serial_barrier_clique: self.serial_barrier_clique.load(Ordering::Relaxed),
             jump_defer: self.jump_defer.load(Ordering::Relaxed),
             second_repair_await: self.second_repair_await.load(Ordering::Relaxed),

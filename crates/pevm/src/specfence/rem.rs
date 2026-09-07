@@ -543,20 +543,21 @@ impl PartialRetryState {
         })
                 }
             });
-        // Iter11: among live snaps with k < k_fail, prefer highest Handler
-        // sstore_index (last multi-SSTORE tip). Iter9 claimed k < k_fail but still
-        // filtered k ≤ cp.k and preferred exact cp.k — early tips beat later tips
-        // between cp and k_fail → multi-SSTORE seq≠par / jump refused.
+        // Iter19: among live snaps with k < k_fail, prefer Bind/read-boundary
+        // (sstore_index=0, !post_sstore) certified-prefix end — post-SSTORE plant
+        // tips are usually k≥k_fail on RAW-read fails (Iter18 aj=0). Among Bind
+        // tips pick highest k / opcode_steps. SSTORE tips remain tiebreak only.
         let (jump_snap, journal_blob) = self
             .live_boundaries
             .iter()
             .filter(|(k, (s, _))| **k < k_fail && s.is_live_capture())
             .max_by_key(|(k, (s, _))| {
                 (
-                    s.sstore_index,
-                    u64::from(s.post_sstore),
+                    u64::from(s.sstore_index == 0 && !s.post_sstore),
                     s.opcode_steps,
                     **k,
+                    s.sstore_index,
+                    u64::from(s.post_sstore),
                 )
             })
             .map(|(_, (s, b))| (Some(s.clone()), Some(b.clone())))
