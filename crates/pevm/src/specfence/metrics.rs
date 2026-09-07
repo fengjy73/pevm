@@ -207,6 +207,9 @@ pub struct SpecFenceMetrics {
     pub second_repair_await: usize,
     /// Iter14: first SuffixRepair parked behind Executing conflict writer (schedule-side).
     pub first_repair_await: usize,
+    /// Iter15: first-fail true_suffix + high-fan Executing spine → escalate+barrier
+    /// (collapse doomed SuffixRepair→fb_reabort→FullRestart chains).
+    pub fanout_fr_collapse: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -298,6 +301,7 @@ pub(crate) struct MetricsInner {
     jump_defer: AtomicUsize,
     second_repair_await: AtomicUsize,
     first_repair_await: AtomicUsize,
+    fanout_fr_collapse: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -629,6 +633,10 @@ impl MetricsInner {
         self.first_repair_await.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_fanout_fr_collapse(&self) {
+        self.fanout_fr_collapse.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_jump_defer(&self) {
         self.jump_defer.fetch_add(1, Ordering::Relaxed);
     }
@@ -858,6 +866,7 @@ impl MetricsInner {
             jump_defer: self.jump_defer.load(Ordering::Relaxed),
             second_repair_await: self.second_repair_await.load(Ordering::Relaxed),
             first_repair_await: self.first_repair_await.load(Ordering::Relaxed),
+            fanout_fr_collapse: self.fanout_fr_collapse.load(Ordering::Relaxed),
         }
     }
 }

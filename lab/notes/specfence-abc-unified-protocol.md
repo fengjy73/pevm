@@ -142,3 +142,12 @@ pre-abort. Keep Iter12 2nd-repair + Iter13 Validated FF. Jump/capture OFF.
 fra fires; aj=0. Stretch <10 unmet.
 See `specfence-abc-iter14-status.md`. Iter 15 cause: collapse fan-out FullRestarts
 / RebindOnly on true_suffix / hang-free opcode skip — not SoftWait Soft / Estimate park.
+
+### Iter 15 — fan-out FR collapse (fr↓; wall plateau)
+First-fail true_suffix + fan≥8 Executing spine → escalate+serial-barrier; widen
+storm barrier; longer true_suffix Validated RebindOnly spin. Keep Iter12–14.
+Jump/capture OFF. SoftWait Soft=0.
+597 N5 med **13.1** SoftWait=0; **fr≈½ vs Iter14**; stretch <10 unmet.
+Drain-spin / BO-OR Await falsified.
+See `specfence-abc-iter15-status.md`. Iter 16 cause: cheap absorb (validate-defer /
+RebindOnly-after-spine) or hang-free opcode skip — not early FullRestart tax.

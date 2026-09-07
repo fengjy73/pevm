@@ -492,6 +492,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 // Storm + program: also hotset when live fanout evidences multi-consumer
                 // (avoids abort-noise HotSet → BO park storms / wall regress).
                 // Iter7: 2nd repair always Await on force_prefix|sticky (Validated gate).
+                // Iter15c: hotset OR live_fanout_hot falsified (599 p90 spike).
                 let prefer_await = if second_repair && (force_prefix || sticky) {
                     true
                 } else if storm && is_program {

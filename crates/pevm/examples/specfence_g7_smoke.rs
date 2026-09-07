@@ -241,7 +241,7 @@ fn main() {
                 aborts_v.push(aborts as f64);
                 if iters == 1 || i + 1 == iters {
                     println!(
-                        "  block={bn} mode={mode:10} iter={}/{} ok={ok} tps={tps:.0} wall_ms={wall_ms:.1} soft={soft} wait_hard={wh} abort_rate={:.3} lean={} evm={} reexec={} fb_reabort={} fra={} sra={} sb_res={} sb_def={} hsstore={} sb_clique={} jdef={} aj={} rebind={} cold={} occ_fast={} steal={} park_k={} mw_ms={:.1} h_ms={:.1} v_ms={:.1} park_ms={:.1} sw_ms={:.1} ea_ms={:.1} bo_ms={:.1} parks={}",
+                        "  block={bn} mode={mode:10} iter={}/{} ok={ok} tps={tps:.0} wall_ms={wall_ms:.1} soft={soft} wait_hard={wh} abort_rate={:.3} lean={} evm={} reexec={} fb_reabort={} fra={} sra={} sb_res={} sb_def={} hsstore={} sb_clique={} jdef={} aj={} rebind={} ffc={} cold={} occ_fast={} steal={} park_k={} mw_ms={:.1} h_ms={:.1} v_ms={:.1} park_ms={:.1} sw_ms={:.1} ea_ms={:.1} bo_ms={:.1} parks={}",
                         i + 1,
                         iters,
                         if n == 0 { 0.0 } else { aborts as f64 / n as f64 },
@@ -258,6 +258,7 @@ fn main() {
                         m.jump_defer,
                         m.absolute_jump_applied,
                         m.rebind_only,
+                        m.fanout_fr_collapse,
                         m.cold_spec_fast,
                         m.occ_fast_first,
                         m.ready_steal_on_wait,
@@ -304,6 +305,7 @@ fn main() {
                     "soft_wait_wake_ok": m.soft_wait_wake_ok,
                     "soft_wait_wake_reabort": m.soft_wait_wake_reabort,
                     "rebind_only": m.rebind_only,
+                    "fanout_fr_collapse": m.fanout_fr_collapse,
                     "cold_spec_fast": m.cold_spec_fast,
                     "occ_fast_first": m.occ_fast_first,
                     "profile_handler_ns": m.profile_handler_ns,

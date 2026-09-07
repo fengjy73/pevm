@@ -892,6 +892,8 @@ fn try_validate(
     let mut cached_read_locations: Option<Vec<crate::MemoryLocationHash>> = None;
     let mut cached_write_locations: Option<Vec<crate::MemoryLocationHash>> = None;
     let mut cached_plan: Option<Option<crate::specfence::PartialRetryPlan>> = None;
+    // Iter15: true_suffix flag for fan-out FR collapse / RebindOnly widen on abort path.
+    let mut true_suffix_flag = false;
     if specfence.mode == ConcurrencyMode::SpecFence && !invalid.is_empty() {
         specfence
             .metrics
@@ -931,6 +933,7 @@ fn try_validate(
             ),
             None => !write_locations.is_empty(),
         };
+        true_suffix_flag = true_suffix;
         // Iter6: brief yield so Estimate→Data can land before RebindOnly decision
         // (value-stable same-output). No SoftWait Soft; bounded spin only.
         // Iter12d: longer spin when force_bind / ff_head (more RebindOnly chance).
@@ -1010,7 +1013,9 @@ fn try_validate(
                 }
             }
             if need_validated {
-                for _ in 0..48 {
+                // Iter15: longer Validated spin on true_suffix (RebindOnly chance↑).
+                let vs_spin = if true_suffix { 72 } else { 48 };
+                for _ in 0..vs_spin {
                     let all_ready = invalid.iter().all(|&loc| {
                         let w = mv_memory
                             .last_writer_before(loc, tx_version.tx_idx)
@@ -1137,6 +1142,7 @@ fn try_validate(
             } else {
                 was_force_bind || repair_depth >= 2
             };
+            let mut fanout_collapse = false;
             // Iter12d: skip doomed 2nd SuffixRepair when fail-loc writers are
             // ESTIMATE/Aborting but an Executing spine writer exists for
             // serial-barrier — prefer one FullRestart behind Data over a
@@ -1171,6 +1177,41 @@ fn try_validate(
                 }
                 if has_estimate_or_aborting && has_executing_spine {
                     escalate = true;
+                }
+            }
+            // Iter15: collapse fan-out FullRestarts — first-fail true_suffix with
+            // high-fan Executing spine → escalate+serial-barrier immediately.
+            // Skips doomed SuffixRepair→fra→fb_reabort→FR chains on 597-class
+            // program fan-out. SoftWait Soft=0; no sibling park; Estimate park OFF.
+            if !escalate
+                && !was_force_bind
+                && repair_depth == 0
+                && true_suffix_flag
+                && specfence.engagement.is_storm()
+            {
+                let mut best_fan = 0usize;
+                for location in &invalid {
+                    let w = mv_memory
+                        .last_writer_before(*location, tx_version.tx_idx)
+                        .or_else(|| {
+                            mv_memory.residual_writer_before(*location, tx_version.tx_idx)
+                        });
+                    if let Some(w) = w {
+                        if w < tx_version.tx_idx && scheduler.is_executing(w) {
+                            let fan = mv_memory.higher_readers_of(*location, w).len();
+                            if fan > best_fan {
+                                best_fan = fan;
+                            }
+                        }
+                    }
+                }
+                // HOT_FANOUT_THRESH = 8: absorb high-fan consumers into spine FR+barrier.
+                // 15a: fr↓~½ (SUCCESS). Drain-spin/BO-OR widen falsified (wall↑/599 p90).
+                const FANOUT_FR_COLLAPSE_FAN: usize = 8;
+                if best_fan >= FANOUT_FR_COLLAPSE_FAN {
+                    escalate = true;
+                    fanout_collapse = true;
+                    specfence.metrics.record_fanout_fr_collapse();
                 }
             }
             let repair = if escalate {
@@ -1453,8 +1494,10 @@ fn try_validate(
             // Iter13: rank ALL Executing conflict writers and try claims in order
             // (no sibling-park — Iter4 sibling hang). Executed→Validated escalate
             // spin falsified (13a wall↑).
+            // Iter15: widen to all storm escalates (incl. fanout_collapse first-fail),
+            // not only was_force_bind — Quiet still gated by is_storm().
             if escalate
-                && was_force_bind
+                && (was_force_bind || fanout_collapse || repair_depth >= 1)
                 && specfence.engagement.is_storm()
                 && !specfence
                     .partial_retry

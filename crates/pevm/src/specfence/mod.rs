@@ -39,6 +39,10 @@
 //! (prevent doomed first repair; Estimate park falsified Iter8) + RebindOnly
 //! Validated collapse spin (Executed tip→Validated). Keep Iter12 2nd-repair +
 //! Validated-gated FF. Jump/capture OFF. SoftWait Soft ~0.
+//! Iter15: fan-out FR collapse — first-fail true_suffix + fan≥8 Executing spine
+//! → escalate+serial-barrier (fr↓; SoftWait Soft=0). Widen storm serial-barrier;
+//! longer true_suffix Validated RebindOnly spin. Pre-abort drain / BO-OR Await
+//! falsified. Keep Iter12–14. Jump/capture OFF. SoftWait Soft ~0.
 //! Iter8 memory snap retained. Head-FF (Iter5). SoftWait Soft ~0.
 //!
 //! **Learn (C):** Inter morph selects Quiet (598 OCC-lite) vs Storm (597 Await-ready).
