@@ -3,7 +3,7 @@
 **Date:** 2026-09-07 (Asia/Shanghai)  
 **Branch:** `specfence`  
 **Authority:** `specfence-region-fence-adaptive-architecture.md` (5e306f7), learn-from-blocks, control-law v3  
-**Tip:** `5eb5854` (implementation); docs on branch tip after push
+**Tip:** `2364467f593e3045987df2f9863a116e5b2ef82a` (`2364467`); code impl `5eb5854`
 
 ---
 
