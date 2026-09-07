@@ -30,7 +30,10 @@ impl<EVM, ERROR> Default for NoBeneficiaryHandler<EVM, ERROR> {
 
 impl<EVM, ERROR> Handler for NoBeneficiaryHandler<EVM, ERROR>
 where
-    EVM: EvmTr<Context: ContextTr<Journal: JournalTr<State = EvmState>>, Frame = EthFrame<EthInterpreter>>,
+    EVM: EvmTr<
+        Context: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt>,
+        Frame = EthFrame<EthInterpreter>,
+    >,
     ERROR: EvmTrError<EVM>,
 {
     type Evm = EVM;
@@ -64,7 +67,8 @@ pub(crate) fn run_ethereum_tx<DB: Database>(
     evm: &mut <PevmEthereum as PevmChain>::Evm<DB>,
     use_inspect: bool,
 ) -> Result<ExecutionResult<HaltReason>, EthDbError<DB>> {
-    let mut h = NoBeneficiaryHandler::<<PevmEthereum as PevmChain>::Evm<DB>, EthDbError<DB>>::default();
+    let mut h =
+        NoBeneficiaryHandler::<<PevmEthereum as PevmChain>::Evm<DB>, EthDbError<DB>>::default();
     if use_inspect {
         h.inspect_run(evm)
     } else {

@@ -418,6 +418,8 @@ thread_local! {
     static CALL_SEQ: Cell<u32> = const { Cell::new(0) };
     static LAST_SNAP: RefCell<Option<BoundarySnapshot>> = const { RefCell::new(None) };
     static PENDING_EFFECT_CP: Cell<bool> = const { Cell::new(false) };
+    /// Iter4: SSTORE count on Handler::run plant path (hang-free, no Inspector).
+    static HANDLER_SSTORE_STEPS: Cell<u64> = const { Cell::new(0) };
     static PENDING_RESUME: RefCell<Option<BoundarySnapshot>> = const { RefCell::new(None) };
     static PENDING_JOURNAL_BLOB: RefCell<Option<JournalBlob>> = const { RefCell::new(None) };
     /// Nested calls entered but not yet `call_end` (metadata for cache store).
@@ -494,6 +496,7 @@ pub(crate) fn with_plant_tls_journal<R>(
     CALL_SEQ.set(0);
     LAST_SNAP.with(|c| *c.borrow_mut() = None);
     PENDING_EFFECT_CP.set(false);
+    HANDLER_SSTORE_STEPS.set(0);
     PENDING_CALL_STACK.with(|c| c.borrow_mut().clear());
     CAPTURED_CALLS.with(|c| c.borrow_mut().clear());
     RESUME_CALL_CACHE.with(|c| c.borrow_mut().clear());
@@ -1108,6 +1111,169 @@ fn maybe_note_journal_effect(interp: &Interpreter<EthInterpreter>, op: u8, opcod
     });
 }
 
+/// True while `with_plant_tls*` is active on this worker (Handler or inspect).
+pub(crate) fn plant_tls_active() -> bool {
+    PLANT.with(|p| p.get().is_some())
+}
+
+/// True when an absolute PC resume snap is armed (cheap TLS check).
+pub(crate) fn pending_resume_armed() -> bool {
+    PENDING_RESUME.with(|c| c.borrow().is_some())
+}
+
+/// Iter4: apply armed `PENDING_RESUME` to an interpreter without `inspect_run`.
+/// Shared by SpecFenceInspector::initialize_interp and Handler::run_exec_loop.
+pub(crate) fn try_apply_pending_pc_resume<CTX>(
+    interp: &mut Interpreter<EthInterpreter>,
+    context: &mut CTX,
+    call_depth: u16,
+) where
+    CTX: ContextTr,
+    CTX::Journal: JournalExt,
+{
+    if RESUME_APPLIED.get() {
+        return;
+    }
+    let snap = PENDING_RESUME.with(|c| c.borrow().clone());
+    let Some(snap) = snap else {
+        return;
+    };
+    if snap.call_depth != call_depth && !(snap.call_depth <= 1 && call_depth <= 1) {
+        clear_pc_resume();
+        return;
+    }
+    if let Some(expected) = snap.code_hash {
+        let actual = interp.bytecode.get_or_calculate_hash();
+        if actual != expected {
+            clear_pc_resume();
+            return;
+        }
+    }
+    if snap.bytecode_len > 0 && snap.pc >= snap.bytecode_len {
+        clear_pc_resume();
+        return;
+    }
+    let blob = PENDING_JOURNAL_BLOB.with(|c| c.borrow_mut().take());
+    if let Some(blob) = blob {
+        let n = blob.account_count();
+        let state = context.journal_mut().evm_state_mut();
+        let tx_id = state
+            .values()
+            .next()
+            .map(|a| a.transaction_id)
+            .or_else(|| blob.state.values().next().map(|a| a.transaction_id))
+            .unwrap_or(0);
+        for (addr, mut acc) in blob.state {
+            let _ = acc.mark_warm_with_transaction_id(tx_id);
+            for slot in acc.storage.values_mut() {
+                let _ = slot.mark_warm_with_transaction_id(tx_id);
+            }
+            state.insert(addr, acc);
+        }
+        for log in blob.logs {
+            context.journal_mut().log(log);
+        }
+        if n > 0 {
+            record_journal_blob_ff(n);
+        }
+    }
+    let seed_basics =
+        PENDING_CALL_TOUCH_BASICS.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    for (addr, basic, code_hash) in &seed_basics {
+        seed_journal_basic_if_missing(context, *addr, basic, *code_hash);
+    }
+    let call_touches = PENDING_CALL_TOUCHES.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    for cached in &call_touches {
+        if try_transfer_in_journal(
+            context,
+            cached.caller,
+            cached.target,
+            cached.value,
+        ) {
+            record_call_outcome_hit();
+        } else {
+            clear_pc_resume();
+            PENDING_WRITE_REPLAYS.with(|c| c.borrow_mut().clear());
+            PENDING_CALL_TOUCH_BASICS.with(|c| c.borrow_mut().clear());
+            arm_call_outcome_cache(call_touches.clone());
+            return;
+        }
+    }
+    let logs = PENDING_LOG_REPLAYS.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    for log in logs {
+        context.journal_mut().log(log);
+    }
+    let writes = PENDING_WRITE_REPLAYS.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    if !writes.is_empty() {
+        apply_write_replays(context, &writes);
+    }
+    let skipped = snap.opcode_steps;
+    snap.apply_to_interp(interp);
+    RESUME_APPLIED.set(true);
+    PENDING_RESUME.with(|c| *c.borrow_mut() = None);
+    OPCODE_STEPS.set(0);
+    record_pc_resume(skipped);
+}
+
+/// EthInterpreter SSTORE plant capture (installed on Mainnet EVM instruction table).
+pub(crate) fn sstore_plant_capture_eth<H: revm::interpreter::Host + ?Sized>(
+    context: revm::interpreter::InstructionContext<'_, H, EthInterpreter>,
+) {
+    // Call stock SSTORE first.
+    let interp_ptr = context.interpreter as *mut Interpreter<EthInterpreter>;
+    revm::interpreter::instructions::host::sstore(context);
+    if !plant_tls_active() {
+        return;
+    }
+    // Hang-free lite capture: gas+pc only (no stack/memory clone — WaitHard livelock).
+    let interp = unsafe { &mut *interp_ptr };
+    let n = HANDLER_SSTORE_STEPS.get().saturating_add(1);
+    HANDLER_SSTORE_STEPS.set(n);
+    let pc = interp.bytecode.pc();
+    let gas_remaining = interp.gas.remaining();
+    let gas_refunded = interp.gas.refunded();
+    let bytecode_len = interp.bytecode.bytecode_slice().len();
+    let code_hash = Some(interp.bytecode.get_or_calculate_hash());
+    let mem_gas = *interp.gas.memory();
+    let snap = BoundarySnapshot {
+        pc,
+        gas_remaining,
+        gas_refunded,
+        memory_words: mem_gas.words_num,
+        memory_expansion_cost: mem_gas.expansion_cost,
+        call_depth: CALL_DEPTH.get(),
+        opcode_steps: n,
+        stack: Vec::new(), // lite — jump_is_safe needs stack for full jump; rem tip OK
+        memory: Vec::new(),
+        code_hash,
+        bytecode_len,
+        at_call_boundary: false,
+        post_sstore: true,
+    };
+    PLANT.with(|p| {
+        if let Some(plant) = p.get() {
+            let table = unsafe { &*plant.partial_retry };
+            table.note_post_sstore_gas(plant.tx_idx, gas_remaining);
+            let metrics = unsafe { &*plant.metrics };
+            metrics.record_handler_sstore_capture();
+            // Record tip for resume decisions without full jump snap clone storms.
+            table.attach_live_boundary(plant.tx_idx, snap.clone(), JournalBlob::default());
+        }
+    });
+    LAST_SNAP.with(|c| *c.borrow_mut() = Some(snap));
+}
+
+/// Install hang-free SSTORE plant capture on a Mainnet-style instruction table.
+pub(crate) fn install_handler_sstore_plant_capture<H: revm::interpreter::Host>(
+    instructions: &mut revm::handler::instructions::EthInstructions<EthInterpreter, H>,
+) {
+    const OP_SSTORE: u8 = 0x55;
+    instructions.insert_instruction(
+        OP_SSTORE,
+        revm::interpreter::Instruction::new(sstore_plant_capture_eth::<H>, 0),
+    );
+}
+
 /// SpecFence boundary Inspector — observational except on armed PC resume.
 #[derive(Debug, Default, Clone)]
 pub struct SpecFenceInspector;
@@ -1129,104 +1295,7 @@ where
         interp: &mut Interpreter<EthInterpreter>,
         context: &mut CTX,
     ) {
-        if RESUME_APPLIED.get() {
-            return;
-        }
-        let snap = PENDING_RESUME.with(|c| c.borrow().clone());
-        let Some(snap) = snap else {
-            return;
-        };
-        let depth = CALL_DEPTH.get();
-        if snap.call_depth != depth && !(snap.call_depth <= 1 && depth <= 1) {
-            // Depth mismatch — leave pending cleared and fall through without jump.
-            clear_pc_resume();
-            return;
-        }
-        // Same-contract gate: refuse jump if code hash diverges.
-        if let Some(expected) = snap.code_hash {
-            let actual = interp.bytecode.get_or_calculate_hash();
-            if actual != expected {
-                clear_pc_resume();
-                return;
-            }
-        }
-        if snap.bytecode_len > 0 && snap.pc >= snap.bytecode_len {
-            clear_pc_resume();
-            return;
-        }
-        // M1e/M1f: restore revm journal blob so prefix SSTORE/LOG world-state is
-        // present without re-executing those opcodes after the PC jump.
-        // Re-warm accounts/slots for the current journal transaction_id so
-        // post-jump SLOAD/SSTORE see warm gas (remaining already accounts for it).
-        let blob = PENDING_JOURNAL_BLOB.with(|c| c.borrow_mut().take());
-        if let Some(blob) = blob {
-            let n = blob.account_count();
-            let state = context.journal_mut().evm_state_mut();
-            let tx_id = state
-                .values()
-                .next()
-                .map(|a| a.transaction_id)
-                .or_else(|| blob.state.values().next().map(|a| a.transaction_id))
-                .unwrap_or(0);
-            for (addr, mut acc) in blob.state {
-                let _ = acc.mark_warm_with_transaction_id(tx_id);
-                for slot in acc.storage.values_mut() {
-                    let _ = slot.mark_warm_with_transaction_id(tx_id);
-                }
-                state.insert(addr, acc);
-            }
-            for log in blob.logs {
-                context.journal_mut().log(log);
-            }
-            if n > 0 {
-                record_journal_blob_ff(n);
-            }
-        }
-        // M1i/M1j/M1l: replay nested CALL journal touches before PC-skip past CALL.
-        // Zero-value needs EIP-158 touch; valued needs transfer. FF-seed Basics
-        // first (no Db) so valued targets absent at top-level init can transfer.
-        // Abort jump if still cold (hang-free, seq≡par via mid-exec SC fallback).
-        let seed_basics =
-            PENDING_CALL_TOUCH_BASICS.with(|c| std::mem::take(&mut *c.borrow_mut()));
-        for (addr, basic, code_hash) in &seed_basics {
-            seed_journal_basic_if_missing(context, *addr, basic, *code_hash);
-        }
-        let call_touches = PENDING_CALL_TOUCHES.with(|c| std::mem::take(&mut *c.borrow_mut()));
-        for cached in &call_touches {
-            if try_transfer_in_journal(
-                context,
-                cached.caller,
-                cached.target,
-                cached.value,
-            ) {
-                record_call_outcome_hit();
-            } else {
-                // Jump armed but touches cannot apply — abort jump and re-arm
-                // CallOutcome cache so mid-exec SC still runs (vm.rs skipped the
-                // !jumped arm path because try_arm returned true).
-                clear_pc_resume();
-                PENDING_WRITE_REPLAYS.with(|c| c.borrow_mut().clear());
-                PENDING_CALL_TOUCH_BASICS.with(|c| c.borrow_mut().clear());
-                arm_call_outcome_cache(call_touches.clone());
-                return;
-            }
-        }
-        // M1j: re-emit certified-prefix LOG* skipped by absolute jump.
-        let logs = PENDING_LOG_REPLAYS.with(|c| std::mem::take(&mut *c.borrow_mut()));
-        for log in logs {
-            context.journal_mut().log(log);
-        }
-        // M1i: controlled per-slot storage replay (never full present_values dump).
-        let writes = PENDING_WRITE_REPLAYS.with(|c| std::mem::take(&mut *c.borrow_mut()));
-        if !writes.is_empty() {
-            apply_write_replays(context, &writes);
-        }
-        let skipped = snap.opcode_steps;
-        snap.apply_to_interp(interp);
-        RESUME_APPLIED.set(true);
-        PENDING_RESUME.with(|c| *c.borrow_mut() = None);
-        OPCODE_STEPS.set(0);
-        record_pc_resume(skipped);
+        try_apply_pending_pc_resume(interp, context, CALL_DEPTH.get());
     }
 
     fn step(&mut self, interp: &mut Interpreter<EthInterpreter>, _context: &mut CTX) {

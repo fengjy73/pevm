@@ -21,7 +21,7 @@ use revm::{
 };
 
 use crate::{
-    EvmAccount, MemoryEntry, MemoryLocation, MemoryValue, Storage, Task, TxIdx, TxVersion,
+    EvmAccount, MemoryEntry, MemoryLocation, MemoryLocationHash, MemoryValue, Storage, Task, TxIdx, TxVersion,
     chain::PevmChain,
     compat::get_block_env,
     hash_deterministic,
@@ -1216,10 +1216,10 @@ fn try_validate(
             specfence.metrics.record_fence_cascade(cascade, skipped);
             // V5-P0: engagement.note_abort is metrics-only (no HotSet storm insert).
             let _ = specfence.engagement.note_abort();
-            // Iter3 B: serial-barrier resolve after escalate FullRestart.
-            // Prefer park behind unfinished conflict writers so the head reexec
-            // runs once against Data (not ESTIMATE race). SpecFence-native —
-            // not whole-block serialize / not inspect_run jump.
+            // Iter3/4 B: serial-barrier + capped hot-ℓ clique resolve after escalate.
+            // Prefer park behind Executing conflict writers so head reexec runs once
+            // against Data. Iter4: also park up to 2 Aborting sibling readers of the
+            // same hot ℓ behind that writer (fan-out serialize), carefully capped.
             if escalate
                 && was_force_bind
                 && specfence.engagement.is_storm()
@@ -1227,10 +1227,11 @@ fn try_validate(
                     .partial_retry
                     .serial_barrier_used(tx_version.tx_idx)
             {
-                // Narrow Iter3 barrier: once per tx, only behind an *Executing*
-                // conflict writer (not Ready/Aborting queue). Claim slot only on
-                // successful park (anti-cascade).
-                let mut barrier_writer: Option<TxIdx> = None;
+                // Iter4 hot-ℓ clique: among Executing conflict writers, prefer the
+                // writer whose ℓ has the largest higher-reader fan-out (storm spine).
+                // Do **not** park sibling consumers (Aborting sibling deps raced
+                // finish_validation and hung m2/p4). Cap stays 1 barrier claim/tx.
+                let mut best: Option<(TxIdx, MemoryLocationHash, usize)> = None;
                 for location in &invalid {
                     let w = mv_memory
                         .last_writer_before(*location, tx_version.tx_idx)
@@ -1238,22 +1239,27 @@ fn try_validate(
                             mv_memory.residual_writer_before(*location, tx_version.tx_idx)
                         });
                     if let Some(w) = w {
-                        // Only park behind an actively Executing writer (Ready/Aborting
-                        // queues caused park-tax / cascade outliers).
                         if w < tx_version.tx_idx && scheduler.is_executing(w) {
-                            barrier_writer = Some(match barrier_writer {
-                                Some(prev) => prev.max(w),
-                                None => w,
-                            });
+                            let fan = mv_memory.higher_readers_of(*location, w).len();
+                            let take = match best {
+                                None => true,
+                                Some((pw, _, pf)) => fan > pf || (fan == pf && w > pw),
+                            };
+                            if take {
+                                best = Some((w, *location, fan));
+                            }
                         }
                     }
                 }
-                if let Some(w) = barrier_writer {
+                if let Some((w, _loc, fan)) = best {
                     if scheduler.add_dependency_from_aborting(tx_version.tx_idx, w) {
                         let _ = specfence
                             .partial_retry
                             .try_claim_serial_barrier(tx_version.tx_idx);
                         specfence.metrics.record_serial_barrier_resolve();
+                        if fan > 1 {
+                            specfence.metrics.record_serial_barrier_clique();
+                        }
                         return scheduler.finish_validation_fenced_barrier_park(
                             tx_version,
                             rewind_to,

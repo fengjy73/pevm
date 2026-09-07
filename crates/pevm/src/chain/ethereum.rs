@@ -24,7 +24,8 @@ use super::{CalculateReceiptRootError, PevmChain};
 use crate::{
     BuildIdentityHasher, MemoryLocation, MemoryLocationHash, PevmTxExecutionResult, TxIdx,
     hash_deterministic, mv_memory::MvMemory,
-    specfence::SpecFenceInspector,
+    specfence::{install_handler_sstore_plant_capture, SpecFenceInspector},
+
 };
 
 /// Implementation of [`PevmChain`] for Ethereum
@@ -127,11 +128,14 @@ impl PevmChain for PevmEthereum {
         } else if spec_id >= SpecId::CANCUN {
             cfg = cfg.with_max_blobs_per_tx(MAX_BLOB_NUMBER_PER_BLOCK_CANCUN);
         }
-        Context::mainnet()
+        let mut evm = Context::mainnet()
             .with_cfg(cfg)
             .with_block(block_env)
             .with_db(db)
-            .build_mainnet_with_inspector(SpecFenceInspector::new())
+            .build_mainnet_with_inspector(SpecFenceInspector::new());
+        // Iter4: hang-free post-SSTORE PC/gas plant on Handler::run (no inspect_run).
+        install_handler_sstore_plant_capture(&mut evm.instruction);
+        evm
     }
 
     /// Get the REVM tx envs of an Alloy block.

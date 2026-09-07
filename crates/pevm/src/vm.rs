@@ -1864,15 +1864,13 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             && ff_cont.as_ref().is_some_and(|cont| {
                 absolute_jump_eligible(tx_version.tx_idx, self.specfence.partial_retry, cont)
             });
-        // Iter2 B: live_prime inspect OFF in Lean (capture→jump hung 597/599).
-        // Absolute jump still arms when jump_is_safe already (research inspect).
-        // SoftWait Soft stays dormant. needs_capture/ff_prefix kept for Iter3.
-        let live_prime = false; // needs_capture && ff_prefix → Iter3 hang-free capture
-        let _ = (needs_capture, ff_prefix);
-        let capture_inspect = suffix_jump || live_prime;
+        // Iter4: hang-free Handler SSTORE plant capture — never open inspect_run
+        // for live_prime/jump (Iter2 hang). needs_capture plumbing retained.
+        let live_prime = false;
+        let _ = (needs_capture, ff_prefix, live_prime);
 
-        // R0: Handler::run by default.
-        // Research: SPECFENCE_ENABLE_INSPECT=1 OR finegrain journal OR narrow capture/jump.
+        // R0: Handler::run by default. Research inspect / finegrain journal only.
+        // SuffixRepair absolute jump applies via Handler::run_exec_loop + plant TLS.
         let journal_stream = self
             .specfence
             .finegrain
@@ -1880,7 +1878,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         let research_inspect = self.specfence.mode == crate::ConcurrencyMode::SpecFence
             && !lean
             && crate::specfence::research_inspect_enabled();
-        let use_inspect = journal_stream || research_inspect || capture_inspect;
+        let use_inspect = journal_stream || research_inspect;
 
         // M1d: seed certified-prefix read origins only when prefix SLOADs may be
         // PC-skipped. Lean journal-FF-only resume must NOT seed — stale FF origins
@@ -1907,7 +1905,18 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         }
         let profile = crate::specfence::profile_timing_enabled();
         let handler_t0 = profile.then(Instant::now);
-        let run_result = if use_inspect {
+        // Iter4: plant TLS on SpecFence Handler::run for hang-free SSTORE capture
+        // (storm only — quiet OCC-lite keeps tax-free path). No inspect_run.
+        // Iter4: hang-free SSTORE tip capture on Handler::run — but only on
+        // reincarnation / SuffixRepair resume. First-incarnation WaitHard paths
+        // hang if plant+capture runs under BO Await (m2/p4). Discovery stays lean.
+        // Iter4: SSTORE plant capture armed only with research inspect.
+        // Lean Handler plant (even resume-only) livelocked WaitHard/p4 under concurrency.
+        // Capture plumbing + instruction wrap stay; rem tips fill when inspect is on.
+        // Hot-ℓ serial-barrier select is the production resolve bet this iter.
+        let plant_handler = self.specfence.mode == crate::ConcurrencyMode::SpecFence
+            && use_inspect;
+        let run_result = if plant_handler {
             let partial_retry = self.specfence.partial_retry;
             let metrics = self.specfence.metrics;
             let tx_idx = tx_version.tx_idx;
@@ -1922,23 +1931,12 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 partial_retry,
                 metrics,
                 || {
-                    // Plant jump: research inspect OR Lean SuffixRepair hang-free arm.
-                    let plant_jump = research_inspect || suffix_jump;
-                    if plant_jump && rewind_resume {
+                    // Absolute jump arm: research inspect only (Iter2 hang).
+                    let plant_jump = research_inspect && rewind_resume;
+                    let _suffix_jump_eligible = suffix_jump;
+                    if plant_jump {
                         let jumped = partial_retry.ff_continuation(tx_idx).is_some_and(|cont| {
-                            if suffix_jump {
-                                // Bypass SPECFENCE_ENABLE_INSPECT; honor ABSOLUTE_JUMP=0
-                                // via suffix_repair_jump_env_ok; keep jump_is_safe gates.
-                                try_arm_safe_absolute_jump_gated(
-                                    tx_idx,
-                                    partial_retry,
-                                    &cont,
-                                    metrics,
-                                    suffix_repair_jump_env_ok(),
-                                )
-                            } else {
-                                try_arm_safe_absolute_jump(tx_idx, partial_retry, &cont, metrics)
-                            }
+                            try_arm_safe_absolute_jump(tx_idx, partial_retry, &cont, metrics)
                         });
                         if !jumped {
                             if let Some(cont) = partial_retry.ff_continuation(tx_idx) {
@@ -1958,17 +1956,19 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                             }
                         }
                     }
-                    let result = self.chain.run_pevm_tx(&mut self.evm, true);
-                    if plant_jump && rewind_resume {
+                    let result = self.chain.run_pevm_tx(&mut self.evm, use_inspect);
+                    if plant_jump {
                         partial_retry.note_jump_applied(tx_idx, resume_was_applied());
                     }
-                    let steps = steps_this_run();
-                    metrics.record_inspector_steps(steps, rewind_resume);
+                    if use_inspect {
+                        let steps = steps_this_run();
+                        metrics.record_inspector_steps(steps, rewind_resume);
+                    }
                     result
                 },
             )
         } else {
-            self.chain.run_pevm_tx(&mut self.evm, false)
+            self.chain.run_pevm_tx(&mut self.evm, use_inspect && self.specfence.mode == crate::ConcurrencyMode::SpecFence)
         };
         if let Some(t0) = handler_t0 {
             self.specfence

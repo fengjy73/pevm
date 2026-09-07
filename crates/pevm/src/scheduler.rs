@@ -532,6 +532,16 @@ impl Scheduler {
         tx.status == IncarnationStatus::Executing
     }
 
+    /// True when status is `Aborting` (Iter4 clique sibling park).
+    #[inline]
+    pub(crate) fn is_aborting(&self, tx_idx: TxIdx) -> bool {
+        if tx_idx >= self.block_size {
+            return false;
+        }
+        let tx = index_mutex!(self.transactions_status, tx_idx);
+        tx.status == IncarnationStatus::Aborting
+    }
+
     #[inline]
     fn set_done_flag(&self, tx_idx: TxIdx, done: bool) {
         // SAFETY: callers only use inbound tx indices.

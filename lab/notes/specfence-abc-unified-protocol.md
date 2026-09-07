@@ -78,3 +78,8 @@ See `specfence-abc-iter2-status.md`. Iter 3 cause: hang-free PC capture ≠ full
 Storm∧was_force_bind escalate → once park behind Executing conflict writer (no inspect).  
 597 N=10 med **13.4** SoftWait=0 (↓ vs Iter2 13.9); stretch &lt;10 unmet; aj=0.  
 See `specfence-abc-iter3-status.md`. Iter 4 cause: hang-free PC ≠ inspect_run and/or stronger clique barrier.
+
+### Iter 4 — Handler SSTORE plant + hot-ℓ barrier
+Hang-free SSTORE lite capture plumbing landed but Lean plant TLS livelocks WaitHard (same family as inspect). Production: plant OFF on Lean; hot-ℓ fanout writer select for serial-barrier.  
+597 N=10 med **14.2** SoftWait=0 (no win vs Iter3 13.4); aj=0; hsstore=0.  
+See `specfence-abc-iter4-status.md`. Iter 5 cause: serial one-tx capture window or write-prefix skip without plant TLS.

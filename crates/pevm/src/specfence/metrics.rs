@@ -195,6 +195,10 @@ pub struct SpecFenceMetrics {
     pub serial_barrier_resolve: usize,
     /// Iter3: escalate FullRestart steal-first defer (no unfinished writer).
     pub serial_barrier_defer: usize,
+    /// Iter4: hang-free Handler::run post-SSTORE plant captures.
+    pub handler_sstore_capture: usize,
+    /// Iter4: sibling consumers parked in hot-ℓ clique barrier.
+    pub serial_barrier_clique: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -280,6 +284,8 @@ pub(crate) struct MetricsInner {
     soft_wait_wake_reabort: AtomicUsize,
     serial_barrier_resolve: AtomicUsize,
     serial_barrier_defer: AtomicUsize,
+    handler_sstore_capture: AtomicUsize,
+    serial_barrier_clique: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -595,6 +601,14 @@ impl MetricsInner {
         self.serial_barrier_defer.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_handler_sstore_capture(&self) {
+        self.handler_sstore_capture.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_serial_barrier_clique(&self) {
+        self.serial_barrier_clique.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_journal_ff_entries(&self, n: usize) {
         if n > 0 {
             self.journal_ff_entries.fetch_add(n, Ordering::Relaxed);
@@ -810,6 +824,8 @@ impl MetricsInner {
             soft_wait_wake_reabort: self.soft_wait_wake_reabort.load(Ordering::Relaxed),
             serial_barrier_resolve: self.serial_barrier_resolve.load(Ordering::Relaxed),
             serial_barrier_defer: self.serial_barrier_defer.load(Ordering::Relaxed),
+            handler_sstore_capture: self.handler_sstore_capture.load(Ordering::Relaxed),
+            serial_barrier_clique: self.serial_barrier_clique.load(Ordering::Relaxed),
         }
     }
 }

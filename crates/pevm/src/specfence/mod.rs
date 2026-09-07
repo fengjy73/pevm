@@ -20,10 +20,10 @@
 //! records `armed_at_k`. SoftWait Soft stays ~0 unless wake EV re-proven.
 //!
 //! **Resolve (B):** RebindOnly when value-stable; else SuffixRepair + hang-free
-//! absolute jump when `jump_is_safe`; else journal-FF resume. Escalate FullRestart
-//! after SuffixRepair depth≥2 (fb-loop break), then **serial-barrier**: park behind
-//! unfinished conflict writers (or steal-first defer) so head reexec runs once
-//! against Data. Never ESTIMATE-poison certified prefix. No Lean live_prime.
+//! absolute jump when `jump_is_safe` (Iter4: Handler SSTORE plant capture, no
+//! inspect_run). Escalate FullRestart after depth≥2, then **serial-barrier** /
+//! **hot-ℓ clique barrier** (capped) so head reexec runs once against Data.
+//! Never ESTIMATE-poison certified prefix. No Lean live_prime.
 //!
 //! **Learn (C):** Inter morph selects Quiet (598 OCC-lite) vs Storm (597 Await-ready).
 //! Intra `choose_action` / learner updates only on hot candidates.
@@ -101,6 +101,7 @@ pub(crate) use boundary::{
     arm_pending_effect_cp_only,
     resume_was_applied, steps_this_run, try_arm_safe_absolute_jump, try_arm_safe_absolute_jump_gated,
     with_plant_tls, with_plant_tls_journal, BoundarySnapshot, CachedCallOutcome, JournalBlob,
+    plant_tls_active, pending_resume_armed, try_apply_pending_pc_resume, install_handler_sstore_plant_capture,
 };
 pub use boundary::SpecFenceInspector;
 #[allow(unused_imports)]
