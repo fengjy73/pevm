@@ -27,10 +27,11 @@ use crate::{
     mv_memory::MvMemory,
     scheduler::Scheduler,
     specfence::{
-        AccountHints, AdaptiveEngagement, BayesMap, ConcurrencyMode, DEFAULT_TAU, HotSet,
-        FineGrainCollector, FineGrainSnapshot, HeatMap, MetricsInner, PartialRetryTable,
-        RemCounters, RepairPlan, RwPriorMap, SpecDag, SpecFenceCtx, SpecFenceMetrics,
-        WaveParkTable, seed_wait_regions, update_bayes, update_heat, update_rw_prior,
+        AccountHints, AdaptiveEngagement, AdaptiveParams, BayesMap, ConcurrencyMode, DEFAULT_TAU,
+        HotSet, FineGrainCollector, FineGrainSnapshot, HeatMap, InterBlockPrior, LiveLearner,
+        MetricsInner, PartialRetryTable, RemCounters, RepairPlan, RwPriorMap, SpecDag,
+        SpecFenceCtx, SpecFenceMetrics, WaveParkTable, seed_wait_regions, update_bayes,
+        update_heat, update_rw_prior,
     },
     storage::StorageWrapper,
     vm::{
@@ -160,6 +161,10 @@ pub struct Pevm {
     rw_prior: RwPriorMap,
     /// R1: process-persistent HotSet (per-block members + multi-writer prior).
     hotset: HotSet,
+    /// P1: inter-block morph / top-ℓ prior (warm-start only).
+    inter_prior: InterBlockPrior,
+    /// P1: tunable π constants (process-level).
+    adaptive_params: AdaptiveParams,
     last_metrics: SpecFenceMetrics,
     last_initial_wait_accounts: std::collections::HashSet<alloy_primitives::Address>,
     /// M4: abort rate from the previous SpecFence block (`occ_aborts / n_tx`).
@@ -180,6 +185,8 @@ impl Default for Pevm {
             bayes: BayesMap::new(),
             rw_prior: RwPriorMap::new(),
             hotset: HotSet::new(),
+            inter_prior: InterBlockPrior::new(),
+            adaptive_params: AdaptiveParams::default(),
             last_metrics: SpecFenceMetrics::default(),
             last_initial_wait_accounts: std::collections::HashSet::new(),
             last_abort_rate: 0.0,
@@ -365,17 +372,25 @@ impl Pevm {
         let hints = AccountHints::build(chain, &txs);
         let metrics_inner = MetricsInner::default();
         let mut initial_wait = std::collections::HashSet::new();
-        // R1: always LeanOCC unless research inspect; seed HotSet from process prior.
+        // R1/P0/P1: LeanOCC default; HotSet hint-only; inter-prior seeds tracking only.
+        let learner = LiveLearner::new();
         if self.concurrency_mode == ConcurrencyMode::SpecFence {
             self.hotset.begin_block();
+            let prior_morph = self.inter_prior.morph_ema();
+            learner.begin_block(prior_morph);
+            // Warm-start HotSet/Bayes from inter-block top-ℓ — NEVER arm SoftWait from prior.
+            for top in self.inter_prior.top_locations() {
+                self.hotset.track_from_prior(top.location);
+                // Mild Bayes seed so conflict_probability is location-aware without Wait arm.
+                if top.abort_rate >= 0.15 || top.fanout_ema >= 16.0 {
+                    let _ = self.bayes.observe_conflict_location(top.location);
+                }
+            }
         }
         let start_lean = self.concurrency_mode == ConcurrencyMode::SpecFence
             && AdaptiveEngagement::should_start_lean();
-        // SpecFence default: skip block-wide Bayes Wait seed (HotSet gates WaitHard).
-        // PCC still seeds; research-inspect SpecFence may seed for M1* experiments.
-        if self.concurrency_mode == ConcurrencyMode::Pcc
-            || (self.concurrency_mode == ConcurrencyMode::SpecFence && !start_lean)
-        {
+        // P0: only PCC seeds account Wait. SpecFence never seeds account Wait.
+        if self.concurrency_mode == ConcurrencyMode::Pcc {
             seed_wait_regions(
                 &mv_memory.regions,
                 &hints,
@@ -424,6 +439,8 @@ impl Pevm {
             rw_prior: &self.rw_prior,
             engagement: &engagement,
             hotset: &self.hotset,
+            learner: &learner,
+            params: &self.adaptive_params,
             finegrain: finegrain_ref,
         };
 
@@ -438,7 +455,12 @@ impl Pevm {
                     while task.is_some() {
                         task = match task.unwrap() {
                             Task::Execution(tx_version) => {
-                                self.try_execute(&mut vm, &scheduler, tx_version, wave_ref)
+                                let fence_ref = if self.concurrency_mode == ConcurrencyMode::SpecFence {
+                                    Some(&dag)
+                                } else {
+                                    None
+                                };
+                                self.try_execute(&mut vm, &scheduler, tx_version, wave_ref, fence_ref)
                             }
                             Task::Validation(tx_version) => {
                                 try_validate(&mv_memory, &scheduler, &tx_version, specfence)
@@ -487,6 +509,11 @@ impl Pevm {
         );
         if self.concurrency_mode == ConcurrencyMode::SpecFence {
             self.hotset.end_block();
+            // P1: pack InterBlockPrior from live morph hat + top-ℓ (flip → higher α).
+            let morph_hat = learner.morph_hat();
+            let top = learner.pack_top_locations();
+            let _alpha = self.inter_prior.end_block(morph_hat, top);
+            metrics_inner.set_soft_wait_arms(dag.soft_arm_count());
         }
         metrics_inner.set_engagement_metrics(
             engagement.lean_mode_txs(),
@@ -664,6 +691,7 @@ impl Pevm {
         scheduler: &Scheduler,
         tx_version: TxVersion,
         wave: Option<&WaveParkTable>,
+        fence: Option<&crate::specfence::FenceGraph>,
     ) -> Option<Task> {
         let result_slot = self.execution_results.slot_mut(tx_version.tx_idx);
         loop {
@@ -680,7 +708,7 @@ impl Pevm {
             return match vm.execute(&tx_version, result_slot) {
                 Ok(flags) => {
                     // PublishWrite ≈ incarnation finished: wake location waiters + ready.
-                    scheduler.finish_execution_with_wave(tx_version, flags, wave)
+                    scheduler.finish_execution_with_wave_fence(tx_version, flags, wave, fence)
                 }
                 Err(VmExecutionError::Retry) => {
                     if self.abort_reason.get().is_none() {
@@ -817,6 +845,10 @@ fn try_validate(
                 // Learn Wait sticky for HotLocal; cold path ignores until HotSet.
                 specfence.promote_from_bayes(&mv_memory.regions, *location, None);
             }
+            let cascade_hint = invalid.len().max(1);
+            for location in &invalid {
+                specfence.learner.note_abort(*location, cascade_hint);
+            }
             let rewind_to =
                 mv_memory.min_higher_reader_of(tx_version.tx_idx, &write_locations);
             let block_size = scheduler.block_size();
@@ -866,11 +898,13 @@ fn try_validate(
                 .rw_prior
                 .observe_write_set(&write_locations, None);
             let mut first_pass = 0usize;
+            let cascade_hint = invalid.len().max(1);
             for location in &invalid {
                 specfence.bayes.observe_conflict_location_always(*location);
                 specfence.metrics.record_bayes_conflict();
                 specfence.rw_prior.observe_co_access(*location);
                 specfence.hotset.note_abort(*location);
+                specfence.learner.note_abort(*location, cascade_hint);
                 if specfence.rw_prior.predicts_write(*location)
                     || mv_memory.residual_writer_before(*location, tx_version.tx_idx).is_some()
                 {

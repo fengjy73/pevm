@@ -1,15 +1,17 @@
 //! Resolution algebra: WaitHard / Bind / SpecRead (SpecFence control law v3).
 //!
-//! v3 (frozen from plant-measured effect RAW):
+//! v3 (frozen from plant-measured effect RAW) + P0/P1 hooks:
 //! 1. Bind if producer Data published.
-//! 2. Else if program && (fanout_hint || d large): WaitHard+park.
-//! 3. Else if handler / short-lag: SpecRead.
-//! 4. EarlyAbort only when heavy-tx morphology && d small (~0.1) — optional research.
-//! 5. Long WAW spine (handler multi-writer): SpecRead / schedule — not WaitHard.
-//! HotSet / writer counts = fanout_hint only, not a hard Wait gate.
+//! 2. Else if program && (fanout_hint || d large) && !waw_spine_hint: WaitHard+park.
+//! 3. Else if handler / short-lag / WAW spine: SpecRead.
+//! 4. EarlyAbort niche (P3): heavy-tx && d small — flagged only; not armed here.
+//! 5. HotSet / writer counts = fanout_hint only, not a hard Wait gate.
+//! Constants live in [`AdaptiveParams`] (also re-exported as module consts).
 
 #![allow(dead_code)]
 use crate::{MemoryLocationHash, TxIdx, TxIncarnation, TxVersion};
+
+use super::learner::{AdaptiveParams, MorphWeights};
 
 /// Policy action chosen by π for one region read.
 #[derive(Debug, Clone, PartialEq)]
@@ -22,7 +24,7 @@ pub(crate) enum ResolveAction {
     SpecRead,
 }
 
-/// Context features for π (control law v3).
+/// Context features for π (control law v3 + P1 morph/waw/heavy).
 #[derive(Debug, Clone)]
 pub(crate) struct PolicyCtx {
     pub location: MemoryLocationHash,
@@ -38,13 +40,21 @@ pub(crate) struct PolicyCtx {
     pub prior_ws_predicts: bool,
     /// Program (storage/code/selfdestruct) vs handler (basic/lazy).
     pub is_program: bool,
-    /// HotSet / high writer-count morphology hint — NOT a hard gate.
+    /// HotSet / high writer-count / live fanout morphology hint — NOT a hard gate.
     pub fanout_hint: bool,
     /// Gross-work depth d = gas_used_so_far/tx_gas_used when known (inspect/research).
     pub gross_work_depth: Option<f64>,
+    /// P1: morphology posterior weights (or summary).
+    pub morph_weights: MorphWeights,
+    /// P1: WAW-heavy / multi-writer without RAW useful → suppress WaitHard.
+    pub waw_spine_hint: bool,
+    /// P1: gas band / prior says heavy tx (EarlyAbort niche for P3).
+    pub tx_heavy_hint: bool,
+    /// Tunable π constants.
+    pub params: AdaptiveParams,
 }
 
-/// Legacy Spec v1 §7.3 thresholds (kept for revoke / seed docs).
+/// Legacy Spec v1 §7.3 thresholds (kept for revoke / seed docs / Bayes).
 pub(crate) const TAU_W: f64 = 0.35;
 pub(crate) const TAU_S: f64 = 0.50;
 pub(crate) const TAU_REVOKE: f64 = 0.20;
@@ -57,7 +67,7 @@ pub(crate) const COST_MARGIN: f64 = 0.40;
 pub(crate) const TAU_VERY_HIGH: f64 = 0.75;
 /// Gross-work depth above which Wait beats EarlyAbort on fan-out program edges.
 pub(crate) const D_WAIT: f64 = 0.50;
-/// EarlyAbort only when d is small (heavy-tx minority) — research path.
+/// EarlyAbort only when d is small (heavy-tx minority) — research path / P3.
 pub(crate) const D_EARLY: f64 = 0.15;
 
 /// Estimated producer remaining work: 0 if published/done, else 1.0 unit.
@@ -69,7 +79,12 @@ pub(crate) fn cost_wait(writer_done: bool) -> f64 {
 /// Expected SpecRead cost: base progress + conflict-weighted retry.
 #[inline]
 pub(crate) fn cost_spec(p_conflict: f64) -> f64 {
-    1.0 + p_conflict.clamp(0.0, 1.0) * C_RETRY
+    cost_spec_params(p_conflict, C_RETRY)
+}
+
+#[inline]
+pub(crate) fn cost_spec_params(p_conflict: f64, c_retry: f64) -> f64 {
+    1.0 + p_conflict.clamp(0.0, 1.0) * c_retry
 }
 
 /// True when cost model prefers WaitHard over SpecRead (legacy helper / safety).
@@ -79,16 +94,43 @@ pub(crate) fn cost_prefers_wait(
     writer_done: bool,
     p_conflict: f64,
 ) -> bool {
-    let p = p_conflict.clamp(0.0, 1.0);
-    if writer_known && cost_wait(writer_done) < cost_spec(p) * COST_MARGIN {
-        return true;
-    }
-    p >= TAU_VERY_HIGH
+    cost_prefers_wait_params(
+        writer_known,
+        writer_done,
+        p_conflict,
+        &AdaptiveParams::default(),
+    )
 }
 
-/// Control law v3 π: Bind → WaitHard (program fanout / late d) → SpecRead.
+#[inline]
+pub(crate) fn cost_prefers_wait_params(
+    writer_known: bool,
+    writer_done: bool,
+    p_conflict: f64,
+    params: &AdaptiveParams,
+) -> bool {
+    let p = p_conflict.clamp(0.0, 1.0);
+    if writer_known
+        && cost_wait(writer_done) < cost_spec_params(p, params.c_retry) * params.cost_margin
+    {
+        return true;
+    }
+    p >= params.tau_very_high
+}
+
+/// P3 hook: EarlyAbort candidate (not armed in production yet).
+#[inline]
+pub(crate) fn early_abort_candidate(ctx: &PolicyCtx) -> bool {
+    let d = ctx.gross_work_depth;
+    ctx.tx_heavy_hint
+        && ctx.is_program
+        && d.map(|x| x <= ctx.params.d_early).unwrap_or(false)
+}
+
+/// Control law v3 π: Bind → WaitHard (program fanout / late d, !waw) → SpecRead.
 /// HotSet is `fanout_hint` only. Handler / WAW-spine paths prefer SpecRead.
 pub(crate) fn choose_action(ctx: PolicyCtx) -> ResolveAction {
+    let params = ctx.params;
     // 1. Bind when a concrete published version is ready.
     if let Some(v) = ctx.bind_version.clone() {
         if ctx.placeholder_ready || ctx.writer_done {
@@ -102,28 +144,35 @@ pub(crate) fn choose_action(ctx: PolicyCtx) -> ResolveAction {
     }
 
     let d = ctx.gross_work_depth;
-    let d_large = d.map(|x| x >= D_WAIT).unwrap_or(false);
+    let d_large = d.map(|x| x >= params.d_wait).unwrap_or(false);
     // Without inspect depth, fanout_hint stands in for "late discovery likely" on hot program locs.
     let want_wait = ctx.is_program
         && ctx.writer_known
         && !ctx.writer_done
-        && (ctx.fanout_hint || d_large || ctx.posterior_conflict >= TAU_VERY_HIGH);
+        && !ctx.waw_spine_hint
+        && (ctx.fanout_hint || d_large || ctx.posterior_conflict >= params.tau_very_high);
 
-    // 2. Program + (fanout / late d / very-high P) → WaitHard+park.
+    // 2. Program + (fanout / late d / very-high P) ∧ !waw_spine → WaitHard+park.
     if want_wait {
-        // EarlyAbort research niche: heavy-tx small d — still WaitHard here is safer
-        // without a true abort API on this path; SpecRead would waste more when d tiny
-        // only if we could drop the incarnation cheaply (not available without rem arm).
-        let _early = d.map(|x| x <= D_EARLY).unwrap_or(false) && ctx.fanout_hint;
+        // P3 EarlyAbort niche: heavy ∧ d≤D_EARLY ∧ program — flag only (no production arm).
+        let _early = early_abort_candidate(&ctx);
         let _ = _early;
+        // TODO(P3): when rem/PartialRetry EarlyAbort is hang-free, return EarlyAbort here
+        // instead of WaitHard for the heavy-early minority.
         return ResolveAction::WaitHard;
     }
 
-    // 3. Handler / short-lag / no fanout → SpecRead (WAW spine: schedule/steal ≫ WaitHard).
-    // 4. Cost safety: program + very high P even without fanout hint.
+    // 3. Handler / short-lag / WAW spine / no fanout → SpecRead.
+    // 4. Cost safety: program + very high P even without fanout hint (still suppress on WAW).
     if ctx.is_program
         && ctx.writer_known
-        && cost_prefers_wait(ctx.writer_known, ctx.writer_done, ctx.posterior_conflict)
+        && !ctx.waw_spine_hint
+        && cost_prefers_wait_params(
+            ctx.writer_known,
+            ctx.writer_done,
+            ctx.posterior_conflict,
+            &params,
+        )
     {
         return ResolveAction::WaitHard;
     }
@@ -179,6 +228,10 @@ mod tests {
             is_program,
             fanout_hint,
             gross_work_depth: d,
+            morph_weights: MorphWeights::default(),
+            waw_spine_hint: false,
+            tx_heavy_hint: false,
+            params: AdaptiveParams::default(),
         }
     }
 
@@ -239,5 +292,88 @@ mod tests {
         assert!(COST_MARGIN < 1.0);
         assert!(C_RETRY >= 2.0 && C_RETRY <= 4.0);
         assert!((TAU_VERY_HIGH - 0.75).abs() < f64::EPSILON);
+        let p = AdaptiveParams::default();
+        assert!((p.d_wait - D_WAIT).abs() < f64::EPSILON);
+        assert!((p.d_early - D_EARLY).abs() < f64::EPSILON);
+        assert!((p.tau_revoke - TAU_REVOKE).abs() < f64::EPSILON);
+    }
+
+    // --- P0/P1 extended matrix ---
+
+    #[test]
+    fn program_fanout_wait_via_pi_not_hotset_gate() {
+        // HotSet absent is represented as fanout_hint=false; with high P still Wait via π.
+        let a = choose_action(ctx_v3(0.80, true, false, None, false, true, false, None));
+        assert_eq!(a, ResolveAction::WaitHard);
+        // With fanout_hint (HotSet member) and moderate P → Wait.
+        let a2 = choose_action(ctx_v3(0.3, true, false, None, false, true, true, None));
+        assert_eq!(a2, ResolveAction::WaitHard);
+    }
+
+    #[test]
+    fn hotset_absent_still_specread_or_wait_via_pi() {
+        // Cold ℓ, low P, no fanout → SpecRead (π, not HotSet gate).
+        let a = choose_action(ctx_v3(0.15, true, false, None, false, true, false, None));
+        assert_eq!(a, ResolveAction::SpecRead);
+        // Cold ℓ, late depth → Wait via π without HotSet.
+        let a2 = choose_action(ctx_v3(0.15, true, false, None, false, true, false, Some(0.9)));
+        assert_eq!(a2, ResolveAction::WaitHard);
+    }
+
+    #[test]
+    fn handler_specread() {
+        let a = choose_action(ctx_v3(0.5, true, false, None, false, false, true, Some(0.9)));
+        assert_eq!(a, ResolveAction::SpecRead);
+    }
+
+    #[test]
+    fn waw_spine_suppresses_waithard() {
+        let mut c = ctx_v3(0.3, true, false, None, false, true, true, Some(0.9));
+        c.waw_spine_hint = true;
+        assert_eq!(choose_action(c), ResolveAction::SpecRead);
+        // Even very-high P safety path is suppressed on WAW spine.
+        let mut c2 = ctx_v3(0.90, true, false, None, false, true, true, None);
+        c2.waw_spine_hint = true;
+        assert_eq!(choose_action(c2), ResolveAction::SpecRead);
+    }
+
+    #[test]
+    fn bind_when_ready() {
+        let v = TxVersion {
+            tx_idx: 1,
+            tx_incarnation: 0,
+        };
+        let a = choose_action(ctx_v3(
+            0.4,
+            true,
+            true,
+            Some(v.clone()),
+            true,
+            true,
+            true,
+            None,
+        ));
+        assert_eq!(a, ResolveAction::Bind(v));
+    }
+
+    #[test]
+    fn early_abort_candidate_flagged_not_armed() {
+        let mut c = ctx_v3(0.3, true, false, None, false, true, true, Some(0.10));
+        c.tx_heavy_hint = true;
+        assert!(early_abort_candidate(&c));
+        // Production still WaitHard (P3 not armed).
+        assert_eq!(choose_action(c), ResolveAction::WaitHard);
+    }
+
+    #[test]
+    fn morph_quiet_does_not_force_wait() {
+        let mut c = ctx_v3(0.2, true, false, None, false, true, false, None);
+        c.morph_weights = MorphWeights {
+            fan_out: 0.05,
+            mixed: 0.10,
+            waw_spine: 0.05,
+            quiet: 0.80,
+        };
+        assert_eq!(choose_action(c), ResolveAction::SpecRead);
     }
 }

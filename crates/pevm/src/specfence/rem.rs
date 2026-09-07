@@ -1062,6 +1062,11 @@ impl RemCounters {
         self.effects.fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    /// Best-effort global effect counter as SoftWait `k` when per-tx ordinal unavailable.
+    pub(crate) fn effect_ordinal_hint(&self) -> u64 {
+        self.effects.load(Ordering::Relaxed) as u64
+    }
+
     pub(crate) fn note_checkpoint_opportunity(&self) {
         self.checkpoint_opportunities
             .fetch_add(1, Ordering::Relaxed);

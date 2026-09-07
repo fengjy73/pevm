@@ -8,8 +8,8 @@
 //! (`lean_mode_txs=0` on mainnet).
 //!
 //! ## Location policy
-//! HotLocal Bind/WaitHard/park applies only for `ℓ ∈ HotSet` (see `hotset.rs`).
-//! Cold locations always SpecRead (OCC-style). WaitHard is forbidden off HotSet.
+//! HotSet is a fanout/tracking **hint** for `choose_action` (see `hotset.rs`).
+//! Cold locations default SpecRead via π; WaitHard is **not** forbidden off HotSet (P0).
 //!
 //! ## Mid-block
 //! On abort_rate ≥ τ_abort_mid (0.08), ensure abort locations land in HotSet

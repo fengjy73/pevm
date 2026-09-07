@@ -6,8 +6,9 @@
 //! 3. Process prior: sustained multi-writer mass for ℓ above threshold
 //!    (needs repeated reinforcement; decays when unseen so wide blocks stay lean).
 //!
-//! Control law v3: HotSet is a **fanout / tracking cache hint** for `choose_action`,
+//! Control law v3 / P0: HotSet is a **fanout / tracking cache hint** for `choose_action`,
 //! not a hard Wait gate (handler / cold locs still SpecRead via π).
+//! Inter-block prior may seed membership for dense tracking only — never SoftWait.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -95,6 +96,20 @@ impl HotSet {
     #[inline]
     pub(crate) fn contains(&self, location: MemoryLocationHash) -> bool {
         self.members.contains_key(&location)
+    }
+
+    /// Distinct writers observed for ℓ this block (live WAW / fanout feature).
+    #[inline]
+    pub(crate) fn writer_count(&self, location: MemoryLocationHash) -> usize {
+        self.writers
+            .get(&location)
+            .map(|e| e.txs.len())
+            .unwrap_or(0)
+    }
+
+    /// Seed dense tracking from inter-block prior (P1). Never arms SoftWait.
+    pub(crate) fn track_from_prior(&self, location: MemoryLocationHash) {
+        self.members.insert(location, ());
     }
 
     #[inline]

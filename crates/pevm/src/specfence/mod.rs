@@ -21,8 +21,11 @@
 //! M2: WaitHard parks (tx-level) + ready-queue steal (lower TxIdx first); worker never spins.
 //! M3: online WŜ/RŜ prior → Bind-before-touch on first incarnation when writer version known.
 //! M4 (superseded by Adaptive CC R1): lean thresholds that never fired on mainnet.
-//! Adaptive CC R0–R2 + control law v3: HotSet is a fanout/tracking **hint** only;
-//! `choose_action` decides Bind/WaitHard/SpecRead (program fanout / handler SpecRead).
+//! Adaptive CC R0–R2 + control law v3 + P0/P1/P2:
+//! HotSet = fanout/tracking **hint** only (no WaitHard gate).
+//! Account Wait is diagnostic-only on SpecFence (conflict key = MemoryLocation).
+//! FenceGraph SoftWait is source of truth; RegionTable Wait bits are mirrors.
+//! Dual-horizon learner fills PolicyCtx; `choose_action` is the only π choke point.
 //! Inspect/jump off unless `SPECFENCE_ENABLE_INSPECT=1`.
 
 use crate::{
@@ -41,6 +44,7 @@ mod dag;
 mod finegrain;
 mod heat;
 mod hotset;
+mod learner;
 mod metrics;
 mod region;
 mod rem;
@@ -52,7 +56,10 @@ pub(crate) use hotset::HotSet;
 #[allow(unused_imports)]
 pub(crate) use hotset::{H_A, H_W};
 pub(crate) use prior::RwPriorMap;
-pub(crate) use dag::SpecDag;
+pub(crate) use dag::{FenceGraph, SpecDag};
+pub(crate) use learner::{
+    AdaptiveParams, InterBlockPrior, LiveLearner, MorphWeights, TopLocPrior,
+};
 pub(crate) use heat::HeatMap;
 pub(crate) use metrics::MetricsInner;
 pub use metrics::SpecFenceMetrics;
@@ -174,8 +181,12 @@ pub(crate) struct SpecFenceCtx<'a> {
     pub rw_prior: &'a RwPriorMap,
     /// M4/R1 adaptive lean engagement (SpecFence only).
     pub engagement: &'a AdaptiveEngagement,
-    /// R1 location-local HotSet (WaitHard/Bind only for members).
+    /// R1 location-local HotSet (fanout/tracking hint only).
     pub hotset: &'a HotSet,
+    /// P1 dual-horizon live learner (morph / fanout).
+    pub learner: &'a LiveLearner,
+    /// P1 tunable π constants.
+    pub params: &'a AdaptiveParams,
     /// Opt-in lab fine-grain OCC/RW tracer (None = disabled, zero cost).
     pub finegrain: Option<&'a crate::specfence::FineGrainCollector>,
 }
@@ -188,32 +199,10 @@ impl<'a> SpecFenceCtx<'a> {
         if self.mode == ConcurrencyMode::Pcc {
             return true;
         }
-        // R1: account-level Wait only when Basic(address) ∈ HotSet (no block-wide Wait).
-        let basic = hash_deterministic(MemoryLocation::Basic(*address));
-        if !self.hotset.contains(basic) {
-            return false;
-        }
-        // SpecFence: revoke sticky account Wait when posterior low.
-        if regions.account_mode(address) == RegionMode::Wait {
-            if self.bayes.should_revoke(
-                hash_deterministic(MemoryLocation::Basic(*address)),
-                Some(address),
-            ) {
-                if regions.clear_account_wait(*address) {
-                    self.metrics.record_soft_edge_revoke();
-                }
-                return false;
-            }
-            return true;
-        }
-        if self.bayes.decide_account(address, self.tau) == RegionMode::Wait {
-            self.metrics.record_bayes_wait();
-            self.bayes.note_wait_decision_account(address);
-            true
-        } else {
-            self.metrics.record_bayes_speculate();
-            false
-        }
+        // P0: SpecFence conflict key = MemoryLocation only. Account Wait is
+        // diagnostic-only — never a control authority (no promotions / no Wait).
+        let _ = (regions, address);
+        false
     }
 
     /// Location-granularity Wait via cost-aware π with revokeable sticky flags.
@@ -231,10 +220,8 @@ impl<'a> SpecFenceCtx<'a> {
         if self.mode == ConcurrencyMode::Pcc {
             return true;
         }
-        // R1: WaitHard forbidden for ℓ ∉ HotSet.
-        if !self.hotset.contains(location) {
-            return false;
-        }
+        // P0: HotSet is fanout/tracking hint only — no hard Wait gate.
+        // Cold ℓ still flows through choose_action (SpecRead default) on SpecFence path.
         // Revoke sticky Wait when posterior < τ_revoke.
         if regions.location_mode(location) == RegionMode::Wait
             || self.dag.is_wait(location)
@@ -307,12 +294,15 @@ impl<'a> SpecFenceCtx<'a> {
         is_program: bool,
         fanout_hint: bool,
         gross_work_depth: Option<f64>,
+        waw_spine_hint: bool,
+        tx_heavy_hint: bool,
     ) -> ResolveAction {
         let posterior_conflict = self.bayes.conflict_probability(location, Some(address));
         let posterior_bind = self.bayes.bind_useful_probability(location)
             .max(self.rw_prior.write_confidence(location));
         // M3: residual / process prior makes a published version a Bind placeholder.
         let prior = residual_predicts || prior_ws_predicts;
+        let morph_weights = self.learner.morph_weights();
         let ctx = PolicyCtx {
             location,
             writer_known: writer.is_some(),
@@ -327,15 +317,29 @@ impl<'a> SpecFenceCtx<'a> {
             is_program,
             fanout_hint,
             gross_work_depth,
+            morph_weights,
+            waw_spine_hint,
+            tx_heavy_hint,
+            params: *self.params,
         };
         let action = choose_action(ctx);
         match &action {
             ResolveAction::WaitHard => {
                 self.metrics.record_cost_chose_wait();
+                if is_program {
+                    self.metrics.record_cost_chose_wait_program();
+                } else {
+                    self.metrics.record_cost_chose_wait_handler();
+                }
                 self.bayes.note_cost_decision_posterior(posterior_conflict, true);
             }
             ResolveAction::SpecRead => {
                 self.metrics.record_cost_chose_spec();
+                if is_program {
+                    self.metrics.record_cost_chose_spec_program();
+                } else {
+                    self.metrics.record_cost_chose_spec_handler();
+                }
                 self.bayes.note_cost_decision_posterior(posterior_conflict, false);
             }
             ResolveAction::Bind(_) => {
@@ -363,7 +367,8 @@ impl<'a> SpecFenceCtx<'a> {
         }
     }
 
-    /// Promote location to Wait; bump wave on new flip. Also mirrors into Ĝ.
+    /// Promote location Wait **mirror** (FenceGraph SoftWait remains authority for arms).
+    /// Abort/conflict densifies tracking; does not arm SoftWait by itself.
     pub(crate) fn promote_from_bayes(
         &self,
         regions: &RegionTable,
@@ -371,6 +376,7 @@ impl<'a> SpecFenceCtx<'a> {
         address: Option<Address>,
     ) -> bool {
         let promoted = regions.promote_location(location);
+        // Mirror only — SoftWait arms come from choose_action→WaitHard→arm_soft.
         let _ = self.dag.set_wait(location);
         if promoted {
             self.metrics.record_promotion(address);
@@ -382,24 +388,40 @@ impl<'a> SpecFenceCtx<'a> {
         }
     }
 
-    /// Attempt revoke of sticky Wait when posterior dropped.
+    /// Unified SoftWait revoke: τ_revoke and/or morph quiet|waw.
+    pub(crate) fn try_revoke_unified(
+        &self,
+        regions: &RegionTable,
+        location: crate::MemoryLocationHash,
+        address: Option<&Address>,
+    ) -> bool {
+        let morph = self.learner.morph_weights();
+        let morph_revoke = morph.dominant_quiet() || morph.dominant_waw();
+        let bayes_revoke = self.bayes.should_revoke(location, address);
+        if !bayes_revoke && !morph_revoke {
+            return false;
+        }
+        // Only morph-revoke SoftWaits when posterior is also not insisting on Wait,
+        // or when quiet/waw dominates (schedule/steal ≫ sticky Wait).
+        if morph_revoke || bayes_revoke {
+            let cleared_region = regions.clear_location_wait(location);
+            let cleared_fence = self.dag.clear(location) > 0 || self.dag.clear_wait(location);
+            if cleared_region || cleared_fence {
+                self.metrics.record_soft_edge_revoke();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Attempt revoke of sticky Wait when posterior dropped (delegates to unified).
     pub(crate) fn try_revoke(
         &self,
         regions: &RegionTable,
         location: crate::MemoryLocationHash,
         address: Option<&Address>,
     ) -> bool {
-        if !self.bayes.should_revoke(location, address) {
-            return false;
-        }
-        let cleared_region = regions.clear_location_wait(location);
-        let cleared_dag = self.dag.clear_wait(location);
-        if cleared_region || cleared_dag {
-            self.metrics.record_soft_edge_revoke();
-            true
-        } else {
-            false
-        }
+        self.try_revoke_unified(regions, location, address)
     }
 }
 
@@ -420,8 +442,9 @@ pub(crate) fn seed_wait_regions(
         if address == beneficiary {
             continue;
         }
-        let wait = mode == ConcurrencyMode::Pcc
-            || bayes.decide_account(&address, tau) == RegionMode::Wait;
+        // P0: SpecFence never seeds account Wait (conflict key = ℓ only).
+        let wait = mode == ConcurrencyMode::Pcc;
+        let _ = (bayes, tau);
         if wait {
             regions.seed_account_wait(address);
             regions.promote_location(hash_deterministic(MemoryLocation::Basic(address)));

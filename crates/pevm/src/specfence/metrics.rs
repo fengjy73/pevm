@@ -145,6 +145,16 @@ pub struct SpecFenceMetrics {
     pub hot_local_reads: usize,
     /// R1: |HotSet| at block end.
     pub hotset_size: usize,
+    /// P0/P2: SoftWait arms created (FenceGraph.arm_soft).
+    pub soft_wait_arms: usize,
+    /// P0: cost π WaitHard on program locations.
+    pub cost_chose_wait_program: usize,
+    /// P0: cost π WaitHard on handler locations (should stay ~0).
+    pub cost_chose_wait_handler: usize,
+    /// P0: cost π SpecRead on program locations.
+    pub cost_chose_spec_program: usize,
+    /// P0: cost π SpecRead on handler locations.
+    pub cost_chose_spec_handler: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -205,6 +215,11 @@ pub(crate) struct MetricsInner {
     engagement_switches: AtomicUsize,
     hot_local_reads: AtomicUsize,
     hotset_size: AtomicUsize,
+    soft_wait_arms: AtomicUsize,
+    cost_chose_wait_program: AtomicUsize,
+    cost_chose_wait_handler: AtomicUsize,
+    cost_chose_spec_program: AtomicUsize,
+    cost_chose_spec_handler: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -340,6 +355,30 @@ impl MetricsInner {
 
     pub(crate) fn record_cost_chose_bind(&self) {
         self.cost_chose_bind.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_soft_wait_arm(&self) {
+        self.soft_wait_arms.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_soft_wait_arms(&self, n: usize) {
+        self.soft_wait_arms.store(n, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_cost_chose_wait_program(&self) {
+        self.cost_chose_wait_program.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_cost_chose_wait_handler(&self) {
+        self.cost_chose_wait_handler.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_cost_chose_spec_program(&self) {
+        self.cost_chose_spec_program.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_cost_chose_spec_handler(&self) {
+        self.cost_chose_spec_handler.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Fresh EVM session / interpreter start from tx head (plant v2 L1 denominator).
@@ -590,6 +629,11 @@ impl MetricsInner {
             engagement_switches: self.engagement_switches.load(Ordering::Relaxed),
             hot_local_reads: self.hot_local_reads.load(Ordering::Relaxed),
             hotset_size: self.hotset_size.load(Ordering::Relaxed),
+            soft_wait_arms: self.soft_wait_arms.load(Ordering::Relaxed),
+            cost_chose_wait_program: self.cost_chose_wait_program.load(Ordering::Relaxed),
+            cost_chose_wait_handler: self.cost_chose_wait_handler.load(Ordering::Relaxed),
+            cost_chose_spec_program: self.cost_chose_spec_program.load(Ordering::Relaxed),
+            cost_chose_spec_handler: self.cost_chose_spec_handler.load(Ordering::Relaxed),
         }
     }
 }

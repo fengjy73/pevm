@@ -356,16 +356,37 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return Ok(());
         }
 
-        // --- SpecFence path (control law v3) ---
-        if address == self.specfence.beneficiary {
+        // --- SpecFence path (control law v3 + P0/P1/P2) ---
+        if address == self.specfence.beneficiary || self.is_lazy {
+            // Beneficiary / basic_lazy never SoftWait.
             self.specfence.metrics.record_spec_read();
             return Ok(());
         }
         // HotSet = fanout / tracking cache hint only — not a hard Wait gate.
-        let fanout_hint = self.specfence.hotset.contains(location_hash);
-        if fanout_hint {
+        let hotset_hint = self.specfence.hotset.contains(location_hash);
+        if hotset_hint {
             self.specfence.hotset.record_hot_local_read();
         }
+        let writer_count = self
+            .specfence
+            .hotset
+            .writer_count(location_hash)
+            .max(self.specfence.learner.writer_count_live(location_hash));
+        // P1: refresh live learner features before π.
+        self.specfence
+            .learner
+            .note_observe(location_hash, is_program, writer_count);
+        let live_fanout = self.specfence.learner.fanout_live(location_hash);
+        let fanout_hint = hotset_hint || live_fanout >= 8;
+        let waw_spine_hint = self.specfence.learner.waw_spine_hint(
+            location_hash,
+            is_program,
+            self.specfence.params,
+        );
+        let tx_heavy_hint = self
+            .specfence
+            .learner
+            .tx_heavy_hint(self.tx.gas_limit, self.specfence.params);
 
         let residual_predicts = self
             .mv_memory
@@ -399,8 +420,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
             .partial_retry
             .must_force_bind(self.tx_idx, location_hash);
 
-        // Revoke sticky Wait when posterior < τ_revoke (side effects only).
-        // v6: sticky no longer forces WaitHard — cost-aware π decides.
+        // Unified revoke: τ_revoke + morph quiet/waw (side effects only).
         let _ = self.specfence.try_revoke(
             &self.mv_memory.regions,
             location_hash,
@@ -430,6 +450,8 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 is_program,
                 fanout_hint,
                 None, // gross-work depth requires inspect; production default omits
+                waw_spine_hint,
+                tx_heavy_hint,
             );
             // Safety valve only: escalate SpecRead when P is very high.
             // (Old EarlyVal@0.35 WaitHard bias removed — cost model owns π.)
@@ -456,7 +478,18 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     && !self.specfence.scheduler.is_done(prev)
                 {
                     self.specfence.metrics.record_wait(address);
-                    self.specfence.dag.note_soft_wait(location_hash, self.tx_idx);
+                    // P2: FenceGraph SoftWait is source of truth (k=effect ordinal best-effort).
+                    let k = self.specfence.rem.effect_ordinal_hint();
+                    if self.specfence.dag.arm_soft(
+                        location_hash,
+                        self.tx_idx,
+                        k,
+                        Some(prev),
+                    ) {
+                        self.specfence.metrics.record_soft_wait_arm();
+                    }
+                    // Mirror RegionTable Wait bit (facade).
+                    let _ = self.mv_memory.regions.promote_location(location_hash);
                     self.specfence
                         .wave
                         .set_pending_park_location(location_hash);
@@ -498,6 +531,15 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 if !self.specfence.scheduler.is_done(v.tx_idx) {
                     self.specfence.metrics.record_wait_hard();
                     self.specfence.metrics.record_wait(address);
+                    let k = self.specfence.rem.effect_ordinal_hint();
+                    if self.specfence.dag.arm_soft(
+                        location_hash,
+                        self.tx_idx,
+                        k,
+                        Some(v.tx_idx),
+                    ) {
+                        self.specfence.metrics.record_soft_wait_arm();
+                    }
                     self.specfence
                         .wave
                         .set_pending_park_location(location_hash);

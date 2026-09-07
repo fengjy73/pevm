@@ -11,7 +11,7 @@ use smallvec::SmallVec;
 
 use crate::{
     FinishExecFlags, IncarnationStatus, Task, TxIdx, TxStatus, TxVersion,
-    specfence::WaveParkTable,
+    specfence::{FenceGraph, WaveParkTable},
 };
 
 // The Pevm collaborative scheduler coordinates execution & validation
@@ -245,6 +245,17 @@ impl Scheduler {
         flags: FinishExecFlags,
         wave: Option<&WaveParkTable>,
     ) -> Option<Task> {
+        self.finish_execution_with_wave_fence(tx_version, flags, wave, None)
+    }
+
+    /// SpecFence P2: also clear FenceGraph SoftWaits for the finishing writer.
+    pub(crate) fn finish_execution_with_wave_fence(
+        &self,
+        tx_version: TxVersion,
+        flags: FinishExecFlags,
+        wave: Option<&WaveParkTable>,
+        fence: Option<&FenceGraph>,
+    ) -> Option<Task> {
         let mut tx = index_mutex!(self.transactions_status, tx_version.tx_idx);
         debug_assert_eq!(tx.status, IncarnationStatus::Executing);
         debug_assert_eq!(tx.incarnation, tx_version.tx_incarnation);
@@ -265,6 +276,10 @@ impl Scheduler {
                 // need Ready (should not happen if park always used add_dependency).
                 let _ = waiter;
             }
+        }
+        // P2: FenceGraph SoftWait source of truth — clear arms on Publish/finish.
+        if let Some(fence) = fence {
+            let _ = fence.clear_for_writer(tx_version.tx_idx);
         }
 
         // TODO: Simplify or better document this logic.
