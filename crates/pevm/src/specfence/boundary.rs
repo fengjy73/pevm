@@ -397,6 +397,96 @@ pub(crate) fn jump_is_safe(cont: &ResumeContinuation) -> bool {
     true
 }
 
+/// Iter20 dig: why [`jump_is_safe`] refused (Bind-snap consume diagnosis).
+pub(crate) fn jump_refuse_reason(cont: &ResumeContinuation) -> &'static str {
+    let Some(snap) = cont.jump_snap.as_ref() else {
+        return "no_snap";
+    };
+    if !snap.is_live_capture() {
+        return "not_live";
+    }
+    if cont.valued_blocks_jump {
+        return "valued_blocks";
+    }
+    if !cont.call_outcomes.is_empty() {
+        let has_valued = cont.call_outcomes.iter().any(|c| !c.value.is_zero());
+        if has_valued && cont.write_replays.is_empty() {
+            return "valued_call_no_writes";
+        }
+        if !snap.at_call_boundary {
+            return "call_outcomes_not_boundary";
+        }
+    }
+    if snap.call_depth > 2 {
+        return "call_depth";
+    }
+    if snap.bytecode_len > 0 && snap.pc >= snap.bytecode_len {
+        return "pc_oob";
+    }
+    let has_storage = cont.values.values().any(|v| {
+        matches!(v, crate::specfence::rem::FfValue::Storage { .. })
+    });
+    let has_basic = cont.values.values().any(|v| {
+        matches!(v, crate::specfence::rem::FfValue::Basic { .. })
+    });
+    let has_write_effects = cont.effects.iter().any(|e| e.mode == AccessMode::Write);
+    const MAX_TINY: usize = 256;
+    const MAX_STORAGE: usize = 24_576;
+    if snap.bytecode_len > MAX_TINY {
+        if snap.bytecode_len > MAX_STORAGE {
+            return "bytecode_huge";
+        }
+        if !has_storage && !snap.at_call_boundary && cont.write_replays.is_empty() {
+            return "bytecode_no_storage_ff";
+        }
+    }
+    if cont.cp.k == 0 && cont.effects.is_empty() && snap.opcode_steps == 0 {
+        return "empty_cp0";
+    }
+    let max_steps = if !cont.write_replays.is_empty() || !cont.call_outcomes.is_empty() || has_storage {
+        2048u64
+    } else {
+        128u64
+    };
+    if snap.opcode_steps == 0 {
+        return "steps_zero";
+    }
+    if snap.opcode_steps > max_steps {
+        return "steps_over";
+    }
+    if cont.effects.is_empty() {
+        return "effects_empty";
+    }
+    if snap.post_sstore && cont.write_replays.is_empty() {
+        return "post_sstore_no_replays";
+    }
+    if snap.sstore_index > 0 {
+        return "sstore_tip_gates";
+    }
+    if !cont.write_replays.is_empty() {
+        if snap.sstore_index == 0 && !write_prefix_jump_is_safe(cont, snap) {
+            return "write_prefix_unsafe";
+        }
+    } else if has_write_effects {
+        return "write_effects_no_replays";
+    }
+    if !has_basic && !has_storage && cont.write_replays.is_empty() {
+        return "no_ff_values";
+    }
+    if let Some(blob) = cont.journal_blob.as_ref() {
+        if blob.state.values().any(|a| a.is_selfdestructed()) {
+            return "blob_selfdestruct";
+        }
+        if blob.state.values().any(|a| !a.storage.is_empty()) {
+            return "blob_storage_poison";
+        }
+    }
+    if jump_is_safe(cont) {
+        return "ok";
+    }
+    "unknown"
+}
+
 /// M1i: Write-prefix absolute jump is safe only with post-SSTORE gas evidence and
 /// controlled `write_replays` (per-slot journal apply — not present_values dump).
 fn write_prefix_jump_is_safe(cont: &ResumeContinuation, snap: &BoundarySnapshot) -> bool {
@@ -1338,8 +1428,9 @@ pub(crate) fn note_pending_bind_snap() {
 }
 
 /// Env gate: `SPECFENCE_BIND_SNAP=1` enables hang-free Bind/SLOAD snap capture.
-/// Default **off** — capture-without-jump wall-taxes 597/599 (Iter19); absolute jump
-/// behind `SPECFENCE_BIND_SNAP_JUMP=1` hung Lean fixtures (same family as Iter13).
+/// Default **off** — capture-without-jump wall-taxes 597/599 (Iter19). Iter20:
+/// abs jump stays hard-OFF (Storage-FF Bind jump hung 597); credit consume is
+/// hang-free but not an opcode cut. `SPECFENCE_BIND_SNAP_JUMP` is dig-only.
 pub(crate) fn bind_snap_env_enabled() -> bool {
     match std::env::var_os("SPECFENCE_BIND_SNAP") {
         None => false,

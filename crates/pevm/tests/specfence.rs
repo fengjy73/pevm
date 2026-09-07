@@ -1585,6 +1585,91 @@ fn specfence_iter11_handler_multi_sstore_jump_seq_eq_par() {
     let _ = last;
 }
 
+/// Iter20: production Bind-snap consume stays opt-in (SNAP/JUMP OFF).
+/// SLOAD reader/writer RAW conflicts; seq≡par; SoftWait Soft=0; aj=0; bsnap=0.
+#[test]
+fn specfence_iter20_bind_snap_consume_production_off() {
+    let probe = Address::from(U160::from(81));
+    // CALLDATASIZE; ISZERO; PUSH1 read; JUMPI;
+    // write: PUSH1 1; PUSH1 0; SSTORE; STOP;
+    // read JUMPDEST: (PUSH1 0; SLOAD; POP)×6 ; STOP
+    let mut code = Vec::new();
+    code.push(0x36); // CALLDATASIZE
+    code.push(0x15); // ISZERO
+    code.push(0x60);
+    code.push(0x0b); // jump dest = 11
+    code.push(0x57); // JUMPI
+    code.push(0x60);
+    code.push(0x01);
+    code.push(0x60);
+    code.push(0x00);
+    code.push(0x55); // SSTORE
+    code.push(0x00); // STOP
+    assert_eq!(code.len(), 11);
+    code.push(0x5b); // JUMPDEST
+    for _ in 0..6 {
+        code.push(0x60);
+        code.push(0x00);
+        code.push(0x54); // SLOAD
+        code.push(0x50); // POP
+    }
+    code.push(0x00);
+    let bytecode = Bytecode::new_raw(Bytes::from(code));
+    let code_hash = bytecode.hash_slow();
+    let mut state = (0..=60_000).map(common::mock_account).collect::<ChainState>();
+    state.insert(
+        probe,
+        EvmAccount {
+            balance: U256::from(1),
+            nonce: 1,
+            code_hash: Some(code_hash),
+            code: Some(bytecode.clone().into()),
+            storage: Default::default(),
+        },
+    );
+    let mut bytecodes = Bytecodes::default();
+    bytecodes.insert(code_hash, bytecode.into());
+    let mut txs: Vec<TxEnv> = Vec::new();
+    for i in 0..24 {
+        txs.push(TxEnv {
+            caller: Address::from(U160::from(3_100 + i)),
+            nonce: 1,
+            kind: TransactTo::Call(probe),
+            gas_limit: 100_000,
+            gas_price: 1,
+            data: Bytes::from(vec![0x01]),
+            ..TxEnv::default()
+        });
+    }
+    for i in 0..24 {
+        txs.push(TxEnv {
+            caller: Address::from(U160::from(4_100 + i)),
+            nonce: 1,
+            kind: TransactTo::Call(probe),
+            gas_limit: 100_000,
+            gas_price: 1,
+            ..TxEnv::default()
+        });
+    }
+    for i in 0..48 {
+        txs.push(self_transfer(Address::from(U160::from(51_100 + i)), 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+    let width = NonZeroUsize::new(concurrency().get().min(4).max(2)).unwrap();
+    for _ in 0..8 {
+        let (_, m, _) = run_mode_conc(
+            ConcurrencyMode::SpecFence,
+            &storage,
+            txs.clone(),
+            width,
+        );
+        assert_eq!(m.absolute_jump_applied, 0, "production jump OFF: {m:?}");
+        assert_eq!(m.bind_snap_capture, 0, "production SNAP OFF: {m:?}");
+        assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
+        assert_eq!(m.handler_sstore_capture, 0, "stock SSTORE: {m:?}");
+    }
+}
+
 /// M1i-A: write-prefix absolute jump — SSTORE then BALANCE(hot).
 /// Post-SSTORE EffectBoundary snap + write_replays; seq≡par; absolute_jump_applied > 0.
 #[ignore = "R0: M1* inspect/jump research-only (SPECFENCE_ENABLE_INSPECT); hang risk on default path"]

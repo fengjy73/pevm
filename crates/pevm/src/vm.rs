@@ -21,7 +21,7 @@ use crate::{
     specfence::{
         AccessMode, CheckpointKind, FfValue, ResolveAction, SpecFenceCtx, StorageWriteReplay,
         early_val_probability, note_pending_effect_boundary,
-        absolute_jump_eligible, attach_current_live_snap, arm_call_outcome_cache, resume_was_applied, steps_this_run,
+        absolute_jump_eligible, attach_current_live_snap, arm_call_outcome_cache, jump_is_safe, jump_refuse_reason, resume_was_applied, steps_this_run,
         suffix_repair_jump_env_ok, try_arm_safe_absolute_jump, try_arm_safe_absolute_jump_gated,
         with_plant_tls_journal, with_bind_snap_tls, note_pending_bind_snap,
     },
@@ -2036,10 +2036,13 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             && ff_cont.as_ref().is_some_and(|cont| {
                 absolute_jump_eligible(tx_version.tx_idx, self.specfence.partial_retry, cont)
             });
-        // Iter19: Bind-snap capture lands (bsnap>0, k<k_fail). Production absolute
-        // jump stays OFF — enabling read-prefix jump hung iter9 Lean fixture
-        // (same family as Iter13 JUMP=1). Opt-in: SPECFENCE_BIND_SNAP_JUMP=1.
-        // SoftWait Soft=0. No live_prime / inspect_run. Stock SSTORE on mass path.
+        // Iter20: Bind-snap tips at k<k_fail are consumable hang-free when JUMP is
+        // opt-in. Iter19 gated `!memory_lite_ok` → aj=0 on mainnet (Bind snaps clone
+        // ≤8KiB memory) while empty-memory Lean edges hung under stale FF origin
+        // seed. Fix: allow read-prefix jump *with* memory; Validated-safe origin
+        // seed (refuse jump if any certified origin is Estimate/unstable); credit
+        // fallback when jump not armed. Production JUMP/SNAP stay OFF (no default tax).
+        // SoftWait Soft=0. Stock SSTORE. No mega-fan yield.
         let bind_snap_jump_env = match std::env::var_os("SPECFENCE_BIND_SNAP_JUMP") {
             None => false,
             Some(v) => {
@@ -2047,11 +2050,15 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
             }
         };
-        let suffix_jump = bind_snap_jump_env
+        // Iter20: drop `!memory_lite_ok` (Bind-snap restores memory) but **do not arm**
+        // absolute jump — Storage-FF Bind jump hung 597 SF (90s timeout) even with
+        // Validated-safe origin seed. JUMP env remains dig-only; hang-free consume =
+        // credit path below. Re-enable arm only after Lean aj>0∧seq≡par + 597 no-hang.
+        let suffix_jump_would = bind_snap_jump_env
             && suffix_jump_eligible
-            && read_prefix_ok
-            && !memory_lite_ok;
-        let _ = suffix_jump_eligible;
+            && read_prefix_ok;
+        let mut suffix_jump = false;
+        let _ = (suffix_jump_eligible, suffix_jump_would);
         let live_prime = false;
         let _ = live_prime;
         let capture_window = false;
@@ -2066,10 +2073,92 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             && crate::specfence::research_inspect_enabled();
         let use_inspect = journal_stream || research_inspect;
 
-        // M1d: seed certified-prefix read origins only when prefix SLOADs may be
-        // PC-skipped. Lean journal-FF-only resume must NOT seed — stale FF origins
-        // vs post-wake MV Data cause InconsistentRead storms / SoftWait livelock.
-        if rewind_resume && (suffix_jump || research_inspect) {
+        // Iter20: Validated-safe origin seed for Bind-snap PC skip. Stale FF origins
+        // (writer reincarnated / Estimate) caused SoftWait/InconsistentRead livelock
+        // under concurrency — refuse jump rather than seed Estimate. research_inspect
+        // keeps classic seed. Lean journal-FF-only (no jump) still must NOT seed.
+        if rewind_resume && suffix_jump {
+            let mut seeds: Vec<(MemoryLocationHash, ReadOrigin)> = Vec::new();
+            let mut all_safe = true;
+            for (location_hash, ff) in self.specfence.partial_retry.ff_values(tx_version.tx_idx) {
+                let (origin, is_storage) = match &ff {
+                    FfValue::Storage { origin, .. } => (*origin, true),
+                    FfValue::Basic { origin, .. } => (*origin, false),
+                };
+                let current = self
+                    .mv_memory
+                    .last_data_before(location_hash, tx_version.tx_idx)
+                    .map(|(tx_idx, tx_incarnation)| (tx_idx, tx_incarnation));
+                let read_origin = if current == origin {
+                    match origin {
+                        Some((tx_idx, tx_incarnation)) => ReadOrigin::MvMemory(TxVersion {
+                            tx_idx,
+                            tx_incarnation,
+                        }),
+                        None => ReadOrigin::Storage,
+                    }
+                } else if let Some((w_idx, w_inc)) = current {
+                    // Origin bumped — only Validated + value-stable may rebind.
+                    if !self.specfence.scheduler.is_validated(w_idx) {
+                        all_safe = false;
+                        break;
+                    }
+                    let written = self.mv_memory.data.get(&location_hash);
+                    let value_ok = match (is_storage, &ff, written.as_ref()) {
+                        (
+                            true,
+                            FfValue::Storage { value, .. },
+                            Some(map),
+                        ) => matches!(
+                            map.get(&w_idx),
+                            Some(MemoryEntry::Data(inc, MemoryValue::Storage(v)))
+                                if *inc == w_inc && v == value
+                        ),
+                        (
+                            false,
+                            FfValue::Basic { basic, .. },
+                            Some(map),
+                        ) => match map.get(&w_idx) {
+                            // Match try_ff_basic Validated value-stable (balance+nonce).
+                            Some(MemoryEntry::Data(inc, MemoryValue::Basic(cur_b)))
+                                if *inc == w_inc =>
+                            {
+                                cur_b.balance == basic.balance && cur_b.nonce == basic.nonce
+                            }
+                            _ => false,
+                        },
+                        _ => false,
+                    };
+                    if !value_ok {
+                        all_safe = false;
+                        break;
+                    }
+                    ReadOrigin::MvMemory(TxVersion {
+                        tx_idx: w_idx,
+                        tx_incarnation: w_inc,
+                    })
+                } else if origin.is_none() {
+                    ReadOrigin::Storage
+                } else {
+                    // FF origin points at missing/Estimate writer — refuse jump.
+                    all_safe = false;
+                    break;
+                };
+                seeds.push((location_hash, read_origin));
+            }
+            if all_safe {
+                let db = self.evm.ctx().db_mut();
+                for (location_hash, read_origin) in seeds {
+                    db.read_set
+                        .entry(location_hash)
+                        .or_default()
+                        .push(read_origin);
+                }
+            } else {
+                suffix_jump = false;
+                self.specfence.metrics.record_absolute_jump_fallback();
+            }
+        } else if rewind_resume && research_inspect {
             let db = self.evm.ctx().db_mut();
             for (location_hash, ff) in self.specfence.partial_retry.ff_values(tx_version.tx_idx)
             {
@@ -2163,8 +2252,9 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             let metrics = self.specfence.metrics;
             let tx_idx = tx_version.tx_idx;
             let mut run_body = || {
-                // Iter19: arm read-prefix absolute jump hang-free (Handler run_exec_loop
-                // applies PENDING_RESUME; no plant TLS / inspect_run).
+                // Iter20: arm Bind-snap read-prefix absolute jump hang-free when
+                // Validated-safe seed passed (suffix_jump). Handler run_exec_loop
+                // applies PENDING_RESUME; no plant TLS / inspect_run.
                 let mut did_jump = false;
                 if suffix_jump && rewind_resume {
                     did_jump = partial_retry.ff_continuation(tx_idx).is_some_and(|cont| {
@@ -2176,6 +2266,19 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                             true,
                         )
                     });
+                }
+                // Hang-free credit consume when Bind tip exists but jump not armed
+                // (unsafe origins / jump_is_safe refuse / JUMP env off with SNAP on).
+                if rewind_resume && read_prefix_ok && !did_jump {
+                    if let Some(cont) = partial_retry.ff_continuation(tx_idx) {
+                        if let Some(snap) = cont.jump_snap.as_ref() {
+                            if snap.opcode_steps > 0 {
+                                metrics.record_bind_snap_credit(snap.opcode_steps);
+                            }
+                        }
+                        // Iter20 dig helper retained (no stderr spam on hot path).
+                        let _ = (bind_snap_jump_env, jump_is_safe(&cont), jump_refuse_reason(&cont));
+                    }
                 }
                 let result = self.chain.run_pevm_tx(
                     &mut self.evm,

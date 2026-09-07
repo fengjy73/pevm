@@ -241,7 +241,7 @@ fn main() {
                 aborts_v.push(aborts as f64);
                 if iters == 1 || i + 1 == iters {
                     println!(
-                        "  block={bn} mode={mode:10} iter={}/{} ok={ok} tps={tps:.0} wall_ms={wall_ms:.1} soft={soft} wait_hard={wh} abort_rate={:.3} lean={} evm={} reexec={} fb_reabort={} fra={} sra={} sb_res={} sb_def={} hsstore={} bsnap={} sb_clique={} jdef={} aj={} rebind={} ffc={} fvd={} fab={} cold={} occ_fast={} steal={} park_k={} mw_ms={:.1} h_ms={:.1} v_ms={:.1} park_ms={:.1} sw_ms={:.1} ea_ms={:.1} bo_ms={:.1} parks={}",
+                        "  block={bn} mode={mode:10} iter={}/{} ok={ok} tps={tps:.0} wall_ms={wall_ms:.1} soft={soft} wait_hard={wh} abort_rate={:.3} lean={} evm={} reexec={} fb_reabort={} fra={} sra={} sb_res={} sb_def={} hsstore={} bsnap={} bcredit={} sb_clique={} jdef={} aj={} rebind={} ffc={} fvd={} fab={} cold={} occ_fast={} steal={} park_k={} mw_ms={:.1} h_ms={:.1} v_ms={:.1} park_ms={:.1} sw_ms={:.1} ea_ms={:.1} bo_ms={:.1} parks={}",
                         i + 1,
                         iters,
                         if n == 0 { 0.0 } else { aborts as f64 / n as f64 },
@@ -255,6 +255,7 @@ fn main() {
                         m.serial_barrier_defer,
                         m.handler_sstore_capture,
                         m.bind_snap_capture,
+                        m.bind_snap_credit,
                         m.serial_barrier_clique,
                         m.jump_defer,
                         m.absolute_jump_applied,
@@ -339,6 +340,7 @@ fn main() {
                     row["serial_barrier_defer"] = serde_json::json!(m.serial_barrier_defer);
                     row["handler_sstore_capture"] = serde_json::json!(m.handler_sstore_capture);
                     row["bind_snap_capture"] = serde_json::json!(m.bind_snap_capture);
+                    row["bind_snap_credit"] = serde_json::json!(m.bind_snap_credit);
                     row["serial_barrier_clique"] = serde_json::json!(m.serial_barrier_clique);
                 }
             }

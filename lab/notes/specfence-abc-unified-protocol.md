@@ -184,3 +184,11 @@ SoftWait Soft=0; 597 N5 ~14.9 / N10 ~16.3 under high load.
 See `specfence-abc-iter19-status.md`. Iter 20 cause: hang-free Bind-snap consume
 ≠ full abs jump, or fix jump hang with seq≡par, or 599-safe critical-path
 without yield-deepening.
+
+### Iter 20 — Bind-snap consume: credit hang-free; jump falsified
+Hang-free credit consume of Bind tips (`bcredit`) with SNAP opt-in; abs jump
+hard-OFF — Storage-FF Bind jump hung 597 even after dropping `!memory_lite_ok` +
+Validated-safe origin seed. Basic-only tips refuse (`bytecode_no_storage_ff`).
+SoftWait Soft=0; production SNAP OFF (no default tax). 597 N5 ~15.1 under load.
+See `specfence-abc-iter20-status.md`. Iter 21 cause: minimal Storage-FF Bind jump
+hang repro (seq≡par) or non-jump opcode cut / 599-safe critical-path.
