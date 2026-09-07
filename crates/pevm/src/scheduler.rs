@@ -223,13 +223,26 @@ impl Scheduler {
     /// Park→steal: wave ready first, then one cautious `execution_idx` fetch_add.
     /// Counts `ready_steal_on_wait` only for Execution steals (not validation).
     pub(crate) fn next_task_steal_after_park(&self, wave: &WaveParkTable) -> Option<Task> {
+        self.next_task_steal_after_park_prefer(wave, None)
+    }
+
+    pub(crate) fn next_task_steal_after_park_prefer(
+        &self,
+        wave: &WaveParkTable,
+        prefer: Option<TxIdx>,
+    ) -> Option<Task> {
+        if let Some(idx) = prefer
+            && let Some(tx_version) = self.try_execute(idx)
+        {
+            wave.note_ready_steal_if_after_park();
+            return Some(Task::Execution(tx_version));
+        }
         while let Some(tx_idx) = wave.pop_ready() {
             if let Some(tx_version) = self.try_execute(tx_idx) {
                 wave.note_ready_steal_if_after_park();
                 return Some(Task::Execution(tx_version));
             }
         }
-        // One collaborative execution attempt — no whole-block scan / no tip CAX stampede.
         let idx = self.execution_idx.fetch_add(1, Ordering::Relaxed);
         if let Some(tx_version) = self.try_execute(idx) {
             wave.note_ready_steal_if_after_park();

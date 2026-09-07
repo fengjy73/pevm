@@ -1599,7 +1599,8 @@ pub(crate) enum ParkKind {
     SoftWaitSoft = 0,
     /// P3 EarlyAbort Blocking (no SoftWait arm).
     EarlyAbort = 1,
-    /// Cold/hint WaitHard, ESTIMATE Blocking, or validation Blocking without Soft arm.
+    /// ESTIMATE / aborted-incarnation / nonce Blocking (no SoftWait arm). Cold
+    /// account-hint WaitHard was converted to SpecRead (BlockingOther cut).
     #[default]
     BlockingOther = 2,
 }

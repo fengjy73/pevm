@@ -965,6 +965,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
                 match iter.next_back() {
                     Some((blocking_idx, MemoryEntry::Estimate)) => {
                         self.promote_on_conflict(address, location_hash);
+                        if self.specfence.mode == crate::ConcurrencyMode::SpecFence { self.specfence.wave.set_pending_park_location(location_hash); }
                         return Err(ReadError::Blocking(*blocking_idx));
                     }
                     Some((closest_idx, MemoryEntry::Data(tx_incarnation, value))) => {
@@ -973,6 +974,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
                             .is_aborted_incarnation(*closest_idx, *tx_incarnation)
                         {
                             self.promote_on_conflict(address, location_hash);
+                            if self.specfence.mode == crate::ConcurrencyMode::SpecFence { self.specfence.wave.set_pending_park_location(location_hash); }
                             return Err(ReadError::Blocking(*closest_idx));
                         }
                         self.specfence.metrics.record_db_heavy_op();
@@ -1231,6 +1233,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
                         .is_aborted_incarnation(*closest_idx, *tx_incarnation)
                     {
                         self.promote_on_conflict(address, location_hash);
+                        if self.specfence.mode == crate::ConcurrencyMode::SpecFence { self.specfence.wave.set_pending_park_location(location_hash); }
                         return Err(ReadError::Blocking(*closest_idx));
                     }
                     self.specfence.metrics.record_db_heavy_op();
@@ -1261,6 +1264,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
                 }
                 MemoryEntry::Estimate => {
                     self.promote_on_conflict(address, location_hash);
+                    if self.specfence.mode == crate::ConcurrencyMode::SpecFence { self.specfence.wave.set_pending_park_location(location_hash); }
                     return Err(ReadError::Blocking(*closest_idx));
                 }
                 _ => return Err(ReadError::InvalidMemoryValueType),

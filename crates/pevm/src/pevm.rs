@@ -831,7 +831,7 @@ impl Pevm {
                     }
                     // Park→steal: immediately try ready work before returning to outer loop.
                     if let Some(wave) = wave {
-                        if let Some(stolen) = scheduler.next_task_steal_after_park(wave) {
+                        if let Some(stolen) = scheduler.next_task_steal_after_park_prefer(wave, Some(blocking_tx_idx)) {
                             return Some(stolen);
                         }
                     }
