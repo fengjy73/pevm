@@ -292,6 +292,7 @@ fn main() {
                     "resume_count": m.resume_count,
                     "journal_ff_entries": m.journal_ff_entries,
                     "journal_ff_hits": m.journal_ff_hits,
+                    "value_stable_ff_hits": m.value_stable_ff_hits,
                     "park_resume_at_k": m.park_resume_at_k,
                     "park_resume_full_retry": m.park_resume_full_retry,
                     "full_restart": m.full_restart,

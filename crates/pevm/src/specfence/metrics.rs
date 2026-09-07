@@ -130,6 +130,8 @@ pub struct SpecFenceMetrics {
     pub journal_ff_entries: usize,
     /// M1b: certified-prefix DB reads served from FF cache (skipped MV lazy walk).
     pub journal_ff_hits: usize,
+    /// Iter13: journal FF hits via Validated-gated value-stable (origin bump, same value).
+    pub value_stable_ff_hits: usize,
     /// M1b: MV lazy-walk steps + cold storage fallbacks (heavy DB work).
     pub db_heavy_ops: usize,
     /// M1c: times RewindTo credited a boundary resume (PC jump or effect-boundary skip).
@@ -257,6 +259,7 @@ pub(crate) struct MetricsInner {
     park_ns_blocking_other: std::sync::atomic::AtomicU64,
     journal_ff_entries: AtomicUsize,
     journal_ff_hits: AtomicUsize,
+    value_stable_ff_hits: AtomicUsize,
     db_heavy_ops: AtomicUsize,
     pc_resume_count: AtomicUsize,
     prefix_opcodes_skipped: AtomicUsize,
@@ -633,6 +636,10 @@ impl MetricsInner {
         self.journal_ff_hits.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_value_stable_ff_hit(&self) {
+        self.value_stable_ff_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_db_heavy_op(&self) {
         self.db_heavy_ops.fetch_add(1, Ordering::Relaxed);
     }
@@ -807,6 +814,7 @@ impl MetricsInner {
             wave_width_mean,
             journal_ff_entries: self.journal_ff_entries.load(Ordering::Relaxed),
             journal_ff_hits: self.journal_ff_hits.load(Ordering::Relaxed),
+            value_stable_ff_hits: self.value_stable_ff_hits.load(Ordering::Relaxed),
             db_heavy_ops: self.db_heavy_ops.load(Ordering::Relaxed),
             pc_resume_count: self.pc_resume_count.load(Ordering::Relaxed),
             prefix_opcodes_skipped: self.prefix_opcodes_skipped.load(Ordering::Relaxed),

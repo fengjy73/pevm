@@ -1350,6 +1350,9 @@ fn try_validate(
             // Prefer park behind Executing conflict writers so head reexec runs once
             // against Data. Iter4: also park up to 2 Aborting sibling readers of the
             // same hot ℓ behind that writer (fan-out serialize), carefully capped.
+            // Iter13: rank ALL Executing conflict writers and try claims in order
+            // (no sibling-park — Iter4 sibling hang). Executed→Validated escalate
+            // spin falsified (13a wall↑).
             if escalate
                 && was_force_bind
                 && specfence.engagement.is_storm()
@@ -1357,11 +1360,12 @@ fn try_validate(
                     .partial_retry
                     .serial_barrier_used(tx_version.tx_idx)
             {
-                // Iter4 hot-ℓ clique: among Executing conflict writers, prefer the
-                // writer whose ℓ has the largest higher-reader fan-out (storm spine).
-                // Do **not** park sibling consumers (Aborting sibling deps raced
-                // finish_validation and hung m2/p4). Cap stays 1 barrier claim/tx.
-                let mut best: Option<(TxIdx, MemoryLocationHash, usize)> = None;
+                // Iter13: Collect Executing candidates (best fan per writer),
+                // try claims in fan-desc order. Cap still 1 successful claim/tx.
+                // No sibling-park (Iter4 hang). No Executed→Validated abort-path
+                // spin (Iter12/13a wall↑ — same family as evidence spins).
+                let mut best_by_w: HashMap<TxIdx, (MemoryLocationHash, usize)> =
+                    HashMap::new();
                 for location in &invalid {
                     let w = mv_memory
                         .last_writer_before(*location, tx_version.tx_idx)
@@ -1369,19 +1373,28 @@ fn try_validate(
                             mv_memory.residual_writer_before(*location, tx_version.tx_idx)
                         });
                     if let Some(w) = w {
-                        if w < tx_version.tx_idx && scheduler.is_executing(w) {
+                        if w >= tx_version.tx_idx {
+                            continue;
+                        }
+                        if scheduler.is_executing(w) {
                             let fan = mv_memory.higher_readers_of(*location, w).len();
-                            let take = match best {
-                                None => true,
-                                Some((pw, _, pf)) => fan > pf || (fan == pf && w > pw),
-                            };
-                            if take {
-                                best = Some((w, *location, fan));
-                            }
+                            best_by_w
+                                .entry(w)
+                                .and_modify(|e| {
+                                    if fan > e.1 {
+                                        *e = (*location, fan);
+                                    }
+                                })
+                                .or_insert((*location, fan));
                         }
                     }
                 }
-                if let Some((w, _loc, fan)) = best {
+                let mut cands: Vec<(TxIdx, MemoryLocationHash, usize)> = best_by_w
+                    .into_iter()
+                    .map(|(w, (loc, fan))| (w, loc, fan))
+                    .collect();
+                cands.sort_by(|a, b| b.2.cmp(&a.2).then(b.0.cmp(&a.0)));
+                for (w, _loc, fan) in cands {
                     if scheduler.add_dependency_from_aborting(tx_version.tx_idx, w) {
                         let _ = specfence
                             .partial_retry

@@ -235,17 +235,39 @@ impl<'a, S: Storage> VmDb<'a, S> {
             .mv_memory
             .last_data_before(location_hash, self.tx_idx)
             .map(|(tx_idx, tx_incarnation)| (tx_idx, tx_incarnation));
-        if current != origin {
+        if current == origin {
+            let read_origin = match origin {
+                Some((tx_idx, tx_incarnation)) => ReadOrigin::MvMemory(TxVersion {
+                    tx_idx,
+                    tx_incarnation,
+                }),
+                None => ReadOrigin::Storage,
+            };
+            return Some((value, read_origin));
+        }
+        // Iter13: Validated-gated value-stable FF (origin bump, same U256).
+        // Iter10 bare value-stable FF falsified (livelock / N10 wall↑) — only
+        // after writer Validated. Rebind read origin to current Validated tip.
+        // FF-path Validated yield falsified (13c no wall win). SoftWait Soft=0.
+        let (w_idx, w_inc) = current?;
+        if !self.specfence.scheduler.is_validated(w_idx) {
             return None;
         }
-        let read_origin = match origin {
-            Some((tx_idx, tx_incarnation)) => ReadOrigin::MvMemory(TxVersion {
-                tx_idx,
-                tx_incarnation,
-            }),
-            None => ReadOrigin::Storage,
+        let written = self.mv_memory.data.get(&location_hash)?;
+        let MemoryEntry::Data(inc, MemoryValue::Storage(cur_v)) = written.get(&w_idx)? else {
+            return None;
         };
-        Some((value, read_origin))
+        if *inc != w_inc || *cur_v != value {
+            return None;
+        }
+        self.specfence.metrics.record_value_stable_ff_hit();
+        Some((
+            value,
+            ReadOrigin::MvMemory(TxVersion {
+                tx_idx: w_idx,
+                tx_incarnation: w_inc,
+            }),
+        ))
     }
 
     fn try_ff_basic(
@@ -269,22 +291,46 @@ impl<'a, S: Storage> VmDb<'a, S> {
         else {
             return None;
         };
-        // Only single-origin basics are cached; require matching top writer.
+        // Only single-origin basics are cached; require matching top writer
+        // OR Iter13 Validated-gated value-stable (balance+nonce; code via hash).
+        // Iter10 bare Basic+Storage livelocked — Validated gate only.
         let current = self
             .mv_memory
             .last_data_before(location_hash, self.tx_idx)
             .map(|(tx_idx, tx_incarnation)| (tx_idx, tx_incarnation));
-        if current != origin {
+        if current == origin {
+            let read_origin = match origin {
+                Some((tx_idx, tx_incarnation)) => ReadOrigin::MvMemory(TxVersion {
+                    tx_idx,
+                    tx_incarnation,
+                }),
+                None => ReadOrigin::Storage,
+            };
+            return Some((basic, code_hash, read_origin));
+        }
+        let (w_idx, w_inc) = current?;
+        if !self.specfence.scheduler.is_validated(w_idx) {
             return None;
         }
-        let read_origin = match origin {
-            Some((tx_idx, tx_incarnation)) => ReadOrigin::MvMemory(TxVersion {
-                tx_idx,
-                tx_incarnation,
-            }),
-            None => ReadOrigin::Storage,
+        let written = self.mv_memory.data.get(&location_hash)?;
+        let MemoryEntry::Data(inc, MemoryValue::Basic(cur_b)) = written.get(&w_idx)? else {
+            return None;
         };
-        Some((basic, code_hash, read_origin))
+        if *inc != w_inc {
+            return None;
+        }
+        if cur_b.balance != basic.balance || cur_b.nonce != basic.nonce {
+            return None;
+        }
+        self.specfence.metrics.record_value_stable_ff_hit();
+        Some((
+            basic,
+            code_hash,
+            ReadOrigin::MvMemory(TxVersion {
+                tx_idx: w_idx,
+                tx_incarnation: w_inc,
+            }),
+        ))
     }
 
     fn hash_basic(&self, address: &Address) -> MemoryLocationHash {
@@ -1946,9 +1992,9 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             && ff_cont.as_ref().is_some_and(|cont| {
                 absolute_jump_eligible(tx_version.tx_idx, self.specfence.partial_retry, cont)
             });
-        // Iter11: multi-SSTORE last-tip gates + k<k_fail snap select + plant
-        // no-warm original landed; abs jump still **not** proven aj>0∧seq≡par on
-        // Lean fixtures (double-abort+jump_is_safe chain). Production OFF.
+        // Iter11/13: multi-SSTORE still refused. Iter13: env-gated single-SSTORE
+        // capture+jump (`SPECFENCE_ABSOLUTE_JUMP=1`) **hung** iter9 Lean fixture
+        // (same family as prior jump/capture hangs) — keep production OFF.
         // SoftWait Soft=0. No live_prime / inspect_run. Stock SSTORE on mass path.
         let _ = suffix_jump_eligible;
         let suffix_jump = false;

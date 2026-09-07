@@ -31,6 +31,10 @@
 //! force_prefix ESTIMATE→BO when writer Executing; doomed-2nd-repair escalate to
 //! serial-barrier when ESTIMATE/Aborting∧Executing spine; longer RebindOnly spin
 //! on force_bind/ff_head. Abort-path Validated evidence spins falsified (wall↑).
+//! Iter13: Validated-gated Storage+Basic value-stable journal FF (origin bump,
+//! same value; Iter10 bare value-stable falsified); serial-barrier multi-candidate
+//! claim (no sibling park; Executed→Validated escalate spin falsified). Jump/
+//! capture OFF (single-SSTORE env trial hung). SoftWait Soft ~0.
 //! Iter8 memory snap retained. Head-FF (Iter5). SoftWait Soft ~0.
 //!
 //! **Learn (C):** Inter morph selects Quiet (598 OCC-lite) vs Storm (597 Await-ready).

@@ -125,3 +125,12 @@ longer RebindOnly spin on force_bind/ff_head. Abort-path evidence spins falsifie
 597 N=5 med **12.5** SoftWait=0 (↓ vs Iter11 12.7); N=10 med **14.0** (↓ vs 14.2). aj=0.
 See `specfence-abc-iter12-status.md`. Iter 13 cause: hang-free opcode cut on *successful*
 SuffixRepair without abs jump / abort-path spins.
+
+### Iter 13 — Validated-gated vs-FF + multi-cand barrier
+Validated-gated Storage+Basic value-stable journal FF (Iter10 bare falsified);
+serial-barrier multi-candidate (no sibling park). Executed→Validated escalate spin /
+FF-path yield / single-SSTORE JUMP=1 hung — falsified. SoftWait=0; aj=0; vs_ff rare.
+597 N5 med **12.9** / N10 **13.7** (≤ Iter12 N10 14.0). Stretch <10 unmet.
+See `specfence-abc-iter13-status.md`. Iter 14 cause: schedule-side Validated Await
+before first repair / RebindOnly collapse / hang-free non-TLS jump — not FF/spin.
+
