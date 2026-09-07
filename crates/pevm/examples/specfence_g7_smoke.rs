@@ -171,9 +171,13 @@ fn main() {
             let (ok, tps, soft, wh, aborts) = run_one(&chain, &mut pevm, &loaded, 8);
             let m = pevm.last_specfence_metrics();
             println!(
-                "  block={bn} mode={mode:10} ok={ok} tps={tps:.0} soft={soft} wait_hard={wh} abort_rate={:.3} lean={}",
+                "  block={bn} mode={mode:10} ok={ok} tps={tps:.0} soft={soft} wait_hard={wh} abort_rate={:.3} lean={} evm={} rewind={} ff_hit={} park_k={}",
                 if n_tx(&loaded.block) == 0 { 0.0 } else { aborts as f64 / n_tx(&loaded.block) as f64 },
                 m.lean_mode_txs,
+                m.evm_entries,
+                m.rewind_to_cp,
+                m.journal_ff_hits,
+                m.park_resume_at_k,
             );
             sweep_rows.push(serde_json::json!({
                 "block": bn,
@@ -188,6 +192,16 @@ fn main() {
                 "hotset_size": m.hotset_size,
                 "bind_hits": m.bind_hits,
                 "spec_read_count": m.spec_read_count,
+                // V5-P3 dig hooks (interpreter-seconds / rewind / SoftWait wake)
+                "evm_entries": m.evm_entries,
+                "rewind_to_cp": m.rewind_to_cp,
+                "resume_count": m.resume_count,
+                "journal_ff_entries": m.journal_ff_entries,
+                "journal_ff_hits": m.journal_ff_hits,
+                "park_resume_at_k": m.park_resume_at_k,
+                "park_resume_full_retry": m.park_resume_full_retry,
+                "full_restart": m.full_restart,
+                "partial_retry_count": m.partial_retry_count,
             }));
         }
     }

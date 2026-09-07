@@ -29,7 +29,7 @@ use crate::{
     specfence::{
         AccountHints, AdaptiveEngagement, AdaptiveParams, BayesMap, ConcurrencyMode, DEFAULT_TAU,
         HotSet, FineGrainCollector, FineGrainSnapshot, HeatMap, InterBlockPrior, LiveLearner,
-        MetricsInner, PartialRetryTable, RemCounters, RepairPlan, RwPriorMap, SpecDag,
+        MetricsInner, PartialRetryTable, RemCounters, ResearchAbortRepair, RwPriorMap, SpecDag,
         SpecFenceCtx, SpecFenceMetrics, WaveParkTable, seed_wait_regions, update_bayes,
         update_heat, update_rw_prior,
     },
@@ -971,65 +971,43 @@ fn try_validate(
                     .record_first_pass_validate_fail(first_pass);
             }
 
-            // Research plant: RewindTo when plan_repair says so; otherwise one FullRestart.
-            let fence_locs = match specfence.partial_retry.plan_partial_retry(
+            // V5-P3 research plant API (opt-in inspect only) — separate from Lean
+            // `apply_lean_abort_repair`. Arms RewindTo+FF when checkpoint exists.
+            let fence_locs = match specfence.partial_retry.research_apply_abort_repair(
                 tx_version.tx_idx,
                 &read_locations,
                 &invalid,
                 &write_locations,
             ) {
-                Some(plan) => {
-                    match specfence.partial_retry.plan_repair(tx_version.tx_idx, &plan) {
-                        RepairPlan::RewindTo {
-                            certified,
-                            suffix_writes,
-                            cp,
-                            k_fail,
-                        } => {
-                            specfence.metrics.record_partial_retry();
-                            specfence.metrics.record_rewind_to_cp();
-                            specfence.learner.note_reexec_cost(0.6);
-                            specfence.partial_retry.arm_rewind_to(
-                                tx_version.tx_idx,
-                                cp,
-                                k_fail,
-                                certified.clone(),
-                                suffix_writes.clone(),
-                                plan.prefix_writes.clone(),
-                            );
-                            specfence
-                                .partial_retry
-                                .set_force_bind(tx_version.tx_idx, certified);
-                            let estimated = mv_memory
-                                .invalidate_partial_suffix(tx_version.tx_idx, &suffix_writes);
-                            if !estimated.is_empty() {
-                                specfence
-                                    .metrics
-                                    .record_selective_invalidate(estimated.len());
-                            }
-                            if estimated.is_empty() {
-                                suffix_writes
-                            } else {
-                                estimated
-                            }
-                        }
-                        // RebindOnly already handled pre-abort; treat as FullRestart.
-                        RepairPlan::RebindOnly { .. } | RepairPlan::FullRestart => {
-                            research_full_restart_invalidate(
-                                &specfence,
-                                mv_memory,
-                                tx_version,
-                                &write_locations,
-                            )
-                        }
+                ResearchAbortRepair::RewindTo {
+                    certified: _,
+                    suffix_writes,
+                    reexec_cost,
+                } => {
+                    specfence.metrics.record_partial_retry();
+                    specfence.metrics.record_rewind_to_cp();
+                    specfence.learner.note_reexec_cost(reexec_cost);
+                    let estimated = mv_memory
+                        .invalidate_partial_suffix(tx_version.tx_idx, &suffix_writes);
+                    if !estimated.is_empty() {
+                        specfence
+                            .metrics
+                            .record_selective_invalidate(estimated.len());
+                    }
+                    if estimated.is_empty() {
+                        suffix_writes
+                    } else {
+                        estimated
                     }
                 }
-                None => research_full_restart_invalidate(
-                    &specfence,
-                    mv_memory,
-                    tx_version,
-                    &write_locations,
-                ),
+                ResearchAbortRepair::FullRestart { .. } => {
+                    research_full_restart_invalidate(
+                        &specfence,
+                        mv_memory,
+                        tx_version,
+                        &write_locations,
+                    )
+                }
             };
 
             let rewind_to = mv_memory.min_higher_reader_of(tx_version.tx_idx, &fence_locs);

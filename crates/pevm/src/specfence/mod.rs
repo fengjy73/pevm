@@ -12,7 +12,7 @@
 //!     ↑
 //! OutcomeLearner: P_abort, T_wait, …      # L4 — continuous θ features only
 //!     ↑
-//! RepairPlant: V5-P1 single lean repair   # L1 — force-bind+selective | FullRestart
+//! RepairPlant: V5-P1 Lean force-bind | research RewindTo (opt-in)  # L1
 //! ```
 //!
 //! **Default:** SpecRead (OCC-like). SoftWait only when `EV_Wait < EV_Spec`.
@@ -28,9 +28,11 @@
 //! - AdaptiveEngagement abort_rate mode ladders (always Lean execute)
 //! - HotSet as Wait gate (`H_w`/`H_a` = optional dense-stat / fanout features)
 //!
-//! # Research-only (not default behavior)
+//! # Research-only (not default behavior) — V5-P3
 //! Inspect / absolute jump / CallOutcome SC stay behind `SPECFENCE_ENABLE_INSPECT=1`.
-//! Plant M1a–M1l code remains for research; it is **not** SpecFence v5 default.
+//! Plant M1a–M1l + [`research_apply_abort_repair`] remain research; **not** graduated
+//! (A/B: inspect hangs on 597 path). Lean SoftWait wake may still arm hang-free
+//! journal FF via `try_arm_park_resume_at_k` (no absolute jump).
 //! Finegrain collectors are lab opt-in.
 //!
 //! Correctness shield: cascade fence + Block-STM validate / ESTIMATE unchanged.
@@ -97,7 +99,7 @@ pub use boundary::SpecFenceInspector;
 pub(crate) use rem::{
     AccessMode, Checkpoint, CheckpointId, CheckpointKind, EffectOrdinal, FfValue, LeanAbortRepair,
     ParkedWait, ParkResumeIntent, ParkResumeKind, PartialRetryPlan, PartialRetryState, PendingPark,
-    RegionAccess, RemTask, RepairPlan, ResumeContinuation, StorageWriteReplay,
+    RegionAccess, RemTask, RepairPlan, ResearchAbortRepair, ResumeContinuation, StorageWriteReplay,
 };
 pub(crate) use resolve::{PolicyCtx, ResolveAction, choose_action, early_abort_candidate};
 #[allow(unused_imports)]

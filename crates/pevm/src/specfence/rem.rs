@@ -1,34 +1,26 @@
-//! Region Execution Machine (REM) plant scaffolding for SpecFence Spec v1 / plant v2.
+//! Region Execution Machine (REM) — Lean repair + research plant (kept separate).
 //!
 //! Phase-1 still drives one interpreter session per incarnation (`RunTx`), but
 //! must emit region events and expose per-location validate semantics.
 //!
-//! P3: EarlyAbort arms RewindTo/FullRetry + force-bind via [`PartialRetryTable::arm_early_abort`].
-//! P2: semantic PartialRetry — revm re-executes from start, but π forces
-//! Bind (Data-ready) / SpecRead (else) on certified-prefix locations, and only
-//! failed-suffix writes are selectively invalidated (no global aborted stamp).
+//! # Two APIs (V5-P3 — do not conflate)
 //!
-//! **V5-P1 single Lean repair story** ([`PartialRetryTable::apply_lean_abort_repair`]):
-//! when a certified prefix exists → `set_force_bind` + selective invalidate
-//! (hang-free FullRestart-from-head reexec); otherwise clear + FullRestart.
-//! Lean never arms inspect / PC jump. Research RewindTo+FF stays behind
-//! `SPECFENCE_ENABLE_INSPECT` via [`PartialRetryTable::plan_repair`] / `arm_rewind_to`.
+//! | API | Entry | Default Lean? | What it arms |
+//! |-----|-------|---------------|--------------|
+//! | **Lean repair** | [`PartialRetryTable::apply_lean_abort_repair`] | **yes** | force-bind + clear RewindTo; head reexec |
+//! | **Research plant** | [`PartialRetryTable::research_apply_abort_repair`] | **no** (`SPECFENCE_ENABLE_INSPECT`) | RewindTo + journal FF + force-bind |
+//! | SoftWait wake (P4) | [`PartialRetryTable::try_arm_park_resume_at_k`] | yes (hang-free) | journal FF + force-bind only; **no** absolute jump |
 //!
-//! M1 (plant v2, research): checkpoints at CALL + write/effect boundaries; RewindTo /
-//! RebindOnly demote head PartialRetry when a certified prefix exists.
-//! M1b: journal fast-forward + bound-value cache on RewindTo resume — SpecFence
-//! M1e: journal-blob side channel + jump_snap for safe absolute PC jump (opt-in).
-//! M1g: Storage-prefix jump (no journal poison) + nested CallOutcome cache.
-//! effect journal restored to `cp`, certified-prefix DB reads served from FF
-//! cache (skip MV lazy walks).
-//! M1c: CALL/effect-boundary PC resume via stock Inspector — skip prefix opcodes
-//! when a boundary snapshot is available; must NOT count as `evm_entries`.
+//! V5-P3 A/B on block 14689597: full inspect **hangs** → plant stays research-only.
+//! Never graduate by default: absolute PC jump, multi-SSTORE/LOG jump mythology,
+//! valued CallOutcome SC, fanout→WaitHard.
 //!
-//! M2 (plant v2): `WaveParkTable` parks WaitHard at **tx grain** (Block-STM
-//! Blocking style) and steals from a lower-TxIdx-first ready deque.
-//! P4: park entries carry SoftWait `armed_at_k`; wake restores resume intent;
-//! safe subset arms RewindTo/FF when a checkpoint exists before `k`, else
-//! FullRetry. Live mid-effect Interpreter park remains out of scope.
+//! P3 EarlyAbort: [`PartialRetryTable::arm_early_abort`] (RewindTo/FullRetry + force-bind).
+//! P2 semantic PartialRetry: Bind-when-Data / SpecRead-else on certified prefix;
+//! selective suffix invalidate (no global aborted stamp).
+//!
+//! M1a–M1l research checkpoints / jump / CallOutcome SC remain behind inspect flag.
+//! M2 `WaveParkTable` + P4 SoftWait `(t,k)` wake stay on Lean (journal FF only).
 
 #![allow(dead_code)]
 use std::cmp::Reverse;
@@ -260,6 +252,39 @@ impl LeanAbortRepair {
     #[inline]
     pub(crate) fn did_force_bind(&self) -> bool {
         matches!(self, Self::ForceBind { .. })
+    }
+}
+
+/// V5-P3 research-plant abort outcome — **not** used by Lean default.
+///
+/// Absolute PC jump / valued CallOutcome SC are **not** decided here; resume
+/// path gates those behind `SPECFENCE_ABSOLUTE_JUMP` / inspect + safety checks.
+#[derive(Debug, Clone)]
+pub(crate) enum ResearchAbortRepair {
+    /// Armed RewindTo + journal FF continuation + force-bind.
+    RewindTo {
+        certified: Vec<MemoryLocationHash>,
+        suffix_writes: Vec<MemoryLocationHash>,
+        /// Suggested `LiveLearner::note_reexec_cost` sample (~0.6).
+        reexec_cost: f64,
+    },
+    /// No usable checkpoint → FullRestart (caller selective/full invalidate).
+    FullRestart {
+        reexec_cost: f64,
+    },
+}
+
+impl ResearchAbortRepair {
+    #[inline]
+    pub(crate) fn reexec_cost(&self) -> f64 {
+        match self {
+            Self::RewindTo { reexec_cost, .. } | Self::FullRestart { reexec_cost } => *reexec_cost,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_rewind(&self) -> bool {
+        matches!(self, Self::RewindTo { .. })
     }
 }
 
@@ -1065,7 +1090,7 @@ impl PartialRetryTable {
         self.force_bind.remove(&tx_idx);
     }
 
-    /// V5-P1 — **single Lean SpecFence abort repair story**.
+    /// V5-P1/P3 — **single Lean SpecFence abort repair** (default path).
     ///
     /// ```text
     /// if certified prefix from plan_partial_retry:
@@ -1076,8 +1101,10 @@ impl PartialRetryTable {
     /// ```
     ///
     /// Hang-free: next incarnation uses `force_prefix` Bind-when-Data / SpecRead-else
-    /// (never WaitHard without Data). Research RewindTo+FF is **not** armed here —
-    /// only behind `SPECFENCE_ENABLE_INSPECT` via [`Self::plan_repair`] / `arm_rewind_to`.
+    /// (never WaitHard without Data). **Does not** arm RewindTo/FF — that is the
+    /// research API [`Self::research_apply_abort_repair`] (opt-in inspect only).
+    /// SoftWait wake may still arm hang-free journal FF via
+    /// [`Self::try_arm_park_resume_at_k`] independently of this abort helper.
     pub(crate) fn apply_lean_abort_repair(
         &self,
         tx_idx: TxIdx,
@@ -1100,6 +1127,51 @@ impl PartialRetryTable {
                 self.clear_repair(tx_idx);
                 LeanAbortRepair::FullRestart { reexec_cost: 2.2 }
             }
+        }
+    }
+
+    /// V5-P3 — **research plant** abort arming (thin wrapper over plan_repair + arm_rewind_to).
+    ///
+    /// Call only when `research_inspect_enabled()` / non-lean execute. Arms
+    /// RewindTo + journal FF + force-bind when a checkpoint exists; otherwise
+    /// clears to FullRestart. Does **not** enable absolute PC jump or valued
+    /// CallOutcome SC (resume path). V5-P3 A/B: inspect hangs on 597 path →
+    /// **not** graduated to Lean default.
+    pub(crate) fn research_apply_abort_repair(
+        &self,
+        tx_idx: TxIdx,
+        read_locations: &[MemoryLocationHash],
+        invalid: &[MemoryLocationHash],
+        write_locations: &[MemoryLocationHash],
+    ) -> ResearchAbortRepair {
+        match self.plan_partial_retry(tx_idx, read_locations, invalid, write_locations) {
+            Some(plan) => match self.plan_repair(tx_idx, &plan) {
+                RepairPlan::RewindTo {
+                    certified,
+                    suffix_writes,
+                    cp,
+                    k_fail,
+                } => {
+                    self.arm_rewind_to(
+                        tx_idx,
+                        cp,
+                        k_fail,
+                        certified.clone(),
+                        suffix_writes.clone(),
+                        plan.prefix_writes.clone(),
+                    );
+                    self.set_force_bind(tx_idx, certified.clone());
+                    ResearchAbortRepair::RewindTo {
+                        certified,
+                        suffix_writes,
+                        reexec_cost: 0.6,
+                    }
+                }
+                RepairPlan::RebindOnly { .. } | RepairPlan::FullRestart => {
+                    ResearchAbortRepair::FullRestart { reexec_cost: 2.2 }
+                }
+            },
+            None => ResearchAbortRepair::FullRestart { reexec_cost: 2.2 },
         }
     }
 
@@ -2007,5 +2079,42 @@ mod abort_cheapening_tests {
         }
         assert!(!table.must_force_bind(0, 99));
         assert!(!table.is_rewind_resume(0));
+    }
+
+    /// V5-P3: research wrapper arms RewindTo; Lean helper must not.
+    #[test]
+    fn research_apply_abort_repair_arms_rewind_lean_does_not() {
+        let table = PartialRetryTable::new(1);
+        table.reset_incarnation(0, 0);
+        let _ = table.push_checkpoint(0, CheckpointKind::CallEntry);
+        table.note_access(0, 10, AccessMode::Read);
+        table.note_certified(0, 10);
+        // Need k>0 checkpoint for RewindTo preference.
+        let _ = table.push_checkpoint(0, CheckpointKind::EffectBoundary);
+        table.note_access(0, 11, AccessMode::Read);
+
+        match table.research_apply_abort_repair(0, &[10, 11], &[11], &[]) {
+            ResearchAbortRepair::RewindTo {
+                certified,
+                reexec_cost,
+                ..
+            } => {
+                assert!(certified.contains(&10));
+                assert!((reexec_cost - 0.6).abs() < 1e-9);
+            }
+            other => panic!("expected research RewindTo, got {other:?}"),
+        }
+        assert!(table.is_rewind_resume(0));
+        assert!(table.must_force_bind(0, 10));
+
+        // Same inputs on Lean must clear RewindTo.
+        match table.apply_lean_abort_repair(0, &[10, 11], &[11], &[]) {
+            LeanAbortRepair::ForceBind { .. } => {}
+            other => panic!("expected Lean ForceBind, got {other:?}"),
+        }
+        assert!(
+            !table.is_rewind_resume(0),
+            "V5-P3: Lean abort must clear research RewindTo"
+        );
     }
 }
