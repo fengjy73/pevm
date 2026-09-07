@@ -87,6 +87,16 @@ pub struct SpecFenceMetrics {
     pub rebind_only: usize,
     /// Cold SpecRead fast path: skipped Bayes/HotSet/π (OCC-like discovery).
     pub cold_spec_fast: usize,
+    /// First-incarnation OCC-identical SpecRead (no FenceGraph/π/writer lookups).
+    pub occ_fast_first: usize,
+    /// Profile: ns spent in Handler::run / inspect_run (includes DB/maybe_wait).
+    pub profile_handler_ns: u64,
+    /// Profile: ns spent inside maybe_wait (π / Bind / SoftWait decide).
+    pub profile_maybe_wait_ns: u64,
+    /// Profile: ns spent in try_validate + SuffixRepair/RebindOnly.
+    pub profile_validate_ns: u64,
+    /// Profile: ns spent in worker next_task / steal scheduling.
+    pub profile_scheduler_ns: u64,
     /// M1+: rewind journal/PC to checkpoint then resume (stays 0 until RewindTo).
     pub rewind_to_cp: usize,
     /// FullRestart decisions: OCC abort reexec, or SpecFence FullRetry (no certified prefix).
@@ -204,6 +214,11 @@ pub(crate) struct MetricsInner {
     resume_count: AtomicUsize,
     rebind_only: AtomicUsize,
     cold_spec_fast: AtomicUsize,
+    occ_fast_first: AtomicUsize,
+    profile_handler_ns: std::sync::atomic::AtomicU64,
+    profile_maybe_wait_ns: std::sync::atomic::AtomicU64,
+    profile_validate_ns: std::sync::atomic::AtomicU64,
+    profile_scheduler_ns: std::sync::atomic::AtomicU64,
     rewind_to_cp: AtomicUsize,
     full_restart: AtomicUsize,
     tx_head_reexec: AtomicUsize,
@@ -424,6 +439,38 @@ impl MetricsInner {
 
     pub(crate) fn record_cold_spec_fast(&self) {
         self.cold_spec_fast.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_occ_fast_first(&self) {
+        self.occ_fast_first.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn add_profile_handler_ns(&self, ns: u64) {
+        if ns > 0 {
+            self.profile_handler_ns.fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn add_profile_maybe_wait_ns(&self, ns: u64) {
+        if ns > 0 {
+            self.profile_maybe_wait_ns.fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn add_profile_validate_ns(&self, ns: u64) {
+        if ns > 0 {
+            self.profile_validate_ns.fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn add_profile_scheduler_ns(&self, ns: u64) {
+        if ns > 0 {
+            self.profile_scheduler_ns.fetch_add(ns, Ordering::Relaxed);
+        }
     }
 
     /// M1: rewind journal/PC to checkpoint then resume.
@@ -656,6 +703,11 @@ impl MetricsInner {
             resume_count: self.resume_count.load(Ordering::Relaxed),
             rebind_only: self.rebind_only.load(Ordering::Relaxed),
             cold_spec_fast: self.cold_spec_fast.load(Ordering::Relaxed),
+            occ_fast_first: self.occ_fast_first.load(Ordering::Relaxed),
+            profile_handler_ns: self.profile_handler_ns.load(Ordering::Relaxed),
+            profile_maybe_wait_ns: self.profile_maybe_wait_ns.load(Ordering::Relaxed),
+            profile_validate_ns: self.profile_validate_ns.load(Ordering::Relaxed),
+            profile_scheduler_ns: self.profile_scheduler_ns.load(Ordering::Relaxed),
             rewind_to_cp: self.rewind_to_cp.load(Ordering::Relaxed),
             full_restart: self.full_restart.load(Ordering::Relaxed),
             tx_head_reexec: self.tx_head_reexec.load(Ordering::Relaxed),

@@ -240,7 +240,7 @@ fn main() {
                 aborts_v.push(aborts as f64);
                 if iters == 1 || i + 1 == iters {
                     println!(
-                        "  block={bn} mode={mode:10} iter={}/{} ok={ok} tps={tps:.0} wall_ms={wall_ms:.1} soft={soft} wait_hard={wh} abort_rate={:.3} lean={} evm={} reexec={} fb_reabort={} rebind={} cold={} steal={} park_k={}",
+                        "  block={bn} mode={mode:10} iter={}/{} ok={ok} tps={tps:.0} wall_ms={wall_ms:.1} soft={soft} wait_hard={wh} abort_rate={:.3} lean={} evm={} reexec={} fb_reabort={} rebind={} cold={} occ_fast={} steal={} park_k={} mw_ms={:.1} h_ms={:.1} v_ms={:.1} park_ms={:.1}",
                         i + 1,
                         iters,
                         if n == 0 { 0.0 } else { aborts as f64 / n as f64 },
@@ -250,8 +250,13 @@ fn main() {
                         m.force_bind_reabort,
                         m.rebind_only,
                         m.cold_spec_fast,
+                        m.occ_fast_first,
                         m.ready_steal_on_wait,
                         m.park_resume_at_k,
+                        m.profile_maybe_wait_ns as f64 / 1e6,
+                        m.profile_handler_ns as f64 / 1e6,
+                        m.profile_validate_ns as f64 / 1e6,
+                        m.wait_park_ns as f64 / 1e6,
                     );
                 }
                 last_row = Some(serde_json::json!({
@@ -284,6 +289,11 @@ fn main() {
                     "soft_wait_wake_reabort": m.soft_wait_wake_reabort,
                     "rebind_only": m.rebind_only,
                     "cold_spec_fast": m.cold_spec_fast,
+                    "occ_fast_first": m.occ_fast_first,
+                    "profile_handler_ns": m.profile_handler_ns,
+                    "profile_maybe_wait_ns": m.profile_maybe_wait_ns,
+                    "profile_validate_ns": m.profile_validate_ns,
+                    "profile_scheduler_ns": m.profile_scheduler_ns,
                     "absolute_jump_applied": m.absolute_jump_applied,
                     "absolute_jump_fallback": m.absolute_jump_fallback,
                     "tx_full_retry": m.tx_full_retry,

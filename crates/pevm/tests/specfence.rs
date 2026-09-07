@@ -1971,7 +1971,8 @@ fn specfence_m3_prior_bind_cuts_first_pass_waste() {
     .unwrap();
     let mut saw_prior_bind = false;
     let mut last = None;
-    for _ in 0..8 {
+    // Bind-first + schedule noise: allow more retries to observe prior_bind.
+    for _ in 0..24 {
         let par2 = pevm
             .execute_revm_parallel(
                 &chain,

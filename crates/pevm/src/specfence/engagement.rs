@@ -46,6 +46,19 @@ pub(crate) fn softwait_disabled() -> bool {
     }
 }
 
+/// `SPECFENCE_PROFILE=1` enables ns Instant buckets (handler/maybe_wait/validate/sched).
+/// Default off — Instant tax on every SpecRead biases wall vs OCC.
+pub(crate) fn profile_timing_enabled() -> bool {
+    match std::env::var_os("SPECFENCE_PROFILE") {
+        None => false,
+        Some(v) => {
+            let s = v.to_string_lossy();
+            s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
+        }
+    }
+}
+
+
 /// Per-block adaptive engagement controller (SpecFence only).
 #[derive(Debug)]
 pub(crate) struct AdaptiveEngagement {

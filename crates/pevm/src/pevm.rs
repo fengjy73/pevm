@@ -1,3 +1,4 @@
+use std::time::Instant;
 use std::{
     cell::UnsafeCell,
     fmt::Debug,
@@ -473,7 +474,13 @@ impl Pevm {
                     let mut vm = Vm::new(
                         chain, spec_id, &block_env, &txs, storage, &mv_memory, specfence,
                     );
+                    let profile = crate::specfence::profile_timing_enabled();
+                    let mut sched_t0 = profile.then(Instant::now);
                     let mut task = scheduler.next_task_with_wave(wave_ref);
+                    if let Some(t0) = sched_t0 {
+                        metrics_inner
+                            .add_profile_scheduler_ns(t0.elapsed().as_nanos() as u64);
+                    }
                     while task.is_some() {
                         task = match task.unwrap() {
                             Task::Execution(tx_version) => {
@@ -485,7 +492,17 @@ impl Pevm {
                                 self.try_execute(&mut vm, &scheduler, tx_version, wave_ref, fence_ref)
                             }
                             Task::Validation(tx_version) => {
-                                try_validate(&mv_memory, &scheduler, &tx_version, specfence)
+                                if profile {
+                                    let v0 = Instant::now();
+                                    let next = try_validate(
+                                        &mv_memory, &scheduler, &tx_version, specfence,
+                                    );
+                                    metrics_inner
+                                        .add_profile_validate_ns(v0.elapsed().as_nanos() as u64);
+                                    next
+                                } else {
+                                    try_validate(&mv_memory, &scheduler, &tx_version, specfence)
+                                }
                             }
                         };
 
@@ -500,7 +517,12 @@ impl Pevm {
                         }
 
                         if task.is_none() {
+                            sched_t0 = profile.then(Instant::now);
                             task = scheduler.next_task_with_wave(wave_ref);
+                            if let Some(t0) = sched_t0 {
+                                metrics_inner
+                                    .add_profile_scheduler_ns(t0.elapsed().as_nanos() as u64);
+                            }
                         }
                     }
                 });

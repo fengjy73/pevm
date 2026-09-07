@@ -1,3 +1,4 @@
+use std::time::Instant;
 use alloy_primitives::{Address, B256, TxKind, U256};
 use alloy_rpc_types_eth::Receipt;
 use hashbrown::HashMap;
@@ -356,6 +357,24 @@ impl<'a, S: Storage> VmDb<'a, S> {
         }
 
         // --- SpecFence v5 path: AEC choose_action + FenceGraph SoftWait ---
+        if crate::specfence::profile_timing_enabled() {
+            let t0 = Instant::now();
+            let mw_result = self.maybe_wait_specfence(address, location_hash, is_program);
+            self.specfence
+                .metrics
+                .add_profile_maybe_wait_ns(t0.elapsed().as_nanos() as u64);
+            return mw_result;
+        }
+        return self.maybe_wait_specfence(address, location_hash, is_program);
+    }
+
+    /// SpecFence π body (profile-wrapped by [`Self::maybe_wait`]).
+    fn maybe_wait_specfence(
+        &self,
+        address: Address,
+        location_hash: MemoryLocationHash,
+        is_program: bool,
+    ) -> Result<(), ReadError> {
         if address == self.specfence.beneficiary || self.is_lazy {
             // Beneficiary / basic_lazy never SoftWait.
             self.specfence.metrics.record_spec_read();
@@ -396,8 +415,29 @@ impl<'a, S: Storage> VmDb<'a, S> {
 
         let hotset_hint = self.specfence.hotset.contains(location_hash);
 
-        // B. OCC-like cold SpecRead: skip π + revoke + note_observe DashMap tax.
-        if !force_prefix
+        // Structural strip (profile-backed):
+        // 1) Bind-on-Data BEFORE π only when writer is done (true Bind — no SoftWait).
+        //    Data while producer still running → SpecRead (OCC-like), not Bind→park.
+        //    Profile: park idle owns the ~26ms wall gap; SoftWait-as-Bind inflated idle.
+        // 2) First-incarnation OCC-fast when no writer/prior/sticky/force.
+        let action = if let Some(v) = bind_version.clone() {
+            // Bind-on-Data before π (native). SoftWait only if force/sticky and writer
+            // still running — see Bind arm. Else SpecRead (profile: park idle = gap).
+            ResolveAction::Bind(v)
+        } else if self.tx_incarnation == 0
+            && !force_prefix
+            && !sticky
+            && !self.specfence.partial_retry.has_force_bind(self.tx_idx)
+            && !hotset_hint
+            && !prior_ws_predicts
+            && writer.is_none()
+        {
+            self.specfence.metrics.record_spec_read();
+            self.specfence.metrics.record_occ_fast_first();
+            self.specfence.metrics.record_cold_spec_fast();
+            note_pending_effect_boundary(self.tx_idx, self.specfence.partial_retry);
+            return Ok(());
+        } else if !force_prefix
             && !sticky
             && !hotset_hint
             && !prior_ws_predicts
@@ -407,76 +447,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
             self.specfence.metrics.record_cold_spec_fast();
             note_pending_effect_boundary(self.tx_idx, self.specfence.partial_retry);
             return Ok(());
-        }
-
-        let action = if force_prefix {
-            // Repair Bind/SpecRead — no revoke/π.
-            if let Some(v) = bind_version.clone() {
-                ResolveAction::Bind(v)
-            } else {
-                ResolveAction::SpecRead
-            }
-        } else if sticky {
-            if let Some(v) = bind_version.clone() {
-                // Sticky + Data → Bind without π/revoke.
-                ResolveAction::Bind(v)
-            } else {
-                // Sticky without Data: fall into π (may Await) — need hot features.
-                if hotset_hint {
-                    self.specfence.hotset.record_hot_local_read();
-                }
-                let writer_count = self
-                    .specfence
-                    .hotset
-                    .writer_count(location_hash)
-                    .max(self.specfence.learner.writer_count_live(location_hash));
-                self.specfence
-                    .learner
-                    .note_observe(location_hash, is_program, writer_count);
-                let live_fanout = self.specfence.learner.fanout_live(location_hash);
-                let fanout_hint = hotset_hint || live_fanout >= 8;
-                let waw_spine_hint = self.specfence.learner.waw_spine_hint(
-                    location_hash,
-                    is_program,
-                    self.specfence.params,
-                );
-                let tx_heavy_hint = self
-                    .specfence
-                    .learner
-                    .tx_heavy_hint(self.tx.gas_limit, self.specfence.params);
-                let _ = self.specfence.try_revoke(
-                    &self.mv_memory.regions,
-                    location_hash,
-                    Some(&address),
-                );
-                let gross_work_depth = self
-                    .specfence
-                    .partial_retry
-                    .estimate_effect_depth(self.tx_idx);
-                if let Some(d) = gross_work_depth {
-                    self.specfence.learner.note_depth_sample(d);
-                }
-                self.specfence.learner.note_producer_status(
-                    location_hash,
-                    bind_version.is_some() || writer_done,
-                );
-                self.specfence.choose_resolve(
-                    location_hash,
-                    &address,
-                    writer,
-                    writer_done,
-                    bind_version.clone(),
-                    residual_predicts,
-                    prior_ws_predicts,
-                    is_program,
-                    fanout_hint,
-                    live_fanout as f64,
-                    gross_work_depth,
-                    waw_spine_hint,
-                    tx_heavy_hint,
-                )
-            }
+        } else if force_prefix {
+            ResolveAction::SpecRead
         } else {
+            // Sticky-without-Data or hot/prior path: full π (may Await / EarlyAbort).
             if hotset_hint {
                 self.specfence.hotset.record_hot_local_read();
             }
@@ -532,11 +506,6 @@ impl<'a, S: Storage> VmDb<'a, S> {
             )
         };
 
-        let posterior = self
-            .specfence
-            .bayes
-            .conflict_probability(location_hash, Some(&address));
-
         // Dig A/B: SPECFENCE_DISABLE_SOFTWAIT → never arm SoftWait (π SpecRead-only).
         let action = match action {
             ResolveAction::WaitHard if crate::specfence::softwait_disabled() => {
@@ -571,6 +540,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     return Err(ReadError::Blocking(prev));
                 }
                 // Cold-start: skip WaitHard when posterior is cold.
+                let posterior = self
+                    .specfence
+                    .bayes
+                    .conflict_probability(location_hash, Some(&address));
                 if posterior < crate::specfence::TAU_REVOKE {
                     let _ = self.specfence.try_revoke(
                         &self.mv_memory.regions,
@@ -1670,6 +1643,8 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     .push(read_origin);
             }
         }
+        let profile = crate::specfence::profile_timing_enabled();
+        let handler_t0 = profile.then(Instant::now);
         let run_result = if use_inspect {
             let partial_retry = self.specfence.partial_retry;
             let metrics = self.specfence.metrics;
@@ -1733,6 +1708,11 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         } else {
             self.chain.run_pevm_tx(&mut self.evm, false)
         };
+        if let Some(t0) = handler_t0 {
+            self.specfence
+                .metrics
+                .add_profile_handler_ns(t0.elapsed().as_nanos() as u64);
+        }
 
         match run_result {
 
