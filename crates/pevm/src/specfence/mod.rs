@@ -26,10 +26,12 @@
 //! after first SuffixRepair fail, sticky BO Await on fail locs (+ force_bind
 //! extend) until writers Validated before 2nd resume. Iter10: strip Iter9 hot-path
 //! tax (stock SSTORE unless plant install wanted; no first_k-from-gas on finalize).
-//! Iter11: multi-SSTORE last-tip + k<k_fail snap select; jump/capture trial via
-//! SPECFENCE_ABSOLUTE_JUMP=1 (production OFF without env). Iter8 memory snap
-//! + run_exec_loop PENDING_RESUME apply retained. Escalation retains **head-FF**
-//! (Iter5). SoftWait Soft ~0.
+//! Iter11: multi-SSTORE last-tip + k<k_fail snap select; jump/capture OFF.
+//! Iter12: Validated-strict spin on 2nd-repair prefer_await (no park tax);
+//! force_prefix ESTIMATE→BO when writer Executing; doomed-2nd-repair escalate to
+//! serial-barrier when ESTIMATE/Aborting∧Executing spine; longer RebindOnly spin
+//! on force_bind/ff_head. Abort-path Validated evidence spins falsified (wall↑).
+//! Iter8 memory snap retained. Head-FF (Iter5). SoftWait Soft ~0.
 //!
 //! **Learn (C):** Inter morph selects Quiet (598 OCC-lite) vs Storm (597 Await-ready).
 //! Intra `choose_action` / learner updates only on hot candidates.

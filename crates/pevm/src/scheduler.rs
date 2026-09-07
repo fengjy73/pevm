@@ -50,6 +50,10 @@ pub(crate) struct Scheduler {
     transactions_status: Vec<Mutex<TxStatus>>,
     // Lock-free mirror: true iff status is Executed|Validated (Bind/Wait hot path).
     done_flags: Vec<AtomicBool>,
+    // Lock-free mirror: true iff status is Validated (Iter12 ESTIMATE-race gate).
+    // Bind-on-Executed can still see ESTIMATE if the writer later aborts; 2nd-repair
+    // / serial-barrier paths spin for Validated without SoftWait Soft park tax.
+    validated_flags: Vec<AtomicBool>,
     // The list of dependent transactions to resume when the
     // key transaction is re-executed.
     transactions_dependents: Vec<Mutex<SmallVec<[TxIdx; 1]>>>,
@@ -83,6 +87,7 @@ impl Scheduler {
                 })
                 .collect(),
             done_flags: (0..block_size).map(|_| AtomicBool::new(false)).collect(),
+            validated_flags: (0..block_size).map(|_| AtomicBool::new(false)).collect(),
             transactions_dependents: (0..block_size).map(|_| Mutex::default()).collect(),
             // We won't validate until we find the first non-lazy transaction that
             // needs to read explicit values. We also skip the first transaction.
@@ -447,7 +452,8 @@ impl Scheduler {
                 self.num_validated.fetch_add(1, Ordering::Relaxed);
             }
         }
-        // Publish lock-free done before releasing status mutex / waking waiters.
+        // Publish lock-free done/validated before releasing status mutex / waking.
+        let is_validated = matches!(tx.status, IncarnationStatus::Validated);
         self.set_done_flag(
             tx_version.tx_idx,
             matches!(
@@ -455,6 +461,7 @@ impl Scheduler {
                 IncarnationStatus::Executed | IncarnationStatus::Validated
             ),
         );
+        self.set_validated_flag(tx_version.tx_idx, is_validated);
 
         // Wake after status is Data-ready (`is_done`), still under writer lock so
         // add_dependency cannot lose a waiter between drain and Ready.
@@ -549,6 +556,39 @@ impl Scheduler {
             self.done_flags
                 .get_unchecked(tx_idx)
                 .store(done, Ordering::Release);
+            // Clearing done always clears validated; setting done alone does not
+            // publish Validated (Executed path sets validated=false explicitly).
+            if !done {
+                self.validated_flags
+                    .get_unchecked(tx_idx)
+                    .store(false, Ordering::Release);
+            }
+        }
+    }
+
+    #[inline]
+    fn set_validated_flag(&self, tx_idx: TxIdx, validated: bool) {
+        // SAFETY: callers only use inbound tx indices.
+        unsafe {
+            self.validated_flags
+                .get_unchecked(tx_idx)
+                .store(validated, Ordering::Release);
+        }
+    }
+
+    /// True when status is `Validated` (stronger than [`Self::is_done`]).
+    /// Iter12: 2nd-repair / serial-barrier spin for Validated to cut ESTIMATE races
+    /// without SoftWait Soft park tax.
+    #[inline]
+    pub(crate) fn is_validated(&self, tx_idx: TxIdx) -> bool {
+        if tx_idx >= self.block_size {
+            return true;
+        }
+        // SAFETY: tx_idx checked against block_size above.
+        unsafe {
+            self.validated_flags
+                .get_unchecked(tx_idx)
+                .load(Ordering::Acquire)
         }
     }
 
@@ -613,6 +653,8 @@ impl Scheduler {
             if tx.status == IncarnationStatus::Executed {
                 tx.status = IncarnationStatus::Validated;
                 self.num_validated.fetch_add(1, Ordering::Relaxed);
+                // Iter12: publish Validated for ESTIMATE-race spins (lock-free).
+                self.set_validated_flag(tx_version.tx_idx, true);
             }
         }
         None

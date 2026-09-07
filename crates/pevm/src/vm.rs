@@ -480,6 +480,32 @@ impl<'a, S: Storage> VmDb<'a, S> {
                         );
                         return Err(ReadError::Blocking(v.tx_idx));
                     }
+                    // Iter12d: short Validated spin after done (no park tax) on
+                    // 2nd-repair force_prefix|sticky — cut ESTIMATE races.
+                    if second_repair && (force_prefix || sticky) {
+                        for _ in 0..32 {
+                            if self.specfence.scheduler.is_validated(v.tx_idx)
+                                || !self.specfence.scheduler.is_done(v.tx_idx)
+                            {
+                                break;
+                            }
+                            std::thread::yield_now();
+                        }
+                        if !self.specfence.scheduler.is_done(v.tx_idx)
+                            && self.specfence.scheduler.is_executing(v.tx_idx)
+                        {
+                            self.specfence.metrics.record_wait_hard();
+                            self.specfence.metrics.record_wait(address);
+                            let armed_at_k =
+                                self.specfence.partial_retry.current_k(self.tx_idx) as u64;
+                            self.specfence.wave.set_pending_park(
+                                location_hash,
+                                armed_at_k,
+                                crate::specfence::ParkKind::BlockingOther,
+                            );
+                            return Err(ReadError::Blocking(v.tx_idx));
+                        }
+                    }
                     return self.bind_on_data_lite(address, location_hash, v, force_prefix);
                 }
             }
@@ -566,7 +592,26 @@ impl<'a, S: Storage> VmDb<'a, S> {
         } else if writer.is_some_and(|w| {
             self.mv_memory.entry_kind_at(location_hash, w) == "estimate"
         }) {
-            // ESTIMATE marker: SpecRead — never BlockingOther / SoftWait.
+            // ESTIMATE marker: SpecRead — never SoftWait Soft.
+            // Iter12d: 2nd-repair force_prefix + Executing writer → BO Await
+            // (SpecRead-through-ESTIMATE wastes SuffixRepair). Ready/Aborting
+            // Estimate park stays falsified (Iter7/8).
+            if second_repair && force_prefix {
+                if let Some(w) = writer {
+                    if self.specfence.scheduler.is_executing(w) {
+                        self.specfence.metrics.record_wait_hard();
+                        self.specfence.metrics.record_wait(address);
+                        let armed_at_k =
+                            self.specfence.partial_retry.current_k(self.tx_idx) as u64;
+                        self.specfence.wave.set_pending_park(
+                            location_hash,
+                            armed_at_k,
+                            crate::specfence::ParkKind::BlockingOther,
+                        );
+                        return Err(ReadError::Blocking(w));
+                    }
+                }
+            }
             self.specfence.metrics.record_spec_read();
             note_pending_effect_boundary(self.tx_idx, self.specfence.partial_retry);
             return Ok(());

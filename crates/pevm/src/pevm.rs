@@ -933,6 +933,14 @@ fn try_validate(
         };
         // Iter6: brief yield so Estimate→Data can land before RebindOnly decision
         // (value-stable same-output). No SoftWait Soft; bounded spin only.
+        // Iter12d: longer spin when force_bind / ff_head (more RebindOnly chance).
+        let rebind_spin = if specfence.partial_retry.has_force_bind(tx_version.tx_idx)
+            || specfence.partial_retry.has_ff_head(tx_version.tx_idx)
+        {
+            72
+        } else {
+            48
+        };
         if !invalid.is_empty()
             && invalid.iter().any(|&loc| {
                 mv_memory
@@ -940,7 +948,7 @@ fn try_validate(
                     .is_none()
             })
         {
-            for _ in 0..48 {
+            for _ in 0..rebind_spin {
                 if invalid.iter().all(|&loc| {
                     mv_memory
                         .current_data_value(tx_version.tx_idx, loc)
@@ -1064,11 +1072,47 @@ fn try_validate(
             // depth>=2 with cheap_resume: one extra SuffixRepair vs classic
             // was_force_bind escalate-at-1 (Iter6 measure: depth>=3 cut fr but
             // wall↑ from fb loops — prefer one extra repair only).
-            let escalate = if cheap_resume {
+            let mut escalate = if cheap_resume {
                 repair_depth >= 2
             } else {
                 was_force_bind || repair_depth >= 2
             };
+            // Iter12d: skip doomed 2nd SuffixRepair when fail-loc writers are
+            // ESTIMATE/Aborting but an Executing spine writer exists for
+            // serial-barrier — prefer one FullRestart behind Data over a
+            // SpecRead-through-ESTIMATE resume that will reabort.
+            if !escalate
+                && was_force_bind
+                && cheap_resume
+                && repair_depth >= 1
+                && specfence.engagement.is_storm()
+            {
+                let mut has_estimate_or_aborting = false;
+                let mut has_executing_spine = false;
+                for location in &invalid {
+                    let w = mv_memory
+                        .last_writer_before(*location, tx_version.tx_idx)
+                        .or_else(|| {
+                            mv_memory.residual_writer_before(*location, tx_version.tx_idx)
+                        });
+                    if let Some(w) = w {
+                        if w >= tx_version.tx_idx {
+                            continue;
+                        }
+                        if scheduler.is_executing(w) {
+                            has_executing_spine = true;
+                        }
+                        if scheduler.is_aborting(w)
+                            || mv_memory.entry_kind_at(*location, w) == "estimate"
+                        {
+                            has_estimate_or_aborting = true;
+                        }
+                    }
+                }
+                if has_estimate_or_aborting && has_executing_spine {
+                    escalate = true;
+                }
+            }
             let repair = if escalate {
                 // Drop sticky force_bind; retain certified FF values for head reexec.
                 specfence.partial_retry.escalate_full_restart(tx_version.tx_idx)

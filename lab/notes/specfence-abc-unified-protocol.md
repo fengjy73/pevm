@@ -118,3 +118,10 @@ See `specfence-abc-iter10-status.md`. Iter 11 cause: multi-SSTORE Handler abs ju
 Diagnosed plant pre-sload warm (−2100) seq≠par; fixed no-warm original. Landed k<k_fail snap select + plant-only first_k + last-tip gates. Multi-SSTORE abs jump still not aj>0∧seq≡par on Lean → jump/capture OFF. SoftWait=0; 597 N=5 med **12.7**.  
 See `specfence-abc-iter11-status.md`. Iter 12 cause: alternate resume opcode cut without abs jump.
 
+### Iter 12 — Validated gate + doomed-2nd-repair→barrier (wall↓)
+Lock-free `is_validated`; 2nd-repair prefer_await Validated spin (no park);
+force_prefix ESTIMATE→BO (Executing only); doomed SuffixRepair→serial-barrier escalate;
+longer RebindOnly spin on force_bind/ff_head. Abort-path evidence spins falsified (wall↑).
+597 N=5 med **12.5** SoftWait=0 (↓ vs Iter11 12.7); N=10 med **14.0** (↓ vs 14.2). aj=0.
+See `specfence-abc-iter12-status.md`. Iter 13 cause: hang-free opcode cut on *successful*
+SuffixRepair without abs jump / abort-path spins.
