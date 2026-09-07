@@ -242,8 +242,11 @@ pub(crate) enum LeanAbortRepair {
         reexec_cost: f64,
     },
     /// Certified prefix but no usable mid-tx checkpoint → force-bind + head reexec.
+    /// `suffix_writes` alone are ESTIMATEd; certified/`prefix` Data stays (no selective abort stamp).
     ForceBind {
         certified: Vec<MemoryLocationHash>,
+        /// Failed-suffix write locations to ESTIMATE (certified prefix kept as Data).
+        suffix_writes: Vec<MemoryLocationHash>,
         /// Suggested `LiveLearner::note_reexec_cost` sample.
         reexec_cost: f64,
     },
@@ -1230,10 +1233,12 @@ impl PartialRetryTable {
                     }
                 }
                 // Certified prefix but no usable mid-tx checkpoint → head ForceBind.
+                // Still ESTIMATE only failed suffix — never poison certified prefix Data.
                 self.set_force_bind(tx_idx, plan.certified.clone());
                 self.clear_repair(tx_idx);
                 LeanAbortRepair::ForceBind {
                     certified: plan.certified,
+                    suffix_writes: plan.suffix_writes,
                     reexec_cost: 1.2,
                 }
             }
@@ -1849,6 +1854,12 @@ impl WaveParkTable {
         self.ready.lock().unwrap().pop().map(|Reverse(t)| t)
     }
 
+    /// Arm park→steal convert without recording park idle (BlockingOther ESTIMATE path).
+    /// Dependent stays Aborting in `transactions_dependents`; worker steals Ready writer.
+    pub(crate) fn arm_steal_convert_without_park(&self) {
+        STEAL_AFTER_PARK.with(|c| c.set(true));
+    }
+
     /// Mark that a steal after park succeeded (wave ready **or** collaborative Ready).
     pub(crate) fn note_ready_steal_if_after_park(&self) {
         STEAL_AFTER_PARK.with(|c| {
@@ -2360,12 +2371,21 @@ mod abort_cheapening_tests {
         let _ = table.push_checkpoint(0, CheckpointKind::CallEntry);
         table.note_access(0, 10, AccessMode::Read);
         table.note_certified(0, 10);
+        table.note_access(0, 10, AccessMode::Write);
         table.note_access(0, 11, AccessMode::Read);
+        table.note_access(0, 20, AccessMode::Write);
 
-        match table.apply_suffix_repair(0, &[10, 11], &[11], &[]) {
-            LeanAbortRepair::ForceBind { certified, reexec_cost } => {
+        match table.apply_suffix_repair(0, &[10, 11], &[11], &[10, 20]) {
+            LeanAbortRepair::ForceBind {
+                certified,
+                suffix_writes,
+                reexec_cost,
+            } => {
                 assert!(certified.contains(&10));
                 assert!(!certified.contains(&11));
+                // 10 is certified write (prefix); 20 is failed-suffix write.
+                assert!(suffix_writes.contains(&20), "suffix_writes={suffix_writes:?}");
+                assert!(!suffix_writes.contains(&10), "must not ESTIMATE certified prefix write");
                 assert!((reexec_cost - 1.2).abs() < 1e-9);
             }
             other => panic!("expected ForceBind fallback, got {other:?}"),

@@ -803,14 +803,31 @@ impl Pevm {
                 }
                 Err(VmExecutionError::Blocking(blocking_tx_idx)) => {
                     // M2/P4: WaitHard registered park+(location,k) in Vm (SpecFence).
-                    // add_dependency parks the tx (Aborting); worker must steal ready work.
+                    // add_dependency marks Aborting; worker must steal ready work.
                     let pending = vm.take_pending_park();
                     let park_loc = pending.map(|p| p.location).unwrap_or(0);
                     let park_k = pending.map(|p| p.armed_at_k).unwrap_or(0);
                     let park_kind = pending
                         .map(|p| p.kind)
                         .unwrap_or(crate::specfence::ParkKind::BlockingOther);
+                    // Dependency first (Block-STM). SoftWait/EarlyAbort still need wave
+                    // park for (t,k) resume; BlockingOther ESTIMATE may convert to
+                    // steal-without-long-park when the writer is Ready.
+                    if !scheduler.add_dependency(tx_version.tx_idx, blocking_tx_idx)
+                        && self.abort_reason.get().is_none()
+                    {
+                        // Writer already done — retry without parking.
+                        continue;
+                    }
                     if let Some(wave) = wave {
+                        if park_kind == crate::specfence::ParkKind::BlockingOther {
+                            wave.arm_steal_convert_without_park();
+                            if let Some(stolen) = scheduler
+                                .next_task_steal_after_park_prefer(wave, Some(blocking_tx_idx))
+                            {
+                                return Some(stolen);
+                            }
+                        }
                         wave.park_with_kind(
                             tx_version.tx_idx,
                             blocking_tx_idx,
@@ -818,20 +835,9 @@ impl Pevm {
                             park_k,
                             park_kind,
                         );
-                    }
-                    if !scheduler.add_dependency(tx_version.tx_idx, blocking_tx_idx)
-                        && self.abort_reason.get().is_none()
-                    {
-                        // Retry the execution immediately if the blocking transaction was
-                        // re-executed by the time we can add it as a dependency.
-                        if let Some(wave) = wave {
-                            wave.unpark(tx_version.tx_idx, blocking_tx_idx, park_loc);
-                        }
-                        continue;
-                    }
-                    // Park→steal: immediately try ready work before returning to outer loop.
-                    if let Some(wave) = wave {
-                        if let Some(stolen) = scheduler.next_task_steal_after_park_prefer(wave, Some(blocking_tx_idx)) {
+                        if let Some(stolen) = scheduler
+                            .next_task_steal_after_park_prefer(wave, Some(blocking_tx_idx))
+                        {
                             return Some(stolen);
                         }
                     }
@@ -957,7 +963,10 @@ fn try_validate(
         // checkpoint exists). Research inspect (`!lean_tx`) keeps separate plant API.
         if lean_tx {
             // Dig: abort while prior ForceBind / SoftWait-wake still armed.
-            let was_force_bind = specfence.partial_retry.has_force_bind(tx_version.tx_idx);
+            let prior_force_bind = specfence
+                .partial_retry
+                .force_bind_locations(tx_version.tx_idx);
+            let was_force_bind = !prior_force_bind.is_empty();
             if was_force_bind {
                 specfence.metrics.record_force_bind_reabort();
             }
@@ -1012,36 +1021,73 @@ fn try_validate(
                         estimated
                     }
                 }
-                LeanAbortRepair::ForceBind { .. } => {
-                    // Certified prefix without mid-tx cp: selective invalidate only.
-                    // Keep force_bind from apply_suffix_repair; not FullRestart.
-                    let (estimated, fallback) = mv_memory.invalidate_selective(
-                        tx_version.tx_idx,
-                        Some(tx_version.tx_incarnation),
-                    );
-                    if fallback {
-                        specfence.metrics.record_selective_fallback_full();
-                    } else if !estimated.is_empty() {
+                LeanAbortRepair::ForceBind { suffix_writes, .. } => {
+                    // Certified prefix without mid-tx cp: ESTIMATE failed suffix only.
+                    // Never invalidate_selective here — aborted stamp + ESTIMATE would
+                    // poison ForceBound prefix Data and drive BlockingOther parks.
+                    let estimated = mv_memory
+                        .invalidate_partial_suffix(tx_version.tx_idx, suffix_writes);
+                    if !estimated.is_empty() {
                         specfence
                             .metrics
                             .record_selective_invalidate(estimated.len());
                     }
-                    write_locations.clone()
+                    if estimated.is_empty() {
+                        if suffix_writes.is_empty() {
+                            write_locations.clone()
+                        } else {
+                            suffix_writes.clone()
+                        }
+                    } else {
+                        estimated
+                    }
                 }
                 LeanAbortRepair::FullRestart { .. } => {
-                    let (estimated, fallback) = mv_memory.invalidate_selective(
-                        tx_version.tx_idx,
-                        Some(tx_version.tx_incarnation),
-                    );
-                    if fallback {
-                        specfence.metrics.record_selective_fallback_full();
-                    } else if !estimated.is_empty() {
-                        specfence
-                            .metrics
-                            .record_selective_invalidate(estimated.len());
+                    // Prior ForceBound prefix writes must not be ESTIMATEd on abort.
+                    let mut protect = prior_force_bind.clone();
+                    for loc in specfence.partial_retry.force_bind_locations(tx_version.tx_idx) {
+                        if !protect.contains(&loc) {
+                            protect.push(loc);
+                        }
                     }
+                    let fence_locs = if !protect.is_empty() {
+                        let suffix: Vec<_> = write_locations
+                            .iter()
+                            .copied()
+                            .filter(|l| !protect.contains(l))
+                            .collect();
+                        let estimated = mv_memory
+                            .invalidate_partial_suffix(tx_version.tx_idx, &suffix);
+                        if !estimated.is_empty() {
+                            specfence
+                                .metrics
+                                .record_selective_invalidate(estimated.len());
+                        }
+                        if estimated.is_empty() {
+                            if suffix.is_empty() {
+                                write_locations.clone()
+                            } else {
+                                suffix
+                            }
+                        } else {
+                            estimated
+                        }
+                    } else {
+                        let (estimated, fallback) = mv_memory.invalidate_selective(
+                            tx_version.tx_idx,
+                            Some(tx_version.tx_incarnation),
+                        );
+                        if fallback {
+                            specfence.metrics.record_selective_fallback_full();
+                        } else if !estimated.is_empty() {
+                            specfence
+                                .metrics
+                                .record_selective_invalidate(estimated.len());
+                        }
+                        write_locations.clone()
+                    };
                     specfence.metrics.record_full_restart();
-                    write_locations.clone()
+                    fence_locs
                 }
             };
             specfence.metrics.record_occ_abort();
