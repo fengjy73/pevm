@@ -20,7 +20,8 @@ use crate::{
     specfence::{
         AccessMode, CheckpointKind, FfValue, ResolveAction, SpecFenceCtx, StorageWriteReplay,
         early_val_probability, note_pending_effect_boundary,
-        arm_call_outcome_cache, resume_was_applied, steps_this_run, try_arm_safe_absolute_jump,
+        absolute_jump_eligible, arm_call_outcome_cache, resume_was_applied, steps_this_run,
+        suffix_repair_jump_env_ok, try_arm_safe_absolute_jump, try_arm_safe_absolute_jump_gated,
         with_plant_tls_journal,
     },
 };
@@ -1512,27 +1513,25 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             ctx.journal_mut().clear();
         }
 
-        // Plant v2 M1 / V5-P3: research RewindTo resume must NOT call record_evm_entry.
-        // Fresh starts (incl. Lean FullRestart-from-head) still count as evm_entries.
-        // Lean default: `rewind_resume` is always false (abort clears RewindTo via
-        // apply_suffix_repair / SoftWait wake). SoftWait wake and Lean SuffixRepair
-        // arm journal FF + force-bind (`try_arm_park_resume_at_k` / RewindTo) without
-        // absolute jump — set_tx still replays FF; try_ff_* when is_rewind_resume.
+        // SpecFence-native resume: RewindTo (SuffixRepair / SoftWait wake) takes the
+        // resume path on Lean too — do NOT gate on `!lean`. Journal FF (`try_ff_*`)
+        // already keys off table `is_rewind_resume`; this also seeds read origins,
+        // prefers `record_resume`, and may narrow-arm hang-free absolute jump.
         let lean = self.specfence.mode == crate::ConcurrencyMode::SpecFence
             && self.specfence.engagement.begin_tx(tx_version.tx_idx);
         let rewind_resume = self.specfence.mode == crate::ConcurrencyMode::SpecFence
-            && !lean
             && self
                 .specfence
                 .partial_retry
                 .is_rewind_resume(tx_version.tx_idx);
         if rewind_resume {
-            // M1b/M1d: journal FF in set_tx; live PC arm below inside inspect_run.
+            // M1b/M1d: journal FF in set_tx; optional live PC arm inside inspect_run.
             self.specfence.metrics.record_resume();
         } else {
             self.specfence.metrics.record_evm_entry();
-            // M4 lean: no CallEntry checkpoints (OCC-fast Handler::run).
-            if self.specfence.mode == crate::ConcurrencyMode::SpecFence && !lean {
+            // Lean + research: CallEntry so SuffixRepair can find 0 < cp.k < k_fail
+            // together with mid-tx EffectBoundary / write checkpoints.
+            if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
                 let _ = self.specfence.partial_retry.push_checkpoint(
                     tx_version.tx_idx,
                     CheckpointKind::CallEntry,
@@ -1540,9 +1539,35 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             }
         }
 
-        // M1d: seed certified-prefix read origins so validation still covers
-        // locations whose SLOAD/BALANCE opcodes are PC-skipped.
-        if rewind_resume {
+        // Hang-free SuffixRepair prefix skip: if Lean + RewindTo continuation is
+        // jump_is_safe, open inspect_run for THIS incarnation only and arm jump
+        // (no whole-block SPECFENCE_ENABLE_INSPECT). Else Handler::run + journal FF.
+        let suffix_jump = lean
+            && rewind_resume
+            && suffix_repair_jump_env_ok()
+            && self
+                .specfence
+                .partial_retry
+                .ff_continuation(tx_version.tx_idx)
+                .is_some_and(|cont| {
+                    absolute_jump_eligible(tx_version.tx_idx, self.specfence.partial_retry, &cont)
+                });
+
+        // R0: Handler::run by default.
+        // Research: SPECFENCE_ENABLE_INSPECT=1 OR finegrain journal OR narrow SuffixRepair jump.
+        let journal_stream = self
+            .specfence
+            .finegrain
+            .is_some_and(|fg| fg.journal_enabled());
+        let research_inspect = self.specfence.mode == crate::ConcurrencyMode::SpecFence
+            && !lean
+            && crate::specfence::research_inspect_enabled();
+        let use_inspect = journal_stream || research_inspect || suffix_jump;
+
+        // M1d: seed certified-prefix read origins only when prefix SLOADs may be
+        // PC-skipped. Lean journal-FF-only resume must NOT seed — stale FF origins
+        // vs post-wake MV Data cause InconsistentRead storms / SoftWait livelock.
+        if rewind_resume && (suffix_jump || research_inspect) {
             let db = self.evm.ctx().db_mut();
             for (location_hash, ff) in self.specfence.partial_retry.ff_values(tx_version.tx_idx)
             {
@@ -1562,17 +1587,6 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     .push(read_origin);
             }
         }
-
-        // R0: Handler::run by default.
-        // Research: SPECFENCE_ENABLE_INSPECT=1 (SpecFence plant) OR finegrain journal stream.
-        let journal_stream = self
-            .specfence
-            .finegrain
-            .is_some_and(|fg| fg.journal_enabled());
-        let use_inspect = journal_stream
-            || (self.specfence.mode == crate::ConcurrencyMode::SpecFence
-                && !lean
-                && crate::specfence::research_inspect_enabled());
         let run_result = if use_inspect {
             let partial_retry = self.specfence.partial_retry;
             let metrics = self.specfence.metrics;
@@ -1588,13 +1602,23 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 partial_retry,
                 metrics,
                 || {
-                    // SpecFence plant jump/resume only on non-journal-only research inspect.
-                    let plant_jump = self.specfence.mode == crate::ConcurrencyMode::SpecFence
-                        && !lean
-                        && crate::specfence::research_inspect_enabled();
+                    // Plant jump: research inspect OR Lean SuffixRepair hang-free arm.
+                    let plant_jump = research_inspect || suffix_jump;
                     if plant_jump && rewind_resume {
                         let jumped = partial_retry.ff_continuation(tx_idx).is_some_and(|cont| {
-                            try_arm_safe_absolute_jump(tx_idx, partial_retry, &cont, metrics)
+                            if suffix_jump {
+                                // Bypass SPECFENCE_ENABLE_INSPECT; honor ABSOLUTE_JUMP=0
+                                // via suffix_repair_jump_env_ok; keep jump_is_safe gates.
+                                try_arm_safe_absolute_jump_gated(
+                                    tx_idx,
+                                    partial_retry,
+                                    &cont,
+                                    metrics,
+                                    suffix_repair_jump_env_ok(),
+                                )
+                            } else {
+                                try_arm_safe_absolute_jump(tx_idx, partial_retry, &cont, metrics)
+                            }
                         });
                         if !jumped {
                             if let Some(cont) = partial_retry.ff_continuation(tx_idx) {
@@ -1742,7 +1766,9 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 // the revm journal, re-publish certified-prefix writes so record() does
                 // not drop them — from MvMemory residual Data and/or SpecFence
                 // write_replays (never journal-blob present_values).
-                if rewind_resume {
+                // Lean journal-FF-only Handler::run re-executes prefix stores — residual
+                // republish would paste stale MvMemory Data and break seq≡par.
+                if rewind_resume && (suffix_jump || research_inspect) {
                     let suffix: hashbrown::HashSet<_, BuildIdentityHasher> = self
                         .specfence
                         .partial_retry

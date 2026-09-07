@@ -366,6 +366,15 @@ pub(crate) fn absolute_jump_env_enabled() -> bool {
     }
 }
 
+/// Lean SuffixRepair may attempt hang-free absolute jump without whole-block
+/// `SPECFENCE_ENABLE_INSPECT`. Still honor explicit `SPECFENCE_ABSOLUTE_JUMP=0`.
+pub(crate) fn suffix_repair_jump_env_ok() -> bool {
+    match std::env::var_os("SPECFENCE_ABSOLUTE_JUMP") {
+        Some(v) if v == "0" => false,
+        _ => true,
+    }
+}
+
 /// Adaptive CC R0: valued CallOutcome SC **off by default**. Enable with
 /// `SPECFENCE_VALUED_CALL_CACHE=1` or `SPECFENCE_ENABLE_INSPECT=1`.
 pub(crate) fn valued_call_cache_env_enabled() -> bool {
@@ -591,6 +600,16 @@ fn current_effect_k() -> usize {
     })
 }
 
+/// Hang-free absolute-jump eligibility (safety gates only — no env / inspect flag).
+/// Used by Lean SuffixRepair to decide whether a narrow inspect_run is worth opening.
+pub(crate) fn absolute_jump_eligible(
+    tx_idx: TxIdx,
+    partial_retry: &PartialRetryTable,
+    cont: &ResumeContinuation,
+) -> bool {
+    !partial_retry.is_jump_disabled(tx_idx) && jump_is_safe(cont)
+}
+
 /// M1e: if continuation passes [`jump_is_safe`] and jump is not disabled for this
 /// tx (anti-livelock), arm absolute PC jump (+ journal blob).
 /// Returns true when armed; false → caller must use credit-only / non-jump fallback.
@@ -600,12 +619,29 @@ pub(crate) fn try_arm_safe_absolute_jump(
     cont: &ResumeContinuation,
     metrics: &MetricsInner,
 ) -> bool {
-    // M1f: default-on when jump_is_safe; SPECFENCE_ABSOLUTE_JUMP=0 disables.
+    try_arm_safe_absolute_jump_gated(
+        tx_idx,
+        partial_retry,
+        cont,
+        metrics,
+        absolute_jump_env_enabled(),
+    )
+}
+
+/// Like [`try_arm_safe_absolute_jump`], but caller supplies the env gate.
+/// Lean SuffixRepair resume passes `env_ok=true` so hang-free `jump_is_safe`
+/// jumps work without whole-block `SPECFENCE_ENABLE_INSPECT`.
+pub(crate) fn try_arm_safe_absolute_jump_gated(
+    tx_idx: TxIdx,
+    partial_retry: &PartialRetryTable,
+    cont: &ResumeContinuation,
+    metrics: &MetricsInner,
+    env_ok: bool,
+) -> bool {
+    // M1f: default-on when jump_is_safe; SPECFENCE_ABSOLUTE_JUMP=0 disables (research).
     // Anti-livelock: jump_disabled after a jumped resume fails validation.
-    if !absolute_jump_env_enabled()
-        || partial_retry.is_jump_disabled(tx_idx)
-        || !jump_is_safe(cont)
-    {
+    // SuffixRepair may pass env_ok=true; safety still requires jump_is_safe.
+    if !env_ok || !absolute_jump_eligible(tx_idx, partial_retry, cont) {
         metrics.record_absolute_jump_fallback();
         return false;
     }

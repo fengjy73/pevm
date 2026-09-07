@@ -1156,9 +1156,11 @@ impl PartialRetryTable {
     ///   clear_force_bind; clear_repair → FullRestart
     /// ```
     ///
-    /// Does **not** enable absolute PC jump / valued CallOutcome (research inspect
-    /// only). After SuffixRepair, [`Self::is_rewind_resume`] is true so `set_tx`
-    /// journal FF applies.
+    /// Absolute PC jump is **not** armed here — the execute path may hang-free
+    /// narrow-arm via `jump_is_safe` on the SuffixRepair resume incarnation only
+    /// (no whole-block `SPECFENCE_ENABLE_INSPECT`). After SuffixRepair,
+    /// [`Self::is_rewind_resume`] is true so Lean takes the resume path
+    /// (`record_resume`, FF seed, `try_ff_*`).
     pub(crate) fn apply_suffix_repair(
         &self,
         tx_idx: TxIdx,
