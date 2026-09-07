@@ -419,18 +419,37 @@ impl<'a, S: Storage> VmDb<'a, S> {
             });
 
         if let Some(v) = bind_version {
-            // Sticky / force_bind / hot_inc0 + unfinished Data: yield-spin for
-            // producer done, then Bind-on-Data. No SoftWait Soft; no BO park on
-            // published Data (park idle regressed wall). No-Data Estimate path
-            // may Await via WaitHard→BO after spin below.
+            // force_bind location without validated (Executed/Validated) Data:
+            // brief yield-spin then BlockingOther prefer-steal Await (not SoftWait
+            // Soft) until writer done — then Bind. Prevents speculative Bind-no-park
+            // on stale force_bind that fuels force_bind_reabort loops.
             let writer_unfinished = !self.specfence.scheduler.is_done(v.tx_idx);
+            if writer_unfinished && force_prefix {
+                for _ in 0..64 {
+                    if self.specfence.scheduler.is_done(v.tx_idx) {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                if !self.specfence.scheduler.is_done(v.tx_idx) {
+                    self.specfence.metrics.record_wait_hard();
+                    self.specfence.metrics.record_wait(address);
+                    self.specfence
+                        .wave
+                        .set_pending_park_location(location_hash);
+                    return Err(ReadError::Blocking(v.tx_idx));
+                }
+                return self.bind_on_data_lite(address, location_hash, v, true);
+            }
+            // Sticky / hot_inc0 + unfinished Data: brief yield-spin then Bind.
+            // No SoftWait Soft. (force_prefix handled above via spin+BO.)
             if writer_unfinished {
                 let sticky = self.tx_incarnation > 0
                     && self.specfence.learner.is_sticky_resolve(location_hash);
                 let hot_inc0 = self.tx_incarnation == 0
                     && self.specfence.hotset.contains(location_hash)
                     && self.specfence.rw_prior.predicts_write(location_hash);
-                if force_prefix || sticky || hot_inc0 {
+                if sticky || hot_inc0 {
                     for _ in 0..128 {
                         if self.specfence.scheduler.is_done(v.tx_idx) {
                             break;

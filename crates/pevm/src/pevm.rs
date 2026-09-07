@@ -957,6 +957,9 @@ fn try_validate(
             specfence.metrics.record_rebind_only();
             specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
             specfence.partial_retry.clear_repair(tx_version.tx_idx);
+            specfence
+                .partial_retry
+                .clear_suffix_repair_depth(tx_version.tx_idx);
             specfence.learner.note_reexec_cost(0.1);
             read_set_valid = true;
             // Fall through to success path below (no abort / no SuffixRepair).
@@ -999,24 +1002,40 @@ fn try_validate(
                 .unwrap_or_else(|| mv_memory.write_locations(tx_version.tx_idx));
             let read_locations = cached_read_locations
                 .unwrap_or_else(|| mv_memory.read_locations(tx_version.tx_idx));
-            // Reuse plan when we already built it for k_fail; else plan once.
-            let plan = cached_plan.unwrap_or_else(|| {
-                specfence.partial_retry.plan_partial_retry(
-                    tx_version.tx_idx,
-                    &read_locations,
-                    &invalid,
-                    &write_locations,
-                )
-            });
-            let repair = specfence
+            // Break force_bind_reabort ≈ resume loop:
+            //  (1) escalate after 1 reabort → clear force_bind + OCC FullRestart
+            //  (3) cap SuffixRepair depth (≥2) → same escalate
+            // RebindOnly already preferred above when it can apply.
+            let repair_depth = specfence
                 .partial_retry
-                .apply_suffix_repair_planned(tx_version.tx_idx, plan);
+                .suffix_repair_depth(tx_version.tx_idx);
+            let escalate = was_force_bind || repair_depth >= 2;
+            let repair = if escalate {
+                // Drop sticky force_bind for this incarnation; no RewindTo.
+                specfence.partial_retry.escalate_full_restart(tx_version.tx_idx)
+            } else {
+                // Reuse plan when we already built it for k_fail; else plan once.
+                let plan = cached_plan.unwrap_or_else(|| {
+                    specfence.partial_retry.plan_partial_retry(
+                        tx_version.tx_idx,
+                        &read_locations,
+                        &invalid,
+                        &write_locations,
+                    )
+                });
+                let repair = specfence
+                    .partial_retry
+                    .apply_suffix_repair_planned(tx_version.tx_idx, plan);
+                if repair.did_force_bind() {
+                    specfence.partial_retry.note_suffix_repair(tx_version.tx_idx);
+                }
+                repair
+            };
             if repair.did_force_bind() {
                 specfence.metrics.record_partial_retry();
             }
-            // Sticky AFTER SuffixRepair arming — merge conflict ℓ into force_bind
-            // so next touch Bind-if-Data (apply_suffix_repair would overwrite if first).
-            if was_force_bind {
+            // Sticky AFTER SuffixRepair only when not escalating (reabort escalates).
+            if was_force_bind && !escalate {
                 for location in &invalid {
                     specfence.learner.note_sticky_resolve(*location);
                 }
@@ -1071,13 +1090,23 @@ fn try_validate(
                     }
                 }
                 LeanAbortRepair::FullRestart { .. } => {
-                    // Prior ForceBound prefix writes must not be ESTIMATEd on abort.
-                    let mut protect = prior_force_bind.clone();
-                    for loc in specfence.partial_retry.force_bind_locations(tx_version.tx_idx) {
-                        if !protect.contains(&loc) {
-                            protect.push(loc);
+                    // Escalate (fb_reabort / depth cap): OCC-style full invalidate —
+                    // do not protect prior force_bind prefix (sticky fb dropped).
+                    // Non-escalate FullRestart still protects armed force_bind Data.
+                    let protect = if escalate {
+                        Vec::new()
+                    } else {
+                        let mut protect = prior_force_bind.clone();
+                        for loc in specfence
+                            .partial_retry
+                            .force_bind_locations(tx_version.tx_idx)
+                        {
+                            if !protect.contains(&loc) {
+                                protect.push(loc);
+                            }
                         }
-                    }
+                        protect
+                    };
                     let fence_locs = if !protect.is_empty() {
                         let suffix: Vec<_> = write_locations
                             .iter()
@@ -1311,6 +1340,9 @@ fn try_validate(
             .partial_retry
             .clear_force_bind(tx_version.tx_idx);
         specfence.partial_retry.clear_repair(tx_version.tx_idx);
+        specfence
+            .partial_retry
+            .clear_suffix_repair_depth(tx_version.tx_idx);
         specfence
             .partial_retry
             .clear_jump_disabled(tx_version.tx_idx);

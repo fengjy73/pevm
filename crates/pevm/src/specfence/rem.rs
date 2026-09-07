@@ -738,6 +738,8 @@ pub(crate) struct PartialRetryTable {
     /// After force_bind_reabort: next Lean execute should open narrow inspect to
     /// capture live jump_snap (CallEntry/EffectBoundary + Storage FF path).
     needs_live_capture: DashMap<TxIdx, (), BuildIdentityHasher>,
+    /// Per-tx SuffixRepair/ForceBind resolve depth this block. Cap → FullRestart.
+    suffix_repair_depth: Vec<AtomicUsize>,
 }
 
 // SAFETY: scheduler runs ≤1 executor per tx; validate after execute returns.
@@ -767,6 +769,7 @@ impl PartialRetryTable {
             last_jump_applied: DashMap::default(),
             jump_disabled: DashMap::default(),
             needs_live_capture: DashMap::default(),
+            suffix_repair_depth: (0..block_size).map(|_| AtomicUsize::new(0)).collect(),
         }
     }
 
@@ -1257,6 +1260,41 @@ impl PartialRetryTable {
 
     pub(crate) fn take_softwait_parked(&self, tx_idx: TxIdx) -> bool {
         self.softwait_parked.remove(&tx_idx).is_some()
+    }
+
+    /// Count of SuffixRepair/ForceBind resolves armed for `tx` this block.
+    #[inline]
+    pub(crate) fn suffix_repair_depth(&self, tx_idx: TxIdx) -> usize {
+        self.suffix_repair_depth
+            .get(tx_idx)
+            .map(|a| a.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// Note one SuffixRepair / ForceBind arm (depth for escalate-after-N).
+    #[inline]
+    pub(crate) fn note_suffix_repair(&self, tx_idx: TxIdx) {
+        if let Some(a) = self.suffix_repair_depth.get(tx_idx) {
+            a.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Clear repair depth (success validate or escalate FullRestart).
+    #[inline]
+    pub(crate) fn clear_suffix_repair_depth(&self, tx_idx: TxIdx) {
+        if let Some(a) = self.suffix_repair_depth.get(tx_idx) {
+            a.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Escalate out of force_bind_reabort / SuffixRepair depth cap:
+    /// clear force_bind + RewindTo repair + depth → OCC-style FullRestart.
+    pub(crate) fn escalate_full_restart(&self, tx_idx: TxIdx) -> LeanAbortRepair {
+        self.clear_force_bind(tx_idx);
+        self.clear_repair(tx_idx);
+        self.clear_suffix_repair_depth(tx_idx);
+        self.needs_live_capture.remove(&tx_idx);
+        LeanAbortRepair::FullRestart { reexec_cost: 2.2 }
     }
 
     /// SpecFence-native Lean resolve: **SuffixRepair-first** (default abort path).
@@ -2501,6 +2539,32 @@ mod abort_cheapening_tests {
     }
 
     /// Research + Lean SuffixRepair both arm RewindTo when mid-tx cp exists.
+
+    /// Escalate clears force_bind + repair depth and returns FullRestart.
+    #[test]
+    fn escalate_full_restart_clears_force_bind_and_depth() {
+        let table = PartialRetryTable::new(1);
+        table.reset_incarnation(0, 0);
+        let _ = table.push_checkpoint(0, CheckpointKind::CallEntry);
+        table.note_access(0, 10, AccessMode::Read);
+        table.note_certified(0, 10);
+        let _ = table.push_checkpoint(0, CheckpointKind::EffectBoundary);
+        table.note_access(0, 11, AccessMode::Read);
+        let _ = table.apply_suffix_repair(0, &[10, 11], &[11], &[]);
+        table.note_suffix_repair(0);
+        assert!(table.has_force_bind(0));
+        assert_eq!(table.suffix_repair_depth(0), 1);
+        match table.escalate_full_restart(0) {
+            LeanAbortRepair::FullRestart { reexec_cost } => {
+                assert!((reexec_cost - 2.2).abs() < 1e-9);
+            }
+            other => panic!("expected FullRestart, got {other:?}"),
+        }
+        assert!(!table.has_force_bind(0));
+        assert_eq!(table.suffix_repair_depth(0), 0);
+        assert!(!table.is_rewind_resume(0));
+    }
+
     #[test]
     fn research_and_lean_suffix_repair_both_arm_rewind() {
         let table = PartialRetryTable::new(1);
