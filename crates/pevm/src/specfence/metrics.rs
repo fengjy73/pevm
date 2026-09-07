@@ -85,6 +85,8 @@ pub struct SpecFenceMetrics {
     pub resume_count: usize,
     /// M1+: rebind-only repair without rewind/restart (stays 0 until Rebind).
     pub rebind_only: usize,
+    /// Cold SpecRead fast path: skipped Bayes/HotSet/π (OCC-like discovery).
+    pub cold_spec_fast: usize,
     /// M1+: rewind journal/PC to checkpoint then resume (stays 0 until RewindTo).
     pub rewind_to_cp: usize,
     /// FullRestart decisions: OCC abort reexec, or SpecFence FullRetry (no certified prefix).
@@ -201,6 +203,7 @@ pub(crate) struct MetricsInner {
     evm_entries: AtomicUsize,
     resume_count: AtomicUsize,
     rebind_only: AtomicUsize,
+    cold_spec_fast: AtomicUsize,
     rewind_to_cp: AtomicUsize,
     full_restart: AtomicUsize,
     tx_head_reexec: AtomicUsize,
@@ -417,6 +420,10 @@ impl MetricsInner {
     /// M1: rebind-only repair without rewind/restart.
     pub(crate) fn record_rebind_only(&self) {
         self.rebind_only.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_cold_spec_fast(&self) {
+        self.cold_spec_fast.fetch_add(1, Ordering::Relaxed);
     }
 
     /// M1: rewind journal/PC to checkpoint then resume.
@@ -648,6 +655,7 @@ impl MetricsInner {
             evm_entries: self.evm_entries.load(Ordering::Relaxed),
             resume_count: self.resume_count.load(Ordering::Relaxed),
             rebind_only: self.rebind_only.load(Ordering::Relaxed),
+            cold_spec_fast: self.cold_spec_fast.load(Ordering::Relaxed),
             rewind_to_cp: self.rewind_to_cp.load(Ordering::Relaxed),
             full_restart: self.full_restart.load(Ordering::Relaxed),
             tx_head_reexec: self.tx_head_reexec.load(Ordering::Relaxed),

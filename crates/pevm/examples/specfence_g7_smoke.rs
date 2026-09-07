@@ -195,6 +195,7 @@ fn main() {
                 _ => Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence),
             };
             pevm.reset_heat();
+            pevm.reset_inter_prior();
             let (ok, tps, wall_ms, soft, wh, aborts) = run_one(&chain, &mut pevm, &loaded, 8);
             let m = pevm.last_specfence_metrics();
             let n = n_tx(&loaded.block);
@@ -240,6 +241,7 @@ fn main() {
                 "soft_wait_wake_ok": m.soft_wait_wake_ok,
                 "soft_wait_wake_reabort": m.soft_wait_wake_reabort,
                 "rebind_only": m.rebind_only,
+                "cold_spec_fast": m.cold_spec_fast,
                 "absolute_jump_applied": m.absolute_jump_applied,
                 "absolute_jump_fallback": m.absolute_jump_fallback,
                 "tx_full_retry": m.tx_full_retry,

@@ -177,13 +177,8 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 .reset_incarnation(tx_idx, incarnation);
             // M1b: restore SpecFence journal to checkpoint via FF continuation.
             let n = self.specfence.partial_retry.replay_ff_if_armed(tx_idx);
-            let entries = self
-                .specfence
-                .partial_retry
-                .ff_entries(tx_idx)
-                .max(n);
-            if entries > 0 {
-                self.specfence.metrics.record_journal_ff_entries(entries);
+            if n > 0 {
+                self.specfence.metrics.record_journal_ff_entries(n);
             }
         }
         if let TxKind::Call(to) = tx.kind {
@@ -423,6 +418,20 @@ impl<'a, S: Storage> VmDb<'a, S> {
             .specfence
             .partial_retry
             .must_force_bind(self.tx_idx, location_hash);
+
+        // B. OCC-like cold SpecRead: no sticky/writer/hot/prior/force_bind ⇒ skip
+        // π + revoke tax. note_observe already refreshed cheap learner features.
+        if !force_prefix
+            && !self.specfence.learner.is_sticky_resolve(location_hash)
+            && !hotset_hint
+            && !prior_ws_predicts
+            && writer.is_none()
+        {
+            self.specfence.metrics.record_spec_read();
+            self.specfence.metrics.record_cold_spec_fast();
+            note_pending_effect_boundary(self.tx_idx, self.specfence.partial_retry);
+            return Ok(());
+        }
 
         // Unified revoke: τ_revoke + morph quiet/waw (side effects only).
         let _ = self.specfence.try_revoke(

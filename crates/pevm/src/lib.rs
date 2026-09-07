@@ -75,7 +75,7 @@ fn hash_deterministic<T: Hash>(x: T) -> u64 {
 // TODO: It would be nice if we could tie the different cases of
 // memory locations & values at the type level, to prevent lots of
 // matches & potentially dangerous mismatch mistakes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum MemoryValue {
     Basic(AccountBasic),
     CodeHash(B256),

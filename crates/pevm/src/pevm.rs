@@ -854,6 +854,8 @@ fn try_validate(
             }
         }
         // RebindOnly when no true failed-suffix write (or no writes if k unknown).
+        // Widen: value-stable RebindOnly even with true_suffix when incarnation
+        // value_snap equals current published Data (same-output republish).
         let true_suffix = match k_fail {
             Some(k) => specfence.partial_retry.has_true_suffix_writes(
                 tx_version.tx_idx,
@@ -862,9 +864,30 @@ fn try_validate(
             ),
             None => !write_locations.is_empty(),
         };
-        if !true_suffix
-            && mv_memory.try_rebind_invalid_reads(tx_version.tx_idx, &invalid)
-        {
+        // Storage-only value-stable: Basic/Lazy can false-match under selective
+        // invalidate and commit a non-serializable continuation.
+        let value_stable = !invalid.is_empty()
+            && invalid.iter().all(|&loc| {
+                let Some(snap) = specfence.partial_retry.snapped_value(tx_version.tx_idx, loc) else {
+                    return false;
+                };
+                let Some(cur) = mv_memory.current_data_value(tx_version.tx_idx, loc) else {
+                    return false;
+                };
+                matches!(
+                    (&snap, &cur),
+                    (
+                        crate::specfence::FfValue::Storage { value, .. },
+                        MemoryValue::Storage(v),
+                    ) if value == v
+                )
+            });
+        let rebound = if !true_suffix || value_stable {
+            mv_memory.try_rebind_invalid_reads(tx_version.tx_idx, &invalid)
+        } else {
+            false
+        };
+        if rebound {
             specfence.metrics.record_partial_retry();
             specfence.metrics.record_rebind_only();
             specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
@@ -936,7 +959,23 @@ fn try_validate(
                         estimated
                     }
                 }
-                LeanAbortRepair::ForceBind { .. } | LeanAbortRepair::FullRestart { .. } => {
+                LeanAbortRepair::ForceBind { .. } => {
+                    // Certified prefix without mid-tx cp: selective invalidate only.
+                    // Keep force_bind from apply_suffix_repair; not FullRestart.
+                    let (estimated, fallback) = mv_memory.invalidate_selective(
+                        tx_version.tx_idx,
+                        Some(tx_version.tx_incarnation),
+                    );
+                    if fallback {
+                        specfence.metrics.record_selective_fallback_full();
+                    } else if !estimated.is_empty() {
+                        specfence
+                            .metrics
+                            .record_selective_invalidate(estimated.len());
+                    }
+                    write_locations.clone()
+                }
+                LeanAbortRepair::FullRestart { .. } => {
                     let (estimated, fallback) = mv_memory.invalidate_selective(
                         tx_version.tx_idx,
                         Some(tx_version.tx_incarnation),

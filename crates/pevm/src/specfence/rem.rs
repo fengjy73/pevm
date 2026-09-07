@@ -781,6 +781,17 @@ impl PartialRetryTable {
         }
     }
 
+    /// Live incarnation value snap (for value-stable RebindOnly at validation).
+    pub(crate) fn snapped_value(
+        &self,
+        tx_idx: TxIdx,
+        location: MemoryLocationHash,
+    ) -> Option<FfValue> {
+        self.states.get(tx_idx).and_then(|slot| {
+            slot.lock().unwrap().value_snap.get(&location).cloned()
+        })
+    }
+
     /// M1i: Inspector post-SSTORE gas capture for write-prefix jump gas-equality.
     pub(crate) fn note_post_sstore_gas(&self, tx_idx: TxIdx, gas_remaining_after: u64) {
         if let Some(slot) = self.states.get(tx_idx) {

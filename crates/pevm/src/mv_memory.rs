@@ -318,6 +318,7 @@ impl MvMemory {
     /// M1 RebindOnly: patch invalid read origins to the current valid version
     /// without aborting. Refuses multi-origin (lazy) reads — those need RewindTo.
     /// Returns true iff after patching `collect_invalid_reads` is empty.
+    /// Applies patches atomically (no partial mutate on failure).
     pub(crate) fn try_rebind_invalid_reads(
         &self,
         tx_idx: TxIdx,
@@ -326,20 +327,45 @@ impl MvMemory {
         if invalid.is_empty() {
             return true;
         }
-        let mut locs = index_mutex!(self.last_locations, tx_idx);
-        for &location in invalid {
-            let prior = locs.read.get(&location).cloned();
-            if prior.as_ref().is_some_and(|o| o.len() > 1) {
-                // Lazy multi-origin — unsafe to rebind in place.
-                return false;
+        let mut planned = Vec::with_capacity(invalid.len());
+        {
+            let locs = index_mutex!(self.last_locations, tx_idx);
+            for &location in invalid {
+                let prior = locs.read.get(&location);
+                if prior.is_some_and(|o| o.len() > 1) {
+                    return false;
+                }
+                let Some(new_origins) = self.current_read_origins(tx_idx, location) else {
+                    return false;
+                };
+                planned.push((location, new_origins));
             }
-            let Some(new_origins) = self.current_read_origins(tx_idx, location) else {
-                return false;
-            };
+        }
+        let mut locs = index_mutex!(self.last_locations, tx_idx);
+        for (location, new_origins) in planned {
             locs.read.insert(location, new_origins);
         }
         drop(locs);
         self.collect_invalid_reads(tx_idx).is_empty()
+    }
+
+    /// Closest live Data value below `tx_idx`, if any (Estimate → None).
+    pub(crate) fn current_data_value(
+        &self,
+        tx_idx: TxIdx,
+        location: MemoryLocationHash,
+    ) -> Option<crate::MemoryValue> {
+        let written = self.data.get(&location)?;
+        match written.range(..tx_idx).next_back()? {
+            (idx, MemoryEntry::Data(inc, val)) => {
+                if self.is_aborted_incarnation(*idx, *inc) {
+                    None
+                } else {
+                    Some(val.clone())
+                }
+            }
+            (_, MemoryEntry::Estimate) => None,
+        }
     }
 
     /// Current single-origin read for `location` as of `tx_idx` (for RebindOnly).
