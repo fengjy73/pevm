@@ -6,7 +6,9 @@ use revm::{
         ContextTr, JournalTr,
         result::{EVMError, ExecutionResult, HaltReason, InvalidTransaction},
     },
-    handler::{EthFrame, EvmTr, EvmTrError, FrameResult, Handler},
+    handler::{
+        EthFrame, EvmTr, EvmTrError, FrameResult, FrameTr, Handler, ItemOrResult,
+    },
     inspector::{InspectorEvmTr, InspectorHandler, JournalExt},
     interpreter::interpreter::EthInterpreter,
     state::EvmState,
@@ -14,6 +16,7 @@ use revm::{
 };
 
 use crate::chain::{PevmChain, PevmEthereum};
+use crate::specfence::{pending_resume_armed, try_apply_pending_pc_resume};
 
 /// MainnetHandler that skips beneficiary reward (pevm applies via MvMemory).
 pub(crate) struct NoBeneficiaryHandler<EVM, ERROR> {
@@ -46,6 +49,55 @@ where
         _: &mut FrameResult,
     ) -> Result<(), Self::Error> {
         Ok(())
+    }
+
+    /// Iter8: apply armed PENDING_RESUME on Handler::run (no inspect_run).
+    /// Stock revm only applies via Inspector::initialize_interp; we hook after
+    /// first frame_init so memory-lite absolute jump works hang-free on Lean.
+    #[inline]
+    fn run_exec_loop(
+        &mut self,
+        evm: &mut Self::Evm,
+        first_frame_input: <<Self::Evm as EvmTr>::Frame as FrameTr>::FrameInit,
+    ) -> Result<FrameResult, Self::Error> {
+        let res = evm.frame_init(first_frame_input)?;
+
+        if let ItemOrResult::Result(frame_result) = res {
+            return Ok(frame_result);
+        }
+
+        // Apply PC/stack/memory/write_replays before first frame_run.
+        // frame_stack and ctx are distinct Evm fields — split via raw pointers.
+        if pending_resume_armed() {
+            let evm_ptr = evm as *mut Self::Evm;
+            // SAFETY: ctx and frame_stack are disjoint fields; no aliasing with
+            // other borrows for the duration of try_apply_pending_pc_resume.
+            unsafe {
+                let frame = (*evm_ptr).frame_stack().get();
+                let depth = frame.depth.min(u16::MAX as usize) as u16;
+                let interp = &mut frame.interpreter;
+                let ctx = (*evm_ptr).ctx();
+                try_apply_pending_pc_resume(interp, ctx, depth);
+            }
+        }
+
+        loop {
+            let call_or_result = evm.frame_run()?;
+
+            let result = match call_or_result {
+                ItemOrResult::Item(init) => match evm.frame_init(init)? {
+                    ItemOrResult::Item(_) => {
+                        continue;
+                    }
+                    ItemOrResult::Result(result) => result,
+                },
+                ItemOrResult::Result(result) => result,
+            };
+
+            if let Some(result) = evm.frame_return_result(result)? {
+                return Ok(result);
+            }
+        }
     }
 }
 

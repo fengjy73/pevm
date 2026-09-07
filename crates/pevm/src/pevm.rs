@@ -1266,8 +1266,10 @@ fn try_validate(
             // Iter7: after first SuffixRepair fail (was_force_bind, arming 2nd
             // SuffixRepair), sticky BO Await — park this tx behind unfinished
             // fail-loc writers until Executed/Validated before 2nd resume.
+            // Iter8: first-repair Estimate park falsified (wall↑ / sra↑). SoftWait Soft=0.
             // Not SoftWait Soft; not storm-wide fanout Await (fail locs only).
             if !escalate && was_force_bind && specfence.engagement.is_storm() {
+
                 // Hang-free: only park behind *Executing* fail-loc writers (Iter3
                 // lesson). Ready/Aborting deps idle the 2nd resume (wall↑ on N=5).
                 let mut best: Option<(crate::TxIdx, usize)> = None;

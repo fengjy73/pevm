@@ -1237,8 +1237,16 @@ pub(crate) fn sstore_plant_capture_eth<H: revm::interpreter::Host + ?Sized>(
     let mem_gas = *interp.gas.memory();
     // Iter5 serial capture window: WaitHard demoted while plant_tls_active, so
     // stack clone is hang-free (Iter4 empty-stack lite could not absolute-jump).
-    // Memory stays empty (clone cost); write_replays restore storage presents.
+    // Iter8: also clone memory when small (≤8KiB). Empty-memory abs jump falsified
+    // seq≠par; large memory clones stay in the hang family — cap and skip.
     let stack: Vec<_> = interp.stack.data().to_vec();
+    const MEMORY_SNAP_CAP: usize = 8 * 1024;
+    let mem_slice = interp.memory.context_memory();
+    let memory = if mem_slice.len() > 0 && mem_slice.len() <= MEMORY_SNAP_CAP {
+        mem_slice.to_vec()
+    } else {
+        Vec::new()
+    };
     let snap = BoundarySnapshot {
         pc,
         gas_remaining,
@@ -1248,7 +1256,7 @@ pub(crate) fn sstore_plant_capture_eth<H: revm::interpreter::Host + ?Sized>(
         call_depth: CALL_DEPTH.get(),
         opcode_steps: n,
         stack,
-        memory: Vec::new(),
+        memory,
         code_hash,
         bytecode_len,
         at_call_boundary: false,

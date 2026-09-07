@@ -99,4 +99,7 @@ After first SuffixRepair fail: sticky + force_bind-extend fail locs; storm∧Exe
 597 N=5 med **13.2** SoftWait=0; N=10 med **13.9**; **fb_reabort/resume/fr↓**.  
 See `specfence-abc-iter7-status.md`. Iter 8 cause: remaining SuffixRepair opcode-seconds; hang-free memory snap ≠ inspect, or RebindOnly on certified-prefix-only / Storage-stable fails.
 
-
+### Iter 8 — hang-free memory snap plumbing; jump falsified
+Handler SSTORE memory clone (≤8KiB) + run_exec_loop PENDING_RESUME apply (no inspect). Broad memory-lite jump **seq≠par**; capture-without-jump wall↑; RebindOnly widen / first-repair Estimate park falsified. Production jump/capture OFF. SoftWait=0; aj=0; hsstore proof off-path.  
+597 N=5 med **13.4**; N=10 med **13.4** (↓ vs Iter7 13.9).  
+See `specfence-abc-iter8-status.md`. Iter 9 cause: correct Handler jump restore → aj>0 seq≡par then enable capture+jump.
