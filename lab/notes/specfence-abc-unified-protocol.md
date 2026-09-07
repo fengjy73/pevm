@@ -159,3 +159,11 @@ plumbing for !true_suffix (fvd≈0 on 597). Keep Iter12–15. Jump/capture OFF.
 597 N5 med **12.3** SoftWait=0 (≤ Iter14 12.4; ↓ vs Iter15 13.1).
 See `specfence-abc-iter16-status.md`. Iter 17 cause: hang-free opcode skip /
 RebindOnly-after-fra on true_suffix / schedule Await before SpecRead — not sticky-absorb.
+
+### Iter 17 — yield-spin Await before SpecRead (plateau)
+Schedule Await before SpecRead via yield-spin on storm+program live_fanout≥8
+unfinished writers (no BO park). BO park / true_suffix defer / long RebindOnly
+wait falsified. Keep Iter16 absorb-no-sticky. Jump/capture OFF. SoftWait Soft=0.
+597 N5 med **12.7–12.8**; N10 **13.0** (≤ Iter16 N10 13.5). Stretch <10 unmet.
+See `specfence-abc-iter17-status.md`. Iter 18 cause: hang-free opcode skip on
+successful SuffixRepair / later RewindTo without mass-path tax — not fan BO park.

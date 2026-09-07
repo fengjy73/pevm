@@ -48,6 +48,10 @@
 //! instead of early FullRestart (FR collapse reserved for Estimate/Aborting
 //! doomed spines). Keep Iter12–15 barrier widen / vs-spin / fra. Jump/capture
 //! OFF. SoftWait Soft ~0. No 15b drain / 15c BO-OR.
+//! Iter17: schedule Await before SpecRead via yield-spin on storm+program
+//! live_fanout≥8 unfinished writers (no BO park). Falsified: 17a/f BO park,
+//! 17b true_suffix defer, 17d long RebindOnly wait, 17g cut vs_spin. Keep
+//! Iter16 absorb-no-sticky. Jump/capture OFF. SoftWait Soft ~0.
 //! Iter8 memory snap retained. Head-FF (Iter5). SoftWait Soft ~0.
 //!
 //! **Learn (C):** Inter morph selects Quiet (598 OCC-lite) vs Storm (597 Await-ready).

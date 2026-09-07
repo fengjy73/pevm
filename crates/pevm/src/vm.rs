@@ -555,6 +555,31 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     }
                     return self.bind_on_data_lite(address, location_hash, v, force_prefix);
                 }
+                // Iter17: hang-free yield-spin before SpecRead/Bind on hot unfinished
+                // writers — NO BlockingOther park (17a/f park tax falsified). SoftWait
+                // Soft=0. Evidence live_fanout≥8 + storm+program only. Not 15c
+                // HotSet-OR; not sticky-absorb; not true_suffix defer (17b).
+                if storm
+                    && is_program
+                    && self.specfence.learner.live_fanout_hot(location_hash)
+                {
+                    for _ in 0..64 {
+                        if self.specfence.scheduler.is_done(v.tx_idx) {
+                            break;
+                        }
+                        std::thread::yield_now();
+                    }
+                    if self.specfence.scheduler.is_done(v.tx_idx) {
+                        for _ in 0..32 {
+                            if self.specfence.scheduler.is_validated(v.tx_idx)
+                                || !self.specfence.scheduler.is_done(v.tx_idx)
+                            {
+                                break;
+                            }
+                            std::thread::yield_now();
+                        }
+                    }
+                }
             }
             return self.bind_on_data_lite(address, location_hash, v, force_prefix);
         }
