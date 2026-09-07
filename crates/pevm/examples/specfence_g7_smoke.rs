@@ -240,7 +240,7 @@ fn main() {
                 aborts_v.push(aborts as f64);
                 if iters == 1 || i + 1 == iters {
                     println!(
-                        "  block={bn} mode={mode:10} iter={}/{} ok={ok} tps={tps:.0} wall_ms={wall_ms:.1} soft={soft} wait_hard={wh} abort_rate={:.3} lean={} evm={} reexec={} fb_reabort={} rebind={} cold={} occ_fast={} steal={} park_k={} mw_ms={:.1} h_ms={:.1} v_ms={:.1} park_ms={:.1} sw_ms={:.1} ea_ms={:.1} bo_ms={:.1} parks={}",
+                        "  block={bn} mode={mode:10} iter={}/{} ok={ok} tps={tps:.0} wall_ms={wall_ms:.1} soft={soft} wait_hard={wh} abort_rate={:.3} lean={} evm={} reexec={} fb_reabort={} sb_res={} sb_def={} rebind={} cold={} occ_fast={} steal={} park_k={} mw_ms={:.1} h_ms={:.1} v_ms={:.1} park_ms={:.1} sw_ms={:.1} ea_ms={:.1} bo_ms={:.1} parks={}",
                         i + 1,
                         iters,
                         if n == 0 { 0.0 } else { aborts as f64 / n as f64 },
@@ -248,6 +248,8 @@ fn main() {
                         m.evm_entries,
                         reexec_entries,
                         m.force_bind_reabort,
+                        m.serial_barrier_resolve,
+                        m.serial_barrier_defer,
                         m.rebind_only,
                         m.cold_spec_fast,
                         m.occ_fast_first,
@@ -315,6 +317,8 @@ fn main() {
                     row["inspector_steps"] = serde_json::json!(m.inspector_steps);
                     row["inspector_steps_resume"] = serde_json::json!(m.inspector_steps_resume);
                     row["live_pc_resume_count"] = serde_json::json!(m.live_pc_resume_count);
+                    row["serial_barrier_resolve"] = serde_json::json!(m.serial_barrier_resolve);
+                    row["serial_barrier_defer"] = serde_json::json!(m.serial_barrier_defer);
                 }
             }
             let (wall_med, wall_p90, wall_min, wall_mean) = summarize_f64(&mut walls);

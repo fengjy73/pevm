@@ -751,6 +751,8 @@ pub(crate) struct PartialRetryTable {
     needs_live_capture: DashMap<TxIdx, (), BuildIdentityHasher>,
     /// Per-tx SuffixRepair/ForceBind resolve depth this block. Cap → FullRestart.
     suffix_repair_depth: Vec<AtomicUsize>,
+    /// Iter3: serial-barrier park count this block (cap in try_claim).
+    serial_barrier_count: Vec<AtomicUsize>,
 }
 
 // SAFETY: scheduler runs ≤1 executor per tx; validate after execute returns.
@@ -781,6 +783,7 @@ impl PartialRetryTable {
             jump_disabled: DashMap::default(),
             needs_live_capture: DashMap::default(),
             suffix_repair_depth: (0..block_size).map(|_| AtomicUsize::new(0)).collect(),
+            serial_barrier_count: (0..block_size).map(|_| AtomicUsize::new(0)).collect(),
         }
     }
 
@@ -1298,8 +1301,28 @@ impl PartialRetryTable {
         }
     }
 
-    /// Escalate out of force_bind_reabort / SuffixRepair depth cap:
-    /// clear force_bind + RewindTo repair + depth → OCC-style FullRestart.
+    /// Iter3: claim a serial-barrier park (cap 1/tx/block — anti-cascade).
+    pub(crate) fn try_claim_serial_barrier(&self, tx_idx: TxIdx) -> bool {
+        const MAX_BARRIERS: usize = 1;
+        let Some(a) = self.serial_barrier_count.get(tx_idx) else {
+            return false;
+        };
+        let cur = a.load(Ordering::Relaxed);
+        if cur >= MAX_BARRIERS {
+            return false;
+        }
+        a.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// True when this tx has exhausted its serial-barrier budget.
+    pub(crate) fn serial_barrier_used(&self, tx_idx: TxIdx) -> bool {
+        const MAX_BARRIERS: usize = 1;
+        self.serial_barrier_count
+            .get(tx_idx)
+            .is_some_and(|a| a.load(Ordering::Relaxed) >= MAX_BARRIERS)
+    }
+
     pub(crate) fn escalate_full_restart(&self, tx_idx: TxIdx) -> LeanAbortRepair {
         self.clear_force_bind(tx_idx);
         self.clear_repair(tx_idx);

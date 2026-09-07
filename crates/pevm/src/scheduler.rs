@@ -282,6 +282,73 @@ impl Scheduler {
         true
     }
 
+    /// Iter3 serial-barrier resolve: after validation abort the tx is already
+    /// `Aborting`. Park it behind an unfinished writer (`blocking_tx_idx`) so the
+    /// FullRestart runs once writers have published Data — SpecFence-native
+    /// barrier, not a global OCC serialize.
+    ///
+    /// Returns `false` if the writer is already Executed|Validated (race).
+    pub(crate) fn add_dependency_from_aborting(
+        &self,
+        tx_idx: TxIdx,
+        blocking_tx_idx: TxIdx,
+    ) -> bool {
+        let blocking_tx = index_mutex!(self.transactions_status, blocking_tx_idx);
+        if matches!(
+            blocking_tx.status,
+            IncarnationStatus::Executed | IncarnationStatus::Validated
+        ) {
+            return false;
+        }
+        {
+            let tx = index_mutex!(self.transactions_status, tx_idx);
+            debug_assert_eq!(tx.status, IncarnationStatus::Aborting);
+        }
+        let mut blocking_dependents = index_mutex!(self.transactions_dependents, blocking_tx_idx);
+        blocking_dependents.push(tx_idx);
+        true
+    }
+
+    /// Abort finish that arms Ready + cascade rewind but does **not** immediately
+    /// `try_execute` the aborted tx (steal-first). Kept for Iter4 clique experiments;
+    /// Iter3 production path uses writer-barrier park only.
+    #[allow(dead_code)]
+    pub(crate) fn finish_validation_fenced_defer_exec(
+        &self,
+        tx_version: &TxVersion,
+        rewind_to: Option<TxIdx>,
+        wave: Option<&crate::specfence::WaveParkTable>,
+    ) -> Option<Task> {
+        self.set_ready_status(tx_version.tx_idx);
+        if let Some(wave) = wave {
+            wave.push_ready(tx_version.tx_idx);
+        }
+        if self.execution_idx.load(Ordering::Relaxed) > tx_version.tx_idx {
+            self.execution_idx
+                .fetch_min(tx_version.tx_idx, Ordering::Relaxed);
+        }
+        if let Some(to) = rewind_to {
+            let to = to.clamp(tx_version.tx_idx + 1, self.block_size);
+            self.validation_idx.fetch_min(to, Ordering::Relaxed);
+        }
+        None
+    }
+
+    /// Validation abort parked on a writer: leave `Aborting`, rewind cascade only.
+    /// Writer `finish_execution` drains dependents → Ready.
+    pub(crate) fn finish_validation_fenced_barrier_park(
+        &self,
+        tx_version: &TxVersion,
+        rewind_to: Option<TxIdx>,
+    ) -> Option<Task> {
+        // Status stays Aborting (dependency already registered).
+        if let Some(to) = rewind_to {
+            let to = to.clamp(tx_version.tx_idx + 1, self.block_size);
+            self.validation_idx.fetch_min(to, Ordering::Relaxed);
+        }
+        None
+    }
+
     fn set_ready_status(&self, tx_idx: TxIdx) {
         let mut tx = index_mutex!(self.transactions_status, tx_idx);
         debug_assert_eq!(tx.status, IncarnationStatus::Aborting);
@@ -452,6 +519,17 @@ impl Scheduler {
         }
         // SAFETY: tx_idx checked against block_size above.
         unsafe { self.done_flags.get_unchecked(tx_idx).load(Ordering::Acquire) }
+    }
+
+    /// True when the incarnation is actively `Executing` (not merely Ready/Aborting).
+    /// Used by Iter3 serial-barrier to avoid parking behind idle/queued writers.
+    #[inline]
+    pub(crate) fn is_executing(&self, tx_idx: TxIdx) -> bool {
+        if tx_idx >= self.block_size {
+            return false;
+        }
+        let tx = index_mutex!(self.transactions_status, tx_idx);
+        tx.status == IncarnationStatus::Executing
     }
 
     #[inline]

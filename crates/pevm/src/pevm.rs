@@ -1216,6 +1216,51 @@ fn try_validate(
             specfence.metrics.record_fence_cascade(cascade, skipped);
             // V5-P0: engagement.note_abort is metrics-only (no HotSet storm insert).
             let _ = specfence.engagement.note_abort();
+            // Iter3 B: serial-barrier resolve after escalate FullRestart.
+            // Prefer park behind unfinished conflict writers so the head reexec
+            // runs once against Data (not ESTIMATE race). SpecFence-native —
+            // not whole-block serialize / not inspect_run jump.
+            if escalate
+                && was_force_bind
+                && specfence.engagement.is_storm()
+                && !specfence
+                    .partial_retry
+                    .serial_barrier_used(tx_version.tx_idx)
+            {
+                // Narrow Iter3 barrier: once per tx, only behind an *Executing*
+                // conflict writer (not Ready/Aborting queue). Claim slot only on
+                // successful park (anti-cascade).
+                let mut barrier_writer: Option<TxIdx> = None;
+                for location in &invalid {
+                    let w = mv_memory
+                        .last_writer_before(*location, tx_version.tx_idx)
+                        .or_else(|| {
+                            mv_memory.residual_writer_before(*location, tx_version.tx_idx)
+                        });
+                    if let Some(w) = w {
+                        // Only park behind an actively Executing writer (Ready/Aborting
+                        // queues caused park-tax / cascade outliers).
+                        if w < tx_version.tx_idx && scheduler.is_executing(w) {
+                            barrier_writer = Some(match barrier_writer {
+                                Some(prev) => prev.max(w),
+                                None => w,
+                            });
+                        }
+                    }
+                }
+                if let Some(w) = barrier_writer {
+                    if scheduler.add_dependency_from_aborting(tx_version.tx_idx, w) {
+                        let _ = specfence
+                            .partial_retry
+                            .try_claim_serial_barrier(tx_version.tx_idx);
+                        specfence.metrics.record_serial_barrier_resolve();
+                        return scheduler.finish_validation_fenced_barrier_park(
+                            tx_version,
+                            rewind_to,
+                        );
+                    }
+                }
+            }
             return scheduler.finish_validation_fenced(tx_version, true, rewind_to, Some(specfence.wave));
         }
         // Snapshot write locations before invalidate (same set).

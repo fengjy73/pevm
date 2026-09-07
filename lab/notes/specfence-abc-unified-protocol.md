@@ -73,3 +73,8 @@ See `specfence-abc-iter1-status.md`. Iter 2 cause: hang-free live snap → jump 
 ### Iter 2 — live_prime→jump ladder falsified
 Tried hang-free live snap via narrow Lean inspect prime + delay fb escalate when `jump_is_safe`. Preview can be true, but inspect/jump under concurrency **hangs 597/599**. Production: live_prime OFF; classic escalate. SoftWait=0; 597 med ~13.9 ≈ plateau; aj=0.  
 See `specfence-abc-iter2-status.md`. Iter 3 cause: hang-free PC capture ≠ full inspect_run (or serial-barrier resolve).
+
+### Iter 3 — serial-barrier resolve (modest)
+Storm∧was_force_bind escalate → once park behind Executing conflict writer (no inspect).  
+597 N=10 med **13.4** SoftWait=0 (↓ vs Iter2 13.9); stretch &lt;10 unmet; aj=0.  
+See `specfence-abc-iter3-status.md`. Iter 4 cause: hang-free PC ≠ inspect_run and/or stronger clique barrier.

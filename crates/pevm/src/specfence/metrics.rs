@@ -191,6 +191,10 @@ pub struct SpecFenceMetrics {
     pub soft_wait_wake_ok: usize,
     /// V5 dig: SoftWait wake → next validation aborted again.
     pub soft_wait_wake_reabort: usize,
+    /// Iter3: escalate FullRestart parked behind unfinished conflict writer.
+    pub serial_barrier_resolve: usize,
+    /// Iter3: escalate FullRestart steal-first defer (no unfinished writer).
+    pub serial_barrier_defer: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -274,6 +278,8 @@ pub(crate) struct MetricsInner {
     force_bind_reabort: AtomicUsize,
     soft_wait_wake_ok: AtomicUsize,
     soft_wait_wake_reabort: AtomicUsize,
+    serial_barrier_resolve: AtomicUsize,
+    serial_barrier_defer: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -580,6 +586,15 @@ impl MetricsInner {
         self.soft_wait_wake_reabort.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_serial_barrier_resolve(&self) {
+        self.serial_barrier_resolve.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn record_serial_barrier_defer(&self) {
+        self.serial_barrier_defer.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_journal_ff_entries(&self, n: usize) {
         if n > 0 {
             self.journal_ff_entries.fetch_add(n, Ordering::Relaxed);
@@ -793,6 +808,8 @@ impl MetricsInner {
             force_bind_reabort: self.force_bind_reabort.load(Ordering::Relaxed),
             soft_wait_wake_ok: self.soft_wait_wake_ok.load(Ordering::Relaxed),
             soft_wait_wake_reabort: self.soft_wait_wake_reabort.load(Ordering::Relaxed),
+            serial_barrier_resolve: self.serial_barrier_resolve.load(Ordering::Relaxed),
+            serial_barrier_defer: self.serial_barrier_defer.load(Ordering::Relaxed),
         }
     }
 }

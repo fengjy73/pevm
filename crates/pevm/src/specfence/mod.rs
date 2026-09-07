@@ -12,7 +12,7 @@
 //!     ↑
 //! π = choose_action on hot candidates only # C intra
 //!     ↑
-//! Resolve: RebindOnly | SuffixRepair|Jump  # B — FullRestart after depth≥2
+//! Resolve: RebindOnly | SuffixRepair|Jump  # B — escalate→serial-barrier
 //! ```
 //!
 //! **Avoid (A):** unfinished writer on hot program ℓ → BlockingOther prefer-steal
@@ -21,7 +21,9 @@
 //!
 //! **Resolve (B):** RebindOnly when value-stable; else SuffixRepair + hang-free
 //! absolute jump when `jump_is_safe`; else journal-FF resume. Escalate FullRestart
-//! after SuffixRepair depth≥2 (fb-loop break). Never ESTIMATE-poison certified prefix.
+//! after SuffixRepair depth≥2 (fb-loop break), then **serial-barrier**: park behind
+//! unfinished conflict writers (or steal-first defer) so head reexec runs once
+//! against Data. Never ESTIMATE-poison certified prefix. No Lean live_prime.
 //!
 //! **Learn (C):** Inter morph selects Quiet (598 OCC-lite) vs Storm (597 Await-ready).
 //! Intra `choose_action` / learner updates only on hot candidates.
