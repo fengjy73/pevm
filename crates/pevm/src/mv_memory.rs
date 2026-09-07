@@ -424,7 +424,7 @@ impl MvMemory {
     }
 
     /// Last non-ESTIMATE Data version strictly below `tx_idx` (OrderedDirtyRead).
-    /// Skips ESTIMATE and aborted incarnations.
+    /// Skips ESTIMATE markers and aborted incarnations (continue past both).
     pub(crate) fn last_data_before(
         &self,
         location: MemoryLocationHash,
@@ -437,10 +437,10 @@ impl MvMemory {
                     if !self.is_aborted_incarnation(*idx, *inc) {
                         return Some((*idx, *inc));
                     }
+                    // Aborted incarnation: keep scanning for older live Data.
                 }
                 MemoryEntry::Estimate => {
-                    // Skip ESTIMATE → caller may WaitHard on this writer.
-                    return None;
+                    // OrderedDirtyRead: skip ESTIMATE marker, keep scanning.
                 }
             }
         }

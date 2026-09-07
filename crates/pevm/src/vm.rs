@@ -447,6 +447,23 @@ impl<'a, S: Storage> VmDb<'a, S> {
             self.specfence.metrics.record_cold_spec_fast();
             note_pending_effect_boundary(self.tx_idx, self.specfence.partial_retry);
             return Ok(());
+        } else if writer.is_some_and(|w| {
+            self.mv_memory.entry_kind_at(location_hash, w) == "estimate"
+        }) {
+            // ESTIMATE marker: producer aborted. Prefer Bind-on-prior (handled above)
+            // or SpecRead — never BlockingOther / SoftWait on the ESTIMATE writer.
+            // (ODR past ESTIMATE in basic/storage; validation catches republish.)
+            self.specfence.metrics.record_spec_read();
+            note_pending_effect_boundary(self.tx_idx, self.specfence.partial_retry);
+            return Ok(());
+        } else if writer.is_some()
+            && !writer_done
+            && !force_prefix
+            && (sticky || prior_ws_predicts || hotset_hint)
+        {
+            // Known unfinished live writer + sticky/prior/hot: Await without
+            // note_observe / try_revoke / choose_action DashMap tax (profile: maybe_wait).
+            ResolveAction::WaitHard
         } else if force_prefix {
             ResolveAction::SpecRead
         } else {
@@ -964,8 +981,22 @@ impl<S: Storage> Database for VmDb<'_, S> {
             loop {
                 match iter.next_back() {
                     Some((blocking_idx, MemoryEntry::Estimate)) => {
+                        // SpecFence OrderedDirtyRead: skip *leading* ESTIMATE (no lazy
+                        // chain started yet) to prior Data — avoids BlockingOther park
+                        // while the aborted writer re-executes. Mid-lazy-chain ESTIMATE
+                        // still Blocks (need republished lazy update).
+                        if self.specfence.mode == crate::ConcurrencyMode::SpecFence
+                            && new_origins.is_empty()
+                            && balance_addition == U256::ZERO
+                            && nonce_addition == 0
+                        {
+                            self.specfence.metrics.record_spec_read();
+                            continue;
+                        }
                         self.promote_on_conflict(address, location_hash);
-                        if self.specfence.mode == crate::ConcurrencyMode::SpecFence { self.specfence.wave.set_pending_park_location(location_hash); }
+                        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+                            self.specfence.wave.set_pending_park_location(location_hash);
+                        }
                         return Err(ReadError::Blocking(*blocking_idx));
                     }
                     Some((closest_idx, MemoryEntry::Data(tx_incarnation, value))) => {
@@ -973,8 +1004,18 @@ impl<S: Storage> Database for VmDb<'_, S> {
                             .mv_memory
                             .is_aborted_incarnation(*closest_idx, *tx_incarnation)
                         {
+                            if self.specfence.mode == crate::ConcurrencyMode::SpecFence
+                                && new_origins.is_empty()
+                                && balance_addition == U256::ZERO
+                                && nonce_addition == 0
+                            {
+                                self.specfence.metrics.record_spec_read();
+                                continue;
+                            }
                             self.promote_on_conflict(address, location_hash);
-                            if self.specfence.mode == crate::ConcurrencyMode::SpecFence { self.specfence.wave.set_pending_park_location(location_hash); }
+                            if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+                                self.specfence.wave.set_pending_park_location(location_hash);
+                            }
                             return Err(ReadError::Blocking(*closest_idx));
                         }
                         self.specfence.metrics.record_db_heavy_op();
@@ -1232,8 +1273,46 @@ impl<S: Storage> Database for VmDb<'_, S> {
                         .mv_memory
                         .is_aborted_incarnation(*closest_idx, *tx_incarnation)
                     {
+                        // SpecFence OrderedDirtyRead: try prior live Data without parking.
+                        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+                            if let Some((idx, inc)) = self
+                                .mv_memory
+                                .last_data_before(location_hash, self.tx_idx)
+                            {
+                                if let Some(written) = self.mv_memory.data.get(&location_hash)
+                                    && let Some(MemoryEntry::Data(i2, MemoryValue::Storage(v2))) =
+                                        written.get(&idx)
+                                    && *i2 == inc
+                                {
+                                    self.specfence.metrics.record_spec_read();
+                                    self.specfence.metrics.record_db_heavy_op();
+                                    let origin = ReadOrigin::MvMemory(TxVersion {
+                                        tx_idx: idx,
+                                        tx_incarnation: inc,
+                                    });
+                                    Self::push_origin(read_origins, origin.clone())?;
+                                    self.deep_trace_read(
+                                        location_hash,
+                                        crate::specfence::LocationKind::Storage,
+                                        Some(&origin),
+                                    );
+                                    self.specfence.partial_retry.note_value(
+                                        self.tx_idx,
+                                        location_hash,
+                                        FfValue::Storage {
+                                            address,
+                                            slot: index,
+                                            value: *v2,
+                                            origin: Some((idx, inc)),
+                                        },
+                                    );
+                                    self.maybe_early_val(address, location_hash)?;
+                                    return Ok(*v2);
+                                }
+                            }
+                            self.specfence.wave.set_pending_park_location(location_hash);
+                        }
                         self.promote_on_conflict(address, location_hash);
-                        if self.specfence.mode == crate::ConcurrencyMode::SpecFence { self.specfence.wave.set_pending_park_location(location_hash); }
                         return Err(ReadError::Blocking(*closest_idx));
                     }
                     self.specfence.metrics.record_db_heavy_op();
@@ -1263,9 +1342,48 @@ impl<S: Storage> Database for VmDb<'_, S> {
                     return Ok(*value);
                 }
                 MemoryEntry::Estimate => {
-                    self.promote_on_conflict(address, location_hash);
-                    if self.specfence.mode == crate::ConcurrencyMode::SpecFence { self.specfence.wave.set_pending_park_location(location_hash); }
-                    return Err(ReadError::Blocking(*closest_idx));
+                    // SpecFence OrderedDirtyRead: skip ESTIMATE → prior Storage / pre-state.
+                    if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+                        if let Some((idx, inc)) =
+                            self.mv_memory.last_data_before(location_hash, self.tx_idx)
+                        {
+                            if let Some(written) = self.mv_memory.data.get(&location_hash)
+                                && let Some(MemoryEntry::Data(i2, MemoryValue::Storage(v2))) =
+                                    written.get(&idx)
+                                && *i2 == inc
+                            {
+                                self.specfence.metrics.record_spec_read();
+                                self.specfence.metrics.record_db_heavy_op();
+                                let origin = ReadOrigin::MvMemory(TxVersion {
+                                    tx_idx: idx,
+                                    tx_incarnation: inc,
+                                });
+                                Self::push_origin(read_origins, origin.clone())?;
+                                self.deep_trace_read(
+                                    location_hash,
+                                    crate::specfence::LocationKind::Storage,
+                                    Some(&origin),
+                                );
+                                self.specfence.partial_retry.note_value(
+                                    self.tx_idx,
+                                    location_hash,
+                                    FfValue::Storage {
+                                        address,
+                                        slot: index,
+                                        value: *v2,
+                                        origin: Some((idx, inc)),
+                                    },
+                                );
+                                self.maybe_early_val(address, location_hash)?;
+                                return Ok(*v2);
+                            }
+                        }
+                        // No prior Data: fall through to storage (not BlockingOther).
+                        self.specfence.metrics.record_spec_read();
+                    } else {
+                        self.promote_on_conflict(address, location_hash);
+                        return Err(ReadError::Blocking(*closest_idx));
+                    }
                 }
                 _ => return Err(ReadError::InvalidMemoryValueType),
             }
