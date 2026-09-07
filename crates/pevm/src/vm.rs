@@ -382,7 +382,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
     /// learner / Bayes / FenceGraph / choose_action. Bind journals+certifies under
     /// one rem lock; unfinished producer → BlockingOther steal (no SoftWait Soft).
     /// Full π only for sticky force_bind / program-prior Await / repair reincarnation.
-    /// First incarnation = OCC discovery until validate fail → SuffixRepair + sticky.
+    /// Incarnation-0 hot/prior/sticky unfinished → BO prefer-steal Await before Bind.
     fn maybe_wait_specfence(
         &self,
         address: Address,
@@ -419,43 +419,34 @@ impl<'a, S: Storage> VmDb<'a, S> {
             });
 
         if let Some(v) = bind_version {
-            // force_bind location without validated (Executed/Validated) Data:
-            // brief yield-spin then BlockingOther prefer-steal Await (not SoftWait
-            // Soft) until writer done — then Bind. Prevents speculative Bind-no-park
-            // on stale force_bind that fuels force_bind_reabort loops.
+            // Unfinished published Data: BlockingOther prefer-steal Await until
+            // Executed/Validated, then Bind — *before* SpecRead/Bind-no-park.
+            // Extends force_prefix BO to sticky + incarnation-0 prior (hot/prior
+            // conflict). Previously these only yield-spun then Bind-no-park — that
+            // is the first force_bind abort grain (reading past unfinished writer).
+            // SoftWait Soft = 0; keep escalate-after-1-reabort / RebindOnly.
             let writer_unfinished = !self.specfence.scheduler.is_done(v.tx_idx);
-            if writer_unfinished && force_prefix {
-                for _ in 0..64 {
-                    if self.specfence.scheduler.is_done(v.tx_idx) {
-                        break;
-                    }
-                    std::thread::yield_now();
-                }
-                if !self.specfence.scheduler.is_done(v.tx_idx) {
-                    self.specfence.metrics.record_wait_hard();
-                    self.specfence.metrics.record_wait(address);
-                    self.specfence
-                        .wave
-                        .set_pending_park_location(location_hash);
-                    return Err(ReadError::Blocking(v.tx_idx));
-                }
-                return self.bind_on_data_lite(address, location_hash, v, true);
-            }
-            // Sticky / hot_inc0 + unfinished Data: brief yield-spin then Bind.
-            // No SoftWait Soft. (force_prefix handled above via spin+BO.)
             if writer_unfinished {
-                let sticky = self.tx_incarnation > 0
-                    && self.specfence.learner.is_sticky_resolve(location_hash);
-                let hot_inc0 = self.tx_incarnation == 0
-                    && self.specfence.hotset.contains(location_hash)
+                let sticky = self.specfence.learner.is_sticky_resolve(location_hash);
+                let prior_inc0 = self.tx_incarnation == 0
                     && self.specfence.rw_prior.predicts_write(location_hash);
-                if sticky || hot_inc0 {
-                    for _ in 0..128 {
+                let prefer_await = force_prefix || sticky || prior_inc0;
+                if prefer_await {
+                    for _ in 0..64 {
                         if self.specfence.scheduler.is_done(v.tx_idx) {
                             break;
                         }
                         std::thread::yield_now();
                     }
+                    if !self.specfence.scheduler.is_done(v.tx_idx) {
+                        self.specfence.metrics.record_wait_hard();
+                        self.specfence.metrics.record_wait(address);
+                        self.specfence
+                            .wave
+                            .set_pending_park_location(location_hash);
+                        return Err(ReadError::Blocking(v.tx_idx));
+                    }
+                    return self.bind_on_data_lite(address, location_hash, v, force_prefix);
                 }
             }
             return self.bind_on_data_lite(address, location_hash, v, force_prefix);
@@ -473,12 +464,17 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if self.tx_incarnation == 0 && !tx_has_force {
             if let Some(w) = self.mv_memory.last_writer_before(location_hash, self.tx_idx) {
                 if self.mv_memory.entry_kind_at(location_hash, w) == "estimate" {
+                    // Cold SpecRead-through-ESTIMATE (ESTIMATE→BO wall↑).
                     self.specfence.metrics.record_spec_read();
                     self.specfence.metrics.record_occ_fast_first();
                     return Ok(());
                 }
+                // Known unfinished writer + prior/hot/sticky: BO prefer-steal
+                // Await before SpecRead (prevent first abort). SoftWait Soft = 0.
                 if !self.specfence.scheduler.is_done(w)
-                    && self.specfence.rw_prior.predicts_write(location_hash)
+                    && (self.specfence.rw_prior.predicts_write(location_hash)
+                        || self.specfence.hotset.contains(location_hash)
+                        || self.specfence.learner.is_sticky_resolve(location_hash))
                 {
                     self.specfence.metrics.record_wait_hard();
                     self.specfence.metrics.record_wait(address);
