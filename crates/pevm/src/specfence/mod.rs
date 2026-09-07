@@ -310,6 +310,7 @@ impl<'a> SpecFenceCtx<'a> {
         let morph_weights = self.learner.morph_weights();
         let e_wait_time = self.learner.e_wait_time(location);
         let e_cascade = self.learner.e_cascade(location);
+        let e_reexec = self.learner.e_reexec();
         let meta_budget_exceeded = self.learner.meta_budget_exceeded(self.params);
         // G3: pass published Data version into π even when writer not yet is_done —
         // choose_action decides Bind via prior_ws / high P / placeholder_ready.
@@ -328,6 +329,7 @@ impl<'a> SpecFenceCtx<'a> {
             live_fanout,
             e_wait_time,
             e_cascade,
+            e_reexec,
             meta_budget_exceeded,
             gross_work_depth,
             morph_weights,

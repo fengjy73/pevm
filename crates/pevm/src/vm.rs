@@ -436,10 +436,12 @@ impl<'a, S: Storage> VmDb<'a, S> {
             .conflict_probability(location_hash, Some(&address));
 
         let action = if force_prefix {
+            // PartialRetry force-bind: Bind when Data ready; else SpecRead.
+            // WaitHard here SoftWait-armed without Data and livelocked fan-out (abort cheapening).
             if let Some(v) = bind_version.clone() {
                 ResolveAction::Bind(v)
             } else {
-                ResolveAction::WaitHard
+                ResolveAction::SpecRead
             }
         } else {
             // G1: cheap effect-progress depth when prior incarnation finished; else None.
@@ -457,7 +459,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 bind_version.is_some() || writer_done,
             );
             // G3: single π choke — no post-choose_action SpecRead→Bind/WaitHard mutate.
-            // (PartialRetry force_prefix Bind/WaitHard above is repair, not π.)
+            // (PartialRetry force_prefix Bind-or-SpecRead above is repair, not π.)
             self.specfence.choose_resolve(
                 location_hash,
                 &address,
@@ -1488,6 +1490,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
 
         // Plant v2 M1: RewindTo resume must NOT call record_evm_entry / head path.
         // Fresh starts (incl. FullRestart) still count as evm_entries.
+        // LeanOCC may still take hang-free RewindTo+journal FF+force-bind (no inspect/PC jump).
         let lean = self.specfence.mode == crate::ConcurrencyMode::SpecFence
             && self.specfence.engagement.begin_tx(tx_version.tx_idx);
         let rewind_resume = self.specfence.mode == crate::ConcurrencyMode::SpecFence
@@ -1501,13 +1504,8 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             self.specfence.metrics.record_resume();
         } else {
             self.specfence.metrics.record_evm_entry();
-            // CallEntry/CallExit come from SpecFenceInspector on the inspect path.
-            // OCC/PCC keep a synthetic CallEntry for PartialRetry bookkeeping only
-            // when SpecFence mode... (SpecFence uses inspector hooks instead).
-            // M4 lean: no checkpoints (OCC-fast Handler::run).
+            // M4 lean: no CallEntry checkpoints (OCC-fast Handler::run).
             if self.specfence.mode == crate::ConcurrencyMode::SpecFence && !lean {
-                // Still record a k=0 CallEntry so plan_repair has a floor cp when
-                // the inspector call hook is delayed; inspector may add richer cps.
                 let _ = self.specfence.partial_retry.push_checkpoint(
                     tx_version.tx_idx,
                     CheckpointKind::CallEntry,

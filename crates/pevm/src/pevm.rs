@@ -851,6 +851,7 @@ fn try_validate(
                 specfence.metrics.record_rebind_only();
                 specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
                 specfence.partial_retry.clear_repair(tx_version.tx_idx);
+                specfence.learner.note_reexec_cost(0.1);
                 read_set_valid = true;
                 // Fall through to success path below (no abort).
             }
@@ -864,6 +865,27 @@ fn try_validate(
         // HotSet non-empty (retained), else full ESTIMATE. Fence cascade kept.
         if lean_tx {
             let write_locations = mv_memory.write_locations(tx_version.tx_idx);
+            // Cheapen lean abort without RewindTo/inspect: force-bind certified prefix
+            // (Bind-only when Data ready — see vm force_prefix) + selective invalidate.
+            if let Some(plan) = specfence.partial_retry.plan_partial_retry(
+                tx_version.tx_idx,
+                &read_locations,
+                &invalid,
+                &write_locations,
+            ) {
+                if !plan.certified.is_empty() {
+                    specfence
+                        .partial_retry
+                        .set_force_bind(tx_version.tx_idx, plan.certified.clone());
+                    specfence.metrics.record_partial_retry();
+                    specfence.learner.note_reexec_cost(1.2);
+                } else {
+                    specfence.learner.note_reexec_cost(2.0);
+                }
+            } else {
+                specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
+                specfence.learner.note_reexec_cost(2.2);
+            }
             // Prefer selective invalidate (R2); fall back to full ESTIMATE inside helper.
             let (estimated, fallback) = mv_memory.invalidate_selective(
                 tx_version.tx_idx,
@@ -992,6 +1014,7 @@ fn try_validate(
                     } => {
                         specfence.metrics.record_partial_retry();
                         specfence.metrics.record_rewind_to_cp();
+                        specfence.learner.note_reexec_cost(0.6);
                         // M1b: arm journal FF continuation from failed incarnation snap.
                         specfence.partial_retry.arm_rewind_to(
                             tx_version.tx_idx,
@@ -1022,6 +1045,7 @@ fn try_validate(
                         specfence.metrics.record_tx_full_retry();
                         specfence.metrics.record_full_restart();
                         specfence.metrics.record_partial_retry_fallback_full();
+                        specfence.learner.note_reexec_cost(2.0);
                         specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
                         specfence.partial_retry.clear_repair(tx_version.tx_idx);
                         let (estimated, fallback) = mv_memory.invalidate_selective(

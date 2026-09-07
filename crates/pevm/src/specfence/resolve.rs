@@ -2,12 +2,15 @@
 //!
 //! Sole decision = argmin EV over FenceGraph actions (makespan-relevant):
 //! ```text
-//! EV_Bind  = 0 if Data ready else +∞
+//! EV_Bind  = 0 if Data ready (published version) else +∞
 //! EV_Wait  = E_wait_time(ℓ) * (1 + α * fanout)   # HIGH fanout ↑ EV_Wait
-//! EV_Spec  = P_abort(ℓ,x) * (W_remain(d) + β * E_cascade)
+//! EV_Spec  = P_abort(ℓ,x) * (W_remain(d) + β * E_cascade + E_reexec)
 //! EV_Early = W_prefix(d) + E_reexec   # only if d known & heavy features
 //! pick argmin; ties → SpecRead (OCC-like default)
 //! ```
+//! Abort→reexec cost feeds `E_reexec` so Spec is not underpriced on fan-out.
+//! Bind is aggressive when Data is published / WŜ predicts a ready version —
+//! still EV (not Boolean Wait ladders).
 //!
 //! Features (never Boolean Wait gates): HotSet, H_w/H_a, morph, live fanout, d,
 //! heavy hint, WAW ratio. Removed ladders: `if fanout_hint: WaitHard`,
@@ -61,6 +64,8 @@ pub(crate) struct PolicyCtx {
     pub e_wait_time: f64,
     /// Learned / prior E_cascade(ℓ).
     pub e_cascade: f64,
+    /// Learned / prior abort→reexec cost (feeds EV_Spec + EV_Early).
+    pub e_reexec: f64,
     /// Meta budget exceeded → force SpecRead (OCC fallback).
     pub meta_budget_exceeded: bool,
     /// Known depth only: gross-work / effect-progress proxy.
@@ -201,11 +206,14 @@ pub(crate) fn compute_ev(ctx: &PolicyCtx) -> EvScores {
 
     let p_abort = ctx.posterior_conflict.clamp(0.0, 1.0);
     let e_cascade = ctx.e_cascade.max(0.0);
-    let ev_spec = p_abort * (w_remain(ctx) + params.beta_cascade * e_cascade);
+    // Measured abort→reexec (FullRestart/RewindTo) so Spec is not underpriced on fan-out.
+    // Half-weight E_reexec so Spec is priced but Quiet/low-fanout does not Wait-storm.
+    let e_reexec = ctx.e_reexec.max(params.e_reexec * 0.25).max(0.0);
+    let ev_spec = p_abort * (w_remain(ctx) + params.beta_cascade * e_cascade + 0.5 * e_reexec);
 
     let ev_early = if early_abort_candidate(ctx) {
         let w_prefix = ctx.gross_work_depth.unwrap_or(0.0).clamp(0.0, 1.0);
-        w_prefix + params.e_reexec
+        w_prefix + e_reexec
     } else {
         f64::INFINITY
     };
@@ -220,18 +228,17 @@ pub(crate) fn compute_ev(ctx: &PolicyCtx) -> EvScores {
 /// AEC π: Bind if Data ready; else argmin EV; ties → SpecRead; meta budget → SpecRead.
 pub(crate) fn choose_action(ctx: PolicyCtx) -> ResolveAction {
     let params = ctx.params;
-    // 1. Bind when a concrete published version is ready.
+    // 1. Raise Bind hits when published Data is hang-free to consume (writer_done)
+    // or WŜ/placeholder/high bind posterior predicts the ready version.
+    // Do NOT Bind solely on bind_version when !writer_done — that SoftWait-arms and
+    // can livelock fan-out (M1k/M1l). Unresolved Data still enters EV below.
     if let Some(v) = ctx.bind_version.clone() {
-        if ctx.placeholder_ready
-            || ctx.writer_done
+        if ctx.writer_done
+            || ctx.placeholder_ready
             || ctx.prior_ws_predicts
             || ctx.posterior_conflict >= params.tau_very_high
+            || ctx.posterior_bind_success >= params.tau_s
         {
-            return ResolveAction::Bind(v);
-        }
-    }
-    if ctx.placeholder_ready {
-        if let Some(v) = ctx.bind_version {
             return ResolveAction::Bind(v);
         }
     }
@@ -241,7 +248,36 @@ pub(crate) fn choose_action(ctx: PolicyCtx) -> ResolveAction {
         return ResolveAction::SpecRead;
     }
 
-    let ev = compute_ev(&ctx);
+    let mut ev = compute_ev(&ctx);
+    // Data published but writer not yet done: EV_Bind ≈ small wake cost (not +∞).
+    // Prefer Bind (may SoftWait) only when that beats Spec — still argmin EV.
+    if let Some(v) = ctx.bind_version.clone() {
+        let ev_bind = ctx.e_wait_time.max(params.e_wait_prior * 0.05)
+            * (1.0 + params.alpha_fanout * fanout_feature(&ctx) * 0.25);
+        if ctx.prior_ws_predicts || ctx.placeholder_ready {
+            ev.ev_spec *= 1.0 + ctx.posterior_bind_success.clamp(0.0, 1.0);
+        }
+        const EPS: f64 = 1e-9;
+        let mut best = ResolveAction::SpecRead;
+        let mut best_ev = ev.ev_spec;
+        if ev_bind + EPS < best_ev {
+            best = ResolveAction::Bind(v);
+            best_ev = ev_bind;
+        }
+        if ev.ev_wait + EPS < best_ev {
+            best = ResolveAction::WaitHard;
+            best_ev = ev.ev_wait;
+        }
+        if ev.ev_early + EPS < best_ev {
+            best = ResolveAction::EarlyAbort;
+        }
+        return best;
+    }
+
+    // When WŜ predicts a writer but Data not yet published, raise Spec abort cost.
+    if ctx.prior_ws_predicts || ctx.placeholder_ready {
+        ev.ev_spec *= 1.0 + ctx.posterior_bind_success.clamp(0.0, 1.0);
+    }
 
     // Argmin; strict improvement only — ties keep SpecRead (OCC-like default).
     const EPS: f64 = 1e-9;
@@ -311,6 +347,7 @@ mod tests {
             live_fanout,
             e_wait_time: params.e_wait_prior,
             e_cascade: params.e_cascade_prior,
+            e_reexec: params.e_reexec,
             meta_budget_exceeded: false,
             gross_work_depth: d,
             morph_weights: MorphWeights::default(),
@@ -392,13 +429,11 @@ mod tests {
     #[test]
     fn aec_tie_defaults_to_specread() {
         let mut c = ctx_aec(0.5, true, false, None, false, true, false, 0.0, None);
-        // Force EV_Wait ≈ EV_Spec by construction.
-        c.e_wait_time = 0.5 * (1.0 + c.params.beta_cascade * c.e_cascade); // = EV_Spec when fanout=0, p=0.5, w=1
-        // EV_Spec = 0.5 * (1 + 1*1) = 1.0; EV_Wait = 1.0 * (1+0) = 1.0 → tie → SpecRead
-        c.e_wait_time = 1.0;
+        // EV_Spec = 0.5 * (1 + β*1 + 0.5*1.5) = 1.375; set EV_Wait equal → tie → SpecRead
+        c.e_wait_time = 1.375;
         c.posterior_conflict = 0.5;
         c.e_cascade = 1.0;
-        // w_remain=1 → EV_Spec=0.5*(1+1)=1.0; EV_Wait=1.0 → tie
+        c.e_reexec = 1.5;
         assert_eq!(choose_action(c), ResolveAction::SpecRead);
     }
 
@@ -466,6 +501,56 @@ mod tests {
         assert_eq!(choose_action(c), ResolveAction::Bind(v.clone()));
         let c2 = ctx_aec(0.80, true, false, Some(v.clone()), false, true, false, 8.0, None);
         assert_eq!(choose_action(c2), ResolveAction::Bind(v));
+    }
+
+    #[test]
+    fn aec_bind_when_data_and_writer_done_or_quality() {
+        let v = TxVersion {
+            tx_idx: 1,
+            tx_incarnation: 0,
+        };
+        // writer_done → Bind (EV_Bind=0, hang-free).
+        let c = ctx_aec(0.05, true, true, Some(v.clone()), false, true, true, 32.0, None);
+        assert_eq!(choose_action(c), ResolveAction::Bind(v.clone()));
+        // High bind posterior + Data → Bind (quality signal).
+        let mut c2 = ctx_aec(0.05, true, false, Some(v.clone()), false, true, false, 2.0, None);
+        c2.posterior_bind_success = 0.80;
+        assert_eq!(choose_action(c2), ResolveAction::Bind(v.clone()));
+        // Data alone at high fanout without quality → Spec (no SoftWait storm).
+        let mut c3 = ctx_aec(0.05, true, false, Some(v.clone()), false, true, true, 32.0, None);
+        c3.e_wait_time = 2.0;
+        c3.e_reexec = 0.5;
+        assert_eq!(choose_action(c3), ResolveAction::SpecRead);
+    }
+
+    #[test]
+    fn aec_ev_spec_includes_reexec_so_cheap_wake_can_wait() {
+        // Without E_reexec, high-P low-fanout might still Spec; with reexec, Wait wins.
+        let mut c = ctx_aec(0.85, true, false, None, false, true, false, 1.0, Some(0.3));
+        c.e_wait_time = 0.4;
+        c.e_cascade = 0.5;
+        c.e_reexec = 2.5; // measured FullRestart-ish abort cost
+        let ev = compute_ev(&c);
+        assert!(
+            ev.ev_wait < ev.ev_spec,
+            "EV_Wait={:?} should beat EV_Spec={:?} when reexec is priced",
+            ev.ev_wait,
+            ev.ev_spec
+        );
+        assert_eq!(choose_action(c), ResolveAction::WaitHard);
+    }
+
+    #[test]
+    fn aec_prior_ws_raises_spec_cost_without_boolean_wait() {
+        let mut c = ctx_aec(0.30, true, false, None, false, true, false, 8.0, None);
+        c.e_wait_time = 3.0; // Wait expensive at fanout
+        c.e_cascade = 1.0;
+        c.e_reexec = 1.5;
+        c.prior_ws_predicts = true;
+        c.posterior_bind_success = 0.8;
+        // High fanout keeps Wait expensive; Spec still wins (no Boolean Wait), but cost raised.
+        let a = choose_action(c);
+        assert_eq!(a, ResolveAction::SpecRead);
     }
 
     #[test]

@@ -1771,3 +1771,108 @@ mod p3_early_abort_tests {
     }
 }
 
+
+#[cfg(test)]
+mod abort_cheapening_tests {
+    use super::*;
+
+    /// Lean-style abort: CallEntry floor + certified prefix → RewindTo (not bare FullRestart).
+    #[test]
+    fn plan_repair_prefers_rewind_with_call_entry_floor() {
+        let table = PartialRetryTable::new(2);
+        table.reset_incarnation(0, 0);
+        let _ = table.push_checkpoint(0, CheckpointKind::CallEntry);
+        table.note_access(0, 10, AccessMode::Read);
+        table.note_certified(0, 10);
+        table.note_access(0, 11, AccessMode::Read);
+        table.note_access(0, 20, AccessMode::Write);
+        let _ = table.push_checkpoint(0, CheckpointKind::StorageWrite);
+
+        let reads = vec![10u64, 11];
+        let invalid = vec![11u64];
+        let writes = vec![20u64];
+        let plan = table
+            .plan_partial_retry(0, &reads, &invalid, &writes)
+            .expect("certified prefix");
+        assert!(plan.certified.contains(&10));
+        assert!(!plan.certified.contains(&11));
+        match table.plan_repair(0, &plan) {
+            RepairPlan::RewindTo {
+                certified,
+                k_fail,
+                ..
+            } => {
+                assert!(certified.contains(&10));
+                assert!(k_fail >= 1);
+            }
+            other => panic!("expected RewindTo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_repair_synthesizes_k0_rewind_when_no_explicit_cp() {
+        // last_checkpoint_before synthesizes k=0 when k_fail>0 so abort can still
+        // arm hang-free RewindTo+force-bind (cheaper than bare FullRestart).
+        let table = PartialRetryTable::new(1);
+        table.reset_incarnation(0, 0);
+        table.note_access(0, 1, AccessMode::Read);
+        table.note_access(0, 2, AccessMode::Read);
+        let plan = table
+            .plan_partial_retry(0, &[1, 2], &[2], &[])
+            .expect("certified");
+        match table.plan_repair(0, &plan) {
+            RepairPlan::RewindTo { cp, certified, .. } => {
+                assert_eq!(cp.k, 0);
+                assert!(certified.contains(&1));
+            }
+            other => panic!("expected synthetic-k0 RewindTo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_partial_retry_none_when_no_certified_prefix() {
+        let table = PartialRetryTable::new(1);
+        table.reset_incarnation(0, 0);
+        table.note_access(0, 1, AccessMode::Read);
+        assert!(
+            table
+                .plan_partial_retry(0, &[1], &[1], &[])
+                .is_none(),
+            "all-invalid → no PartialRetry plan → FullRestart caller path"
+        );
+    }
+
+    #[test]
+    fn arm_rewind_sets_force_bind_for_next_incarnation() {
+        let table = PartialRetryTable::new(1);
+        table.reset_incarnation(0, 0);
+        let _ = table.push_checkpoint(0, CheckpointKind::CallEntry);
+        table.note_access(0, 5, AccessMode::Read);
+        table.note_certified(0, 5);
+        table.note_access(0, 6, AccessMode::Read);
+        let plan = table
+            .plan_partial_retry(0, &[5, 6], &[6], &[])
+            .unwrap();
+        let RepairPlan::RewindTo {
+            cp,
+            certified,
+            k_fail,
+            suffix_writes,
+        } = table.plan_repair(0, &plan)
+        else {
+            panic!("expected RewindTo");
+        };
+        table.arm_rewind_to(
+            0,
+            cp,
+            k_fail,
+            certified.clone(),
+            suffix_writes,
+            plan.prefix_writes.clone(),
+        );
+        table.set_force_bind(0, certified);
+        assert!(table.is_rewind_resume(0));
+        assert!(table.must_force_bind(0, 5));
+        assert!(!table.must_force_bind(0, 6));
+    }
+}

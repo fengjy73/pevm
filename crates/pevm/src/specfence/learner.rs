@@ -346,9 +346,10 @@ pub(crate) struct LiveLearner {
     meta_ops: AtomicUsize,
     /// Useful effects (bind + wait_useful + publishes) for ρ denominator.
     useful_effects: AtomicUsize,
-    /// Global EMA E_wait_time / E_cascade (fixed-point ×1e6).
+    /// Global EMA E_wait_time / E_cascade / E_reexec (fixed-point ×1e6).
     global_e_wait_bits: AtomicU64,
     global_e_cascade_bits: AtomicU64,
+    global_e_reexec_bits: AtomicU64,
     /// Running morph weights (normalized periodically).
     morph_bits: Mutex<MorphWeights>,
     /// Block AdaptiveParams snapshot for EMA rates (set at begin_block).
@@ -389,6 +390,8 @@ impl LiveLearner {
             .store(fp_encode(params.e_wait_prior), Ordering::Relaxed);
         self.global_e_cascade_bits
             .store(fp_encode(params.e_cascade_prior), Ordering::Relaxed);
+        self.global_e_reexec_bits
+            .store(fp_encode(params.e_reexec), Ordering::Relaxed);
         *self.morph_bits.lock().unwrap() = prior_morph.normalize();
         *self.params_bits.lock().unwrap() = params;
     }
@@ -560,6 +563,33 @@ impl LiveLearner {
             g
         } else {
             self.params_bits.lock().unwrap().e_cascade_prior
+        }
+    }
+
+    /// Feed measured abort→reexec cost into E_reexec EMA (∉ TCB).
+    /// Typical samples: RebindOnly≈0.1, RewindTo/FF≈0.6, FullRestart≈2.0+.
+    pub(crate) fn note_reexec_cost(&self, cost: f64) {
+        let sample = cost.clamp(0.05, 8.0);
+        let params = *self.params_bits.lock().unwrap();
+        let lr = params.lr_cascade; // reuse cascade lr for reexec EMA
+        let prev = fp_decode(self.global_e_reexec_bits.load(Ordering::Relaxed));
+        let prev = if prev <= f64::EPSILON {
+            params.e_reexec
+        } else {
+            prev
+        };
+        let next = (1.0 - lr) * prev + lr * sample;
+        self.global_e_reexec_bits
+            .store(fp_encode(next), Ordering::Relaxed);
+    }
+
+    /// E_reexec — abort→reexec overhead for EV_Spec / EV_Early.
+    pub(crate) fn e_reexec(&self) -> f64 {
+        let g = fp_decode(self.global_e_reexec_bits.load(Ordering::Relaxed));
+        if g > f64::EPSILON {
+            g
+        } else {
+            self.params_bits.lock().unwrap().e_reexec
         }
     }
 
