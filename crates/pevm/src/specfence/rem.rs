@@ -5,10 +5,16 @@
 //!
 //! P3: EarlyAbort arms RewindTo/FullRetry + force-bind via [`PartialRetryTable::arm_early_abort`].
 //! P2: semantic PartialRetry — revm re-executes from start, but π forces
-//! Bind/WaitHard on the previously certified-prefix locations, and only
+//! Bind (Data-ready) / SpecRead (else) on certified-prefix locations, and only
 //! failed-suffix writes are selectively invalidated (no global aborted stamp).
 //!
-//! M1 (plant v2): checkpoints at CALL + write/effect boundaries; RewindTo /
+//! **V5-P1 single Lean repair story** ([`PartialRetryTable::apply_lean_abort_repair`]):
+//! when a certified prefix exists → `set_force_bind` + selective invalidate
+//! (hang-free FullRestart-from-head reexec); otherwise clear + FullRestart.
+//! Lean never arms inspect / PC jump. Research RewindTo+FF stays behind
+//! `SPECFENCE_ENABLE_INSPECT` via [`PartialRetryTable::plan_repair`] / `arm_rewind_to`.
+//!
+//! M1 (plant v2, research): checkpoints at CALL + write/effect boundaries; RewindTo /
 //! RebindOnly demote head PartialRetry when a certified prefix exists.
 //! M1b: journal fast-forward + bound-value cache on RewindTo resume — SpecFence
 //! M1e: journal-blob side channel + jump_snap for safe absolute PC jump (opt-in).
@@ -223,6 +229,38 @@ pub(crate) enum RepairPlan {
     },
     /// Empty prefix / control-flow broken — FullRestart from tx head.
     FullRestart,
+}
+
+/// V5-P1 outcome of the single Lean SpecFence abort repair path.
+///
+/// Lean never arms RewindTo / inspect resume — only force-bind + selective
+/// invalidate (or bare FullRestart). Research inspect keeps [`RepairPlan::RewindTo`].
+#[derive(Debug, Clone)]
+pub(crate) enum LeanAbortRepair {
+    /// Certified prefix → force-bind armed; caller selective-invalidates + head reexec.
+    ForceBind {
+        certified: Vec<MemoryLocationHash>,
+        /// Suggested `LiveLearner::note_reexec_cost` sample.
+        reexec_cost: f64,
+    },
+    /// No usable certified prefix → force-bind cleared; FullRestart from tx head.
+    FullRestart {
+        reexec_cost: f64,
+    },
+}
+
+impl LeanAbortRepair {
+    #[inline]
+    pub(crate) fn reexec_cost(&self) -> f64 {
+        match self {
+            Self::ForceBind { reexec_cost, .. } | Self::FullRestart { reexec_cost } => *reexec_cost,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn did_force_bind(&self) -> bool {
+        matches!(self, Self::ForceBind { .. })
+    }
 }
 
 /// Per-tx checkpoint / certified-prefix state for PartialRetry + M1 RewindTo.
@@ -1025,6 +1063,44 @@ impl PartialRetryTable {
 
     pub(crate) fn clear_force_bind(&self, tx_idx: TxIdx) {
         self.force_bind.remove(&tx_idx);
+    }
+
+    /// V5-P1 — **single Lean SpecFence abort repair story**.
+    ///
+    /// ```text
+    /// if certified prefix from plan_partial_retry:
+    ///   set_force_bind(certified); clear_repair (no inspect/RewindTo arm)
+    ///   → ForceBind  (caller: selective invalidate + FullRestart-from-head reexec)
+    /// else:
+    ///   clear_force_bind; clear_repair → FullRestart
+    /// ```
+    ///
+    /// Hang-free: next incarnation uses `force_prefix` Bind-when-Data / SpecRead-else
+    /// (never WaitHard without Data). Research RewindTo+FF is **not** armed here —
+    /// only behind `SPECFENCE_ENABLE_INSPECT` via [`Self::plan_repair`] / `arm_rewind_to`.
+    pub(crate) fn apply_lean_abort_repair(
+        &self,
+        tx_idx: TxIdx,
+        read_locations: &[MemoryLocationHash],
+        invalid: &[MemoryLocationHash],
+        write_locations: &[MemoryLocationHash],
+    ) -> LeanAbortRepair {
+        match self.plan_partial_retry(tx_idx, read_locations, invalid, write_locations) {
+            Some(plan) if !plan.certified.is_empty() => {
+                self.set_force_bind(tx_idx, plan.certified.clone());
+                // Lean: do NOT arm RewindTo / inspect resume — drop any stale plant.
+                self.clear_repair(tx_idx);
+                LeanAbortRepair::ForceBind {
+                    certified: plan.certified,
+                    reexec_cost: 1.2,
+                }
+            }
+            _ => {
+                self.clear_force_bind(tx_idx);
+                self.clear_repair(tx_idx);
+                LeanAbortRepair::FullRestart { reexec_cost: 2.2 }
+            }
+        }
     }
 
     /// P3 EarlyAbort: arm rem repair for the next incarnation after cutting at `fail_location`.
@@ -1874,5 +1950,62 @@ mod abort_cheapening_tests {
         assert!(table.is_rewind_resume(0));
         assert!(table.must_force_bind(0, 5));
         assert!(!table.must_force_bind(0, 6));
+    }
+
+    /// V5-P1: Lean repair with certified prefix → ForceBind only (no RewindTo arm).
+    #[test]
+    fn apply_lean_abort_repair_force_bind_no_rewind() {
+        let table = PartialRetryTable::new(1);
+        table.reset_incarnation(0, 0);
+        let _ = table.push_checkpoint(0, CheckpointKind::CallEntry);
+        table.note_access(0, 10, AccessMode::Read);
+        table.note_certified(0, 10);
+        table.note_access(0, 11, AccessMode::Read);
+        // Stale research plant must be cleared by Lean helper.
+        table.set_repair(
+            0,
+            RepairPlan::RewindTo {
+                cp: CheckpointId {
+                    tx_idx: 0,
+                    incarnation: 0,
+                    k: 0,
+                },
+                certified: vec![10],
+                k_fail: 2,
+                suffix_writes: vec![],
+            },
+        );
+        assert!(table.is_rewind_resume(0));
+
+        match table.apply_lean_abort_repair(0, &[10, 11], &[11], &[]) {
+            LeanAbortRepair::ForceBind { certified, reexec_cost } => {
+                assert!(certified.contains(&10));
+                assert!(!certified.contains(&11));
+                assert!((reexec_cost - 1.2).abs() < 1e-9);
+            }
+            other => panic!("expected ForceBind, got {other:?}"),
+        }
+        assert!(table.must_force_bind(0, 10));
+        assert!(
+            !table.is_rewind_resume(0),
+            "V5-P1 Lean must not leave RewindTo armed"
+        );
+    }
+
+    /// V5-P1: no certified prefix → FullRestart + cleared force-bind.
+    #[test]
+    fn apply_lean_abort_repair_full_restart_without_prefix() {
+        let table = PartialRetryTable::new(1);
+        table.reset_incarnation(0, 0);
+        table.note_access(0, 1, AccessMode::Read);
+        table.set_force_bind(0, vec![99]);
+        match table.apply_lean_abort_repair(0, &[1], &[1], &[]) {
+            LeanAbortRepair::FullRestart { reexec_cost } => {
+                assert!((reexec_cost - 2.2).abs() < 1e-9);
+            }
+            other => panic!("expected FullRestart, got {other:?}"),
+        }
+        assert!(!table.must_force_bind(0, 99));
+        assert!(!table.is_rewind_resume(0));
     }
 }

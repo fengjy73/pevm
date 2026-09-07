@@ -12,12 +12,13 @@
 //!     ↑
 //! OutcomeLearner: P_abort, T_wait, …      # L4 — continuous θ features only
 //!     ↑
-//! RepairPlant: force-bind + selective     # L1 — Lean abort cheapening
+//! RepairPlant: V5-P1 single lean repair   # L1 — force-bind+selective | FullRestart
 //! ```
 //!
 //! **Default:** SpecRead (OCC-like). SoftWait only when `EV_Wait < EV_Spec`.
 //! Fan-out raises `EV_Wait` (discourage serialize). Abort cheapened with
-//! force-bind + selective invalidate on Lean — never requires inspect.
+//! V5-P1: one Lean abort path (`apply_lean_abort_repair`) — force-bind +
+//! selective when certified prefix exists, else FullRestart. Never inspect.
 //!
 //! # Shoveled off SpecFence control (V5-P0)
 //! - Heat / `seed_wait_regions` SoftWait arming (PCC may still seed account Wait)
@@ -94,8 +95,8 @@ pub(crate) use boundary::{
 pub use boundary::SpecFenceInspector;
 #[allow(unused_imports)]
 pub(crate) use rem::{
-    AccessMode, Checkpoint, CheckpointId, CheckpointKind, EffectOrdinal, FfValue, ParkedWait,
-    ParkResumeIntent, ParkResumeKind, PartialRetryPlan, PartialRetryState, PendingPark,
+    AccessMode, Checkpoint, CheckpointId, CheckpointKind, EffectOrdinal, FfValue, LeanAbortRepair,
+    ParkedWait, ParkResumeIntent, ParkResumeKind, PartialRetryPlan, PartialRetryState, PendingPark,
     RegionAccess, RemTask, RepairPlan, ResumeContinuation, StorageWriteReplay,
 };
 pub(crate) use resolve::{PolicyCtx, ResolveAction, choose_action, early_abort_candidate};

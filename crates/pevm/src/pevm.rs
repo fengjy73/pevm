@@ -831,8 +831,8 @@ fn try_validate(
         specfence
             .metrics
             .record_region_validate_fail(invalid.len());
-        // R0/R2: RebindOnly needs no inspect — keep it on LeanOCC. RewindTo/jump
-        // still requires research inspect (lean abort path below).
+        // RebindOnly (suffix empty) needs no inspect — keep on LeanOCC before abort.
+        // V5-P1: RewindTo/jump only on research-inspect abort path (`!lean_tx`).
         for _ in &read_locations {
             specfence.rem.note_checkpoint_opportunity();
             specfence.metrics.record_checkpoint_opportunity();
@@ -856,36 +856,24 @@ fn try_validate(
                 // Fall through to success path below (no abort).
             }
         }
-        let _ = lean_tx; // execute lean still gates RewindTo on abort
     }
 
     let aborted = !read_set_valid && scheduler.try_validation_abort(tx_version);
     if aborted {
-        // R0/R2 lean abort: no RewindTo/inspect resume; selective invalidate when
-        // HotSet non-empty (retained), else full ESTIMATE. Fence cascade kept.
+        // V5-P1: SpecFence Lean default → single repair helper (force-bind+selective |
+        // FullRestart). Research inspect (`!lean_tx`) keeps RewindTo+FF separately.
         if lean_tx {
             let write_locations = mv_memory.write_locations(tx_version.tx_idx);
-            // Cheapen lean abort without RewindTo/inspect: force-bind certified prefix
-            // (Bind-only when Data ready — see vm force_prefix) + selective invalidate.
-            if let Some(plan) = specfence.partial_retry.plan_partial_retry(
+            let repair = specfence.partial_retry.apply_lean_abort_repair(
                 tx_version.tx_idx,
                 &read_locations,
                 &invalid,
                 &write_locations,
-            ) {
-                if !plan.certified.is_empty() {
-                    specfence
-                        .partial_retry
-                        .set_force_bind(tx_version.tx_idx, plan.certified.clone());
-                    specfence.metrics.record_partial_retry();
-                    specfence.learner.note_reexec_cost(1.2);
-                } else {
-                    specfence.learner.note_reexec_cost(2.0);
-                }
-            } else {
-                specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
-                specfence.learner.note_reexec_cost(2.2);
+            );
+            if repair.did_force_bind() {
+                specfence.metrics.record_partial_retry();
             }
+            specfence.learner.note_reexec_cost(repair.reexec_cost());
             // Prefer selective invalidate (R2); fall back to full ESTIMATE inside helper.
             let (estimated, fallback) = mv_memory.invalidate_selective(
                 tx_version.tx_idx,
@@ -941,6 +929,8 @@ fn try_validate(
             Vec::new()
         };
         if specfence.mode == ConcurrencyMode::SpecFence {
+            // Research-inspect abort path (`SPECFENCE_ENABLE_INSPECT`): RewindTo+FF
+            // when certified prefix + checkpoint; else same FullRestart as Lean.
             specfence.metrics.record_occ_abort();
             // V5-P0: engagement.note_abort is metrics-only (no HotSet storm insert).
             let _ = specfence.engagement.note_abort();
@@ -981,99 +971,65 @@ fn try_validate(
                     .record_first_pass_validate_fail(first_pass);
             }
 
-            // M1: RewindTo (L1 resume) when certified prefix + checkpoint;
-            // FullRestart from head only when prefix empty / control-flow broken.
-            // Demotes semantic PartialRetry-from-head (`tx_head_reexec`).
-            let plan = specfence.partial_retry.plan_partial_retry(
+            // Research plant: RewindTo when plan_repair says so; otherwise one FullRestart.
+            let fence_locs = match specfence.partial_retry.plan_partial_retry(
                 tx_version.tx_idx,
                 &read_locations,
                 &invalid,
                 &write_locations,
-            );
-            let fence_locs = if let Some(plan) = plan {
-                let repair = specfence.partial_retry.plan_repair(tx_version.tx_idx, &plan);
-                match repair {
-                    RepairPlan::RewindTo {
-                        certified,
-                        suffix_writes,
-                        cp,
-                        k_fail,
-                    } => {
-                        specfence.metrics.record_partial_retry();
-                        specfence.metrics.record_rewind_to_cp();
-                        specfence.learner.note_reexec_cost(0.6);
-                        // M1b: arm journal FF continuation from failed incarnation snap.
-                        specfence.partial_retry.arm_rewind_to(
-                            tx_version.tx_idx,
+            ) {
+                Some(plan) => {
+                    match specfence.partial_retry.plan_repair(tx_version.tx_idx, &plan) {
+                        RepairPlan::RewindTo {
+                            certified,
+                            suffix_writes,
                             cp,
                             k_fail,
-                            certified.clone(),
-                            suffix_writes.clone(),
-                            plan.prefix_writes.clone(),
-                        );
-                        specfence
-                            .partial_retry
-                            .set_force_bind(tx_version.tx_idx, certified);
-                        let estimated = mv_memory
-                            .invalidate_partial_suffix(tx_version.tx_idx, &suffix_writes);
-                        if !estimated.is_empty() {
+                        } => {
+                            specfence.metrics.record_partial_retry();
+                            specfence.metrics.record_rewind_to_cp();
+                            specfence.learner.note_reexec_cost(0.6);
+                            specfence.partial_retry.arm_rewind_to(
+                                tx_version.tx_idx,
+                                cp,
+                                k_fail,
+                                certified.clone(),
+                                suffix_writes.clone(),
+                                plan.prefix_writes.clone(),
+                            );
                             specfence
-                                .metrics
-                                .record_selective_invalidate(estimated.len());
+                                .partial_retry
+                                .set_force_bind(tx_version.tx_idx, certified);
+                            let estimated = mv_memory
+                                .invalidate_partial_suffix(tx_version.tx_idx, &suffix_writes);
+                            if !estimated.is_empty() {
+                                specfence
+                                    .metrics
+                                    .record_selective_invalidate(estimated.len());
+                            }
+                            if estimated.is_empty() {
+                                suffix_writes
+                            } else {
+                                estimated
+                            }
                         }
-                        if estimated.is_empty() {
-                            suffix_writes
-                        } else {
-                            estimated
-                        }
-                    }
-                    RepairPlan::RebindOnly { .. } | RepairPlan::FullRestart => {
-                        // No usable checkpoint → FullRestart from tx head.
-                        specfence.metrics.record_tx_full_retry();
-                        specfence.metrics.record_full_restart();
-                        specfence.metrics.record_partial_retry_fallback_full();
-                        specfence.learner.note_reexec_cost(2.0);
-                        specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
-                        specfence.partial_retry.clear_repair(tx_version.tx_idx);
-                        let (estimated, fallback) = mv_memory.invalidate_selective(
-                            tx_version.tx_idx,
-                            Some(tx_version.tx_incarnation),
-                        );
-                        if fallback {
-                            specfence.metrics.record_selective_fallback_full();
-                        } else {
-                            specfence
-                                .metrics
-                                .record_selective_invalidate(estimated.len().max(1));
-                        }
-                        if estimated.is_empty() {
-                            write_locations.clone()
-                        } else {
-                            estimated
+                        // RebindOnly already handled pre-abort; treat as FullRestart.
+                        RepairPlan::RebindOnly { .. } | RepairPlan::FullRestart => {
+                            research_full_restart_invalidate(
+                                &specfence,
+                                mv_memory,
+                                tx_version,
+                                &write_locations,
+                            )
                         }
                     }
                 }
-            } else {
-                // Unsafe / no certified prefix → FullRetry / FullRestart from tx head.
-                specfence.metrics.record_tx_full_retry();
-                specfence.metrics.record_full_restart();
-                specfence.metrics.record_partial_retry_fallback_full();
-                specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
-                specfence.partial_retry.clear_repair(tx_version.tx_idx);
-                let (estimated, fallback) = mv_memory
-                    .invalidate_selective(tx_version.tx_idx, Some(tx_version.tx_incarnation));
-                if fallback {
-                    specfence.metrics.record_selective_fallback_full();
-                } else {
-                    specfence
-                        .metrics
-                        .record_selective_invalidate(estimated.len().max(1));
-                }
-                if estimated.is_empty() {
-                    write_locations.clone()
-                } else {
-                    estimated
-                }
+                None => research_full_restart_invalidate(
+                    &specfence,
+                    mv_memory,
+                    tx_version,
+                    &write_locations,
+                ),
             };
 
             let rewind_to = mv_memory.min_higher_reader_of(tx_version.tx_idx, &fence_locs);
@@ -1149,6 +1105,37 @@ fn try_validate(
         }
     }
     scheduler.finish_validation(tx_version, aborted)
+}
+
+
+/// Research-inspect FullRestart arm (shared by duplicate match arms).
+/// Clears force-bind/repair, selective-invalidates, records FullRestart metrics.
+fn research_full_restart_invalidate(
+    specfence: &SpecFenceCtx<'_>,
+    mv_memory: &MvMemory,
+    tx_version: &TxVersion,
+    write_locations: &[crate::MemoryLocationHash],
+) -> Vec<crate::MemoryLocationHash> {
+    specfence.metrics.record_tx_full_retry();
+    specfence.metrics.record_full_restart();
+    specfence.metrics.record_partial_retry_fallback_full();
+    specfence.learner.note_reexec_cost(2.0);
+    specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
+    specfence.partial_retry.clear_repair(tx_version.tx_idx);
+    let (estimated, fallback) =
+        mv_memory.invalidate_selective(tx_version.tx_idx, Some(tx_version.tx_incarnation));
+    if fallback {
+        specfence.metrics.record_selective_fallback_full();
+    } else {
+        specfence
+            .metrics
+            .record_selective_invalidate(estimated.len().max(1));
+    }
+    if estimated.is_empty() {
+        write_locations.to_vec()
+    } else {
+        estimated
+    }
 }
 
 /// Execute REVM transactions sequentially.
