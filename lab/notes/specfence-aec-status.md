@@ -3,7 +3,7 @@
 **Date:** 2026-09-07 (Asia/Shanghai)  
 **Branch:** `specfence`  
 **Authority:** `lab/notes/specfence-true-adaptive-vs-threshold-ladders.md`  
-**Tip:** _(filled at commit)_
+**Tip:** `1fefc36`
 
 ---
 
