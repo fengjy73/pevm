@@ -716,6 +716,12 @@ pub(crate) fn attach_current_live_snap(tx_idx: TxIdx, partial_retry: &PartialRet
     partial_retry.attach_live_boundary(tx_idx, snap, JournalBlob::default());
 }
 
+/// Arm Inspector step_end live-snap capture without rem checkpoint plant.
+/// Used by Bind-on-Data lite after `note_certified_with_effect_boundary`.
+pub(crate) fn arm_pending_effect_cp_only() {
+    PENDING_EFFECT_CP.set(true);
+}
+
 pub(crate) fn note_pending_effect_boundary(
     tx_idx: TxIdx,
     partial_retry: &PartialRetryTable,

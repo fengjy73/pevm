@@ -778,6 +778,40 @@ impl PartialRetryTable {
             .note_certified(location);
     }
 
+    /// Bind-on-Data lite: certify + plant EffectBoundary under **one** rem lock
+    /// (avoids note_certified + current_k + push_checkpoint triple lock).
+    pub(crate) fn note_certified_with_effect_boundary(
+        &self,
+        tx_idx: TxIdx,
+        location: MemoryLocationHash,
+    ) {
+        if let Some(slot) = self.states.get(tx_idx) {
+            let mut st = slot.lock().unwrap();
+            st.note_certified(location);
+            let k = st.current_k();
+            let snap = BoundarySnapshot {
+                pc: 0,
+                gas_remaining: 0,
+                gas_refunded: 0,
+                memory_words: 0,
+                memory_expansion_cost: 0,
+                call_depth: 0,
+                opcode_steps: k as u64,
+                stack: Vec::new(),
+                memory: Vec::new(),
+                code_hash: None,
+                bytecode_len: 0,
+                at_call_boundary: false,
+                post_sstore: false,
+            };
+            let _ = st.push_checkpoint_with_boundary(
+                tx_idx,
+                CheckpointKind::EffectBoundary,
+                Some(snap),
+            );
+        }
+    }
+
     pub(crate) fn note_value(&self, tx_idx: TxIdx, location: MemoryLocationHash, value: FfValue) {
         if let Some(slot) = self.states.get(tx_idx) {
             slot.lock().unwrap().note_value(location, value);

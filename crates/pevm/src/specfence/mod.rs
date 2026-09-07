@@ -92,6 +92,7 @@ pub(crate) use rem::WaveParkTable;
 pub(crate) use boundary::{
     absolute_jump_eligible, suffix_repair_jump_env_ok, arm_call_outcome_cache, arm_pc_resume, clear_pc_resume, in_inspect_run,
     jump_is_safe, last_boundary_snap, attach_current_live_snap, note_pending_effect_boundary,
+    arm_pending_effect_cp_only,
     resume_was_applied, steps_this_run, try_arm_safe_absolute_jump, try_arm_safe_absolute_jump_gated,
     with_plant_tls, with_plant_tls_journal, BoundarySnapshot, CachedCallOutcome, JournalBlob,
 };
