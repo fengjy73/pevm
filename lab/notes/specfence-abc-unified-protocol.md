@@ -70,3 +70,6 @@ Landed A∧B∧C runtime (BO Await+armed_at_k; RebindOnly/SuffixRepair/escalate;
 597 N=5 med **13.3** SoftWait=0 (≈ plateau). Hole remains **resolve=FullRestart EVM**; jump_applied=0.  
 See `specfence-abc-iter1-status.md`. Iter 2 cause: hang-free live snap → jump before escalate.
 
+### Iter 2 — live_prime→jump ladder falsified
+Tried hang-free live snap via narrow Lean inspect prime + delay fb escalate when `jump_is_safe`. Preview can be true, but inspect/jump under concurrency **hangs 597/599**. Production: live_prime OFF; classic escalate. SoftWait=0; 597 med ~13.9 ≈ plateau; aj=0.  
+See `specfence-abc-iter2-status.md`. Iter 3 cause: hang-free PC capture ≠ full inspect_run (or serial-barrier resolve).

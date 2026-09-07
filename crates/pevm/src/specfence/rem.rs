@@ -520,19 +520,30 @@ impl PartialRetryState {
                     })
                 }
             });
-        // M1f side channel: prefer exact `cp.k` live snap; else nearest k ≤ cp.k.
-        // Always-on step_end attach usually hits exact k; fallback covers CallEntry
-        // floor when an EffectBoundary live exists at the certified prefix tip.
+        // M1f side channel: prefer exact `cp.k` *live* snap; else nearest live
+        // k ≤ cp.k. Never let a lite/non-live entry at exact k shadow a real
+        // Inspector capture (Iter2: that left jump_snap non-live → jump_ready=0).
         let (jump_snap, journal_blob) = self
             .live_boundaries
             .get(&cp.k)
+            .filter(|(s, _)| s.is_live_capture())
             .map(|(s, b)| (Some(s.clone()), Some(b.clone())))
             .or_else(|| {
+                // Prefer live snaps with real opcode_steps (Iter2: steps=0 shadows).
                 self.live_boundaries
                     .iter()
-                    .filter(|(k, _)| **k <= cp.k)
+                    .filter(|(k, (s, _))| {
+                        **k <= cp.k && s.is_live_capture() && s.opcode_steps > 0
+                    })
                     .max_by_key(|(k, _)| *k)
                     .map(|(_, (s, b))| (Some(s.clone()), Some(b.clone())))
+                    .or_else(|| {
+                        self.live_boundaries
+                            .iter()
+                            .filter(|(k, (s, _))| **k <= cp.k && s.is_live_capture())
+                            .max_by_key(|(k, _)| *k)
+                            .map(|(_, (s, b))| (Some(s.clone()), Some(b.clone())))
+                    })
             })
             .unwrap_or((None, None));
         let journal_blob = journal_blob.filter(|b| !b.is_empty());
@@ -1504,18 +1515,100 @@ impl PartialRetryTable {
         self.jump_disabled.remove(&tx_idx);
     }
 
-    /// Mark tx for one Lean inspect capture (live jump_snap) after force_bind_reabort.
+    /// Mark tx for one Lean inspect capture (live jump_snap) after SuffixRepair
+    /// with Storage write_replays (Iter2 hang-free prime — not bare force_bind).
     pub(crate) fn mark_needs_live_capture(&self, tx_idx: TxIdx) {
         self.needs_live_capture.insert(tx_idx, ());
     }
 
-    /// Take live-capture prime flag (one-shot per force_bind_reabort).
+    /// Take live-capture prime flag (one-shot).
     pub(crate) fn take_needs_live_capture(&self, tx_idx: TxIdx) -> bool {
         self.needs_live_capture.remove(&tx_idx).is_some()
     }
 
     pub(crate) fn needs_live_capture(&self, tx_idx: TxIdx) -> bool {
         self.needs_live_capture.contains_key(&tx_idx)
+    }
+
+    /// True when current incarnation has at least one live Inspector snap
+    /// (Iter2: delay fb escalate so next SuffixRepair can absolute-jump).
+    pub(crate) fn has_live_boundary(&self, tx_idx: TxIdx) -> bool {
+        if tx_idx >= self.states.len() {
+            return false;
+        }
+        // SAFETY: single-executor invariant
+        unsafe { self.state_ref(tx_idx) }
+            .live_boundaries
+            .values()
+            .any(|(snap, _)| snap.is_live_capture())
+    }
+
+    /// Iter2: true when planning SuffixRepair *now* would yield a `jump_is_safe`
+    /// continuation (live snap + Storage/read-only or write_replay gates). Used to
+    /// delay fb escalate only when the next resume can actually absolute-jump.
+    pub(crate) fn preview_next_jump_safe(
+        &self,
+        tx_idx: TxIdx,
+        plan: &Option<PartialRetryPlan>,
+    ) -> bool {
+        self.preview_next_jump_safe_why(tx_idx, plan).0
+    }
+
+    /// Like [`preview_next_jump_safe`] but returns `(ok, reason)` for Iter2 debug.
+    pub(crate) fn preview_next_jump_safe_why(
+        &self,
+        tx_idx: TxIdx,
+        plan: &Option<PartialRetryPlan>,
+    ) -> (bool, &'static str) {
+        if self.is_jump_disabled(tx_idx) {
+            return (false, "jump_disabled");
+        }
+        if !self.has_live_boundary(tx_idx) {
+            return (false, "no_live");
+        }
+        let Some(plan) = plan.as_ref() else {
+            return (false, "no_plan");
+        };
+        if plan.certified.is_empty() || plan.k_fail == 0 {
+            return (false, "bad_plan");
+        }
+        let Some(cp) = self.last_checkpoint_before(tx_idx, plan.k_fail) else {
+            return (false, "no_cp");
+        };
+        if !(cp.k > 0 && cp.k < plan.k_fail) {
+            return (false, "cp_k");
+        }
+        let cont = unsafe { self.state_ref(tx_idx) }.build_continuation(
+            cp,
+            plan.k_fail,
+            plan.certified.clone(),
+            plan.suffix_writes.clone(),
+            plan.prefix_writes.clone(),
+        );
+        if !super::boundary::jump_is_safe(&cont) {
+            let why = match cont.jump_snap.as_ref() {
+                None => "snap_none",
+                Some(s) if !s.is_live_capture() => "snap_not_live",
+                Some(s) if s.opcode_steps == 0 || s.opcode_steps > 2048 => "steps",
+                Some(s) if s.call_depth > 2 => "depth",
+                Some(s) if s.bytecode_len > 4096 => "bytecode",
+                _ if cont.valued_blocks_jump => "valued_blocks",
+                _ if cont.effects.is_empty() => "no_effects",
+                _ if cont.effects.iter().any(|e| e.mode == AccessMode::Write)
+                    && cont.write_replays.is_empty() =>
+                {
+                    "write_no_replay"
+                }
+                _ if !cont.call_outcomes.is_empty()
+                    && cont.jump_snap.as_ref().is_some_and(|s| !s.at_call_boundary) =>
+                {
+                    "need_call_boundary"
+                }
+                _ => "jump_gate",
+            };
+            return (false, why);
+        }
+        (true, "ok")
     }
 
 

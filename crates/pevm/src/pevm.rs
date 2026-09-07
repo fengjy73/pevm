@@ -1018,17 +1018,19 @@ fn try_validate(
             // Break force_bind_reabort ≈ resume loop:
             //  (1) escalate after 1 reabort → clear force_bind + OCC FullRestart
             //  (3) cap SuffixRepair depth (≥2) → same escalate
+            // Iter2: delay fb escalate only when preview shows jump_is_safe
+            // (avoids 599/097 fb storms from blind live-snap defer).
             // RebindOnly already preferred above when it can apply.
             let repair_depth = specfence
                 .partial_retry
                 .suffix_repair_depth(tx_version.tx_idx);
+            // Classic fb escalate (Iter2: delay-for-jump hung under concurrency).
             let escalate = was_force_bind || repair_depth >= 2;
             let repair = if escalate {
                 // Drop sticky force_bind for this incarnation; no RewindTo.
                 specfence.partial_retry.escalate_full_restart(tx_version.tx_idx)
             } else {
-                // Reuse plan when we already built it for k_fail; else plan once.
-                let plan = cached_plan.unwrap_or_else(|| {
+                let plan = cached_plan.clone().unwrap_or_else(|| {
                     specfence.partial_retry.plan_partial_retry(
                         tx_version.tx_idx,
                         &read_locations,
@@ -1048,8 +1050,8 @@ fn try_validate(
                 specfence.metrics.record_partial_retry();
             }
             // A∩B: after SuffixRepair (not escalate), sticky conflict ℓ so other
-            // consumers prefer BO Await; mark live-capture when write_replays exist
-            // so hang-free jump can fire on a later rewind (else journal-FF).
+            // consumers prefer BO Await; mark live-capture only when write_replays
+            // exist (Iter2: Storage+WR path — not bare force_bind 4× inspect).
             if !escalate {
                 for location in &invalid {
                     specfence.learner.note_sticky_resolve(*location);
@@ -1059,11 +1061,9 @@ fn try_validate(
                         .partial_retry
                         .extend_force_bind(tx_version.tx_idx, &invalid);
                 }
-                let has_wr = !specfence
-                    .partial_retry
-                    .write_replay_locations(tx_version.tx_idx)
-                    .is_empty();
-                if has_wr || repair.did_force_bind() {
+                // Iter2: prime live snap on SuffixRepair resumes (Storage FF path).
+                // Capture is still gated in vm.rs on storage_prefix; not bare ForceBind.
+                if repair.is_suffix_repair() {
                     specfence
                         .partial_retry
                         .mark_needs_live_capture(tx_version.tx_idx);

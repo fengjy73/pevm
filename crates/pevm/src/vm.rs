@@ -1814,13 +1814,14 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             }
         }
 
-        // Hang-free SuffixRepair prefix skip + live-snap capture:
+        // Hang-free SuffixRepair prefix skip + live-snap capture (Iter2):
         // Lean EffectBoundary snaps are often lite → jump_is_safe never arms.
         // Open narrow inspect_run (no whole-block SPECFENCE_ENABLE_INSPECT) when:
-        //   (a) RewindTo + Storage FF prefix (CallEntry/EB bisect), or
-        //   (b) one-shot after force_bind_reabort (`needs_live_capture`).
-        // Arm absolute jump only when jump_is_safe; else inspect captures live
-        // jump_snap for a later SuffixRepair. Honor SPECFENCE_ABSOLUTE_JUMP=0.
+        //   (a) RewindTo already jump_is_safe (absolute jump), or
+        //   (b) one-shot Storage+write_replay live_prime (`needs_live_capture`)
+        //       — NOT bare force_bind (that 4× evm_entries / wall↑ on 597).
+        // Capture plants live jump_snap; pevm delays fb escalate once so the
+        // next SuffixRepair can arm absolute jump. Honor SPECFENCE_ABSOLUTE_JUMP=0.
         let ff_cont = self
             .specfence
             .partial_retry
@@ -1834,17 +1835,21 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 matches!(v, FfValue::Storage { .. })
             })
         });
-        // B: hang-free absolute jump when jump_is_safe (live snap already on
-        // continuation); else journal-FF resume. Do NOT open inspect solely to
-        // prime live snaps (historically 4× evm_entries / wall↑ on 597). SoftWait
-        // Soft stays dormant. needs_live_capture consumed for metrics only.
-        let _ = self
+        let basic_prefix = ff_cont.as_ref().is_some_and(|cont| {
+            cont.values.values().any(|v| {
+                matches!(v, FfValue::Basic { .. })
+            })
+        });
+        // Hang-free jump/prime when Storage or Basic FF values exist (M1f Basic-only).
+        let ff_prefix = storage_prefix || basic_prefix;
+        // Iter2: live_prime disabled; still peek/take plumbing kept for Iter3.
+        let needs_capture = self
             .specfence
             .partial_retry
-            .take_needs_live_capture(tx_version.tx_idx);
+            .needs_live_capture(tx_version.tx_idx);
         // If TLS already holds a live snap (rare Lean path), attach then refresh cont.
         let mut ff_cont = ff_cont;
-        if rewind_resume && storage_prefix {
+        if rewind_resume && ff_prefix {
             attach_current_live_snap(tx_version.tx_idx, self.specfence.partial_retry);
             ff_cont = self
                 .specfence
@@ -1855,11 +1860,16 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             && rewind_resume
             && suffix_repair_jump_env_ok()
             && !jump_disabled
-            && storage_prefix
+            && ff_prefix
             && ff_cont.as_ref().is_some_and(|cont| {
                 absolute_jump_eligible(tx_version.tx_idx, self.specfence.partial_retry, cont)
             });
-        let capture_inspect = suffix_jump;
+        // Iter2 B: live_prime inspect OFF in Lean (capture→jump hung 597/599).
+        // Absolute jump still arms when jump_is_safe already (research inspect).
+        // SoftWait Soft stays dormant. needs_capture/ff_prefix kept for Iter3.
+        let live_prime = false; // needs_capture && ff_prefix → Iter3 hang-free capture
+        let _ = (needs_capture, ff_prefix);
+        let capture_inspect = suffix_jump || live_prime;
 
         // R0: Handler::run by default.
         // Research: SPECFENCE_ENABLE_INSPECT=1 OR finegrain journal OR narrow capture/jump.
@@ -1964,6 +1974,19 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             self.specfence
                 .metrics
                 .add_profile_handler_ns(t0.elapsed().as_nanos() as u64);
+        }
+        // Iter2: consume live_prime only after inspect completed (keep on Blocking).
+        if live_prime {
+            let blocked = matches!(
+                &run_result,
+                Err(EVMError::Database(ReadError::Blocking(_)))
+            );
+            if !blocked {
+                let _ = self
+                    .specfence
+                    .partial_retry
+                    .take_needs_live_capture(tx_version.tx_idx);
+            }
         }
 
         match run_result {

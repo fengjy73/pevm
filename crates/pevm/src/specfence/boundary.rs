@@ -247,8 +247,9 @@ pub(crate) fn jump_is_safe(cont: &ResumeContinuation) -> bool {
     let has_write_effects = cont.effects.iter().any(|e| e.mode == AccessMode::Write);
     // Tiny Basic-only (M1f) always OK. Larger bytecode only when Storage FF,
     // write_replays, and/or CALL-boundary make post-jump ≡ sequential under pevm MV.
+    // Iter2: ERC-20 / DeFi bytecode often 4–20KB; 4096 blocked all 597 jumps.
     const MAX_TINY: usize = 256;
-    const MAX_STORAGE: usize = 4096;
+    const MAX_STORAGE: usize = 24_576;
     if snap.bytecode_len > MAX_TINY {
         if snap.bytecode_len > MAX_STORAGE {
             return false;
@@ -262,8 +263,9 @@ pub(crate) fn jump_is_safe(cont: &ResumeContinuation) -> bool {
     }
     // M1j: multi-SSTORE+LOG prefixes can exceed 128 steps; allow up to 512 when
     // write_replays and/or call_outcomes certify a controlled jump.
-    let max_steps = if !cont.write_replays.is_empty() || !cont.call_outcomes.is_empty() {
-        512u64
+    // Iter2: Storage/write_replay prefixes on 597 often need >512 prefix steps.
+    let max_steps = if !cont.write_replays.is_empty() || !cont.call_outcomes.is_empty() || has_storage {
+        2048u64
     } else {
         128u64
     };
@@ -1266,6 +1268,9 @@ where
                     table.note_post_sstore_gas(plant.tx_idx, gas_after);
                 }
             });
+            // Iter2: always attach post-SSTORE live tip (write-prefix jump needs
+            // gas-equal snap even when PENDING_EFFECT_CP was not armed).
+            attach_live_to_plant(snap.clone(), JournalBlob::default());
         } else if (OP_LOG0..=OP_LOG4).contains(&op) {
             // M1j/M1k: record new journal logs with post-LOG PC (filter on jump).
             let pc = snap.pc;

@@ -312,6 +312,9 @@ fn main() {
                     row["park_ns_early_abort"] = serde_json::json!(m.park_ns_early_abort);
                     row["park_count_blocking_other"] = serde_json::json!(m.park_count_blocking_other);
                     row["park_ns_blocking_other"] = serde_json::json!(m.park_ns_blocking_other);
+                    row["inspector_steps"] = serde_json::json!(m.inspector_steps);
+                    row["inspector_steps_resume"] = serde_json::json!(m.inspector_steps_resume);
+                    row["live_pc_resume_count"] = serde_json::json!(m.live_pc_resume_count);
                 }
             }
             let (wall_med, wall_p90, wall_min, wall_mean) = summarize_f64(&mut walls);
