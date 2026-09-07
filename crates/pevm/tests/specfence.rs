@@ -1526,6 +1526,65 @@ fn specfence_iter9_handler_single_sstore_jump_seq_eq_par() {
     let _ = (saw, last);
 }
 
+/// Iter11: multi-SSTORE Handler plant no-warm + restore gates compile; jump OFF.
+/// Proves seq≡par with production posture (no SPECFENCE_ABSOLUTE_JUMP).
+/// Abs-jump enablement falsified this iter (see status note).
+#[test]
+fn specfence_iter11_handler_multi_sstore_jump_seq_eq_par() {
+    let hot = Address::from(U160::from(42));
+    let probe = Address::from(U160::from(79));
+    let mut code = Vec::new();
+    code.extend_from_slice(&[0x60, 0x01, 0x60, 0x00, 0x52]);
+    code.extend_from_slice(&[0x60, 0x01, 0x60, 0x00, 0x55]);
+    code.extend_from_slice(&[0x60, 0x02, 0x60, 0x01, 0x55]);
+    for _ in 0..8 {
+        code.push(0x73);
+        code.extend_from_slice(hot.as_slice());
+        code.extend_from_slice(&[0x31, 0x50]);
+    }
+    code.push(0x00);
+    let bytecode = Bytecode::new_raw(Bytes::from(code));
+    let code_hash = bytecode.hash_slow();
+    let mut state = (0..=60_000).map(common::mock_account).collect::<ChainState>();
+    state.insert(probe, EvmAccount {
+        balance: U256::from(1), nonce: 1, code_hash: Some(code_hash),
+        code: Some(bytecode.clone().into()), storage: Default::default(),
+    });
+    state.entry(hot).or_insert_with(|| { let (_, a) = common::mock_account(42); a });
+    let mut bytecodes = Bytecodes::default();
+    bytecodes.insert(code_hash, bytecode.into());
+    let mut txs: Vec<TxEnv> = Vec::new();
+    for i in 0..24 {
+        txs.push(transfer(Address::from(U160::from(7_200 + i)), hot, 1));
+    }
+    for i in 0..24 {
+        txs.push(TxEnv {
+            caller: Address::from(U160::from(8_200 + i)), nonce: 1,
+            kind: TransactTo::Call(probe), gas_limit: 200_000, gas_price: 1,
+            ..TxEnv::default()
+        });
+    }
+    for i in 0..48 {
+        txs.push(self_transfer(Address::from(U160::from(53_200 + i)), 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+    let width = NonZeroUsize::new(concurrency().get().min(4).max(2)).unwrap();
+    let mut last = None;
+    for _ in 0..8 {
+        let (_, m, _) = run_mode_conc(
+            ConcurrencyMode::SpecFence,
+            &storage,
+            txs.clone(),
+            width,
+        );
+        last = Some(m.clone());
+        assert_eq!(m.absolute_jump_applied, 0, "production jump OFF: {m:?}");
+        assert_eq!(m.handler_sstore_capture, 0, "production capture OFF: {m:?}");
+        assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
+    }
+    let _ = last;
+}
+
 /// M1i-A: write-prefix absolute jump — SSTORE then BALANCE(hot).
 /// Post-SSTORE EffectBoundary snap + write_replays; seq≡par; absolute_jump_applied > 0.
 #[ignore = "R0: M1* inspect/jump research-only (SPECFENCE_ENABLE_INSPECT); hang risk on default path"]

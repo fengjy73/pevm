@@ -26,7 +26,8 @@
 //! after first SuffixRepair fail, sticky BO Await on fail locs (+ force_bind
 //! extend) until writers Validated before 2nd resume. Iter10: strip Iter9 hot-path
 //! tax (stock SSTORE unless plant install wanted; no first_k-from-gas on finalize).
-//! Iter9 jump restore gates retained; production jump/capture OFF. Iter8 memory snap
+//! Iter11: multi-SSTORE last-tip + k<k_fail snap select; jump/capture trial via
+//! SPECFENCE_ABSOLUTE_JUMP=1 (production OFF without env). Iter8 memory snap
 //! + run_exec_loop PENDING_RESUME apply retained. Escalation retains **head-FF**
 //! (Iter5). SoftWait Soft ~0.
 //!
@@ -101,7 +102,7 @@ pub(crate) use rem::PartialRetryTable;
 pub(crate) use rem::WaveParkTable;
 #[allow(unused_imports)]
 pub(crate) use boundary::{
-    absolute_jump_eligible, suffix_repair_jump_env_ok, arm_call_outcome_cache, arm_pc_resume, clear_pc_resume, in_inspect_run,
+    absolute_jump_eligible, absolute_jump_env_enabled, suffix_repair_jump_env_ok, arm_call_outcome_cache, arm_pc_resume, clear_pc_resume, in_inspect_run,
     jump_is_safe, last_boundary_snap, attach_current_live_snap, note_pending_effect_boundary,
     arm_pending_effect_cp_only,
     resume_was_applied, steps_this_run, try_arm_safe_absolute_jump, try_arm_safe_absolute_jump_gated,

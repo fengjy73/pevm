@@ -311,8 +311,56 @@ pub(crate) fn jump_is_safe(cont: &ResumeContinuation) -> bool {
         }) {
             return false;
         }
-        // Iter9: multi-SSTORE Handler tips still seq≠par on pevm fixtures even with
-        // exact tip embedding (stack/MV). Allow only single-SSTORE tips until Iter10.
+        // Iter11: multi-SSTORE last tip — require memory-lite + tip == last plant
+        // gas (min among tip replays) + FF Storage presents match tip writes when
+        // FF has that (address,slot). Empty-memory / early-tip / FF-mismatch refuse.
+        if snap.memory.is_empty() {
+            return false;
+        }
+        let tip_gases: Vec<u64> = snap
+            .write_replays_at_tip
+            .iter()
+            .map(|w| w.gas_remaining_after)
+            .filter(|g| *g > 0)
+            .collect();
+        if tip_gases.is_empty() {
+            return false;
+        }
+        let min_tip = tip_gases.iter().copied().min().unwrap_or(0);
+        // Last SSTORE spent the most gas → remaining == min tip gas.
+        if snap.gas_remaining != min_tip {
+            return false;
+        }
+        // Cap Handler prefix SSTORE count (ERC-20 transfer = 2; refuse huge tips).
+        if snap.sstore_index > 8 {
+            return false;
+        }
+        // Tip embeds must agree with continuation write_replays for same slots
+        // (finalize must not have clobbered present/original under pevm MV).
+        for wr in &snap.write_replays_at_tip {
+            let Some(cont_wr) = cont.write_replays.iter().find(|c| {
+                c.address == wr.address && c.slot == wr.slot
+            }) else {
+                return false;
+            };
+            if cont_wr.present != wr.present || cont_wr.original != wr.original {
+                return false;
+            }
+        }
+        // Distinct tip slots must equal sstore_index (same-slot multi collapses).
+        let distinct = {
+            let mut seen = std::collections::HashSet::new();
+            snap.write_replays_at_tip
+                .iter()
+                .filter(|w| seen.insert((w.address, w.slot)))
+                .count()
+        };
+        if distinct as u64 != snap.sstore_index {
+            return false;
+        }
+        // Iter11: last-tip gates above are necessary but not sufficient — Lean
+        // capture→jump still fails to prove aj>0∧seq≡par on fixtures (and prior
+        // force-allow multi was seq≠par). Refuse multi until Iter12+ proves it.
         if snap.sstore_index != 1 {
             return false;
         }
@@ -1307,7 +1355,9 @@ pub(crate) fn sstore_plant_capture_eth<H: revm::interpreter::Host + ?Sized>(
 fn sstore_plant_capture_eth_slow<H: revm::interpreter::Host + ?Sized>(
     context: revm::interpreter::InstructionContext<'_, H, EthInterpreter>,
 ) {
-    // Plant path: peek operands + original before stock pops stack.
+    // Iter11: never warm via `sload` before stock SSTORE (EIP-2929 −2100 → seq≠par).
+    // Peek stack; take original only if already warm (`sload_skip_cold_load`);
+    // else ZERO (empty slot — correct for first-write; ERC-20 always SLOAD first).
     let interp_ptr = context.interpreter as *mut Interpreter<EthInterpreter>;
     let host_ptr = context.host as *mut H;
     let (slot, present, target) = {
@@ -1323,14 +1373,14 @@ fn sstore_plant_capture_eth_slow<H: revm::interpreter::Host + ?Sized>(
         }
     };
     let original = unsafe { &mut *host_ptr }
-        .sload(target, slot)
+        .sload_skip_cold_load(target, slot, true)
+        .ok()
         .map(|v| v.data)
         .unwrap_or(U256::ZERO);
     revm::interpreter::instructions::host::sstore(context);
 
     let n = HANDLER_SSTORE_STEPS.get().saturating_add(1);
     HANDLER_SSTORE_STEPS.set(n);
-    // context moved into stock sstore; re-borrow interpreter via saved ptr.
     let interp = unsafe { &mut *interp_ptr };
     let pc = interp.bytecode.pc();
     let gas_remaining = interp.gas.remaining();
@@ -1338,10 +1388,6 @@ fn sstore_plant_capture_eth_slow<H: revm::interpreter::Host + ?Sized>(
     let bytecode_len = interp.bytecode.bytecode_slice().len();
     let code_hash = Some(interp.bytecode.get_or_calculate_hash());
     let mem_gas = *interp.gas.memory();
-    // Iter5 serial capture window: WaitHard demoted while plant_tls_active, so
-    // stack clone is hang-free (Iter4 empty-stack lite could not absolute-jump).
-    // Iter8: also clone memory when small (≤8KiB). Empty-memory abs jump falsified
-    // seq≠par; large memory clones stay in the hang family — cap and skip.
     let stack: Vec<_> = interp.stack.data().to_vec();
     const MEMORY_SNAP_CAP: usize = 8 * 1024;
     let mem_slice = interp.memory.context_memory();
@@ -1371,8 +1417,6 @@ fn sstore_plant_capture_eth_slow<H: revm::interpreter::Host + ?Sized>(
         if let Some(plant) = p.get() {
             let table = unsafe { &*plant.partial_retry };
             table.note_post_sstore_gas(plant.tx_idx, gas_remaining);
-            // Iter9: per-SSTORE write_replay with tip gas so jump_is_safe can require
-            // exact sstore_index coverage (finalize must not clobber plant gas).
             if target != Address::ZERO {
                 let loc = hash_deterministic(MemoryLocation::Storage(target, slot));
                 table.note_write_replay(
@@ -1387,11 +1431,9 @@ fn sstore_plant_capture_eth_slow<H: revm::interpreter::Host + ?Sized>(
                     },
                 );
             }
-            // Snapshot exact replays at this tip (ordered, post-note).
             snap.write_replays_at_tip = table.write_replay_values(plant.tx_idx);
             let metrics = unsafe { &*plant.metrics };
             metrics.record_handler_sstore_capture();
-            // Record tip for resume decisions without full jump snap clone storms.
             table.attach_live_boundary(plant.tx_idx, snap.clone(), JournalBlob::default());
         }
     });

@@ -451,9 +451,12 @@ impl PartialRetryState {
         location: MemoryLocationHash,
         mut replay: StorageWriteReplay,
     ) {
-        // Iter10: restore Iter8 hot-path — do NOT touch first_k here (journal owns
-        // first_k; Iter9 first_k-from-gas changed true_suffix/RebindOnly). Preserve
-        // plant tip gas when finalize re-notes with 0 (jump restore correctness).
+        // Iter10: finalize re-notes with gas=0 must NOT touch first_k (that shifted
+        // true_suffix/RebindOnly). Iter11: *plant* notes (gas>0) pin first_k at the
+        // current effect ordinal so build_continuation keeps tip write_replays when
+        // abort hits before finalize Write note_access (otherwise fk=MAX drops them
+        // → cont.write_replays empty → Handler jump never arms).
+        let plant_note = replay.gas_remaining_after > 0;
         let mut prior_gas = 0u64;
         self.write_replays.retain(|(l, r)| {
             if *l == location {
@@ -469,6 +472,9 @@ impl PartialRetryState {
             } else {
                 self.last_post_sstore_gas()
             };
+        }
+        if plant_note {
+            self.first_k.entry(location).or_insert(self.k);
         }
         self.write_replays.push((location, replay));
     }
@@ -537,29 +543,23 @@ impl PartialRetryState {
         })
                 }
             });
-        // M1f side channel: prefer exact `cp.k` *live* snap; else nearest live
-        // k ≤ cp.k. Prefer highest Handler sstore_index among ties (Iter9).
+        // Iter11: among live snaps with k < k_fail, prefer highest Handler
+        // sstore_index (last multi-SSTORE tip). Iter9 claimed k < k_fail but still
+        // filtered k ≤ cp.k and preferred exact cp.k — early tips beat later tips
+        // between cp and k_fail → multi-SSTORE seq≠par / jump refused.
         let (jump_snap, journal_blob) = self
             .live_boundaries
-            .get(&cp.k)
-            .filter(|(s, _)| s.is_live_capture())
-            .map(|(s, b)| (Some(s.clone()), Some(b.clone())))
-            .or_else(|| {
-                self.live_boundaries
-                    .iter()
-                    .filter(|(k, (s, _))| {
-                        **k <= cp.k && s.is_live_capture() && s.opcode_steps > 0
-                    })
-                    .max_by_key(|(k, (s, _))| (s.sstore_index, *k))
-                    .map(|(_, (s, b))| (Some(s.clone()), Some(b.clone())))
-                    .or_else(|| {
-                        self.live_boundaries
-                            .iter()
-                            .filter(|(k, (s, _))| **k <= cp.k && s.is_live_capture())
-                            .max_by_key(|(k, (s, _))| (s.sstore_index, *k))
-                            .map(|(_, (s, b))| (Some(s.clone()), Some(b.clone())))
-                    })
+            .iter()
+            .filter(|(k, (s, _))| **k < k_fail && s.is_live_capture())
+            .max_by_key(|(k, (s, _))| {
+                (
+                    s.sstore_index,
+                    u64::from(s.post_sstore),
+                    s.opcode_steps,
+                    **k,
+                )
             })
+            .map(|(_, (s, b))| (Some(s.clone()), Some(b.clone())))
             .unwrap_or((None, None));
         let journal_blob = journal_blob.filter(|b| !b.is_empty());
         // Bound values for the whole certified prefix (k < k_fail), not only

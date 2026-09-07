@@ -1901,10 +1901,10 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             && ff_cont.as_ref().is_some_and(|cont| {
                 absolute_jump_eligible(tx_version.tx_idx, self.specfence.partial_retry, cont)
             });
-        // Iter10: jump/capture remain OFF (multi-SSTORE abs jump still unsafe).
-        // Hot-path tax stripped (stock SSTORE unless plant install wanted; rem
-        // first_k-from-gas reverted). Value-stable FF (Storage/Basic) falsified
-        // (livelock / N10 wall↑). SoftWait Soft=0. No live_prime / inspect_run.
+        // Iter11: multi-SSTORE last-tip gates + k<k_fail snap select + plant
+        // no-warm original landed; abs jump still **not** proven aj>0∧seq≡par on
+        // Lean fixtures (double-abort+jump_is_safe chain). Production OFF.
+        // SoftWait Soft=0. No live_prime / inspect_run. Stock SSTORE on mass path.
         let _ = suffix_jump_eligible;
         let suffix_jump = false;
         let live_prime = false;

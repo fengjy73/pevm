@@ -114,3 +114,7 @@ Diagnosed Iter9 accidental hot-path tax (fat SSTORE wrap always installed; first
 597 N=5 med **13.3**; N=10 med **13.8** (restored vs Iter9 19.4 / approx Iter8d 13.4).  
 See `specfence-abc-iter10-status.md`. Iter 11 cause: multi-SSTORE Handler abs jump == sequential under pevm MV (or new evidence for resume without abs jump).
 
+### Iter 11 — multi-SSTORE jump falsified; plant gas fixed
+Diagnosed plant pre-sload warm (−2100) seq≠par; fixed no-warm original. Landed k<k_fail snap select + plant-only first_k + last-tip gates. Multi-SSTORE abs jump still not aj>0∧seq≡par on Lean → jump/capture OFF. SoftWait=0; 597 N=5 med **12.7**.  
+See `specfence-abc-iter11-status.md`. Iter 12 cause: alternate resume opcode cut without abs jump.
+
