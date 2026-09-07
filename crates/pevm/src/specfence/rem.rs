@@ -841,6 +841,32 @@ impl PartialRetryTable {
         })
     }
 
+    /// Value-stable check without cloning FfValue out of the snap map.
+    /// Storage: exact U256. Basic: balance+nonce (code excluded — Lazy/Estimate → false).
+    pub(crate) fn value_stable_match(
+        &self,
+        tx_idx: TxIdx,
+        location: MemoryLocationHash,
+        cur: &crate::MemoryValue,
+    ) -> bool {
+        if tx_idx >= self.states.len() {
+            return false;
+        }
+        // SAFETY: single-executor invariant
+        let snap = match unsafe { self.state_ref(tx_idx) }.value_snap.get(&location) {
+            Some(s) => s,
+            None => return false,
+        };
+        match (snap, cur) {
+            (FfValue::Storage { value, .. }, crate::MemoryValue::Storage(v)) => value == v,
+            (
+                FfValue::Basic { basic, .. },
+                crate::MemoryValue::Basic(b),
+            ) => basic.balance == b.balance && basic.nonce == b.nonce,
+            _ => false,
+        }
+    }
+
     /// M1i: Inspector post-SSTORE gas capture for write-prefix jump gas-equality.
     pub(crate) fn note_post_sstore_gas(&self, tx_idx: TxIdx, gas_remaining_after: u64) {
         if tx_idx < self.states.len() {
@@ -1257,7 +1283,17 @@ impl PartialRetryTable {
         invalid: &[MemoryLocationHash],
         write_locations: &[MemoryLocationHash],
     ) -> LeanAbortRepair {
-        match self.plan_partial_retry(tx_idx, read_locations, invalid, write_locations) {
+        let plan = self.plan_partial_retry(tx_idx, read_locations, invalid, write_locations);
+        self.apply_suffix_repair_planned(tx_idx, plan)
+    }
+
+    /// SuffixRepair using a precomputed [`PartialRetryPlan`] (avoids double plan).
+    pub(crate) fn apply_suffix_repair_planned(
+        &self,
+        tx_idx: TxIdx,
+        plan: Option<PartialRetryPlan>,
+    ) -> LeanAbortRepair {
+        match plan {
             Some(plan) if !plan.certified.is_empty() => {
                 let k_fail = plan.k_fail;
                 // Hang-free SoftWait-wake criteria: real mid-tx checkpoint before k.
@@ -1443,6 +1479,7 @@ impl PartialRetryTable {
     pub(crate) fn needs_live_capture(&self, tx_idx: TxIdx) -> bool {
         self.needs_live_capture.contains_key(&tx_idx)
     }
+
 
     /// True when any write's first effect ordinal is at/after `k_fail` (true failed suffix).
     /// Writes before `k_fail` that PartialRetry classified as suffix (uncertified) are

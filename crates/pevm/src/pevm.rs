@@ -861,11 +861,8 @@ fn try_validate(
     tx_version: &TxVersion,
     specfence: SpecFenceCtx<'_>,
 ) -> Option<Task> {
-    let read_locations = if specfence.mode == ConcurrencyMode::SpecFence {
-        mv_memory.read_locations(tx_version.tx_idx)
-    } else {
-        Vec::new()
-    };
+    // OCC-like first pass: one read-set walk. Defer read_locations until fail
+    // (avoids a second last_locations lock on the common success path).
     let invalid = if specfence.mode.uses_regions() {
         mv_memory.collect_invalid_reads(tx_version.tx_idx)
     } else {
@@ -878,6 +875,10 @@ fn try_validate(
     };
     let lean_tx = specfence.mode == ConcurrencyMode::SpecFence
         && specfence.engagement.tx_was_lean(tx_version.tx_idx);
+    // Carried into SuffixRepair to avoid re-plan / re-lock write set.
+    let mut cached_read_locations: Option<Vec<crate::MemoryLocationHash>> = None;
+    let mut cached_write_locations: Option<Vec<crate::MemoryLocationHash>> = None;
+    let mut cached_plan: Option<Option<crate::specfence::PartialRetryPlan>> = None;
     if specfence.mode == ConcurrencyMode::SpecFence && !invalid.is_empty() {
         specfence
             .metrics
@@ -889,18 +890,21 @@ fn try_validate(
         specfence.rem.note_checkpoint_opportunity();
         specfence.metrics.record_checkpoint_opportunity();
         let write_locations = mv_memory.write_locations(tx_version.tx_idx);
+        let read_locations = mv_memory.read_locations(tx_version.tx_idx);
         let mut k_fail = invalid
             .iter()
             .filter_map(|l| specfence.partial_retry.first_k(tx_version.tx_idx, *l))
             .min();
+        let mut plan = None;
         if k_fail.is_none() {
-            if let Some(plan) = specfence.partial_retry.plan_partial_retry(
+            plan = specfence.partial_retry.plan_partial_retry(
                 tx_version.tx_idx,
                 &read_locations,
                 &invalid,
                 &write_locations,
-            ) {
-                k_fail = Some(plan.k_fail);
+            );
+            if let Some(ref p) = plan {
+                k_fail = Some(p.k_fail);
             }
         }
         // RebindOnly when no true failed-suffix write (or no writes if k unknown).
@@ -915,28 +919,16 @@ fn try_validate(
             None => !write_locations.is_empty(),
         };
         // Value-stable RebindOnly: same-output republish (Estimate→Data / incarnation
-        // bump) is safe without reexec. Storage always; Basic when balance+nonce match
-        // and current entry is live Data (Estimate → None, no skip). Lazy excluded
-        // (multi-origin refused by try_rebind).
+        // bump) is safe without reexec. Storage always; Basic when balance+nonce match.
+        // No FfValue clone — rem compares snap in place. Lazy/multi-origin refused by try_rebind.
         let value_stable = !invalid.is_empty()
             && invalid.iter().all(|&loc| {
-                let Some(snap) = specfence.partial_retry.snapped_value(tx_version.tx_idx, loc) else {
-                    return false;
-                };
                 let Some(cur) = mv_memory.current_data_value(tx_version.tx_idx, loc) else {
                     return false;
                 };
-                match (&snap, &cur) {
-                    (
-                        crate::specfence::FfValue::Storage { value, .. },
-                        MemoryValue::Storage(v),
-                    ) => value == v,
-                    (
-                        crate::specfence::FfValue::Basic { basic, .. },
-                        MemoryValue::Basic(b),
-                    ) => basic.balance == b.balance && basic.nonce == b.nonce,
-                    _ => false,
-                }
+                specfence
+                    .partial_retry
+                    .value_stable_match(tx_version.tx_idx, loc, &cur)
             });
         // Prefer RebindOnly when !true_suffix, or when value-stable (incl. Estimate→Data
         // same-output). try_rebind refuses Estimate / multi-origin.
@@ -953,6 +945,19 @@ fn try_validate(
             specfence.learner.note_reexec_cost(0.1);
             read_set_valid = true;
             // Fall through to success path below (no abort / no SuffixRepair).
+        } else {
+            // Ensure one plan for SuffixRepair (k_fail may have come from first_k only).
+            if plan.is_none() {
+                plan = specfence.partial_retry.plan_partial_retry(
+                    tx_version.tx_idx,
+                    &read_locations,
+                    &invalid,
+                    &write_locations,
+                );
+            }
+            cached_read_locations = Some(read_locations);
+            cached_write_locations = Some(write_locations);
+            cached_plan = Some(plan);
         }
     }
 
@@ -975,13 +980,22 @@ fn try_validate(
             {
                 specfence.metrics.record_soft_wait_wake_reabort();
             }
-            let write_locations = mv_memory.write_locations(tx_version.tx_idx);
-            let repair = specfence.partial_retry.apply_suffix_repair(
-                tx_version.tx_idx,
-                &read_locations,
-                &invalid,
-                &write_locations,
-            );
+            let write_locations = cached_write_locations
+                .unwrap_or_else(|| mv_memory.write_locations(tx_version.tx_idx));
+            let read_locations = cached_read_locations
+                .unwrap_or_else(|| mv_memory.read_locations(tx_version.tx_idx));
+            // Reuse plan when we already built it for k_fail; else plan once.
+            let plan = cached_plan.unwrap_or_else(|| {
+                specfence.partial_retry.plan_partial_retry(
+                    tx_version.tx_idx,
+                    &read_locations,
+                    &invalid,
+                    &write_locations,
+                )
+            });
+            let repair = specfence
+                .partial_retry
+                .apply_suffix_repair_planned(tx_version.tx_idx, plan);
             if repair.did_force_bind() {
                 specfence.metrics.record_partial_retry();
             }
@@ -1190,6 +1204,8 @@ fn try_validate(
 
             // Research plant API (opt-in inspect only) — separate from Lean
             // `apply_suffix_repair`. Absolute jump stays inspect-gated.
+            let read_locations = cached_read_locations
+                .unwrap_or_else(|| mv_memory.read_locations(tx_version.tx_idx));
             let fence_locs = match specfence.partial_retry.research_apply_abort_repair(
                 tx_version.tx_idx,
                 &read_locations,
@@ -1288,22 +1304,20 @@ fn try_validate(
         // successful WS into residual caused WaitHard storms / M2 hangs on ERC-20.
         let writes = mv_memory.write_locations(tx_version.tx_idx);
         specfence.rw_prior.observe_write_set(&writes, None);
-        // Successful SpecRead validation → success++; try revoke sticky Waits.
+        // Successful SpecRead validation: O(1) opportunity + revoke sticky Waits only.
+        // Skip O(|reads|) bayes success storm — SoftWait scarce under Bind-no-park;
+        // abort-path bayes/hotset still learn conflicts.
+        specfence.rem.note_checkpoint_opportunity();
+        let read_locations = mv_memory.read_locations(tx_version.tx_idx);
         for location in &read_locations {
             if *location
                 == hash_deterministic(MemoryLocation::Basic(specfence.beneficiary))
             {
                 continue;
             }
-            specfence.rem.note_checkpoint_opportunity();
             if mv_memory.regions.location_mode(*location) == crate::specfence::RegionMode::Wait {
-                // Revoke when posterior dropped below τ_revoke.
                 let _ = specfence.try_revoke(&mv_memory.regions, *location, None);
-                continue;
             }
-            specfence.bayes.observe_speculate_ok_location(*location);
-            specfence.metrics.record_bayes_success();
-            let _ = specfence.try_revoke(&mv_memory.regions, *location, None);
         }
     }
     scheduler.finish_validation(tx_version, aborted)

@@ -317,7 +317,7 @@ impl MvMemory {
 
     /// M1 RebindOnly: patch invalid read origins to the current valid version
     /// without aborting. Refuses multi-origin (lazy) reads — those need RewindTo.
-    /// Returns true iff after patching `collect_invalid_reads` is empty.
+    /// Returns true iff every invalid location was patched to a still-valid origin.
     /// Applies patches atomically (no partial mutate on failure).
     pub(crate) fn try_rebind_invalid_reads(
         &self,
@@ -338,6 +338,10 @@ impl MvMemory {
                 let Some(new_origins) = self.current_read_origins(tx_idx, location) else {
                     return false;
                 };
+                // Pre-check against MV (no mutate yet).
+                if !self.origin_still_valid(tx_idx, location, &new_origins) {
+                    return false;
+                }
                 planned.push((location, new_origins));
             }
         }
@@ -345,8 +349,7 @@ impl MvMemory {
         for (location, new_origins) in planned {
             locs.read.insert(location, new_origins);
         }
-        drop(locs);
-        self.collect_invalid_reads(tx_idx).is_empty()
+        true
     }
 
     /// Closest live Data value below `tx_idx`, if any (Estimate → None).
@@ -587,7 +590,7 @@ impl MvMemory {
     ) -> Vec<MemoryLocationHash> {
         let writes = self.write_locations(tx_idx);
         self.residual_write_sets.insert(tx_idx, writes);
-        let mut estimated = Vec::new();
+        let mut estimated = Vec::with_capacity(suffix.len());
         for &location in suffix {
             if let Some(mut written_transactions) = self.data.get_mut(&location) {
                 written_transactions.insert(tx_idx, MemoryEntry::Estimate);
