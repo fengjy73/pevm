@@ -1782,6 +1782,11 @@ impl WaveParkTable {
         });
     }
 
+    /// True when this worker just parked and should prefer Ready steals.
+    pub(crate) fn steal_after_park_pending(&self) -> bool {
+        STEAL_AFTER_PARK.with(|c| c.get())
+    }
+
     /// Clear steal-after-park flag without counting (e.g. idle yield).
     pub(crate) fn clear_steal_flag(&self) {
         STEAL_AFTER_PARK.with(|c| c.set(false));

@@ -361,39 +361,13 @@ impl<'a, S: Storage> VmDb<'a, S> {
             self.specfence.metrics.record_spec_read();
             return Ok(());
         }
-        // HotSet = fanout / tracking cache hint only — not a hard Wait gate.
-        let hotset_hint = self.specfence.hotset.contains(location_hash);
-        if hotset_hint {
-            self.specfence.hotset.record_hot_local_read();
-        }
-        let writer_count = self
-            .specfence
-            .hotset
-            .writer_count(location_hash)
-            .max(self.specfence.learner.writer_count_live(location_hash));
-        // P1: refresh live learner features before π.
-        self.specfence
-            .learner
-            .note_observe(location_hash, is_program, writer_count);
-        let live_fanout = self.specfence.learner.fanout_live(location_hash);
-        let fanout_hint = hotset_hint || live_fanout >= 8;
-        let waw_spine_hint = self.specfence.learner.waw_spine_hint(
-            location_hash,
-            is_program,
-            self.specfence.params,
-        );
-        let tx_heavy_hint = self
-            .specfence
-            .learner
-            .tx_heavy_hint(self.tx.gas_limit, self.specfence.params);
 
-        let residual_predicts = self
-            .mv_memory
-            .residual_writer_before(location_hash, self.tx_idx)
-            .is_some();
-        // M3: process-local WŜ prior (inter-block) + residual (intra-block / reincarnation).
-        let process_prior = self.specfence.rw_prior.predicts_write(location_hash);
-        let prior_ws_predicts = residual_predicts || process_prior;
+        // Thin hot π: force_prefix / sticky Bind before HotSet/learner/revoke DashMap.
+        let force_prefix = self
+            .specfence
+            .partial_retry
+            .must_force_bind(self.tx_idx, location_hash);
+        let sticky = self.specfence.learner.is_sticky_resolve(location_hash);
         // Concrete writer: MV published/ESTIMATE entry, else residual WŜ(t) of a lower tx.
         // Do NOT fall back to AccountHints.prev here — that can WaitHard on a tx that
         // never writes ℓ (ERC-20 address vs slot) and inflate park chains under M3.
@@ -409,20 +383,22 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 tx_idx,
                 tx_incarnation,
             });
+
+        let residual_predicts = self
+            .mv_memory
+            .residual_writer_before(location_hash, self.tx_idx)
+            .is_some();
+        let process_prior = self.specfence.rw_prior.predicts_write(location_hash);
+        let prior_ws_predicts = residual_predicts || process_prior;
         if prior_ws_predicts && writer.is_some() {
             self.specfence.rw_prior.observe_co_access(location_hash);
         }
 
-        // P2: certified-prefix from prior PartialRetry → force Bind/WaitHard.
-        let force_prefix = self
-            .specfence
-            .partial_retry
-            .must_force_bind(self.tx_idx, location_hash);
+        let hotset_hint = self.specfence.hotset.contains(location_hash);
 
-        // B. OCC-like cold SpecRead: no sticky/writer/hot/prior/force_bind ⇒ skip
-        // π + revoke tax. note_observe already refreshed cheap learner features.
+        // B. OCC-like cold SpecRead: skip π + revoke + note_observe DashMap tax.
         if !force_prefix
-            && !self.specfence.learner.is_sticky_resolve(location_hash)
+            && !sticky
             && !hotset_hint
             && !prior_ws_predicts
             && writer.is_none()
@@ -433,31 +409,101 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return Ok(());
         }
 
-        // Unified revoke: τ_revoke + morph quiet/waw (side effects only).
-        let _ = self.specfence.try_revoke(
-            &self.mv_memory.regions,
-            location_hash,
-            Some(&address),
-        );
-
-        let posterior = self
-            .specfence
-            .bayes
-            .conflict_probability(location_hash, Some(&address));
-
         let action = if force_prefix {
-            // PartialRetry force-bind: Bind when Data ready; else SpecRead.
-            // Sticky Await is EV-only in choose_action (not Boolean Wait here —
-            // WaitHard-without-Data on force_prefix SoftWait-stormed 597).
+            // Repair Bind/SpecRead — no revoke/π.
             if let Some(v) = bind_version.clone() {
                 ResolveAction::Bind(v)
             } else {
                 ResolveAction::SpecRead
             }
+        } else if sticky {
+            if let Some(v) = bind_version.clone() {
+                // Sticky + Data → Bind without π/revoke.
+                ResolveAction::Bind(v)
+            } else {
+                // Sticky without Data: fall into π (may Await) — need hot features.
+                if hotset_hint {
+                    self.specfence.hotset.record_hot_local_read();
+                }
+                let writer_count = self
+                    .specfence
+                    .hotset
+                    .writer_count(location_hash)
+                    .max(self.specfence.learner.writer_count_live(location_hash));
+                self.specfence
+                    .learner
+                    .note_observe(location_hash, is_program, writer_count);
+                let live_fanout = self.specfence.learner.fanout_live(location_hash);
+                let fanout_hint = hotset_hint || live_fanout >= 8;
+                let waw_spine_hint = self.specfence.learner.waw_spine_hint(
+                    location_hash,
+                    is_program,
+                    self.specfence.params,
+                );
+                let tx_heavy_hint = self
+                    .specfence
+                    .learner
+                    .tx_heavy_hint(self.tx.gas_limit, self.specfence.params);
+                let _ = self.specfence.try_revoke(
+                    &self.mv_memory.regions,
+                    location_hash,
+                    Some(&address),
+                );
+                let gross_work_depth = self
+                    .specfence
+                    .partial_retry
+                    .estimate_effect_depth(self.tx_idx);
+                if let Some(d) = gross_work_depth {
+                    self.specfence.learner.note_depth_sample(d);
+                }
+                self.specfence.learner.note_producer_status(
+                    location_hash,
+                    bind_version.is_some() || writer_done,
+                );
+                self.specfence.choose_resolve(
+                    location_hash,
+                    &address,
+                    writer,
+                    writer_done,
+                    bind_version.clone(),
+                    residual_predicts,
+                    prior_ws_predicts,
+                    is_program,
+                    fanout_hint,
+                    live_fanout as f64,
+                    gross_work_depth,
+                    waw_spine_hint,
+                    tx_heavy_hint,
+                )
+            }
         } else {
-            // G1: cheap effect-progress depth when prior incarnation finished; else None.
-            // Morph late prior for Wait EV is applied inside choose_action (not here).
-            // EarlyAbort still requires known d — morph prior never supplies it.
+            if hotset_hint {
+                self.specfence.hotset.record_hot_local_read();
+            }
+            let writer_count = self
+                .specfence
+                .hotset
+                .writer_count(location_hash)
+                .max(self.specfence.learner.writer_count_live(location_hash));
+            self.specfence
+                .learner
+                .note_observe(location_hash, is_program, writer_count);
+            let live_fanout = self.specfence.learner.fanout_live(location_hash);
+            let fanout_hint = hotset_hint || live_fanout >= 8;
+            let waw_spine_hint = self.specfence.learner.waw_spine_hint(
+                location_hash,
+                is_program,
+                self.specfence.params,
+            );
+            let tx_heavy_hint = self
+                .specfence
+                .learner
+                .tx_heavy_hint(self.tx.gas_limit, self.specfence.params);
+            let _ = self.specfence.try_revoke(
+                &self.mv_memory.regions,
+                location_hash,
+                Some(&address),
+            );
             let gross_work_depth = self
                 .specfence
                 .partial_retry
@@ -469,8 +515,6 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 location_hash,
                 bind_version.is_some() || writer_done,
             );
-            // G3: single π choke — no post-choose_action SpecRead→Bind/WaitHard mutate.
-            // (PartialRetry force_prefix Bind-or-SpecRead above is repair, not π.)
             self.specfence.choose_resolve(
                 location_hash,
                 &address,
@@ -487,6 +531,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 tx_heavy_hint,
             )
         };
+
+        let posterior = self
+            .specfence
+            .bayes
+            .conflict_probability(location_hash, Some(&address));
 
         // Dig A/B: SPECFENCE_DISABLE_SOFTWAIT → never arm SoftWait (π SpecRead-only).
         let action = match action {

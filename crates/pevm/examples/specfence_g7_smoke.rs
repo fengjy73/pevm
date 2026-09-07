@@ -81,6 +81,30 @@ fn load_block(
     })
 }
 
+
+fn percentile_sorted(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let n = sorted.len();
+    if n == 1 {
+        return sorted[0];
+    }
+    let idx = ((n as f64 - 1.0) * p).round() as usize;
+    sorted[idx.min(n - 1)]
+}
+
+fn summarize_f64(vals: &mut [f64]) -> (f64, f64, f64, f64) {
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mean = vals.iter().sum::<f64>() / vals.len() as f64;
+    (
+        percentile_sorted(vals, 0.5),
+        percentile_sorted(vals, 0.9),
+        vals[0],
+        mean,
+    )
+}
+
 fn n_tx(block: &Block<<PevmEthereum as PevmChain>::Transaction>) -> usize {
     match &block.transactions {
         alloy_rpc_types_eth::BlockTransactions::Full(txs) => txs.len(),
@@ -181,74 +205,124 @@ fn main() {
     })).unwrap()).unwrap();
     println!("wrote {flip_path:?}");
 
-    // --- SF vs OCC@8 cores ---
-    println!("=== G7 SF vs OCC@8 cores ===");
+    // --- SF vs OCC@8 cores (SPECFENCE_G7_ITERS=N → median+p90 over N runs, default 1) ---
+    let iters = std::env::var("SPECFENCE_G7_ITERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1);
+    println!("=== G7 SF vs OCC@8 cores iters={iters} ===");
     let cores_blocks = [14_689_597u64, 19_606_599u64, 19_469_097u64, 19_606_598u64];
     let mut sweep_rows = Vec::new();
+    let mut multi_summaries = Vec::new();
     for bn in cores_blocks {
         let Some(loaded) = load_block(&data_dir, bn, Arc::clone(&bytecodes), Arc::clone(&block_hashes)) else {
             continue;
         };
         for mode in ["occ", "specfence"] {
-            let mut pevm = match mode {
-                "occ" => Pevm::with_concurrency_mode(ConcurrencyMode::Occ),
-                _ => Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence),
-            };
-            pevm.reset_heat();
-            pevm.reset_inter_prior();
-            let (ok, tps, wall_ms, soft, wh, aborts) = run_one(&chain, &mut pevm, &loaded, 8);
-            let m = pevm.last_specfence_metrics();
-            let n = n_tx(&loaded.block);
-            let reexec_entries = m.evm_entries.saturating_sub(n);
-            println!(
-                "  block={bn} mode={mode:10} ok={ok} tps={tps:.0} wall_ms={wall_ms:.1} soft={soft} wait_hard={wh} abort_rate={:.3} lean={} evm={} reexec={} fb_reabort={} sw_ok={} sw_reabort={} park_k={}",
-                if n == 0 { 0.0 } else { aborts as f64 / n as f64 },
-                m.lean_mode_txs,
-                m.evm_entries,
-                reexec_entries,
-                m.force_bind_reabort,
-                m.soft_wait_wake_ok,
-                m.soft_wait_wake_reabort,
-                m.park_resume_at_k,
-            );
-            sweep_rows.push(serde_json::json!({
-                "block": bn,
-                "mode": mode,
-                "cores": 8,
-                "ok": ok,
-                "n_tx": n,
-                "tps": tps,
-                "wall_ms": wall_ms,
-                "soft_wait_arms": soft,
-                "wait_hard": wh,
-                "occ_aborts": aborts,
-                "lean_mode_txs": m.lean_mode_txs,
-                "hotset_size": m.hotset_size,
-                "bind_hits": m.bind_hits,
-                "spec_read_count": m.spec_read_count,
-                // V5 dig hooks (interpreter-seconds / rewind / SoftWait / ForceBind)
-                "evm_entries": m.evm_entries,
-                "reexec_entries": reexec_entries,
-                "rewind_to_cp": m.rewind_to_cp,
-                "resume_count": m.resume_count,
-                "journal_ff_entries": m.journal_ff_entries,
-                "journal_ff_hits": m.journal_ff_hits,
-                "park_resume_at_k": m.park_resume_at_k,
-                "park_resume_full_retry": m.park_resume_full_retry,
-                "full_restart": m.full_restart,
-                "partial_retry_count": m.partial_retry_count,
-                "force_bind_reabort": m.force_bind_reabort,
-                "soft_wait_wake_ok": m.soft_wait_wake_ok,
-                "soft_wait_wake_reabort": m.soft_wait_wake_reabort,
-                "rebind_only": m.rebind_only,
-                "cold_spec_fast": m.cold_spec_fast,
-                "absolute_jump_applied": m.absolute_jump_applied,
-                "absolute_jump_fallback": m.absolute_jump_fallback,
-                "tx_full_retry": m.tx_full_retry,
-                "wait_park_count": m.wait_park_count,
-                "wait_park_ns": m.wait_park_ns,
-                "ready_steal_on_wait": m.ready_steal_on_wait,
-            }));
+            let mut walls = Vec::with_capacity(iters);
+            let mut softs = Vec::with_capacity(iters);
+            let mut aborts_v = Vec::with_capacity(iters);
+            let mut last_row = None;
+            for i in 0..iters {
+                let mut pevm = match mode {
+                    "occ" => Pevm::with_concurrency_mode(ConcurrencyMode::Occ),
+                    _ => Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence),
+                };
+                pevm.reset_heat();
+                pevm.reset_inter_prior();
+                let (ok, tps, wall_ms, soft, wh, aborts) = run_one(&chain, &mut pevm, &loaded, 8);
+                let m = pevm.last_specfence_metrics();
+                let n = n_tx(&loaded.block);
+                let reexec_entries = m.evm_entries.saturating_sub(n);
+                walls.push(wall_ms);
+                softs.push(soft as f64);
+                aborts_v.push(aborts as f64);
+                if iters == 1 || i + 1 == iters {
+                    println!(
+                        "  block={bn} mode={mode:10} iter={}/{} ok={ok} tps={tps:.0} wall_ms={wall_ms:.1} soft={soft} wait_hard={wh} abort_rate={:.3} lean={} evm={} reexec={} fb_reabort={} rebind={} cold={} steal={} park_k={}",
+                        i + 1,
+                        iters,
+                        if n == 0 { 0.0 } else { aborts as f64 / n as f64 },
+                        m.lean_mode_txs,
+                        m.evm_entries,
+                        reexec_entries,
+                        m.force_bind_reabort,
+                        m.rebind_only,
+                        m.cold_spec_fast,
+                        m.ready_steal_on_wait,
+                        m.park_resume_at_k,
+                    );
+                }
+                last_row = Some(serde_json::json!({
+                    "block": bn,
+                    "mode": mode,
+                    "cores": 8,
+                    "ok": ok,
+                    "n_tx": n,
+                    "tps": tps,
+                    "wall_ms": wall_ms,
+                    "soft_wait_arms": soft,
+                    "wait_hard": wh,
+                    "occ_aborts": aborts,
+                    "lean_mode_txs": m.lean_mode_txs,
+                    "hotset_size": m.hotset_size,
+                    "bind_hits": m.bind_hits,
+                    "spec_read_count": m.spec_read_count,
+                    "evm_entries": m.evm_entries,
+                    "reexec_entries": reexec_entries,
+                    "rewind_to_cp": m.rewind_to_cp,
+                    "resume_count": m.resume_count,
+                    "journal_ff_entries": m.journal_ff_entries,
+                    "journal_ff_hits": m.journal_ff_hits,
+                    "park_resume_at_k": m.park_resume_at_k,
+                    "park_resume_full_retry": m.park_resume_full_retry,
+                    "full_restart": m.full_restart,
+                    "partial_retry_count": m.partial_retry_count,
+                    "force_bind_reabort": m.force_bind_reabort,
+                    "soft_wait_wake_ok": m.soft_wait_wake_ok,
+                    "soft_wait_wake_reabort": m.soft_wait_wake_reabort,
+                    "rebind_only": m.rebind_only,
+                    "cold_spec_fast": m.cold_spec_fast,
+                    "absolute_jump_applied": m.absolute_jump_applied,
+                    "absolute_jump_fallback": m.absolute_jump_fallback,
+                    "tx_full_retry": m.tx_full_retry,
+                    "wait_park_count": m.wait_park_count,
+                    "wait_park_ns": m.wait_park_ns,
+                    "ready_steal_on_wait": m.ready_steal_on_wait,
+                }));
+            }
+            let (wall_med, wall_p90, wall_min, wall_mean) = summarize_f64(&mut walls);
+            let (soft_med, _, _, _) = summarize_f64(&mut softs);
+            let (abort_med, _, _, _) = summarize_f64(&mut aborts_v);
+            if iters > 1 {
+                println!(
+                    "  block={bn} mode={mode:10} SUMMARY n={iters} wall_ms median={wall_med:.1} p90={wall_p90:.1} min={wall_min:.1} mean={wall_mean:.1} soft_med={soft_med:.0} abort_med={abort_med:.0}"
+                );
+            }
+            if let Some(mut row) = last_row {
+                row["wall_ms_median"] = serde_json::json!(wall_med);
+                row["wall_ms_p90"] = serde_json::json!(wall_p90);
+                row["wall_ms_min"] = serde_json::json!(wall_min);
+                row["wall_ms_mean"] = serde_json::json!(wall_mean);
+                row["iters"] = serde_json::json!(iters);
+                row["soft_wait_arms_median"] = serde_json::json!(soft_med);
+                row["occ_aborts_median"] = serde_json::json!(abort_med);
+                if mode == "specfence" && bn == 14_689_597 {
+                    multi_summaries.push(serde_json::json!({
+                        "block": bn,
+                        "mode": mode,
+                        "iters": iters,
+                        "wall_ms_median": wall_med,
+                        "wall_ms_p90": wall_p90,
+                        "wall_ms_min": wall_min,
+                        "wall_ms_mean": wall_mean,
+                        "soft_wait_arms_median": soft_med,
+                        "occ_aborts_median": abort_med,
+                    }));
+                }
+                sweep_rows.push(row);
+            }
         }
     }
     // Ratios
@@ -275,9 +349,11 @@ fn main() {
         "test": "SF vs OCC@8 architecture cores",
         "tag": if tag.is_empty() { serde_json::Value::Null } else { serde_json::json!(tag) },
         "softwait_disabled": softwait_disabled,
+        "iters": iters,
         "v8_mean_reference": 0.325,
         "mean_sf_occ": mean,
         "ratios": ratios,
+        "multi_run_597": multi_summaries,
         "rows": sweep_rows,
     })).unwrap()).unwrap();
     println!("wrote {sweep_path:?}");

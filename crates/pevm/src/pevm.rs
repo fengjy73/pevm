@@ -864,8 +864,10 @@ fn try_validate(
             ),
             None => !write_locations.is_empty(),
         };
-        // Storage-only value-stable: Basic/Lazy can false-match under selective
-        // invalidate and commit a non-serializable continuation.
+        // Value-stable RebindOnly: same-output republish (Estimate→Data / incarnation
+        // bump) is safe without reexec. Storage always; Basic when balance+nonce match
+        // and current entry is live Data (Estimate → None, no skip). Lazy excluded
+        // (multi-origin refused by try_rebind).
         let value_stable = !invalid.is_empty()
             && invalid.iter().all(|&loc| {
                 let Some(snap) = specfence.partial_retry.snapped_value(tx_version.tx_idx, loc) else {
@@ -874,14 +876,20 @@ fn try_validate(
                 let Some(cur) = mv_memory.current_data_value(tx_version.tx_idx, loc) else {
                     return false;
                 };
-                matches!(
-                    (&snap, &cur),
+                match (&snap, &cur) {
                     (
                         crate::specfence::FfValue::Storage { value, .. },
                         MemoryValue::Storage(v),
-                    ) if value == v
-                )
+                    ) => value == v,
+                    (
+                        crate::specfence::FfValue::Basic { basic, .. },
+                        MemoryValue::Basic(b),
+                    ) => basic.balance == b.balance && basic.nonce == b.nonce,
+                    _ => false,
+                }
             });
+        // Prefer RebindOnly when !true_suffix, or when value-stable (incl. Estimate→Data
+        // same-output). try_rebind refuses Estimate / multi-origin.
         let rebound = if !true_suffix || value_stable {
             mv_memory.try_rebind_invalid_reads(tx_version.tx_idx, &invalid)
         } else {
@@ -1024,7 +1032,7 @@ fn try_validate(
             specfence.metrics.record_fence_cascade(cascade, skipped);
             // V5-P0: engagement.note_abort is metrics-only (no HotSet storm insert).
             let _ = specfence.engagement.note_abort();
-            return scheduler.finish_validation_fenced(tx_version, true, rewind_to);
+            return scheduler.finish_validation_fenced(tx_version, true, rewind_to, Some(specfence.wave));
         }
         // Snapshot write locations before invalidate (same set).
         let write_locations = if specfence.mode == ConcurrencyMode::SpecFence {
@@ -1146,7 +1154,7 @@ fn try_validate(
                 None => (0, block_size.saturating_sub(cascade_from)),
             };
             specfence.metrics.record_fence_cascade(cascade, skipped);
-            return scheduler.finish_validation_fenced(tx_version, true, rewind_to);
+            return scheduler.finish_validation_fenced(tx_version, true, rewind_to, Some(specfence.wave));
         }
         // OCC / PCC: full write-set ESTIMATE (unchanged).
         let occ_write_locs = mv_memory.write_locations(tx_version.tx_idx);

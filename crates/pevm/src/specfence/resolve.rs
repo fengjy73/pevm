@@ -273,21 +273,11 @@ fn meta_tax_prefers_spec(ev_wait: f64, ev_spec: f64, meta_tax: f64, params: &Ada
 /// Meta tax may still bias away from Wait storms; no Boolean fanout→Wait ladders.
 pub(crate) fn choose_action(ctx: PolicyCtx) -> ResolveAction {
     let params = ctx.params;
-    // 1. Raise Bind hits when published Data is hang-free to consume (writer_done)
-    // or WŜ/placeholder/high bind posterior predicts the ready version.
-    // Do NOT Bind solely on bind_version when !writer_done — that SoftWait-arms and
-    // can livelock fan-out (M1k/M1l). Unresolved Data still enters EV below.
+    // 1. Published Data → Bind (install origin / certify). Bind match arm does **not**
+    // SoftWait; waiting is WaitHard-only. Prefer Bind over SpecRead whenever MV Data
+    // exists to cut origin churn and enable RebindOnly / force_bind prefixes.
     if let Some(v) = ctx.bind_version.clone() {
-        // Do NOT early-Bind on sticky alone when !writer_done — that SoftWait-arms.
-        // Sticky still biases EV (higher Spec / lower Wait) so Await/Bind compete.
-        if ctx.writer_done
-            || ctx.placeholder_ready
-            || ctx.prior_ws_predicts
-            || ctx.posterior_conflict >= params.tau_very_high
-            || ctx.posterior_bind_success >= params.tau_s
-        {
-            return ResolveAction::Bind(v);
-        }
+        return ResolveAction::Bind(v);
     }
 
     // Meta budget → SpecRead fallback (storm brake), not OCC identity.
@@ -298,37 +288,6 @@ pub(crate) fn choose_action(ctx: PolicyCtx) -> ResolveAction {
     let mut ev = compute_ev(&ctx);
     // Producer known unfinished → Await wins on EV_Wait ≈ EV_Spec ties.
     let prefer_await_tie = ctx.writer_known && !ctx.writer_done;
-
-    // Data published but writer not yet done: EV_Bind ≈ small wake cost (not +∞).
-    // Prefer Bind (may SoftWait) only when that beats Spec — still argmin EV.
-    if let Some(v) = ctx.bind_version.clone() {
-        let ev_bind = ctx.e_wait_time.max(params.e_wait_prior * 0.05)
-            * (1.0 + params.alpha_fanout * fanout_feature(&ctx) * 0.25);
-        if ctx.prior_ws_predicts || ctx.placeholder_ready {
-            ev.ev_spec *= 1.0 + ctx.posterior_bind_success.clamp(0.0, 1.0);
-        }
-        const EPS: f64 = 1e-9;
-        let mut best = ResolveAction::SpecRead;
-        let mut best_ev = ev.ev_spec;
-        if ev_bind + EPS < best_ev {
-            best = ResolveAction::Bind(v);
-            best_ev = ev_bind;
-        }
-        let wait_ok = if prefer_await_tie {
-            ev.ev_wait <= best_ev + EPS
-        } else {
-            ev.ev_wait + EPS < best_ev
-        };
-        if wait_ok && !meta_tax_prefers_spec(ev.ev_wait, ev.ev_spec, ctx.meta_tax, &params)
-        {
-            best = ResolveAction::WaitHard;
-            best_ev = ev.ev_wait;
-        }
-        if ev.ev_early + EPS < best_ev {
-            best = ResolveAction::EarlyAbort;
-        }
-        return best;
-    }
 
     // When WŜ predicts a writer but Data not yet published, raise Spec abort cost.
     if ctx.prior_ws_predicts || ctx.placeholder_ready {
@@ -596,11 +555,11 @@ mod tests {
         let mut c2 = ctx_aec(0.05, true, false, Some(v.clone()), false, true, false, 2.0, None);
         c2.posterior_bind_success = 0.80;
         assert_eq!(choose_action(c2), ResolveAction::Bind(v.clone()));
-        // Data alone at high fanout without quality → Spec (no SoftWait storm).
+        // Data alone → Bind (Bind does not SoftWait; origin install is hang-free).
         let mut c3 = ctx_aec(0.05, true, false, Some(v.clone()), false, true, true, 32.0, None);
         c3.e_wait_time = 2.0;
         c3.e_reexec = 0.5;
-        assert_eq!(choose_action(c3), ResolveAction::SpecRead);
+        assert_eq!(choose_action(c3), ResolveAction::Bind(v));
     }
 
     #[test]

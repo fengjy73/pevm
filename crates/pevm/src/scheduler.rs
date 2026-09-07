@@ -383,28 +383,44 @@ impl Scheduler {
     pub(crate) fn finish_validation(&self, tx_version: &TxVersion, aborted: bool) -> Option<Task> {
         // Classic Block-STM: abort cascades validation from aborted_idx+1 through
         // the rest of the block.
-        self.finish_validation_fenced(tx_version, aborted, aborted.then_some(tx_version.tx_idx + 1))
+        self.finish_validation_fenced(
+            tx_version,
+            aborted,
+            aborted.then_some(tx_version.tx_idx + 1),
+            None,
+        )
     }
 
     /// Like [`finish_validation`], but on abort only rewinds `validation_idx` to
     /// `rewind_to` (the first higher tx that read an aborted write). `None` means
     /// no higher dependent reader was found — do not force a suffix cascade.
+    /// When `wave` is set, push the aborted tx onto the ready deque and
+    /// `execution_idx.fetch_min` so SoftWait/EarlyAbort park workers can steal it.
     pub(crate) fn finish_validation_fenced(
         &self,
         tx_version: &TxVersion,
         aborted: bool,
         rewind_to: Option<TxIdx>,
+        wave: Option<&crate::specfence::WaveParkTable>,
     ) -> Option<Task> {
         if aborted {
             self.set_ready_status(tx_version.tx_idx);
+            // Park→steal: always push wave ready so SoftWait park workers see Ready txs.
+            // Only rewind execution_idx when it already passed this tx (avoid stampede
+            // reexec of low-idx aborts that inflates median abort cascades).
+            if let Some(wave) = wave {
+                wave.push_ready(tx_version.tx_idx);
+            }
+            if self.execution_idx.load(Ordering::Relaxed) > tx_version.tx_idx {
+                self.execution_idx
+                    .fetch_min(tx_version.tx_idx, Ordering::Relaxed);
+            }
             if let Some(to) = rewind_to {
                 // Never rewind past the aborted tx itself; clamp to [tx_idx+1, block_size].
                 let to = to.clamp(tx_version.tx_idx + 1, self.block_size);
                 self.validation_idx.fetch_min(to, Ordering::Relaxed);
             }
-            if self.execution_idx.load(Ordering::Relaxed) > tx_version.tx_idx {
-                return self.try_execute(tx_version.tx_idx).map(Task::Execution);
-            }
+            return self.try_execute(tx_version.tx_idx).map(Task::Execution);
         } else {
             let mut tx = index_mutex!(self.transactions_status, tx_version.tx_idx);
             if tx.status == IncarnationStatus::Executed {
@@ -414,4 +430,6 @@ impl Scheduler {
         }
         None
     }
+
 }
+
