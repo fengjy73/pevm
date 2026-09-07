@@ -3,7 +3,7 @@
 **Date:** 2026-09-07 (Asia/Shanghai)  
 **Branch:** `specfence`  
 **Base tip:** `0a7754e` (compliance audit)  
-**This tip:** `c5988a1`  
+**This tip:** `8a55c75`
 
 **Authority:** `specfence-architecture-compliance-audit.md` G1–G7; learn-from-blocks; region-fence adaptive architecture.
 
