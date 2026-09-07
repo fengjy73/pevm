@@ -8,6 +8,7 @@
 
 #![allow(dead_code)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use dashmap::{DashMap, DashSet};
@@ -62,6 +63,8 @@ pub(crate) struct FenceGraph {
     soft_revoke_count: AtomicUsize,
     /// Wake notifications this block.
     wake_count: AtomicUsize,
+    /// G4: locations whose SoftWait woke on Publish (drained by learner credit).
+    wake_useful_locs: Mutex<Vec<MemoryLocationHash>>,
     /// Txs whose known hard waits are clear (ready hint).
     ready_hints: DashSet<TxIdx, BuildIdentityHasher>,
     /// Arm timestamps (best-effort revoke age).
@@ -195,8 +198,14 @@ impl FenceGraph {
         }
         if !woken.is_empty() {
             self.wake_count.fetch_add(woken.len(), Ordering::Relaxed);
+            self.wake_useful_locs.lock().unwrap().push(location);
         }
         woken
+    }
+
+    /// G4: drain SoftWait-wake locations for learner `wait_useful` credit.
+    pub(crate) fn drain_wake_useful_locs(&self) -> Vec<MemoryLocationHash> {
+        std::mem::take(&mut *self.wake_useful_locs.lock().unwrap())
     }
 
     /// SoftWait `armed_at_k` for `(location, waiter)` if armed.

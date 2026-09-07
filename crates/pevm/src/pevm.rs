@@ -186,7 +186,7 @@ impl Default for Pevm {
             rw_prior: RwPriorMap::new(),
             hotset: HotSet::new(),
             inter_prior: InterBlockPrior::new(),
-            adaptive_params: AdaptiveParams::default(),
+            adaptive_params: AdaptiveParams::from_l3(),
             last_metrics: SpecFenceMetrics::default(),
             last_initial_wait_accounts: std::collections::HashSet::new(),
             last_abort_rate: 0.0,
@@ -208,6 +208,16 @@ impl Pevm {
     /// Set the concurrency-control mode for subsequent blocks.
     pub const fn set_concurrency_mode(&mut self, mode: ConcurrencyMode) {
         self.concurrency_mode = mode;
+    }
+
+    /// G6: replace process-level AdaptiveParams (L3 overrides / lab).
+    pub(crate) fn set_adaptive_params(&mut self, params: AdaptiveParams) {
+        self.adaptive_params = params;
+    }
+
+    /// Current AdaptiveParams (L3 defaults unless overridden).
+    pub(crate) const fn adaptive_params(&self) -> &AdaptiveParams {
+        &self.adaptive_params
     }
 
     /// Current concurrency-control mode.
@@ -271,6 +281,8 @@ impl Pevm {
     }
 
     /// Clear inter-block heat and Bayesian posteriors (test / replay).
+    /// Does **not** clear InterBlockPrior (morph EMA / flip α) — use
+    /// [`reset_inter_prior`] for a full cold start.
     pub fn reset_heat(&mut self) {
         self.heat.reset();
         self.bayes.reset();
@@ -278,6 +290,16 @@ impl Pevm {
         self.hotset.reset();
         self.last_initial_wait_accounts.clear();
         self.last_abort_rate = 0.0;
+    }
+
+    /// Clear dual-horizon inter-block morph / top-ℓ prior (lab cold start).
+    pub fn reset_inter_prior(&mut self) {
+        self.inter_prior.reset();
+    }
+
+    /// G7: InterBlockPrior flip-α events observed since last reset.
+    pub fn inter_prior_flip_count(&self) -> usize {
+        self.inter_prior.flip_count()
     }
 
     /// M3: number of locations with process-local write prior (diagnostics).
@@ -717,7 +739,13 @@ impl Pevm {
             return match vm.execute(&tx_version, result_slot) {
                 Ok(flags) => {
                     // PublishWrite ≈ incarnation finished: wake location waiters + ready.
-                    scheduler.finish_execution_with_wave_fence(tx_version, flags, wave, fence)
+                    let task = scheduler
+                        .finish_execution_with_wave_fence(tx_version, flags, wave, fence);
+                    // G4: SoftWait wake → wait_useful learner credit.
+                    if let Some(fence) = fence {
+                        vm.credit_softwait_wakes(fence);
+                    }
+                    task
                 }
                 Err(VmExecutionError::Retry) => {
                     if self.abort_reason.get().is_none() {

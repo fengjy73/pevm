@@ -68,6 +68,9 @@ impl RegionTable {
     }
 
     /// Promote an account Speculate → Wait. Returns true if this was a new promotion.
+    ///
+    /// **G5:** SpecFence must never call this — conflict key is MemoryLocation only.
+    /// Callers gate behind `ConcurrencyMode::Pcc` (or non-SpecFence legacy).
     pub(crate) fn promote_account(&self, address: Address) -> bool {
         match self.accounts.insert(address, RegionMode::Wait) {
             None | Some(RegionMode::Speculate) => true,
