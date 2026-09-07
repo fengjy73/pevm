@@ -292,6 +292,7 @@ impl<'a> SpecFenceCtx<'a> {
             morph_weights,
             waw_spine_hint,
             tx_heavy_hint,
+            sticky_resolve: self.learner.is_sticky_resolve(location),
             params: *self.params,
         };
         let action = choose_action(ctx);

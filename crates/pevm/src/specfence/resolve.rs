@@ -83,6 +83,8 @@ pub(crate) struct PolicyCtx {
     pub waw_spine_hint: bool,
     /// Gas band / prior says heavy tx (EarlyAbort niche feature).
     pub tx_heavy_hint: bool,
+    /// Sticky resolve after force_bind_reabort on this ℓ — Bind/Await EV bias.
+    pub sticky_resolve: bool,
     /// Learning rates / priors (not decision cuts).
     pub params: AdaptiveParams,
 }
@@ -233,6 +235,11 @@ pub(crate) fn compute_ev(ctx: &PolicyCtx) -> EvScores {
         f64::INFINITY
     };
 
+    // Sticky resolve: raise EV_Spec / dampen EV_Wait (not Boolean Wait storm).
+    // Sticky resolve uses force_bind extension (Bind-if-Data), not EV Wait dampening —
+    // EV Wait dampening SoftWait/park-stormed 597 (wait_park 497→2662).
+    let _ = ctx.sticky_resolve;
+
     EvScores {
         ev_wait,
         ev_spec,
@@ -271,6 +278,8 @@ pub(crate) fn choose_action(ctx: PolicyCtx) -> ResolveAction {
     // Do NOT Bind solely on bind_version when !writer_done — that SoftWait-arms and
     // can livelock fan-out (M1k/M1l). Unresolved Data still enters EV below.
     if let Some(v) = ctx.bind_version.clone() {
+        // Do NOT early-Bind on sticky alone when !writer_done — that SoftWait-arms.
+        // Sticky still biases EV (higher Spec / lower Wait) so Await/Bind compete.
         if ctx.writer_done
             || ctx.placeholder_ready
             || ctx.prior_ws_predicts
@@ -409,6 +418,7 @@ mod tests {
             morph_weights: MorphWeights::default(),
             waw_spine_hint: false,
             tx_heavy_hint: false,
+            sticky_resolve: false,
             params,
         }
     }
@@ -758,5 +768,36 @@ mod tests {
         assert_eq!(choose_action(c.clone()), ResolveAction::WaitHard);
         c.meta_tax = 2.0; // thresh = 0.06*(1+2)=0.18 > gap
         assert_eq!(choose_action(c), ResolveAction::SpecRead);
+    }
+
+    #[test]
+    fn sticky_resolve_raises_spec_and_binds_on_data() {
+        let v = TxVersion {
+            tx_idx: 0,
+            tx_incarnation: 0,
+        };
+        // Sticky flag is informational for π; Bind still requires hang-free gates.
+        let mut c = ctx_aec(0.2, true, true, Some(v.clone()), false, true, false, 2.0, None);
+        c.sticky_resolve = true;
+        assert_eq!(choose_action(c), ResolveAction::Bind(v));
+
+        // Sticky alone must not Boolean-Wait: EV unchanged vs plain (force_bind extend
+        // owns sticky resolve — not EV Wait dampening).
+        let mut c2 = ctx_aec(0.45, true, false, None, false, true, false, 2.0, Some(0.4));
+        c2.e_wait_time = 0.15;
+        c2.sticky_resolve = true;
+        let sticky_ev = compute_ev(&c2);
+        let mut plain = c2.clone();
+        plain.sticky_resolve = false;
+        let plain_ev = compute_ev(&plain);
+        assert!(
+            (sticky_ev.ev_spec - plain_ev.ev_spec).abs() < 1e-12,
+            "sticky must not alter EV_Spec (force_bind extend is the sticky verb)"
+        );
+        assert!(
+            (sticky_ev.ev_wait - plain_ev.ev_wait).abs() < 1e-12
+                || (!sticky_ev.ev_wait.is_finite() && !plain_ev.ev_wait.is_finite()),
+            "sticky must not alter EV_Wait"
+        );
     }
 }

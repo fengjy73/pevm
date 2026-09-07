@@ -240,6 +240,8 @@ fn main() {
                 "soft_wait_wake_ok": m.soft_wait_wake_ok,
                 "soft_wait_wake_reabort": m.soft_wait_wake_reabort,
                 "rebind_only": m.rebind_only,
+                "absolute_jump_applied": m.absolute_jump_applied,
+                "absolute_jump_fallback": m.absolute_jump_fallback,
                 "tx_full_retry": m.tx_full_retry,
                 "wait_park_count": m.wait_park_count,
                 "wait_park_ns": m.wait_park_ns,

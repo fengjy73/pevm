@@ -831,30 +831,47 @@ fn try_validate(
         specfence
             .metrics
             .record_region_validate_fail(invalid.len());
-        // RebindOnly (suffix empty) needs no inspect — keep on LeanOCC before abort.
-        // V5-P1: RewindTo/jump only on research-inspect abort path (`!lean_tx`).
+        // RebindOnly-first (native resolve): patch origins when invalid reads now
+        // have Data/Storage and there is no *true* failed-suffix write (first_k ≥
+        // k_fail). Uncertified writes before k_fail must not block RebindOnly.
         for _ in &read_locations {
             specfence.rem.note_checkpoint_opportunity();
             specfence.metrics.record_checkpoint_opportunity();
         }
         let write_locations = mv_memory.write_locations(tx_version.tx_idx);
-        if let Some(plan) = specfence.partial_retry.plan_partial_retry(
-            tx_version.tx_idx,
-            &read_locations,
-            &invalid,
-            &write_locations,
-        ) {
-            if plan.suffix_writes.is_empty()
-                && mv_memory.try_rebind_invalid_reads(tx_version.tx_idx, &invalid)
-            {
-                specfence.metrics.record_partial_retry();
-                specfence.metrics.record_rebind_only();
-                specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
-                specfence.partial_retry.clear_repair(tx_version.tx_idx);
-                specfence.learner.note_reexec_cost(0.1);
-                read_set_valid = true;
-                // Fall through to success path below (no abort).
+        let mut k_fail = invalid
+            .iter()
+            .filter_map(|l| specfence.partial_retry.first_k(tx_version.tx_idx, *l))
+            .min();
+        if k_fail.is_none() {
+            if let Some(plan) = specfence.partial_retry.plan_partial_retry(
+                tx_version.tx_idx,
+                &read_locations,
+                &invalid,
+                &write_locations,
+            ) {
+                k_fail = Some(plan.k_fail);
             }
+        }
+        // RebindOnly when no true failed-suffix write (or no writes if k unknown).
+        let true_suffix = match k_fail {
+            Some(k) => specfence.partial_retry.has_true_suffix_writes(
+                tx_version.tx_idx,
+                k,
+                &write_locations,
+            ),
+            None => !write_locations.is_empty(),
+        };
+        if !true_suffix
+            && mv_memory.try_rebind_invalid_reads(tx_version.tx_idx, &invalid)
+        {
+            specfence.metrics.record_partial_retry();
+            specfence.metrics.record_rebind_only();
+            specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
+            specfence.partial_retry.clear_repair(tx_version.tx_idx);
+            specfence.learner.note_reexec_cost(0.1);
+            read_set_valid = true;
+            // Fall through to success path below (no abort / no SuffixRepair).
         }
     }
 
@@ -864,7 +881,8 @@ fn try_validate(
         // checkpoint exists). Research inspect (`!lean_tx`) keeps separate plant API.
         if lean_tx {
             // Dig: abort while prior ForceBind / SoftWait-wake still armed.
-            if specfence.partial_retry.has_force_bind(tx_version.tx_idx) {
+            let was_force_bind = specfence.partial_retry.has_force_bind(tx_version.tx_idx);
+            if was_force_bind {
                 specfence.metrics.record_force_bind_reabort();
             }
             if specfence
@@ -882,6 +900,19 @@ fn try_validate(
             );
             if repair.did_force_bind() {
                 specfence.metrics.record_partial_retry();
+            }
+            // Sticky AFTER SuffixRepair arming — merge conflict ℓ into force_bind
+            // so next touch Bind-if-Data (apply_suffix_repair would overwrite if first).
+            if was_force_bind {
+                for location in &invalid {
+                    specfence.learner.note_sticky_resolve(*location);
+                }
+                specfence
+                    .partial_retry
+                    .extend_force_bind(tx_version.tx_idx, &invalid);
+                specfence
+                    .partial_retry
+                    .mark_needs_live_capture(tx_version.tx_idx);
             }
             specfence.learner.note_reexec_cost(repair.reexec_cost());
             // SuffixRepair → invalidate failed suffix only; else selective/full.
@@ -967,6 +998,15 @@ fn try_validate(
             // when certified prefix + checkpoint; else same FullRestart as Lean.
             if specfence.partial_retry.has_force_bind(tx_version.tx_idx) {
                 specfence.metrics.record_force_bind_reabort();
+                for location in &invalid {
+                    specfence.learner.note_sticky_resolve(*location);
+                }
+                specfence
+                    .partial_retry
+                    .extend_force_bind(tx_version.tx_idx, &invalid);
+                specfence
+                    .partial_retry
+                    .mark_needs_live_capture(tx_version.tx_idx);
             }
             if specfence
                 .partial_retry

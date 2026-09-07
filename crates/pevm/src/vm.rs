@@ -438,7 +438,8 @@ impl<'a, S: Storage> VmDb<'a, S> {
 
         let action = if force_prefix {
             // PartialRetry force-bind: Bind when Data ready; else SpecRead.
-            // WaitHard here SoftWait-armed without Data and livelocked fan-out (abort cheapening).
+            // Sticky Await is EV-only in choose_action (not Boolean Wait here —
+            // WaitHard-without-Data on force_prefix SoftWait-stormed 597).
             if let Some(v) = bind_version.clone() {
                 ResolveAction::Bind(v)
             } else {
@@ -1539,22 +1540,46 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             }
         }
 
-        // Hang-free SuffixRepair prefix skip: if Lean + RewindTo continuation is
-        // jump_is_safe, open inspect_run for THIS incarnation only and arm jump
-        // (no whole-block SPECFENCE_ENABLE_INSPECT). Else Handler::run + journal FF.
+        // Hang-free SuffixRepair prefix skip + live-snap capture:
+        // Lean EffectBoundary snaps are often lite → jump_is_safe never arms.
+        // Open narrow inspect_run (no whole-block SPECFENCE_ENABLE_INSPECT) when:
+        //   (a) RewindTo + Storage FF prefix (CallEntry/EB bisect), or
+        //   (b) one-shot after force_bind_reabort (`needs_live_capture`).
+        // Arm absolute jump only when jump_is_safe; else inspect captures live
+        // jump_snap for a later SuffixRepair. Honor SPECFENCE_ABSOLUTE_JUMP=0.
+        let ff_cont = self
+            .specfence
+            .partial_retry
+            .ff_continuation(tx_version.tx_idx);
+        let jump_disabled = self
+            .specfence
+            .partial_retry
+            .is_jump_disabled(tx_version.tx_idx);
+        let storage_prefix = ff_cont.as_ref().is_some_and(|cont| {
+            cont.values.values().any(|v| {
+                matches!(v, FfValue::Storage { .. })
+            })
+        });
+        // Live jump_snap: only open inspect when jump_is_safe already (Storage FF
+        // + live capture from a prior inspect path). One-shot live_prime after
+        // force_bind_reabort was tried — cut force_bind_reabort but 4× evm_entries
+        // / wall regression on 597; consume the flag without inspect tax.
+        let _ = self
+            .specfence
+            .partial_retry
+            .take_needs_live_capture(tx_version.tx_idx);
         let suffix_jump = lean
             && rewind_resume
             && suffix_repair_jump_env_ok()
-            && self
-                .specfence
-                .partial_retry
-                .ff_continuation(tx_version.tx_idx)
-                .is_some_and(|cont| {
-                    absolute_jump_eligible(tx_version.tx_idx, self.specfence.partial_retry, &cont)
-                });
+            && !jump_disabled
+            && storage_prefix
+            && ff_cont.as_ref().is_some_and(|cont| {
+                absolute_jump_eligible(tx_version.tx_idx, self.specfence.partial_retry, cont)
+            });
+        let capture_inspect = suffix_jump;
 
         // R0: Handler::run by default.
-        // Research: SPECFENCE_ENABLE_INSPECT=1 OR finegrain journal OR narrow SuffixRepair jump.
+        // Research: SPECFENCE_ENABLE_INSPECT=1 OR finegrain journal OR narrow capture/jump.
         let journal_stream = self
             .specfence
             .finegrain
@@ -1562,7 +1587,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         let research_inspect = self.specfence.mode == crate::ConcurrencyMode::SpecFence
             && !lean
             && crate::specfence::research_inspect_enabled();
-        let use_inspect = journal_stream || research_inspect || suffix_jump;
+        let use_inspect = journal_stream || research_inspect || capture_inspect;
 
         // M1d: seed certified-prefix read origins only when prefix SLOADs may be
         // PC-skipped. Lean journal-FF-only resume must NOT seed — stale FF origins

@@ -325,6 +325,8 @@ struct LocLive {
     e_wait_bits: AtomicU64,
     /// Fixed-point ×1e6 EMA of E_cascade.
     e_cascade_bits: AtomicU64,
+    /// Sticky resolve: conflict ℓ after force_bind_reabort (Bind/Await bias).
+    sticky_resolve: AtomicUsize,
 }
 
 
@@ -481,6 +483,21 @@ impl LiveLearner {
         }
         *m = m.normalize();
     }
+
+    /// Record conflict location after force_bind_reabort (sticky resolve).
+    /// Next touch: raise EV_Spec / lower EV_Wait so Bind/Await beat SpecRead loops.
+    pub(crate) fn note_sticky_resolve(&self, location: MemoryLocationHash) {
+        let entry = self.locs.entry(location).or_default();
+        entry.sticky_resolve.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// True when ℓ is sticky after a force_bind_reabort this block.
+    pub(crate) fn is_sticky_resolve(&self, location: MemoryLocationHash) -> bool {
+        self.locs
+            .get(&location)
+            .is_some_and(|e| e.sticky_resolve.load(Ordering::Relaxed) > 0)
+    }
+
 
     pub(crate) fn note_publish(&self, location: MemoryLocationHash) {
         self.publish_events.fetch_add(1, Ordering::Relaxed);

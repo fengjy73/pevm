@@ -730,6 +730,9 @@ pub(crate) struct PartialRetryTable {
     last_jump_applied: DashMap<TxIdx, bool, BuildIdentityHasher>,
     /// M1e: absolute jump disabled after a jumped resume failed validation (anti-livelock).
     jump_disabled: DashMap<TxIdx, (), BuildIdentityHasher>,
+    /// After force_bind_reabort: next Lean execute should open narrow inspect to
+    /// capture live jump_snap (CallEntry/EffectBoundary + Storage FF path).
+    needs_live_capture: DashMap<TxIdx, (), BuildIdentityHasher>,
 }
 
 impl PartialRetryTable {
@@ -745,6 +748,7 @@ impl PartialRetryTable {
             ff_resume: DashMap::default(),
             last_jump_applied: DashMap::default(),
             jump_disabled: DashMap::default(),
+            needs_live_capture: DashMap::default(),
         }
     }
 
@@ -1122,6 +1126,28 @@ impl PartialRetryTable {
             .is_some_and(|v| !v.is_empty())
     }
 
+    /// Sticky resolve: union conflict locations into the armed force_bind set.
+    pub(crate) fn extend_force_bind(
+        &self,
+        tx_idx: TxIdx,
+        locations: &[MemoryLocationHash],
+    ) {
+        if locations.is_empty() {
+            return;
+        }
+        let mut merged = self
+            .force_bind
+            .get(&tx_idx)
+            .map(|v| v.clone())
+            .unwrap_or_default();
+        for &loc in locations {
+            if !merged.contains(&loc) {
+                merged.push(loc);
+            }
+        }
+        self.set_force_bind(tx_idx, merged);
+    }
+
     /// Mark SoftWait wake → next incarnation (for dig wake→validate counters).
     pub(crate) fn mark_post_softwait_wake(&self, tx_idx: TxIdx) {
         self.post_softwait_wake.insert(tx_idx, ());
@@ -1337,6 +1363,36 @@ impl PartialRetryTable {
 
     pub(crate) fn clear_jump_disabled(&self, tx_idx: TxIdx) {
         self.jump_disabled.remove(&tx_idx);
+    }
+
+    /// Mark tx for one Lean inspect capture (live jump_snap) after force_bind_reabort.
+    pub(crate) fn mark_needs_live_capture(&self, tx_idx: TxIdx) {
+        self.needs_live_capture.insert(tx_idx, ());
+    }
+
+    /// Take live-capture prime flag (one-shot per force_bind_reabort).
+    pub(crate) fn take_needs_live_capture(&self, tx_idx: TxIdx) -> bool {
+        self.needs_live_capture.remove(&tx_idx).is_some()
+    }
+
+    pub(crate) fn needs_live_capture(&self, tx_idx: TxIdx) -> bool {
+        self.needs_live_capture.contains_key(&tx_idx)
+    }
+
+    /// True when any write's first effect ordinal is at/after `k_fail` (true failed suffix).
+    /// Writes before `k_fail` that PartialRetry classified as suffix (uncertified) are
+    /// **not** true suffix — RebindOnly may still restore serializability.
+    pub(crate) fn has_true_suffix_writes(
+        &self,
+        tx_idx: TxIdx,
+        k_fail: usize,
+        write_locations: &[MemoryLocationHash],
+    ) -> bool {
+        write_locations.iter().any(|&w| {
+            self.first_k(tx_idx, w)
+                .map(|k| k >= k_fail)
+                .unwrap_or(false)
+        })
     }
 
     pub(crate) fn peek_repair(&self, tx_idx: TxIdx) -> Option<RepairPlan> {
@@ -2222,4 +2278,33 @@ mod abort_cheapening_tests {
             "Lean SuffixRepair must arm RewindTo when mid-tx checkpoint exists"
         );
     }
+    #[test]
+    fn extend_force_bind_merges_conflict_locs_after_suffix_repair() {
+        let table = PartialRetryTable::new(1);
+        table.reset_incarnation(0, 0);
+        let _ = table.push_checkpoint(0, CheckpointKind::CallEntry);
+        let _ = table.note_access(0, 1, AccessMode::Read);
+        table.note_certified(0, 1);
+        let _ = table.push_checkpoint(0, CheckpointKind::EffectBoundary);
+        let _ = table.note_access(0, 2, AccessMode::Read);
+        let repair = table.apply_suffix_repair(0, &[1, 2], &[2], &[]);
+        assert!(matches!(repair, LeanAbortRepair::SuffixRepair { .. }) || matches!(repair, LeanAbortRepair::ForceBind { .. }));
+        assert!(table.has_force_bind(0));
+        table.extend_force_bind(0, &[2, 3]);
+        assert!(table.must_force_bind(0, 2));
+        assert!(table.must_force_bind(0, 3));
+    }
+
+    #[test]
+    fn has_true_suffix_writes_ignores_uncertified_prefix() {
+        let table = PartialRetryTable::new(1);
+        table.reset_incarnation(0, 0);
+        let _ = table.note_access(0, 10, AccessMode::Write); // k=1
+        let _ = table.note_access(0, 20, AccessMode::Read); // k=2 fail
+        assert!(!table.has_true_suffix_writes(0, 2, &[10]), "write before k_fail is not true suffix");
+        let _ = table.note_access(0, 30, AccessMode::Write); // k=3 after fail
+        assert!(table.has_true_suffix_writes(0, 2, &[10, 30]));
+    }
+
+
 }
