@@ -2,7 +2,7 @@
 //!
 //! SoftWait is the **source of truth** for SpecFence scheduling fences.
 //! `RegionTable` location Wait bits and legacy wait-flags are mirrors/facades.
-//! WaveParkTable remains the M2 tx-grain park executor.
+//! WaveParkTable remains the M2/P4 park executor (tx-grain + SoftWait `k` resume intent).
 //!
 //! Evolved from Spec v1 SpecDag; `SpecDag` is a type alias for compatibility.
 
@@ -199,6 +199,58 @@ impl FenceGraph {
         woken
     }
 
+    /// SoftWait `armed_at_k` for `(location, waiter)` if armed.
+    pub(crate) fn soft_wait_k(
+        &self,
+        location: MemoryLocationHash,
+        waiter: TxIdx,
+    ) -> Option<u64> {
+        self.soft_waits.get(&location).and_then(|v| {
+            v.iter()
+                .find(|a| a.waiter == waiter)
+                .map(|a| a.armed_at_k)
+        })
+    }
+
+    /// Like [`wake_on_publish`] but returns full SoftWait arms (includes `armed_at_k`).
+    pub(crate) fn wake_on_publish_arms(
+        &self,
+        location: MemoryLocationHash,
+        writer_t: TxIdx,
+    ) -> Vec<SoftWaitArm> {
+        let mut woken = Vec::new();
+        let mut keep = Vec::new();
+        if let Some(mut v) = self.soft_waits.get_mut(&location) {
+            for a in v.drain(..) {
+                let match_writer = a
+                    .expected_writer
+                    .map(|w| w == writer_t)
+                    .unwrap_or(true);
+                if match_writer && a.waiter > writer_t {
+                    self.arm_started.remove(&a.arm_id);
+                    if !woken.iter().any(|x: &SoftWaitArm| x.waiter == a.waiter) {
+                        woken.push(a);
+                    }
+                } else {
+                    keep.push(a);
+                }
+            }
+            *v = keep;
+        }
+        if self
+            .soft_waits
+            .get(&location)
+            .is_none_or(|v| v.is_empty())
+        {
+            self.soft_waits.remove(&location);
+            self.wait_locations.remove(&location);
+        }
+        if !woken.is_empty() {
+            self.wake_count.fetch_add(woken.len(), Ordering::Relaxed);
+        }
+        woken
+    }
+
     /// Clear SoftWaits armed against `writer` (Publish / finish_execution wake).
     pub(crate) fn clear_for_writer(&self, writer: TxIdx) -> Vec<(MemoryLocationHash, TxIdx)> {
         let mut cleared = Vec::new();
@@ -328,5 +380,17 @@ mod tests {
         assert_eq!(arms.len(), 1);
         assert_eq!(arms[0].waiter, 10);
         assert_eq!(arms[0].armed_at_k, 7);
+        assert_eq!(g.soft_wait_k(3, 10), Some(7));
+    }
+
+    #[test]
+    fn wake_on_publish_arms_preserves_k() {
+        let g = FenceGraph::new();
+        assert!(g.arm_soft(1, 5, 11, Some(2)));
+        let arms = g.wake_on_publish_arms(1, 2);
+        assert_eq!(arms.len(), 1);
+        assert_eq!(arms[0].waiter, 5);
+        assert_eq!(arms[0].armed_at_k, 11);
+        assert!(!g.has_soft_wait(1));
     }
 }

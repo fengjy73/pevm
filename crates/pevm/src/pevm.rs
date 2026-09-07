@@ -507,6 +507,10 @@ impl Pevm {
             wave.wait_park_ns(),
             wave.ready_steal_on_wait(),
         );
+        metrics_inner.set_park_resume_metrics(
+            wave.park_resume_at_k(),
+            wave.park_resume_full_retry(),
+        );
         if self.concurrency_mode == ConcurrencyMode::SpecFence {
             self.hotset.end_block();
             // P1: pack InterBlockPrior from live morph hat + top-ℓ (flip → higher α).
@@ -705,6 +709,11 @@ impl Pevm {
                 vm.record_wait_admission(address);
                 return None;
             }
+            // P4: SoftWait wake may have restored a (t,k) resume intent — arm RewindTo/FF
+            // or FullRetry while the parked incarnation journal is still intact.
+            if let Some(wave) = wave {
+                vm.try_apply_park_resume(tx_version.tx_idx, wave);
+            }
             return match vm.execute(&tx_version, result_slot) {
                 Ok(flags) => {
                     // PublishWrite ≈ incarnation finished: wake location waiters + ready.
@@ -723,16 +732,13 @@ impl Pevm {
                     None
                 }
                 Err(VmExecutionError::Blocking(blocking_tx_idx)) => {
-                    // M2: WaitHard already registered park+location in Vm (SpecFence).
+                    // M2/P4: WaitHard registered park+(location,k) in Vm (SpecFence).
                     // add_dependency parks the tx (Aborting); worker returns to steal.
-                    let park_loc = vm.take_pending_park_location();
+                    let pending = vm.take_pending_park();
+                    let park_loc = pending.map(|p| p.location).unwrap_or(0);
+                    let park_k = pending.map(|p| p.armed_at_k).unwrap_or(0);
                     if let Some(wave) = wave {
-                        if let Some(loc) = park_loc {
-                            wave.park(tx_version.tx_idx, blocking_tx_idx, loc);
-                        } else {
-                            // Blocking without location (lazy/ESTIMATE) — still park by writer.
-                            wave.park(tx_version.tx_idx, blocking_tx_idx, 0);
-                        }
+                        wave.park(tx_version.tx_idx, blocking_tx_idx, park_loc, park_k);
                     }
                     if !scheduler.add_dependency(tx_version.tx_idx, blocking_tx_idx)
                         && self.abort_reason.get().is_none()
@@ -740,8 +746,7 @@ impl Pevm {
                         // Retry the execution immediately if the blocking transaction was
                         // re-executed by the time we can add it as a dependency.
                         if let Some(wave) = wave {
-                            let loc = park_loc.unwrap_or(0);
-                            wave.unpark(tx_version.tx_idx, blocking_tx_idx, loc);
+                            wave.unpark(tx_version.tx_idx, blocking_tx_idx, park_loc);
                         }
                         continue;
                     }

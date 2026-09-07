@@ -1,12 +1,17 @@
-//! Resolution algebra: WaitHard / Bind / SpecRead (SpecFence control law v3).
+//! Resolution algebra: WaitHard / Bind / SpecRead / EarlyAbort (control law v3 + P3).
 //!
-//! v3 (frozen from plant-measured effect RAW) + P0/P1 hooks:
+//! v3 (frozen from plant-measured effect RAW) + P0/P1/P3 hooks:
 //! 1. Bind if producer Data published.
-//! 2. Else if program && (fanout_hint || d large) && !waw_spine_hint: WaitHard+park.
+//! 2. Else if program && (fanout_hint || d large) && !waw_spine_hint: WaitHard+park
+//!    — unless EarlyAbort niche (heavy ∧ d≤D_EARLY ∧ known d ∧ unresolved producer).
 //! 3. Else if handler / short-lag / WAW spine: SpecRead.
-//! 4. EarlyAbort niche (P3): heavy-tx && d small — flagged only; not armed here.
+//! 4. EarlyAbort (P3): cut incarnation at first-cross; rem RewindTo/FullRetry + Blocking.
 //! 5. HotSet / writer counts = fanout_hint only, not a hard Wait gate.
 //! Constants live in [`AdaptiveParams`] (also re-exported as module consts).
+//!
+//! **Depth rule:** EarlyAbort only when `gross_work_depth` is `Some` (known d).
+//! No gas_limit proxy — `used/limit` underestimates true `used/tx_gas_used` and can
+//! false-positive EarlyAbort. LeanOCC (no inspect) keeps WaitHard/SpecRead.
 
 #![allow(dead_code)]
 use crate::{MemoryLocationHash, TxIdx, TxIncarnation, TxVersion};
@@ -22,6 +27,10 @@ pub(crate) enum ResolveAction {
     Bind(TxVersion),
     /// OrderedDirtyRead: last Data `< t` skipping ESTIMATE (else Wait).
     SpecRead,
+    /// P3: cut incarnation at early bad program cross (heavy ∧ d≤D_EARLY).
+    /// VM arms rem RewindTo/FullRetry + Blocking on unresolved producer (hang-free).
+    /// Does **not** SoftWait-arm (alternate fence to WaitHard).
+    EarlyAbort,
 }
 
 /// Context features for π (control law v3 + P1 morph/waw/heavy).
@@ -118,16 +127,19 @@ pub(crate) fn cost_prefers_wait_params(
     p >= params.tau_very_high
 }
 
-/// P3 hook: EarlyAbort candidate (not armed in production yet).
+/// P3: EarlyAbort niche — heavy ∧ program ∧ known d≤D_EARLY ∧ unresolved producer.
+/// Returns false when `gross_work_depth` is None (no guess / no gas_limit proxy).
 #[inline]
 pub(crate) fn early_abort_candidate(ctx: &PolicyCtx) -> bool {
     let d = ctx.gross_work_depth;
     ctx.tx_heavy_hint
         && ctx.is_program
+        && ctx.writer_known
+        && !ctx.writer_done
         && d.map(|x| x <= ctx.params.d_early).unwrap_or(false)
 }
 
-/// Control law v3 π: Bind → WaitHard (program fanout / late d, !waw) → SpecRead.
+/// Control law v3 π: Bind → WaitHard|EarlyAbort (program fanout / late d, !waw) → SpecRead.
 /// HotSet is `fanout_hint` only. Handler / WAW-spine paths prefer SpecRead.
 pub(crate) fn choose_action(ctx: PolicyCtx) -> ResolveAction {
     let params = ctx.params;
@@ -152,13 +164,12 @@ pub(crate) fn choose_action(ctx: PolicyCtx) -> ResolveAction {
         && !ctx.waw_spine_hint
         && (ctx.fanout_hint || d_large || ctx.posterior_conflict >= params.tau_very_high);
 
-    // 2. Program + (fanout / late d / very-high P) ∧ !waw_spine → WaitHard+park.
+    // 2. Program + (fanout / late d / very-high P) ∧ !waw_spine → WaitHard+park
+    //    or EarlyAbort (P3 heavy ∧ known d≤D_EARLY).
     if want_wait {
-        // P3 EarlyAbort niche: heavy ∧ d≤D_EARLY ∧ program — flag only (no production arm).
-        let _early = early_abort_candidate(&ctx);
-        let _ = _early;
-        // TODO(P3): when rem/PartialRetry EarlyAbort is hang-free, return EarlyAbort here
-        // instead of WaitHard for the heavy-early minority.
+        if early_abort_candidate(&ctx) {
+            return ResolveAction::EarlyAbort;
+        }
         return ResolveAction::WaitHard;
     }
 
@@ -357,13 +368,47 @@ mod tests {
     }
 
     #[test]
-    fn early_abort_candidate_flagged_not_armed() {
+    fn early_abort_candidate_arms_early_abort() {
         let mut c = ctx_v3(0.3, true, false, None, false, true, true, Some(0.10));
         c.tx_heavy_hint = true;
         assert!(early_abort_candidate(&c));
-        // Production still WaitHard (P3 not armed).
+        assert_eq!(choose_action(c), ResolveAction::EarlyAbort);
+    }
+
+    #[test]
+    fn early_abort_requires_known_depth() {
+        // No inspect → d=None → never EarlyAbort (keep WaitHard).
+        let mut c = ctx_v3(0.3, true, false, None, false, true, true, None);
+        c.tx_heavy_hint = true;
+        assert!(!early_abort_candidate(&c));
         assert_eq!(choose_action(c), ResolveAction::WaitHard);
     }
+
+    #[test]
+    fn early_abort_not_when_late_depth() {
+        let mut c = ctx_v3(0.3, true, false, None, false, true, true, Some(0.90));
+        c.tx_heavy_hint = true;
+        assert!(!early_abort_candidate(&c));
+        assert_eq!(choose_action(c), ResolveAction::WaitHard);
+    }
+
+    #[test]
+    fn early_abort_not_when_not_heavy() {
+        let mut c = ctx_v3(0.3, true, false, None, false, true, true, Some(0.10));
+        c.tx_heavy_hint = false;
+        assert!(!early_abort_candidate(&c));
+        assert_eq!(choose_action(c), ResolveAction::WaitHard);
+    }
+
+    #[test]
+    fn early_abort_not_when_writer_done() {
+        let mut c = ctx_v3(0.3, true, true, None, false, true, true, Some(0.10));
+        c.tx_heavy_hint = true;
+        // writer_done → not EarlyAbort niche (producer resolved).
+        assert!(!early_abort_candidate(&c));
+        assert_ne!(choose_action(c), ResolveAction::EarlyAbort);
+    }
+
 
     #[test]
     fn morph_quiet_does_not_force_wait() {

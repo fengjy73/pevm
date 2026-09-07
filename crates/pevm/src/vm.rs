@@ -311,9 +311,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.specfence.metrics.mark_hot(address);
     }
 
-    /// SpecFence π at location granularity: WaitHard / Bind / SpecRead.
+    /// SpecFence π at location granularity: WaitHard / Bind / SpecRead / EarlyAbort.
     /// PCC keeps sticky Wait. Beneficiary never waits.
     /// P2: force Bind/WaitHard on certified-prefix locations after PartialRetry.
+    /// P3: EarlyAbort cuts incarnation (rem RewindTo/FullRetry) + Blocking (hang-free);
+    ///     only when π saw known d (LeanOCC passes None → never EarlyAbort).
     fn maybe_wait(
         &self,
         address: Address,
@@ -478,8 +480,8 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     && !self.specfence.scheduler.is_done(prev)
                 {
                     self.specfence.metrics.record_wait(address);
-                    // P2: FenceGraph SoftWait is source of truth (k=effect ordinal best-effort).
-                    let k = self.specfence.rem.effect_ordinal_hint();
+                    // P2/P4: FenceGraph SoftWait SoT; k = per-tx PartialRetry ordinal.
+                    let k = self.specfence.partial_retry.current_k(self.tx_idx) as u64;
                     if self.specfence.dag.arm_soft(
                         location_hash,
                         self.tx_idx,
@@ -492,7 +494,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     let _ = self.mv_memory.regions.promote_location(location_hash);
                     self.specfence
                         .wave
-                        .set_pending_park_location(location_hash);
+                        .set_pending_park(location_hash, k);
                     return Err(ReadError::Blocking(prev));
                 }
                 // Cold-start: skip WaitHard when posterior is cold.
@@ -531,7 +533,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 if !self.specfence.scheduler.is_done(v.tx_idx) {
                     self.specfence.metrics.record_wait_hard();
                     self.specfence.metrics.record_wait(address);
-                    let k = self.specfence.rem.effect_ordinal_hint();
+                    let k = self.specfence.partial_retry.current_k(self.tx_idx) as u64;
                     if self.specfence.dag.arm_soft(
                         location_hash,
                         self.tx_idx,
@@ -542,7 +544,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     }
                     self.specfence
                         .wave
-                        .set_pending_park_location(location_hash);
+                        .set_pending_park(location_hash, k);
                     return Err(ReadError::Blocking(v.tx_idx));
                 }
                 self.specfence.dag.note_hard_edge();
@@ -556,6 +558,72 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 // inspect_run is driving; else lite effect-ordinal snap.
                 note_pending_effect_boundary(self.tx_idx, self.specfence.partial_retry);
                 Ok(())
+            }
+            ResolveAction::EarlyAbort => {
+                // P3: cut incarnation at early heavy program cross instead of WaitHard.
+                // Hang-free: Blocking(writer) via add_dependency (same as WaitHard park),
+                // but do **not** SoftWait-arm (EarlyAbort ≠ WaitHard fence; P4 SoftWait
+                // (t,k) park stays independent). Rem RewindTo/FullRetry + force_bind for
+                // the next incarnation.
+                // early_abort_count already recorded in choose_resolve.
+                // Learn conflict densify (same family as validate-fail / EarlyVal miss).
+                if self
+                    .specfence
+                    .bayes
+                    .observe_conflict_location(location_hash)
+                {
+                    self.specfence.metrics.record_bayes_conflict();
+                }
+                self.specfence.hotset.note_abort(location_hash);
+                self.specfence.learner.note_abort(location_hash, 1);
+                self.specfence.promote_from_bayes(
+                    &self.mv_memory.regions,
+                    location_hash,
+                    Some(address),
+                );
+
+                // Certified prefix from this incarnation (origins still valid) + prior force_bind.
+                let mut certified = self
+                    .specfence
+                    .partial_retry
+                    .force_bind_locations(self.tx_idx);
+                for loc in self.read_set.keys() {
+                    if *loc != location_hash
+                        && !certified.contains(loc)
+                        && self.mv_memory.origins_still_valid(
+                            self.tx_idx,
+                            *loc,
+                            self.read_set.get(loc).unwrap(),
+                        )
+                    {
+                        certified.push(*loc);
+                    }
+                }
+                // Note the fail observe so rem has first_k for RewindTo tip.
+                let _ = self.specfence.partial_retry.note_access(
+                    self.tx_idx,
+                    location_hash,
+                    AccessMode::Read,
+                );
+                self.specfence.partial_retry.arm_early_abort(
+                    self.tx_idx,
+                    location_hash,
+                    certified,
+                );
+                self.specfence.metrics.record_partial_retry();
+
+                if let Some(prev) = writer
+                    && !self.specfence.scheduler.is_done(prev)
+                {
+                    self.specfence.metrics.record_wait(address);
+                    // Park tracking for M2 steal — no FenceGraph SoftWait arm.
+                    self.specfence
+                        .wave
+                        .set_pending_park_location(location_hash);
+                    return Err(ReadError::Blocking(prev));
+                }
+                // Writer raced to done — do not SpecRead the stale cross; retry incarnation.
+                Err(ReadError::InconsistentRead)
             }
             ResolveAction::SpecRead => {
                 self.specfence.metrics.record_spec_read();
@@ -1258,9 +1326,42 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         None
     }
 
+    /// SpecFence M2/P4: location + SoftWait `k` of WaitHard that returned Blocking.
+    pub(crate) fn take_pending_park(
+        &self,
+    ) -> Option<crate::specfence::PendingPark> {
+        self.specfence.wave.take_pending_park()
+    }
+
     /// SpecFence M2: location of WaitHard that returned Blocking (if any).
     pub(crate) fn take_pending_park_location(&self) -> Option<crate::MemoryLocationHash> {
-        self.specfence.wave.take_pending_park_location()
+        self.take_pending_park().map(|p| p.location)
+    }
+
+    /// P4: apply SoftWait park resume intent before re-execute (journal still parked).
+    ///
+    /// Arms RewindTo/FF when a checkpoint exists before SoftWait `k`; else FullRetry.
+    pub(crate) fn try_apply_park_resume(
+        &self,
+        tx_idx: crate::TxIdx,
+        wave: &crate::specfence::WaveParkTable,
+    ) {
+        let Some(intent) = wave.take_resume_intent(tx_idx) else {
+            return;
+        };
+        let kind = self
+            .specfence
+            .partial_retry
+            .try_arm_park_resume_at_k(tx_idx, intent.armed_at_k);
+        match kind {
+            crate::specfence::ParkResumeKind::ResumeAtK { .. } => {
+                wave.note_park_resume_at_k();
+                self.specfence.metrics.record_rewind_to_cp();
+            }
+            crate::specfence::ParkResumeKind::FullRetry => {
+                wave.note_park_resume_full_retry();
+            }
+        }
     }
 
     pub(crate) fn record_wait_admission(&self, address: Address) {

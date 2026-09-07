@@ -19,13 +19,16 @@
 //! M1l: lighter inspect step + multi-SSTORE at higher width; warm valued SC gas_limit-match; valued+write CALL-boundary jump.
 //! suffix-only InvalidateSelective when safe.
 //! M2: WaitHard parks (tx-level) + ready-queue steal (lower TxIdx first); worker never spins.
+//! P4: SoftWait `(t,k)` park data plane — wake restores resume intent; RewindTo/FF when cp
+//! exists before `k`, else tx-grain FullRetry. No live Interpreter mid-tx park.
 //! M3: online WŜ/RŜ prior → Bind-before-touch on first incarnation when writer version known.
 //! M4 (superseded by Adaptive CC R1): lean thresholds that never fired on mainnet.
-//! Adaptive CC R0–R2 + control law v3 + P0/P1/P2:
+//! Adaptive CC R0–R2 + control law v3 + P0/P1/P2/P3:
 //! HotSet = fanout/tracking **hint** only (no WaitHard gate).
 //! Account Wait is diagnostic-only on SpecFence (conflict key = MemoryLocation).
 //! FenceGraph SoftWait is source of truth; RegionTable Wait bits are mirrors.
 //! Dual-horizon learner fills PolicyCtx; `choose_action` is the only π choke point.
+//! P3 EarlyAbort: heavy ∧ known d≤D_EARLY ∧ program → cut incarnation (rem + Blocking).
 //! Inspect/jump off unless `SPECFENCE_ENABLE_INSPECT=1`.
 
 use crate::{
@@ -88,14 +91,14 @@ pub use boundary::SpecFenceInspector;
 #[allow(unused_imports)]
 pub(crate) use rem::{
     AccessMode, Checkpoint, CheckpointId, CheckpointKind, EffectOrdinal, FfValue, ParkedWait,
-    PartialRetryPlan, PartialRetryState, RegionAccess, RemTask, RepairPlan, ResumeContinuation,
-    StorageWriteReplay,
+    ParkResumeIntent, ParkResumeKind, PartialRetryPlan, PartialRetryState, PendingPark,
+    RegionAccess, RemTask, RepairPlan, ResumeContinuation, StorageWriteReplay,
 };
-pub(crate) use resolve::{PolicyCtx, ResolveAction, choose_action};
+pub(crate) use resolve::{PolicyCtx, ResolveAction, choose_action, early_abort_candidate};
 #[allow(unused_imports)]
 pub(crate) use resolve::{
-    BindTarget, SelectiveOutcome, C_RETRY, COST_MARGIN, TAU_REVOKE, TAU_S, TAU_VERY_HIGH, TAU_W,
-    cost_prefers_wait, early_val_probability,
+    BindTarget, SelectiveOutcome, C_RETRY, COST_MARGIN, D_EARLY, D_WAIT, TAU_REVOKE, TAU_S,
+    TAU_VERY_HIGH, TAU_W, cost_prefers_wait, early_val_probability,
 };
 
 /// Selectable concurrency control for parallel block execution.
@@ -331,6 +334,18 @@ impl<'a> SpecFenceCtx<'a> {
                 } else {
                     self.metrics.record_cost_chose_wait_handler();
                 }
+                self.bayes.note_cost_decision_posterior(posterior_conflict, true);
+            }
+            ResolveAction::EarlyAbort => {
+                // EarlyAbort is a WaitHard niche cut — count as wait-side cost choice
+                // plus dedicated early_abort counter.
+                self.metrics.record_cost_chose_wait();
+                if is_program {
+                    self.metrics.record_cost_chose_wait_program();
+                } else {
+                    self.metrics.record_cost_chose_wait_handler();
+                }
+                self.metrics.record_early_abort();
                 self.bayes.note_cost_decision_posterior(posterior_conflict, true);
             }
             ResolveAction::SpecRead => {

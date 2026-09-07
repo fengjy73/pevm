@@ -3,6 +3,7 @@
 //! Phase-1 still drives one interpreter session per incarnation (`RunTx`), but
 //! must emit region events and expose per-location validate semantics.
 //!
+//! P3: EarlyAbort arms RewindTo/FullRetry + force-bind via [`PartialRetryTable::arm_early_abort`].
 //! P2: semantic PartialRetry — revm re-executes from start, but π forces
 //! Bind/WaitHard on the previously certified-prefix locations, and only
 //! failed-suffix writes are selectively invalidated (no global aborted stamp).
@@ -18,8 +19,10 @@
 //! when a boundary snapshot is available; must NOT count as `evm_entries`.
 //!
 //! M2 (plant v2): `WaveParkTable` parks WaitHard at **tx grain** (Block-STM
-//! Blocking style) and steals from a lower-TxIdx-first ready deque. Live
-//! mid-effect Interpreter park is out of scope.
+//! Blocking style) and steals from a lower-TxIdx-first ready deque.
+//! P4: park entries carry SoftWait `armed_at_k`; wake restores resume intent;
+//! safe subset arms RewindTo/FF when a checkpoint exists before `k`, else
+//! FullRetry. Live mid-effect Interpreter park remains out of scope.
 
 #![allow(dead_code)]
 use std::cmp::Reverse;
@@ -729,6 +732,83 @@ impl PartialRetryTable {
         );
     }
 
+    /// P4 SoftWait wake: try hang-free resume at armed observe `k`.
+    ///
+    /// **Safe subset:** if a checkpoint with `0 < cp.k < armed_at_k` exists in the
+    /// parked incarnation journal, arm existing RewindTo + journal FF (no new
+    /// live-Interpreter park). Otherwise return [`ParkResumeKind::FullRetry`]
+    /// (tx-grain head reexec — M2 behaviour). Absolute PC jump remains gated by
+    /// M1e/M1l safety on the resume path — this only arms journal FF + force-bind.
+    pub(crate) fn try_arm_park_resume_at_k(
+        &self,
+        tx_idx: TxIdx,
+        armed_at_k: u64,
+    ) -> ParkResumeKind {
+        let k_fail = armed_at_k as usize;
+        if k_fail == 0 {
+            self.repair.insert(tx_idx, RepairPlan::FullRestart);
+            return ParkResumeKind::FullRetry;
+        }
+        let Some(cp) = self.last_checkpoint_before(tx_idx, k_fail) else {
+            self.repair.insert(tx_idx, RepairPlan::FullRestart);
+            return ParkResumeKind::FullRetry;
+        };
+        // Require real mid-tx progress — synthetic CallEntry at k=0 alone is FullRetry.
+        if cp.k == 0 || cp.k >= k_fail {
+            self.repair.insert(tx_idx, RepairPlan::FullRestart);
+            return ParkResumeKind::FullRetry;
+        }
+
+        let st = self.states[tx_idx].lock().unwrap();
+        let mut certified: Vec<MemoryLocationHash> = st
+            .certified
+            .iter()
+            .copied()
+            .filter(|loc| st.first_k(*loc).unwrap_or(usize::MAX) <= cp.k)
+            .collect();
+        for access in &st.journal {
+            if access.k <= cp.k
+                && matches!(access.mode, AccessMode::Read)
+                && !certified.contains(&access.location)
+            {
+                certified.push(access.location);
+            }
+        }
+        if certified.is_empty() {
+            drop(st);
+            self.repair.insert(tx_idx, RepairPlan::FullRestart);
+            return ParkResumeKind::FullRetry;
+        }
+        let mut suffix_writes = Vec::new();
+        let mut prefix_writes = Vec::new();
+        for access in &st.journal {
+            if !matches!(access.mode, AccessMode::Write) {
+                continue;
+            }
+            if access.k <= cp.k {
+                if !prefix_writes.contains(&access.location) {
+                    prefix_writes.push(access.location);
+                }
+            } else if !suffix_writes.contains(&access.location) {
+                suffix_writes.push(access.location);
+            }
+        }
+        drop(st);
+
+        self.arm_rewind_to(
+            tx_idx,
+            cp,
+            k_fail,
+            certified.clone(),
+            suffix_writes,
+            prefix_writes,
+        );
+        self.set_force_bind(tx_idx, certified);
+        ParkResumeKind::ResumeAtK {
+            checkpoint_k: cp.k,
+        }
+    }
+
     /// After `reset_incarnation`, replay FF continuation into the fresh journal.
     /// Returns effects replayed (0 if none).
     pub(crate) fn replay_ff_if_armed(&self, tx_idx: TxIdx) -> usize {
@@ -904,6 +984,42 @@ impl PartialRetryTable {
 
     pub(crate) fn clear_force_bind(&self, tx_idx: TxIdx) {
         self.force_bind.remove(&tx_idx);
+    }
+
+    /// P3 EarlyAbort: arm rem repair for the next incarnation after cutting at `fail_location`.
+    ///
+    /// Mirrors EarlyVal-fail path: RewindTo + journal FF when a checkpoint exists,
+    /// else FullRestart; always `set_force_bind` on the certified prefix so the
+    /// reincarnation Bind/WaitHards instead of SpecReading the same early cross.
+    /// Hang-freedom is the caller's Blocking(writer) — this only arms rem state.
+    pub(crate) fn arm_early_abort(
+        &self,
+        tx_idx: TxIdx,
+        fail_location: MemoryLocationHash,
+        certified: Vec<MemoryLocationHash>,
+    ) {
+        let k_fail = self
+            .first_k(tx_idx, fail_location)
+            .unwrap_or_else(|| self.current_k(tx_idx));
+        let cp = self.last_checkpoint_before(tx_idx, k_fail).unwrap_or(CheckpointId {
+            tx_idx,
+            incarnation: 0,
+            k: 0,
+        });
+        if cp.k > 0 {
+            self.arm_rewind_to(
+                tx_idx,
+                cp,
+                k_fail,
+                certified.clone(),
+                Vec::new(),
+                Vec::new(),
+            );
+        } else {
+            // No certified checkpoint → FullRestart from tx head on next incarnation.
+            self.set_repair(tx_idx, RepairPlan::FullRestart);
+        }
+        self.set_force_bind(tx_idx, certified);
     }
 
     pub(crate) fn set_repair(&self, tx_idx: TxIdx, plan: RepairPlan) {
@@ -1103,26 +1219,60 @@ impl EffectOrdinal {
 thread_local! {
     /// Set when this worker just parked a WaitHard; next successful ready steal counts.
     static STEAL_AFTER_PARK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Location of the in-flight WaitHard Blocking about to be confirmed in pevm.
-    static PENDING_PARK_LOC: std::cell::Cell<Option<MemoryLocationHash>> =
+    /// Location + SoftWait `k` of the in-flight WaitHard Blocking about to be confirmed in pevm.
+    static PENDING_PARK: std::cell::Cell<Option<PendingPark>> =
         const { std::cell::Cell::new(None) };
 }
 
-/// One WaitHard park entry (tx-level continuation — not mid-effect Interpreter).
+/// How SoftWait wake should resume the waiter incarnation.
+///
+/// Hang-free subset (P4): never live-park the Interpreter. Either arm existing
+/// RewindTo/FF when a real checkpoint exists before armed `k`, or fall back to
+/// tx-grain FullRetry (head reexec) — same as M2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParkResumeKind {
+    /// Checkpoint `checkpoint_k` with `0 < checkpoint_k < armed_at_k` — arm RewindTo+FF.
+    ResumeAtK { checkpoint_k: usize },
+    /// No safe mid-tx continuation — reexec from tx head.
+    FullRetry,
+}
+
+/// Intent restored on SoftWait wake: resume waiter at SoftWait `armed_at_k` if safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ParkResumeIntent {
+    pub waiter: TxIdx,
+    pub armed_at_k: u64,
+    pub location: MemoryLocationHash,
+}
+
+/// One WaitHard park entry. Carries SoftWait `(t,k)` for P4 wake resume intent.
+///
+/// Still **not** a live mid-effect Interpreter continuation — PEVM tasks remain
+/// whole-tx; `armed_at_k` records where SoftWait armed so wake can try RewindTo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ParkedWait {
     pub waiter: TxIdx,
     pub writer: TxIdx,
     pub location: MemoryLocationHash,
+    /// SoftWait observe ordinal (per-tx PartialRetry `k`, else 0).
+    pub armed_at_k: u64,
 }
 
-/// M2 wave ready-queue + WaitHard park table.
+/// Pending WaitHard park location + SoftWait `k` (thread-local until pevm parks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PendingPark {
+    pub location: MemoryLocationHash,
+    pub armed_at_k: u64,
+}
+
+/// M2/P4 wave ready-queue + WaitHard park table.
 ///
 /// **Grain (honest):** PEVM tasks are still whole-tx. Park = Block-STM
 /// `Aborting` + dependency (`add_dependency`); wake = `ReadyToExecute` +
-/// incarnation++ (resume from tx head or M1 RewindTo force-bind). The rayon
-/// worker never spins inside WaitHard — it returns to `next_task` / steals.
-/// Mid-effect live Interpreter park is not implemented.
+/// incarnation++. P4 stores SoftWait `armed_at_k` on the park entry and restores
+/// a [`ParkResumeIntent`] so the next incarnation can arm RewindTo/FF when a
+/// checkpoint exists; otherwise FullRetry from tx head (M2 behaviour).
+/// Mid-effect live Interpreter park is **not** implemented (M1k/M1l hang lessons).
 #[derive(Debug, Default)]
 pub(crate) struct WaveParkTable {
     /// Min-heap: lower `TxIdx` first (frozen choice §8.3).
@@ -1134,11 +1284,17 @@ pub(crate) struct WaveParkTable {
     waiters_by_writer: DashMap<TxIdx, Vec<ParkedWait>, BuildIdentityHasher>,
     /// Best-effort park start for `wait_park_ns`.
     park_started: DashMap<TxIdx, Instant, BuildIdentityHasher>,
+    /// SoftWait wake resume intents consumed before the next `Vm::execute`.
+    resume_intents: DashMap<TxIdx, ParkResumeIntent, BuildIdentityHasher>,
     wait_park_count: AtomicUsize,
     wait_park_ns: AtomicU64,
     ready_steal_on_wait: AtomicUsize,
     wave_width_sum: AtomicU64,
     wave_width_samples: AtomicUsize,
+    /// P4: wakes that armed RewindTo at checkpoint before SoftWait `k`.
+    park_resume_at_k: AtomicUsize,
+    /// P4: wakes that fell back to tx-grain FullRetry.
+    park_resume_full_retry: AtomicUsize,
 }
 
 impl WaveParkTable {
@@ -1146,13 +1302,27 @@ impl WaveParkTable {
         Self::default()
     }
 
-    /// Record location for the WaitHard that is about to return `Blocking`.
+    /// Record location + SoftWait `k` for the WaitHard about to return `Blocking`.
+    pub(crate) fn set_pending_park(&self, location: MemoryLocationHash, armed_at_k: u64) {
+        PENDING_PARK.with(|c| {
+            c.set(Some(PendingPark {
+                location,
+                armed_at_k,
+            }))
+        });
+    }
+
+    /// Backward-compatible: pending park with `k=0` (tx-grain FullRetry on wake).
     pub(crate) fn set_pending_park_location(&self, location: MemoryLocationHash) {
-        PENDING_PARK_LOC.with(|c| c.set(Some(location)));
+        self.set_pending_park(location, 0);
+    }
+
+    pub(crate) fn take_pending_park(&self) -> Option<PendingPark> {
+        PENDING_PARK.with(|c| c.take())
     }
 
     pub(crate) fn take_pending_park_location(&self) -> Option<MemoryLocationHash> {
-        PENDING_PARK_LOC.with(|c| c.take())
+        self.take_pending_park().map(|p| p.location)
     }
 
     fn sample_wave_width_locked(&self, depth: usize) {
@@ -1161,17 +1331,19 @@ impl WaveParkTable {
         self.wave_width_samples.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Park a WaitHard waiter; worker must then steal (not spin).
+    /// Park a WaitHard waiter at SoftWait `(t,k)`; worker must then steal (not spin).
     pub(crate) fn park(
         &self,
         waiter: TxIdx,
         writer: TxIdx,
         location: MemoryLocationHash,
+        armed_at_k: u64,
     ) {
         let entry = ParkedWait {
             waiter,
             writer,
             location,
+            armed_at_k,
         };
         self.waiters_by_loc
             .entry(location)
@@ -1197,7 +1369,44 @@ impl WaveParkTable {
             v.retain(|p| p.waiter != waiter);
         }
         self.park_started.remove(&waiter);
+        self.resume_intents.remove(&waiter);
         STEAL_AFTER_PARK.with(|c| c.set(false));
+    }
+
+    fn record_resume_intent(&self, p: &ParkedWait) {
+        self.resume_intents.insert(
+            p.waiter,
+            ParkResumeIntent {
+                waiter: p.waiter,
+                armed_at_k: p.armed_at_k,
+                location: p.location,
+            },
+        );
+    }
+
+    /// Consume SoftWait wake resume intent (call before next `Vm::execute`).
+    pub(crate) fn take_resume_intent(&self, waiter: TxIdx) -> Option<ParkResumeIntent> {
+        self.resume_intents.remove(&waiter).map(|(_, v)| v)
+    }
+
+    pub(crate) fn peek_resume_intent(&self, waiter: TxIdx) -> Option<ParkResumeIntent> {
+        self.resume_intents.get(&waiter).map(|v| *v)
+    }
+
+    pub(crate) fn note_park_resume_at_k(&self) {
+        self.park_resume_at_k.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_park_resume_full_retry(&self) {
+        self.park_resume_full_retry.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn park_resume_at_k(&self) -> usize {
+        self.park_resume_at_k.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn park_resume_full_retry(&self) -> usize {
+        self.park_resume_full_retry.load(Ordering::Relaxed)
     }
 
     /// Push a ready continuation; priority = lower TxIdx first.
@@ -1237,6 +1446,14 @@ impl WaveParkTable {
     /// Call after scheduler has set waiters to `ReadyToExecute` (dependents drain)
     /// or in addition when location publish is known. Accumulates `wait_park_ns`.
     pub(crate) fn wake_writer_done(&self, writer: TxIdx) -> Vec<TxIdx> {
+        self.wake_writer_done_intents(writer)
+            .into_iter()
+            .map(|i| i.waiter)
+            .collect()
+    }
+
+    /// Writer finished: wake parks, restore SoftWait `(t,k)` resume intents, push ready.
+    pub(crate) fn wake_writer_done_intents(&self, writer: TxIdx) -> Vec<ParkResumeIntent> {
         let mut woken = Vec::new();
         if let Some((_, parked)) = self.waiters_by_writer.remove(&writer) {
             for p in parked {
@@ -1244,8 +1461,14 @@ impl WaveParkTable {
                 if let Some(mut v) = self.waiters_by_loc.get_mut(&p.location) {
                     v.retain(|x| x.waiter != p.waiter);
                 }
-                if !woken.contains(&p.waiter) {
-                    woken.push(p.waiter);
+                if !woken.iter().any(|i: &ParkResumeIntent| i.waiter == p.waiter) {
+                    self.record_resume_intent(&p);
+                    let intent = ParkResumeIntent {
+                        waiter: p.waiter,
+                        armed_at_k: p.armed_at_k,
+                        location: p.location,
+                    };
+                    woken.push(intent);
                     self.push_ready(p.waiter);
                 }
             }
@@ -1255,6 +1478,17 @@ impl WaveParkTable {
 
     /// PublishWrite wake for location ℓ (same as writer-done for that ℓ's waiters).
     pub(crate) fn wake_location(&self, location: MemoryLocationHash) -> Vec<TxIdx> {
+        self.wake_location_intents(location)
+            .into_iter()
+            .map(|i| i.waiter)
+            .collect()
+    }
+
+    /// Location publish wake with SoftWait `(t,k)` resume intents.
+    pub(crate) fn wake_location_intents(
+        &self,
+        location: MemoryLocationHash,
+    ) -> Vec<ParkResumeIntent> {
         let mut woken = Vec::new();
         if let Some((_, parked)) = self.waiters_by_loc.remove(&location) {
             for p in parked {
@@ -1262,8 +1496,13 @@ impl WaveParkTable {
                 if let Some(mut v) = self.waiters_by_writer.get_mut(&p.writer) {
                     v.retain(|x| x.waiter != p.waiter || x.location != location);
                 }
-                if !woken.contains(&p.waiter) {
-                    woken.push(p.waiter);
+                if !woken.iter().any(|i: &ParkResumeIntent| i.waiter == p.waiter) {
+                    self.record_resume_intent(&p);
+                    woken.push(ParkResumeIntent {
+                        waiter: p.waiter,
+                        armed_at_k: p.armed_at_k,
+                        location: p.location,
+                    });
                     self.push_ready(p.waiter);
                 }
             }
@@ -1344,6 +1583,122 @@ mod m1b_tests {
         assert_eq!(st.checkpoint_count(), cont.checkpoints.len());
         assert!(st.certified_locations().contains(&1));
         assert!(st.certified_locations().contains(&2));
+    }
+}
+
+#[cfg(test)]
+mod p4_tk_park_tests {
+    use super::*;
+
+    #[test]
+    fn park_stores_armed_at_k_and_wake_restores_intent() {
+        let wave = WaveParkTable::new();
+        wave.park(5, 2, 99, 7);
+        assert_eq!(wave.wait_park_count(), 1);
+        let intents = wave.wake_writer_done_intents(2);
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].waiter, 5);
+        assert_eq!(intents[0].armed_at_k, 7);
+        assert_eq!(intents[0].location, 99);
+        let taken = wave.take_resume_intent(5).expect("intent");
+        assert_eq!(taken.armed_at_k, 7);
+        assert!(wave.take_resume_intent(5).is_none());
+        assert_eq!(wave.pop_ready(), Some(5));
+    }
+
+    #[test]
+    fn try_arm_park_resume_falls_back_when_k_zero_or_no_cp() {
+        let table = PartialRetryTable::new(4);
+        table.reset_incarnation(1, 0);
+        // k=0 → FullRetry
+        assert_eq!(
+            table.try_arm_park_resume_at_k(1, 0),
+            ParkResumeKind::FullRetry
+        );
+        // Journaled observe but only synthetic path with no mid-tx cp > 0
+        table.note_access(1, 10, AccessMode::Read);
+        // CallEntry-style cp at k after note would be at current k; push at k=1
+        let _ = table.push_checkpoint(1, CheckpointKind::CallEntry);
+        // armed_at_k == cp.k → need cp.k < armed_at_k; arm at same k → FullRetry
+        assert_eq!(
+            table.try_arm_park_resume_at_k(1, 1),
+            ParkResumeKind::FullRetry
+        );
+    }
+
+    #[test]
+    fn try_arm_park_resume_at_k_when_checkpoint_before_k() {
+        let table = PartialRetryTable::new(4);
+        table.reset_incarnation(2, 0);
+        // Build prefix: reads 1..=3 with cps at k=1 and k=2; SoftWait at k=3.
+        for i in 1..=3 {
+            let loc = i as MemoryLocationHash;
+            table.note_access(2, loc, AccessMode::Read);
+            table.note_certified(2, loc);
+            table.states[2].lock().unwrap().note_value(
+                loc,
+                FfValue::Storage {
+                    address: Address::ZERO,
+                    slot: U256::from(i),
+                    value: U256::from(i),
+                    origin: None,
+                },
+            );
+            if i <= 2 {
+                let _ = table.push_checkpoint(2, CheckpointKind::EffectBoundary);
+            }
+        }
+        assert_eq!(table.current_k(2), 3);
+        let kind = table.try_arm_park_resume_at_k(2, 3);
+        match kind {
+            ParkResumeKind::ResumeAtK { checkpoint_k } => {
+                assert_eq!(checkpoint_k, 2);
+            }
+            other => panic!("expected ResumeAtK, got {other:?}"),
+        }
+        assert!(table.is_rewind_resume(2));
+        assert!(table.must_force_bind(2, 1));
+        assert!(table.must_force_bind(2, 2));
+    }
+
+    #[test]
+    fn pending_park_carries_k() {
+        let wave = WaveParkTable::new();
+        wave.set_pending_park(42, 9);
+        let p = wave.take_pending_park().expect("pending");
+        assert_eq!(p.location, 42);
+        assert_eq!(p.armed_at_k, 9);
+        assert!(wave.take_pending_park().is_none());
+    }
+}
+
+#[cfg(test)]
+mod p3_early_abort_tests {
+    use super::*;
+
+    #[test]
+    fn arm_early_abort_full_restart_without_cp() {
+        let table = PartialRetryTable::new(2);
+        table.reset_incarnation(0, 0);
+        table.note_access(0, 7, AccessMode::Read);
+        table.arm_early_abort(0, 7, vec![1, 2]);
+        assert!(table.must_force_bind(0, 1));
+        assert!(table.must_force_bind(0, 2));
+        // No mid-tx checkpoint → FullRestart repair, not RewindTo.
+        assert!(!table.is_rewind_resume(0));
+    }
+
+    #[test]
+    fn arm_early_abort_rewind_when_checkpoint_exists() {
+        let table = PartialRetryTable::new(2);
+        table.reset_incarnation(0, 0);
+        table.note_access(0, 1, AccessMode::Read);
+        table.note_certified(0, 1);
+        let _ = table.push_checkpoint(0, CheckpointKind::EffectBoundary);
+        table.note_access(0, 9, AccessMode::Read);
+        table.arm_early_abort(0, 9, vec![1]);
+        assert!(table.must_force_bind(0, 1));
+        assert!(table.is_rewind_resume(0));
     }
 }
 

@@ -896,6 +896,67 @@ fn specfence_m2_wait_hard_parks_and_steals() {
     }
 }
 
+/// P4: SoftWait `(t,k)` park data plane — seq≡par; park/resume counters defined.
+/// ResumeAtK only when a mid-tx checkpoint exists; otherwise tx-grain FullRetry.
+#[test]
+fn specfence_p4_tk_park_seq_eq_par_and_metrics() {
+    let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 12, 6);
+    state.insert(Address::ZERO, EvmAccount::default());
+    for i in 0..64 {
+        let (addr, account) = common::mock_account(81_000 + i);
+        state.insert(addr, account);
+        txs.push(self_transfer(addr, 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+
+    let mut pevm = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
+    let chain = PevmEthereum::mainnet();
+    for _ in 0..2 {
+        let _ = pevm
+            .execute_revm_parallel(
+                &chain,
+                &storage,
+                Default::default(),
+                BlockEnv::default(),
+                txs.clone(),
+                concurrency(),
+            )
+            .expect("warm");
+    }
+
+    let sequential = execute_revm_sequential(
+        &chain,
+        &storage,
+        Default::default(),
+        BlockEnv::default(),
+        txs.clone(),
+    )
+    .expect("sequential");
+    let parallel = pevm
+        .execute_revm_parallel(
+            &chain,
+            &storage,
+            Default::default(),
+            BlockEnv::default(),
+            txs,
+            concurrency(),
+        )
+        .expect("parallel");
+    assert_eq!(sequential, parallel, "P4 must preserve sequential equivalence");
+
+    let m = pevm.last_specfence_metrics();
+    // Counters always defined; ResumeAtK is rare on default lean path (often FullRetry).
+    let _ = (m.park_resume_at_k, m.park_resume_full_retry, m.soft_wait_arms);
+    assert!(
+        m.wait_hard_count > 0
+            || m.wait_park_count > 0
+            || m.spec_read_count > 0
+            || m.bind_hits > 0
+            || m.soft_wait_arms > 0,
+        "P4 path should still exercise SpecFence resolve/park: {m:?}"
+    );
+}
+
 /// M1b: RewindTo resume must journal-FF the certified prefix and serve at least
 /// one prefix read from the FF cache (skipping an MV/storage heavy op).
 /// Concrete proof that resume does less DB work than a full head reexec path.

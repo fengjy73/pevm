@@ -155,6 +155,12 @@ pub struct SpecFenceMetrics {
     pub cost_chose_spec_program: usize,
     /// P0: cost π SpecRead on handler locations.
     pub cost_chose_spec_handler: usize,
+    /// P3: EarlyAbort fence arms (cut incarnation at early heavy program cross).
+    pub early_abort_count: usize,
+    /// P4: SoftWait wakes that armed RewindTo/FF at checkpoint before `k`.
+    pub park_resume_at_k: usize,
+    /// P4: SoftWait wakes that fell back to tx-grain FullRetry.
+    pub park_resume_full_retry: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -220,6 +226,9 @@ pub(crate) struct MetricsInner {
     cost_chose_wait_handler: AtomicUsize,
     cost_chose_spec_program: AtomicUsize,
     cost_chose_spec_handler: AtomicUsize,
+    early_abort_count: AtomicUsize,
+    park_resume_at_k: AtomicUsize,
+    park_resume_full_retry: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -381,6 +390,11 @@ impl MetricsInner {
         self.cost_chose_spec_handler.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_early_abort(&self) {
+        self.early_abort_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+
     /// Fresh EVM session / interpreter start from tx head (plant v2 L1 denominator).
     pub(crate) fn record_evm_entry(&self) {
         self.evm_entries.fetch_add(1, Ordering::Relaxed);
@@ -425,7 +439,7 @@ impl MetricsInner {
         self.ready_steal_on_wait.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Copy M2 wave counters from the block's WaveParkTable at snapshot time.
+    /// Copy M2/P4 wave counters from the block's WaveParkTable at snapshot time.
     pub(crate) fn set_wave_metrics(
         &self,
         wait_park_count: usize,
@@ -437,6 +451,17 @@ impl MetricsInner {
         self.wait_park_ns.store(wait_park_ns, Ordering::Relaxed);
         self.ready_steal_on_wait
             .store(ready_steal_on_wait, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_park_resume_metrics(
+        &self,
+        park_resume_at_k: usize,
+        park_resume_full_retry: usize,
+    ) {
+        self.park_resume_at_k
+            .store(park_resume_at_k, Ordering::Relaxed);
+        self.park_resume_full_retry
+            .store(park_resume_full_retry, Ordering::Relaxed);
     }
 
     pub(crate) fn record_journal_ff_entries(&self, n: usize) {
@@ -634,6 +659,9 @@ impl MetricsInner {
             cost_chose_wait_handler: self.cost_chose_wait_handler.load(Ordering::Relaxed),
             cost_chose_spec_program: self.cost_chose_spec_program.load(Ordering::Relaxed),
             cost_chose_spec_handler: self.cost_chose_spec_handler.load(Ordering::Relaxed),
+            early_abort_count: self.early_abort_count.load(Ordering::Relaxed),
+            park_resume_at_k: self.park_resume_at_k.load(Ordering::Relaxed),
+            park_resume_full_retry: self.park_resume_full_retry.load(Ordering::Relaxed),
         }
     }
 }
