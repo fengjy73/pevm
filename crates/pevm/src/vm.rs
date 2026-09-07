@@ -19,7 +19,7 @@ use crate::{
     TxIdx, TxVersion, WriteSet, chain::PevmChain, hash_deterministic, mv_memory::MvMemory,
     specfence::{
         AccessMode, CheckpointKind, FfValue, ResolveAction, SpecFenceCtx, StorageWriteReplay,
-        TAU_VERY_HIGH, early_val_probability, note_pending_effect_boundary,
+        early_val_probability, note_pending_effect_boundary,
         arm_call_outcome_cache, resume_was_applied, steps_this_run, try_arm_safe_absolute_jump,
         with_plant_tls_journal,
     },
@@ -307,6 +307,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if self.mv_memory.regions.promote_location(location) {
             self.specfence.metrics.record_promotion(Some(address));
         }
+        // G5: account promote is PCC/legacy only (SpecFence returned above).
         self.mv_memory.regions.promote_account(address);
         self.specfence.metrics.mark_hot(address);
     }
@@ -315,16 +316,16 @@ impl<'a, S: Storage> VmDb<'a, S> {
     /// PCC keeps sticky Wait. Beneficiary never waits.
     /// P2: force Bind/WaitHard on certified-prefix locations after PartialRetry.
     /// P3: EarlyAbort cuts incarnation (rem RewindTo/FullRetry) + Blocking (hang-free);
-    ///     only when π saw known d (LeanOCC passes None → never EarlyAbort).
+    ///     only when π saw known d (effect-progress / inspect); morph prior ≠ EarlyAbort.
     fn maybe_wait(
         &self,
         address: Address,
         location_hash: MemoryLocationHash,
         is_program: bool,
     ) -> Result<(), ReadError> {
-        if self.specfence.mode == crate::ConcurrencyMode::SpecFence
-            && self.specfence.hotset.contains(location_hash)
-        {
+        // G2: RegionPlant k on **all** SpecFence cold MV R/W — HotSet only densifies
+        // tracking/hints, not plant emission. SoftWait armed_at_k can then be >0 mid-tx.
+        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
             let _ = self.specfence.rem.note_effect();
             self.specfence.partial_retry.note_access(
                 self.tx_idx,
@@ -441,7 +442,23 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 ResolveAction::WaitHard
             }
         } else {
-            let mut a = self.specfence.choose_resolve(
+            // G1: cheap effect-progress depth when prior incarnation finished; else None.
+            // Morph late prior for Wait EV is applied inside choose_action (not here).
+            // EarlyAbort still requires known d — morph prior never supplies it.
+            let gross_work_depth = self
+                .specfence
+                .partial_retry
+                .estimate_effect_depth(self.tx_idx);
+            if let Some(d) = gross_work_depth {
+                self.specfence.learner.note_depth_sample(d);
+            }
+            self.specfence.learner.note_producer_status(
+                location_hash,
+                bind_version.is_some() || writer_done,
+            );
+            // G3: single π choke — no post-choose_action SpecRead→Bind/WaitHard mutate.
+            // (PartialRetry force_prefix Bind/WaitHard above is repair, not π.)
+            self.specfence.choose_resolve(
                 location_hash,
                 &address,
                 writer,
@@ -451,26 +468,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 prior_ws_predicts,
                 is_program,
                 fanout_hint,
-                None, // gross-work depth requires inspect; production default omits
+                gross_work_depth,
                 waw_spine_hint,
                 tx_heavy_hint,
-            );
-            // Safety valve only: escalate SpecRead when P is very high.
-            // (Old EarlyVal@0.35 WaitHard bias removed — cost model owns π.)
-            // M3: also escalate when process/residual WŜ predicts a writer.
-            // M3: if WŜ prior + published Data → Bind before SpecRead.
-            // Keep WaitHard escalate at very-high P only (pre-M3 safety valve).
-            // Residual unfinished writers already flow through cost π / writer_known.
-            if matches!(a, ResolveAction::SpecRead) {
-                if let Some(v) = bind_version.clone() {
-                    if prior_ws_predicts || posterior >= TAU_VERY_HIGH {
-                        a = ResolveAction::Bind(v);
-                    }
-                } else if posterior >= TAU_VERY_HIGH && writer.is_some() {
-                    a = ResolveAction::WaitHard;
-                }
-            }
-            a
+            )
         };
 
         match action {
@@ -521,6 +522,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
             ResolveAction::Bind(v) => {
                 self.specfence.metrics.record_bind_hit();
                 self.specfence.bayes.observe_bind_hit(location_hash);
+                self.specfence.learner.note_bind_success(location_hash);
                 // M3: Bind-before-touch credit when WŜ prior (re-check process map —
                 // may have been learned mid-block) or residual / force-prefix.
                 let prior_now = prior_ws_predicts
@@ -1368,6 +1370,13 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         self.specfence.metrics.record_wait(address);
     }
 
+    /// G4: credit LiveLearner wait_useful for SoftWaits woken on Publish.
+    pub(crate) fn credit_softwait_wakes(&self, fence: &crate::specfence::FenceGraph) {
+        for loc in fence.drain_wake_useful_locs() {
+            self.specfence.learner.note_wait_useful(loc);
+        }
+    }
+
     fn promote_region(&self, location: MemoryLocationHash, address: Option<Address>) {
         // WW contention → intra-block Wait; mild once-per-block Bayes conflict.
         if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
@@ -1390,6 +1399,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             if address == self.specfence.beneficiary {
                 return;
             }
+            // G5: PCC/legacy only (SpecFence returned above).
             self.mv_memory.regions.promote_account(address);
             self.specfence.metrics.mark_hot(address);
         }
@@ -1411,6 +1421,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         if let Some(location) = location {
             self.promote_region(location, Some(address));
         } else {
+            // G5: PCC/legacy only (SpecFence returned above).
             self.mv_memory.regions.promote_account(address);
             self.specfence.metrics.mark_hot(address);
         }
@@ -1801,11 +1812,14 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
 
                 if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
                     for (loc, value) in &write_set {
+                        // G2: plant Write ordinal always (HotSet not required).
                         self.specfence.partial_retry.note_access(
                             tx_version.tx_idx,
                             *loc,
                             AccessMode::Write,
                         );
+                        // G4: Publish → bind prior credit.
+                        self.specfence.learner.note_publish(*loc);
                         let kind = match value {
                             MemoryValue::Basic(_)
                             | MemoryValue::LazySender(_)
@@ -1823,6 +1837,11 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     let _ = self.specfence.partial_retry.push_checkpoint(
                         tx_version.tx_idx,
                         CheckpointKind::CallExit,
+                    );
+                    // G1: persist k + tx_gas_used for next-incarnation effect-depth proxy.
+                    self.specfence.partial_retry.note_incarnation_finish(
+                        tx_version.tx_idx,
+                        exec_result.tx_gas_used(),
                     );
                 }
 

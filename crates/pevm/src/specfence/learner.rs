@@ -54,6 +54,21 @@ impl MorphWeights {
         self.quiet >= 0.45
     }
 
+    /// Fan-out morphology (597-like): late first-cross dominates Wait EV.
+    pub(crate) fn dominant_fan_out(self) -> bool {
+        self.fan_out >= 0.35 && self.fan_out >= self.mixed && self.fan_out >= self.waw_spine
+    }
+
+    /// Morph/class prior substitute for **Wait EV only** when measured d is unknown.
+    /// fan_out-dominant → treat as late (~0.9). Never feed EarlyAbort (needs known d).
+    pub(crate) fn wait_depth_prior(self) -> Option<f64> {
+        if self.dominant_fan_out() {
+            Some(0.9)
+        } else {
+            None
+        }
+    }
+
     /// Symmetric KL-ish distance for flip detection (not a true KL).
     pub(crate) fn divergence(self, other: Self) -> f64 {
         let a = [self.fan_out, self.mixed, self.waw_spine, self.quiet];
@@ -98,6 +113,15 @@ pub(crate) struct AdaptiveParams {
 
 impl Default for AdaptiveParams {
     fn default() -> Self {
+        // L3-authorized choose_action v3 defaults (see lab/results/adaptive-params-l3.json).
+        Self::from_l3()
+    }
+}
+
+impl AdaptiveParams {
+    /// Constants calibrated / authorized by L3 offline EV (`l3-offline-ev.json`).
+    /// Mapping: d_wait←Wait-if-program-fanout d≥0.5; d_early←early-heavy gw~0.11 envelope.
+    pub(crate) const fn from_l3() -> Self {
         Self {
             d_wait: 0.50,
             d_early: 0.15,
@@ -110,6 +134,45 @@ impl Default for AdaptiveParams {
             waw_writer_floor: 8,
             heavy_gas_limit: 200_000,
         }
+    }
+
+    /// Apply optional field overrides (lab JSON / process start). Unknown keys ignored by caller.
+    pub(crate) fn with_overrides(
+        mut self,
+        d_wait: Option<f64>,
+        d_early: Option<f64>,
+        tau_very_high: Option<f64>,
+        c_retry: Option<f64>,
+        cost_margin: Option<f64>,
+        tau_revoke: Option<f64>,
+        waw_writer_floor: Option<usize>,
+        heavy_gas_limit: Option<u64>,
+    ) -> Self {
+        if let Some(v) = d_wait {
+            self.d_wait = v;
+        }
+        if let Some(v) = d_early {
+            self.d_early = v;
+        }
+        if let Some(v) = tau_very_high {
+            self.tau_very_high = v;
+        }
+        if let Some(v) = c_retry {
+            self.c_retry = v;
+        }
+        if let Some(v) = cost_margin {
+            self.cost_margin = v;
+        }
+        if let Some(v) = tau_revoke {
+            self.tau_revoke = v;
+        }
+        if let Some(v) = waw_writer_floor {
+            self.waw_writer_floor = v;
+        }
+        if let Some(v) = heavy_gas_limit {
+            self.heavy_gas_limit = v;
+        }
+        self
     }
 }
 
@@ -193,6 +256,13 @@ struct LocLive {
     aborts: AtomicUsize,
     program_reads: AtomicUsize,
     handler_reads: AtomicUsize,
+    /// Bind success credits (π Bind hit + Publish→bind prior).
+    bind_hits: AtomicUsize,
+    /// SoftWait wake was useful (producer published while waiter armed).
+    wait_useful: AtomicUsize,
+    /// Producer status hist: Data / Running-ish (coarse bits).
+    status_data: AtomicUsize,
+    status_running: AtomicUsize,
 }
 
 /// Intra-block live fanout + morphology posterior (one block).
@@ -204,6 +274,11 @@ pub(crate) struct LiveLearner {
     abort_events: AtomicUsize,
     cascade_sum: AtomicU64,
     publish_events: AtomicUsize,
+    bind_success_total: AtomicUsize,
+    wait_useful_total: AtomicUsize,
+    /// Cheap EMA of measured gross-work / effect-progress depth samples.
+    d_sum_bits: AtomicU64,
+    d_count: AtomicUsize,
     /// Running morph weights (normalized periodically).
     morph_bits: Mutex<MorphWeights>,
 }
@@ -220,6 +295,10 @@ impl LiveLearner {
         self.abort_events.store(0, Ordering::Relaxed);
         self.cascade_sum.store(0, Ordering::Relaxed);
         self.publish_events.store(0, Ordering::Relaxed);
+        self.bind_success_total.store(0, Ordering::Relaxed);
+        self.wait_useful_total.store(0, Ordering::Relaxed);
+        self.d_sum_bits.store(0, Ordering::Relaxed);
+        self.d_count.store(0, Ordering::Relaxed);
         *self.morph_bits.lock().unwrap() = prior_morph.normalize();
     }
 
@@ -276,8 +355,67 @@ impl LiveLearner {
         *m = m.normalize();
     }
 
-    pub(crate) fn note_publish(&self, _location: MemoryLocationHash) {
+    pub(crate) fn note_publish(&self, location: MemoryLocationHash) {
         self.publish_events.fetch_add(1, Ordering::Relaxed);
+        // Publish Data ⇒ Bind would have succeeded — cheap bind-prior credit.
+        let entry = self.locs.entry(location).or_default();
+        entry.bind_hits.fetch_add(1, Ordering::Relaxed);
+        entry.status_data.fetch_add(1, Ordering::Relaxed);
+        self.bind_success_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// π Bind hit credit (symmetric with Bayes observe_bind_hit).
+    pub(crate) fn note_bind_success(&self, location: MemoryLocationHash) {
+        self.bind_success_total.fetch_add(1, Ordering::Relaxed);
+        let entry = self.locs.entry(location).or_default();
+        entry.bind_hits.fetch_add(1, Ordering::Relaxed);
+        entry.status_data.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// SoftWait wake useful: producer published while waiter was armed.
+    pub(crate) fn note_wait_useful(&self, location: MemoryLocationHash) {
+        self.wait_useful_total.fetch_add(1, Ordering::Relaxed);
+        self.locs
+            .entry(location)
+            .or_default()
+            .wait_useful
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Optional status hist at discovery (Data vs still-running producer).
+    pub(crate) fn note_producer_status(&self, location: MemoryLocationHash, data_ready: bool) {
+        let e = self.locs.entry(location).or_default();
+        if data_ready {
+            e.status_data.fetch_add(1, Ordering::Relaxed);
+        } else {
+            e.status_running.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Record measured/proxy depth sample when known (inspect or effect-progress).
+    pub(crate) fn note_depth_sample(&self, d: f64) {
+        let d = d.clamp(0.0, 1.0);
+        // Store as fixed-point × 1e6 for atomic add.
+        let bits = (d * 1_000_000.0) as u64;
+        self.d_sum_bits.fetch_add(bits, Ordering::Relaxed);
+        self.d_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn mean_depth_sample(&self) -> Option<f64> {
+        let n = self.d_count.load(Ordering::Relaxed);
+        if n == 0 {
+            return None;
+        }
+        let sum = self.d_sum_bits.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+        Some(sum / n as f64)
+    }
+
+    pub(crate) fn bind_success_total(&self) -> usize {
+        self.bind_success_total.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn wait_useful_total(&self) -> usize {
+        self.wait_useful_total.load(Ordering::Relaxed)
     }
 
     fn bump_morph_from_observe(&self, is_program: bool, writers: usize, readers: usize) {
@@ -483,5 +621,41 @@ mod tests {
         let alpha = prior.end_block(hat, vec![]);
         assert!((alpha - ALPHA_FLIP).abs() < 1e-9 || alpha >= ALPHA_NORMAL);
         assert!(prior.flip_count() >= 1 || hat.divergence(MorphWeights::default()) <= FLIP_KL);
+    }
+
+    #[test]
+    fn g4_bind_and_wait_useful_and_publish_credit() {
+        let live = LiveLearner::new();
+        live.begin_block(MorphWeights::default());
+        live.note_bind_success(1);
+        live.note_wait_useful(1);
+        live.note_publish(2);
+        live.note_depth_sample(0.9);
+        assert_eq!(live.bind_success_total(), 2); // bind + publish
+        assert_eq!(live.wait_useful_total(), 1);
+        assert!((live.mean_depth_sample().unwrap() - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn g1_fan_out_wait_depth_prior() {
+        let m = MorphWeights {
+            fan_out: 0.55,
+            mixed: 0.25,
+            waw_spine: 0.10,
+            quiet: 0.10,
+        };
+        assert!(m.dominant_fan_out());
+        assert!((m.wait_depth_prior().unwrap() - 0.9).abs() < 1e-9);
+        assert!(MorphWeights::default().wait_depth_prior().is_none());
+    }
+
+    #[test]
+    fn g6_adaptive_params_from_l3() {
+        let p = AdaptiveParams::from_l3();
+        assert!((p.d_wait - 0.50).abs() < f64::EPSILON);
+        assert!((p.d_early - 0.15).abs() < f64::EPSILON);
+        let p2 = p.with_overrides(Some(0.55), None, None, None, None, None, None, None);
+        assert!((p2.d_wait - 0.55).abs() < f64::EPSILON);
+        assert!((p2.d_early - 0.15).abs() < f64::EPSILON);
     }
 }

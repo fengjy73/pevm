@@ -306,16 +306,17 @@ impl<'a> SpecFenceCtx<'a> {
         // M3: residual / process prior makes a published version a Bind placeholder.
         let prior = residual_predicts || prior_ws_predicts;
         let morph_weights = self.learner.morph_weights();
+        // G3: pass published Data version into π even when writer not yet is_done —
+        // choose_action decides Bind via prior_ws / high P / placeholder_ready.
         let ctx = PolicyCtx {
             location,
-            writer_known: writer.is_some(),
+            writer_known: writer.is_some() || bind_version.is_some(),
             writer,
             writer_done,
             posterior_conflict,
             posterior_bind_success: posterior_bind,
             placeholder_ready: prior && (writer_done || bind_version.is_some()),
-            // Bind only against a published writer version.
-            bind_version: if writer_done { bind_version } else { None },
+            bind_version,
             prior_ws_predicts: prior,
             is_program,
             fanout_hint,

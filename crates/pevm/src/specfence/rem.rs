@@ -252,10 +252,15 @@ pub(crate) struct PartialRetryState {
     post_sstore_gases: Vec<u64>,
     /// M1j: LOG* events captured this incarnation for jump-past-LOG replay.
     log_replays: Vec<LogReplay>,
+    /// G1: last completed incarnation's final effect ordinal (survives reset).
+    last_final_k: usize,
+    /// G1: last completed incarnation's tx_gas_used (survives reset; for docs / future).
+    last_tx_gas_used: u64,
 }
 
 impl PartialRetryState {
     pub(crate) fn reset(&mut self, incarnation: TxIncarnation) {
+        // Preserve last_final_k / last_tx_gas_used across incarnations (G1 depth proxy).
         self.incarnation = incarnation;
         self.k = 0;
         self.first_k.clear();
@@ -268,6 +273,28 @@ impl PartialRetryState {
         self.write_replays.clear();
         self.post_sstore_gases.clear();
         self.log_replays.clear();
+    }
+
+    /// Record finish of an incarnation for cheap depth proxy on the next try.
+    pub(crate) fn note_incarnation_finish(&mut self, tx_gas_used: u64) {
+        if self.k > 0 {
+            self.last_final_k = self.k;
+        }
+        if tx_gas_used > 0 {
+            self.last_tx_gas_used = tx_gas_used;
+        }
+    }
+
+    /// G1 cheap depth: `current_k / last_final_k` from a prior incarnation.
+    /// Correlated with gross-work when prior finish completed; **not** gas/limit.
+    /// Returns None on first incarnation or empty prior.
+    pub(crate) fn estimate_effect_depth(&self) -> Option<f64> {
+        let prior = self.last_final_k;
+        if prior == 0 {
+            return None;
+        }
+        let cur = self.k.max(1);
+        Some(((cur as f64) / (prior as f64)).clamp(0.0, 1.0))
     }
 
     pub(crate) fn note_access(
@@ -954,6 +981,20 @@ impl PartialRetryTable {
             .get(tx_idx)
             .map(|s| s.lock().unwrap().current_k())
             .unwrap_or(0)
+    }
+
+    /// G1: cheap effect-progress depth proxy for π (None on first incarnation).
+    pub(crate) fn estimate_effect_depth(&self, tx_idx: TxIdx) -> Option<f64> {
+        self.states
+            .get(tx_idx)
+            .and_then(|s| s.lock().unwrap().estimate_effect_depth())
+    }
+
+    /// G1: record finished incarnation gas + k for next-try depth proxy.
+    pub(crate) fn note_incarnation_finish(&self, tx_idx: TxIdx, tx_gas_used: u64) {
+        if let Some(slot) = self.states.get(tx_idx) {
+            slot.lock().unwrap().note_incarnation_finish(tx_gas_used);
+        }
     }
 
     pub(crate) fn first_k(&self, tx_idx: TxIdx, location: MemoryLocationHash) -> Option<usize> {
@@ -1699,6 +1740,34 @@ mod p3_early_abort_tests {
         table.arm_early_abort(0, 9, vec![1]);
         assert!(table.must_force_bind(0, 1));
         assert!(table.is_rewind_resume(0));
+    }
+
+    #[test]
+    fn g1_effect_depth_proxy_survives_reset() {
+        let table = PartialRetryTable::new(2);
+        table.reset_incarnation(0, 0);
+        assert!(table.estimate_effect_depth(0).is_none());
+        for i in 0..10 {
+            table.note_access(0, i as u64, AccessMode::Read);
+        }
+        table.note_incarnation_finish(0, 50_000);
+        table.reset_incarnation(0, 1);
+        // Mid next incarnation at k=3 → d≈0.3
+        table.note_access(0, 100, AccessMode::Read);
+        table.note_access(0, 101, AccessMode::Read);
+        table.note_access(0, 102, AccessMode::Read);
+        let d = table.estimate_effect_depth(0).unwrap();
+        assert!((d - 0.3).abs() < 1e-9, "d={d}");
+    }
+
+    #[test]
+    fn g2_plant_k_advances_without_hotset() {
+        let table = PartialRetryTable::new(1);
+        table.reset_incarnation(0, 0);
+        assert_eq!(table.current_k(0), 0);
+        table.note_access(0, 42, AccessMode::Read);
+        table.note_access(0, 43, AccessMode::Write);
+        assert_eq!(table.current_k(0), 2);
     }
 }
 

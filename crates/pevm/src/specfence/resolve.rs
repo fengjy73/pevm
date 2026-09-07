@@ -11,7 +11,13 @@
 //!
 //! **Depth rule:** EarlyAbort only when `gross_work_depth` is `Some` (known d).
 //! No gas_limit proxy — `used/limit` underestimates true `used/tx_gas_used` and can
-//! false-positive EarlyAbort. LeanOCC (no inspect) keeps WaitHard/SpecRead.
+//! false-positive EarlyAbort.
+//!
+//! **G1 depth without v7 inspect tax:**
+//! - Measured/proxy `gross_work_depth` from cheap counters (effect-progress /
+//!   prior-incarnation `k/k_final`, or inspect gas when research on).
+//! - When still unknown: morph prior (`fan_out` → late ≈0.9) feeds **Wait EV only**;
+//!   EarlyAbort still requires known d.
 
 #![allow(dead_code)]
 use crate::{MemoryLocationHash, TxIdx, TxIncarnation, TxVersion};
@@ -51,7 +57,9 @@ pub(crate) struct PolicyCtx {
     pub is_program: bool,
     /// HotSet / high writer-count / live fanout morphology hint — NOT a hard gate.
     pub fanout_hint: bool,
-    /// Gross-work depth d = gas_used_so_far/tx_gas_used when known (inspect/research).
+    /// Known depth only: gross-work `gas_used_so_far/tx_gas_used` (inspect) or
+    /// cheap effect-progress proxy `k/k_final` from a prior incarnation.
+    /// Morph late prior is applied inside `choose_action` for Wait EV — not stored here.
     pub gross_work_depth: Option<f64>,
     /// P1: morphology posterior weights (or summary).
     pub morph_weights: MorphWeights,
@@ -144,8 +152,14 @@ pub(crate) fn early_abort_candidate(ctx: &PolicyCtx) -> bool {
 pub(crate) fn choose_action(ctx: PolicyCtx) -> ResolveAction {
     let params = ctx.params;
     // 1. Bind when a concrete published version is ready.
+    // G3: prior_ws / very-high P Bind escalation lives here (single π choke) —
+    // not as a post-choose_action mutate in vm.rs.
     if let Some(v) = ctx.bind_version.clone() {
-        if ctx.placeholder_ready || ctx.writer_done {
+        if ctx.placeholder_ready
+            || ctx.writer_done
+            || ctx.prior_ws_predicts
+            || ctx.posterior_conflict >= params.tau_very_high
+        {
             return ResolveAction::Bind(v);
         }
     }
@@ -155,9 +169,11 @@ pub(crate) fn choose_action(ctx: PolicyCtx) -> ResolveAction {
         }
     }
 
-    let d = ctx.gross_work_depth;
-    let d_large = d.map(|x| x >= params.d_wait).unwrap_or(false);
-    // Without inspect depth, fanout_hint stands in for "late discovery likely" on hot program locs.
+    // G1: measured/proxy d for EarlyAbort; morph late prior only for Wait EV.
+    let d_measured = ctx.gross_work_depth;
+    let d_for_wait = d_measured.or_else(|| ctx.morph_weights.wait_depth_prior());
+    let d_large = d_for_wait.map(|x| x >= params.d_wait).unwrap_or(false);
+    // Without depth, fanout_hint stands in for "late discovery likely" on hot program locs.
     let want_wait = ctx.is_program
         && ctx.writer_known
         && !ctx.writer_done
@@ -165,7 +181,7 @@ pub(crate) fn choose_action(ctx: PolicyCtx) -> ResolveAction {
         && (ctx.fanout_hint || d_large || ctx.posterior_conflict >= params.tau_very_high);
 
     // 2. Program + (fanout / late d / very-high P) ∧ !waw_spine → WaitHard+park
-    //    or EarlyAbort (P3 heavy ∧ known d≤D_EARLY).
+    //    or EarlyAbort (P3 heavy ∧ known d≤D_EARLY — morph prior does NOT arm EarlyAbort).
     if want_wait {
         if early_abort_candidate(&ctx) {
             return ResolveAction::EarlyAbort;
@@ -420,5 +436,62 @@ mod tests {
             quiet: 0.80,
         };
         assert_eq!(choose_action(c), ResolveAction::SpecRead);
+    }
+
+    #[test]
+    fn g1_morph_fan_out_late_prior_waits_without_measured_d() {
+        // No measured d; fan_out morph → Wait EV treats as late (~0.9).
+        let mut c = ctx_v3(0.2, true, false, None, false, true, false, None);
+        c.morph_weights = MorphWeights {
+            fan_out: 0.55,
+            mixed: 0.25,
+            waw_spine: 0.10,
+            quiet: 0.10,
+        };
+        assert_eq!(choose_action(c.clone()), ResolveAction::WaitHard);
+        // EarlyAbort still requires known d even under fan_out + heavy.
+        c.tx_heavy_hint = true;
+        assert!(!early_abort_candidate(&c));
+        assert_eq!(choose_action(c), ResolveAction::WaitHard);
+    }
+
+    #[test]
+    fn g1_early_abort_still_needs_known_d_not_morph() {
+        let mut c = ctx_v3(0.3, true, false, None, false, true, true, None);
+        c.tx_heavy_hint = true;
+        c.morph_weights = MorphWeights {
+            fan_out: 0.70,
+            mixed: 0.15,
+            waw_spine: 0.05,
+            quiet: 0.10,
+        };
+        assert!(!early_abort_candidate(&c));
+        assert_ne!(choose_action(c.clone()), ResolveAction::EarlyAbort);
+        // Known early d → EarlyAbort.
+        c.gross_work_depth = Some(0.10);
+        assert!(early_abort_candidate(&c));
+        assert_eq!(choose_action(c), ResolveAction::EarlyAbort);
+    }
+
+    #[test]
+    fn g3_prior_ws_or_high_p_bind_inside_pi() {
+        let v = TxVersion {
+            tx_idx: 0,
+            tx_incarnation: 0,
+        };
+        // prior_ws + published version → Bind (no post-π escalate needed).
+        let mut c = ctx_v3(0.2, true, false, Some(v.clone()), false, true, false, None);
+        c.prior_ws_predicts = true;
+        assert_eq!(choose_action(c), ResolveAction::Bind(v.clone()));
+        // very-high P + published version → Bind inside π.
+        let c2 = ctx_v3(0.80, true, false, Some(v.clone()), false, true, false, None);
+        assert_eq!(choose_action(c2), ResolveAction::Bind(v));
+    }
+
+    #[test]
+    fn g3_no_handler_waithard_from_high_p_without_program() {
+        // Handler must SpecRead even with high P (folded π — no vm escalate).
+        let a = choose_action(ctx_v3(0.90, true, false, None, false, false, true, None));
+        assert_eq!(a, ResolveAction::SpecRead);
     }
 }
