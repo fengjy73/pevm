@@ -1086,6 +1086,50 @@ fn try_validate(
         }
     }
 
+    // Iter16: validate-defer / RebindOnly-after-spine — when !true_suffix and a
+    // high-fan Executing spine still owns fail ℓ, park *without* abort/invalidate
+    // so the same incarnation re-validates (then RebindOnly) once Data lands.
+    // SoftWait Soft=0; no Estimate park; no pre-abort Executing drain spin (15b).
+    // Unsafe for true_suffix (published writes may poison higher readers).
+    if !read_set_valid
+        && !true_suffix_flag
+        && specfence.mode == ConcurrencyMode::SpecFence
+        && lean_tx
+        && specfence.engagement.is_storm()
+        && specfence
+            .partial_retry
+            .try_claim_validation_defer(tx_version.tx_idx)
+    {
+        let mut best: Option<(crate::TxIdx, usize)> = None;
+        for &location in &invalid {
+            let w = mv_memory
+                .last_writer_before(location, tx_version.tx_idx)
+                .or_else(|| mv_memory.residual_writer_before(location, tx_version.tx_idx));
+            if let Some(w) = w {
+                if w < tx_version.tx_idx && scheduler.is_executing(w) {
+                    let fan = mv_memory.higher_readers_of(location, w).len();
+                    let take = match best {
+                        None => true,
+                        Some((pw, pf)) => fan > pf || (fan == pf && w > pw),
+                    };
+                    if take {
+                        best = Some((w, fan));
+                    }
+                }
+            }
+        }
+        const FANOUT_VALIDATE_DEFER_FAN: usize = 8;
+        if let Some((w, fan)) = best {
+            if fan >= FANOUT_VALIDATE_DEFER_FAN
+                && scheduler.defer_validation_behind(tx_version.tx_idx, w)
+            {
+                specfence.metrics.record_fanout_validate_defer();
+                // Stay Executed; writer finish re-queues Validation.
+                return None;
+            }
+        }
+    }
+
     let aborted = !read_set_valid && scheduler.try_validation_abort(tx_version);
     if aborted {
         // SpecFence-native Lean resolve: SuffixRepair-first (RewindTo+FF when
@@ -1143,6 +1187,7 @@ fn try_validate(
                 was_force_bind || repair_depth >= 2
             };
             let mut fanout_collapse = false;
+            let mut fanout_absorb = false;
             // Iter12d: skip doomed 2nd SuffixRepair when fail-loc writers are
             // ESTIMATE/Aborting but an Executing spine writer exists for
             // serial-barrier — prefer one FullRestart behind Data over a
@@ -1179,10 +1224,12 @@ fn try_validate(
                     escalate = true;
                 }
             }
-            // Iter15: collapse fan-out FullRestarts — first-fail true_suffix with
-            // high-fan Executing spine → escalate+serial-barrier immediately.
-            // Skips doomed SuffixRepair→fra→fb_reabort→FR chains on 597-class
-            // program fan-out. SoftWait Soft=0; no sibling park; Estimate park OFF.
+            // Iter16: cheap absorb for first-fail true_suffix + high-fan Executing
+            // spine — SuffixRepair+first_repair_await (no FullRestart) so certified
+            // prefix / RewindTo+FF survive until spine publishes Data.
+            // Reserve Iter15 FullRestart collapse only when fail-loc writers are
+            // Estimate/Aborting *and* an Executing spine exists (doomed resume).
+            // SoftWait Soft=0; no sibling park; Estimate park OFF; no 15b drain.
             if !escalate
                 && !was_force_bind
                 && repair_depth == 0
@@ -1190,6 +1237,8 @@ fn try_validate(
                 && specfence.engagement.is_storm()
             {
                 let mut best_fan = 0usize;
+                let mut has_executing = false;
+                let mut has_estimate_or_aborting = false;
                 for location in &invalid {
                     let w = mv_memory
                         .last_writer_before(*location, tx_version.tx_idx)
@@ -1197,21 +1246,35 @@ fn try_validate(
                             mv_memory.residual_writer_before(*location, tx_version.tx_idx)
                         });
                     if let Some(w) = w {
-                        if w < tx_version.tx_idx && scheduler.is_executing(w) {
+                        if w >= tx_version.tx_idx {
+                            continue;
+                        }
+                        if scheduler.is_executing(w) {
+                            has_executing = true;
                             let fan = mv_memory.higher_readers_of(*location, w).len();
                             if fan > best_fan {
                                 best_fan = fan;
                             }
                         }
+                        if scheduler.is_aborting(w)
+                            || mv_memory.entry_kind_at(*location, w) == "estimate"
+                        {
+                            has_estimate_or_aborting = true;
+                        }
                     }
                 }
-                // HOT_FANOUT_THRESH = 8: absorb high-fan consumers into spine FR+barrier.
-                // 15a: fr↓~½ (SUCCESS). Drain-spin/BO-OR widen falsified (wall↑/599 p90).
-                const FANOUT_FR_COLLAPSE_FAN: usize = 8;
-                if best_fan >= FANOUT_FR_COLLAPSE_FAN {
-                    escalate = true;
-                    fanout_collapse = true;
-                    specfence.metrics.record_fanout_fr_collapse();
+                const FANOUT_ABSORB_FAN: usize = 8;
+                if best_fan >= FANOUT_ABSORB_FAN && has_executing {
+                    if has_estimate_or_aborting {
+                        // Doomed SpecRead-through-ESTIMATE — keep Iter15 FR+barrier.
+                        escalate = true;
+                        fanout_collapse = true;
+                        specfence.metrics.record_fanout_fr_collapse();
+                    } else {
+                        // Executing spine → SuffixRepair+fra; skip sticky (Iter16b).
+                        fanout_absorb = true;
+                        specfence.metrics.record_fanout_absorb();
+                    }
                 }
             }
             let repair = if escalate {
@@ -1241,8 +1304,12 @@ fn try_validate(
             // consumers prefer BO Await; mark live-capture only when write_replays
             // exist (Iter2: Storage+WR path — not bare force_bind 4× inspect).
             if !escalate {
-                for location in &invalid {
-                    specfence.learner.note_sticky_resolve(*location);
+                // Iter16b: fanout_absorb skips sticky — sticky BO Await was the
+                // wall tax when SuffixRepair replaced early FR (N5 med 20.3).
+                if !fanout_absorb {
+                    for location in &invalid {
+                        specfence.learner.note_sticky_resolve(*location);
+                    }
                 }
                 // Iter7: on *second* repair arm (was_force_bind), union fail locs into
                 // force_bind so force_prefix-Awaits them until Validated. First repair

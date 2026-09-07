@@ -318,6 +318,38 @@ impl Scheduler {
     /// `try_execute` the aborted tx (steal-first). Kept for Iter4 clique experiments;
     /// Iter3 production path uses writer-barrier park only.
     #[allow(dead_code)]
+        /// Iter16: validate-defer — park an *Executed* consumer behind an unfinished
+    /// writer without abort/invalidate. On writer finish, wake re-queues Validation
+    /// (same incarnation) so RebindOnly / validate-ok can absorb once Data lands.
+    /// Only safe when caller has no true_suffix writes (poison risk otherwise).
+    /// Returns `false` if the writer is already Executed|Validated (race).
+    pub(crate) fn defer_validation_behind(
+        &self,
+        tx_idx: TxIdx,
+        blocking_tx_idx: TxIdx,
+    ) -> bool {
+        let blocking_tx = index_mutex!(self.transactions_status, blocking_tx_idx);
+        if matches!(
+            blocking_tx.status,
+            IncarnationStatus::Executed | IncarnationStatus::Validated
+        ) {
+            return false;
+        }
+        {
+            let tx = index_mutex!(self.transactions_status, tx_idx);
+            // Must still be Executed (or rare Validated recheck) — not Aborting.
+            if !matches!(
+                tx.status,
+                IncarnationStatus::Executed | IncarnationStatus::Validated
+            ) {
+                return false;
+            }
+        }
+        let mut blocking_dependents = index_mutex!(self.transactions_dependents, blocking_tx_idx);
+        blocking_dependents.push(tx_idx);
+        true
+    }
+
     pub(crate) fn finish_validation_fenced_defer_exec(
         &self,
         tx_version: &TxVersion,
@@ -465,11 +497,25 @@ impl Scheduler {
 
         // Wake after status is Data-ready (`is_done`), still under writer lock so
         // add_dependency cannot lose a waiter between drain and Ready.
+        // Iter16: validate-defer waiters stay Executed|Validated — re-queue
+        // Validation (same incarnation, no reexec / no invalidate). Aborting
+        // dependents still go Ready→reexec (SuffixRepair / FullRestart).
         for tx_idx in drained {
-            self.set_ready_status(tx_idx);
-            self.execution_idx.fetch_min(tx_idx, Ordering::Relaxed);
-            if let Some(wave) = wave {
-                wave.push_ready(tx_idx);
+            let revalidate = {
+                let tx = index_mutex!(self.transactions_status, tx_idx);
+                matches!(
+                    tx.status,
+                    IncarnationStatus::Executed | IncarnationStatus::Validated
+                )
+            };
+            if revalidate {
+                self.validation_idx.fetch_min(tx_idx, Ordering::Relaxed);
+            } else {
+                self.set_ready_status(tx_idx);
+                self.execution_idx.fetch_min(tx_idx, Ordering::Relaxed);
+                if let Some(wave) = wave {
+                    wave.push_ready(tx_idx);
+                }
             }
         }
         // Location-keyed WaitHard parks: wake → ready deque + park_ns.

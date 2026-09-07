@@ -151,3 +151,11 @@ Jump/capture OFF. SoftWait Soft=0.
 Drain-spin / BO-OR Await falsified.
 See `specfence-abc-iter15-status.md`. Iter 16 cause: cheap absorb (validate-defer /
 RebindOnly-after-spine) or hang-free opcode skip — not early FullRestart tax.
+
+### Iter 16 — cheap absorb (wall ≤ Iter14)
+SuffixRepair+fra absorb on Executing-spine fan≥8 **without sticky** (16a sticky
+falsified wall↑); FR collapse only for Estimate/Aborting doomed; validate-defer
+plumbing for !true_suffix (fvd≈0 on 597). Keep Iter12–15. Jump/capture OFF.
+597 N5 med **12.3** SoftWait=0 (≤ Iter14 12.4; ↓ vs Iter15 13.1).
+See `specfence-abc-iter16-status.md`. Iter 17 cause: hang-free opcode skip /
+RebindOnly-after-fra on true_suffix / schedule Await before SpecRead — not sticky-absorb.

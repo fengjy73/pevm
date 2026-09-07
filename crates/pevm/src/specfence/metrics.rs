@@ -210,6 +210,10 @@ pub struct SpecFenceMetrics {
     /// Iter15: first-fail true_suffix + high-fan Executing spine → escalate+barrier
     /// (collapse doomed SuffixRepair→fb_reabort→FullRestart chains).
     pub fanout_fr_collapse: usize,
+    /// Iter16: !true_suffix validate-defer behind Executing spine (RebindOnly-after-spine).
+    pub fanout_validate_defer: usize,
+    /// Iter16: true_suffix SuffixRepair+barrier absorb (no FullRestart) on fan≥8 spine.
+    pub fanout_absorb: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -302,6 +306,8 @@ pub(crate) struct MetricsInner {
     second_repair_await: AtomicUsize,
     first_repair_await: AtomicUsize,
     fanout_fr_collapse: AtomicUsize,
+    fanout_validate_defer: AtomicUsize,
+    fanout_absorb: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -637,6 +643,14 @@ impl MetricsInner {
         self.fanout_fr_collapse.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_fanout_validate_defer(&self) {
+        self.fanout_validate_defer.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_fanout_absorb(&self) {
+        self.fanout_absorb.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_jump_defer(&self) {
         self.jump_defer.fetch_add(1, Ordering::Relaxed);
     }
@@ -867,6 +881,8 @@ impl MetricsInner {
             second_repair_await: self.second_repair_await.load(Ordering::Relaxed),
             first_repair_await: self.first_repair_await.load(Ordering::Relaxed),
             fanout_fr_collapse: self.fanout_fr_collapse.load(Ordering::Relaxed),
+            fanout_validate_defer: self.fanout_validate_defer.load(Ordering::Relaxed),
+            fanout_absorb: self.fanout_absorb.load(Ordering::Relaxed),
         }
     }
 }

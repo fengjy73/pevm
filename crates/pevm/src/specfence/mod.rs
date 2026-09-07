@@ -43,6 +43,11 @@
 //! → escalate+serial-barrier (fr↓; SoftWait Soft=0). Widen storm serial-barrier;
 //! longer true_suffix Validated RebindOnly spin. Pre-abort drain / BO-OR Await
 //! falsified. Keep Iter12–14. Jump/capture OFF. SoftWait Soft ~0.
+//! Iter16: cheap absorb — !true_suffix validate-defer behind Executing spine
+//! (RebindOnly-after-spine, no invalidate); true_suffix SuffixRepair+fra absorb
+//! instead of early FullRestart (FR collapse reserved for Estimate/Aborting
+//! doomed spines). Keep Iter12–15 barrier widen / vs-spin / fra. Jump/capture
+//! OFF. SoftWait Soft ~0. No 15b drain / 15c BO-OR.
 //! Iter8 memory snap retained. Head-FF (Iter5). SoftWait Soft ~0.
 //!
 //! **Learn (C):** Inter morph selects Quiet (598 OCC-lite) vs Storm (597 Await-ready).

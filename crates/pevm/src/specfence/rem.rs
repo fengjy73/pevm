@@ -770,6 +770,8 @@ pub(crate) struct PartialRetryTable {
     serial_barrier_count: Vec<AtomicUsize>,
     /// Iter5: delay fb escalate once when jump_is_safe after serial capture window.
     jump_defer_count: Vec<AtomicUsize>,
+    /// Iter16: validate-defer / RebindOnly-after-spine claims (cap 1/tx/block).
+    validation_defer_count: Vec<AtomicUsize>,
     /// Iter5: certified-prefix FF values retained across escalate FullRestart (DB skip).
     ff_head: DashMap<
         TxIdx,
@@ -808,6 +810,7 @@ impl PartialRetryTable {
             suffix_repair_depth: (0..block_size).map(|_| AtomicUsize::new(0)).collect(),
             serial_barrier_count: (0..block_size).map(|_| AtomicUsize::new(0)).collect(),
             jump_defer_count: (0..block_size).map(|_| AtomicUsize::new(0)).collect(),
+            validation_defer_count: (0..block_size).map(|_| AtomicUsize::new(0)).collect(),
             ff_head: DashMap::default(),
         }
     }
@@ -1395,6 +1398,20 @@ impl PartialRetryTable {
     pub(crate) fn try_claim_jump_defer(&self, tx_idx: TxIdx) -> bool {
         const MAX_DEFER: usize = 1;
         let Some(a) = self.jump_defer_count.get(tx_idx) else {
+            return false;
+        };
+        let cur = a.load(Ordering::Relaxed);
+        if cur >= MAX_DEFER {
+            return false;
+        }
+        a.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// Iter16: claim one validate-defer (RebindOnly-after-spine) per tx/block.
+    pub(crate) fn try_claim_validation_defer(&self, tx_idx: TxIdx) -> bool {
+        const MAX_DEFER: usize = 1;
+        let Some(a) = self.validation_defer_count.get(tx_idx) else {
             return false;
         };
         let cur = a.load(Ordering::Relaxed);
