@@ -468,6 +468,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 prior_ws_predicts,
                 is_program,
                 fanout_hint,
+                live_fanout as f64,
                 gross_work_depth,
                 waw_spine_hint,
                 tx_heavy_hint,
@@ -1370,10 +1371,13 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         self.specfence.metrics.record_wait(address);
     }
 
-    /// G4: credit LiveLearner wait_useful for SoftWaits woken on Publish.
+    /// G4/AEC: credit LiveLearner wait_useful + arm→wake latency for SoftWait wakes.
     pub(crate) fn credit_softwait_wakes(&self, fence: &crate::specfence::FenceGraph) {
         for loc in fence.drain_wake_useful_locs() {
             self.specfence.learner.note_wait_useful(loc);
+        }
+        for (loc, ns) in fence.drain_wake_latencies() {
+            self.specfence.learner.note_wait_latency(loc, ns);
         }
     }
 

@@ -28,7 +28,8 @@
 //! Account Wait is diagnostic-only on SpecFence (conflict key = MemoryLocation).
 //! FenceGraph SoftWait is source of truth; RegionTable Wait bits are mirrors.
 //! Dual-horizon learner fills PolicyCtx; `choose_action` is the only π choke point.
-//! P3 EarlyAbort: heavy ∧ known d≤D_EARLY ∧ program → cut incarnation (rem + Blocking).
+//! P3 EarlyAbort: heavy ∧ known d≤D_EARLY ∧ program ∧ EV_Early wins → cut incarnation.
+//! AEC: `choose_action` = argmin EV (Wait raised by fanout); ties → SpecRead.
 //! Inspect/jump off unless `SPECFENCE_ENABLE_INSPECT=1`.
 
 use crate::{
@@ -97,8 +98,8 @@ pub(crate) use rem::{
 pub(crate) use resolve::{PolicyCtx, ResolveAction, choose_action, early_abort_candidate};
 #[allow(unused_imports)]
 pub(crate) use resolve::{
-    BindTarget, SelectiveOutcome, C_RETRY, COST_MARGIN, D_EARLY, D_WAIT, TAU_REVOKE, TAU_S,
-    TAU_VERY_HIGH, TAU_W, cost_prefers_wait, early_val_probability,
+    BindTarget, EvScores, SelectiveOutcome, C_RETRY, COST_MARGIN, D_EARLY, D_WAIT, TAU_REVOKE,
+    TAU_S, TAU_VERY_HIGH, TAU_W, compute_ev, cost_prefers_wait, early_val_probability,
 };
 
 /// Selectable concurrency control for parallel block execution.
@@ -284,7 +285,7 @@ impl<'a> SpecFenceCtx<'a> {
         }
     }
 
-    /// Choose ResolveAction for a SpecFence location read (cost-aware π).
+    /// Choose ResolveAction for a SpecFence location read (AEC argmin EV).
     pub(crate) fn choose_resolve(
         &self,
         location: crate::MemoryLocationHash,
@@ -296,6 +297,7 @@ impl<'a> SpecFenceCtx<'a> {
         prior_ws_predicts: bool,
         is_program: bool,
         fanout_hint: bool,
+        live_fanout: f64,
         gross_work_depth: Option<f64>,
         waw_spine_hint: bool,
         tx_heavy_hint: bool,
@@ -306,6 +308,9 @@ impl<'a> SpecFenceCtx<'a> {
         // M3: residual / process prior makes a published version a Bind placeholder.
         let prior = residual_predicts || prior_ws_predicts;
         let morph_weights = self.learner.morph_weights();
+        let e_wait_time = self.learner.e_wait_time(location);
+        let e_cascade = self.learner.e_cascade(location);
+        let meta_budget_exceeded = self.learner.meta_budget_exceeded(self.params);
         // G3: pass published Data version into π even when writer not yet is_done —
         // choose_action decides Bind via prior_ws / high P / placeholder_ready.
         let ctx = PolicyCtx {
@@ -320,6 +325,10 @@ impl<'a> SpecFenceCtx<'a> {
             prior_ws_predicts: prior,
             is_program,
             fanout_hint,
+            live_fanout,
+            e_wait_time,
+            e_cascade,
+            meta_budget_exceeded,
             gross_work_depth,
             morph_weights,
             waw_spine_hint,
@@ -330,6 +339,7 @@ impl<'a> SpecFenceCtx<'a> {
         match &action {
             ResolveAction::WaitHard => {
                 self.metrics.record_cost_chose_wait();
+                self.learner.note_meta_op();
                 if is_program {
                     self.metrics.record_cost_chose_wait_program();
                 } else {
@@ -338,8 +348,7 @@ impl<'a> SpecFenceCtx<'a> {
                 self.bayes.note_cost_decision_posterior(posterior_conflict, true);
             }
             ResolveAction::EarlyAbort => {
-                // EarlyAbort is a WaitHard niche cut — count as wait-side cost choice
-                // plus dedicated early_abort counter.
+                // EarlyAbort niche — count as wait-side cost choice + early_abort.
                 self.metrics.record_cost_chose_wait();
                 if is_program {
                     self.metrics.record_cost_chose_wait_program();

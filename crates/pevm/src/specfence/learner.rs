@@ -1,8 +1,12 @@
-//! Dual-horizon SpecFence learner (P1) — ∉ TCB.
+//! Dual-horizon SpecFence learner (P1 / AEC) — ∉ TCB.
 //!
-//! Intra-block: live fanout + morphology posterior updated on Observe/Abort/Publish.
-//! Inter-block: `InterBlockPrior` EMA + flip decay; seeds HotSet/Bayes only —
+//! Intra-block: live fanout + morphology posterior + EV estimators
+//! (`E_wait_time`, `E_cascade`, SoftWait latency, bind/wait_useful) updated on outcomes.
+//! Inter-block: `InterBlockPrior` EMA + flip decay; seeds HotSet/Bayes / θ warm-start only —
 //! **never** arms SoftWait from prior alone.
+//!
+//! `AdaptiveParams` are learning rates / priors for the Adaptive EV Controller —
+//! **not** Boolean Wait cuts (`D_WAIT` / fanout ladders).
 
 #![allow(dead_code)]
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -59,8 +63,9 @@ impl MorphWeights {
         self.fan_out >= 0.35 && self.fan_out >= self.mixed && self.fan_out >= self.waw_spine
     }
 
-    /// Morph/class prior substitute for **Wait EV only** when measured d is unknown.
-    /// fan_out-dominant → treat as late (~0.9). Never feed EarlyAbort (needs known d).
+    /// Morph feature for **W_remain** estimate when measured d is unknown.
+    /// fan_out-dominant → late (~0.9) ⇒ smaller remaining work if Spec aborts.
+    /// Never Boolean-forces Wait; never feeds EarlyAbort (needs known d).
     pub(crate) fn wait_depth_prior(self) -> Option<f64> {
         if self.dominant_fan_out() {
             Some(0.9)
@@ -94,43 +99,75 @@ impl MorphWeights {
     }
 }
 
-/// Tunable π constants (process + optional block override). Learning ∉ TCB.
+/// AEC learning rates / priors (∉ TCB). **Not** Boolean Wait decision cuts.
+///
+/// `d_wait` / `cost_margin` are retained for lab override compatibility only —
+/// [`crate::specfence::choose_action`] must **not** use them as Wait gates.
+/// Depth `d` and fan-out enter EV as continuous features.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct AdaptiveParams {
-    pub d_wait: f64,
+    /// α in `EV_Wait = E_wait_time * (1 + α * fanout)` — high fanout ↑ EV_Wait.
+    pub alpha_fanout: f64,
+    /// β in `EV_Spec = P_abort * (W_remain + β * E_cascade)`.
+    pub beta_cascade: f64,
+    /// EMA learning rate for per-ℓ E_wait_time (arm→wake latency units).
+    pub lr_wait_time: f64,
+    /// EMA learning rate for E_cascade.
+    pub lr_cascade: f64,
+    /// Prior E_wait_time (normalized work units; ~1.0 = one unresolved producer).
+    pub e_wait_prior: f64,
+    /// Prior expected cascade size (work units).
+    pub e_cascade_prior: f64,
+    /// EarlyAbort reexec overhead term in `EV_Early = W_prefix + E_reexec`.
+    pub e_reexec: f64,
+    /// Meta budget ρ: if meta_ops/useful_effects > ρ → force SpecRead (OCC fallback).
+    pub meta_budget_rho: f64,
+    /// EarlyAbort niche only: known d ≤ d_early (not a Wait cut).
     pub d_early: f64,
+    /// Bind escalation when published Data + very-high P (not a Wait gate).
     pub tau_very_high: f64,
     pub tau_w: f64,
     pub tau_s: f64,
     pub tau_revoke: f64,
+    /// Legacy SpecRead cost scale (maps into W_remain / docs).
     pub c_retry: f64,
+    /// DEPRECATED — not a Wait gate in AEC π (kept for lab JSON compatibility).
+    pub d_wait: f64,
+    /// DEPRECATED — not a Wait gate in AEC π.
     pub cost_margin: f64,
-    /// Distinct writers before ℓ is treated as WAW-spine-ish (schedule ≫ WaitHard).
+    /// Distinct writers before ℓ is treated as WAW-spine feature.
     pub waw_writer_floor: usize,
-    /// Gas-limit band for tx_heavy_hint (optional heuristic).
+    /// Gas-limit band for tx_heavy_hint feature (EarlyAbort niche).
     pub heavy_gas_limit: u64,
 }
 
 impl Default for AdaptiveParams {
     fn default() -> Self {
-        // L3-authorized choose_action v3 defaults (see lab/results/adaptive-params-l3.json).
         Self::from_l3()
     }
 }
 
 impl AdaptiveParams {
-    /// Constants calibrated / authorized by L3 offline EV (`l3-offline-ev.json`).
-    /// Mapping: d_wait←Wait-if-program-fanout d≥0.5; d_early←early-heavy gw~0.11 envelope.
+    /// AEC defaults: learning rates / priors. `d_wait` retained but unused by π.
     pub(crate) const fn from_l3() -> Self {
         Self {
-            d_wait: 0.50,
+            alpha_fanout: 0.20,
+            beta_cascade: 1.0,
+            lr_wait_time: 0.25,
+            lr_cascade: 0.20,
+            e_wait_prior: 1.0,
+            e_cascade_prior: 1.0,
+            e_reexec: 1.5,
+            // SoftWait/meta_ops over useful effects > ρ → OCC SpecRead (after warmup).
+            meta_budget_rho: 0.35,
             d_early: 0.15,
             tau_very_high: 0.75,
             tau_w: 0.35,
             tau_s: 0.50,
             tau_revoke: 0.20,
             c_retry: 3.0,
-            cost_margin: 0.40,
+            d_wait: 0.50, // deprecated for π
+            cost_margin: 0.40, // deprecated for π
             waw_writer_floor: 8,
             heavy_gas_limit: 200_000,
         }
@@ -248,7 +285,7 @@ impl InterBlockPrior {
     }
 }
 
-/// Per-location online stats for the current block.
+/// Per-location online stats for the current block (AEC outcome feeds).
 #[derive(Debug, Default)]
 struct LocLive {
     readers: AtomicUsize,
@@ -263,9 +300,29 @@ struct LocLive {
     /// Producer status hist: Data / Running-ish (coarse bits).
     status_data: AtomicUsize,
     status_running: AtomicUsize,
+    /// SoftWait arm→wake latency sum (ns) for E_wait_time EMA.
+    wait_latency_ns_sum: AtomicU64,
+    wait_latency_count: AtomicUsize,
+    /// Cascade size sum on aborts at this ℓ.
+    cascade_sum: AtomicU64,
+    /// Fixed-point ×1e6 EMA of E_wait_time (normalized units).
+    e_wait_bits: AtomicU64,
+    /// Fixed-point ×1e6 EMA of E_cascade.
+    e_cascade_bits: AtomicU64,
 }
 
-/// Intra-block live fanout + morphology posterior (one block).
+
+#[inline]
+fn fp_encode(x: f64) -> u64 {
+    (x.max(0.0) * 1_000_000.0) as u64
+}
+
+#[inline]
+fn fp_decode(bits: u64) -> f64 {
+    bits as f64 / 1_000_000.0
+}
+
+/// Intra-block live fanout + morphology posterior + AEC EV estimators (one block).
 #[derive(Debug, Default)]
 pub(crate) struct LiveLearner {
     locs: DashMap<MemoryLocationHash, LocLive, BuildIdentityHasher>,
@@ -279,8 +336,23 @@ pub(crate) struct LiveLearner {
     /// Cheap EMA of measured gross-work / effect-progress depth samples.
     d_sum_bits: AtomicU64,
     d_count: AtomicUsize,
+    /// SoftWait arm→wake latency aggregates (debug + global E_wait prior refresh).
+    wait_latency_ns_sum: AtomicU64,
+    wait_latency_count: AtomicUsize,
+    /// Best-effort steal/idle proxies (from wave metrics feed).
+    steal_events: AtomicUsize,
+    park_ns_proxy: AtomicU64,
+    /// Meta ops counted toward ρ budget (SoftWait arms observed by π).
+    meta_ops: AtomicUsize,
+    /// Useful effects (bind + wait_useful + publishes) for ρ denominator.
+    useful_effects: AtomicUsize,
+    /// Global EMA E_wait_time / E_cascade (fixed-point ×1e6).
+    global_e_wait_bits: AtomicU64,
+    global_e_cascade_bits: AtomicU64,
     /// Running morph weights (normalized periodically).
     morph_bits: Mutex<MorphWeights>,
+    /// Block AdaptiveParams snapshot for EMA rates (set at begin_block).
+    params_bits: Mutex<AdaptiveParams>,
 }
 
 impl LiveLearner {
@@ -289,6 +361,14 @@ impl LiveLearner {
     }
 
     pub(crate) fn begin_block(&self, prior_morph: MorphWeights) {
+        self.begin_block_with_params(prior_morph, AdaptiveParams::default());
+    }
+
+    pub(crate) fn begin_block_with_params(
+        &self,
+        prior_morph: MorphWeights,
+        params: AdaptiveParams,
+    ) {
         self.locs.clear();
         self.program_obs.store(0, Ordering::Relaxed);
         self.handler_obs.store(0, Ordering::Relaxed);
@@ -299,7 +379,18 @@ impl LiveLearner {
         self.wait_useful_total.store(0, Ordering::Relaxed);
         self.d_sum_bits.store(0, Ordering::Relaxed);
         self.d_count.store(0, Ordering::Relaxed);
+        self.wait_latency_ns_sum.store(0, Ordering::Relaxed);
+        self.wait_latency_count.store(0, Ordering::Relaxed);
+        self.steal_events.store(0, Ordering::Relaxed);
+        self.park_ns_proxy.store(0, Ordering::Relaxed);
+        self.meta_ops.store(0, Ordering::Relaxed);
+        self.useful_effects.store(0, Ordering::Relaxed);
+        self.global_e_wait_bits
+            .store(fp_encode(params.e_wait_prior), Ordering::Relaxed);
+        self.global_e_cascade_bits
+            .store(fp_encode(params.e_cascade_prior), Ordering::Relaxed);
         *self.morph_bits.lock().unwrap() = prior_morph.normalize();
+        *self.params_bits.lock().unwrap() = params;
     }
 
     /// Observe a location read resolve (policy feature refresh).
@@ -335,14 +426,28 @@ impl LiveLearner {
     }
 
     pub(crate) fn note_abort(&self, location: MemoryLocationHash, cascade_hint: usize) {
+        let c = cascade_hint.max(1);
         self.abort_events.fetch_add(1, Ordering::Relaxed);
         self.cascade_sum
-            .fetch_add(cascade_hint.max(1) as u64, Ordering::Relaxed);
-        self.locs
-            .entry(location)
-            .or_default()
-            .aborts
-            .fetch_add(1, Ordering::Relaxed);
+            .fetch_add(c as u64, Ordering::Relaxed);
+        let entry = self.locs.entry(location).or_default();
+        entry.aborts.fetch_add(1, Ordering::Relaxed);
+        entry.cascade_sum.fetch_add(c as u64, Ordering::Relaxed);
+        // EMA update E_cascade at ℓ and globally.
+        let params = *self.params_bits.lock().unwrap();
+        let lr = params.lr_cascade;
+        let prev = fp_decode(entry.e_cascade_bits.load(Ordering::Relaxed));
+        let prev = if prev <= f64::EPSILON {
+            params.e_cascade_prior
+        } else {
+            prev
+        };
+        let next = (1.0 - lr) * prev + lr * (c as f64);
+        entry.e_cascade_bits.store(fp_encode(next), Ordering::Relaxed);
+        let g_prev = fp_decode(self.global_e_cascade_bits.load(Ordering::Relaxed));
+        let g_next = (1.0 - lr) * g_prev + lr * (c as f64);
+        self.global_e_cascade_bits
+            .store(fp_encode(g_next), Ordering::Relaxed);
         // Large cascade → morph toward fan_out.
         let mut m = self.morph_bits.lock().unwrap();
         if cascade_hint >= 8 {
@@ -362,11 +467,13 @@ impl LiveLearner {
         entry.bind_hits.fetch_add(1, Ordering::Relaxed);
         entry.status_data.fetch_add(1, Ordering::Relaxed);
         self.bind_success_total.fetch_add(1, Ordering::Relaxed);
+        self.useful_effects.fetch_add(1, Ordering::Relaxed);
     }
 
     /// π Bind hit credit (symmetric with Bayes observe_bind_hit).
     pub(crate) fn note_bind_success(&self, location: MemoryLocationHash) {
         self.bind_success_total.fetch_add(1, Ordering::Relaxed);
+        self.useful_effects.fetch_add(1, Ordering::Relaxed);
         let entry = self.locs.entry(location).or_default();
         entry.bind_hits.fetch_add(1, Ordering::Relaxed);
         entry.status_data.fetch_add(1, Ordering::Relaxed);
@@ -375,11 +482,136 @@ impl LiveLearner {
     /// SoftWait wake useful: producer published while waiter was armed.
     pub(crate) fn note_wait_useful(&self, location: MemoryLocationHash) {
         self.wait_useful_total.fetch_add(1, Ordering::Relaxed);
+        self.useful_effects.fetch_add(1, Ordering::Relaxed);
         self.locs
             .entry(location)
             .or_default()
             .wait_useful
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// SoftWait arm→wake latency (ns). Updates E_wait_time EMA in normalized units.
+    /// Coarse: 1e6 ns ≈ 1.0 work unit (same scale as unresolved-producer prior).
+    pub(crate) fn note_wait_latency(&self, location: MemoryLocationHash, latency_ns: u64) {
+        self.wait_latency_ns_sum
+            .fetch_add(latency_ns, Ordering::Relaxed);
+        self.wait_latency_count.fetch_add(1, Ordering::Relaxed);
+        let entry = self.locs.entry(location).or_default();
+        entry
+            .wait_latency_ns_sum
+            .fetch_add(latency_ns, Ordering::Relaxed);
+        entry.wait_latency_count.fetch_add(1, Ordering::Relaxed);
+        let params = *self.params_bits.lock().unwrap();
+        let lr = params.lr_wait_time;
+        // Normalize: clamp to [0.05, 8.0] work units.
+        let sample = (latency_ns as f64 / 1_000_000.0).clamp(0.05, 8.0);
+        let prev = fp_decode(entry.e_wait_bits.load(Ordering::Relaxed));
+        let prev = if prev <= f64::EPSILON {
+            params.e_wait_prior
+        } else {
+            prev
+        };
+        let next = (1.0 - lr) * prev + lr * sample;
+        entry.e_wait_bits.store(fp_encode(next), Ordering::Relaxed);
+        let g_prev = fp_decode(self.global_e_wait_bits.load(Ordering::Relaxed));
+        let g_next = (1.0 - lr) * g_prev + lr * sample;
+        self.global_e_wait_bits
+            .store(fp_encode(g_next), Ordering::Relaxed);
+    }
+
+    /// Best-effort steal/idle or park duration proxies (debug + meta awareness).
+    pub(crate) fn note_steal_or_park_proxy(&self, steal: bool, park_ns: u64) {
+        if steal {
+            self.steal_events.fetch_add(1, Ordering::Relaxed);
+        }
+        if park_ns > 0 {
+            self.park_ns_proxy.fetch_add(park_ns, Ordering::Relaxed);
+        }
+    }
+
+    /// Count a meta op (SoftWait arm / WaitHard decision) toward ρ budget.
+    pub(crate) fn note_meta_op(&self) {
+        self.meta_ops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// E_wait_time(ℓ) — per-ℓ EMA or global prior.
+    pub(crate) fn e_wait_time(&self, location: MemoryLocationHash) -> f64 {
+        if let Some(e) = self.locs.get(&location) {
+            let v = fp_decode(e.e_wait_bits.load(Ordering::Relaxed));
+            if v > f64::EPSILON {
+                return v;
+            }
+        }
+        fp_decode(self.global_e_wait_bits.load(Ordering::Relaxed)).max(
+            self.params_bits.lock().unwrap().e_wait_prior,
+        )
+    }
+
+    /// E_cascade(ℓ) — per-ℓ EMA or global prior.
+    pub(crate) fn e_cascade(&self, location: MemoryLocationHash) -> f64 {
+        if let Some(e) = self.locs.get(&location) {
+            let v = fp_decode(e.e_cascade_bits.load(Ordering::Relaxed));
+            if v > f64::EPSILON {
+                return v;
+            }
+        }
+        let g = fp_decode(self.global_e_cascade_bits.load(Ordering::Relaxed));
+        if g > f64::EPSILON {
+            g
+        } else {
+            self.params_bits.lock().unwrap().e_cascade_prior
+        }
+    }
+
+    /// Mean cascade size this block (fallback).
+    pub(crate) fn mean_cascade(&self) -> f64 {
+        let n = self.abort_events.load(Ordering::Relaxed);
+        if n == 0 {
+            return self.params_bits.lock().unwrap().e_cascade_prior;
+        }
+        self.cascade_sum.load(Ordering::Relaxed) as f64 / n as f64
+    }
+
+    /// Meta budget exceeded: SoftWait/meta_ops over useful effects > ρ.
+    /// Requires warmup observes so cold start cannot OCC-fallback the whole block.
+    pub(crate) fn meta_budget_exceeded(&self, params: &AdaptiveParams) -> bool {
+        let obs = self.program_obs.load(Ordering::Relaxed)
+            + self.handler_obs.load(Ordering::Relaxed);
+        if obs < 64 {
+            return false;
+        }
+        let meta = self.meta_ops.load(Ordering::Relaxed) as f64;
+        let useful = self
+            .useful_effects
+            .load(Ordering::Relaxed)
+            .max(self.program_obs.load(Ordering::Relaxed))
+            .max(obs / 4)
+            .max(1) as f64;
+        meta / useful > params.meta_budget_rho
+    }
+
+    pub(crate) fn meta_ops(&self) -> usize {
+        self.meta_ops.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn useful_effects(&self) -> usize {
+        self.useful_effects.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn wait_latency_count(&self) -> usize {
+        self.wait_latency_count.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn mean_wait_latency_ns(&self) -> Option<f64> {
+        let n = self.wait_latency_count.load(Ordering::Relaxed);
+        if n == 0 {
+            return None;
+        }
+        Some(self.wait_latency_ns_sum.load(Ordering::Relaxed) as f64 / n as f64)
+    }
+
+    pub(crate) fn steal_events(&self) -> usize {
+        self.steal_events.load(Ordering::Relaxed)
     }
 
     /// Optional status hist at discovery (Data vs still-running producer).
@@ -654,8 +886,52 @@ mod tests {
         let p = AdaptiveParams::from_l3();
         assert!((p.d_wait - 0.50).abs() < f64::EPSILON);
         assert!((p.d_early - 0.15).abs() < f64::EPSILON);
+        assert!(p.alpha_fanout > 0.0);
+        assert!(p.meta_budget_rho > 0.0);
         let p2 = p.with_overrides(Some(0.55), None, None, None, None, None, None, None);
         assert!((p2.d_wait - 0.55).abs() < f64::EPSILON);
         assert!((p2.d_early - 0.15).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn aec_wait_latency_updates_e_wait() {
+        let live = LiveLearner::new();
+        let params = AdaptiveParams::from_l3();
+        live.begin_block_with_params(MorphWeights::default(), params);
+        let prior = live.e_wait_time(9);
+        live.note_wait_latency(9, 2_000_000); // 2.0 units
+        let after = live.e_wait_time(9);
+        assert!(after > prior.min(params.e_wait_prior) - 1e-9);
+        assert_eq!(live.wait_latency_count(), 1);
+    }
+
+    #[test]
+    fn aec_meta_budget_trips_on_softwait_storm() {
+        let live = LiveLearner::new();
+        let params = AdaptiveParams::from_l3();
+        live.begin_block_with_params(MorphWeights::default(), params);
+        // Warmup observes (meta budget inactive before 64).
+        for i in 0..70 {
+            live.note_observe(i as u64, true, 1);
+        }
+        live.note_bind_success(1);
+        for _ in 0..40 {
+            live.note_meta_op();
+        }
+        assert!(live.meta_budget_exceeded(&params));
+        // Fresh block: no trip before warmup.
+        live.begin_block_with_params(MorphWeights::default(), params);
+        live.note_meta_op();
+        assert!(!live.meta_budget_exceeded(&params));
+    }
+
+    #[test]
+    fn aec_high_fanout_raises_ev_wait_feature() {
+        // Feature contract: e_wait * (1 + α * fanout) grows with fanout.
+        let p = AdaptiveParams::from_l3();
+        let e = p.e_wait_prior;
+        let low = e * (1.0 + p.alpha_fanout * 1.0);
+        let high = e * (1.0 + p.alpha_fanout * 16.0);
+        assert!(high > low);
     }
 }

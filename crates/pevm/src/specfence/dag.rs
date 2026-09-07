@@ -65,9 +65,11 @@ pub(crate) struct FenceGraph {
     wake_count: AtomicUsize,
     /// G4: locations whose SoftWait woke on Publish (drained by learner credit).
     wake_useful_locs: Mutex<Vec<MemoryLocationHash>>,
+    /// AEC: (location, arm→wake latency ns) drained by learner.
+    wake_latencies: Mutex<Vec<(MemoryLocationHash, u64)>>,
     /// Txs whose known hard waits are clear (ready hint).
     ready_hints: DashSet<TxIdx, BuildIdentityHasher>,
-    /// Arm timestamps (best-effort revoke age).
+    /// Arm timestamps (best-effort revoke age / SoftWait latency).
     arm_started: DashMap<u64, Instant, BuildIdentityHasher>,
 }
 
@@ -171,6 +173,7 @@ impl FenceGraph {
     ) -> Vec<TxIdx> {
         let mut woken = Vec::new();
         let mut keep = Vec::new();
+        let mut latencies = Vec::new();
         if let Some(mut v) = self.soft_waits.get_mut(&location) {
             for a in v.drain(..) {
                 let match_writer = a
@@ -178,7 +181,10 @@ impl FenceGraph {
                     .map(|w| w == writer_t)
                     .unwrap_or(true);
                 if match_writer && a.waiter > writer_t {
-                    self.arm_started.remove(&a.arm_id);
+                    if let Some((_, started)) = self.arm_started.remove(&a.arm_id) {
+                        let ns = started.elapsed().as_nanos() as u64;
+                        latencies.push(ns);
+                    }
                     if !woken.contains(&a.waiter) {
                         woken.push(a.waiter);
                     }
@@ -199,6 +205,10 @@ impl FenceGraph {
         if !woken.is_empty() {
             self.wake_count.fetch_add(woken.len(), Ordering::Relaxed);
             self.wake_useful_locs.lock().unwrap().push(location);
+            let mut wl = self.wake_latencies.lock().unwrap();
+            for ns in latencies {
+                wl.push((location, ns));
+            }
         }
         woken
     }
@@ -206,6 +216,11 @@ impl FenceGraph {
     /// G4: drain SoftWait-wake locations for learner `wait_useful` credit.
     pub(crate) fn drain_wake_useful_locs(&self) -> Vec<MemoryLocationHash> {
         std::mem::take(&mut *self.wake_useful_locs.lock().unwrap())
+    }
+
+    /// AEC: drain SoftWait arm→wake latencies (ns) for learner E_wait_time.
+    pub(crate) fn drain_wake_latencies(&self) -> Vec<(MemoryLocationHash, u64)> {
+        std::mem::take(&mut *self.wake_latencies.lock().unwrap())
     }
 
     /// SoftWait `armed_at_k` for `(location, waiter)` if armed.
@@ -236,7 +251,10 @@ impl FenceGraph {
                     .map(|w| w == writer_t)
                     .unwrap_or(true);
                 if match_writer && a.waiter > writer_t {
-                    self.arm_started.remove(&a.arm_id);
+                    if let Some((_, started)) = self.arm_started.remove(&a.arm_id) {
+                        let ns = started.elapsed().as_nanos() as u64;
+                        self.wake_latencies.lock().unwrap().push((location, ns));
+                    }
                     if !woken.iter().any(|x: &SoftWaitArm| x.waiter == a.waiter) {
                         woken.push(a);
                     }

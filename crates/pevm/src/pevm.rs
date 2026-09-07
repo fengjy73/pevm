@@ -210,7 +210,7 @@ impl Pevm {
         self.concurrency_mode = mode;
     }
 
-    /// G6: replace process-level AdaptiveParams (L3 overrides / lab).
+    /// G6/AEC: replace process-level AdaptiveParams (learning rates / priors).
     pub(crate) fn set_adaptive_params(&mut self, params: AdaptiveParams) {
         self.adaptive_params = params;
     }
@@ -399,7 +399,7 @@ impl Pevm {
         if self.concurrency_mode == ConcurrencyMode::SpecFence {
             self.hotset.begin_block();
             let prior_morph = self.inter_prior.morph_ema();
-            learner.begin_block(prior_morph);
+            learner.begin_block_with_params(prior_morph, self.adaptive_params);
             // Warm-start HotSet/Bayes from inter-block top-ℓ — NEVER arm SoftWait from prior.
             for top in self.inter_prior.top_locations() {
                 self.hotset.track_from_prior(top.location);
@@ -529,6 +529,18 @@ impl Pevm {
             wave.wait_park_ns(),
             wave.ready_steal_on_wait(),
         );
+        // AEC: best-effort steal/idle / park duration proxies → learner (∉ TCB).
+        if self.concurrency_mode == ConcurrencyMode::SpecFence {
+            let steals = wave.ready_steal_on_wait();
+            let park_ns = wave.wait_park_ns();
+            if steals > 0 || park_ns > 0 {
+                learner.note_steal_or_park_proxy(steals > 0, park_ns);
+                // Count additional steals coarsely (one event already recorded).
+                for _ in 1..steals {
+                    learner.note_steal_or_park_proxy(true, 0);
+                }
+            }
+        }
         metrics_inner.set_park_resume_metrics(
             wave.park_resume_at_k(),
             wave.park_resume_full_retry(),
