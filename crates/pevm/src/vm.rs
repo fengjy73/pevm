@@ -202,8 +202,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
     /// M1b: try serving a certified-prefix read from the FF value cache.
     /// Returns Some when origin is unchanged — caller skips MV lazy walk.
 
-    /// Skip rem value_snap lock on lean first incarnation (RebindOnly rare; SuffixRepair
-    /// still arms force_bind). Repair reincarnations keep snaps for journal FF.
+    /// Record rem value_snap for value-stable RebindOnly at validate (and journal FF).
     #[inline]
     fn maybe_note_value(&self, location_hash: MemoryLocationHash, value: FfValue) {
         if self.specfence.mode != crate::ConcurrencyMode::SpecFence {
@@ -420,7 +419,26 @@ impl<'a, S: Storage> VmDb<'a, S> {
             });
 
         if let Some(v) = bind_version {
-            // Bind-on-Data: zero sticky/HotSet/prior/learner/Bayes/choose_action.
+            // Sticky / force_bind / hot_inc0 + unfinished Data: yield-spin for
+            // producer done, then Bind-on-Data. No SoftWait Soft; no BO park on
+            // published Data (park idle regressed wall). No-Data Estimate path
+            // may Await via WaitHard→BO after spin below.
+            let writer_unfinished = !self.specfence.scheduler.is_done(v.tx_idx);
+            if writer_unfinished {
+                let sticky = self.tx_incarnation > 0
+                    && self.specfence.learner.is_sticky_resolve(location_hash);
+                let hot_inc0 = self.tx_incarnation == 0
+                    && self.specfence.hotset.contains(location_hash)
+                    && self.specfence.rw_prior.predicts_write(location_hash);
+                if force_prefix || sticky || hot_inc0 {
+                    for _ in 0..128 {
+                        if self.specfence.scheduler.is_done(v.tx_idx) {
+                            break;
+                        }
+                        std::thread::yield_now();
+                    }
+                }
+            }
             return self.bind_on_data_lite(address, location_hash, v, force_prefix);
         }
 
@@ -495,7 +513,6 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return Ok(());
         } else if writer.is_some()
             && !writer_done
-            && !force_prefix
             && sticky
             && !self.specfence.learner.waw_spine_hint(
                 location_hash,
@@ -503,7 +520,8 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 self.specfence.params,
             )
         {
-            // Cheap Await: sticky (post force_bind_reabort) without π DashMap.
+            // Cheap Await: sticky (post force_bind_reabort), including force_prefix
+            // when no Data yet (Estimate) — break SpecRead→reabort loops.
             ResolveAction::WaitHard
         } else if writer.is_some()
             && !writer_done
@@ -531,7 +549,41 @@ impl<'a, S: Storage> VmDb<'a, S> {
             // Program prior unfinished without sticky: cheap Await.
             ResolveAction::WaitHard
         } else if force_prefix {
-            ResolveAction::SpecRead
+            // force_bind + unfinished writer without Data: brief yield-spin for
+            // Data/done, then SpecRead (not SoftWait Soft). If still Estimated and
+            // unfinished after spin → BO Await to break SpecRead→reabort loops.
+            if let Some(w) = writer.filter(|_| !writer_done) {
+                for _ in 0..128 {
+                    if self.specfence.scheduler.is_done(w) {
+                        break;
+                    }
+                    if self
+                        .mv_memory
+                        .last_data_before(location_hash, self.tx_idx)
+                        .is_some()
+                    {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                if let Some(v) = self
+                    .mv_memory
+                    .last_data_before(location_hash, self.tx_idx)
+                    .map(|(tx_idx, tx_incarnation)| TxVersion {
+                        tx_idx,
+                        tx_incarnation,
+                    })
+                {
+                    return self.bind_on_data_lite(address, location_hash, v, true);
+                }
+                if !self.specfence.scheduler.is_done(w) {
+                    ResolveAction::WaitHard
+                } else {
+                    ResolveAction::SpecRead
+                }
+            } else {
+                ResolveAction::SpecRead
+            }
         } else {
             // Sticky-without-Data or hot/prior: full π (may Await / EarlyAbort).
             if hotset_hint {

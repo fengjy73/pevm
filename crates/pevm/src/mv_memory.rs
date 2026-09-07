@@ -10,8 +10,8 @@ use revm::state::Bytecode;
 use smallvec::SmallVec;
 
 use crate::{
-    BuildIdentityHasher, BuildSuffixHasher, MemoryEntry, MemoryLocationHash, ReadOrigin, ReadSet,
-    TxIdx, TxIncarnation, TxVersion, WriteSet, specfence::RegionTable,
+    BuildIdentityHasher, BuildSuffixHasher, MemoryEntry, MemoryLocationHash, MemoryValue,
+    ReadOrigin, ReadSet, TxIdx, TxIncarnation, TxVersion, WriteSet, specfence::RegionTable,
 };
 
 #[derive(Default, Debug)]
@@ -316,13 +316,33 @@ impl MvMemory {
     }
 
     /// M1 RebindOnly: patch invalid read origins to the current valid version
-    /// without aborting. Refuses multi-origin (lazy) reads — those need RewindTo.
+    /// without aborting. Refuses multi-origin (lazy) reads — those need RewindTo
+    /// unless [`Self::try_rebind_invalid_reads_value_stable`] (same-output).
     /// Returns true iff every invalid location was patched to a still-valid origin.
     /// Applies patches atomically (no partial mutate on failure).
     pub(crate) fn try_rebind_invalid_reads(
         &self,
         tx_idx: TxIdx,
         invalid: &[MemoryLocationHash],
+    ) -> bool {
+        self.try_rebind_invalid_reads_inner(tx_idx, invalid, false)
+    }
+
+    /// Value-stable RebindOnly: allow multi-origin (lazy) → current single Data
+    /// when caller proved same-output republish. Still refuses Estimate.
+    pub(crate) fn try_rebind_invalid_reads_value_stable(
+        &self,
+        tx_idx: TxIdx,
+        invalid: &[MemoryLocationHash],
+    ) -> bool {
+        self.try_rebind_invalid_reads_inner(tx_idx, invalid, true)
+    }
+
+    fn try_rebind_invalid_reads_inner(
+        &self,
+        tx_idx: TxIdx,
+        invalid: &[MemoryLocationHash],
+        allow_multi_origin: bool,
     ) -> bool {
         if invalid.is_empty() {
             return true;
@@ -332,7 +352,7 @@ impl MvMemory {
             let locs = index_mutex!(self.last_locations, tx_idx);
             for &location in invalid {
                 let prior = locs.read.get(&location);
-                if prior.is_some_and(|o| o.len() > 1) {
+                if !allow_multi_origin && prior.is_some_and(|o| o.len() > 1) {
                     return false;
                 }
                 let Some(new_origins) = self.current_read_origins(tx_idx, location) else {
@@ -350,6 +370,48 @@ impl MvMemory {
             locs.read.insert(location, new_origins);
         }
         true
+    }
+
+    /// Value-stable across origin bump for `location` in `tx_idx`'s last read set:
+    /// prior single MvMemory origin's Data equals current published Data
+    /// (balance+nonce / Storage U256). Storage-origin / multi-origin / Estimate → false.
+    pub(crate) fn prior_read_value_stable(
+        &self,
+        tx_idx: TxIdx,
+        location: MemoryLocationHash,
+    ) -> bool {
+        let prior = {
+            let locs = index_mutex!(self.last_locations, tx_idx);
+            let Some(prior_origins) = locs.read.get(&location) else {
+                return false;
+            };
+            if prior_origins.len() != 1 {
+                return false;
+            }
+            match prior_origins.first() {
+                Some(ReadOrigin::MvMemory(v)) => v.clone(),
+                _ => return false,
+            }
+        };
+        let Some(cur) = self.current_data_value(tx_idx, location) else {
+            return false;
+        };
+        let Some(written) = self.data.get(&location) else {
+            return false;
+        };
+        let Some(MemoryEntry::Data(inc, prior_val)) = written.get(&prior.tx_idx) else {
+            return false;
+        };
+        if *inc != prior.tx_incarnation || self.is_aborted_incarnation(prior.tx_idx, *inc) {
+            return false;
+        }
+        match (prior_val, &cur) {
+            (MemoryValue::Storage(a), MemoryValue::Storage(b)) => a == b,
+            (MemoryValue::Basic(a), MemoryValue::Basic(b)) => {
+                a.balance == b.balance && a.nonce == b.nonce
+            }
+            _ => false,
+        }
     }
 
     /// Closest live Data value below `tx_idx`, if any (Estimate → None).

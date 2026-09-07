@@ -907,9 +907,9 @@ fn try_validate(
                 k_fail = Some(p.k_fail);
             }
         }
-        // RebindOnly when no true failed-suffix write (or no writes if k unknown).
-        // Widen: value-stable RebindOnly even with true_suffix when incarnation
-        // value_snap equals current published Data (same-output republish).
+        // RebindOnly when no true failed-suffix write. Unknown k_fail + any
+        // write: conservative true_suffix (avoid unsafe in-place patch).
+        // Value-stable still widens Estimate→Data / incarnation same-output.
         let true_suffix = match k_fail {
             Some(k) => specfence.partial_retry.has_true_suffix_writes(
                 tx_version.tx_idx,
@@ -919,20 +919,35 @@ fn try_validate(
             None => !write_locations.is_empty(),
         };
         // Value-stable RebindOnly: same-output republish (Estimate→Data / incarnation
-        // bump) is safe without reexec. Storage always; Basic when balance+nonce match.
-        // No FfValue clone — rem compares snap in place. Lazy/multi-origin refused by try_rebind.
-        let value_stable = !invalid.is_empty()
+        // bump) is safe without reexec. Snap match first; else prior-origin MV value
+        // vs current Data (covers lean paths that skipped snaps). try_rebind refuses
+        // Estimate / multi-origin.
+        let estimate_cleared = !invalid.is_empty()
             && invalid.iter().all(|&loc| {
-                let Some(cur) = mv_memory.current_data_value(tx_version.tx_idx, loc) else {
-                    return false;
+                mv_memory
+                    .current_data_value(tx_version.tx_idx, loc)
+                    .is_some()
+            });
+        let value_stable = estimate_cleared
+            && invalid.iter().all(|&loc| {
+                let cur = match mv_memory.current_data_value(tx_version.tx_idx, loc) {
+                    Some(c) => c,
+                    None => return false,
                 };
-                specfence
+                if specfence
                     .partial_retry
                     .value_stable_match(tx_version.tx_idx, loc, &cur)
+                {
+                    return true;
+                }
+                // Fallback: prior origin's published Basic/Storage == current.
+                mv_memory.prior_read_value_stable(tx_version.tx_idx, loc)
             });
-        // Prefer RebindOnly when !true_suffix, or when value-stable (incl. Estimate→Data
-        // same-output). try_rebind refuses Estimate / multi-origin.
-        let rebound = if !true_suffix || value_stable {
+        // Prefer RebindOnly when !true_suffix, or when Estimate cleared + value-stable.
+        // Value-stable path allows multi-origin (lazy) → single current Data.
+        let rebound = if value_stable {
+            mv_memory.try_rebind_invalid_reads_value_stable(tx_version.tx_idx, &invalid)
+        } else if !true_suffix {
             mv_memory.try_rebind_invalid_reads(tx_version.tx_idx, &invalid)
         } else {
             false
