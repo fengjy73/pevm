@@ -34,6 +34,18 @@ pub(crate) fn research_inspect_enabled() -> bool {
     }
 }
 
+/// Dig A/B: `SPECFENCE_DISABLE_SOFTWAIT=1` forces π SpecRead-only (never arm SoftWait).
+/// Lean default SoftWait stays scarce; this is for makespan comparison only.
+pub(crate) fn softwait_disabled() -> bool {
+    match std::env::var_os("SPECFENCE_DISABLE_SOFTWAIT") {
+        None => false,
+        Some(v) => {
+            let s = v.to_string_lossy();
+            s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
+        }
+    }
+}
+
 /// Per-block adaptive engagement controller (SpecFence only).
 #[derive(Debug)]
 pub(crate) struct AdaptiveEngagement {

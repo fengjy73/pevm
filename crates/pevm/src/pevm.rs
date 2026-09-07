@@ -863,6 +863,16 @@ fn try_validate(
         // V5-P1: SpecFence Lean default → single repair helper (force-bind+selective |
         // FullRestart). Research inspect (`!lean_tx`) keeps RewindTo+FF separately.
         if lean_tx {
+            // Dig: abort while prior ForceBind / SoftWait-wake still armed.
+            if specfence.partial_retry.has_force_bind(tx_version.tx_idx) {
+                specfence.metrics.record_force_bind_reabort();
+            }
+            if specfence
+                .partial_retry
+                .take_post_softwait_wake(tx_version.tx_idx)
+            {
+                specfence.metrics.record_soft_wait_wake_reabort();
+            }
             let write_locations = mv_memory.write_locations(tx_version.tx_idx);
             let repair = specfence.partial_retry.apply_lean_abort_repair(
                 tx_version.tx_idx,
@@ -931,6 +941,15 @@ fn try_validate(
         if specfence.mode == ConcurrencyMode::SpecFence {
             // Research-inspect abort path (`SPECFENCE_ENABLE_INSPECT`): RewindTo+FF
             // when certified prefix + checkpoint; else same FullRestart as Lean.
+            if specfence.partial_retry.has_force_bind(tx_version.tx_idx) {
+                specfence.metrics.record_force_bind_reabort();
+            }
+            if specfence
+                .partial_retry
+                .take_post_softwait_wake(tx_version.tx_idx)
+            {
+                specfence.metrics.record_soft_wait_wake_reabort();
+            }
             specfence.metrics.record_occ_abort();
             // V5-P0: engagement.note_abort is metrics-only (no HotSet storm insert).
             let _ = specfence.engagement.note_abort();
@@ -1051,6 +1070,13 @@ fn try_validate(
             }
         }
     } else if !aborted && specfence.mode == ConcurrencyMode::SpecFence && read_set_valid {
+        // Dig: SoftWait wake → validate-ok.
+        if specfence
+            .partial_retry
+            .take_post_softwait_wake(tx_version.tx_idx)
+        {
+            specfence.metrics.record_soft_wait_wake_ok();
+        }
         // Successful validation clears PartialRetry / RewindTo state for this tx.
         specfence
             .partial_retry

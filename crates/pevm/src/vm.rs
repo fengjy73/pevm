@@ -477,6 +477,14 @@ impl<'a, S: Storage> VmDb<'a, S> {
             )
         };
 
+        // Dig A/B: SPECFENCE_DISABLE_SOFTWAIT → never arm SoftWait (π SpecRead-only).
+        let action = match action {
+            ResolveAction::WaitHard if crate::specfence::softwait_disabled() => {
+                ResolveAction::SpecRead
+            }
+            other => other,
+        };
+
         match action {
             ResolveAction::WaitHard => {
                 self.specfence.metrics.record_wait_hard();
@@ -494,6 +502,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     ) {
                         self.specfence.metrics.record_soft_wait_arm();
                     }
+                    self.specfence.partial_retry.mark_softwait_parked(self.tx_idx);
                     // Mirror RegionTable Wait bit (facade).
                     let _ = self.mv_memory.regions.promote_location(location_hash);
                     self.specfence
@@ -536,6 +545,15 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     self.specfence.metrics.record_prior_bind_hit();
                 }
                 if !self.specfence.scheduler.is_done(v.tx_idx) {
+                    // Dig A/B: SPECFENCE_DISABLE_SOFTWAIT → SpecRead (never SoftWait-arm).
+                    if crate::specfence::softwait_disabled() {
+                        self.specfence.metrics.record_spec_read();
+                        if prior_ws_predicts {
+                            self.specfence.bayes.observe_bind_miss(location_hash);
+                        }
+                        note_pending_effect_boundary(self.tx_idx, self.specfence.partial_retry);
+                        return Ok(());
+                    }
                     self.specfence.metrics.record_wait_hard();
                     self.specfence.metrics.record_wait(address);
                     let k = self.specfence.partial_retry.current_k(self.tx_idx) as u64;
@@ -547,6 +565,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     ) {
                         self.specfence.metrics.record_soft_wait_arm();
                     }
+                    self.specfence.partial_retry.mark_softwait_parked(self.tx_idx);
                     self.specfence
                         .wave
                         .set_pending_park(location_hash, k);
@@ -1354,6 +1373,12 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         let Some(intent) = wave.take_resume_intent(tx_idx) else {
             return;
         };
+        // Dig: only attribute SoftWait (FenceGraph) wakes — not EarlyAbort-only parks.
+        if self.specfence.partial_retry.take_softwait_parked(tx_idx) {
+            self.specfence
+                .partial_retry
+                .mark_post_softwait_wake(tx_idx);
+        }
         let kind = self
             .specfence
             .partial_retry

@@ -699,6 +699,10 @@ pub(crate) struct PartialRetryTable {
     states: Vec<Mutex<PartialRetryState>>,
     /// Locations π must Bind/WaitHard on the next incarnation of `t`.
     force_bind: DashMap<TxIdx, Vec<MemoryLocationHash>, BuildIdentityHasher>,
+    /// SoftWait wake consumed; next validation outcome → soft_wait_wake_{ok,reabort}.
+    post_softwait_wake: DashMap<TxIdx, (), BuildIdentityHasher>,
+    /// Tx currently parked via FenceGraph SoftWait (not EarlyAbort-only park).
+    softwait_parked: DashMap<TxIdx, (), BuildIdentityHasher>,
     /// Pending repair for next execute / Retry loop of `t`.
     repair: DashMap<TxIdx, RepairPlan, BuildIdentityHasher>,
     /// M1b journal-FF continuation armed with RewindTo.
@@ -716,6 +720,8 @@ impl PartialRetryTable {
                 .map(|_| Mutex::new(PartialRetryState::default()))
                 .collect(),
             force_bind: DashMap::default(),
+            post_softwait_wake: DashMap::default(),
+            softwait_parked: DashMap::default(),
             repair: DashMap::default(),
             ff_resume: DashMap::default(),
             last_jump_applied: DashMap::default(),
@@ -1088,6 +1094,35 @@ impl PartialRetryTable {
 
     pub(crate) fn clear_force_bind(&self, tx_idx: TxIdx) {
         self.force_bind.remove(&tx_idx);
+    }
+
+    /// True when a certified-prefix force_bind set is armed for this tx.
+    pub(crate) fn has_force_bind(&self, tx_idx: TxIdx) -> bool {
+        self.force_bind
+            .get(&tx_idx)
+            .is_some_and(|v| !v.is_empty())
+    }
+
+    /// Mark SoftWait wake → next incarnation (for dig wake→validate counters).
+    pub(crate) fn mark_post_softwait_wake(&self, tx_idx: TxIdx) {
+        self.post_softwait_wake.insert(tx_idx, ());
+    }
+
+    /// Take SoftWait-wake-pending flag for this tx (if any).
+    pub(crate) fn take_post_softwait_wake(&self, tx_idx: TxIdx) -> bool {
+        self.post_softwait_wake.remove(&tx_idx).is_some()
+    }
+
+    pub(crate) fn clear_post_softwait_wake(&self, tx_idx: TxIdx) {
+        self.post_softwait_wake.remove(&tx_idx);
+    }
+
+    pub(crate) fn mark_softwait_parked(&self, tx_idx: TxIdx) {
+        self.softwait_parked.insert(tx_idx, ());
+    }
+
+    pub(crate) fn take_softwait_parked(&self, tx_idx: TxIdx) -> bool {
+        self.softwait_parked.remove(&tx_idx).is_some()
     }
 
     /// V5-P1/P3 — **single Lean SpecFence abort repair** (default path).

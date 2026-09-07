@@ -161,6 +161,12 @@ pub struct SpecFenceMetrics {
     pub park_resume_at_k: usize,
     /// P4: SoftWait wakes that fell back to tx-grain FullRetry.
     pub park_resume_full_retry: usize,
+    /// V5 dig: abort while force_bind / force_prefix was already armed (Lean PartialRetry reabort).
+    pub force_bind_reabort: usize,
+    /// V5 dig: SoftWait wake → next validation succeeded without abort.
+    pub soft_wait_wake_ok: usize,
+    /// V5 dig: SoftWait wake → next validation aborted again.
+    pub soft_wait_wake_reabort: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -229,6 +235,9 @@ pub(crate) struct MetricsInner {
     early_abort_count: AtomicUsize,
     park_resume_at_k: AtomicUsize,
     park_resume_full_retry: AtomicUsize,
+    force_bind_reabort: AtomicUsize,
+    soft_wait_wake_ok: AtomicUsize,
+    soft_wait_wake_reabort: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -464,6 +473,18 @@ impl MetricsInner {
             .store(park_resume_full_retry, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_force_bind_reabort(&self) {
+        self.force_bind_reabort.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_soft_wait_wake_ok(&self) {
+        self.soft_wait_wake_ok.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_soft_wait_wake_reabort(&self) {
+        self.soft_wait_wake_reabort.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_journal_ff_entries(&self, n: usize) {
         if n > 0 {
             self.journal_ff_entries.fetch_add(n, Ordering::Relaxed);
@@ -662,6 +683,9 @@ impl MetricsInner {
             early_abort_count: self.early_abort_count.load(Ordering::Relaxed),
             park_resume_at_k: self.park_resume_at_k.load(Ordering::Relaxed),
             park_resume_full_retry: self.park_resume_full_retry.load(Ordering::Relaxed),
+            force_bind_reabort: self.force_bind_reabort.load(Ordering::Relaxed),
+            soft_wait_wake_ok: self.soft_wait_wake_ok.load(Ordering::Relaxed),
+            soft_wait_wake_reabort: self.soft_wait_wake_reabort.load(Ordering::Relaxed),
         }
     }
 }

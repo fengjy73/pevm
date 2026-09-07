@@ -61,7 +61,7 @@ mod rem;
 mod resolve;
 
 pub(crate) use bayes::{BayesMap, DEFAULT_TAU};
-pub(crate) use engagement::{AdaptiveEngagement, research_inspect_enabled};
+pub(crate) use engagement::{AdaptiveEngagement, research_inspect_enabled, softwait_disabled};
 pub(crate) use hotset::HotSet;
 #[allow(unused_imports)]
 pub(crate) use hotset::{H_A, H_W};

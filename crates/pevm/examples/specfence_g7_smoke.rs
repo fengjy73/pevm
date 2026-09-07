@@ -94,7 +94,7 @@ fn run_one(
     pevm: &mut Pevm,
     loaded: &LoadedBlock,
     cores: usize,
-) -> (bool, f64, usize, usize, usize) {
+) -> (bool, f64, f64, usize, usize, usize) {
     let cores_nz = NonZeroUsize::new(cores.max(1)).unwrap();
     let n = n_tx(&loaded.block);
     let t0 = Instant::now();
@@ -104,11 +104,18 @@ fn run_one(
     match result {
         Ok(_) => {
             let m = pevm.last_specfence_metrics();
-            (true, tps, m.soft_wait_arms, m.wait_hard_count, m.occ_aborts)
+            (
+                true,
+                tps,
+                elapsed * 1000.0,
+                m.soft_wait_arms,
+                m.wait_hard_count,
+                m.occ_aborts,
+            )
         }
         Err(e) => {
             eprintln!("  ERROR: {e:?}");
-            (false, 0.0, 0, 0, 0)
+            (false, 0.0, 0.0, 0, 0, 0)
         }
     }
 }
@@ -119,6 +126,26 @@ fn main() {
     let chain = PevmEthereum::mainnet();
     let out_dir = repo_root().join("lab/results");
     std::fs::create_dir_all(&out_dir).ok();
+    // Dig naming: SPECFENCE_G7_TAG=v5-bottleneck-lean → v5-bottleneck-lean-sf-occ.json
+    let tag = std::env::var("SPECFENCE_G7_TAG").unwrap_or_default();
+    let flip_name = if tag.is_empty() {
+        "g7-flip-smoke.json".to_string()
+    } else {
+        format!("{tag}-flip.json")
+    };
+    let sweep_name = if tag.is_empty() {
+        "g7-sf-occ-smoke.json".to_string()
+    } else {
+        format!("{tag}-sf-occ.json")
+    };
+    let softwait_disabled = std::env::var_os("SPECFENCE_DISABLE_SOFTWAIT").is_some_and(|v| {
+        let s = v.to_string_lossy();
+        s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
+    });
+    println!(
+        "G7 dig tag={:?} softwait_disabled={softwait_disabled}",
+        if tag.is_empty() { "default".into() } else { tag.clone() }
+    );
 
     // --- Flip smoke: quiet 598 → mixed 599 on same Pevm (InterBlockPrior α flip) ---
     println!("=== G7 flip smoke 19606598 → 19606599 ===");
@@ -130,7 +157,7 @@ fn main() {
         let Some(loaded) = load_block(&data_dir, bn, Arc::clone(&bytecodes), Arc::clone(&block_hashes)) else {
             continue;
         };
-        let (ok, tps, soft, wh, aborts) = run_one(&chain, &mut pevm, &loaded, 8);
+        let (ok, tps, _ms, soft, wh, aborts) = run_one(&chain, &mut pevm, &loaded, 8);
         let flips = pevm.inter_prior_flip_count();
         println!(
             "  block={bn} ok={ok} tps={tps:.0} soft_wait_arms={soft} wait_hard={wh} aborts={aborts} flip_count={flips}"
@@ -145,7 +172,7 @@ fn main() {
             "inter_prior_flip_count": flips,
         }));
     }
-    let flip_path = out_dir.join("g7-flip-smoke.json");
+    let flip_path = out_dir.join(&flip_name);
     std::fs::write(&flip_path, serde_json::to_string_pretty(&serde_json::json!({
         "test": "quiet→mixed flip",
         "blocks": [19606598, 19606599],
@@ -168,15 +195,19 @@ fn main() {
                 _ => Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence),
             };
             pevm.reset_heat();
-            let (ok, tps, soft, wh, aborts) = run_one(&chain, &mut pevm, &loaded, 8);
+            let (ok, tps, wall_ms, soft, wh, aborts) = run_one(&chain, &mut pevm, &loaded, 8);
             let m = pevm.last_specfence_metrics();
+            let n = n_tx(&loaded.block);
+            let reexec_entries = m.evm_entries.saturating_sub(n);
             println!(
-                "  block={bn} mode={mode:10} ok={ok} tps={tps:.0} soft={soft} wait_hard={wh} abort_rate={:.3} lean={} evm={} rewind={} ff_hit={} park_k={}",
-                if n_tx(&loaded.block) == 0 { 0.0 } else { aborts as f64 / n_tx(&loaded.block) as f64 },
+                "  block={bn} mode={mode:10} ok={ok} tps={tps:.0} wall_ms={wall_ms:.1} soft={soft} wait_hard={wh} abort_rate={:.3} lean={} evm={} reexec={} fb_reabort={} sw_ok={} sw_reabort={} park_k={}",
+                if n == 0 { 0.0 } else { aborts as f64 / n as f64 },
                 m.lean_mode_txs,
                 m.evm_entries,
-                m.rewind_to_cp,
-                m.journal_ff_hits,
+                reexec_entries,
+                m.force_bind_reabort,
+                m.soft_wait_wake_ok,
+                m.soft_wait_wake_reabort,
                 m.park_resume_at_k,
             );
             sweep_rows.push(serde_json::json!({
@@ -184,7 +215,9 @@ fn main() {
                 "mode": mode,
                 "cores": 8,
                 "ok": ok,
+                "n_tx": n,
                 "tps": tps,
+                "wall_ms": wall_ms,
                 "soft_wait_arms": soft,
                 "wait_hard": wh,
                 "occ_aborts": aborts,
@@ -192,8 +225,9 @@ fn main() {
                 "hotset_size": m.hotset_size,
                 "bind_hits": m.bind_hits,
                 "spec_read_count": m.spec_read_count,
-                // V5-P3 dig hooks (interpreter-seconds / rewind / SoftWait wake)
+                // V5 dig hooks (interpreter-seconds / rewind / SoftWait / ForceBind)
                 "evm_entries": m.evm_entries,
+                "reexec_entries": reexec_entries,
                 "rewind_to_cp": m.rewind_to_cp,
                 "resume_count": m.resume_count,
                 "journal_ff_entries": m.journal_ff_entries,
@@ -202,6 +236,14 @@ fn main() {
                 "park_resume_full_retry": m.park_resume_full_retry,
                 "full_restart": m.full_restart,
                 "partial_retry_count": m.partial_retry_count,
+                "force_bind_reabort": m.force_bind_reabort,
+                "soft_wait_wake_ok": m.soft_wait_wake_ok,
+                "soft_wait_wake_reabort": m.soft_wait_wake_reabort,
+                "rebind_only": m.rebind_only,
+                "tx_full_retry": m.tx_full_retry,
+                "wait_park_count": m.wait_park_count,
+                "wait_park_ns": m.wait_park_ns,
+                "ready_steal_on_wait": m.ready_steal_on_wait,
             }));
         }
     }
@@ -224,9 +266,11 @@ fn main() {
         ratios.iter().map(|r| r["sf_occ"].as_f64().unwrap()).sum::<f64>() / ratios.len() as f64
     };
     println!("  mean SF/OCC@8 = {mean:.3} (v8 baseline ~0.325 on different block set)");
-    let sweep_path = out_dir.join("g7-sf-occ-smoke.json");
+    let sweep_path = out_dir.join(&sweep_name);
     std::fs::write(&sweep_path, serde_json::to_string_pretty(&serde_json::json!({
         "test": "SF vs OCC@8 architecture cores",
+        "tag": if tag.is_empty() { serde_json::Value::Null } else { serde_json::json!(tag) },
+        "softwait_disabled": softwait_disabled,
         "v8_mean_reference": 0.325,
         "mean_sf_occ": mean,
         "ratios": ratios,
