@@ -21,8 +21,9 @@
 //! M2: WaitHard parks (tx-level) + ready-queue steal (lower TxIdx first); worker never spins.
 //! M3: online WŜ/RŜ prior → Bind-before-touch on first incarnation when writer version known.
 //! M4 (superseded by Adaptive CC R1): lean thresholds that never fired on mainnet.
-//! Adaptive CC R0–R2: default LeanOCC + location HotSet; inspect/jump off unless
-//! `SPECFENCE_ENABLE_INSPECT=1`; WaitHard only for ℓ ∈ HotSet; HotLocal Bind/park on hot ℓ.
+//! Adaptive CC R0–R2 + control law v3: HotSet is a fanout/tracking **hint** only;
+//! `choose_action` decides Bind/WaitHard/SpecRead (program fanout / handler SpecRead).
+//! Inspect/jump off unless `SPECFENCE_ENABLE_INSPECT=1`.
 
 use crate::{
     BuildSuffixHasher, MemoryLocation, TxIdx, chain::PevmChain, hash_deterministic,
@@ -56,11 +57,12 @@ pub(crate) use heat::HeatMap;
 pub(crate) use metrics::MetricsInner;
 pub use metrics::SpecFenceMetrics;
 pub use finegrain::{
-    AbortEvent, AccountGrainObserve, ConsumerFirstCross, DagStats, EffectClass, FineGrainCollector, FineGrainSnapshot, EffectStreamDiag,
-    HotLocation, LocationKind, MaMdProxy, RawEffectEdge, TxRw, RawEdge, analyze_dag,
-    classify_raw_edges, dependency_edges, effect_raw_longest_chain, effect_raw_max_fanout,
-    estimate_ma_md, filter_effect_edges, hot_locations, kind_histogram, percentile_f64,
-    program_raw_longest_chain,
+    AbortEvent, AccountGrainObserve, ConsumerFirstCross, DagStats, EffectClass, EffectLogEntry,
+    FineGrainCollector, FineGrainSnapshot, EffectStreamDiag, HotLocation, L1DagSummary,
+    LocationKind, MaMdProxy, MeasurementMethod, RawEffectEdge, TxRw, RawEdge, TxWorkTotal,
+    analyze_dag, classify_raw_edges, dependency_edges, effect_raw_longest_chain,
+    effect_raw_max_fanout, estimate_ma_md, filter_effect_edges, hot_locations, kind_histogram,
+    l1_dag_summary, percentile_f64, producer_status_canonical, program_raw_longest_chain,
 };
 pub use region::RegionMode;
 pub(crate) use region::RegionTable;
@@ -302,6 +304,9 @@ impl<'a> SpecFenceCtx<'a> {
         bind_version: Option<crate::TxVersion>,
         residual_predicts: bool,
         prior_ws_predicts: bool,
+        is_program: bool,
+        fanout_hint: bool,
+        gross_work_depth: Option<f64>,
     ) -> ResolveAction {
         let posterior_conflict = self.bayes.conflict_probability(location, Some(address));
         let posterior_bind = self.bayes.bind_useful_probability(location)
@@ -319,6 +324,9 @@ impl<'a> SpecFenceCtx<'a> {
             // Bind only against a published writer version.
             bind_version: if writer_done { bind_version } else { None },
             prior_ws_predicts: prior,
+            is_program,
+            fanout_hint,
+            gross_work_depth,
         };
         let action = choose_action(ctx);
         match &action {

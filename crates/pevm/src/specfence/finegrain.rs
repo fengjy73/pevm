@@ -61,6 +61,76 @@ impl LocationKind {
     }
 }
 
+/// Frozen measurement schema emitted by every finegrain collector export (§4 methodology).
+#[derive(Debug, Clone, Serialize)]
+pub struct MeasurementMethod {
+    /// pevm MemoryLocation (Basic / Storage / CodeHash / …)
+    pub location: &'static str,
+    /// Warm journal re-reads: always emit with warm=true (chosen policy).
+    pub warm_policy: &'static str,
+    /// Primary depth metric identity.
+    pub primary_depth: &'static str,
+    /// Depth formula: gas_used_so_far / tx_gas_used.
+    pub primary_depth_formula: &'static str,
+    /// No (p,c,ℓ) instance dedupe on RAW edges.
+    pub raw_instance: bool,
+    /// Excluded from effective G*.
+    pub excluded_from_effective_gstar: Vec<&'static str>,
+    /// Producer readiness sampled at discovering incarnation.
+    pub producer_status_sampled_at: &'static str,
+    /// Account-grain is diagnostic only — never primary Wait key.
+    pub account_grain: &'static str,
+    pub schema_version: &'static str,
+}
+
+impl MeasurementMethod {
+    pub fn frozen() -> Self {
+        Self {
+            location: "MemoryLocation",
+            warm_policy: "emit_warm_true",
+            primary_depth: "gross_work",
+            primary_depth_formula: "gas_used_so_far/tx_gas_used",
+            raw_instance: true,
+            excluded_from_effective_gstar: vec!["coinbase_beneficiary", "basic_lazy"],
+            producer_status_sampled_at: "discovering_incarnation",
+            account_grain: "diagnostic_only",
+            schema_version: "l1l2-v1",
+        }
+    }
+}
+
+/// Append-only L1 effect log entry (sequential / journal oracle).
+#[derive(Debug, Clone, Serialize)]
+pub struct EffectLogEntry {
+    pub tx: usize,
+    pub incarnation: usize,
+    pub effect_k: usize,
+    /// Opcode class: sload|sstore|balance|ext|account_write|other
+    pub op_class: String,
+    pub location: u64,
+    /// R | W
+    pub mode: &'static str,
+    pub gas_used_so_far: Option<u64>,
+    pub opcode_steps: Option<usize>,
+    pub call_depth: Option<u16>,
+    /// Journal re-read of a location already observed this incarnation.
+    pub warm: bool,
+    pub kind: String,
+}
+
+/// Canonical L2 producer_status ∈ {Data, Estimate, Running, Absent}.
+pub fn producer_status_canonical(ready: &str, mv: &str) -> &'static str {
+    match (ready, mv) {
+        (_, "estimate") | ("estimate", _) => "Estimate",
+        ("validated", _) | ("executed", _) | ("data", _) | (_, "data") => "Data",
+        ("running", _) | ("aborting", _) | ("ready", _) | ("executing", _) => "Running",
+        (_, "absent") => "Absent",
+        ("unknown", _) | (_, "unknown") => "Absent",
+        _ => "Absent",
+    }
+}
+
+
 /// One successful validation abort (OCC ESTIMATE path).
 #[derive(Debug, Clone, Serialize)]
 pub struct AbortEvent {
@@ -126,6 +196,18 @@ pub struct RawEffectEdge {
     /// MV entry at producer for this location: data|estimate|absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub producer_mv: Option<String>,
+    /// Canonical L2: Data|Estimate|Running|Absent (sampled at discovering incarnation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer_status: Option<String>,
+    /// True when producer_status == Data (Bind candidate).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_for_bind: Option<bool>,
+    /// Warm journal re-read (emit_warm_true policy).
+    #[serde(default)]
+    pub warm: bool,
+    /// Call depth at observe (inspector), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_depth: Option<u16>,
 }
 
 /// Per-consumer depth of first cross-tx program read (deep mode).
@@ -178,7 +260,7 @@ pub struct TxRw {
 }
 
 /// Machine-readable fine-grain snapshot after one parallel block.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct FineGrainSnapshot {
     pub n_tx: usize,
     pub beneficiary_hash: u64,
@@ -200,7 +282,33 @@ pub struct FineGrainSnapshot {
     pub stream_diag: EffectStreamDiag,
     /// Structured account-grain observes (slot cold, account hot) — research.
     pub account_grain_edges: Vec<AccountGrainObserve>,
+    /// Frozen measurement method (§4) — always present on exports.
+    pub method: MeasurementMethod,
+    /// L1 append-only effect timeline (R|W with warm bit); empty if journal off.
+    pub effect_log: Vec<EffectLogEntry>,
 }
+
+impl Default for FineGrainSnapshot {
+    fn default() -> Self {
+        Self {
+            n_tx: 0,
+            beneficiary_hash: 0,
+            txs: Vec::new(),
+            location_kinds: Vec::new(),
+            abort_events: Vec::new(),
+            final_incarnations: Vec::new(),
+            effect_edges: Vec::new(),
+            consumer_first_cross: Vec::new(),
+            deep_mode: false,
+            journal_mode: false,
+            stream_diag: EffectStreamDiag::default(),
+            account_grain_edges: Vec::new(),
+            method: MeasurementMethod::frozen(),
+            effect_log: Vec::new(),
+        }
+    }
+}
+
 
 /// Account-grain cross-tx observe: slot/location had no prior writer, but the
 /// account did (SLOAD/BALANCE/EXT*). Not primary RAW — EV-change diagnostic.
@@ -309,6 +417,12 @@ struct DeepRuntimeState {
     account_grain_edges: Vec<AccountGrainObserve>,
     finished: Vec<ConsumerFirstCross>,
     diag: EffectStreamDiag,
+    /// Locations already observed (R or W) this (tx,inc) — warm bit for emit_warm_true.
+    seen_locs: std::collections::HashSet<(usize, usize, u64)>,
+    /// Append-only L1 effect timeline.
+    effect_log: Vec<EffectLogEntry>,
+    /// Next effect_k for the unified L1 log per (tx, incarnation).
+    effect_counters: std::collections::HashMap<(usize, usize), usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -571,6 +685,8 @@ impl FineGrainCollector {
             c.first_program_producer_ready = Some(ready.clone());
             c.first_program_producer_mv = Some(mv_kind.clone());
         }
+        let status = producer_status_canonical(&ready, &mv_kind).to_string();
+        let ready_for_bind = status == "Data";
         let edge = RawEffectEdge {
             producer_tx,
             producer_effect_k: producer_k,
@@ -586,6 +702,10 @@ impl FineGrainCollector {
             gross_work_so_far: None,
             producer_ready: Some(ready),
             producer_mv: Some(mv_kind),
+            producer_status: Some(status),
+            ready_for_bind: Some(ready_for_bind),
+            warm: false,
+            call_depth: None,
         };
         let _ = c;
         st.edges.push(edge);
@@ -603,6 +723,7 @@ impl FineGrainCollector {
         gas_limit: Option<u64>,
         opcode_steps: Option<usize>,
         account: Option<[u8; 20]>,
+        call_depth: Option<u16>,
     ) -> usize {
         if !self.journal_enabled() {
             return 0;
@@ -614,6 +735,32 @@ impl FineGrainCollector {
             *ctr += 1;
             k
         };
+        let warm = !st.seen_locs.insert((tx_idx, incarnation, location));
+        let effect_k = {
+            let ctr = st.effect_counters.entry((tx_idx, incarnation)).or_insert(0);
+            let ek = *ctr;
+            *ctr += 1;
+            ek
+        };
+        let op_class = match kind {
+            LocationKind::Storage => "sstore",
+            LocationKind::Basic | LocationKind::BasicLazy => "account_write",
+            LocationKind::CodeHash => "account_write",
+            _ => "other",
+        };
+        st.effect_log.push(EffectLogEntry {
+            tx: tx_idx,
+            incarnation,
+            effect_k,
+            op_class: op_class.to_string(),
+            location,
+            mode: "W",
+            gas_used_so_far,
+            opcode_steps,
+            call_depth,
+            warm,
+            kind: kind.as_str().to_string(),
+        });
         st.write_effects
             .insert((tx_idx, incarnation, location), (k, kind));
         st.last_writer
@@ -651,6 +798,7 @@ impl FineGrainCollector {
         gas_used_so_far: Option<u64>,
         gas_limit: Option<u64>,
         opcode_steps: Option<usize>,
+        call_depth: Option<u16>,
     ) -> usize {
         let loc = hash_deterministic(MemoryLocation::Basic(address));
         let mut acct = [0u8; 20];
@@ -664,6 +812,7 @@ impl FineGrainCollector {
             gas_limit,
             opcode_steps,
             Some(acct),
+            call_depth,
         )
     }
 
@@ -678,12 +827,37 @@ impl FineGrainCollector {
         gas_limit: Option<u64>,
         opcode_steps: Option<usize>,
         account: Option<[u8; 20]>,
+        call_depth: Option<u16>,
     ) {
         if !self.journal_enabled() {
             return;
         }
         let mut st = self.deep_state.lock().unwrap();
         st.diag.journal_reads += 1;
+        let warm = !st.seen_locs.insert((consumer_tx, consumer_incarnation, location));
+        let effect_k_log = {
+            let ctr = st
+                .effect_counters
+                .entry((consumer_tx, consumer_incarnation))
+                .or_insert(0);
+            let ek = *ctr;
+            *ctr += 1;
+            ek
+        };
+        let op_class = opcode_class_from_kind(kind_hint).to_string();
+        st.effect_log.push(EffectLogEntry {
+            tx: consumer_tx,
+            incarnation: consumer_incarnation,
+            effect_k: effect_k_log,
+            op_class,
+            location,
+            mode: "R",
+            gas_used_so_far,
+            opcode_steps,
+            call_depth,
+            warm,
+            kind: kind_hint.as_str().to_string(),
+        });
 
         let producer_meta = st.last_writer.get(&location).and_then(|&(ptx, pinc, pk, kind)| {
             if ptx >= consumer_tx {
@@ -828,6 +1002,8 @@ impl FineGrainCollector {
                 }
             }
         }
+        let status = producer_status_canonical(&ready, &mv_kind).to_string();
+        let ready_for_bind = status == "Data";
         let edge = RawEffectEdge {
             producer_tx,
             producer_effect_k: producer_k,
@@ -843,6 +1019,10 @@ impl FineGrainCollector {
             gross_work_so_far: gas_used_so_far,
             producer_ready: Some(ready),
             producer_mv: Some(mv_kind),
+            producer_status: Some(status),
+            ready_for_bind: Some(ready_for_bind),
+            warm,
+            call_depth,
         };
         st.diag.journal_reads_cross += 1;
         st.edges.push(edge);
@@ -954,7 +1134,7 @@ impl FineGrainCollector {
         let abort_events = self.abort_events.lock().unwrap().clone();
         let deep_mode = self.deep_enabled();
         let journal_mode = self.journal_enabled();
-        let (effect_edges, consumer_first_cross, mut stream_diag, account_grain_edges) =
+        let (effect_edges, consumer_first_cross, mut stream_diag, account_grain_edges, effect_log) =
             if deep_mode {
                 let st = self.deep_state.lock().unwrap();
                 (
@@ -962,12 +1142,14 @@ impl FineGrainCollector {
                     st.finished.clone(),
                     st.diag.clone(),
                     st.account_grain_edges.clone(),
+                    st.effect_log.clone(),
                 )
             } else {
                 (
                     Vec::new(),
                     Vec::new(),
                     EffectStreamDiag::default(),
+                    Vec::new(),
                     Vec::new(),
                 )
             };
@@ -1086,6 +1268,8 @@ impl FineGrainCollector {
             journal_mode,
             stream_diag,
             account_grain_edges,
+            method: MeasurementMethod::frozen(),
+            effect_log,
         });
     }
 
@@ -1642,5 +1826,149 @@ pub fn estimate_ma_md(
         depth_p90: percentile_f64(&depths, 0.9),
         depth_mean: mean,
         frac_depth_lt_0_01: lt01,
+    }
+}
+
+
+/// L1 sequential DAG / morphology summary from a finegrain snapshot.
+#[derive(Debug, Clone, Serialize)]
+pub struct L1DagSummary {
+    pub n_raw_instances: usize,
+    pub n_raw_unique_pcl: usize,
+    pub n_waw_pairs: usize,
+    pub n_war_instances: usize,
+    pub wave_width: usize,
+    pub chain_length: usize,
+    pub program_chain_length: usize,
+    pub max_program_fanout: usize,
+    pub morphology: String,
+    pub n_effect_log: usize,
+    pub n_effect_log_warm: usize,
+    pub n_effect_log_cold: usize,
+    pub tx_work: Vec<TxWorkTotal>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TxWorkTotal {
+    pub tx: usize,
+    pub gas_used: Option<u64>,
+    pub opcode_steps: Option<usize>,
+    pub n_reads: usize,
+    pub n_writes: usize,
+}
+
+/// Build L1 DAG summary (RAW/WAW/WAR instances, wave width, chain, morphology).
+pub fn l1_dag_summary(snap: &FineGrainSnapshot) -> L1DagSummary {
+    use std::collections::{HashMap, HashSet};
+    let edges = filter_effect_edges(snap, true, true);
+    let n_raw = edges.len();
+    let mut pcl: HashSet<(usize, usize, u64)> = HashSet::new();
+    for e in &edges {
+        pcl.insert((e.producer_tx, e.consumer_tx, e.location));
+    }
+    let chain = effect_raw_longest_chain(&edges, false);
+    let prog_chain = effect_raw_longest_chain(&edges, true);
+    let fanout = effect_raw_max_fanout(&edges, true);
+    let dag = analyze_dag(snap, true, true);
+    let wave = dag.max_wave_width;
+    let n_waw = snap.stream_diag.waw_pairs;
+    // WAR proxy: locations read then later written by a higher tx (from final RW).
+    let mut writers: HashMap<u64, Vec<usize>> = HashMap::new();
+    let mut readers: HashMap<u64, Vec<usize>> = HashMap::new();
+    for tx in &snap.txs {
+        for &w in &tx.writes {
+            if w == snap.beneficiary_hash {
+                continue;
+            }
+            writers.entry(w).or_default().push(tx.tx_idx);
+        }
+        for &r in &tx.reads {
+            if r == snap.beneficiary_hash {
+                continue;
+            }
+            readers.entry(r).or_default().push(tx.tx_idx);
+        }
+    }
+    let mut n_war = 0usize;
+    for (loc, rs) in &readers {
+        if let Some(ws) = writers.get(loc) {
+            for &r in rs {
+                if ws.iter().any(|&w| w > r) {
+                    n_war += 1;
+                }
+            }
+        }
+    }
+    let n_prog = edges.iter().filter(|e| e.class == "program").count();
+    let n_hand = n_raw.saturating_sub(n_prog);
+    let prog_frac = if n_raw == 0 { 0.0 } else { n_prog as f64 / n_raw as f64 };
+    let morphology = if n_raw < 80 {
+        "quiet".to_string()
+    } else if fanout >= 100 && prog_frac > 0.8 {
+        "fan_out".to_string()
+    } else if snap.stream_diag.waw_pairs_no_intervening_raw as f64
+        >= 0.9 * (snap.stream_diag.waw_pairs.max(1) as f64)
+        && prog_chain <= 5
+        && n_hand as f64 / (n_raw.max(1) as f64) < 0.15
+    {
+        "waw_spine".to_string()
+    } else if prog_chain >= 8 {
+        "long_chain".to_string()
+    } else {
+        "mixed".to_string()
+    };
+
+    let mut best: HashMap<usize, &ConsumerFirstCross> = HashMap::new();
+    for c in &snap.consumer_first_cross {
+        best.entry(c.tx_idx)
+            .and_modify(|e| {
+                if c.incarnation >= e.incarnation {
+                    *e = c;
+                }
+            })
+            .or_insert(c);
+    }
+    let mut log_r: HashMap<usize, usize> = HashMap::new();
+    let mut log_w: HashMap<usize, usize> = HashMap::new();
+    let mut warm = 0usize;
+    let mut cold = 0usize;
+    for e in &snap.effect_log {
+        if e.warm {
+            warm += 1;
+        } else {
+            cold += 1;
+        }
+        match e.mode {
+            "R" => *log_r.entry(e.tx).or_default() += 1,
+            "W" => *log_w.entry(e.tx).or_default() += 1,
+            _ => {}
+        }
+    }
+    let mut tx_work = Vec::new();
+    for tx in &snap.txs {
+        let c = best.get(&tx.tx_idx);
+        tx_work.push(TxWorkTotal {
+            tx: tx.tx_idx,
+            gas_used: c.and_then(|x| x.gas_used),
+            opcode_steps: c.and_then(|x| x.total_opcode_steps),
+            n_reads: log_r.get(&tx.tx_idx).copied().unwrap_or(tx.n_reads),
+            n_writes: log_w.get(&tx.tx_idx).copied().unwrap_or(tx.n_writes),
+        });
+    }
+
+    L1DagSummary {
+        n_raw_instances: n_raw,
+        n_raw_unique_pcl: pcl.len(),
+        n_waw_pairs: n_waw,
+        n_war_instances: n_war,
+        wave_width: wave,
+        chain_length: chain,
+        program_chain_length: prog_chain,
+        max_program_fanout: fanout,
+        morphology,
+        n_effect_log: snap.effect_log.len(),
+        n_effect_log_warm: warm,
+        n_effect_log_cold: cold,
+        tx_work,
     }
 }

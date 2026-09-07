@@ -318,6 +318,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
         &self,
         address: Address,
         location_hash: MemoryLocationHash,
+        is_program: bool,
     ) -> Result<(), ReadError> {
         if self.specfence.mode == crate::ConcurrencyMode::SpecFence
             && self.specfence.hotset.contains(location_hash)
@@ -355,18 +356,16 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return Ok(());
         }
 
-        // --- SpecFence path ---
+        // --- SpecFence path (control law v3) ---
         if address == self.specfence.beneficiary {
             self.specfence.metrics.record_spec_read();
             return Ok(());
         }
-        // R1 LeanOCC: ℓ ∉ HotSet → OCC-style SpecRead only (no Bayes WaitHard).
-        if !self.specfence.hotset.contains(location_hash) {
-            self.specfence.metrics.record_spec_read();
-            return Ok(());
+        // HotSet = fanout / tracking cache hint only — not a hard Wait gate.
+        let fanout_hint = self.specfence.hotset.contains(location_hash);
+        if fanout_hint {
+            self.specfence.hotset.record_hot_local_read();
         }
-        // R2 HotLocal: Bind / WaitHard+park / SpecRead for ℓ ∈ HotSet.
-        self.specfence.hotset.record_hot_local_read();
 
         let residual_predicts = self
             .mv_memory
@@ -428,6 +427,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 bind_version.clone(),
                 residual_predicts,
                 prior_ws_predicts,
+                is_program,
+                fanout_hint,
+                None, // gross-work depth requires inspect; production default omits
             );
             // Safety valve only: escalate SpecRead when P is very high.
             // (Old EarlyVal@0.35 WaitHard bias removed — cost model owns π.)
@@ -719,7 +721,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         let location_hash = self.hash_basic(&address);
-        self.maybe_wait(address, location_hash)?;
+        self.maybe_wait(address, location_hash, false)?;
 
         // We return a mock for non-contract addresses (for lazy updates) to avoid
         // unnecessarily evaluating its balance here.
@@ -1017,7 +1019,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
 
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
         let location_hash = hash_deterministic(MemoryLocation::Storage(address, index));
-        self.maybe_wait(address, location_hash)?;
+        self.maybe_wait(address, location_hash, true)?;
 
         // M1b: certified-prefix FF cache — skip MV/storage heavy path when origin stable.
         if let Some((value, origin)) = self.try_ff_storage(location_hash) {

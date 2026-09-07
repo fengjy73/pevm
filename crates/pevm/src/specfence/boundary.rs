@@ -878,7 +878,7 @@ fn u256_to_address(v: U256) -> Address {
 }
 
 /// Opt-in journal RAW stream (FineGrain journal mode). Zero cost when finegrain TLS unset.
-fn maybe_note_journal_effect(interp: &Interpreter<EthInterpreter>, op: u8, opcode_steps: u64) {
+fn maybe_note_journal_effect(interp: &Interpreter<EthInterpreter>, op: u8, opcode_steps: u64, call_depth: u16) {
     const OP_BALANCE: u8 = 0x31;
     const OP_CALL: u8 = 0xf1;
     const OP_CALLCODE: u8 = 0xf2;
@@ -921,6 +921,7 @@ fn maybe_note_journal_effect(interp: &Interpreter<EthInterpreter>, op: u8, opcod
                     gas_limit,
                     steps,
                     Some(target_acct),
+                    Some(call_depth),
                 );
             }
             OP_SSTORE => {
@@ -936,6 +937,7 @@ fn maybe_note_journal_effect(interp: &Interpreter<EthInterpreter>, op: u8, opcod
                     gas_limit,
                     steps,
                     Some(target_acct),
+                    Some(call_depth),
                 );
             }
             OP_BALANCE => {
@@ -953,6 +955,7 @@ fn maybe_note_journal_effect(interp: &Interpreter<EthInterpreter>, op: u8, opcod
                     gas_limit,
                     steps,
                     Some(acct),
+                    Some(call_depth),
                 );
             }
             OP_SELFBALANCE => {
@@ -966,6 +969,7 @@ fn maybe_note_journal_effect(interp: &Interpreter<EthInterpreter>, op: u8, opcod
                     gas_limit,
                     steps,
                     Some(target_acct),
+                    Some(call_depth),
                 );
             }
             OP_EXTCODESIZE | OP_EXTCODEHASH | OP_EXTCODECOPY => {
@@ -983,6 +987,7 @@ fn maybe_note_journal_effect(interp: &Interpreter<EthInterpreter>, op: u8, opcod
                     gas_limit,
                     steps,
                     Some(acct),
+                    Some(call_depth),
                 );
             }
             // Live account-write instances (producer_effect_k), not finalize-only.
@@ -1003,6 +1008,7 @@ fn maybe_note_journal_effect(interp: &Interpreter<EthInterpreter>, op: u8, opcod
                     gas_used,
                     gas_limit,
                     steps,
+                    Some(call_depth),
                 );
                 fg.deep_note_journal_account_write(
                     plant.tx_idx,
@@ -1012,6 +1018,7 @@ fn maybe_note_journal_effect(interp: &Interpreter<EthInterpreter>, op: u8, opcod
                     gas_used,
                     gas_limit,
                     steps,
+                    Some(call_depth),
                 );
             }
             OP_CREATE | OP_CREATE2 => {
@@ -1024,6 +1031,7 @@ fn maybe_note_journal_effect(interp: &Interpreter<EthInterpreter>, op: u8, opcod
                     gas_used,
                     gas_limit,
                     steps,
+                    Some(call_depth),
                 );
             }
             OP_SELFDESTRUCT => {
@@ -1037,6 +1045,7 @@ fn maybe_note_journal_effect(interp: &Interpreter<EthInterpreter>, op: u8, opcod
                     gas_used,
                     gas_limit,
                     steps,
+                    Some(call_depth),
                 );
                 fg.deep_note_journal_account_write(
                     plant.tx_idx,
@@ -1046,6 +1055,7 @@ fn maybe_note_journal_effect(interp: &Interpreter<EthInterpreter>, op: u8, opcod
                     gas_used,
                     gas_limit,
                     steps,
+                    Some(call_depth),
                 );
             }
             OP_DELEGATECALL | OP_STATICCALL => {}
@@ -1187,7 +1197,8 @@ where
         LAST_OPCODE.set(op);
         // Research journal stream: log every storage/basic world-state opcode
         // (including journal-cached repeats that never re-enter pevm Db).
-        maybe_note_journal_effect(interp, op, n);
+        let depth = CALL_DEPTH.get();
+        maybe_note_journal_effect(interp, op, n, depth);
     }
 
     fn step_end(&mut self, interp: &mut Interpreter<EthInterpreter>, context: &mut CTX) {

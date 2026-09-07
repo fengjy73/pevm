@@ -6,7 +6,8 @@
 //! 3. Process prior: sustained multi-writer mass for ℓ above threshold
 //!    (needs repeated reinforcement; decays when unseen so wide blocks stay lean).
 //!
-//! WaitHard / Bayes Wait are forbidden for ℓ ∉ HotSet (LeanOCC SpecRead only).
+//! Control law v3: HotSet is a **fanout / tracking cache hint** for `choose_action`,
+//! not a hard Wait gate (handler / cold locs still SpecRead via π).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
