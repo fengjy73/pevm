@@ -1,7 +1,8 @@
-//! Dual-horizon SpecFence learner (P1 / AEC) — ∉ TCB.
+//! Dual-horizon SpecFence learner (P1 / AEC / V5-P2 θ) — ∉ TCB.
 //!
 //! Intra-block: live fanout + morphology posterior + EV estimators
-//! (`E_wait_time`, `E_cascade`, SoftWait latency, bind/wait_useful) updated on outcomes.
+//! (`E_wait_time`, `E_cascade`, `E_reexec`, `E_idle_steal`, SoftWait latency,
+//! bind/wait_useful, meta tax) updated on outcomes.
 //! Inter-block: `InterBlockPrior` EMA + flip decay; seeds HotSet/Bayes / θ warm-start only —
 //! **never** arms SoftWait from prior alone.
 //!
@@ -106,22 +107,30 @@ impl MorphWeights {
 /// Depth `d` and fan-out enter EV as continuous features.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct AdaptiveParams {
-    /// α in `EV_Wait = E_wait_time * (1 + α * fanout)` — high fanout ↑ EV_Wait.
+    /// α in `EV_Wait = E_wait_time * (1 + α * fanout) + δ * E_idle` — high fanout ↑ EV_Wait.
     pub alpha_fanout: f64,
-    /// β in `EV_Spec = P_abort * (W_remain + β * E_cascade)`.
+    /// β in `EV_Spec = P_abort * (W_remain + β * E_cascade + γ * E_reexec)`.
     pub beta_cascade: f64,
+    /// γ weight of measured E_reexec inside EV_Spec (V5-P1 lean ForceBind vs FullRestart).
+    pub gamma_reexec: f64,
+    /// δ weight of idle-steal tax added to EV_Wait (park without steal raises Wait).
+    pub delta_idle: f64,
     /// EMA learning rate for per-ℓ E_wait_time (arm→wake latency units).
     pub lr_wait_time: f64,
-    /// EMA learning rate for E_cascade.
+    /// EMA learning rate for E_cascade / E_reexec / E_idle.
     pub lr_cascade: f64,
     /// Prior E_wait_time (normalized work units; ~1.0 = one unresolved producer).
     pub e_wait_prior: f64,
     /// Prior expected cascade size (work units).
     pub e_cascade_prior: f64,
-    /// EarlyAbort reexec overhead term in `EV_Early = W_prefix + E_reexec`.
+    /// Prior / EarlyAbort reexec overhead; also EV_Spec via γ.
     pub e_reexec: f64,
+    /// Prior idle-steal tax (0 = cores stay busy on Wait via steal).
+    pub e_idle_prior: f64,
     /// Meta budget ρ: if meta_ops/useful_effects > ρ → force SpecRead (OCC fallback).
     pub meta_budget_rho: f64,
+    /// Tiny EV gap bias: if EV_Wait beats EV_Spec by < meta_gap_eps*(1+meta_tax) → SpecRead.
+    pub meta_gap_eps: f64,
     /// EarlyAbort niche only: known d ≤ d_early (not a Wait cut).
     pub d_early: f64,
     /// Bind escalation when published Data + very-high P (not a Wait gate).
@@ -151,15 +160,22 @@ impl AdaptiveParams {
     /// AEC defaults: learning rates / priors. `d_wait` retained but unused by π.
     pub(crate) const fn from_l3() -> Self {
         Self {
-            alpha_fanout: 0.20,
+            alpha_fanout: 0.22,
             beta_cascade: 1.0,
+            // Half-weight reexec so Spec is priced but Quiet does not Wait-storm.
+            gamma_reexec: 0.50,
+            // Mild idle tax: park-without-steal raises EV_Wait (prefer Spec).
+            delta_idle: 0.10,
             lr_wait_time: 0.25,
             lr_cascade: 0.20,
             e_wait_prior: 1.0,
             e_cascade_prior: 1.0,
             e_reexec: 1.5,
+            e_idle_prior: 0.20,
             // SoftWait/meta_ops over useful effects > ρ → OCC SpecRead (after warmup).
-            meta_budget_rho: 0.35,
+            meta_budget_rho: 0.30,
+            // Near-tie Wait wins → Spec when measured meta tax (no SoftWait storm).
+            meta_gap_eps: 0.05,
             d_early: 0.15,
             tau_very_high: 0.75,
             tau_w: 0.35,
@@ -346,10 +362,11 @@ pub(crate) struct LiveLearner {
     meta_ops: AtomicUsize,
     /// Useful effects (bind + wait_useful + publishes) for ρ denominator.
     useful_effects: AtomicUsize,
-    /// Global EMA E_wait_time / E_cascade / E_reexec (fixed-point ×1e6).
+    /// Global EMA E_wait_time / E_cascade / E_reexec / E_idle (fixed-point ×1e6).
     global_e_wait_bits: AtomicU64,
     global_e_cascade_bits: AtomicU64,
     global_e_reexec_bits: AtomicU64,
+    global_e_idle_bits: AtomicU64,
     /// Running morph weights (normalized periodically).
     morph_bits: Mutex<MorphWeights>,
     /// Block AdaptiveParams snapshot for EMA rates (set at begin_block).
@@ -392,6 +409,8 @@ impl LiveLearner {
             .store(fp_encode(params.e_cascade_prior), Ordering::Relaxed);
         self.global_e_reexec_bits
             .store(fp_encode(params.e_reexec), Ordering::Relaxed);
+        self.global_e_idle_bits
+            .store(fp_encode(params.e_idle_prior), Ordering::Relaxed);
         *self.morph_bits.lock().unwrap() = prior_morph.normalize();
         *self.params_bits.lock().unwrap() = params;
     }
@@ -522,7 +541,8 @@ impl LiveLearner {
             .store(fp_encode(g_next), Ordering::Relaxed);
     }
 
-    /// Best-effort steal/idle or park duration proxies (debug + meta awareness).
+    /// Steal/idle or park duration proxies → E_idle_steal EMA for EV_Wait.
+    /// Steal success ⇒ low idle tax (cores stay busy); long park ⇒ high tax.
     pub(crate) fn note_steal_or_park_proxy(&self, steal: bool, park_ns: u64) {
         if steal {
             self.steal_events.fetch_add(1, Ordering::Relaxed);
@@ -530,6 +550,29 @@ impl LiveLearner {
         if park_ns > 0 {
             self.park_ns_proxy.fetch_add(park_ns, Ordering::Relaxed);
         }
+        // No sample if neither steal nor park (noop probe).
+        if !steal && park_ns == 0 {
+            return;
+        }
+        let params = *self.params_bits.lock().unwrap();
+        let lr = params.lr_cascade;
+        // Normalized idle tax units (same scale as E_wait_time).
+        // Steal must NOT collapse E_idle: on fan-out, cheap Wait serializes
+        // dependents even if the waiter core steals. Park-without-steal raises tax.
+        let sample = if steal {
+            params.e_idle_prior
+        } else {
+            (park_ns as f64 / 1_000_000.0).clamp(params.e_idle_prior, 4.0)
+        };
+        let prev = fp_decode(self.global_e_idle_bits.load(Ordering::Relaxed));
+        let prev = if prev <= f64::EPSILON {
+            params.e_idle_prior
+        } else {
+            prev
+        };
+        let next = (1.0 - lr) * prev + lr * sample;
+        self.global_e_idle_bits
+            .store(fp_encode(next), Ordering::Relaxed);
     }
 
     /// Count a meta op (SoftWait arm / WaitHard decision) toward ρ budget.
@@ -591,6 +634,33 @@ impl LiveLearner {
         } else {
             self.params_bits.lock().unwrap().e_reexec
         }
+    }
+
+    /// E_idle_steal — park/idle tax when Wait does not keep cores busy via steal.
+    pub(crate) fn e_idle_steal(&self) -> f64 {
+        let g = fp_decode(self.global_e_idle_bits.load(Ordering::Relaxed));
+        if g > f64::EPSILON {
+            g
+        } else {
+            self.params_bits.lock().unwrap().e_idle_prior
+        }
+    }
+
+    /// Continuous meta tax ratio meta_ops/useful (0 before warmup). Feeds tiny-gap Spec bias.
+    pub(crate) fn meta_tax_ratio(&self, params: &AdaptiveParams) -> f64 {
+        let obs = self.program_obs.load(Ordering::Relaxed)
+            + self.handler_obs.load(Ordering::Relaxed);
+        if obs < 64 {
+            return 0.0;
+        }
+        let meta = self.meta_ops.load(Ordering::Relaxed) as f64;
+        let useful = self
+            .useful_effects
+            .load(Ordering::Relaxed)
+            .max(self.program_obs.load(Ordering::Relaxed))
+            .max(obs / 4)
+            .max(1) as f64;
+        (meta / useful).max(0.0)
     }
 
     /// Mean cascade size this block (fallback).
@@ -963,5 +1033,62 @@ mod tests {
         let low = e * (1.0 + p.alpha_fanout * 1.0);
         let high = e * (1.0 + p.alpha_fanout * 16.0);
         assert!(high > low);
+    }
+
+    #[test]
+    fn v5_p2_park_raises_idle_tax_steal_does_not_collapse() {
+        let live = LiveLearner::new();
+        let params = AdaptiveParams::from_l3();
+        live.begin_block_with_params(MorphWeights::default(), params);
+        let prior = live.e_idle_steal();
+        // Long park without steal → idle tax up.
+        live.note_steal_or_park_proxy(false, 3_000_000);
+        let after_park = live.e_idle_steal();
+        assert!(after_park > prior + 0.1, "{after_park} vs {prior}");
+        // Steal refreshes toward prior — must not collapse below ~prior/2.
+        for _ in 0..12 {
+            live.note_steal_or_park_proxy(true, 0);
+        }
+        let after_steal = live.e_idle_steal();
+        assert!(
+            after_steal + 1e-9 >= params.e_idle_prior * 0.5,
+            "steal must not cheapen Wait via collapsed idle: {after_steal}"
+        );
+        assert!(after_steal < after_park, "{after_steal} vs {after_park}");
+    }
+
+    #[test]
+    fn v5_p2_reexec_ema_tracks_lean_force_bind_vs_full_restart() {
+        let live = LiveLearner::new();
+        let params = AdaptiveParams::from_l3();
+        live.begin_block_with_params(MorphWeights::default(), params);
+        // V5-P1 Lean ForceBind sample.
+        live.note_reexec_cost(1.2);
+        let mid = live.e_reexec();
+        assert!(mid > 1.0 && mid < 1.6, "{mid}");
+        // Bare FullRestart raises E_reexec.
+        for _ in 0..6 {
+            live.note_reexec_cost(2.2);
+        }
+        let high = live.e_reexec();
+        assert!(high > mid, "{high} vs {mid}");
+    }
+
+    #[test]
+    fn v5_p2_meta_tax_ratio_continuous() {
+        let live = LiveLearner::new();
+        let params = AdaptiveParams::from_l3();
+        live.begin_block_with_params(MorphWeights::default(), params);
+        assert_eq!(live.meta_tax_ratio(&params), 0.0);
+        for i in 0..70 {
+            live.note_observe(i as u64, true, 1);
+        }
+        live.note_bind_success(1);
+        for _ in 0..5 {
+            live.note_meta_op();
+        }
+        let r = live.meta_tax_ratio(&params);
+        assert!(r > 0.0, "{r}");
+        assert!(!live.meta_budget_exceeded(&params) || r > params.meta_budget_rho);
     }
 }

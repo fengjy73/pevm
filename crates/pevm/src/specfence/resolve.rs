@@ -3,12 +3,14 @@
 //! Sole decision = argmin EV over FenceGraph actions (makespan-relevant):
 //! ```text
 //! EV_Bind  = 0 if Data ready (published version) else +∞
-//! EV_Wait  = E_wait_time(ℓ) * (1 + α * fanout)   # HIGH fanout ↑ EV_Wait
-//! EV_Spec  = P_abort(ℓ,x) * (W_remain(d) + β * E_cascade + E_reexec)
+//! EV_Wait  = E_wait_time(ℓ)*(1+α*fanout) + δ*max(0,E_idle−prior)/(1+fanout)
+//! EV_Spec  = P_abort(ℓ,x) * (W_remain(d) + β * E_cascade + γ * E_reexec)
 //! EV_Early = W_prefix(d) + E_reexec   # only if d known & heavy features
 //! pick argmin; ties → SpecRead (OCC-like default)
 //! ```
-//! Abort→reexec cost feeds `E_reexec` so Spec is not underpriced on fan-out.
+//! V5-P2 θ: measured wake latency → E_wait_time; cascade → E_cascade;
+//! idle-steal → E_idle_steal; lean ForceBind/FullRestart → E_reexec.
+//! Meta tax: ρ hard Spec + tiny-gap Spec bias (no SoftWait storm).
 //! Bind is aggressive when Data is published / WŜ predicts a ready version —
 //! still EV (not Boolean Wait ladders).
 //!
@@ -17,7 +19,6 @@
 //! `if d≥D_WAIT: WaitHard`, morph `d:=0.9` Wait force, `P≥τ` Wait force.
 //!
 //! EarlyAbort only when measured/proxy `d` is Some (no morph-forced EarlyAbort).
-//! Meta budget: if meta_ops/useful > ρ → force SpecRead.
 //! Learning ∉ TCB. Constants live in [`AdaptiveParams`] as rates/priors.
 
 #![allow(dead_code)]
@@ -60,12 +61,16 @@ pub(crate) struct PolicyCtx {
     pub fanout_hint: bool,
     /// Live reader fanout at ℓ (continuous feature for EV_Wait).
     pub live_fanout: f64,
-    /// Learned / prior E_wait_time(ℓ) in normalized work units.
+    /// Learned / prior E_wait_time(ℓ) in normalized work units (wake latency EMA).
     pub e_wait_time: f64,
     /// Learned / prior E_cascade(ℓ).
     pub e_cascade: f64,
     /// Learned / prior abort→reexec cost (feeds EV_Spec + EV_Early).
     pub e_reexec: f64,
+    /// Idle-steal tax: park without steal raises EV_Wait (cores idle).
+    pub e_idle_steal: f64,
+    /// Continuous meta_ops/useful (0 before warmup) — tiny-gap Spec bias.
+    pub meta_tax: f64,
     /// Meta budget exceeded → force SpecRead (OCC fallback).
     pub meta_budget_exceeded: bool,
     /// Known depth only: gross-work / effect-progress proxy.
@@ -190,26 +195,35 @@ pub(crate) struct EvScores {
 }
 
 /// AEC EV estimates (finite actions only; Bind handled separately).
+///
+/// V5-P2: θ-driven continuous costs only — no Boolean Wait gates.
 pub(crate) fn compute_ev(ctx: &PolicyCtx) -> EvScores {
     let params = &ctx.params;
     let fanout = fanout_feature(ctx);
 
-    // EV_Wait: high fanout raises cost (discourage Wait / serialize).
+    // EV_Wait: wake latency × fanout tax + idle-steal tax.
+    // HIGH fanout raises cost (discourage serialize); idle park raises Wait.
     let ev_wait = if !ctx.is_program || ctx.waw_spine_hint || !ctx.writer_known {
         f64::INFINITY
     } else if ctx.writer_done {
         0.0
     } else {
         let e_wait = ctx.e_wait_time.max(params.e_wait_prior * 0.05);
+        // Idle excess above prior; scale by 1/(1+fanout) so high-fanout
+        // serialize tax (α) is not double-counted with worker park.
+        let idle_excess = (ctx.e_idle_steal - params.e_idle_prior).max(0.0);
         e_wait * (1.0 + params.alpha_fanout * fanout)
+            + params.delta_idle * idle_excess / (1.0 + fanout)
     };
 
     let p_abort = ctx.posterior_conflict.clamp(0.0, 1.0);
     let e_cascade = ctx.e_cascade.max(0.0);
-    // Measured abort→reexec (FullRestart/RewindTo) so Spec is not underpriced on fan-out.
-    // Half-weight E_reexec so Spec is priced but Quiet/low-fanout does not Wait-storm.
+    // Measured abort→reexec (V5-P1 ForceBind≈1.2 / FullRestart≈2.2) via γ.
     let e_reexec = ctx.e_reexec.max(params.e_reexec * 0.25).max(0.0);
-    let ev_spec = p_abort * (w_remain(ctx) + params.beta_cascade * e_cascade + 0.5 * e_reexec);
+    let ev_spec = p_abort
+        * (w_remain(ctx)
+            + params.beta_cascade * e_cascade
+            + params.gamma_reexec * e_reexec);
 
     let ev_early = if early_abort_candidate(ctx) {
         let w_prefix = ctx.gross_work_depth.unwrap_or(0.0).clamp(0.0, 1.0);
@@ -223,6 +237,24 @@ pub(crate) fn compute_ev(ctx: &PolicyCtx) -> EvScores {
         ev_spec,
         ev_early,
     }
+}
+
+/// Tiny-gap meta bias: Wait barely beats Spec under meta pressure → SpecRead.
+#[inline]
+fn meta_tax_prefers_spec(ev_wait: f64, ev_spec: f64, meta_tax: f64, params: &AdaptiveParams) -> bool {
+    if !ev_wait.is_finite() || !ev_spec.is_finite() {
+        return false;
+    }
+    // Only when measured meta tax is present — cold start matches pre-P2 π.
+    if meta_tax <= f64::EPSILON {
+        return false;
+    }
+    let gap = ev_spec - ev_wait; // >0 ⇒ Wait currently cheaper
+    if gap <= 0.0 {
+        return false;
+    }
+    let thresh = params.meta_gap_eps * (1.0 + meta_tax);
+    gap < thresh
 }
 
 /// AEC π: Bind if Data ready; else argmin EV; ties → SpecRead; meta budget → SpecRead.
@@ -264,7 +296,9 @@ pub(crate) fn choose_action(ctx: PolicyCtx) -> ResolveAction {
             best = ResolveAction::Bind(v);
             best_ev = ev_bind;
         }
-        if ev.ev_wait + EPS < best_ev {
+        if ev.ev_wait + EPS < best_ev
+            && !meta_tax_prefers_spec(ev.ev_wait, ev.ev_spec, ctx.meta_tax, &params)
+        {
             best = ResolveAction::WaitHard;
             best_ev = ev.ev_wait;
         }
@@ -280,11 +314,14 @@ pub(crate) fn choose_action(ctx: PolicyCtx) -> ResolveAction {
     }
 
     // Argmin; strict improvement only — ties keep SpecRead (OCC-like default).
+    // V5-P2: measured meta tax biases Spec on tiny Wait wins (no SoftWait storm).
     const EPS: f64 = 1e-9;
     let mut best = ResolveAction::SpecRead;
     let mut best_ev = ev.ev_spec;
 
-    if ev.ev_wait + EPS < best_ev {
+    if ev.ev_wait + EPS < best_ev
+        && !meta_tax_prefers_spec(ev.ev_wait, ev.ev_spec, ctx.meta_tax, &params)
+    {
         best = ResolveAction::WaitHard;
         best_ev = ev.ev_wait;
     }
@@ -348,6 +385,8 @@ mod tests {
             e_wait_time: params.e_wait_prior,
             e_cascade: params.e_cascade_prior,
             e_reexec: params.e_reexec,
+            e_idle_steal: params.e_idle_prior,
+            meta_tax: 0.0,
             meta_budget_exceeded: false,
             gross_work_depth: d,
             morph_weights: MorphWeights::default(),
@@ -429,7 +468,9 @@ mod tests {
     #[test]
     fn aec_tie_defaults_to_specread() {
         let mut c = ctx_aec(0.5, true, false, None, false, true, false, 0.0, None);
-        // EV_Spec = 0.5 * (1 + β*1 + 0.5*1.5) = 1.375; set EV_Wait equal → tie → SpecRead
+        // EV_Spec = 0.5 * (1 + β*1 + γ*1.5) = 1.375 with γ=0.5; set EV_Wait equal → tie → SpecRead
+        // EV_Wait also adds δ*E_idle — zero idle for exact tie.
+        c.e_idle_steal = 0.0;
         c.e_wait_time = 1.375;
         c.posterior_conflict = 0.5;
         c.e_cascade = 1.0;
@@ -591,5 +632,102 @@ mod tests {
     fn g3_no_handler_waithard_from_high_p() {
         let a = choose_action(ctx_aec(0.90, true, false, None, false, false, true, 8.0, None));
         assert_eq!(a, ResolveAction::SpecRead);
+    }
+
+    #[test]
+    fn v5_p2_ev_wait_uses_wake_and_idle_theta() {
+        let mut c = ctx_aec(0.5, true, false, None, false, true, false, 2.0, None);
+        c.e_wait_time = 1.0;
+        c.e_idle_steal = c.params.e_idle_prior; // at prior → no excess tax
+        let ev0 = compute_ev(&c);
+        c.e_idle_steal = 0.0; // below prior still no excess
+        let ev_lo = compute_ev(&c);
+        assert!(
+            (ev_lo.ev_wait - ev0.ev_wait).abs() < 1e-12,
+            "idle at/below prior must match P1 EV_Wait"
+        );
+        c.e_idle_steal = 2.0; // park-heavy excess
+        let ev1 = compute_ev(&c);
+        assert!(
+            ev1.ev_wait > ev0.ev_wait,
+            "idle excess θ must raise EV_Wait: {:?} vs {:?}",
+            ev1.ev_wait,
+            ev0.ev_wait
+        );
+        c.e_wait_time = 3.0; // longer wake
+        let ev2 = compute_ev(&c);
+        assert!(
+            ev2.ev_wait > ev1.ev_wait,
+            "wake θ must raise EV_Wait: {:?} vs {:?}",
+            ev2.ev_wait,
+            ev1.ev_wait
+        );
+    }
+
+    #[test]
+    fn v5_p2_ev_spec_uses_measured_reexec_gamma() {
+        let mut c = ctx_aec(0.8, true, false, None, false, true, false, 1.0, Some(0.3));
+        c.e_cascade = 0.5;
+        c.e_reexec = 1.2; // Lean ForceBind
+        let cheap = compute_ev(&c);
+        c.e_reexec = 2.2; // FullRestart
+        let dear = compute_ev(&c);
+        assert!(
+            dear.ev_spec > cheap.ev_spec,
+            "higher E_reexec must raise EV_Spec: {:?} vs {:?}",
+            dear.ev_spec,
+            cheap.ev_spec
+        );
+        // γ is a param (not a Boolean gate).
+        assert!((c.params.gamma_reexec - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn v5_p2_meta_tax_tiny_gap_biases_specread() {
+        // Clear Wait win with zero meta → WaitHard (cold start ≡ P1).
+        let mut c = ctx_aec(0.90, true, false, None, false, true, false, 1.0, Some(0.2));
+        c.e_wait_time = 0.3;
+        c.e_cascade = 2.0;
+        c.e_idle_steal = 0.0;
+        c.meta_tax = 0.0;
+        let ev = compute_ev(&c);
+        assert!(ev.ev_wait + 1e-9 < ev.ev_spec, "{:?}", ev);
+        assert_eq!(choose_action(c.clone()), ResolveAction::WaitHard);
+
+        // Tiny Wait win + measured meta_tax → SpecRead (no SoftWait storm).
+        let mut c2 = c.clone();
+        let gap_target = c2.params.meta_gap_eps * 0.5;
+        let fanout = 1.0;
+        let ev_spec = compute_ev(&c2).ev_spec;
+        c2.e_wait_time = (ev_spec - gap_target) / (1.0 + c2.params.alpha_fanout * fanout);
+        c2.e_idle_steal = 0.0;
+        c2.meta_tax = 0.0;
+        assert_eq!(
+            choose_action(c2.clone()),
+            ResolveAction::WaitHard,
+            "zero meta_tax must not tiny-gap Spec"
+        );
+        c2.meta_tax = 0.5; // thresh = 0.06*(1.5)=0.09 > gap_target
+        assert_eq!(
+            choose_action(c2),
+            ResolveAction::SpecRead,
+            "measured meta tax + tiny Wait win → Spec"
+        );
+    }
+
+    #[test]
+    fn v5_p2_high_meta_tax_widens_tiny_gap_window() {
+        let mut c = ctx_aec(0.85, true, false, None, false, true, false, 1.0, Some(0.25));
+        c.e_cascade = 1.0;
+        c.e_reexec = 1.5;
+        c.e_idle_steal = 0.0;
+        let ev_spec = compute_ev(&c).ev_spec;
+        // Gap = 1.5*eps: zero meta → Wait; high meta widens window → Spec.
+        let gap = c.params.meta_gap_eps * 1.5;
+        c.e_wait_time = (ev_spec - gap) / (1.0 + c.params.alpha_fanout * 1.0);
+        c.meta_tax = 0.0;
+        assert_eq!(choose_action(c.clone()), ResolveAction::WaitHard);
+        c.meta_tax = 2.0; // thresh = 0.06*(1+2)=0.18 > gap
+        assert_eq!(choose_action(c), ResolveAction::SpecRead);
     }
 }

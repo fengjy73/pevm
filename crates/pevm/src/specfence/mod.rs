@@ -261,6 +261,8 @@ impl<'a> SpecFenceCtx<'a> {
         let e_wait_time = self.learner.e_wait_time(location);
         let e_cascade = self.learner.e_cascade(location);
         let e_reexec = self.learner.e_reexec();
+        let e_idle_steal = self.learner.e_idle_steal();
+        let meta_tax = self.learner.meta_tax_ratio(self.params);
         let meta_budget_exceeded = self.learner.meta_budget_exceeded(self.params);
         // G3: pass published Data version into π even when writer not yet is_done —
         // choose_action decides Bind via prior_ws / high P / placeholder_ready.
@@ -280,6 +282,8 @@ impl<'a> SpecFenceCtx<'a> {
             e_wait_time,
             e_cascade,
             e_reexec,
+            e_idle_steal,
+            meta_tax,
             meta_budget_exceeded,
             gross_work_depth,
             morph_weights,
