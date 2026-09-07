@@ -969,7 +969,7 @@ fn try_validate(
                     .current_data_value(tx_version.tx_idx, loc)
                     .is_some()
             });
-        let value_stable = estimate_cleared
+        let mut value_stable = estimate_cleared
             && invalid.iter().all(|&loc| {
                 let cur = match mv_memory.current_data_value(tx_version.tx_idx, loc) {
                     Some(c) => c,
@@ -984,6 +984,66 @@ fn try_validate(
                 // Fallback: prior origin's published Basic/Storage == current.
                 mv_memory.prior_read_value_stable(tx_version.tx_idx, loc)
             });
+        // Iter14 RebindOnly collapse: Estimate cleared but value not yet stable —
+        // writers may be Executed without Validated tip. Brief Validated spin
+        // (no park; SoftWait Soft=0), then recheck value_stable. Distinct from
+        // abort-path escalate spins (Iter12/13a falsified). Measured: helps N5
+        // median vs fra-only 14b (12.4 vs 13.1).
+        if !value_stable
+            && estimate_cleared
+            && specfence.engagement.is_storm()
+            && !invalid.is_empty()
+        {
+            let mut need_validated = false;
+            for &loc in &invalid {
+                let w = mv_memory
+                    .last_writer_before(loc, tx_version.tx_idx)
+                    .or_else(|| mv_memory.residual_writer_before(loc, tx_version.tx_idx));
+                if let Some(w) = w {
+                    if w < tx_version.tx_idx
+                        && scheduler.is_done(w)
+                        && !scheduler.is_validated(w)
+                    {
+                        need_validated = true;
+                        break;
+                    }
+                }
+            }
+            if need_validated {
+                for _ in 0..48 {
+                    let all_ready = invalid.iter().all(|&loc| {
+                        let w = mv_memory
+                            .last_writer_before(loc, tx_version.tx_idx)
+                            .or_else(|| {
+                                mv_memory.residual_writer_before(loc, tx_version.tx_idx)
+                            });
+                        match w {
+                            Some(w) if w < tx_version.tx_idx => {
+                                scheduler.is_validated(w) || !scheduler.is_done(w)
+                            }
+                            _ => true,
+                        }
+                    });
+                    if all_ready {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                value_stable = invalid.iter().all(|&loc| {
+                    let cur = match mv_memory.current_data_value(tx_version.tx_idx, loc) {
+                        Some(c) => c,
+                        None => return false,
+                    };
+                    if specfence
+                        .partial_retry
+                        .value_stable_match(tx_version.tx_idx, loc, &cur)
+                    {
+                        return true;
+                    }
+                    mv_memory.prior_read_value_stable(tx_version.tx_idx, loc)
+                });
+            }
+        }
         // Prefer RebindOnly when !true_suffix, or when Estimate cleared + value-stable.
         // Value-stable path allows multi-origin (lazy) → single current Data.
         let rebound = if value_stable {
@@ -1307,6 +1367,46 @@ fn try_validate(
             specfence.metrics.record_fence_cascade(cascade, skipped);
             // V5-P0: engagement.note_abort is metrics-only (no HotSet storm insert).
             let _ = specfence.engagement.note_abort();
+            // Iter14: schedule-side Validated Await *before first SuffixRepair resume*.
+            // After arming first SuffixRepair (!was_force_bind), park behind Executing
+            // conflict writer so resume sees Data — cut doomed SpecRead-through-
+            // unfinished first repair. Executing-only (Estimate park falsified Iter8).
+            // SoftWait Soft=0; no sibling park; jump/capture OFF.
+            if !escalate
+                && !was_force_bind
+                && repair.did_force_bind()
+                && specfence.engagement.is_storm()
+            {
+                let mut best: Option<(crate::TxIdx, usize)> = None;
+                for location in &invalid {
+                    let w = mv_memory
+                        .last_writer_before(*location, tx_version.tx_idx)
+                        .or_else(|| {
+                            mv_memory.residual_writer_before(*location, tx_version.tx_idx)
+                        });
+                    if let Some(w) = w {
+                        if w < tx_version.tx_idx && scheduler.is_executing(w) {
+                            let fan = mv_memory.higher_readers_of(*location, w).len();
+                            let take = match best {
+                                None => true,
+                                Some((pw, pf)) => fan > pf || (fan == pf && w > pw),
+                            };
+                            if take {
+                                best = Some((w, fan));
+                            }
+                        }
+                    }
+                }
+                if let Some((w, _)) = best {
+                    if scheduler.add_dependency_from_aborting(tx_version.tx_idx, w) {
+                        specfence.metrics.record_first_repair_await();
+                        return scheduler.finish_validation_fenced_barrier_park(
+                            tx_version,
+                            rewind_to,
+                        );
+                    }
+                }
+            }
             // Iter7: after first SuffixRepair fail (was_force_bind, arming 2nd
             // SuffixRepair), sticky BO Await — park this tx behind unfinished
             // fail-loc writers until Executed/Validated before 2nd resume.

@@ -241,7 +241,7 @@ fn main() {
                 aborts_v.push(aborts as f64);
                 if iters == 1 || i + 1 == iters {
                     println!(
-                        "  block={bn} mode={mode:10} iter={}/{} ok={ok} tps={tps:.0} wall_ms={wall_ms:.1} soft={soft} wait_hard={wh} abort_rate={:.3} lean={} evm={} reexec={} fb_reabort={} sra={} sb_res={} sb_def={} hsstore={} sb_clique={} jdef={} aj={} rebind={} cold={} occ_fast={} steal={} park_k={} mw_ms={:.1} h_ms={:.1} v_ms={:.1} park_ms={:.1} sw_ms={:.1} ea_ms={:.1} bo_ms={:.1} parks={}",
+                        "  block={bn} mode={mode:10} iter={}/{} ok={ok} tps={tps:.0} wall_ms={wall_ms:.1} soft={soft} wait_hard={wh} abort_rate={:.3} lean={} evm={} reexec={} fb_reabort={} fra={} sra={} sb_res={} sb_def={} hsstore={} sb_clique={} jdef={} aj={} rebind={} cold={} occ_fast={} steal={} park_k={} mw_ms={:.1} h_ms={:.1} v_ms={:.1} park_ms={:.1} sw_ms={:.1} ea_ms={:.1} bo_ms={:.1} parks={}",
                         i + 1,
                         iters,
                         if n == 0 { 0.0 } else { aborts as f64 / n as f64 },
@@ -249,6 +249,7 @@ fn main() {
                         m.evm_entries,
                         reexec_entries,
                         m.force_bind_reabort,
+                        m.first_repair_await,
                         m.second_repair_await,
                         m.serial_barrier_resolve,
                         m.serial_barrier_defer,
@@ -298,6 +299,7 @@ fn main() {
                     "full_restart": m.full_restart,
                     "partial_retry_count": m.partial_retry_count,
                     "force_bind_reabort": m.force_bind_reabort,
+                    "first_repair_await": m.first_repair_await,
                     "second_repair_await": m.second_repair_await,
                     "soft_wait_wake_ok": m.soft_wait_wake_ok,
                     "soft_wait_wake_reabort": m.soft_wait_wake_reabort,

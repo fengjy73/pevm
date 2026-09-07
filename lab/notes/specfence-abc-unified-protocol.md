@@ -134,3 +134,11 @@ FF-path yield / single-SSTORE JUMP=1 hung — falsified. SoftWait=0; aj=0; vs_ff
 See `specfence-abc-iter13-status.md`. Iter 14 cause: schedule-side Validated Await
 before first repair / RebindOnly collapse / hang-free non-TLS jump — not FF/spin.
 
+### Iter 14 — first-repair schedule Await + RebindOnly Validated collapse
+Schedule-side Executing BO park after first SuffixRepair arm (prevent doomed
+first resume; Estimate park stays falsified). RebindOnly Validated collapse spin
+pre-abort. Keep Iter12 2nd-repair + Iter13 Validated FF. Jump/capture OFF.
+597 N5 med **12.4** SoftWait=0 (≤ Iter12 12.5 / Iter13 12.9); N10 **13.6**.
+fra fires; aj=0. Stretch <10 unmet.
+See `specfence-abc-iter14-status.md`. Iter 15 cause: collapse fan-out FullRestarts
+/ RebindOnly on true_suffix / hang-free opcode skip — not SoftWait Soft / Estimate park.

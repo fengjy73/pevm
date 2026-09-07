@@ -35,6 +35,10 @@
 //! same value; Iter10 bare value-stable falsified); serial-barrier multi-candidate
 //! claim (no sibling park; Executed→Validated escalate spin falsified). Jump/
 //! capture OFF (single-SSTORE env trial hung). SoftWait Soft ~0.
+//! Iter14: schedule-side first-SuffixRepair Await behind Executing conflict writer
+//! (prevent doomed first repair; Estimate park falsified Iter8) + RebindOnly
+//! Validated collapse spin (Executed tip→Validated). Keep Iter12 2nd-repair +
+//! Validated-gated FF. Jump/capture OFF. SoftWait Soft ~0.
 //! Iter8 memory snap retained. Head-FF (Iter5). SoftWait Soft ~0.
 //!
 //! **Learn (C):** Inter morph selects Quiet (598 OCC-lite) vs Storm (597 Await-ready).

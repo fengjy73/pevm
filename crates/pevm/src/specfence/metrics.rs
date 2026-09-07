@@ -205,6 +205,8 @@ pub struct SpecFenceMetrics {
     pub jump_defer: usize,
     /// Iter7: 2nd SuffixRepair parked behind unfinished fail-loc writers (BO Await).
     pub second_repair_await: usize,
+    /// Iter14: first SuffixRepair parked behind Executing conflict writer (schedule-side).
+    pub first_repair_await: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -295,6 +297,7 @@ pub(crate) struct MetricsInner {
     serial_barrier_clique: AtomicUsize,
     jump_defer: AtomicUsize,
     second_repair_await: AtomicUsize,
+    first_repair_await: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -622,6 +625,10 @@ impl MetricsInner {
         self.second_repair_await.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_first_repair_await(&self) {
+        self.first_repair_await.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_jump_defer(&self) {
         self.jump_defer.fetch_add(1, Ordering::Relaxed);
     }
@@ -850,6 +857,7 @@ impl MetricsInner {
             serial_barrier_clique: self.serial_barrier_clique.load(Ordering::Relaxed),
             jump_defer: self.jump_defer.load(Ordering::Relaxed),
             second_repair_await: self.second_repair_await.load(Ordering::Relaxed),
+            first_repair_await: self.first_repair_await.load(Ordering::Relaxed),
         }
     }
 }
