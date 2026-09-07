@@ -1079,6 +1079,13 @@ impl PartialRetryTable {
             .is_some_and(|m| !m.is_empty())
     }
 
+    /// Iter6: armed SuffixRepair FF continuation still has values (cheap resume).
+    pub(crate) fn has_ff_resume_values(&self, tx_idx: TxIdx) -> bool {
+        self.ff_resume
+            .get(&tx_idx)
+            .is_some_and(|c| !c.values.is_empty())
+    }
+
     pub(crate) fn clear_ff_head(&self, tx_idx: TxIdx) {
         self.ff_head.remove(&tx_idx);
     }
@@ -2767,6 +2774,33 @@ mod abort_cheapening_tests {
         assert!(table.ff_value(0, loc).is_some(), "ff_value via ff_head");
         table.clear_ff_head(0);
         assert!(table.ff_value(0, loc).is_none());
+    }
+
+    #[test]
+    fn has_ff_resume_values_true_while_rewind_armed() {
+        let table = PartialRetryTable::new(1);
+        table.reset_incarnation(0, 0);
+        let _ = table.push_checkpoint(0, CheckpointKind::CallEntry);
+        let loc = 0xdef_u64;
+        unsafe { table.state_mut(0) }.note_value(
+            loc,
+            FfValue::Storage {
+                address: Address::ZERO,
+                slot: U256::from(1),
+                value: U256::from(9),
+                origin: None,
+            },
+        );
+        let _ = table.note_access(0, loc, AccessMode::Read);
+        let _ = table.push_checkpoint(0, CheckpointKind::EffectBoundary);
+        assert!(!table.has_ff_resume_values(0));
+        let cp = table.last_checkpoint_before(0, 2).expect("cp");
+        table.arm_rewind_to(0, cp, 2, vec![loc], vec![], vec![loc]);
+        assert!(table.is_rewind_resume(0));
+        assert!(table.has_ff_resume_values(0), "Iter6 cheap-resume gate");
+        let _ = table.escalate_full_restart(0);
+        assert!(!table.has_ff_resume_values(0));
+        assert!(table.has_ff_head(0));
     }
 
     #[test]

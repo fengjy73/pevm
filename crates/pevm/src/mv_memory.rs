@@ -373,8 +373,10 @@ impl MvMemory {
     }
 
     /// Value-stable across origin bump for `location` in `tx_idx`'s last read set:
-    /// prior single MvMemory origin's Data equals current published Data
-    /// (balance+nonce / Storage U256). Storage-origin / multi-origin / Estimate → false.
+    /// prior MvMemory origin's Data equals current published Data (balance+nonce /
+    /// Storage U256). Iter6: last MvMemory origin in a multi-origin (lazy) chain
+    /// is accepted; incarnation must still match (Estimate→Data relies on snap).
+    /// Storage-origin / Estimate → false (snap path covers those).
     pub(crate) fn prior_read_value_stable(
         &self,
         tx_idx: TxIdx,
@@ -385,12 +387,17 @@ impl MvMemory {
             let Some(prior_origins) = locs.read.get(&location) else {
                 return false;
             };
-            if prior_origins.len() != 1 {
-                return false;
-            }
-            match prior_origins.first() {
-                Some(ReadOrigin::MvMemory(v)) => v.clone(),
-                _ => return false,
+            // Iter6: single-origin or last MvMemory in lazy multi-origin chain.
+            let mv = prior_origins
+                .iter()
+                .rev()
+                .find_map(|o| match o {
+                    ReadOrigin::MvMemory(v) => Some(v.clone()),
+                    _ => None,
+                });
+            match mv {
+                Some(v) => v,
+                None => return false,
             }
         };
         let Some(cur) = self.current_data_value(tx_idx, location) else {
@@ -402,7 +409,9 @@ impl MvMemory {
         let Some(MemoryEntry::Data(inc, prior_val)) = written.get(&prior.tx_idx) else {
             return false;
         };
-        if *inc != prior.tx_incarnation || self.is_aborted_incarnation(prior.tx_idx, *inc) {
+        // Incarnation must match the value that was read. Aborted-but-still-Data
+        // is OK for same-output compare (Iter6); reincarnated → snap path.
+        if *inc != prior.tx_incarnation {
             return false;
         }
         match (prior_val, &cur) {

@@ -19,11 +19,13 @@
 //! Await until Executed/Validated, then Bind. Fence intent at first-cross `a`
 //! records `armed_at_k`. SoftWait Soft stays ~0 unless wake EV re-proven.
 //!
-//! **Resolve (B):** RebindOnly when value-stable; else SuffixRepair + journal FF.
-//! Escalate FullRestart after depth≥2 / fb_reabort retains **head-FF** bound
-//! values for certified-prefix DB skip (Iter5 — no plant TLS / no Lean absolute
-//! jump). Then serial-barrier / hot-ℓ clique barrier (capped). Never
-//! ESTIMATE-poison certified prefix. No Lean live_prime / unlimited sibling barrier.
+//! **Resolve (B):** RebindOnly when value-stable (Iter6: Estimate→Data spin +
+//! multi-origin Basic snap / prior match); else SuffixRepair + journal FF.
+//! Escalate FullRestart after depth≥2 when RewindTo/FF armed (one extra
+//! SuffixRepair vs classic fb escalate-at-1; depth≥3 measured wall↑). Else
+//! classic depth≥2 / fb_reabort. Escalation retains **head-FF** (Iter5). Serial-barrier / hot-ℓ
+//! clique barrier (capped). Never ESTIMATE-poison certified prefix. No Lean
+//! live_prime / absolute jump / SoftWait Soft storms.
 //!
 //! **Learn (C):** Inter morph selects Quiet (598 OCC-lite) vs Storm (597 Await-ready).
 //! Intra `choose_action` / learner updates only on hot candidates.

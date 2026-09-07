@@ -931,10 +931,30 @@ fn try_validate(
             ),
             None => !write_locations.is_empty(),
         };
+        // Iter6: brief yield so Estimate→Data can land before RebindOnly decision
+        // (value-stable same-output). No SoftWait Soft; bounded spin only.
+        if !invalid.is_empty()
+            && invalid.iter().any(|&loc| {
+                mv_memory
+                    .current_data_value(tx_version.tx_idx, loc)
+                    .is_none()
+            })
+        {
+            for _ in 0..48 {
+                if invalid.iter().all(|&loc| {
+                    mv_memory
+                        .current_data_value(tx_version.tx_idx, loc)
+                        .is_some()
+                }) {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        }
         // Value-stable RebindOnly: same-output republish (Estimate→Data / incarnation
         // bump) is safe without reexec. Snap match first; else prior-origin MV value
         // vs current Data (covers lean paths that skipped snaps). try_rebind refuses
-        // Estimate / multi-origin.
+        // Estimate / multi-origin (value-stable path allows multi-origin).
         let estimate_cleared = !invalid.is_empty()
             && invalid.iter().all(|&loc| {
                 mv_memory
@@ -1030,9 +1050,25 @@ fn try_validate(
             let repair_depth = specfence
                 .partial_retry
                 .suffix_repair_depth(tx_version.tx_idx);
-            // Classic fb escalate. Iter5: escalate retains head-FF (DB skip) inside
-            // escalate_full_restart — no jump_defer (Lean absolute jump OFF).
-            let escalate = was_force_bind || repair_depth >= 2;
+            // Iter6: when RewindTo / FF resume values are armed, allow longer
+            // SuffixRepair (depth>=3) before FullRestart — head-FF still retained
+            // on escalate (Iter5). Without cheap resume, keep classic escalate.
+            // No Lean jump / SoftWait Soft.
+            let cheap_resume = specfence
+                .partial_retry
+                .is_rewind_resume(tx_version.tx_idx)
+                || specfence
+                    .partial_retry
+                    .has_ff_resume_values(tx_version.tx_idx)
+                || specfence.partial_retry.has_ff_head(tx_version.tx_idx);
+            // depth>=2 with cheap_resume: one extra SuffixRepair vs classic
+            // was_force_bind escalate-at-1 (Iter6 measure: depth>=3 cut fr but
+            // wall↑ from fb loops — prefer one extra repair only).
+            let escalate = if cheap_resume {
+                repair_depth >= 2
+            } else {
+                was_force_bind || repair_depth >= 2
+            };
             let repair = if escalate {
                 // Drop sticky force_bind; retain certified FF values for head reexec.
                 specfence.partial_retry.escalate_full_restart(tx_version.tx_idx)

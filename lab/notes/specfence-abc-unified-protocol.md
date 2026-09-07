@@ -89,3 +89,8 @@ Write-prefix DB skip: escalate FullRestart keeps certified FF values (`ff_head`)
 597 N=5 med **13.1** SoftWait=0 (↓ vs Iter3 13.4 / Iter4 14.1); N=10 med **14.1** (↓ vs Iter4 14.2, not vs Iter3 13.4). ff_hits↑~2.4×; aj=0. Lean absolute jump falsified (seq≠par).  
 See `specfence-abc-iter5-status.md`. Iter 6 cause: opcode-skip hang-free jump (memory-safe) or fewer FullRestarts via RebindOnly/longer SuffixRepair.
 
+### Iter 6 — fewer FullRestarts via cheap-resume SuffixRepair + RebindOnly widen
+Estimate→Data spin + multi-origin Basic snap; one extra SuffixRepair when RewindTo/FF armed (depth≥2, not was_force_bind-at-1). depth≥3 / storm fanout-Await **falsified** (wall↑).  
+597 N=5 med **13.0** SoftWait=0 (↓ vs Iter5 13.1); N=10 med **14.0**; **full_restart ≈½**.  
+See `specfence-abc-iter6-status.md`. Iter 7 cause: SuffixRepair resume opcode-seconds / make 2nd repair succeed (sticky Await) or memory-lite jump.
+

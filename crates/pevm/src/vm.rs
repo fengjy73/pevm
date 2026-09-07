@@ -437,6 +437,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 // A: prefer-steal Await on force_prefix / sticky / prior_inc0.
                 // Storm + program: also hotset when live fanout evidences multi-consumer
                 // (avoids abort-noise HotSet → BO park storms / wall regress).
+                // Iter6: keep A BO Await as-is; resolve-side depth/rebind is the lever.
                 let prefer_await = if storm && is_program {
                     force_prefix
                         || sticky
@@ -1323,23 +1324,28 @@ impl<S: Storage> Database for VmDb<'_, S> {
             self.read_accounts
                 .insert(location_hash, (account.clone(), code_hash));
 
-            // M1b: cache single-origin basics for FF (lazy chains have multi-origins).
+            // M1b: cache basics for FF (single-origin origin) and Iter6 value-stable
+            // RebindOnly (multi-origin lazy: snap balance+nonce with origin=None so
+            // try_ff_basic refuses — avoids seq≠par on lazy chains).
             if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
                 let origins = self.read_set.get(&location_hash);
-                if origins.is_some_and(|o| o.len() == 1) {
-                    let origin = match origins.and_then(|o| o.first()) {
+                let single = origins.is_some_and(|o| o.len() == 1);
+                let origin = if single {
+                    match origins.and_then(|o| o.first()) {
                         Some(ReadOrigin::MvMemory(v)) => Some((v.tx_idx, v.tx_incarnation)),
                         Some(ReadOrigin::Storage) | None => None,
-                    };
-                    self.maybe_note_value(location_hash,
-                        FfValue::Basic {
-                            address,
-                            basic: account.clone(),
-                            code_hash,
-                            origin,
-                        },
-                    );
-                }
+                    }
+                } else {
+                    None
+                };
+                self.maybe_note_value(location_hash,
+                    FfValue::Basic {
+                        address,
+                        basic: account.clone(),
+                        code_hash,
+                        origin,
+                    },
+                );
             }
 
             self.maybe_early_val(address, location_hash)?;
