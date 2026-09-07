@@ -359,7 +359,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return Ok(());
         }
 
-        // --- SpecFence path (control law v3 + P0/P1/P2) ---
+        // --- SpecFence v5 path: AEC choose_action + FenceGraph SoftWait ---
         if address == self.specfence.beneficiary || self.is_lazy {
             // Beneficiary / basic_lazy never SoftWait.
             self.specfence.metrics.record_spec_read();
@@ -1313,7 +1313,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         if !self.specfence.mode.uses_regions() {
             return None;
         }
-        // R1: proactive Wait only via should_wait_account (HotSet-gated). No block-wide lean skip.
+        // V5-P0: SpecFence should_wait_account is always false (account Wait stub).
         let tx = self.chain.tx_env(unsafe { self.txs.get_unchecked(tx_idx) });
         if let Some(prev) = self
             .specfence
@@ -1412,9 +1412,8 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
     }
 
     fn promote_if_multi_writer(&self, address: Address, location: Option<MemoryLocationHash>) {
-        // SpecFence v1: do not promote Wait from mere from/to writer_count hints.
-        // Intra-block Wait comes from observed invalid locations / WW contention.
-        // Inter-block Bayes posteriors seed Wait via seed_wait_regions.
+        // SpecFence v5: never promote Wait from from/to writer_count hints.
+        // SoftWait arms only via choose_action; seed_wait_regions is PCC-only.
         if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
             return;
         }

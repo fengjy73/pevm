@@ -1,5 +1,8 @@
-//! Per-region (memory location / account) Wait vs Speculate mode for the current block.
-//! Spec v1: sticky Wait is revokeable when posterior < τ_revoke.
+//! Per-region Wait vs Speculate **mirrors** for the current block.
+//!
+//! SpecFence v5: FenceGraph SoftWait is the source of truth for Wait arms.
+//! `RegionTable` bits may mirror promotions for metrics / PCC; SpecFence π
+//! (`choose_action`) must not treat `should_wait` / sticky bits as authority.
 
 use alloy_primitives::Address;
 use dashmap::DashMap;
@@ -44,7 +47,7 @@ impl RegionTable {
             .unwrap_or(RegionMode::Speculate)
     }
 
-    /// Location or its owning account is Wait.
+    /// Location or owning account is Wait (PCC / mirror probe — not SpecFence π).
     #[allow(dead_code)]
     pub(crate) fn should_wait(&self, location: MemoryLocationHash, address: &Address) -> bool {
         self.location_mode(location) == RegionMode::Wait

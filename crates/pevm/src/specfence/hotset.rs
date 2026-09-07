@@ -1,4 +1,6 @@
-//! Adaptive CC Redesign v1 — location-local HotSet (R1).
+//! Location-local HotSet — SpecFence v5 **feature cache** (not a Wait gate).
+//!
+//! Adaptive CC Redesign v1 residue retained as dense-stat / fanout features for AEC.
 //!
 //! A location enters HotSet when any holds (online, revocable):
 //! 1. Observed ≥ H_w writers in-block (default 8), or

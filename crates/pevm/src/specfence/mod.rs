@@ -1,36 +1,39 @@
-//! `SpecFence`: adaptive region/wave concurrency control (Spec v1 / P2).
+//! SpecFence **v5** — Block-STM + FenceGraph SoftWait + AEC π + continuous θ + Lean repair.
 //!
-//! Control unit = memory location / slot-level region
-//! (`MemoryLocation::{Basic, CodeHash, Storage}`), not whole-tx.
-//! Bayesian Beta-Bernoulli posteriors + cost-aware π drive WaitHard / Bind /
-//! SpecRead per region; sticky Wait is revokeable when posterior < τ_revoke.
-//! Cascade fence
-//! remains a correctness shield. FullRestart remains whole-tx reexec (revm).
-//! M1: RebindOnly / RewindTo on certified prefix (not head reexec when cps allow);
-//! M1b: journal FF + bound-value cache on RewindTo (prefix DB heavy path skipped).
-//! M1c: CALL/effect-boundary PC resume via stock Inspector (prefix opcodes skipped).
-//! M1d: live `inspect_run` on SpecFence production path (Ethereum) — real PC skip.
-//! M1e: journal-blob FF + safety-gated absolute PC jump on RewindTo resume.
-//! M1f: absolute PC jump default-on when safe (MemoryGas+refund restore); `SPECFENCE_ABSOLUTE_JUMP=0` disables.
-//! M1g: Storage-prefix jump (no Db poison) + nested CallOutcome cache; bytecode_len relaxed carefully.
-//! M1i: post-SSTORE write-prefix jump default-on when safe; valued CallOutcome hang-free.
-//! M1j: multi-SSTORE write-prefix jump (+ LOG after tip).
-//! M1k: hang-free jump-past-LOG (LogReplay) + valued CallOutcome default-on; zero-value+write combine at CALL-boundary.
-//! M1l: lighter inspect step + multi-SSTORE at higher width; warm valued SC gas_limit-match; valued+write CALL-boundary jump.
-//! suffix-only InvalidateSelective when safe.
-//! M2: WaitHard parks (tx-level) + ready-queue steal (lower TxIdx first); worker never spins.
-//! P4: SoftWait `(t,k)` park data plane — wake restores resume intent; RewindTo/FF when cp
-//! exists before `k`, else tx-grain FullRetry. No live Interpreter mid-tx park.
-//! M3: online WŜ/RŜ prior → Bind-before-touch on first incarnation when writer version known.
-//! M4 (superseded by Adaptive CC R1): lean thresholds that never fired on mainnet.
-//! Adaptive CC R0–R2 + control law v3 + P0/P1/P2/P3:
-//! HotSet = fanout/tracking **hint** only (no WaitHard gate).
-//! Account Wait is diagnostic-only on SpecFence (conflict key = MemoryLocation).
-//! FenceGraph SoftWait is source of truth; RegionTable Wait bits are mirrors.
-//! Dual-horizon learner fills PolicyCtx; `choose_action` is the only π choke point.
-//! P3 EarlyAbort: heavy ∧ known d≤D_EARLY ∧ program ∧ EV_Early wins → cut incarnation.
-//! AEC: `choose_action` = argmin EV (Wait raised by fanout); ties → SpecRead.
-//! Inspect/jump off unless `SPECFENCE_ENABLE_INSPECT=1`.
+//! Authoritative design: `lab/notes/specfence-v5-first-principles-clean-slate.md`.
+//!
+//! # Single algorithm (hot path)
+//! ```text
+//! Block-STM scheduler + MvMemory          # L0
+//!     ↑
+//! FenceGraph: SoftWait / wake only        # L2 — sole Wait authority
+//!     ↑
+//! π = argmin EV[Bind, Wait, Spec, Early]  # L3 — choose_action (AEC)
+//!     ↑
+//! OutcomeLearner: P_abort, T_wait, …      # L4 — continuous θ features only
+//!     ↑
+//! RepairPlant: force-bind + selective     # L1 — Lean abort cheapening
+//! ```
+//!
+//! **Default:** SpecRead (OCC-like). SoftWait only when `EV_Wait < EV_Spec`.
+//! Fan-out raises `EV_Wait` (discourage serialize). Abort cheapened with
+//! force-bind + selective invalidate on Lean — never requires inspect.
+//!
+//! # Shoveled off SpecFence control (V5-P0)
+//! - Heat / `seed_wait_regions` SoftWait arming (PCC may still seed account Wait)
+//! - Account Wait / `promote_account` (diagnostic stub; always false)
+//! - `RegionTable` Wait as decision authority (mirrors only; FenceGraph SoT)
+//! - Bayes `should_wait_hard` Boolean second π (Beta posteriors = EV features)
+//! - AdaptiveEngagement abort_rate mode ladders (always Lean execute)
+//! - HotSet as Wait gate (`H_w`/`H_a` = optional dense-stat / fanout features)
+//!
+//! # Research-only (not default behavior)
+//! Inspect / absolute jump / CallOutcome SC stay behind `SPECFENCE_ENABLE_INSPECT=1`.
+//! Plant M1a–M1l code remains for research; it is **not** SpecFence v5 default.
+//! Finegrain collectors are lab opt-in.
+//!
+//! Correctness shield: cascade fence + Block-STM validate / ESTIMATE unchanged.
+//! Learning never commits. SpecFence ≡ sequential on Ethereum fixtures.
 
 use crate::{
     BuildSuffixHasher, MemoryLocation, TxIdx, chain::PevmChain, hash_deterministic,
@@ -113,7 +116,7 @@ pub enum ConcurrencyMode {
     Occ,
     /// Conservative PCC: hinted `from`/`to` accounts start in Wait.
     Pcc,
-    /// Mixed Wait/Speculate at **location** granularity with Bayesian feedback.
+    /// SpecFence v5: AEC π + FenceGraph SoftWait at location grain (Bayes = θ features).
     SpecFence,
 }
 
@@ -203,15 +206,17 @@ impl<'a> SpecFenceCtx<'a> {
         if self.mode == ConcurrencyMode::Pcc {
             return true;
         }
-        // P0: SpecFence conflict key = MemoryLocation only. Account Wait is
-        // diagnostic-only — never a control authority (no promotions / no Wait).
+        // V5-P0: SpecFence conflict key = MemoryLocation only. Account Wait is
+        // a diagnostic stub — never schedules SoftWait / never promotes.
         let _ = (regions, address);
         false
     }
 
-    /// Location-granularity Wait via cost-aware π with revokeable sticky flags.
-    /// Sticky Wait is a soft hint only: always re-evaluate with producer-unknown
-    /// (`writer_done=false`) so over-WaitHard from sticky bias is avoided.
+    /// PCC sticky Wait probe. SpecFence v5: **always false**.
+    ///
+    /// SpecFence Wait is decided only by `choose_action` → FenceGraph SoftWait
+    /// inside `Vm::maybe_wait`. Bayes Bool / RegionTable sticky / account Wait
+    /// must not OR into SpecFence π (V5-P0 shovel).
     pub(crate) fn should_wait_location(
         &self,
         regions: &RegionTable,
@@ -224,65 +229,9 @@ impl<'a> SpecFenceCtx<'a> {
         if self.mode == ConcurrencyMode::Pcc {
             return true;
         }
-        // P0: HotSet is fanout/tracking hint only — no hard Wait gate.
-        // Cold ℓ still flows through choose_action (SpecRead default) on SpecFence path.
-        // Revoke sticky Wait when posterior < τ_revoke.
-        if regions.location_mode(location) == RegionMode::Wait
-            || self.dag.is_wait(location)
-        {
-            if self.bayes.should_revoke(location, Some(address)) {
-                let cleared_region = regions.clear_location_wait(location);
-                let cleared_dag = self.dag.clear_wait(location);
-                if cleared_region || cleared_dag {
-                    self.metrics.record_soft_edge_revoke();
-                }
-            }
-            // Fall through — do not auto-WaitHard on sticky (v6 cost-aware).
-        }
-        // Live cost-aware π (producer unknown here → SpecRead-biased).
-        let writer_known = self.hints.prev(address, 0).is_some()
-            || self.bayes.has_location(location);
-        let writer_done = false;
-        if self.bayes.has_location(location) {
-            if self
-                .bayes
-                .should_wait_hard(location, Some(address), writer_known, writer_done)
-            {
-                self.metrics.record_bayes_wait();
-                self.bayes.note_wait_decision(location, Some(address));
-                true
-            } else {
-                self.metrics.record_bayes_speculate();
-                false
-            }
-        } else if regions.account_mode(address) == RegionMode::Wait {
-            if self.bayes.should_revoke(location, Some(address)) {
-                if regions.clear_account_wait(*address) {
-                    self.metrics.record_soft_edge_revoke();
-                }
-                false
-            } else if self
-                .bayes
-                .should_wait_hard(location, Some(address), writer_known, writer_done)
-            {
-                self.metrics.record_bayes_wait();
-                self.bayes.note_wait_decision(location, Some(address));
-                true
-            } else {
-                self.metrics.record_bayes_speculate();
-                false
-            }
-        } else if self
-            .bayes
-            .should_wait_hard(location, Some(address), writer_known, writer_done)
-        {
-            self.metrics.record_bayes_wait();
-            self.bayes.note_wait_decision(location, Some(address));
-            true
-        } else {
-            self.metrics.record_bayes_speculate();
-            false
-        }
+        // SpecFence: diagnostic no-op. SoftWait arms only via choose_action.
+        let _ = (regions, location, address);
+        false
     }
 
     /// Choose ResolveAction for a SpecFence location read (AEC argmin EV).
@@ -452,7 +401,11 @@ impl<'a> SpecFenceCtx<'a> {
     }
 }
 
-/// Seed Wait from PCC (all hinted accounts) or SpecFence Bayesian posteriors.
+/// Seed account Wait for **PCC only**.
+///
+/// SpecFence v5: this is a **no-op** for SoftWait / Region Wait. Heat and Bayes
+/// priors must never arm SoftWait at block start (V5-P0 shovel). Callers should
+/// gate on `ConcurrencyMode::Pcc` (see `pevm.rs`).
 pub(crate) fn seed_wait_regions(
     regions: &RegionTable,
     hints: &AccountHints,
@@ -462,21 +415,18 @@ pub(crate) fn seed_wait_regions(
     tau: f64,
     initial_wait: &mut std::collections::HashSet<Address>,
 ) {
-    if !mode.uses_regions() {
+    if mode != ConcurrencyMode::Pcc {
+        let _ = (regions, hints, bayes, beneficiary, tau, initial_wait);
         return;
     }
     for address in hints.accounts() {
         if address == beneficiary {
             continue;
         }
-        // P0: SpecFence never seeds account Wait (conflict key = ℓ only).
-        let wait = mode == ConcurrencyMode::Pcc;
         let _ = (bayes, tau);
-        if wait {
-            regions.seed_account_wait(address);
-            regions.promote_location(hash_deterministic(MemoryLocation::Basic(address)));
-            initial_wait.insert(address);
-        }
+        regions.seed_account_wait(address);
+        regions.promote_location(hash_deterministic(MemoryLocation::Basic(address)));
+        initial_wait.insert(address);
     }
 }
 

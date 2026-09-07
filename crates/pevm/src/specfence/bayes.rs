@@ -202,7 +202,11 @@ impl BayesMap {
         self.conflict_probability(location, address) < TAU_REVOKE
     }
 
-    /// True when cost-aware π prefers WaitHard over SpecRead.
+    /// Legacy Boolean Wait probe (cost_prefers_wait).
+    ///
+    /// **Not SpecFence π.** V5-P0: SpecFence Wait is decided only by AEC
+    /// `choose_action`. Keep this for unit tests / PCC-era callers; Beta
+    /// posteriors feed PolicyCtx as continuous features instead.
     /// `writer_done`: producer Executed/Validated (wait cheap); unknown → false.
     pub(crate) fn should_wait_hard(
         &self,

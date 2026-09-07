@@ -1,37 +1,26 @@
-//! Adaptive CC Redesign v1 — default LeanOCC engagement (replaces M4 prove-quiet).
+//! SpecFence v5 engagement — **always Lean execute** (no abort_rate mode ladder).
 //!
-//! # Exact trigger (R1)
+//! Authoritative: `lab/notes/specfence-v5-first-principles-clean-slate.md` (V5-P0).
 //!
-//! ## Block start
-//! Always start **LeanOCC**. Never require proving quiet (`last_abort_rate`,
-//! `conflict_mass`, multi-writer hints) to lean — that was the M4 failure mode
-//! (`lean_mode_txs=0` on mainnet).
-//!
-//! ## Location policy
-//! HotSet is a fanout/tracking **hint** for `choose_action` (see `hotset.rs`).
-//! Cold locations default SpecRead via π; WaitHard is **not** forbidden off HotSet (P0).
-//!
-//! ## Mid-block
-//! On abort_rate ≥ τ_abort_mid (0.08), ensure abort locations land in HotSet
-//! (via `HotSet::note_abort` / `insert`). Engagement stays LeanOCC for execute
-//! (Handler::run) unless `SPECFENCE_ENABLE_INSPECT=1`.
-//!
-//! ## Research inspect
-//! `SPECFENCE_ENABLE_INSPECT=1` re-enables inspect_run / jump / CallOutcome SC
-//! (M1* plant). Default production path never inspects.
+//! - Block start / mid-block: LeanOCC for `Handler::run` unless research inspect.
+//! - `note_abort` is **metrics-only** — does not escalate HotSet or flip π.
+//! - HotSet / Bayes / RegionTable are not Wait authorities; π = `choose_action`.
+//! - `SPECFENCE_ENABLE_INSPECT=1` re-enables inspect_run / jump (research only).
 //!
 //! OCC / PCC modes never consult this module.
+
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::TxIdx;
 
-/// Mid-block abort rate that escalates writers into HotSet (still Lean execute).
+/// Legacy abort-rate cut (unused by π after V5-P0; retained for metrics docs).
+#[allow(dead_code)]
 pub(crate) const TAU_ABORT_MID: f64 = 0.08;
-/// R3: require a real window — `aborts/started` at started=1 is always ≥ τ and
-/// was force-inserting entire abort write-sets into HotSet on the first conflict
-/// of wide blocks (Bind tax with wait_hard=0).
+/// Legacy escalate window (unused after V5-P0 shovel).
+#[allow(dead_code)]
 pub(crate) const MIN_STARTED_FOR_ABORT_ESCALATE: usize = 32;
+#[allow(dead_code)]
 pub(crate) const MIN_ABORTS_FOR_ESCALATE: usize = 4;
 
 /// `SPECFENCE_ENABLE_INSPECT=1` (or `true`/`yes`) enables research inspect/jump.
@@ -118,27 +107,12 @@ impl AdaptiveEngagement {
             .is_some_and(|b| b.load(Ordering::Relaxed))
     }
 
-    /// Record a validation abort. Returns true when mid-block abort rate crossed
-    /// τ_abort_mid (caller should ensure HotSet membership for abort locs).
+    /// Record a validation abort (metrics only).
+    ///
+    /// V5-P0: always returns `false`. Abort-rate HotSet escalate / mode ladders
+    /// are deleted from SpecFence control — π does not consult engagement.
     pub(crate) fn note_abort(&self) -> bool {
-        let aborts = self.aborts.fetch_add(1, Ordering::Relaxed) + 1;
-        let started = self
-            .lean_txs
-            .load(Ordering::Relaxed)
-            .saturating_add(self.full_txs.load(Ordering::Relaxed))
-            .max(1);
-        let rate = aborts as f64 / started as f64;
-        if aborts >= MIN_ABORTS_FOR_ESCALATE
-            && started >= MIN_STARTED_FOR_ABORT_ESCALATE
-            && rate >= TAU_ABORT_MID
-        {
-            // Count an "engagement switch" once when abort storm starts — not lean→full
-            // execute flip (execute stays lean). Signals HotSet escalate pressure.
-            if self.switches.load(Ordering::Relaxed) == 0 {
-                self.switches.store(1, Ordering::Relaxed);
-            }
-            return true;
-        }
+        self.aborts.fetch_add(1, Ordering::Relaxed);
         false
     }
 
@@ -161,7 +135,6 @@ mod tests {
 
     #[test]
     fn default_start_is_lean_without_inspect_flag() {
-        // Ensure flag off for this unit test.
         unsafe {
             std::env::remove_var("SPECFENCE_ENABLE_INSPECT");
         }
@@ -173,23 +146,21 @@ mod tests {
     }
 
     #[test]
-    fn mid_block_abort_rate_signals_hotset_escalate() {
+    fn note_abort_never_escalates_hotset_v5() {
         unsafe {
             std::env::remove_var("SPECFENCE_ENABLE_INSPECT");
         }
         let eng = AdaptiveEngagement::new(64, true);
-        // Fill a real window before rate can escalate.
-        for i in 0..MIN_STARTED_FOR_ABORT_ESCALATE {
+        for i in 0..40 {
             assert!(eng.begin_tx(i));
         }
-        // First few aborts under the min-abort floor must not escalate.
-        for _ in 0..(MIN_ABORTS_FOR_ESCALATE - 1) {
-            assert!(!eng.note_abort());
+        for _ in 0..20 {
+            assert!(
+                !eng.note_abort(),
+                "V5-P0: engagement must not escalate HotSet / flip π"
+            );
         }
-        assert!(eng.note_abort()); // floor met and rate ≥ τ
-        assert_eq!(eng.engagement_switches(), 1);
-        // Execute path stays lean.
-        assert!(eng.begin_tx(MIN_STARTED_FOR_ABORT_ESCALATE));
+        assert_eq!(eng.engagement_switches(), 0);
         assert!(eng.is_lean());
     }
 
@@ -200,10 +171,7 @@ mod tests {
         }
         let eng = AdaptiveEngagement::new(4, true);
         assert!(eng.begin_tx(0));
-        assert!(
-            !eng.note_abort(),
-            "1/1 must not force-insert HotSet (wide-block Bind tax)"
-        );
+        assert!(!eng.note_abort());
         assert_eq!(eng.engagement_switches(), 0);
     }
 }

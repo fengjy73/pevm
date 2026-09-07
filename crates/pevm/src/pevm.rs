@@ -394,7 +394,7 @@ impl Pevm {
         let hints = AccountHints::build(chain, &txs);
         let metrics_inner = MetricsInner::default();
         let mut initial_wait = std::collections::HashSet::new();
-        // R1/P0/P1: LeanOCC default; HotSet hint-only; inter-prior seeds tracking only.
+        // V5-P0: LeanOCC default; HotSet feature-only; inter-prior never arms SoftWait.
         let learner = LiveLearner::new();
         if self.concurrency_mode == ConcurrencyMode::SpecFence {
             self.hotset.begin_block();
@@ -905,11 +905,10 @@ fn try_validate(
                 specfence.bayes.observe_conflict_location_always(*location);
                 specfence.metrics.record_bayes_conflict();
                 specfence.rw_prior.observe_co_access(*location);
-                // R1/R3: abort@ℓ → HotSet (H_a) only for conflict locations.
-                // Do NOT note_abort the whole write-set — that inflated HotSet on
-                // wide blocks (Bind tax). Storm escalate still insert()s write-set.
+                // V5-P0: abort@ℓ → HotSet H_a densifies fanout *features* only.
+                // Do NOT insert whole write-set; engagement escalate deleted.
                 specfence.hotset.note_abort(*location);
-                // Learn Wait sticky for HotLocal; cold path ignores until HotSet.
+                // RegionTable Wait mirror only — SoftWait arms via choose_action.
                 specfence.promote_from_bayes(&mv_memory.regions, *location, None);
             }
             let cascade_hint = invalid.len().max(1);
@@ -931,14 +930,8 @@ fn try_validate(
                 None => (0, block_size.saturating_sub(cascade_from)),
             };
             specfence.metrics.record_fence_cascade(cascade, skipped);
-            if specfence.engagement.note_abort() {
-                for &loc in &write_locations {
-                    specfence.hotset.insert(loc);
-                }
-                for location in &invalid {
-                    specfence.hotset.insert(*location);
-                }
-            }
+            // V5-P0: engagement.note_abort is metrics-only (no HotSet storm insert).
+            let _ = specfence.engagement.note_abort();
             return scheduler.finish_validation_fenced(tx_version, true, rewind_to);
         }
         // Snapshot write locations before invalidate (same set).
@@ -949,14 +942,8 @@ fn try_validate(
         };
         if specfence.mode == ConcurrencyMode::SpecFence {
             specfence.metrics.record_occ_abort();
-            if specfence.engagement.note_abort() {
-                for &loc in &write_locations {
-                    specfence.hotset.insert(loc);
-                }
-                for location in &invalid {
-                    specfence.hotset.insert(*location);
-                }
-            }
+            // V5-P0: engagement.note_abort is metrics-only (no HotSet storm insert).
+            let _ = specfence.engagement.note_abort();
             let _ = specfence
                 .partial_retry
                 .disable_jump_after_failed_resume(tx_version.tx_idx);
