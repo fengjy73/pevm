@@ -1515,9 +1515,9 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         // Plant v2 M1 / V5-P3: research RewindTo resume must NOT call record_evm_entry.
         // Fresh starts (incl. Lean FullRestart-from-head) still count as evm_entries.
         // Lean default: `rewind_resume` is always false (abort clears RewindTo via
-        // apply_lean_abort_repair). SoftWait wake may arm journal FF + force-bind
-        // (`try_arm_park_resume_at_k`) without taking this inspect resume path —
-        // set_tx still replays FF; try_ff_* serves values when is_rewind_resume.
+        // apply_suffix_repair / SoftWait wake). SoftWait wake and Lean SuffixRepair
+        // arm journal FF + force-bind (`try_arm_park_resume_at_k` / RewindTo) without
+        // absolute jump — set_tx still replays FF; try_ff_* when is_rewind_resume.
         let lean = self.specfence.mode == crate::ConcurrencyMode::SpecFence
             && self.specfence.engagement.begin_tx(tx_version.tx_idx);
         let rewind_resume = self.specfence.mode == crate::ConcurrencyMode::SpecFence

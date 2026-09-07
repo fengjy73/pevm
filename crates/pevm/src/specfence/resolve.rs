@@ -6,7 +6,8 @@
 //! EV_Wait  = E_wait_time(ℓ)*(1+α*fanout) + δ*max(0,E_idle−prior)/(1+fanout)
 //! EV_Spec  = P_abort(ℓ,x) * (W_remain(d) + β * E_cascade + γ * E_reexec)
 //! EV_Early = W_prefix(d) + E_reexec   # only if d known & heavy features
-//! pick argmin; ties → SpecRead (OCC-like default)
+//! pick argmin; ties → Await(WaitHard) if producer Running/unfinished,
+//! else SpecRead (discovery — not SpecFence identity)
 //! ```
 //! V5-P2 θ: measured wake latency → E_wait_time; cascade → E_cascade;
 //! idle-steal → E_idle_steal; lean ForceBind/FullRestart → E_reexec.
@@ -71,7 +72,7 @@ pub(crate) struct PolicyCtx {
     pub e_idle_steal: f64,
     /// Continuous meta_ops/useful (0 before warmup) — tiny-gap Spec bias.
     pub meta_tax: f64,
-    /// Meta budget exceeded → force SpecRead (OCC fallback).
+    /// Meta budget exceeded → force SpecRead (storm brake, not OCC identity).
     pub meta_budget_exceeded: bool,
     /// Known depth only: gross-work / effect-progress proxy.
     /// Morph late prior feeds **W_remain feature only** — not EarlyAbort, not Wait gate.
@@ -257,7 +258,12 @@ fn meta_tax_prefers_spec(ev_wait: f64, ev_spec: f64, meta_tax: f64, params: &Ada
     gap < thresh
 }
 
-/// AEC π: Bind if Data ready; else argmin EV; ties → SpecRead; meta budget → SpecRead.
+/// AEC π: Bind if Data ready; else argmin EV.
+///
+/// Tie law (SpecFence-native): when writer is known Running/unfinished and
+/// `EV_Wait ≈ EV_Spec`, prefer **Await (WaitHard)** over SpecRead. SpecRead
+/// remains for writer absent/unknown discovery — not the protocol brand.
+/// Meta tax may still bias away from Wait storms; no Boolean fanout→Wait ladders.
 pub(crate) fn choose_action(ctx: PolicyCtx) -> ResolveAction {
     let params = ctx.params;
     // 1. Raise Bind hits when published Data is hang-free to consume (writer_done)
@@ -275,12 +281,15 @@ pub(crate) fn choose_action(ctx: PolicyCtx) -> ResolveAction {
         }
     }
 
-    // Phase C: measured meta tax → OCC SpecRead fallback.
+    // Meta budget → SpecRead fallback (storm brake), not OCC identity.
     if ctx.meta_budget_exceeded {
         return ResolveAction::SpecRead;
     }
 
     let mut ev = compute_ev(&ctx);
+    // Producer known unfinished → Await wins on EV_Wait ≈ EV_Spec ties.
+    let prefer_await_tie = ctx.writer_known && !ctx.writer_done;
+
     // Data published but writer not yet done: EV_Bind ≈ small wake cost (not +∞).
     // Prefer Bind (may SoftWait) only when that beats Spec — still argmin EV.
     if let Some(v) = ctx.bind_version.clone() {
@@ -296,8 +305,12 @@ pub(crate) fn choose_action(ctx: PolicyCtx) -> ResolveAction {
             best = ResolveAction::Bind(v);
             best_ev = ev_bind;
         }
-        if ev.ev_wait + EPS < best_ev
-            && !meta_tax_prefers_spec(ev.ev_wait, ev.ev_spec, ctx.meta_tax, &params)
+        let wait_ok = if prefer_await_tie {
+            ev.ev_wait <= best_ev + EPS
+        } else {
+            ev.ev_wait + EPS < best_ev
+        };
+        if wait_ok && !meta_tax_prefers_spec(ev.ev_wait, ev.ev_spec, ctx.meta_tax, &params)
         {
             best = ResolveAction::WaitHard;
             best_ev = ev.ev_wait;
@@ -313,14 +326,18 @@ pub(crate) fn choose_action(ctx: PolicyCtx) -> ResolveAction {
         ev.ev_spec *= 1.0 + ctx.posterior_bind_success.clamp(0.0, 1.0);
     }
 
-    // Argmin; strict improvement only — ties keep SpecRead (OCC-like default).
-    // V5-P2: measured meta tax biases Spec on tiny Wait wins (no SoftWait storm).
+    // Argmin; ties → Await if producer Running, else SpecRead (discovery).
+    // Meta tax still biases Spec on tiny Wait wins (no SoftWait storm).
     const EPS: f64 = 1e-9;
     let mut best = ResolveAction::SpecRead;
     let mut best_ev = ev.ev_spec;
 
-    if ev.ev_wait + EPS < best_ev
-        && !meta_tax_prefers_spec(ev.ev_wait, ev.ev_spec, ctx.meta_tax, &params)
+    let wait_ok = if prefer_await_tie {
+        ev.ev_wait <= best_ev + EPS
+    } else {
+        ev.ev_wait + EPS < best_ev
+    };
+    if wait_ok && !meta_tax_prefers_spec(ev.ev_wait, ev.ev_spec, ctx.meta_tax, &params)
     {
         best = ResolveAction::WaitHard;
         best_ev = ev.ev_wait;
@@ -466,10 +483,22 @@ mod tests {
     }
 
     #[test]
-    fn aec_tie_defaults_to_specread() {
+    fn aec_tie_prefers_await_when_producer_running() {
         let mut c = ctx_aec(0.5, true, false, None, false, true, false, 0.0, None);
-        // EV_Spec = 0.5 * (1 + β*1 + γ*1.5) = 1.375 with γ=0.5; set EV_Wait equal → tie → SpecRead
-        // EV_Wait also adds δ*E_idle — zero idle for exact tie.
+        // EV_Spec = 0.5 * (1 + β*1 + γ*1.5) = 1.375 with γ=0.5; set EV_Wait equal →
+        // tie + writer known unfinished → Await (WaitHard), not OCC SpecRead.
+        c.e_idle_steal = 0.0;
+        c.e_wait_time = 1.375;
+        c.posterior_conflict = 0.5;
+        c.e_cascade = 1.0;
+        c.e_reexec = 1.5;
+        assert_eq!(choose_action(c), ResolveAction::WaitHard);
+    }
+
+    #[test]
+    fn aec_tie_specread_when_writer_unknown() {
+        let mut c = ctx_aec(0.5, false, false, None, false, true, false, 0.0, None);
+        // writer_known=false → EV_Wait = ∞; SpecRead for discovery.
         c.e_idle_steal = 0.0;
         c.e_wait_time = 1.375;
         c.posterior_conflict = 0.5;

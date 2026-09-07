@@ -7,9 +7,13 @@
 //!
 //! | API | Entry | Default Lean? | What it arms |
 //! |-----|-------|---------------|--------------|
-//! | **Lean repair** | [`PartialRetryTable::apply_lean_abort_repair`] | **yes** | force-bind + clear RewindTo; head reexec |
-//! | **Research plant** | [`PartialRetryTable::research_apply_abort_repair`] | **no** (`SPECFENCE_ENABLE_INSPECT`) | RewindTo + journal FF + force-bind |
+//! | **SuffixRepair** (Lean) | [`PartialRetryTable::apply_suffix_repair`] | **yes** | hang-free RewindTo + journal FF + force-bind (SoftWait-wake subset) |
+//! | **Research plant** | [`PartialRetryTable::research_apply_abort_repair`] | **no** (`SPECFENCE_ENABLE_INSPECT`) | RewindTo + journal FF + force-bind (may pair with inspect resume) |
 //! | SoftWait wake (P4) | [`PartialRetryTable::try_arm_park_resume_at_k`] | yes (hang-free) | journal FF + force-bind only; **no** absolute jump |
+//!
+//! SpecFence-native resolve: validation fail → **SuffixRepair** (resume at certified
+//! checkpoint ≤ k), not OCC-style head FullRestart. Absolute PC jump / valued
+//! CallOutcome stay research-only (`SPECFENCE_ENABLE_INSPECT`).
 //!
 //! V5-P3 A/B on block 14689597: full inspect **hangs** → plant stays research-only.
 //! Never graduate by default: absolute PC jump, multi-SSTORE/LOG jump mythology,
@@ -223,19 +227,27 @@ pub(crate) enum RepairPlan {
     FullRestart,
 }
 
-/// V5-P1 outcome of the single Lean SpecFence abort repair path.
+/// SpecFence-native Lean abort / validation resolve outcome.
 ///
-/// Lean never arms RewindTo / inspect resume — only force-bind + selective
-/// invalidate (or bare FullRestart). Research inspect keeps [`RepairPlan::RewindTo`].
+/// Default verb is [`Self::SuffixRepair`] (hang-free RewindTo + journal FF +
+/// force-bind) when a certified mid-tx checkpoint exists before fail `k`.
+/// Absolute PC jump / valued CallOutcome remain research-only.
 #[derive(Debug, Clone)]
 pub(crate) enum LeanAbortRepair {
-    /// Certified prefix → force-bind armed; caller selective-invalidates + head reexec.
+    /// Certified checkpoint before fail `k` — RewindTo + FF armed (`is_rewind_resume`).
+    SuffixRepair {
+        certified: Vec<MemoryLocationHash>,
+        suffix_writes: Vec<MemoryLocationHash>,
+        /// Suggested `LiveLearner::note_reexec_cost` sample (~0.6).
+        reexec_cost: f64,
+    },
+    /// Certified prefix but no usable mid-tx checkpoint → force-bind + head reexec.
     ForceBind {
         certified: Vec<MemoryLocationHash>,
         /// Suggested `LiveLearner::note_reexec_cost` sample.
         reexec_cost: f64,
     },
-    /// No usable certified prefix → force-bind cleared; FullRestart from tx head.
+    /// No usable certified prefix / control-flow broken → FullRestart from tx head.
     FullRestart {
         reexec_cost: f64,
     },
@@ -245,13 +257,20 @@ impl LeanAbortRepair {
     #[inline]
     pub(crate) fn reexec_cost(&self) -> f64 {
         match self {
-            Self::ForceBind { reexec_cost, .. } | Self::FullRestart { reexec_cost } => *reexec_cost,
+            Self::SuffixRepair { reexec_cost, .. }
+            | Self::ForceBind { reexec_cost, .. }
+            | Self::FullRestart { reexec_cost } => *reexec_cost,
         }
     }
 
     #[inline]
     pub(crate) fn did_force_bind(&self) -> bool {
-        matches!(self, Self::ForceBind { .. })
+        matches!(self, Self::ForceBind { .. } | Self::SuffixRepair { .. })
+    }
+
+    #[inline]
+    pub(crate) fn is_suffix_repair(&self) -> bool {
+        matches!(self, Self::SuffixRepair { .. })
     }
 }
 
@@ -1125,22 +1144,22 @@ impl PartialRetryTable {
         self.softwait_parked.remove(&tx_idx).is_some()
     }
 
-    /// V5-P1/P3 — **single Lean SpecFence abort repair** (default path).
+    /// SpecFence-native Lean resolve: **SuffixRepair-first** (default abort path).
     ///
     /// ```text
-    /// if certified prefix from plan_partial_retry:
-    ///   set_force_bind(certified); clear_repair (no inspect/RewindTo arm)
-    ///   → ForceBind  (caller: selective invalidate + FullRestart-from-head reexec)
+    /// if plan_partial_retry + checkpoint with 0 < cp.k < k_fail:
+    ///   arm_rewind_to + journal FF + set_force_bind  → SuffixRepair
+    ///   (same hang-free subset as SoftWait wake / try_arm_park_resume_at_k)
+    /// else if certified prefix (no mid-tx cp):
+    ///   set_force_bind; clear RewindTo → ForceBind (head reexec fallback)
     /// else:
     ///   clear_force_bind; clear_repair → FullRestart
     /// ```
     ///
-    /// Hang-free: next incarnation uses `force_prefix` Bind-when-Data / SpecRead-else
-    /// (never WaitHard without Data). **Does not** arm RewindTo/FF — that is the
-    /// research API [`Self::research_apply_abort_repair`] (opt-in inspect only).
-    /// SoftWait wake may still arm hang-free journal FF via
-    /// [`Self::try_arm_park_resume_at_k`] independently of this abort helper.
-    pub(crate) fn apply_lean_abort_repair(
+    /// Does **not** enable absolute PC jump / valued CallOutcome (research inspect
+    /// only). After SuffixRepair, [`Self::is_rewind_resume`] is true so `set_tx`
+    /// journal FF applies.
+    pub(crate) fn apply_suffix_repair(
         &self,
         tx_idx: TxIdx,
         read_locations: &[MemoryLocationHash],
@@ -1149,8 +1168,30 @@ impl PartialRetryTable {
     ) -> LeanAbortRepair {
         match self.plan_partial_retry(tx_idx, read_locations, invalid, write_locations) {
             Some(plan) if !plan.certified.is_empty() => {
+                let k_fail = plan.k_fail;
+                // Hang-free SoftWait-wake criteria: real mid-tx checkpoint before k.
+                if k_fail > 0 {
+                    if let Some(cp) = self.last_checkpoint_before(tx_idx, k_fail) {
+                        if cp.k > 0 && cp.k < k_fail {
+                            self.arm_rewind_to(
+                                tx_idx,
+                                cp,
+                                k_fail,
+                                plan.certified.clone(),
+                                plan.suffix_writes.clone(),
+                                plan.prefix_writes.clone(),
+                            );
+                            self.set_force_bind(tx_idx, plan.certified.clone());
+                            return LeanAbortRepair::SuffixRepair {
+                                certified: plan.certified,
+                                suffix_writes: plan.suffix_writes,
+                                reexec_cost: 0.6,
+                            };
+                        }
+                    }
+                }
+                // Certified prefix but no usable mid-tx checkpoint → head ForceBind.
                 self.set_force_bind(tx_idx, plan.certified.clone());
-                // Lean: do NOT arm RewindTo / inspect resume — drop any stale plant.
                 self.clear_repair(tx_idx);
                 LeanAbortRepair::ForceBind {
                     certified: plan.certified,
@@ -1163,6 +1204,18 @@ impl PartialRetryTable {
                 LeanAbortRepair::FullRestart { reexec_cost: 2.2 }
             }
         }
+    }
+
+    /// Alias for [`Self::apply_suffix_repair`] (legacy Lean abort name).
+    #[inline]
+    pub(crate) fn apply_lean_abort_repair(
+        &self,
+        tx_idx: TxIdx,
+        read_locations: &[MemoryLocationHash],
+        invalid: &[MemoryLocationHash],
+        write_locations: &[MemoryLocationHash],
+    ) -> LeanAbortRepair {
+        self.apply_suffix_repair(tx_idx, read_locations, invalid, write_locations)
     }
 
     /// V5-P3 — **research plant** abort arming (thin wrapper over plan_repair + arm_rewind_to).
@@ -2059,54 +2112,70 @@ mod abort_cheapening_tests {
         assert!(!table.must_force_bind(0, 6));
     }
 
-    /// V5-P1: Lean repair with certified prefix → ForceBind only (no RewindTo arm).
+    /// SuffixRepair: mid-tx checkpoint before fail k → RewindTo + force-bind.
     #[test]
-    fn apply_lean_abort_repair_force_bind_no_rewind() {
+    fn apply_suffix_repair_arms_rewind_when_checkpoint_before_k() {
+        let table = PartialRetryTable::new(1);
+        table.reset_incarnation(0, 0);
+        let _ = table.push_checkpoint(0, CheckpointKind::CallEntry);
+        table.note_access(0, 10, AccessMode::Read);
+        table.note_certified(0, 10);
+        // Real mid-tx progress checkpoint (SoftWait hang-free subset requires cp.k > 0).
+        let _ = table.push_checkpoint(0, CheckpointKind::EffectBoundary);
+        table.note_access(0, 11, AccessMode::Read);
+
+        match table.apply_suffix_repair(0, &[10, 11], &[11], &[]) {
+            LeanAbortRepair::SuffixRepair {
+                certified,
+                suffix_writes: _,
+                reexec_cost,
+            } => {
+                assert!(certified.contains(&10));
+                assert!(!certified.contains(&11));
+                assert!((reexec_cost - 0.6).abs() < 1e-9);
+            }
+            other => panic!("expected SuffixRepair, got {other:?}"),
+        }
+        assert!(table.must_force_bind(0, 10));
+        assert!(
+            table.is_rewind_resume(0),
+            "SuffixRepair must leave RewindTo armed for journal FF"
+        );
+    }
+
+    /// Certified prefix but only k=0 CallEntry → ForceBind head (no RewindTo).
+    #[test]
+    fn apply_suffix_repair_force_bind_without_mid_tx_checkpoint() {
         let table = PartialRetryTable::new(1);
         table.reset_incarnation(0, 0);
         let _ = table.push_checkpoint(0, CheckpointKind::CallEntry);
         table.note_access(0, 10, AccessMode::Read);
         table.note_certified(0, 10);
         table.note_access(0, 11, AccessMode::Read);
-        // Stale research plant must be cleared by Lean helper.
-        table.set_repair(
-            0,
-            RepairPlan::RewindTo {
-                cp: CheckpointId {
-                    tx_idx: 0,
-                    incarnation: 0,
-                    k: 0,
-                },
-                certified: vec![10],
-                k_fail: 2,
-                suffix_writes: vec![],
-            },
-        );
-        assert!(table.is_rewind_resume(0));
 
-        match table.apply_lean_abort_repair(0, &[10, 11], &[11], &[]) {
+        match table.apply_suffix_repair(0, &[10, 11], &[11], &[]) {
             LeanAbortRepair::ForceBind { certified, reexec_cost } => {
                 assert!(certified.contains(&10));
                 assert!(!certified.contains(&11));
                 assert!((reexec_cost - 1.2).abs() < 1e-9);
             }
-            other => panic!("expected ForceBind, got {other:?}"),
+            other => panic!("expected ForceBind fallback, got {other:?}"),
         }
         assert!(table.must_force_bind(0, 10));
         assert!(
             !table.is_rewind_resume(0),
-            "V5-P1 Lean must not leave RewindTo armed"
+            "k=0-only checkpoint must not arm RewindTo (hang-free SoftWait subset)"
         );
     }
 
-    /// V5-P1: no certified prefix → FullRestart + cleared force-bind.
+    /// No certified prefix → FullRestart + cleared force-bind.
     #[test]
-    fn apply_lean_abort_repair_full_restart_without_prefix() {
+    fn apply_suffix_repair_full_restart_without_prefix() {
         let table = PartialRetryTable::new(1);
         table.reset_incarnation(0, 0);
         table.note_access(0, 1, AccessMode::Read);
         table.set_force_bind(0, vec![99]);
-        match table.apply_lean_abort_repair(0, &[1], &[1], &[]) {
+        match table.apply_suffix_repair(0, &[1], &[1], &[]) {
             LeanAbortRepair::FullRestart { reexec_cost } => {
                 assert!((reexec_cost - 2.2).abs() < 1e-9);
             }
@@ -2116,15 +2185,14 @@ mod abort_cheapening_tests {
         assert!(!table.is_rewind_resume(0));
     }
 
-    /// V5-P3: research wrapper arms RewindTo; Lean helper must not.
+    /// Research + Lean SuffixRepair both arm RewindTo when mid-tx cp exists.
     #[test]
-    fn research_apply_abort_repair_arms_rewind_lean_does_not() {
+    fn research_and_lean_suffix_repair_both_arm_rewind() {
         let table = PartialRetryTable::new(1);
         table.reset_incarnation(0, 0);
         let _ = table.push_checkpoint(0, CheckpointKind::CallEntry);
         table.note_access(0, 10, AccessMode::Read);
         table.note_certified(0, 10);
-        // Need k>0 checkpoint for RewindTo preference.
         let _ = table.push_checkpoint(0, CheckpointKind::EffectBoundary);
         table.note_access(0, 11, AccessMode::Read);
 
@@ -2142,14 +2210,14 @@ mod abort_cheapening_tests {
         assert!(table.is_rewind_resume(0));
         assert!(table.must_force_bind(0, 10));
 
-        // Same inputs on Lean must clear RewindTo.
-        match table.apply_lean_abort_repair(0, &[10, 11], &[11], &[]) {
-            LeanAbortRepair::ForceBind { .. } => {}
-            other => panic!("expected Lean ForceBind, got {other:?}"),
+        // Same inputs on Lean SuffixRepair must keep/re-arm RewindTo.
+        match table.apply_suffix_repair(0, &[10, 11], &[11], &[]) {
+            LeanAbortRepair::SuffixRepair { .. } => {}
+            other => panic!("expected Lean SuffixRepair, got {other:?}"),
         }
         assert!(
-            !table.is_rewind_resume(0),
-            "V5-P3: Lean abort must clear research RewindTo"
+            table.is_rewind_resume(0),
+            "Lean SuffixRepair must arm RewindTo when mid-tx checkpoint exists"
         );
     }
 }

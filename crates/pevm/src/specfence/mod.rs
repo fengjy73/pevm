@@ -1,6 +1,7 @@
-//! SpecFence **v5** — Block-STM + FenceGraph SoftWait + AEC π + continuous θ + Lean repair.
+//! SpecFence **v5** — Block-STM + FenceGraph SoftWait + AEC π + SuffixRepair resolve.
 //!
-//! Authoritative design: `lab/notes/specfence-v5-first-principles-clean-slate.md`.
+//! Authoritative resolve: `lab/notes/specfence-native-resolve-protocol.md`.
+//! SpecFence is its **own** CC protocol — not optimized OCC.
 //!
 //! # Single algorithm (hot path)
 //! ```text
@@ -8,17 +9,18 @@
 //!     ↑
 //! FenceGraph: SoftWait / wake only        # L2 — sole Wait authority
 //!     ↑
-//! π = argmin EV[Bind, Wait, Spec, Early]  # L3 — choose_action (AEC)
+//! π = argmin EV[Bind, Await, Spec, Early] # L3 — choose_action (AEC)
 //!     ↑
 //! OutcomeLearner: P_abort, T_wait, …      # L4 — continuous θ features only
 //!     ↑
-//! RepairPlant: V5-P1 Lean force-bind | research RewindTo (opt-in)  # L1
+//! Resolve: SuffixRepair (RewindTo+FF) | FullRestart last resort  # L1
 //! ```
 //!
-//! **Default:** SpecRead (OCC-like). SoftWait only when `EV_Wait < EV_Spec`.
-//! Fan-out raises `EV_Wait` (discourage serialize). Abort cheapened with
-//! V5-P1: one Lean abort path (`apply_lean_abort_repair`) — force-bind +
-//! selective when certified prefix exists, else FullRestart. Never inspect.
+//! **Resolve default:** SuffixRepair (hang-free RewindTo + journal FF + force-bind)
+//! when a certified checkpoint exists before fail `k` — not OCC head restart.
+//! SoftWait / Await when `EV_Wait ≲ EV_Spec` and producer Running; SpecRead for
+//! writer absent/unknown discovery. Fan-out raises `EV_Wait` (discourage serialize).
+//! Absolute jump / inspect stay opt-in research only.
 //!
 //! # Shoveled off SpecFence control (V5-P0)
 //! - Heat / `seed_wait_regions` SoftWait arming (PCC may still seed account Wait)
