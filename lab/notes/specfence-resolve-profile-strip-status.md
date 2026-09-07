@@ -3,6 +3,7 @@
 **Date:** 2026-09-07 (Asia/Shanghai)  
 **Branch:** `specfence`  
 **Base tip:** `1c1ad81` (stabilize Bind-on-Data)  
+**Landing tip:** `9fe988d`  
 **Authority:** `specfence-native-resolve-protocol.md`
 
 ---
