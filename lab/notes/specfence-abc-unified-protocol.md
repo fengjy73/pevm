@@ -94,3 +94,9 @@ Estimate→Data spin + multi-origin Basic snap; one extra SuffixRepair when Rewi
 597 N=5 med **13.0** SoftWait=0 (↓ vs Iter5 13.1); N=10 med **14.0**; **full_restart ≈½**.  
 See `specfence-abc-iter6-status.md`. Iter 7 cause: SuffixRepair resume opcode-seconds / make 2nd repair succeed (sticky Await) or memory-lite jump.
 
+### Iter 7 — 2nd SuffixRepair sticky Await (BO) before resume
+After first SuffixRepair fail: sticky + force_bind-extend fail locs; storm∧Executing writer BO-park before 2nd resume (sra). Memory-lite abs jump gated on non-empty live memory (aj=0 without inspect). SoftWait Soft=0.  
+597 N=5 med **13.2** SoftWait=0; N=10 med **13.9**; **fb_reabort/resume/fr↓**.  
+See `specfence-abc-iter7-status.md`. Iter 8 cause: remaining SuffixRepair opcode-seconds; hang-free memory snap ≠ inspect, or RebindOnly on certified-prefix-only / Storage-stable fails.
+
+

@@ -1099,6 +1099,10 @@ fn try_validate(
                 for location in &invalid {
                     specfence.learner.note_sticky_resolve(*location);
                 }
+                // Iter7: on *second* repair arm (was_force_bind), union fail locs into
+                // force_bind so force_prefix-Awaits them until Validated. First repair
+                // relies on sticky note alone (early force_bind-extend wall↑ via BO).
+                // Narrow: conflict invalid only — not SoftWait Soft / storm fanout.
                 if was_force_bind {
                     specfence
                         .partial_retry
@@ -1259,6 +1263,43 @@ fn try_validate(
             specfence.metrics.record_fence_cascade(cascade, skipped);
             // V5-P0: engagement.note_abort is metrics-only (no HotSet storm insert).
             let _ = specfence.engagement.note_abort();
+            // Iter7: after first SuffixRepair fail (was_force_bind, arming 2nd
+            // SuffixRepair), sticky BO Await — park this tx behind unfinished
+            // fail-loc writers until Executed/Validated before 2nd resume.
+            // Not SoftWait Soft; not storm-wide fanout Await (fail locs only).
+            if !escalate && was_force_bind && specfence.engagement.is_storm() {
+                // Hang-free: only park behind *Executing* fail-loc writers (Iter3
+                // lesson). Ready/Aborting deps idle the 2nd resume (wall↑ on N=5).
+                let mut best: Option<(crate::TxIdx, usize)> = None;
+                for location in &invalid {
+                    let w = mv_memory
+                        .last_writer_before(*location, tx_version.tx_idx)
+                        .or_else(|| {
+                            mv_memory.residual_writer_before(*location, tx_version.tx_idx)
+                        });
+                    if let Some(w) = w {
+                        if w < tx_version.tx_idx && scheduler.is_executing(w) {
+                            let fan = mv_memory.higher_readers_of(*location, w).len();
+                            let take = match best {
+                                None => true,
+                                Some((pw, pf)) => fan > pf || (fan == pf && w > pw),
+                            };
+                            if take {
+                                best = Some((w, fan));
+                            }
+                        }
+                    }
+                }
+                if let Some((w, _)) = best {
+                    if scheduler.add_dependency_from_aborting(tx_version.tx_idx, w) {
+                        specfence.metrics.record_second_repair_await();
+                        return scheduler.finish_validation_fenced_barrier_park(
+                            tx_version,
+                            rewind_to,
+                        );
+                    }
+                }
+            }
             // Iter3/4 B: serial-barrier + capped hot-ℓ clique resolve after escalate.
             // Prefer park behind Executing conflict writers so head reexec runs once
             // against Data. Iter4: also park up to 2 Aborting sibling readers of the

@@ -201,6 +201,8 @@ pub struct SpecFenceMetrics {
     pub serial_barrier_clique: usize,
     /// Iter5: fb escalate deferred once for jump_is_safe after capture window.
     pub jump_defer: usize,
+    /// Iter7: 2nd SuffixRepair parked behind unfinished fail-loc writers (BO Await).
+    pub second_repair_await: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -289,6 +291,7 @@ pub(crate) struct MetricsInner {
     handler_sstore_capture: AtomicUsize,
     serial_barrier_clique: AtomicUsize,
     jump_defer: AtomicUsize,
+    second_repair_await: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -612,6 +615,10 @@ impl MetricsInner {
         self.serial_barrier_clique.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_second_repair_await(&self) {
+        self.second_repair_await.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_jump_defer(&self) {
         self.jump_defer.fetch_add(1, Ordering::Relaxed);
     }
@@ -834,6 +841,7 @@ impl MetricsInner {
             handler_sstore_capture: self.handler_sstore_capture.load(Ordering::Relaxed),
             serial_barrier_clique: self.serial_barrier_clique.load(Ordering::Relaxed),
             jump_defer: self.jump_defer.load(Ordering::Relaxed),
+            second_repair_await: self.second_repair_await.load(Ordering::Relaxed),
         }
     }
 }

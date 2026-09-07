@@ -22,10 +22,12 @@
 //! **Resolve (B):** RebindOnly when value-stable (Iter6: Estimate→Data spin +
 //! multi-origin Basic snap / prior match); else SuffixRepair + journal FF.
 //! Escalate FullRestart after depth≥2 when RewindTo/FF armed (one extra
-//! SuffixRepair vs classic fb escalate-at-1; depth≥3 measured wall↑). Else
-//! classic depth≥2 / fb_reabort. Escalation retains **head-FF** (Iter5). Serial-barrier / hot-ℓ
-//! clique barrier (capped). Never ESTIMATE-poison certified prefix. No Lean
-//! live_prime / absolute jump / SoftWait Soft storms.
+//! SuffixRepair vs classic fb escalate-at-1; depth≥3 measured wall↑). Iter7:
+//! after first SuffixRepair fail, sticky BO Await on fail locs (+ force_bind
+//! extend) until writers Validated before 2nd resume; memory-lite abs jump only
+//! when non-empty live memory snap (else aj=0; no empty-memory / no live_prime).
+//! Escalation retains **head-FF** (Iter5). Serial-barrier / hot-ℓ clique barrier
+//! (capped). Never ESTIMATE-poison certified prefix. SoftWait Soft ~0.
 //!
 //! **Learn (C):** Inter morph selects Quiet (598 OCC-lite) vs Storm (597 Await-ready).
 //! Intra `choose_action` / learner updates only on hot candidates.

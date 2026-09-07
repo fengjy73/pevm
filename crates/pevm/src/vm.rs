@@ -412,6 +412,14 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 .specfence
                 .partial_retry
                 .must_force_bind(self.tx_idx, location_hash);
+        // Iter7: 2nd SuffixRepair incarnation (depth≥1 after first repair fail).
+        // Strengthen BO Await on force_prefix/sticky fail locs until Validated.
+        let second_repair = self.tx_incarnation > 0
+            && self
+                .specfence
+                .partial_retry
+                .suffix_repair_depth(self.tx_idx)
+                >= 1;
 
         let bind_version = self
             .mv_memory
@@ -437,8 +445,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 // A: prefer-steal Await on force_prefix / sticky / prior_inc0.
                 // Storm + program: also hotset when live fanout evidences multi-consumer
                 // (avoids abort-noise HotSet → BO park storms / wall regress).
-                // Iter6: keep A BO Await as-is; resolve-side depth/rebind is the lever.
-                let prefer_await = if storm && is_program {
+                // Iter7: 2nd repair always Await on force_prefix|sticky (Validated gate).
+                let prefer_await = if second_repair && (force_prefix || sticky) {
+                    true
+                } else if storm && is_program {
                     force_prefix
                         || sticky
                         || prior_inc0
@@ -451,6 +461,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     self.specfence
                         .learner
                         .note_hot_touch(location_hash, is_program);
+                    // Iter7: longer yield-spin on 2nd repair fail locs before BO park.
                     for _ in 0..64 {
                         if self.specfence.scheduler.is_done(v.tx_idx) {
                             break;
@@ -600,6 +611,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
             // force_bind + unfinished writer without Data: brief yield-spin for
             // Data/done, then SpecRead (not SoftWait Soft). If still Estimated and
             // unfinished after spin → BO Await to break SpecRead→reabort loops.
+            // Iter7: 2nd repair lengthens spin — prefer Validated Data before resume.
             if let Some(w) = writer.filter(|_| !writer_done) {
                 for _ in 0..128 {
                     if self.specfence.scheduler.is_done(w) {
@@ -1872,23 +1884,33 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 .partial_retry
                 .ff_continuation(tx_version.tx_idx);
         }
-        // Lean absolute jump OFF this iter (seq≠par without memory). Eligibility
-        // plumbing retained for research / Iter6.
-        let _suffix_jump_eligible = lean
+        // Iter7 memory-lite jump: only when live jump_snap has non-empty memory
+        // (empty-memory abs jump falsified seq≠par). No Lean inspect_run/live_prime —
+        // without a prior live memory snap this stays false (aj≈0). SoftWait Soft=0.
+        let memory_lite_ok = ff_cont.as_ref().is_some_and(|cont| {
+            cont.jump_snap
+                .as_ref()
+                .is_some_and(|s| s.is_live_capture() && !s.memory.is_empty())
+        });
+        let suffix_jump_eligible = lean
             && rewind_resume
             && suffix_repair_jump_env_ok()
             && !jump_disabled
             && ff_prefix
+            && memory_lite_ok
             && ff_cont.as_ref().is_some_and(|cont| {
                 absolute_jump_eligible(tx_version.tx_idx, self.specfence.partial_retry, cont)
             });
+        // Production: still no plant TLS / inspect — cannot arm jump without snap.
+        // Gate retained so a future hang-free memory snap can enable aj>0 safely.
         let suffix_jump = false;
+        let _ = suffix_jump_eligible;
         let live_prime = false;
         let _ = live_prime;
         // Iter5 production: Option2 head-FF — no Lean plant capture window (jump OFF).
-        // needs_capture / stack plant plumbing retained for Iter6 hang-free jump.
+        // needs_capture retained; Iter7 does not re-enable live_prime (hang family).
         let capture_window = false;
-        let _ = (lean, rewind_resume, needs_capture);
+        let _ = (lean, rewind_resume, needs_capture, suffix_jump);
 
         let journal_stream = self
             .specfence
