@@ -4,6 +4,7 @@
 **Branch:** `specfence`  
 **Authority:** `specfence-region-fence-adaptive-architecture.md` §P3, learn-from-blocks §4.1  
 **Depends on:** P0–P2 (`8c875c4` tip at start)
+**Tip:** `43323b8739778e750fe466471fc0aeec24d7ab94` (`43323b8`)
 
 ---
 
