@@ -1,10 +1,13 @@
-//! SpecFence v5 engagement — **always Lean execute** (no abort_rate mode ladder).
+//! SpecFence engagement — Lean execute + **quiet/storm block mode** (A+B+C).
 //!
-//! Authoritative: `lab/notes/specfence-v5-first-principles-clean-slate.md` (V5-P0).
+//! Authoritative: `lab/notes/specfence-abc-unified-protocol.md`.
 //!
-//! - Block start / mid-block: LeanOCC for `Handler::run` unless research inspect.
+//! - Execute path: always LeanOCC for `Handler::run` unless research inspect.
+//! - Block engagement mode (C): `Quiet` (598-like OCC-lite) vs `Storm`
+//!   (597-like Await-ready on hot ℓ). Selected from inter morph prior; may flip
+//!   mid-block on live morph evidence (598→599 style). Mode actuates Await set
+//!   in `maybe_wait` — not SoftWait Soft arms.
 //! - `note_abort` is **metrics-only** — does not escalate HotSet or flip π.
-//! - HotSet / Bayes / RegionTable are not Wait authorities; π = `choose_action`.
 //! - `SPECFENCE_ENABLE_INSPECT=1` re-enables inspect_run / jump (research only).
 //!
 //! OCC / PCC modes never consult this module.
@@ -46,6 +49,40 @@ pub(crate) fn softwait_disabled() -> bool {
     }
 }
 
+/// Block-level engagement mode (inter/intra morph actuation — not SoftWait Soft).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum BlockEngagementMode {
+    /// 598-like: OCC-lite discovery; narrow Await (force_prefix/sticky/prior only).
+    Quiet = 0,
+    /// 597-like: Await-ready on hot program ℓ (live fanout / inter top-ℓ / sticky).
+    Storm = 1,
+}
+
+impl BlockEngagementMode {
+    #[inline]
+    pub(crate) fn from_u8(v: u8) -> Self {
+        if v == BlockEngagementMode::Storm as u8 {
+            BlockEngagementMode::Storm
+        } else {
+            BlockEngagementMode::Quiet
+        }
+    }
+
+    /// Map morph weights → engagement mode.
+    /// Storm when fan-out dominates or quiet mass collapses (mixed/storm evidence).
+    pub(crate) fn from_morph(fan_out: f64, mixed: f64, quiet: f64) -> Self {
+        if fan_out >= 0.35 && fan_out >= mixed && fan_out >= quiet {
+            return BlockEngagementMode::Storm;
+        }
+        // Mixed with collapsed quiet (599 flip from 598): Await-ready.
+        if quiet < 0.40 && (fan_out + mixed) >= 0.55 {
+            return BlockEngagementMode::Storm;
+        }
+        BlockEngagementMode::Quiet
+    }
+}
+
 /// `SPECFENCE_PROFILE=1` enables ns Instant buckets (handler/maybe_wait/validate/sched).
 /// Default off — Instant tax on every SpecRead biases wall vs OCC.
 pub(crate) fn profile_timing_enabled() -> bool {
@@ -68,6 +105,8 @@ pub(crate) struct AdaptiveEngagement {
     full_txs: AtomicUsize,
     switches: AtomicUsize,
     aborts: AtomicUsize,
+    /// Quiet vs Storm (C): actuates hot-ℓ Await in maybe_wait.
+    mode: AtomicUsize,
     /// Last execute of `tx_idx` used the lean execute path.
     tx_was_lean: Vec<AtomicBool>,
 }
@@ -89,6 +128,7 @@ impl AdaptiveEngagement {
             full_txs: AtomicUsize::new(0),
             switches: AtomicUsize::new(0),
             aborts: AtomicUsize::new(0),
+            mode: AtomicUsize::new(BlockEngagementMode::Quiet as usize),
             tx_was_lean,
         }
     }
@@ -152,6 +192,35 @@ impl AdaptiveEngagement {
     pub(crate) fn engagement_switches(&self) -> usize {
         self.switches.load(Ordering::Relaxed)
     }
+
+    /// Set block engagement mode from inter-block morph prior (block start).
+    pub(crate) fn set_mode_from_morph(&self, fan_out: f64, mixed: f64, quiet: f64) {
+        let m = BlockEngagementMode::from_morph(fan_out, mixed, quiet);
+        self.mode.store(m as usize, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn mode(&self) -> BlockEngagementMode {
+        BlockEngagementMode::from_u8(self.mode.load(Ordering::Relaxed) as u8)
+    }
+
+    #[inline]
+    pub(crate) fn is_storm(&self) -> bool {
+        self.mode() == BlockEngagementMode::Storm
+    }
+
+    /// Mid-block / inter flip: update mode from live morph; count switches.
+    pub(crate) fn maybe_flip_mode(&self, fan_out: f64, mixed: f64, quiet: f64) -> bool {
+        let next = BlockEngagementMode::from_morph(fan_out, mixed, quiet);
+        let cur = self.mode();
+        if next != cur {
+            self.mode.store(next as usize, Ordering::Relaxed);
+            self.switches.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -198,5 +267,33 @@ mod tests {
         assert!(eng.begin_tx(0));
         assert!(!eng.note_abort());
         assert_eq!(eng.engagement_switches(), 0);
+    }
+
+    #[test]
+    fn morph_selects_quiet_vs_storm() {
+        assert_eq!(
+            BlockEngagementMode::from_morph(0.10, 0.20, 0.60),
+            BlockEngagementMode::Quiet
+        );
+        assert_eq!(
+            BlockEngagementMode::from_morph(0.50, 0.20, 0.20),
+            BlockEngagementMode::Storm
+        );
+        // 598→599 style: quiet collapses, mixed+fan_out rise
+        assert_eq!(
+            BlockEngagementMode::from_morph(0.25, 0.40, 0.25),
+            BlockEngagementMode::Storm
+        );
+    }
+
+    #[test]
+    fn maybe_flip_counts_switch() {
+        let eng = AdaptiveEngagement::new(4, true);
+        assert!(!eng.is_storm());
+        assert!(eng.maybe_flip_mode(0.50, 0.20, 0.20));
+        assert!(eng.is_storm());
+        assert_eq!(eng.engagement_switches(), 1);
+        assert!(!eng.maybe_flip_mode(0.50, 0.20, 0.20));
+        assert_eq!(eng.engagement_switches(), 1);
     }
 }

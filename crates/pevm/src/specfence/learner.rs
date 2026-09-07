@@ -3,8 +3,8 @@
 //! Intra-block: live fanout + morphology posterior + EV estimators
 //! (`E_wait_time`, `E_cascade`, `E_reexec`, `E_idle_steal`, SoftWait latency,
 //! bind/wait_useful, meta tax) updated on outcomes.
-//! Inter-block: `InterBlockPrior` EMA + flip decay; seeds HotSet/Bayes / θ warm-start only —
-//! **never** arms SoftWait from prior alone.
+//! Inter-block: `InterBlockPrior` EMA + flip decay; seeds HotSet/Bayes + **engagement
+//! mode** (quiet vs storm) — never arms SoftWait Soft from prior alone.
 //!
 //! `AdaptiveParams` are learning rates / priors for the Adaptive EV Controller —
 //! **not** Boolean Wait cuts (`D_WAIT` / fanout ladders).
@@ -241,6 +241,8 @@ const MAX_TOP_L: usize = 64;
 const ALPHA_NORMAL: f64 = 0.25;
 const ALPHA_FLIP: f64 = 0.65;
 const FLIP_KL: f64 = 0.35;
+/// Live reader fanout at which ℓ is a hot Await candidate (597-like).
+pub(crate) const HOT_FANOUT_THRESH: usize = 8;
 
 /// Inter-block warm-start prior (persists on [`crate::Pevm`]).
 #[derive(Debug, Default)]
@@ -498,6 +500,40 @@ impl LiveLearner {
             .is_some_and(|e| e.sticky_resolve.load(Ordering::Relaxed) > 0)
     }
 
+    /// Cheap reader bump on hot-candidate first-cross (no morph/π tax).
+    /// Builds live fanout so storm Await can engage without full `note_observe`.
+    pub(crate) fn note_hot_touch(&self, location: MemoryLocationHash, is_program: bool) {
+        let entry = self.locs.entry(location).or_default();
+        entry.readers.fetch_add(1, Ordering::Relaxed);
+        if is_program {
+            entry.program_reads.fetch_add(1, Ordering::Relaxed);
+            self.program_obs.fetch_add(1, Ordering::Relaxed);
+        } else {
+            entry.handler_reads.fetch_add(1, Ordering::Relaxed);
+            self.handler_obs.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Intra hot candidate: prior top-k / live fanout / sticky (for choose_action gate).
+    #[inline]
+    pub(crate) fn is_hot_learn_candidate(
+        &self,
+        location: MemoryLocationHash,
+        hotset: bool,
+        prior_ws: bool,
+        force_bind: bool,
+    ) -> bool {
+        if force_bind || hotset || prior_ws || self.is_sticky_resolve(location) {
+            return true;
+        }
+        self.fanout_live(location) >= HOT_FANOUT_THRESH
+    }
+
+    /// Live fanout crosses Await threshold (A hot ℓ).
+    #[inline]
+    pub(crate) fn live_fanout_hot(&self, location: MemoryLocationHash) -> bool {
+        self.fanout_live(location) >= HOT_FANOUT_THRESH
+    }
 
     pub(crate) fn note_publish(&self, location: MemoryLocationHash) {
         self.publish_events.fetch_add(1, Ordering::Relaxed);

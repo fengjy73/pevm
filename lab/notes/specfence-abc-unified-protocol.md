@@ -64,3 +64,9 @@ Each iter report: detect/avoid/resolve verdict + Region/Fence/intra/inter + tabl
 
 ### Iter 0 — protocol freeze
 This note. Implement A+B+C in one landing, then Iter 1 diagnose.
+
+### Iter 1 — unified landing + diagnose
+Landed A∧B∧C runtime (BO Await+armed_at_k; RebindOnly/SuffixRepair/escalate; Quiet|Storm mode).  
+597 N=5 med **13.3** SoftWait=0 (≈ plateau). Hole remains **resolve=FullRestart EVM**; jump_applied=0.  
+See `specfence-abc-iter1-status.md`. Iter 2 cause: hang-free live snap → jump before escalate.
+

@@ -21,7 +21,7 @@ use crate::{
     specfence::{
         AccessMode, CheckpointKind, FfValue, ResolveAction, SpecFenceCtx, StorageWriteReplay,
         early_val_probability, note_pending_effect_boundary,
-        absolute_jump_eligible, arm_call_outcome_cache, resume_was_applied, steps_this_run,
+        absolute_jump_eligible, attach_current_live_snap, arm_call_outcome_cache, resume_was_applied, steps_this_run,
         suffix_repair_jump_env_ok, try_arm_safe_absolute_jump, try_arm_safe_absolute_jump_gated,
         with_plant_tls_journal,
     },
@@ -419,19 +419,34 @@ impl<'a, S: Storage> VmDb<'a, S> {
             });
 
         if let Some(v) = bind_version {
-            // Unfinished published Data: BlockingOther prefer-steal Await until
-            // Executed/Validated, then Bind — *before* SpecRead/Bind-no-park.
-            // Extends force_prefix BO to sticky + incarnation-0 prior (hot/prior
-            // conflict). Previously these only yield-spun then Bind-no-park — that
-            // is the first force_bind abort grain (reading past unfinished writer).
-            // SoftWait Soft = 0; keep escalate-after-1-reabort / RebindOnly.
+            // A: Unfinished published Data on hot program ℓ → BlockingOther
+            // prefer-steal Await until Executed/Validated, then Bind.
+            // SoftWait Soft stays ~0 (BO Await, not FenceGraph Soft).
+            // Quiet mode: narrow (force_prefix|sticky|prior_inc0) — no storm tax.
+            // Storm mode: widen to live fanout / inter top-ℓ (hotset) / sticky.
             let writer_unfinished = !self.specfence.scheduler.is_done(v.tx_idx);
             if writer_unfinished {
                 let sticky = self.specfence.learner.is_sticky_resolve(location_hash);
-                let prior_inc0 = self.tx_incarnation == 0
-                    && self.specfence.rw_prior.predicts_write(location_hash);
-                let prefer_await = force_prefix || sticky || prior_inc0;
+                let prior_write = self.specfence.rw_prior.predicts_write(location_hash);
+                let prior_inc0 = self.tx_incarnation == 0 && prior_write;
+                let hotset = self.specfence.hotset.contains(location_hash);
+                let storm = self.specfence.engagement.is_storm();
+                // A: prefer-steal Await on force_prefix / sticky / prior_inc0.
+                // Storm + program: also hotset when live fanout evidences multi-consumer
+                // (avoids abort-noise HotSet → BO park storms / wall regress).
+                let prefer_await = if storm && is_program {
+                    force_prefix
+                        || sticky
+                        || prior_inc0
+                        || (hotset && self.specfence.learner.live_fanout_hot(location_hash))
+                } else {
+                    force_prefix || sticky || prior_inc0
+                };
                 if prefer_await {
+                    // Fence intent a=(t,k,ℓ): count hot waiter + armed_at_k.
+                    self.specfence
+                        .learner
+                        .note_hot_touch(location_hash, is_program);
                     for _ in 0..64 {
                         if self.specfence.scheduler.is_done(v.tx_idx) {
                             break;
@@ -441,9 +456,13 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     if !self.specfence.scheduler.is_done(v.tx_idx) {
                         self.specfence.metrics.record_wait_hard();
                         self.specfence.metrics.record_wait(address);
-                        self.specfence
-                            .wave
-                            .set_pending_park_location(location_hash);
+                        let armed_at_k =
+                            self.specfence.partial_retry.current_k(self.tx_idx) as u64;
+                        self.specfence.wave.set_pending_park(
+                            location_hash,
+                            armed_at_k,
+                            crate::specfence::ParkKind::BlockingOther,
+                        );
                         return Err(ReadError::Blocking(v.tx_idx));
                     }
                     return self.bind_on_data_lite(address, location_hash, v, force_prefix);
@@ -465,25 +484,35 @@ impl<'a, S: Storage> VmDb<'a, S> {
             if let Some(w) = self.mv_memory.last_writer_before(location_hash, self.tx_idx) {
                 if self.mv_memory.entry_kind_at(location_hash, w) == "estimate" {
                     // Cold SpecRead-through-ESTIMATE (ESTIMATE→BO wall↑).
+                    // Never ESTIMATE-poison certified prefix (B).
                     self.specfence.metrics.record_spec_read();
                     self.specfence.metrics.record_occ_fast_first();
                     return Ok(());
                 }
-                // Known unfinished writer + prior/hot/sticky: BO prefer-steal
-                // Await before SpecRead (prevent first abort). SoftWait Soft = 0.
-                if !self.specfence.scheduler.is_done(w)
-                    && (self.specfence.rw_prior.predicts_write(location_hash)
-                        || self.specfence.hotset.contains(location_hash)
-                        || self.specfence.learner.is_sticky_resolve(location_hash))
-                {
+                // A: unfinished writer on hot ℓ → BO prefer-steal Await.
+                // Quiet: prior/hot/sticky. Storm+program: also live fanout.
+                let prior = self.specfence.rw_prior.predicts_write(location_hash);
+                let hotset = self.specfence.hotset.contains(location_hash);
+                let sticky = self.specfence.learner.is_sticky_resolve(location_hash);
+                // Same hot set as prevent-first; storm does not add live_fanout-only.
+                let hot_await = prior || hotset || sticky;
+                if !self.specfence.scheduler.is_done(w) && hot_await {
+                    self.specfence
+                        .learner
+                        .note_hot_touch(location_hash, is_program);
                     self.specfence.metrics.record_wait_hard();
                     self.specfence.metrics.record_wait(address);
-                    self.specfence
-                        .wave
-                        .set_pending_park_location(location_hash);
+                    let armed_at_k =
+                        self.specfence.partial_retry.current_k(self.tx_idx) as u64;
+                    self.specfence.wave.set_pending_park(
+                        location_hash,
+                        armed_at_k,
+                        crate::specfence::ParkKind::BlockingOther,
+                    );
                     return Err(ReadError::Blocking(w));
                 }
             }
+            // Cold ℓ: OCC-lite SpecRead (no π tax).
             self.specfence.metrics.record_spec_read();
             self.specfence.metrics.record_occ_fast_first();
             self.specfence.metrics.record_cold_spec_fast();
@@ -600,6 +629,20 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 ResolveAction::SpecRead
             }
         } else {
+            // C intra: choose_action / learner updates ONLY on hot location
+            // candidates (prior top-k / live fanout / sticky / force_bind).
+            let hot_learn = self.specfence.learner.is_hot_learn_candidate(
+                location_hash,
+                hotset_hint,
+                prior_ws_predicts,
+                force_prefix || tx_has_force,
+            );
+            if !hot_learn {
+                self.specfence.metrics.record_spec_read();
+                self.specfence.metrics.record_cold_spec_fast();
+                note_pending_effect_boundary(self.tx_idx, self.specfence.partial_retry);
+                return Ok(());
+            }
             // Sticky-without-Data or hot/prior: full π (may Await / EarlyAbort).
             if hotset_hint {
                 self.specfence.hotset.record_hot_local_read();
@@ -612,6 +655,13 @@ impl<'a, S: Storage> VmDb<'a, S> {
             self.specfence
                 .learner
                 .note_observe(location_hash, is_program, writer_count);
+            // C inter actuation: live morph may flip Quiet↔Storm mid-block.
+            let morph = self.specfence.learner.morph_weights();
+            let _ = self.specfence.engagement.maybe_flip_mode(
+                morph.fan_out,
+                morph.mixed,
+                morph.quiet,
+            );
             let live_fanout = self.specfence.learner.fanout_live(location_hash);
             let fanout_hint = hotset_hint || live_fanout >= 8;
             let waw_spine_hint = self.specfence.learner.waw_spine_hint(
@@ -666,14 +716,19 @@ impl<'a, S: Storage> VmDb<'a, S> {
         match action {
             ResolveAction::WaitHard => {
                 // SpecFence-native Await without FenceGraph SoftWait Soft — BO steal.
+                // Fence intent a=(t,k,ℓ): record armed_at_k (A).
                 self.specfence.metrics.record_wait_hard();
                 if let Some(prev) = writer
                     && !self.specfence.scheduler.is_done(prev)
                 {
                     self.specfence.metrics.record_wait(address);
-                    self.specfence
-                        .wave
-                        .set_pending_park_location(location_hash);
+                    let armed_at_k =
+                        self.specfence.partial_retry.current_k(self.tx_idx) as u64;
+                    self.specfence.wave.set_pending_park(
+                        location_hash,
+                        armed_at_k,
+                        crate::specfence::ParkKind::BlockingOther,
+                    );
                     return Err(ReadError::Blocking(prev));
                 }
                 let posterior = self
@@ -1779,14 +1834,23 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 matches!(v, FfValue::Storage { .. })
             })
         });
-        // Live jump_snap: only open inspect when jump_is_safe already (Storage FF
-        // + live capture from a prior inspect path). One-shot live_prime after
-        // force_bind_reabort was tried — cut force_bind_reabort but 4× evm_entries
-        // / wall regression on 597; consume the flag without inspect tax.
+        // B: hang-free absolute jump when jump_is_safe (live snap already on
+        // continuation); else journal-FF resume. Do NOT open inspect solely to
+        // prime live snaps (historically 4× evm_entries / wall↑ on 597). SoftWait
+        // Soft stays dormant. needs_live_capture consumed for metrics only.
         let _ = self
             .specfence
             .partial_retry
             .take_needs_live_capture(tx_version.tx_idx);
+        // If TLS already holds a live snap (rare Lean path), attach then refresh cont.
+        let mut ff_cont = ff_cont;
+        if rewind_resume && storage_prefix {
+            attach_current_live_snap(tx_version.tx_idx, self.specfence.partial_retry);
+            ff_cont = self
+                .specfence
+                .partial_retry
+                .ff_continuation(tx_version.tx_idx);
+        }
         let suffix_jump = lean
             && rewind_resume
             && suffix_repair_jump_env_ok()

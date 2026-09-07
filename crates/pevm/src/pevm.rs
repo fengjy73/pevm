@@ -397,18 +397,24 @@ impl Pevm {
         let mut initial_wait = std::collections::HashSet::new();
         // V5-P0: LeanOCC default; HotSet feature-only; inter-prior never arms SoftWait.
         let learner = LiveLearner::new();
+        let mut abc_prior_morph = None;
+        let mut abc_top_storm = false;
         if self.concurrency_mode == ConcurrencyMode::SpecFence {
             self.hotset.begin_block();
             let prior_morph = self.inter_prior.morph_ema();
             learner.begin_block_with_params(prior_morph, self.adaptive_params);
-            // Warm-start HotSet/Bayes from inter-block top-ℓ — NEVER arm SoftWait from prior.
+            // Warm-start HotSet/Bayes from inter-block top-ℓ — NEVER arm SoftWait Soft from prior.
             for top in self.inter_prior.top_locations() {
                 self.hotset.track_from_prior(top.location);
                 // Mild Bayes seed so conflict_probability is location-aware without Wait arm.
                 if top.abort_rate >= 0.15 || top.fanout_ema >= 16.0 {
                     let _ = self.bayes.observe_conflict_location(top.location);
                 }
+                if top.fanout_ema >= 16.0 {
+                    abc_top_storm = true;
+                }
             }
+            abc_prior_morph = Some(prior_morph);
         }
         let start_lean = self.concurrency_mode == ConcurrencyMode::SpecFence
             && AdaptiveEngagement::should_start_lean();
@@ -441,6 +447,13 @@ impl Pevm {
         } else {
             AdaptiveEngagement::disabled(block_size)
         };
+        // C: inter morph (+ top-ℓ fanout) selects Quiet vs Storm — actuates Await set.
+        if let Some(m) = abc_prior_morph {
+            engagement.set_mode_from_morph(m.fan_out, m.mixed, m.quiet);
+            if abc_top_storm && !engagement.is_storm() {
+                let _ = engagement.maybe_flip_mode(0.50, 0.25, 0.15);
+            }
+        }
         if self.finegrain_enabled {
             self.finegrain.clear();
             // Producer-readiness sampling for journal/deep research.
@@ -1034,17 +1047,34 @@ fn try_validate(
             if repair.did_force_bind() {
                 specfence.metrics.record_partial_retry();
             }
-            // Sticky AFTER SuffixRepair only when not escalating (reabort escalates).
-            if was_force_bind && !escalate {
+            // A∩B: after SuffixRepair (not escalate), sticky conflict ℓ so other
+            // consumers prefer BO Await; mark live-capture when write_replays exist
+            // so hang-free jump can fire on a later rewind (else journal-FF).
+            if !escalate {
                 for location in &invalid {
                     specfence.learner.note_sticky_resolve(*location);
                 }
-                specfence
+                if was_force_bind {
+                    specfence
+                        .partial_retry
+                        .extend_force_bind(tx_version.tx_idx, &invalid);
+                }
+                let has_wr = !specfence
                     .partial_retry
-                    .extend_force_bind(tx_version.tx_idx, &invalid);
-                specfence
-                    .partial_retry
-                    .mark_needs_live_capture(tx_version.tx_idx);
+                    .write_replay_locations(tx_version.tx_idx)
+                    .is_empty();
+                if has_wr || repair.did_force_bind() {
+                    specfence
+                        .partial_retry
+                        .mark_needs_live_capture(tx_version.tx_idx);
+                }
+                // C: abort morph may flip Quiet→Storm (598→599 style evidence).
+                let morph = specfence.learner.morph_weights();
+                let _ = specfence.engagement.maybe_flip_mode(
+                    morph.fan_out,
+                    morph.mixed,
+                    morph.quiet,
+                );
             }
             specfence.learner.note_reexec_cost(repair.reexec_cost());
             // SuffixRepair → invalidate failed suffix only; else selective/full.
@@ -1159,6 +1189,15 @@ fn try_validate(
             let cascade_hint = invalid.len().max(1);
             for location in &invalid {
                 specfence.learner.note_abort(*location, cascade_hint);
+            }
+            // C: live morph after abort may flip Quiet→Storm (actuates Await set).
+            {
+                let morph = specfence.learner.morph_weights();
+                let _ = specfence.engagement.maybe_flip_mode(
+                    morph.fan_out,
+                    morph.mixed,
+                    morph.quiet,
+                );
             }
             let rewind_to =
                 mv_memory.min_higher_reader_of(tx_version.tx_idx, &fence_locs);

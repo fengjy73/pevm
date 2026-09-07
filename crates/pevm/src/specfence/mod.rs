@@ -1,26 +1,30 @@
-//! SpecFence **v5** — Block-STM + FenceGraph SoftWait + AEC π + SuffixRepair resolve.
+//! SpecFence **A+B+C unified** — access-grain Await + cheap resolve + dual-horizon π.
 //!
-//! Authoritative resolve: `lab/notes/specfence-native-resolve-protocol.md`.
+//! Authoritative: `lab/notes/specfence-abc-unified-protocol.md` (+ native resolve).
 //! SpecFence is its **own** CC protocol — not optimized OCC.
 //!
 //! # Single algorithm (hot path)
 //! ```text
-//! Block-STM scheduler + MvMemory          # L0
+//! Inter prior → Quiet|Storm engagement     # C — actuates Await set
+//! Block-STM scheduler + MvMemory           # L0
 //!     ↑
-//! FenceGraph: SoftWait / wake only        # L2 — sole Wait authority
+//! Hot ℓ: BO Await→Bind; cold: OCC-lite     # A — SoftWait Soft ~0
 //!     ↑
-//! π = argmin EV[Bind, Await, Spec, Early] # L3 — choose_action (AEC)
+//! π = choose_action on hot candidates only # C intra
 //!     ↑
-//! OutcomeLearner: P_abort, T_wait, …      # L4 — continuous θ features only
-//!     ↑
-//! Resolve: SuffixRepair (RewindTo+FF) | FullRestart last resort  # L1
+//! Resolve: RebindOnly | SuffixRepair|Jump  # B — FullRestart after depth≥2
 //! ```
 //!
-//! **Resolve default:** SuffixRepair (hang-free RewindTo + journal FF + force-bind)
-//! when a certified checkpoint exists before fail `k` — not OCC head restart.
-//! SoftWait / Await when `EV_Wait ≲ EV_Spec` and producer Running; SpecRead for
-//! writer absent/unknown discovery. Fan-out raises `EV_Wait` (discourage serialize).
-//! Absolute jump / inspect stay opt-in research only.
+//! **Avoid (A):** unfinished writer on hot program ℓ → BlockingOther prefer-steal
+//! Await until Executed/Validated, then Bind. Fence intent at first-cross `a`
+//! records `armed_at_k`. SoftWait Soft stays ~0 unless wake EV re-proven.
+//!
+//! **Resolve (B):** RebindOnly when value-stable; else SuffixRepair + hang-free
+//! absolute jump when `jump_is_safe`; else journal-FF resume. Escalate FullRestart
+//! after SuffixRepair depth≥2 (fb-loop break). Never ESTIMATE-poison certified prefix.
+//!
+//! **Learn (C):** Inter morph selects Quiet (598 OCC-lite) vs Storm (597 Await-ready).
+//! Intra `choose_action` / learner updates only on hot candidates.
 //!
 //! # Shoveled off SpecFence control (V5-P0)
 //! - Heat / `seed_wait_regions` SoftWait arming (PCC may still seed account Wait)
@@ -63,7 +67,7 @@ mod rem;
 mod resolve;
 
 pub(crate) use bayes::{BayesMap, DEFAULT_TAU};
-pub(crate) use engagement::{AdaptiveEngagement, profile_timing_enabled, research_inspect_enabled, softwait_disabled};
+pub(crate) use engagement::{AdaptiveEngagement, BlockEngagementMode, profile_timing_enabled, research_inspect_enabled, softwait_disabled};
 pub(crate) use hotset::HotSet;
 #[allow(unused_imports)]
 pub(crate) use hotset::{H_A, H_W};
