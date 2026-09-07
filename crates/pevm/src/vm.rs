@@ -201,6 +201,19 @@ impl<'a, S: Storage> VmDb<'a, S> {
 
     /// M1b: try serving a certified-prefix read from the FF value cache.
     /// Returns Some when origin is unchanged — caller skips MV lazy walk.
+
+    /// Skip rem value_snap lock on lean first incarnation (RebindOnly rare; SuffixRepair
+    /// still arms force_bind). Repair reincarnations keep snaps for journal FF.
+    #[inline]
+    fn maybe_note_value(&self, location_hash: MemoryLocationHash, value: FfValue) {
+        if self.specfence.mode != crate::ConcurrencyMode::SpecFence {
+            return;
+        }
+        self.specfence
+            .partial_retry
+            .note_value(self.tx_idx, location_hash, value);
+    }
+
     fn try_ff_storage(
         &self,
         location_hash: MemoryLocationHash,
@@ -320,15 +333,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
         location_hash: MemoryLocationHash,
         is_program: bool,
     ) -> Result<(), ReadError> {
-        // G2: RegionPlant k on **all** SpecFence cold MV R/W — HotSet only densifies
-        // tracking/hints, not plant emission. SoftWait armed_at_k can then be >0 mid-tx.
+        // SpecFence: effect counter only here; per-location journal lives inside
+        // maybe_wait_specfence so Bind can coalesce access+certify under one rem lock.
         if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
             let _ = self.specfence.rem.note_effect();
-            self.specfence.partial_retry.note_access(
-                self.tx_idx,
-                location_hash,
-                AccessMode::Read,
-            );
         }
 
         if self.specfence.mode != crate::ConcurrencyMode::SpecFence {
@@ -370,12 +378,12 @@ impl<'a, S: Storage> VmDb<'a, S> {
 
     /// SpecFence π body (profile-wrapped by [`Self::maybe_wait`]).
     ///
-    /// Structural law (mw-strip): common SpecRead / Bind-on-Data is a **single MV
+    /// Structural law (sub10): common SpecRead / Bind-on-Data is a **single MV
     /// `last_data_before`** like OCC — no HashMap/DashMap sticky / HotSet / prior /
-    /// learner / Bayes / FenceGraph / choose_action. Full π only for sticky
-    /// force_bind / program-prior Await / true conflict repair (incarnation>0 or
-    /// armed force_bind). First incarnation = OCC discovery until validate fail →
-    /// SuffixRepair + sticky (not SoftWait Soft storms).
+    /// learner / Bayes / FenceGraph / choose_action. Bind journals+certifies under
+    /// one rem lock; unfinished producer → BlockingOther steal (no SoftWait Soft).
+    /// Full π only for sticky force_bind / program-prior Await / repair reincarnation.
+    /// First incarnation = OCC discovery until validate fail → SuffixRepair + sticky.
     fn maybe_wait_specfence(
         &self,
         address: Address,
@@ -384,14 +392,19 @@ impl<'a, S: Storage> VmDb<'a, S> {
     ) -> Result<(), ReadError> {
         if address == self.specfence.beneficiary || self.is_lazy {
             // Beneficiary / basic_lazy never SoftWait (lazy mock read follows).
+            self.specfence.partial_retry.note_access(
+                self.tx_idx,
+                location_hash,
+                AccessMode::Read,
+            );
             self.specfence.metrics.record_spec_read();
             return Ok(());
         }
 
         // --- Common path: one MV Data probe (OCC-like) ---
-        // Skip per-location force_bind DashMap unless this tx has an armed set
-        // (incarnation 0 almost never does; repair reincarnations do).
-        let tx_has_force = self.specfence.partial_retry.has_force_bind(self.tx_idx);
+        // Incarnation 0 never has force_bind (armed only after validate fail).
+        let tx_has_force = self.tx_incarnation > 0
+            && self.specfence.partial_retry.has_force_bind(self.tx_idx);
         let force_prefix = tx_has_force
             && self
                 .specfence
@@ -411,12 +424,15 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return self.bind_on_data_lite(address, location_hash, v, force_prefix);
         }
 
+        // No published Data — journal once, then decide.
+        self.specfence.partial_retry.note_access(
+            self.tx_idx,
+            location_hash,
+            AccessMode::Read,
+        );
+
         // No published Data. First incarnation / no force_bind:
-        // - cold (no MV writer) → OCC SpecRead (no DashMap sticky/HotSet/prior/residual)
-        // - ESTIMATE writer → SpecRead (never BO/SoftWait on ESTIMATE)
-        // - unfinished live writer + process prior → BlockingOther steal (M3 Bind-before-
-        //   touch / program-prior Await without SoftWait Soft storms or full π)
-        // Full sticky/HotSet/learner π only on repair reincarnation below.
+        // ESTIMATE → SpecRead; unfinished+prior → BlockingOther steal; else OCC SpecRead.
         if self.tx_incarnation == 0 && !tx_has_force {
             if let Some(w) = self.mv_memory.last_writer_before(location_hash, self.tx_idx) {
                 if self.mv_memory.entry_kind_at(location_hash, w) == "estimate" {
@@ -427,7 +443,6 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 if !self.specfence.scheduler.is_done(w)
                     && self.specfence.rw_prior.predicts_write(location_hash)
                 {
-                    // Prior unfinished: dependency park without FenceGraph SoftWait Soft.
                     self.specfence.metrics.record_wait_hard();
                     self.specfence.metrics.record_wait(address);
                     self.specfence
@@ -583,24 +598,15 @@ impl<'a, S: Storage> VmDb<'a, S> {
 
         match action {
             ResolveAction::WaitHard => {
+                // SpecFence-native Await without FenceGraph SoftWait Soft — BO steal.
                 self.specfence.metrics.record_wait_hard();
                 if let Some(prev) = writer
                     && !self.specfence.scheduler.is_done(prev)
                 {
                     self.specfence.metrics.record_wait(address);
-                    let k = self.specfence.partial_retry.current_k(self.tx_idx) as u64;
-                    if self.specfence.dag.arm_soft(
-                        location_hash,
-                        self.tx_idx,
-                        k,
-                        Some(prev),
-                    ) {
-                        self.specfence.metrics.record_soft_wait_arm();
-                    }
-                    self.specfence.partial_retry.mark_softwait_parked(self.tx_idx);
                     self.specfence
                         .wave
-                        .set_pending_park_softwait(location_hash, k);
+                        .set_pending_park_location(location_hash);
                     return Err(ReadError::Blocking(prev));
                 }
                 let posterior = self
@@ -697,8 +703,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
         }
     }
 
-    /// Bind-on-Data common path: metrics + certify; BlockingOther if producer
-    /// still Executing. No Bayes/learner/prior/HotSet/FenceGraph SoftWait Soft.
+    /// Bind-on-Data: OCC-like certify of published MV Data without `is_done` park.
+    /// Writer abort → ESTIMATE → SuffixRepair/RebindOnly. Repair Await uses
+    /// BlockingOther (WaitHard→BO) — no FenceGraph SoftWait Soft.
     fn bind_on_data_lite(
         &self,
         address: Address,
@@ -706,32 +713,15 @@ impl<'a, S: Storage> VmDb<'a, S> {
         v: TxVersion,
         force_prefix: bool,
     ) -> Result<(), ReadError> {
+        let _ = (address, v);
         self.specfence.metrics.record_bind_hit();
-        // M3: credit prior Bind when force_prefix or process WŜ predicts write.
-        // DashMap only on Bind success (scarce vs SpecRead), not on cold SpecRead.
         if force_prefix || self.specfence.rw_prior.predicts_write(location_hash) {
             self.specfence.metrics.record_prior_bind_hit();
         }
-        if !self.specfence.scheduler.is_done(v.tx_idx) {
-            if crate::specfence::softwait_disabled() {
-                self.specfence.metrics.record_spec_read();
-                return Ok(());
-            }
-            // Dependency + BlockingOther steal-prefer — NOT FenceGraph SoftWait Soft.
-            self.specfence.metrics.record_wait_hard();
-            self.specfence.metrics.record_wait(address);
-            self.specfence
-                .wave
-                .set_pending_park_location(location_hash);
-            return Err(ReadError::Blocking(v.tx_idx));
-        }
-        // Writer done: certify + EffectBoundary under one rem lock. Skip
-        // dag.note_hard_edge / Bayes / learner / predicts_write DashMap.
         self.specfence
             .partial_retry
-            .note_certified_with_effect_boundary(self.tx_idx, location_hash);
+            .note_access_certified_checkpoint(self.tx_idx, location_hash);
         self.specfence.rem.note_checkpoint_opportunity();
-        // Inspector step_end may attach live PC/stack snap.
         crate::specfence::arm_pending_effect_cp_only();
         Ok(())
     }
@@ -1210,9 +1200,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
                         Some(ReadOrigin::MvMemory(v)) => Some((v.tx_idx, v.tx_incarnation)),
                         Some(ReadOrigin::Storage) | None => None,
                     };
-                    self.specfence.partial_retry.note_value(
-                        self.tx_idx,
-                        location_hash,
+                    self.maybe_note_value(location_hash,
                         FfValue::Basic {
                             address,
                             basic: account.clone(),
@@ -1263,9 +1251,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
             );
             self.specfence.metrics.record_journal_ff_hit();
             if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
-                self.specfence.partial_retry.note_value(
-                    self.tx_idx,
-                    location_hash,
+                self.maybe_note_value(location_hash,
                     FfValue::Storage {
                         address,
                         slot: index,
@@ -1317,9 +1303,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
                                         crate::specfence::LocationKind::Storage,
                                         Some(&origin),
                                     );
-                                    self.specfence.partial_retry.note_value(
-                                        self.tx_idx,
-                                        location_hash,
+                                    self.maybe_note_value(location_hash,
                                         FfValue::Storage {
                                             address,
                                             slot: index,
@@ -1348,9 +1332,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
                         Some(&origin),
                     );
                     if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
-                        self.specfence.partial_retry.note_value(
-                            self.tx_idx,
-                            location_hash,
+                        self.maybe_note_value(location_hash,
                             FfValue::Storage {
                                 address,
                                 slot: index,
@@ -1385,9 +1367,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
                                     crate::specfence::LocationKind::Storage,
                                     Some(&origin),
                                 );
-                                self.specfence.partial_retry.note_value(
-                                    self.tx_idx,
-                                    location_hash,
+                                self.maybe_note_value(location_hash,
                                     FfValue::Storage {
                                         address,
                                         slot: index,
@@ -1423,9 +1403,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
             .storage(&address, &index)
             .map_err(|err| ReadError::StorageError(err.to_string()))?;
         if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
-            self.specfence.partial_retry.note_value(
-                self.tx_idx,
-                location_hash,
+            self.maybe_note_value(location_hash,
                 FfValue::Storage {
                     address,
                     slot: index,

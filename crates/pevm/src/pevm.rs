@@ -885,10 +885,9 @@ fn try_validate(
         // RebindOnly-first (native resolve): patch origins when invalid reads now
         // have Data/Storage and there is no *true* failed-suffix write (first_k ≥
         // k_fail). Uncertified writes before k_fail must not block RebindOnly.
-        for _ in &read_locations {
-            specfence.rem.note_checkpoint_opportunity();
-            specfence.metrics.record_checkpoint_opportunity();
-        }
+        // One opportunity tick per validate fail (not O(|reads|) rem atomics).
+        specfence.rem.note_checkpoint_opportunity();
+        specfence.metrics.record_checkpoint_opportunity();
         let write_locations = mv_memory.write_locations(tx_version.tx_idx);
         let mut k_fail = invalid
             .iter()
@@ -1096,10 +1095,7 @@ fn try_validate(
                 specfence.bayes.observe_conflict_location_always(*location);
                 specfence.metrics.record_bayes_conflict();
                 specfence.rw_prior.observe_co_access(*location);
-                // V5-P0: abort@ℓ → HotSet H_a densifies fanout *features* only.
-                // Do NOT insert whole write-set; engagement escalate deleted.
                 specfence.hotset.note_abort(*location);
-                // RegionTable Wait mirror only — SoftWait arms via choose_action.
                 specfence.promote_from_bayes(&mv_memory.regions, *location, None);
             }
             let cascade_hint = invalid.len().max(1);

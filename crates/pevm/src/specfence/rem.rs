@@ -29,7 +29,8 @@
 #![allow(dead_code)]
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::sync::Mutex;
+use parking_lot::Mutex;
+use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -718,7 +719,8 @@ impl PartialRetryState {
 /// Block-scoped PartialRetry / checkpoint plant.
 #[derive(Debug)]
 pub(crate) struct PartialRetryTable {
-    states: Vec<Mutex<PartialRetryState>>,
+    /// Per-tx rem journal. Single-executor invariant (see Sync impl).
+    states: Vec<UnsafeCell<PartialRetryState>>,
     /// Locations π must Bind/WaitHard on the next incarnation of `t`.
     force_bind: DashMap<TxIdx, Vec<MemoryLocationHash>, BuildIdentityHasher>,
     /// SoftWait wake consumed; next validation outcome → soft_wait_wake_{ok,reabort}.
@@ -738,11 +740,24 @@ pub(crate) struct PartialRetryTable {
     needs_live_capture: DashMap<TxIdx, (), BuildIdentityHasher>,
 }
 
+// SAFETY: scheduler runs ≤1 executor per tx; validate after execute returns.
+unsafe impl Sync for PartialRetryTable {}
+
 impl PartialRetryTable {
+    #[inline]
+    unsafe fn state_mut(&self, tx_idx: TxIdx) -> &mut PartialRetryState {
+        unsafe { &mut *self.states.get_unchecked(tx_idx).get() }
+    }
+
+    #[inline]
+    unsafe fn state_ref(&self, tx_idx: TxIdx) -> &PartialRetryState {
+        unsafe { &*self.states.get_unchecked(tx_idx).get() }
+    }
+
     pub(crate) fn new(block_size: usize) -> Self {
         Self {
             states: (0..block_size)
-                .map(|_| Mutex::new(PartialRetryState::default()))
+                .map(|_| UnsafeCell::new(PartialRetryState::default()))
                 .collect(),
             force_bind: DashMap::default(),
             post_softwait_wake: DashMap::default(),
@@ -756,8 +771,9 @@ impl PartialRetryTable {
     }
 
     pub(crate) fn reset_incarnation(&self, tx_idx: TxIdx, incarnation: TxIncarnation) {
-        if let Some(slot) = self.states.get(tx_idx) {
-            slot.lock().unwrap().reset(incarnation);
+        if tx_idx < self.states.len() {
+            // SAFETY: single-executor invariant
+            unsafe { self.state_mut(tx_idx) }.reset(incarnation);
         }
     }
 
@@ -767,54 +783,49 @@ impl PartialRetryTable {
         location: MemoryLocationHash,
         mode: AccessMode,
     ) -> usize {
-        let mut st = self.states[tx_idx].lock().unwrap();
+        let mut st = unsafe { self.state_mut(tx_idx) };
         st.note_access(tx_idx, location, mode)
     }
 
     pub(crate) fn note_certified(&self, tx_idx: TxIdx, location: MemoryLocationHash) {
-        self.states[tx_idx]
-            .lock()
-            .unwrap()
+        unsafe { self.state_mut(tx_idx) }
             .note_certified(location);
     }
 
-    /// Bind-on-Data lite: certify + plant EffectBoundary under **one** rem lock
-    /// (avoids note_certified + current_k + push_checkpoint triple lock).
+    /// Bind-on-Data lite: journal Read access + certify + lightweight EffectBoundary
+    /// checkpoint under **one** rem lock (no BoundarySnapshot alloc).
+    pub(crate) fn note_access_certified_checkpoint(
+        &self,
+        tx_idx: TxIdx,
+        location: MemoryLocationHash,
+    ) {
+        if tx_idx < self.states.len() {
+            // SAFETY: single-executor invariant
+            let st = unsafe { self.state_mut(tx_idx) };
+            st.note_access(tx_idx, location, AccessMode::Read);
+            st.note_certified(location);
+            let _ = st.push_checkpoint(tx_idx, CheckpointKind::EffectBoundary);
+        }
+    }
+
+    /// Bind-on-Data lite (legacy): certify + lightweight EffectBoundary under one lock.
     pub(crate) fn note_certified_with_effect_boundary(
         &self,
         tx_idx: TxIdx,
         location: MemoryLocationHash,
     ) {
-        if let Some(slot) = self.states.get(tx_idx) {
-            let mut st = slot.lock().unwrap();
+        if tx_idx < self.states.len() {
+            // SAFETY: single-executor invariant
+            let st = unsafe { self.state_mut(tx_idx) };
             st.note_certified(location);
-            let k = st.current_k();
-            let snap = BoundarySnapshot {
-                pc: 0,
-                gas_remaining: 0,
-                gas_refunded: 0,
-                memory_words: 0,
-                memory_expansion_cost: 0,
-                call_depth: 0,
-                opcode_steps: k as u64,
-                stack: Vec::new(),
-                memory: Vec::new(),
-                code_hash: None,
-                bytecode_len: 0,
-                at_call_boundary: false,
-                post_sstore: false,
-            };
-            let _ = st.push_checkpoint_with_boundary(
-                tx_idx,
-                CheckpointKind::EffectBoundary,
-                Some(snap),
-            );
+            let _ = st.push_checkpoint(tx_idx, CheckpointKind::EffectBoundary);
         }
     }
 
     pub(crate) fn note_value(&self, tx_idx: TxIdx, location: MemoryLocationHash, value: FfValue) {
-        if let Some(slot) = self.states.get(tx_idx) {
-            slot.lock().unwrap().note_value(location, value);
+        if tx_idx < self.states.len() {
+            // SAFETY: single-executor invariant
+            unsafe { self.state_mut(tx_idx) }.note_value(location, value);
         }
     }
 
@@ -824,15 +835,17 @@ impl PartialRetryTable {
         tx_idx: TxIdx,
         location: MemoryLocationHash,
     ) -> Option<FfValue> {
-        self.states.get(tx_idx).and_then(|slot| {
-            slot.lock().unwrap().value_snap.get(&location).cloned()
+        (tx_idx < self.states.len()).then(|| ()).and_then(|_| {
+            // SAFETY: single-executor invariant
+            unsafe { self.state_ref(tx_idx) }.value_snap.get(&location).cloned()
         })
     }
 
     /// M1i: Inspector post-SSTORE gas capture for write-prefix jump gas-equality.
     pub(crate) fn note_post_sstore_gas(&self, tx_idx: TxIdx, gas_remaining_after: u64) {
-        if let Some(slot) = self.states.get(tx_idx) {
-            slot.lock().unwrap().note_post_sstore_gas(gas_remaining_after);
+        if tx_idx < self.states.len() {
+            // SAFETY: single-executor invariant
+            unsafe { self.state_mut(tx_idx) }.note_post_sstore_gas(gas_remaining_after);
         }
     }
 
@@ -843,31 +856,33 @@ impl PartialRetryTable {
         location: MemoryLocationHash,
         replay: StorageWriteReplay,
     ) {
-        if let Some(slot) = self.states.get(tx_idx) {
-            slot.lock().unwrap().note_write_replay(location, replay);
+        if tx_idx < self.states.len() {
+            // SAFETY: single-executor invariant
+            unsafe { self.state_mut(tx_idx) }.note_write_replay(location, replay);
         }
     }
 
     /// M1j: record LOG* events for absolute-jump past LOG (hang-free vs blob path).
     pub(crate) fn note_log_replays(&self, tx_idx: TxIdx, logs: Vec<LogReplay>) {
-        if let Some(slot) = self.states.get(tx_idx) {
-            slot.lock().unwrap().note_log_replays(logs);
+        if tx_idx < self.states.len() {
+            // SAFETY: single-executor invariant
+            unsafe { self.state_mut(tx_idx) }.note_log_replays(logs);
         }
     }
 
     /// Locations with flushed write_replays in the live incarnation journal.
     pub(crate) fn write_replay_locations(&self, tx_idx: TxIdx) -> Vec<MemoryLocationHash> {
-        self.states
-            .get(tx_idx)
-            .map(|s| {
-                s.lock()
-                    .unwrap()
-                    .write_replays
-                    .iter()
-                    .map(|(l, _)| *l)
-                    .collect()
-            })
-            .unwrap_or_default()
+        if tx_idx >= self.states.len() {
+            return Vec::new();
+        }
+        // SAFETY: single-executor invariant
+        unsafe {
+            self.state_ref(tx_idx)
+                .write_replays
+                .iter()
+                .map(|(l, _)| *l)
+                .collect()
+        }
     }
 
     /// Arm RewindTo + build M1b FF continuation from the failed incarnation's journal.
@@ -880,7 +895,7 @@ impl PartialRetryTable {
         suffix_writes: Vec<MemoryLocationHash>,
         prefix_writes: Vec<MemoryLocationHash>,
     ) {
-        let cont = self.states[tx_idx].lock().unwrap().build_continuation(
+        let cont = unsafe { self.state_mut(tx_idx) }.build_continuation(
             cp,
             k_fail,
             certified.clone(),
@@ -926,7 +941,7 @@ impl PartialRetryTable {
             return ParkResumeKind::FullRetry;
         }
 
-        let st = self.states[tx_idx].lock().unwrap();
+        let st = unsafe { self.state_mut(tx_idx) };
         let mut certified: Vec<MemoryLocationHash> = st
             .certified
             .iter()
@@ -982,9 +997,7 @@ impl PartialRetryTable {
         let Some(cont) = self.ff_resume.get(&tx_idx).map(|c| c.clone()) else {
             return 0;
         };
-        self.states[tx_idx]
-            .lock()
-            .unwrap()
+        unsafe { self.state_mut(tx_idx) }
             .replay_continuation(&cont)
     }
 
@@ -1023,10 +1036,9 @@ impl PartialRetryTable {
         kind: CheckpointKind,
         boundary: Option<BoundarySnapshot>,
     ) -> Option<CheckpointId> {
-        self.states.get(tx_idx).map(|slot| {
-            slot.lock()
-                .unwrap()
-                .push_checkpoint_with_boundary(tx_idx, kind, boundary)
+        (tx_idx < self.states.len()).then(|| {
+            // SAFETY: single-executor invariant
+            unsafe { self.state_mut(tx_idx) }.push_checkpoint_with_boundary(tx_idx, kind, boundary)
         })
     }
 
@@ -1056,8 +1068,9 @@ impl PartialRetryTable {
         snap: BoundarySnapshot,
         blob: JournalBlob,
     ) {
-        if let Some(slot) = self.states.get(tx_idx) {
-            slot.lock().unwrap().attach_live_boundary(snap, blob);
+        if tx_idx < self.states.len() {
+            // SAFETY: single-executor invariant
+            unsafe { self.state_mut(tx_idx) }.attach_live_boundary(snap, blob);
         }
     }
 
@@ -1065,8 +1078,9 @@ impl PartialRetryTable {
     /// Also patch an already-armed RewindTo continuation (EarlyVal may arm mid-run
     /// before `with_plant_tls` ends and flushes captures).
     pub(crate) fn note_call_outcomes(&self, tx_idx: TxIdx, calls: Vec<CachedCallOutcome>) {
-        if let Some(slot) = self.states.get(tx_idx) {
-            slot.lock().unwrap().note_call_outcomes(calls.clone());
+        if tx_idx < self.states.len() {
+            // SAFETY: single-executor invariant
+            unsafe { self.state_mut(tx_idx) }.note_call_outcomes(calls.clone());
         }
         if let Some(mut cont) = self.ff_resume.get_mut(&tx_idx) {
             let cp_k = cont.cp.k;
@@ -1109,17 +1123,17 @@ impl PartialRetryTable {
         tx_idx: TxIdx,
         k_fail: usize,
     ) -> Option<CheckpointId> {
-        self.states
-            .get(tx_idx)?
-            .lock()
-            .unwrap()
-            .last_checkpoint_before(k_fail)
+        if tx_idx >= self.states.len() {
+            return None;
+        }
+        // SAFETY: single-executor invariant
+        unsafe { self.state_ref(tx_idx).last_checkpoint_before(k_fail) }
     }
 
     pub(crate) fn current_k(&self, tx_idx: TxIdx) -> usize {
         self.states
             .get(tx_idx)
-            .map(|s| s.lock().unwrap().current_k())
+            .map(|_| unsafe { self.state_ref(tx_idx).current_k() })
             .unwrap_or(0)
     }
 
@@ -1127,18 +1141,19 @@ impl PartialRetryTable {
     pub(crate) fn estimate_effect_depth(&self, tx_idx: TxIdx) -> Option<f64> {
         self.states
             .get(tx_idx)
-            .and_then(|s| s.lock().unwrap().estimate_effect_depth())
+            .and_then(|_| unsafe { self.state_ref(tx_idx).estimate_effect_depth() })
     }
 
     /// G1: record finished incarnation gas + k for next-try depth proxy.
     pub(crate) fn note_incarnation_finish(&self, tx_idx: TxIdx, tx_gas_used: u64) {
-        if let Some(slot) = self.states.get(tx_idx) {
-            slot.lock().unwrap().note_incarnation_finish(tx_gas_used);
+        if tx_idx < self.states.len() {
+            // SAFETY: single-executor invariant
+            unsafe { self.state_mut(tx_idx) }.note_incarnation_finish(tx_gas_used);
         }
     }
 
     pub(crate) fn first_k(&self, tx_idx: TxIdx, location: MemoryLocationHash) -> Option<usize> {
-        self.states[tx_idx].lock().unwrap().first_k(location)
+        unsafe { self.state_mut(tx_idx) }.first_k(location)
     }
 
     /// Locations π should force Bind/WaitHard for this incarnation (from prior repair).
@@ -1470,7 +1485,7 @@ impl PartialRetryTable {
         if invalid.is_empty() || read_locations.is_empty() {
             return None;
         }
-        let st = self.states[tx_idx].lock().unwrap();
+        let st = unsafe { self.state_mut(tx_idx) };
         let invalid_set: HashSet<MemoryLocationHash, BuildIdentityHasher> =
             invalid.iter().copied().collect();
         let mut certified: Vec<MemoryLocationHash> = read_locations
@@ -1816,7 +1831,7 @@ impl WaveParkTable {
                 self.park_count_blocking_other.fetch_add(1, Ordering::Relaxed);
             }
         }
-        let depth = self.ready.lock().unwrap().len();
+        let depth = self.ready.lock().len();
         self.sample_wave_width_locked(depth);
         STEAL_AFTER_PARK.with(|c| c.set(true));
     }
@@ -1873,7 +1888,7 @@ impl WaveParkTable {
 
     /// Push a ready continuation; priority = lower TxIdx first.
     pub(crate) fn push_ready(&self, tx_idx: TxIdx) {
-        let mut q = self.ready.lock().unwrap();
+        let mut q = self.ready.lock();
         q.push(Reverse(tx_idx));
         self.sample_wave_width_locked(q.len());
     }
@@ -1885,7 +1900,7 @@ impl WaveParkTable {
 
     /// Pop lowest TxIdx from the ready deque (stale entries skipped by caller).
     pub(crate) fn pop_ready(&self) -> Option<TxIdx> {
-        self.ready.lock().unwrap().pop().map(|Reverse(t)| t)
+        self.ready.lock().pop().map(|Reverse(t)| t)
     }
 
     /// Arm park→steal convert without recording park idle (BlockingOther ESTIMATE path).
@@ -2052,7 +2067,7 @@ impl WaveParkTable {
     }
 
     pub(crate) fn ready_depth(&self) -> usize {
-        self.ready.lock().unwrap().len()
+        self.ready.lock().len()
     }
 }
 
@@ -2166,7 +2181,7 @@ mod p4_tk_park_tests {
             let loc = i as MemoryLocationHash;
             table.note_access(2, loc, AccessMode::Read);
             table.note_certified(2, loc);
-            table.states[2].lock().unwrap().note_value(
+            unsafe { &mut *table.states[2].get() }.note_value(
                 loc,
                 FfValue::Storage {
                     address: Address::ZERO,

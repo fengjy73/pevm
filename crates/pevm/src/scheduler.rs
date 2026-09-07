@@ -48,6 +48,8 @@ pub(crate) struct Scheduler {
     // TODO: Consider packing [TxStatus]s into atomics instead of
     // [Mutex] given how small they are.
     transactions_status: Vec<Mutex<TxStatus>>,
+    // Lock-free mirror: true iff status is Executed|Validated (Bind/Wait hot path).
+    done_flags: Vec<AtomicBool>,
     // The list of dependent transactions to resume when the
     // key transaction is re-executed.
     transactions_dependents: Vec<Mutex<SmallVec<[TxIdx; 1]>>>,
@@ -80,6 +82,7 @@ impl Scheduler {
                     })
                 })
                 .collect(),
+            done_flags: (0..block_size).map(|_| AtomicBool::new(false)).collect(),
             transactions_dependents: (0..block_size).map(|_| Mutex::default()).collect(),
             // We won't validate until we find the first non-lazy transaction that
             // needs to read explicit values. We also skip the first transaction.
@@ -113,6 +116,7 @@ impl Scheduler {
             let mut tx = index_mutex!(self.transactions_status, tx_idx);
             if tx.status == IncarnationStatus::ReadyToExecute {
                 tx.status = IncarnationStatus::Executing;
+                self.set_done_flag(tx_idx, false);
                 return Some(TxVersion {
                     tx_idx,
                     tx_incarnation: tx.incarnation,
@@ -174,6 +178,7 @@ impl Scheduler {
                     // "Steal" execution job while holding the lock
                     if tx.status == IncarnationStatus::ReadyToExecute {
                         tx.status = IncarnationStatus::Executing;
+                        self.set_done_flag(tx_idx, false);
                         if let Some(wave) = wave {
                             wave.note_ready_steal_if_after_park();
                         }
@@ -269,6 +274,7 @@ impl Scheduler {
         let mut tx = index_mutex!(self.transactions_status, tx_idx);
         debug_assert_eq!(tx.status, IncarnationStatus::Executing);
         tx.status = IncarnationStatus::Aborting;
+        self.set_done_flag(tx_idx, false);
 
         let mut blocking_dependents = index_mutex!(self.transactions_dependents, blocking_tx_idx);
         blocking_dependents.push(tx_idx);
@@ -281,6 +287,7 @@ impl Scheduler {
         debug_assert_eq!(tx.status, IncarnationStatus::Aborting);
         tx.status = IncarnationStatus::ReadyToExecute;
         tx.incarnation += 1;
+        self.set_done_flag(tx_idx, false);
     }
 
     #[allow(dead_code)]
@@ -373,6 +380,14 @@ impl Scheduler {
                 self.num_validated.fetch_add(1, Ordering::Relaxed);
             }
         }
+        // Publish lock-free done before releasing status mutex / waking waiters.
+        self.set_done_flag(
+            tx_version.tx_idx,
+            matches!(
+                tx.status,
+                IncarnationStatus::Executed | IncarnationStatus::Validated
+            ),
+        );
 
         // Wake after status is Data-ready (`is_done`), still under writer lock so
         // add_dependency cannot lose a waiter between drain and Ready.
@@ -419,6 +434,7 @@ impl Scheduler {
         );
         if aborting {
             tx.status = IncarnationStatus::Aborting;
+            self.set_done_flag(tx_version.tx_idx, false);
         }
         aborting
     }
@@ -428,15 +444,24 @@ impl Scheduler {
     // for the aborted transaction.
     /// True when this transaction has finished the current incarnation enough
     /// for a Wait-mode reader to consume its writes (`Executed` or `Validated`).
+    /// Lock-free via `done_flags` (kept in sync with status transitions).
+    #[inline]
     pub(crate) fn is_done(&self, tx_idx: TxIdx) -> bool {
         if tx_idx >= self.block_size {
             return true;
         }
-        let tx = index_mutex!(self.transactions_status, tx_idx);
-        matches!(
-            tx.status,
-            IncarnationStatus::Executed | IncarnationStatus::Validated
-        )
+        // SAFETY: tx_idx checked against block_size above.
+        unsafe { self.done_flags.get_unchecked(tx_idx).load(Ordering::Acquire) }
+    }
+
+    #[inline]
+    fn set_done_flag(&self, tx_idx: TxIdx, done: bool) {
+        // SAFETY: callers only use inbound tx indices.
+        unsafe {
+            self.done_flags
+                .get_unchecked(tx_idx)
+                .store(done, Ordering::Release);
+        }
     }
 
     /// Research label for producer readiness at discovery (finegrain journal).
