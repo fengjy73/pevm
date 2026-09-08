@@ -229,3 +229,10 @@ cut that arms aj on 597 discovery without mass SNAP, or new 599-safe schedule
 ≤12.3→<10 (not fra≥16 / yield deepen / SoftWait Soft / BO park); or hang-free
 silent-default ResumePath.
 
+### Iter 25 — silent-default ResumePath (Lean hang-free)
+Default `SPECFENCE_BIND_SNAP` unset → ResumePath (Mass JUMP was Lean hang).
+tip_sloads prefix-spin skip / broad inc>0 SNAP **falsified**. SoftWait Soft=0;
+597 N5 **13.7** plateau; stretch <10 unmet; aj≈0 on 597.
+See `specfence-abc-iter25-status.md`. Iter 26 cause: Validated-fresh tip→jump
+on 597 without prefix-spin skip, or new 599-safe schedule ≤12.3→<10.
+

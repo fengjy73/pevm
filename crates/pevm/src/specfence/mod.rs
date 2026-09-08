@@ -83,9 +83,11 @@
 //! production stayed OFF (mass SNAP tax). SoftWait Soft ~0. Keep Iter16–17.
 //! Iter24: cautious Bind-jump enable — `SPECFENCE_BIND_SNAP=resume` ResumePath
 //! SNAP (capture only on SuffixRepair resume / force_bind / needs_live_capture;
-//! not every Handler run) + JUMP follows with refuse-if-stale. Default Off (Lean
-//! hang if JUMP silent-default). Mass=`=1`. SoftWait Soft ~0. Wall-prove no
-//! mass-path tax; aj>0 on 599. Keep Iter16–17/23.
+//! not every Handler run) + JUMP follows with refuse-if-stale. Mass=`=1`. SoftWait Soft ~0.
+//! Iter25: silent-default ResumePath (Mass JUMP was Lean hang — ResumePath+refuse
+//! hang-free + Lean seq≡par). tip_sloads skip of all-prefix Validated spin
+//! falsified (Lean p2 seq≠par); broad inc>0 SNAP falsified (tax, aj=0). SoftWait Soft ~0.
+//! Keep Iter16–17/23/24.
 //! Iter8 memory snap retained. Head-FF (Iter5). SoftWait Soft ~0.
 //!
 //! **Learn (C):** Inter morph selects Quiet (598 OCC-lite) vs Storm (597 Await-ready).

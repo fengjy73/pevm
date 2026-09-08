@@ -3200,12 +3200,12 @@ fn specfence_r1_hot_multiwriter_hotset() {
 }
 
 
-/// Iter24: production ResumePath SNAP + JUMP — SoftWait Soft=0; seq≡par.
-/// Capture may fire on SuffixRepair resume only (bsnap can be >0); mass path OFF.
+/// Iter24/25: production ResumePath SNAP + JUMP — SoftWait Soft=0; seq≡par.
+/// Iter25: silent default is ResumePath (unset env); mass path still OFF.
 #[test]
 fn specfence_iter24_bind_jump_resume_path_production() {
     unsafe {
-        std::env::set_var("SPECFENCE_BIND_SNAP", "resume");
+        std::env::remove_var("SPECFENCE_BIND_SNAP"); // Iter25 silent ResumePath
         std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP"); // JUMP follows mode
     }
     let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 12, 6);
@@ -3339,4 +3339,49 @@ fn specfence_iter24_erc20_mass_bind_jump_dig() {
     eprintln!("iter24 mass dig: aj_runs={aj_runs} success={success} fail={fail}");
     assert_eq!(fail, 0, "Mass SNAP+JUMP must stay fail=0");
     assert!(aj_runs > 0, "expected some aj>0 under Mass dig");
+}
+
+/// Iter25: silent-default ResumePath is hang-free + SoftWait Soft=0 + seq≡par.
+/// Unset SPECFENCE_BIND_SNAP → ResumePath (Mass JUMP was Lean hang; ResumePath OK).
+#[test]
+fn specfence_iter25_silent_default_resume_path() {
+    unsafe {
+        std::env::remove_var("SPECFENCE_BIND_SNAP");
+        std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP");
+    }
+    let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 12, 6);
+    state.insert(Address::ZERO, EvmAccount::default());
+    for i in 0..48 {
+        let (addr, account) = common::mock_account(98_000 + i);
+        state.insert(addr, account);
+        txs.push(self_transfer(addr, 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+    let width = NonZeroUsize::new(concurrency().get().min(4).max(2)).unwrap();
+    let chain = PevmEthereum::mainnet();
+    for _ in 0..3 {
+        let sequential = execute_revm_sequential(
+            &chain,
+            &storage,
+            Default::default(),
+            BlockEnv::default(),
+            txs.clone(),
+        )
+        .expect("sequential");
+        let mut pevm = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
+        let parallel = pevm
+            .execute_revm_parallel(
+                &chain,
+                &storage,
+                Default::default(),
+                BlockEnv::default(),
+                txs.clone(),
+                width,
+            )
+            .expect("parallel");
+        let m = pevm.last_specfence_metrics().clone();
+        assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
+        assert_eq!(m.handler_sstore_capture, 0, "stock SSTORE: {m:?}");
+        assert_eq!(parallel, sequential, "silent ResumePath must stay seq≡par: {m:?}");
+    }
 }

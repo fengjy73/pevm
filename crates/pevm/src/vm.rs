@@ -2081,6 +2081,8 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         // Hang-free yield spin; refuse jump if prefix not ready — eliminates MV races
         // that made ERC-20 aj>0 ∧ seq≠par under concurrency. Dig-only (suffix_jump
         // already env-gated). No BO park.
+        // Iter25: tip_sloads skip of this spin falsified on Lean p2 (seq≠par) —
+        // keep full prefix Validated for silent-default ResumePath safety.
         if suffix_jump {
             let me = tx_version.tx_idx;
             let mut prefix_ok = me == 0;
@@ -2276,10 +2278,13 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         // demote / SSTORE plant). Plant TLS only for research inspect / capture_window.
         let plant_handler = self.specfence.mode == crate::ConcurrencyMode::SpecFence
             && (use_inspect || capture_window);
-        // Iter24: Bind-snap TLS — Mass (=1 dig) on every Lean execute; ResumePath
-        // (production default) only on SuffixRepair resume / force_bind /
+        // Iter24/25: Bind-snap TLS — Mass (=1 dig) on every Lean execute; ResumePath
+        // (silent default) only on SuffixRepair resume / force_bind /
         // needs_live_capture — no mass-path SNAP tax on every Handler run.
         let snap_mode = bind_snap_mode();
+        // Iter24/25: ResumePath capture on SuffixRepair resume / force_bind /
+        // needs_live_capture — discovery (inc=0) SNAP-free. Broad inc>0 capture
+        // falsified Iter25 (bsnap↑ wall↑, aj still 0). SoftWait Soft=0.
         let repair_capture = rewind_resume
             || needs_capture
             || (tx_version.tx_incarnation > 0

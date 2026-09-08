@@ -1621,9 +1621,9 @@ pub(crate) fn note_pending_bind_snap() {
     }
 }
 
-/// Iter24 Bind-snap capture mode.
+/// Iter24/25 Bind-snap capture mode.
 /// - `Off`: no Handler wrap / no TLS (SPECFENCE_BIND_SNAP=0).
-/// - `ResumePath` (`SPECFENCE_BIND_SNAP=resume`): capture only on SuffixRepair resume /
+/// - `ResumePath` (silent default / `=resume`): capture only on SuffixRepair resume /
 ///   force_bind / needs_live_capture — **no mass-path SNAP tax**.
 /// - `Mass`: every Lean SpecFence execute (`SPECFENCE_BIND_SNAP=1` dig).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1634,11 +1634,12 @@ pub(crate) enum BindSnapMode {
 }
 
 /// Resolve Bind-snap mode from `SPECFENCE_BIND_SNAP`.
-/// Iter24: default Off (Lean fixtures hang if JUMP default-on). Production
-/// enable: `SPECFENCE_BIND_SNAP=resume` (no every-Handler tax).
+/// Iter25: default **ResumePath** (silent production) — hang-free with
+/// refuse-if-stale + tip_sloads-gated jump (Mass JUMP was the Lean hang).
+/// Force Off: `=0`; Mass dig: `=1`. No every-Handler tax on ResumePath.
 pub(crate) fn bind_snap_mode() -> BindSnapMode {
     match std::env::var_os("SPECFENCE_BIND_SNAP") {
-        None => BindSnapMode::Off,
+        None => BindSnapMode::ResumePath,
         Some(v) => {
             let s = v.to_string_lossy();
             if s == "0"
@@ -1656,7 +1657,8 @@ pub(crate) fn bind_snap_mode() -> BindSnapMode {
             } else if s.eq_ignore_ascii_case("resume") {
                 BindSnapMode::ResumePath
             } else {
-                BindSnapMode::Off
+                // Unknown → ResumePath (same as unset), not Off — keep silent default.
+                BindSnapMode::ResumePath
             }
         }
     }
