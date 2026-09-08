@@ -208,3 +208,13 @@ gates + Validated-prefix dig spin. ERC-20 SNAP+JUMP still **flaky** aj>0∧seq�
 **13.5** plateau. See `specfence-abc-iter22-status.md`. Iter 23 cause: diff-first
 restore vs cold SuffixRepair, or non-jump opcode cut / 599-safe ≤12.3→<10.
 
+### Iter 23 — diff-first Bind restore + fra pre-yield (JUMP OFF)
+Diff-first: ERC-20 aj>0∧seq≠par = status revert dgas=+661 from stale Bind
+SLOAD values already consumed into require/SUB (stack patch insufficient).
+Landed tip_sloads log + refuse jump when Bind SLOAD ≠ FF → dig **aj>0∧fail=0**
+stable; 597 SNAP+JUMP no-hang. Production JUMP/SNAP stay OFF (capture tax).
+Non-jump: high-fan (≥32) first-repair pre-yield skip-park. SoftWait Soft=0.
+597 N5 med **12.9**. See `specfence-abc-iter23-status.md`. Iter 24 cause:
+cautious enable Bind jump under concurrency (wall proof) or deepen 599-safe
+schedule ≤12.3→<10.
+

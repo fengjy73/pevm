@@ -2116,6 +2116,226 @@ fn specfence_iter22_erc20_bind_jump_seq_eq_par_dig() {
     }
 }
 
+/// Iter23: production SNAP/JUMP OFF — SoftWait Soft=0; aj=0; bsnap=0; seq≡par.
+#[test]
+fn specfence_iter23_bind_jump_production_off() {
+    unsafe {
+        std::env::remove_var("SPECFENCE_BIND_SNAP");
+        std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP");
+    }
+    let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 12, 6);
+    state.insert(Address::ZERO, EvmAccount::default());
+    for i in 0..64 {
+        let (addr, account) = common::mock_account(95_000 + i);
+        state.insert(addr, account);
+        txs.push(self_transfer(addr, 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+    let width = NonZeroUsize::new(concurrency().get().min(4).max(2)).unwrap();
+    for _ in 0..4 {
+        let (_, m, _) = run_mode_conc(
+            ConcurrencyMode::SpecFence,
+            &storage,
+            txs.clone(),
+            width,
+        );
+        assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
+        assert_eq!(m.absolute_jump_applied, 0, "production JUMP OFF: {m:?}");
+        assert_eq!(m.bind_snap_capture, 0, "production SNAP OFF: {m:?}");
+        assert_eq!(m.handler_sstore_capture, 0, "stock SSTORE: {m:?}");
+    }
+}
+
+/// Iter23 diff-first dig: on aj>0∧seq≠par report first differing tx gas/logs/storage
+/// vs sequential; also contrast SNAP-only (cold SuffixRepair) seq≡par.
+/// Ignored. Production JUMP stays OFF until fail=0 over ≥16 aj runs + 597 no-hang.
+#[ignore = "Iter23 dig: diff-first Bind jump vs cold SuffixRepair; run solo --ignored --test-threads=1"]
+#[test]
+fn specfence_iter23_erc20_diff_first_bind_jump_dig() {
+    unsafe {
+        std::env::set_var("SPECFENCE_BIND_SNAP", "1");
+        std::env::set_var("SPECFENCE_BIND_SNAP_JUMP", "1");
+    }
+    let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 12, 6);
+    state.insert(Address::ZERO, EvmAccount::default());
+    for i in 0..64 {
+        let (addr, account) = common::mock_account(96_000 + i);
+        state.insert(addr, account);
+        txs.push(self_transfer(addr, 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+    let width = NonZeroUsize::new(concurrency().get().min(4).max(2)).unwrap();
+    let chain = PevmEthereum::mainnet();
+    let mut success = 0usize;
+    let mut fail = 0usize;
+    let mut aj_runs = 0usize;
+    let mut gas_mismatch = 0usize;
+    let mut state_only_mismatch = 0usize;
+    for run in 0..16 {
+        let sequential = execute_revm_sequential(
+            &chain,
+            &storage,
+            Default::default(),
+            BlockEnv::default(),
+            txs.clone(),
+        )
+        .expect("sequential");
+        let mut pevm = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
+        let parallel = pevm
+            .execute_revm_parallel(
+                &chain,
+                &storage,
+                Default::default(),
+                BlockEnv::default(),
+                txs.clone(),
+                width,
+            )
+            .expect("parallel");
+        let m = pevm.last_specfence_metrics().clone();
+        assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
+        if m.absolute_jump_applied > 0 {
+            aj_runs += 1;
+            if parallel == sequential {
+                success += 1;
+            } else {
+                fail += 1;
+                // Diff-first: locate first diverging tx + classify gas vs state.
+                let mut classified = false;
+                for (i, (s, p)) in sequential.iter().zip(parallel.iter()).enumerate() {
+                    let sg = s.receipt.cumulative_gas_used;
+                    let pg = p.receipt.cumulative_gas_used;
+                    let sl = s.receipt.logs.len();
+                    let pl = p.receipt.logs.len();
+                    let ss = s.receipt.status;
+                    let ps = p.receipt.status;
+                    if sg != pg || sl != pl || ss != ps || s.state != p.state {
+                        let gas_diff = sg != pg;
+                        let status_diff = ss != ps;
+                        if gas_diff && !status_diff && s.state == p.state && sl == pl {
+                            gas_mismatch += 1;
+                        } else {
+                            state_only_mismatch += 1;
+                        }
+                        // First differing *contract* storage (skip addr0 fee dust).
+                        let mut stor = None;
+                        let mut bal = None;
+                        for (addr, s_acc) in &s.state {
+                            if *addr == Address::ZERO {
+                                continue;
+                            }
+                            let p_acc = p.state.get(addr);
+                            match (s_acc.as_ref(), p_acc.and_then(|x| x.as_ref())) {
+                                (Some(sa), Some(pa)) => {
+                                    for (slot, sv) in &sa.storage {
+                                        let pv = pa.storage.get(slot);
+                                        if pv != Some(sv) {
+                                            stor = Some((*addr, *slot, *sv, pv.copied()));
+                                            break;
+                                        }
+                                    }
+                                    if sa.balance != pa.balance || sa.nonce != pa.nonce {
+                                        bal = Some((
+                                            *addr,
+                                            sa.balance,
+                                            pa.balance,
+                                            sa.nonce,
+                                            pa.nonce,
+                                        ));
+                                    }
+                                }
+                                (a, b) if a.is_some() != b.is_some() => {
+                                    stor = Some((*addr, U256::ZERO, U256::ZERO, None));
+                                }
+                                _ => {}
+                            }
+                            if stor.is_some() {
+                                break;
+                            }
+                        }
+                        eprintln!(
+                            "iter23 diff-first run={run} tx={i} status_seq={ss:?} status_par={ps:?} gas_seq={sg} gas_par={pg} dgas={} logs_seq={sl} logs_par={pl} stor={stor:?} bal={bal:?} aj={} bsnap={} resume={}",
+                            pg as i64 - sg as i64,
+                            m.absolute_jump_applied,
+                            m.bind_snap_capture,
+                            m.resume_count,
+                        );
+                        classified = true;
+                        break;
+                    }
+                }
+                if !classified {
+                    eprintln!(
+                        "iter23 diff-first run={run}: vec len/shape mismatch seq={} par={} aj={}",
+                        sequential.len(),
+                        parallel.len(),
+                        m.absolute_jump_applied,
+                    );
+                }
+            }
+        } else if parallel != sequential {
+            fail += 1;
+            eprintln!("iter23 dig: seq≠par without aj run={run}");
+        }
+    }
+    // SNAP-only control: cold SuffixRepair must stay seq≡par (no abs jump).
+    unsafe {
+        std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP");
+    }
+    let mut snap_only_ok = 0usize;
+    for _ in 0..4 {
+        let sequential = execute_revm_sequential(
+            &chain,
+            &storage,
+            Default::default(),
+            BlockEnv::default(),
+            txs.clone(),
+        )
+        .expect("sequential");
+        let mut pevm = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
+        let parallel = pevm
+            .execute_revm_parallel(
+                &chain,
+                &storage,
+                Default::default(),
+                BlockEnv::default(),
+                txs.clone(),
+                width,
+            )
+            .expect("parallel snap-only");
+        let m = pevm.last_specfence_metrics().clone();
+        assert_eq!(m.absolute_jump_applied, 0, "JUMP off in snap-only: {m:?}");
+        assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
+        if parallel == sequential {
+            snap_only_ok += 1;
+        }
+    }
+    unsafe {
+        std::env::remove_var("SPECFENCE_BIND_SNAP");
+    }
+    eprintln!(
+        "iter23 erc20 diff-first: aj_runs={aj_runs} success_seq={success} fail={fail} gas_mismatch={gas_mismatch} state_only={state_only_mismatch} snap_only_ok={snap_only_ok}/4"
+    );
+    assert_eq!(
+        snap_only_ok, 4,
+        "SNAP-only (cold SuffixRepair) must stay seq≡par"
+    );
+    // Iter23: tip_sloads↔FF refuse gate may yield aj=0 (all candidate tips stale
+    // or missing identity under concurrency). That is correct — cold SuffixRepair
+    // stays seq≡par. Enable JUMP only when aj_runs>0 ∧ fail==0 over ≥16 runs.
+    if aj_runs == 0 {
+        eprintln!(
+            "iter23 erc20 dig: aj=0 under refuse-if-stale (expected until restore≡cold); fail={fail} — keep JUMP OFF"
+        );
+        assert_eq!(fail, 0, "refuse-gate must not introduce seq≠par: fail={fail}");
+    } else if fail > 0 {
+        eprintln!(
+            "iter23 erc20 dig: STILL FLAKY seq≠par (fail={fail} gas_mismatch={gas_mismatch} state_only={state_only_mismatch}) — keep JUMP OFF"
+        );
+    } else {
+        eprintln!("iter23 erc20 dig: STABLE aj>0∧seq≡par over aj_runs={aj_runs}");
+    }
+}
+
 /// Iter21: ERC-20 + SNAP+JUMP dig — documents Bind jump seq≠par (or hang).
 /// Ignored. Run solo: `--ignored --test-threads=1`.
 /// Expected falsification: aj>0 ⇒ committed state ≠ sequential (restore wrong

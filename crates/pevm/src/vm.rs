@@ -565,7 +565,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     && self.specfence.learner.live_fanout_hot(location_hash)
                 {
                     // Iter17 yield-spin (Iter19 mega-fan 128/64 falsified under
-                    // load — yield tax↑; 599-safe schedule still open).
+                    // load — yield tax↑; Iter23 y32 64→32 raised 599 wall — keep 64/32).
                     for _ in 0..64 {
                         if self.specfence.scheduler.is_done(v.tx_idx) {
                             break;

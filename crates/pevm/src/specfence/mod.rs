@@ -76,6 +76,11 @@
 //! `apply_to_interp`; warm FF Storage/Basic in journal (EIP-2929); matching-origin
 //! value check; refuse truncated-memory tips. Dig for ERC-20 aj>0∧seq≡par; JUMP
 //! stays OFF under concurrency until stable + 597 no-hang. SoftWait Soft ~0.
+//! Iter23: diff-first Bind-jump vs cold SuffixRepair — tip_sloads log; refuse
+//! jump when Bind SLOAD ≠ FF (stale consumed into require/SUB → ERC-20 revert
+//! dgas=+661); journal warm prefer_tx=min. Non-jump: high-fan (≥32) first-repair
+//! pre-yield skip-park (cut park_ms). JUMP/SNAP OFF until aj>0∧fail=0 + 597
+//! no-hang. SoftWait Soft ~0. Keep Iter16–17 absorb/yield 64/32.
 //! Iter8 memory snap retained. Head-FF (Iter5). SoftWait Soft ~0.
 //!
 //! **Learn (C):** Inter morph selects Quiet (598 OCC-lite) vs Storm (597 Await-ready).

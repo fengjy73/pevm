@@ -540,6 +540,7 @@ impl PartialRetryState {
                         post_sstore: false,
                         sstore_index: 0,
             write_replays_at_tip: Vec::new(),
+            tip_sloads: Vec::new(),
         })
                 }
             });

@@ -127,6 +127,9 @@ pub(crate) struct BoundarySnapshot {
     /// Iter9: exact storage presents at this Handler tip (ordered plant notes).
     /// Empty for Inspector snaps. Armed jump applies these instead of full cont wr.
     pub write_replays_at_tip: Vec<StorageWriteReplay>,
+    /// Iter23: cumulative Bind SLOAD (address, slot, value) log for stack↔FF
+    /// reconcile on abs-jump apply. Empty for Inspector/SSTORE/lite snaps.
+    pub tip_sloads: Vec<(Address, U256, U256)>,
 }
 
 impl BoundarySnapshot {
@@ -154,6 +157,7 @@ impl BoundarySnapshot {
             post_sstore: false,
             sstore_index: 0,
             write_replays_at_tip: Vec::new(),
+            tip_sloads: Vec::new(),
         }
     }
 
@@ -599,6 +603,9 @@ thread_local! {
     static PENDING_BIND_SNAP: Cell<bool> = const { Cell::new(false) };
     /// Bind-snap ordinal this incarnation (opcode_steps proxy for jump credit).
     static BIND_SNAP_STEPS: Cell<u64> = const { Cell::new(0) };
+    /// Iter23: cumulative Bind SLOAD (addr, slot, value) within with_bind_snap_tls.
+    static BIND_SLOAD_LOG: RefCell<Vec<(Address, U256, U256)>> =
+        const { RefCell::new(Vec::new()) };
     static PENDING_RESUME: RefCell<Option<BoundarySnapshot>> = const { RefCell::new(None) };
     /// Iter21: FF read-origin seeds applied only after successful PC restore.
     static PENDING_FF_ORIGIN_SEEDS: RefCell<Vec<(crate::MemoryLocationHash, crate::ReadOrigin)>> = const { RefCell::new(Vec::new()) };
@@ -855,6 +862,30 @@ pub(crate) fn try_arm_safe_absolute_jump_gated(
         return false;
     }
     let snap = cont.jump_snap.clone().expect("jump_is_safe implies jump_snap");
+    // Iter23: when Bind tip_sloads is present, require exact FF match — stale
+    // SLOAD values are often already consumed into require/SUB (ERC-20 revert
+    // dgas=+661); patching tops is insufficient → refuse, cold SuffixRepair.
+    // Empty tip_sloads: allow legacy M1f/Inspector snaps (no Bind identity).
+    if snap.sstore_index == 0 && !snap.post_sstore && !snap.tip_sloads.is_empty() {
+        for (addr, slot, snap_val) in &snap.tip_sloads {
+            let ff = cont.values.values().find_map(|v| match v {
+                crate::specfence::rem::FfValue::Storage {
+                    address,
+                    slot: s,
+                    value,
+                    ..
+                } if address == addr && s == slot => Some(*value),
+                _ => None,
+            });
+            match ff {
+                Some(v) if v == *snap_val => {}
+                _ => {
+                    metrics.record_absolute_jump_fallback();
+                    return false;
+                }
+            }
+        }
+    }
     // Never restore storage present_values (poison pevm Db / MV).
     // M1k: jump-past-LOG is hang-free when LogReplay restores receipt logs on
     // initialize_interp (snap-only tip — never live_boundaries blob logs, which
@@ -965,6 +996,7 @@ pub(crate) fn note_pending_effect_boundary(
         post_sstore: false,
             sstore_index: 0,
             write_replays_at_tip: Vec::new(),
+            tip_sloads: Vec::new(),
         };
     let _ = partial_retry.push_checkpoint_with_boundary(
         tx_idx,
@@ -1536,13 +1568,41 @@ pub(crate) fn try_apply_pending_pc_resume<CTX>(
         let prefer_tx = {
             let state = context.journal().evm_state();
             let target = interp.input.target_address();
-            state.get(&target).map(|a| a.transaction_id)
-                .or_else(|| state.values().map(|a| a.transaction_id).max())
+            // Iter23: prefer target tx_id; else *min* among loaded (stable), not max —
+            // HashMap iteration order made max() flaky under concurrency.
+            state.get(&target).map(|a| a.transaction_id).or_else(|| {
+                state.values().map(|a| a.transaction_id).min()
+            })
         };
         apply_ff_read_presents(context, &ff_reads, prefer_tx);
     }
     let skipped = snap.opcode_steps;
     snap.apply_to_interp(interp);
+    // Iter23: stack↔FF reconcile for cumulative Bind SLOADs (stale earlier
+    // balances on stack → ERC-20 require revert under jump).
+    if !snap.tip_sloads.is_empty() {
+        use crate::specfence::rem::FfValue;
+        for (addr, slot, snap_val) in &snap.tip_sloads {
+            let ff_val = ff_reads.iter().find_map(|ff| match ff {
+                FfValue::Storage {
+                    address,
+                    slot: s,
+                    value,
+                    ..
+                } if address == addr && s == slot => Some(*value),
+                _ => None,
+            });
+            if let Some(ff_val) = ff_val {
+                if ff_val != *snap_val {
+                    for v in interp.stack.data_mut().iter_mut() {
+                        if *v == *snap_val {
+                            *v = ff_val;
+                        }
+                    }
+                }
+            }
+        }
+    }
     RESUME_APPLIED.set(true);
     PENDING_RESUME.with(|c| *c.borrow_mut() = None);
     OPCODE_STEPS.set(0);
@@ -1604,6 +1664,7 @@ pub(crate) fn with_bind_snap_tls<R>(
     }));
     PENDING_BIND_SNAP.set(false);
     BIND_SNAP_STEPS.set(0);
+    BIND_SLOAD_LOG.with(|c| c.borrow_mut().clear());
     // Iter21: clear stale PENDING_RESUME / RESUME_APPLIED from a prior jumped
     // incarnation on this worker — leftover applied flag skipped re-arm and
     // contributed to SoftWait/InconsistentRead livelock under JUMP dig.
@@ -1635,6 +1696,14 @@ fn sload_bind_snap_eth_slow<H: revm::interpreter::Host + ?Sized>(
     context: revm::interpreter::InstructionContext<'_, H, EthInterpreter>,
 ) {
     let interp_ptr = context.interpreter as *mut Interpreter<EthInterpreter>;
+    // Iter23: peek SLOAD key + target before host sload (stack top becomes value).
+    let (tip_addr, tip_slot) = {
+        let interp = unsafe { &*interp_ptr };
+        (
+            interp.input.target_address(),
+            interp.stack.data().last().copied(),
+        )
+    };
     revm::interpreter::instructions::host::sload(context);
     if !PENDING_BIND_SNAP.replace(false) {
         return;
@@ -1649,6 +1718,13 @@ fn sload_bind_snap_eth_slow<H: revm::interpreter::Host + ?Sized>(
     let code_hash = Some(interp.bytecode.get_or_calculate_hash());
     let mem_gas = *interp.gas.memory();
     let stack: Vec<_> = interp.stack.data().to_vec();
+    // Iter23: accumulate ALL Bind SLOADs this incarnation — earlier stale
+    // balances left on stack caused ERC-20 revert (status false, dgas=+661).
+    let mut tip_sloads = BIND_SLOAD_LOG.with(|c| c.borrow().clone());
+    if let (Some(slot), Some(val)) = (tip_slot, stack.last().copied()) {
+        tip_sloads.push((tip_addr, slot, val));
+        BIND_SLOAD_LOG.with(|c| c.borrow_mut().push((tip_addr, slot, val)));
+    }
     // Read-prefix jump may still need pre-SLOAD memory (CALLDATACOPY etc.).
     const MEMORY_SNAP_CAP: usize = 8 * 1024;
     let mem_slice = interp.memory.context_memory();
@@ -1683,6 +1759,7 @@ fn sload_bind_snap_eth_slow<H: revm::interpreter::Host + ?Sized>(
         post_sstore: false,
         sstore_index: 0,
         write_replays_at_tip: Vec::new(),
+        tip_sloads,
     };
     LAST_SNAP.with(|c| *c.borrow_mut() = Some(snap.clone()));
     BIND_SNAP.with(|b| {
@@ -1800,6 +1877,7 @@ fn sstore_plant_capture_eth_slow<H: revm::interpreter::Host + ?Sized>(
         post_sstore: true,
         sstore_index: n,
         write_replays_at_tip: Vec::new(),
+        tip_sloads: Vec::new(),
     };
     PLANT.with(|p| {
         if let Some(plant) = p.get() {
@@ -2147,6 +2225,7 @@ mod m1c_tests {
             post_sstore: false,
             sstore_index: 0,
             write_replays_at_tip: Vec::new(),
+            tip_sloads: Vec::new(),
         }
     }
 
@@ -2169,6 +2248,7 @@ mod m1c_tests {
             post_sstore: false,
             sstore_index: 0,
             write_replays_at_tip: Vec::new(),
+            tip_sloads: Vec::new(),
         };
         assert_eq!(snap.pc, 42);
         assert_eq!(snap.opcode_steps, 17);
@@ -2197,6 +2277,7 @@ mod m1c_tests {
             post_sstore: false,
             sstore_index: 0,
             write_replays_at_tip: Vec::new(),
+            tip_sloads: Vec::new(),
         };
         interp.bytecode = ExtBytecode::new(code);
         interp.gas = Gas::new(100_000);
@@ -2227,6 +2308,7 @@ mod m1c_tests {
             post_sstore: false,
             sstore_index: 0,
             write_replays_at_tip: Vec::new(),
+            tip_sloads: Vec::new(),
         };
         arm_pc_resume(snap);
         assert!(!resume_was_applied());
@@ -2276,6 +2358,7 @@ mod m1c_tests {
             post_sstore: false,
             sstore_index: 0,
             write_replays_at_tip: Vec::new(),
+            tip_sloads: Vec::new(),
         }),
             journal_blob: None,
             ..lite.clone()
@@ -2318,6 +2401,7 @@ mod m1c_tests {
             post_sstore: false,
             sstore_index: 0,
             write_replays_at_tip: Vec::new(),
+            tip_sloads: Vec::new(),
         }),
             journal_blob: Some(JournalBlob {
                 state,
@@ -2373,6 +2457,7 @@ mod m1c_tests {
             post_sstore: false,
             sstore_index: 0,
             write_replays_at_tip: Vec::new(),
+            tip_sloads: Vec::new(),
         }),
             journal_blob: Some(JournalBlob {
                 state: EvmState::default(),
@@ -2429,6 +2514,7 @@ mod m1c_tests {
                 post_sstore: true,
                 sstore_index: 0,
             write_replays_at_tip: Vec::new(),
+            tip_sloads: Vec::new(),
         }),
             journal_blob: None,
             call_outcomes: vec![],
@@ -2482,6 +2568,7 @@ mod m1c_tests {
             post_sstore: false,
             sstore_index: 0,
             write_replays_at_tip: Vec::new(),
+            tip_sloads: Vec::new(),
         }),
             journal_blob: None,
             call_outcomes: vec![],
@@ -2551,6 +2638,7 @@ mod m1c_tests {
             post_sstore: false,
             sstore_index: 0,
             write_replays_at_tip: Vec::new(),
+            tip_sloads: Vec::new(),
         }),
             journal_blob: None,
             call_outcomes: vec![],
@@ -2598,6 +2686,7 @@ mod m1c_tests {
             post_sstore: false,
             sstore_index: 0,
             write_replays_at_tip: Vec::new(),
+            tip_sloads: Vec::new(),
         }),
             journal_blob: None,
             call_outcomes: vec![],
@@ -2643,6 +2732,7 @@ mod m1c_tests {
             post_sstore: false,
             sstore_index: 0,
             write_replays_at_tip: Vec::new(),
+            tip_sloads: Vec::new(),
         };
         let (effects, values) = basic_read_effect();
         let cont = ResumeContinuation {
@@ -2741,6 +2831,7 @@ mod m1c_tests {
                 post_sstore: true,
                 sstore_index: 0,
             write_replays_at_tip: Vec::new(),
+            tip_sloads: Vec::new(),
         }),
             journal_blob: Some(JournalBlob {
                 state: EvmState::default(),
@@ -2829,6 +2920,7 @@ mod m1c_tests {
                 post_sstore: true,
                 sstore_index: 0,
             write_replays_at_tip: Vec::new(),
+            tip_sloads: Vec::new(),
         }),
             journal_blob: None,
             call_outcomes: vec![CachedCallOutcome {
@@ -2892,6 +2984,7 @@ mod m1c_tests {
                 post_sstore: true,
                 sstore_index: 0,
             write_replays_at_tip: Vec::new(),
+            tip_sloads: Vec::new(),
         }),
             journal_blob: None,
             call_outcomes: vec![],
@@ -2956,6 +3049,7 @@ mod m1c_tests {
                 post_sstore: true,
                 sstore_index: 0,
             write_replays_at_tip: Vec::new(),
+            tip_sloads: Vec::new(),
         }),
             journal_blob: None,
             call_outcomes: vec![CachedCallOutcome {

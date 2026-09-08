@@ -1505,13 +1505,31 @@ fn try_validate(
                         }
                     }
                 }
-                if let Some((w, _)) = best {
-                    if scheduler.add_dependency_from_aborting(tx_version.tx_idx, w) {
-                        specfence.metrics.record_first_repair_await();
-                        return scheduler.finish_validation_fenced_barrier_park(
-                            tx_version,
-                            rewind_to,
-                        );
+                if let Some((w, fan)) = best {
+                    // Iter23: high-fan first-repair — brief yield before dependency
+                    // park; if writer already done, skip park (cut park_ms on 597
+                    // without SoftWait Soft / BO). Fan≥32 targets storm fan-out;
+                    // 599 mixed fans stay classic park. SoftWait Soft=0.
+                    if fan >= 32 {
+                        for _ in 0..64 {
+                            if !scheduler.is_executing(w) {
+                                break;
+                            }
+                            std::thread::yield_now();
+                        }
+                        if !scheduler.is_executing(w) {
+                            // Writer left Executing — resume without park.
+                            best = None;
+                        }
+                    }
+                    if let Some((w, _)) = best {
+                        if scheduler.add_dependency_from_aborting(tx_version.tx_idx, w) {
+                            specfence.metrics.record_first_repair_await();
+                            return scheduler.finish_validation_fenced_barrier_park(
+                                tx_version,
+                                rewind_to,
+                            );
+                        }
                     }
                 }
             }
