@@ -273,3 +273,13 @@ falsified (wall↑). SoftWait Soft=0; tip≡FF + steps_cap + LAST_SNAP kept.
 597 N5 med **14.7** / N10 **13.9**; 599/097 aj>0; stretch <10 unmet.
 See `specfence-abc-iter29-status.md`. Iter 30 cause: Lean-safe nested apply default
 or 597 arm gates / schedule ≤12.1→<10.
+
+### Iter 30 — Lean-safe nested apply default-on (wall↓ vs Iter29)
+Named Iter29→30 gates: tip_sloads addr≡target ∧ depth≤2 ∧ tip≡FF; homogeneous-only
+stash (broad stash wall↑ falsified); depth bypass ≤8→≤2; `SPECFENCE_NESTED_BIND`
+default ON (opt-out `=0`). SoftWait Soft=0; tip≡FF + steps_cap + LAST_SNAP kept.
+597 N5 med **13.4** / N10 **13.2** Soft=0 (↓ vs Iter29 14.7/13.9; min 12.1); 599/097 aj>0;
+Lean seq≡par with default-on. Stretch median ≤12.1 / <10 unmet; 597 aj=0 (steps_over/origin_unsafe).
+See `specfence-abc-iter30-status.md`. Iter 31 cause: 597 arm gates
+(origin_unsafe/steps_over) or schedule ≤12.1→<10 — not fra≥16 / yield deepen /
+SoftWait Soft / BO park / mass SNAP / Validated skip / broad nested stash.

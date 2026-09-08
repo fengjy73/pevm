@@ -3446,20 +3446,79 @@ fn specfence_iter28_first_frame_tip_identity() {
     }
 }
 
-/// Iter29: hang-free nested Bind credit (production) + opt-in nested apply off —
-/// SoftWait Soft=0; silent ResumePath; seq≡par; `SPECFENCE_NESTED_BIND` unset.
+/// Iter29: hang-free nested Bind credit path — SoftWait Soft=0; seq≡par.
 #[test]
 fn specfence_iter29_nested_bind_consume() {
     unsafe {
         std::env::remove_var("SPECFENCE_BIND_SNAP");
         std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP");
         std::env::remove_var("SPECFENCE_JUMP_DIG");
-        std::env::remove_var("SPECFENCE_NESTED_BIND");
+        // Iter30 default-on is Lean-safe; force OFF here to pin Iter29 credit posture.
+        std::env::set_var("SPECFENCE_NESTED_BIND", "0");
     }
     let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 12, 6);
     state.insert(Address::ZERO, EvmAccount::default());
     for i in 0..48 {
         let (addr, account) = common::mock_account(97_300 + i);
+        state.insert(addr, account);
+        txs.push(self_transfer(addr, 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+    let width = NonZeroUsize::new(concurrency().get().min(4).max(2)).unwrap();
+    let chain = PevmEthereum::mainnet();
+    for _ in 0..3 {
+        unsafe {
+            std::env::remove_var("SPECFENCE_BIND_SNAP");
+            std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP");
+            std::env::set_var("SPECFENCE_NESTED_BIND", "0");
+        }
+        let sequential = execute_revm_sequential(
+            &chain,
+            &storage,
+            Default::default(),
+            BlockEnv::default(),
+            txs.clone(),
+        )
+        .expect("sequential");
+        let mut pevm = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
+        let parallel = pevm
+            .execute_revm_parallel(
+                &chain,
+                &storage,
+                Default::default(),
+                BlockEnv::default(),
+                txs.clone(),
+                width,
+            )
+            .expect("parallel");
+        let m = pevm.last_specfence_metrics().clone();
+        assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
+        assert_eq!(m.handler_sstore_capture, 0, "stock SSTORE: {m:?}");
+        assert_eq!(
+            parallel, sequential,
+            "Iter29 nested Bind consume must stay seq≡par: {m:?}"
+        );
+        let _ = (m.absolute_jump_applied, m.bind_snap_capture, m.bind_snap_credit);
+    }
+    unsafe {
+        std::env::remove_var("SPECFENCE_NESTED_BIND");
+    }
+}
+
+/// Iter30: Lean-safe nested apply **default-on** (unset NESTED_BIND) —
+/// tip_sloads addr≡target ∧ depth≤2 ∧ tip≡FF; SoftWait Soft=0; seq≡par.
+#[test]
+fn specfence_iter30_lean_safe_nested_apply_default_on() {
+    unsafe {
+        std::env::remove_var("SPECFENCE_BIND_SNAP");
+        std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP");
+        std::env::remove_var("SPECFENCE_JUMP_DIG");
+        std::env::remove_var("SPECFENCE_NESTED_BIND"); // default-on Lean-safe
+    }
+    let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 12, 6);
+    state.insert(Address::ZERO, EvmAccount::default());
+    for i in 0..48 {
+        let (addr, account) = common::mock_account(97_400 + i);
         state.insert(addr, account);
         txs.push(self_transfer(addr, 1));
     }
@@ -3496,7 +3555,7 @@ fn specfence_iter29_nested_bind_consume() {
         assert_eq!(m.handler_sstore_capture, 0, "stock SSTORE: {m:?}");
         assert_eq!(
             parallel, sequential,
-            "Iter29 nested Bind consume must stay seq≡par: {m:?}"
+            "Iter30 Lean-safe nested apply default-on must stay seq≡par: {m:?}"
         );
         let _ = (m.absolute_jump_applied, m.bind_snap_capture, m.bind_snap_credit);
     }

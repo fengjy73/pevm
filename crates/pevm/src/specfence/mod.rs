@@ -95,9 +95,11 @@
 //! Iter28: diagnose 597 first-frame tip identity (router→token nested Bind tips;
 //! nested apply / defer-until-match hung) + LAST_SNAP TLS clear. SoftWait Soft ~0.
 //! Iter29: hang-free nested Bind consume ≠ frame_init defer — stash+natural CALL
-//! apply is opt-in (`SPECFENCE_NESTED_BIND=1`, dig hang-free); production credits
-//! nested tips on code_hash refuse (no PENDING defer / no Lean seq≠par). SoftWait Soft ~0.
-//! Keep Iter16–17/23/24/25/27/28.
+//! apply dig hang-free; Iter29 default-on was Lean seq≠par — stayed opt-in then.
+//! Iter30: Lean-safe nested apply **default-on** — tip_sloads addr≡target ∧
+//! depth≤2 ∧ tip≡FF only (opt-out `SPECFENCE_NESTED_BIND=0`); multi-addr / deep
+//! tips still credit. SoftWait Soft ~0. Keep tip≡FF + steps_cap + LAST_SNAP.
+//! Keep Iter16–17/23/24/25/27/28/29.
 //! Iter8 memory snap retained. Head-FF (Iter5). SoftWait Soft ~0.
 //!
 //! **Learn (C):** Inter morph selects Quiet (598 OCC-lite) vs Storm (597 Await-ready).

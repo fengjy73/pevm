@@ -1524,22 +1524,98 @@ pub(crate) fn pending_resume_armed() -> bool {
     PENDING_RESUME.with(|c| c.borrow().is_some())
 }
 
-/// Iter29: hang-free nested Bind consume (opt-in). Enable: `SPECFENCE_NESTED_BIND=1`.
-/// Differs from Iter28e frame_init-defer: PENDING is cleared on mismatch; only a
-/// separate stash is consulted after natural nested frame_init hash match.
-/// Default OFF — Lean fixtures seq≠par under concurrency when default-on (dig
-/// mainnet hang-free with `=1`; production credit-on-refuse covers nested tips).
+/// Iter30: Lean-safe nested Bind consume **default-on**.
+/// Differs from Iter28e frame_init-defer: PENDING cleared on mismatch; stash is
+/// consulted after natural nested frame_init hash match.
+/// Iter29 default-on hung Lean seq≠par — Iter30 narrows apply with:
+///   tip_sloads addr ≡ target_address ∧ call_depth≤2 ∧ tip≡FF
+/// so silent default stays Lean seq≡par. Opt-out: `SPECFENCE_NESTED_BIND=0`.
+/// Dig override `=1` same as default (gates still apply).
 pub(crate) fn nested_bind_consume_enabled() -> bool {
     match std::env::var_os("SPECFENCE_NESTED_BIND") {
-        None => false,
+        None => true, // Iter30: Lean-safe default-on
         Some(v) => {
             let s = v.to_string_lossy();
-            s == "1"
-                || s.eq_ignore_ascii_case("true")
-                || s.eq_ignore_ascii_case("yes")
-                || s.eq_ignore_ascii_case("on")
+            !(s == "0"
+                || s.eq_ignore_ascii_case("false")
+                || s.eq_ignore_ascii_case("no")
+                || s.eq_ignore_ascii_case("off"))
         }
     }
+}
+
+/// Iter30: tip_sloads all target the nested callee (no cumulative parent slots).
+#[inline]
+fn tip_sloads_addr_eq_target(snap: &BoundarySnapshot, target: Address) -> bool {
+    !snap.tip_sloads.is_empty() && snap.tip_sloads.iter().all(|(a, _, _)| *a == target)
+}
+
+/// Iter30: tip_sloads homogeneous (single address) — stash candidate before nested
+/// target is known.
+#[inline]
+fn tip_sloads_homogeneous(snap: &BoundarySnapshot) -> bool {
+    let Some((first, _, _)) = snap.tip_sloads.first() else {
+        return false;
+    };
+    snap.tip_sloads.iter().all(|(a, _, _)| a == first)
+}
+
+/// Iter30: tip≡FF vs armed PENDING_FF_READ_PRESENTS (≥1 match, no conflict).
+#[inline]
+fn tip_sloads_match_pending_ff(snap: &BoundarySnapshot) -> bool {
+    use crate::specfence::rem::FfValue;
+    PENDING_FF_READ_PRESENTS.with(|c| {
+        let ff = c.borrow();
+        if snap.tip_sloads.is_empty() || ff.is_empty() {
+            return false;
+        }
+        let mut any_match = false;
+        let mut conflict = false;
+        for (addr, slot, snap_val) in &snap.tip_sloads {
+            let found = ff.iter().find_map(|v| match v {
+                FfValue::Storage {
+                    address,
+                    slot: ss,
+                    value,
+                    ..
+                } if address == addr && ss == slot => Some(*value),
+                _ => None,
+            });
+            match found {
+                Some(v) if v == *snap_val => any_match = true,
+                Some(_) => conflict = true,
+                None => {}
+            }
+        }
+        any_match && !conflict
+    })
+}
+
+/// Iter30 Lean-safe nested abs apply gate (named Iter29→30 cause).
+#[inline]
+fn nested_apply_lean_safe(snap: &BoundarySnapshot, target: Address, call_depth: u16) -> bool {
+    call_depth <= 2
+        && tip_sloads_addr_eq_target(snap, target)
+        && tip_sloads_match_pending_ff(snap)
+}
+
+/// Credit nested Bind tip steps then clear (hang-free Lean-safe refuse path).
+fn credit_nested_bind_tip(snap: &BoundarySnapshot) {
+    if snap.opcode_steps > 0 {
+        BIND_SNAP.with(|b| {
+            if let Some(ctx) = b.get() {
+                let metrics = unsafe { &*ctx.metrics };
+                metrics.record_bind_snap_credit(snap.opcode_steps);
+            }
+        });
+    }
+    if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
+        eprintln!(
+            "JUMP_DIG nested_credit snap_pc={} blen={} tip_sloads={} steps={}",
+            snap.pc, snap.bytecode_len, snap.tip_sloads.len(), snap.opcode_steps
+        );
+    }
+    clear_pc_resume();
 }
 
 /// True when a nested Bind tip is stashed awaiting natural CALL match.
@@ -1548,8 +1624,9 @@ pub(crate) fn nested_bind_stash_armed() -> bool {
     NESTED_BIND_STASH.with(|c| c.borrow().is_some())
 }
 
-/// Iter29: after natural nested `frame_init`, apply stashed Bind tip iff code_hash
-/// matches. Hard attempt budget — never spins / never keeps PENDING across frames.
+/// Iter29/30: after natural nested `frame_init`, apply stashed Bind tip iff
+/// code_hash matches **and** Lean-safe gates pass (Iter30). Hard attempt budget —
+/// never spins / never keeps PENDING across frames.
 pub(crate) fn try_consume_nested_bind_resume<CTX>(
     interp: &mut Interpreter<EthInterpreter>,
     context: &mut CTX,
@@ -1581,12 +1658,32 @@ pub(crate) fn try_consume_nested_bind_resume<CTX>(
         }
         return;
     }
-    // Hash match — one-shot re-arm + apply with jdepth allow.
+    // Hash match — Iter30 Lean-safe: keep tip_sloads for this target only.
+    let target = interp.input.target_address();
+    let mut snap = snap;
+    let before_n = snap.tip_sloads.len();
+    snap.tip_sloads.retain(|(a, _, _)| *a == target);
+    if !nested_apply_lean_safe(&snap, target, call_depth) {
+        if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
+            eprintln!(
+                "JUMP_DIG nested_lean_refuse snap_pc={} tip_sloads={}->{} depth={} target={:?}",
+                snap.pc,
+                before_n,
+                snap.tip_sloads.len(),
+                call_depth,
+                target
+            );
+        }
+        NESTED_BIND_STASH.with(|c| *c.borrow_mut() = None);
+        credit_nested_bind_tip(&snap);
+        return;
+    }
     if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
         eprintln!(
-            "JUMP_DIG nested_match snap_pc={} blen={} tip_sloads={} depth={}",
+            "JUMP_DIG nested_match snap_pc={} blen={} tip_sloads={}->{} depth={}",
             snap.pc,
             snap.bytecode_len,
+            before_n,
             snap.tip_sloads.len(),
             call_depth
         );
@@ -1620,9 +1717,10 @@ pub(crate) fn try_apply_pending_pc_resume<CTX>(
         return;
     };
     if snap.call_depth != call_depth && !(snap.call_depth <= 1 && call_depth <= 1) {
-        // Iter29: Lean CALL_DEPTH stays 0 on Bind tips; nested consume applies
+        // Iter29/30: Lean CALL_DEPTH stays 0 on Bind tips; nested consume applies
         // onto frame.depth≥2 after natural CALL — allow under NESTED_ALLOW_JDEPTH.
-        if NESTED_ALLOW_JDEPTH.get() && snap.call_depth <= 1 && call_depth <= 8 {
+        // Iter30: depth≤2 only (≤8 was Lean seq≠par under concurrency).
+        if NESTED_ALLOW_JDEPTH.get() && snap.call_depth <= 1 && call_depth <= 2 {
             if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
                 eprintln!(
                     "JUMP_DIG apply_depth_bypass snap={} frame={}",
@@ -1645,8 +1743,10 @@ pub(crate) fn try_apply_pending_pc_resume<CTX>(
             // PENDING_RESUME so unrelated frames do not re-enter try_apply;
             // natural nested frame_init re-arms once on code_hash match.
             if snap.sstore_index == 0 && !snap.post_sstore && !snap.tip_sloads.is_empty() {
-                if nested_bind_consume_enabled() {
-                    // Opt-in hang-free nested apply path (≠ frame_init defer).
+                if nested_bind_consume_enabled() && tip_sloads_homogeneous(&snap) {
+                    // Iter30: stash only homogeneous tip_sloads (single callee).
+                    // Multi-addr cumulative logs credit (no stash tax). Consume
+                    // still filters addr≡target ∧ depth≤2 ∧ tip≡FF.
                     if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
                         eprintln!(
                             "JUMP_DIG nested_stash snap_pc={} blen={} tip_sloads={}",
@@ -1659,24 +1759,9 @@ pub(crate) fn try_apply_pending_pc_resume<CTX>(
                     // Keep FF presents / write_replays / log / call touches for later apply.
                     return;
                 }
-                // Production: hang-free nested Bind *credit* consume — tip identity is
-                // nested callee; abs apply on frame0 would refuse. Credit steps and
-                // clear (no PENDING defer, no nested apply — Lean seq≡par).
-                if snap.opcode_steps > 0 {
-                    BIND_SNAP.with(|b| {
-                        if let Some(ctx) = b.get() {
-                            let metrics = unsafe { &*ctx.metrics };
-                            metrics.record_bind_snap_credit(snap.opcode_steps);
-                        }
-                    });
-                }
-                if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
-                    eprintln!(
-                        "JUMP_DIG nested_credit snap_pc={} blen={} tip_sloads={} steps={}",
-                        snap.pc, snap.bytecode_len, snap.tip_sloads.len(), snap.opcode_steps
-                    );
-                }
-                clear_pc_resume();
+                // Hang-free nested Bind *credit* — multi-addr tip_sloads or apply off.
+                // Abs apply on frame0 would refuse; credit steps (no PENDING defer).
+                credit_nested_bind_tip(&snap);
                 return;
             }
             if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
