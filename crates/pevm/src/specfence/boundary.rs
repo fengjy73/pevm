@@ -642,6 +642,13 @@ thread_local! {
     static BIND_SNAP_DEFERRED: RefCell<Option<(usize, BoundarySnapshot)>> =
         const { RefCell::new(None) };
     static PENDING_RESUME: RefCell<Option<BoundarySnapshot>> = const { RefCell::new(None) };
+    /// Iter29: hang-free nested Bind consume — stash on frame0 code_hash mismatch
+    /// WITHOUT keeping PENDING_RESUME (Iter28e frame_init-defer hung). Natural
+    /// nested frame_init in run_exec_loop re-arms + applies once on hash match.
+    static NESTED_BIND_STASH: RefCell<Option<BoundarySnapshot>> = const { RefCell::new(None) };
+    static NESTED_BIND_ATTEMPTS: Cell<u16> = const { Cell::new(0) };
+    /// Allow journal.depth()>1 only for the one-shot nested consume apply.
+    static NESTED_ALLOW_JDEPTH: Cell<bool> = const { Cell::new(false) };
     /// Iter21: FF read-origin seeds applied only after successful PC restore.
     static PENDING_FF_ORIGIN_SEEDS: RefCell<Vec<(crate::MemoryLocationHash, crate::ReadOrigin)>> = const { RefCell::new(Vec::new()) };
     /// Iter22: certified-prefix FF Storage/Basic presents to warm in revm journal on
@@ -825,6 +832,10 @@ pub(crate) fn clear_pc_resume() {
     PENDING_LOG_REPLAYS.with(|c| c.borrow_mut().clear());
     PENDING_CALL_TOUCHES.with(|c| c.borrow_mut().clear());
     PENDING_CALL_TOUCH_BASICS.with(|c| c.borrow_mut().clear());
+    // Iter29: drop nested Bind stash with the rest of the arm.
+    NESTED_BIND_STASH.with(|c| *c.borrow_mut() = None);
+    NESTED_BIND_ATTEMPTS.set(0);
+    NESTED_ALLOW_JDEPTH.set(false);
 }
 
 /// Arm nested CallOutcome short-circuit queue for the next inspect_run (RewindTo).
@@ -1513,6 +1524,84 @@ pub(crate) fn pending_resume_armed() -> bool {
     PENDING_RESUME.with(|c| c.borrow().is_some())
 }
 
+/// Iter29: hang-free nested Bind consume (opt-in). Enable: `SPECFENCE_NESTED_BIND=1`.
+/// Differs from Iter28e frame_init-defer: PENDING is cleared on mismatch; only a
+/// separate stash is consulted after natural nested frame_init hash match.
+/// Default OFF — Lean fixtures seq≠par under concurrency when default-on (dig
+/// mainnet hang-free with `=1`; production credit-on-refuse covers nested tips).
+pub(crate) fn nested_bind_consume_enabled() -> bool {
+    match std::env::var_os("SPECFENCE_NESTED_BIND") {
+        None => false,
+        Some(v) => {
+            let s = v.to_string_lossy();
+            s == "1"
+                || s.eq_ignore_ascii_case("true")
+                || s.eq_ignore_ascii_case("yes")
+                || s.eq_ignore_ascii_case("on")
+        }
+    }
+}
+
+/// True when a nested Bind tip is stashed awaiting natural CALL match.
+#[inline]
+pub(crate) fn nested_bind_stash_armed() -> bool {
+    NESTED_BIND_STASH.with(|c| c.borrow().is_some())
+}
+
+/// Iter29: after natural nested `frame_init`, apply stashed Bind tip iff code_hash
+/// matches. Hard attempt budget — never spins / never keeps PENDING across frames.
+pub(crate) fn try_consume_nested_bind_resume<CTX>(
+    interp: &mut Interpreter<EthInterpreter>,
+    context: &mut CTX,
+    call_depth: u16,
+) where
+    CTX: ContextTr,
+    CTX::Journal: JournalExt,
+{
+    if RESUME_APPLIED.get() || !nested_bind_consume_enabled() {
+        return;
+    }
+    let Some(snap) = NESTED_BIND_STASH.with(|c| c.borrow().clone()) else {
+        return;
+    };
+    let Some(expected) = snap.code_hash else {
+        clear_pc_resume();
+        return;
+    };
+    let actual = interp.bytecode.get_or_calculate_hash();
+    if actual != expected {
+        let n = NESTED_BIND_ATTEMPTS.get().saturating_add(1);
+        NESTED_BIND_ATTEMPTS.set(n);
+        // Hard budget: drop stash after unmatched nested frames (hang-free).
+        if n >= 32 {
+            if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
+                eprintln!("JUMP_DIG nested_budget_clear attempts={n}");
+            }
+            clear_pc_resume();
+        }
+        return;
+    }
+    // Hash match — one-shot re-arm + apply with jdepth allow.
+    if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
+        eprintln!(
+            "JUMP_DIG nested_match snap_pc={} blen={} tip_sloads={} depth={}",
+            snap.pc,
+            snap.bytecode_len,
+            snap.tip_sloads.len(),
+            call_depth
+        );
+    }
+    NESTED_BIND_STASH.with(|c| *c.borrow_mut() = None);
+    PENDING_RESUME.with(|c| *c.borrow_mut() = Some(snap));
+    NESTED_ALLOW_JDEPTH.set(true);
+    try_apply_pending_pc_resume(interp, context, call_depth);
+    NESTED_ALLOW_JDEPTH.set(false);
+    if !RESUME_APPLIED.get() {
+        // Apply refused for another reason — drop leftovers hang-free.
+        clear_pc_resume();
+    }
+}
+
 /// Iter4: apply armed `PENDING_RESUME` to an interpreter without `inspect_run`.
 /// Shared by SpecFenceInspector::initialize_interp and Handler::run_exec_loop.
 pub(crate) fn try_apply_pending_pc_resume<CTX>(
@@ -1531,18 +1620,65 @@ pub(crate) fn try_apply_pending_pc_resume<CTX>(
         return;
     };
     if snap.call_depth != call_depth && !(snap.call_depth <= 1 && call_depth <= 1) {
-        if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
-            eprintln!("JUMP_DIG apply_refuse depth snap={} frame={}", snap.call_depth, call_depth);
+        // Iter29: Lean CALL_DEPTH stays 0 on Bind tips; nested consume applies
+        // onto frame.depth≥2 after natural CALL — allow under NESTED_ALLOW_JDEPTH.
+        if NESTED_ALLOW_JDEPTH.get() && snap.call_depth <= 1 && call_depth <= 8 {
+            if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
+                eprintln!(
+                    "JUMP_DIG apply_depth_bypass snap={} frame={}",
+                    snap.call_depth, call_depth
+                );
+            }
+        } else {
+            if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
+                eprintln!("JUMP_DIG apply_refuse depth snap={} frame={}", snap.call_depth, call_depth);
+            }
+            clear_pc_resume();
+            return;
         }
-        clear_pc_resume();
-        return;
     }
     if let Some(expected) = snap.code_hash {
         let actual = interp.bytecode.get_or_calculate_hash();
         if actual != expected {
-            // Iter28 diagnosis: 597 Bind tips are often nested (router→token);
-            // frame0 is tx.to. Nested apply-on-mismatch / defer-until-match both
-            // hung under concurrency — keep refuse + clear (hang-free).
+            // Iter28: defer-until-match keeping PENDING across frame_init hung.
+            // Iter29 hang-free nested Bind consume: stash Bind tip, clear
+            // PENDING_RESUME so unrelated frames do not re-enter try_apply;
+            // natural nested frame_init re-arms once on code_hash match.
+            if snap.sstore_index == 0 && !snap.post_sstore && !snap.tip_sloads.is_empty() {
+                if nested_bind_consume_enabled() {
+                    // Opt-in hang-free nested apply path (≠ frame_init defer).
+                    if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
+                        eprintln!(
+                            "JUMP_DIG nested_stash snap_pc={} blen={} tip_sloads={}",
+                            snap.pc, snap.bytecode_len, snap.tip_sloads.len()
+                        );
+                    }
+                    NESTED_BIND_STASH.with(|c| *c.borrow_mut() = Some(snap));
+                    NESTED_BIND_ATTEMPTS.set(0);
+                    PENDING_RESUME.with(|c| *c.borrow_mut() = None);
+                    // Keep FF presents / write_replays / log / call touches for later apply.
+                    return;
+                }
+                // Production: hang-free nested Bind *credit* consume — tip identity is
+                // nested callee; abs apply on frame0 would refuse. Credit steps and
+                // clear (no PENDING defer, no nested apply — Lean seq≡par).
+                if snap.opcode_steps > 0 {
+                    BIND_SNAP.with(|b| {
+                        if let Some(ctx) = b.get() {
+                            let metrics = unsafe { &*ctx.metrics };
+                            metrics.record_bind_snap_credit(snap.opcode_steps);
+                        }
+                    });
+                }
+                if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
+                    eprintln!(
+                        "JUMP_DIG nested_credit snap_pc={} blen={} tip_sloads={} steps={}",
+                        snap.pc, snap.bytecode_len, snap.tip_sloads.len(), snap.opcode_steps
+                    );
+                }
+                clear_pc_resume();
+                return;
+            }
             if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
                 eprintln!(
                     "JUMP_DIG apply_refuse code_hash snap_pc={} blen={} tip_sloads={}",
@@ -1562,8 +1698,10 @@ pub(crate) fn try_apply_pending_pc_resume<CTX>(
     }
     // Iter22: Bind read-prefix tips are top-level only. journal.depth()>1 means we
     // would apply a tip onto the wrong frame (nested CALL) — refuse.
+    // Iter29: nested Bind consume explicitly allows jdepth>1 for one-shot match.
     let jdepth = context.journal().depth();
-    if snap.sstore_index == 0 && !snap.post_sstore && jdepth > 1 {
+    if snap.sstore_index == 0 && !snap.post_sstore && jdepth > 1 && !NESTED_ALLOW_JDEPTH.get()
+    {
         if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
             eprintln!("JUMP_DIG apply_refuse jdepth={jdepth}");
         }
@@ -2079,6 +2217,10 @@ where
         context: &mut CTX,
     ) {
         try_apply_pending_pc_resume(interp, context, CALL_DEPTH.get());
+        // Iter29: Inspector nested frames — consume stash on hash match (no PENDING defer).
+        if nested_bind_stash_armed() {
+            try_consume_nested_bind_resume(interp, context, CALL_DEPTH.get());
+        }
     }
 
     fn step(&mut self, interp: &mut Interpreter<EthInterpreter>, _context: &mut CTX) {

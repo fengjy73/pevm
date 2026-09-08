@@ -94,7 +94,10 @@
 //! Validated spin (no tip_sloads skip / nested apply hang falsified). SoftWait Soft ~0.
 //! Iter28: diagnose 597 first-frame tip identity (router→token nested Bind tips;
 //! nested apply / defer-until-match hung) + LAST_SNAP TLS clear. SoftWait Soft ~0.
-//! Keep Iter16–17/23/24/25/27.
+//! Iter29: hang-free nested Bind consume ≠ frame_init defer — stash+natural CALL
+//! apply is opt-in (`SPECFENCE_NESTED_BIND=1`, dig hang-free); production credits
+//! nested tips on code_hash refuse (no PENDING defer / no Lean seq≠par). SoftWait Soft ~0.
+//! Keep Iter16–17/23/24/25/27/28.
 //! Iter8 memory snap retained. Head-FF (Iter5). SoftWait Soft ~0.
 //!
 //! **Learn (C):** Inter morph selects Quiet (598 OCC-lite) vs Storm (597 Await-ready).
@@ -173,7 +176,7 @@ pub(crate) use boundary::{
     arm_pending_effect_cp_only,
     resume_was_applied, steps_this_run, try_arm_safe_absolute_jump, try_arm_safe_absolute_jump_gated,
     with_plant_tls, with_plant_tls_journal, BoundarySnapshot, CachedCallOutcome, JournalBlob,
-    plant_tls_active, pending_resume_armed, try_apply_pending_pc_resume, handler_sstore_plant_install_wanted, install_handler_sstore_plant_capture,
+    plant_tls_active, pending_resume_armed, try_apply_pending_pc_resume, nested_bind_consume_enabled, nested_bind_stash_armed, try_consume_nested_bind_resume, handler_sstore_plant_install_wanted, install_handler_sstore_plant_capture,
     handler_bind_snap_install_wanted, install_handler_bind_snap_capture, with_bind_snap_tls, note_pending_bind_snap, bind_snap_env_enabled,
     bind_snap_mode, bind_snap_capture_wanted, bind_snap_jump_enabled, BindSnapMode,
 };

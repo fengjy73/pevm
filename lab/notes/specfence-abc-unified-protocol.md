@@ -264,3 +264,12 @@ Lean attach_current_live_snap; tip≡FF overlap + steps_cap kept. SoftWait Soft=
 See `specfence-abc-iter28-status.md`. Iter 29 cause: hang-free nested Bind consume
 ≠ frame_init defer, or schedule ≤12.1→<10.
 
+### Iter 29 — hang-free nested Bind consume (credit + opt-in apply)
+Hang-free nested path ≠ Iter28e frame_init-defer: stash on code_hash mismatch with
+PENDING cleared; natural nested frame_init hash-match one-shot apply
+(`SPECFENCE_NESTED_BIND=1` dig — hang-free). Default-on nested apply → Lean seq≠par
+— OFF. Production: credit nested tips on code_hash refuse. Richer tip_compact
+falsified (wall↑). SoftWait Soft=0; tip≡FF + steps_cap + LAST_SNAP kept.
+597 N5 med **14.7** / N10 **13.9**; 599/097 aj>0; stretch <10 unmet.
+See `specfence-abc-iter29-status.md`. Iter 30 cause: Lean-safe nested apply default
+or 597 arm gates / schedule ≤12.1→<10.

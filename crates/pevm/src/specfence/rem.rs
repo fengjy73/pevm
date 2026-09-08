@@ -609,6 +609,8 @@ impl PartialRetryState {
                 let steps_ok = steps > 0 && steps <= cap;
                 // Iter27: fewer tip_sloads → likelier first-frame apply (Lean
                 // CALL_DEPTH stuck at 0; nested tips fail code_hash on frame0).
+                // Iter29: keep prefer-fewer (richer tip select raised 597 wall);
+                // hang-free nested consume still applies nested tips when armed.
                 let tip_n = s.tip_sloads.len() as u64;
                 let tip_compact = if tip_n == 0 { 0 } else { 64u64.saturating_sub(tip_n.min(64)) };
                 (
