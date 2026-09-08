@@ -289,12 +289,15 @@ pub(crate) fn jump_is_safe(cont: &ResumeContinuation) -> bool {
     // M1j: multi-SSTORE+LOG prefixes can exceed 128 steps; allow up to 512 when
     // write_replays and/or call_outcomes certify a controlled jump.
     // Iter2: Storage/write_replay prefixes on 597 often need >512 prefix steps.
+    // Three-pillar resolve: tip≡FF Bind tips on 597 often sit at PC 2–6k;
+    // 2048 refused armable tips → steps_over / aj=0. Cap 8192 for storage/FF tips.
     let max_steps = if !cont.write_replays.is_empty()
         || !cont.call_outcomes.is_empty()
         || has_storage
         || tip_sload_ff
+        || !snap.tip_sloads.is_empty()
     {
-        2048u64
+        8192u64
     } else {
         128u64
     };
@@ -475,12 +478,15 @@ pub(crate) fn jump_refuse_reason(cont: &ResumeContinuation) -> &'static str {
     if cont.cp.k == 0 && cont.effects.is_empty() && snap.opcode_steps == 0 {
         return "empty_cp0";
     }
+    // Three-pillar resolve: tip≡FF Bind tips on 597 often sit at PC 2–6k;
+    // 2048 refused armable tips → steps_over / aj=0. Cap 8192 for storage/FF tips.
     let max_steps = if !cont.write_replays.is_empty()
         || !cont.call_outcomes.is_empty()
         || has_storage
         || tip_sload_ff
+        || !snap.tip_sloads.is_empty()
     {
-        2048u64
+        8192u64
     } else {
         128u64
     };
@@ -2022,7 +2028,8 @@ pub(crate) fn with_bind_snap_tls<R>(
     clear_pc_resume();
     RESUME_APPLIED.set(false);
     let out = f();
-    // Iter26: one attach_live_boundary per ResumePath TLS — deepest tip≡FF.
+    // Iter26/three-pillar: one attach_live_boundary per ResumePath TLS — best tip
+    // (steps≤cap ∧ tip≡FF preferred over deepest steps_over).
     BIND_SNAP_DEFERRED.with(|c| {
         if let Some((k, snap)) = c.borrow_mut().take() {
             if let Some(ctx) = BIND_SNAP.get() {
@@ -2125,14 +2132,50 @@ fn sload_bind_snap_eth_slow<H: revm::interpreter::Host + ?Sized>(
         tip_sloads,
     };
     LAST_SNAP.with(|c| *c.borrow_mut() = Some(snap.clone()));
-    // Iter26: defer attach to TLS exit (deepest tip only — one bsnap/resume).
+    // Iter26/three-pillar: one attach / resume — keep *best* tip for arm gates
+    // (prefer steps≤cap ∧ tip≡FF over deepest steps_over). No per-SLOAD attach tax.
     let k_now = BIND_SNAP.with(|b| {
         b.get().map(|ctx| {
             let table = unsafe { &*ctx.partial_retry };
             table.current_k(ctx.tx_idx)
         })
     }).unwrap_or(0);
-    BIND_SNAP_DEFERRED.with(|c| *c.borrow_mut() = Some((k_now, snap)));
+    BIND_SNAP_DEFERRED.with(|c| {
+        let mut slot = c.borrow_mut();
+        let replace = match slot.as_ref() {
+            None => true,
+            Some((_, old)) => deferred_bind_tip_better(&snap, old),
+        };
+        if replace {
+            *slot = Some((k_now, snap));
+        }
+    });
+}
+
+/// Capture-time tip rank for single deferred attach (no mass SNAP).
+/// Prefer in-cap tips; among equals prefer tip≡FF; among over-cap prefer fewer steps.
+#[inline]
+fn deferred_bind_tip_better(new: &BoundarySnapshot, old: &BoundarySnapshot) -> bool {
+    const CAP: u64 = 8192;
+    let new_ok = new.opcode_steps > 0 && new.opcode_steps <= CAP;
+    let old_ok = old.opcode_steps > 0 && old.opcode_steps <= CAP;
+    if new_ok != old_ok {
+        return new_ok;
+    }
+    let new_ff = tip_sloads_match_pending_ff(new);
+    let old_ff = tip_sloads_match_pending_ff(old);
+    if new_ok && new_ff != old_ff {
+        return new_ff;
+    }
+    if new_ok {
+        // Prefer deeper in-cap tip (more prefix skipped) when FF equal.
+        if new_ff == old_ff {
+            return new.opcode_steps > old.opcode_steps;
+        }
+        return false;
+    }
+    // Both over-cap: prefer fewer steps (closer to armable).
+    new.opcode_steps < old.opcode_steps
 }
 
 /// Install SLOAD Bind-snap capture on Mainnet instruction table (Iter19).

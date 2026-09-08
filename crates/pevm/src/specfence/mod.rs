@@ -102,6 +102,15 @@
 //! Keep Iter16–17/23/24/25/27/28/29.
 //! Iter8 memory snap retained. Head-FF (Iter5). SoftWait Soft ~0.
 //!
+//! **Three-pillar (default-on):**
+//! 1. Await@a — storm+program+live_fanout≥8 unfinished writer → BO until done +
+//!    Validated yield-spin, then Bind. SoftWait Soft stays ~0. Escape:
+//!    `SPECFENCE_DISABLE_AWAIT_AT_A=1`.
+//! 2. Resolve ≠ FullRestart — ResumePath Bind tips; tip≡FF max_steps 8192;
+//!    best deferred tip; Lean-safe nested apply; refuse unsafe jumps.
+//! 3. Morph mode — Quiet OCC-lite vs Storm Await-ready from inter morph + live
+//!    fanout flip; Await/choose_action only on hot candidates.
+//!
 //! **Learn (C):** Inter morph selects Quiet (598 OCC-lite) vs Storm (597 Await-ready).
 //! Intra `choose_action` / learner updates only on hot candidates.
 //!
@@ -146,7 +155,7 @@ mod rem;
 mod resolve;
 
 pub(crate) use bayes::{BayesMap, DEFAULT_TAU};
-pub(crate) use engagement::{AdaptiveEngagement, BlockEngagementMode, profile_timing_enabled, research_inspect_enabled, softwait_disabled};
+pub(crate) use engagement::{AdaptiveEngagement, BlockEngagementMode, await_at_a_disabled, profile_timing_enabled, research_inspect_enabled, softwait_disabled};
 pub(crate) use hotset::HotSet;
 #[allow(unused_imports)]
 pub(crate) use hotset::{H_A, H_W};

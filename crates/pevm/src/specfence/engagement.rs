@@ -49,6 +49,18 @@ pub(crate) fn softwait_disabled() -> bool {
     }
 }
 
+/// Dig escape: `SPECFENCE_DISABLE_AWAIT_AT_A=1` turns off storm hot-ℓ Await@a
+/// (production default = on). SoftWait Soft stays independent and ~0.
+pub(crate) fn await_at_a_disabled() -> bool {
+    match std::env::var_os("SPECFENCE_DISABLE_AWAIT_AT_A") {
+        None => false,
+        Some(v) => {
+            let s = v.to_string_lossy();
+            s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
+        }
+    }
+}
+
 /// Block-level engagement mode (inter/intra morph actuation — not SoftWait Soft).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

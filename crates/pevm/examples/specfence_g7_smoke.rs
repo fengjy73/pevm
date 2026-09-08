@@ -241,7 +241,7 @@ fn main() {
                 aborts_v.push(aborts as f64);
                 if iters == 1 || i + 1 == iters {
                     println!(
-                        "  block={bn} mode={mode:10} iter={}/{} ok={ok} tps={tps:.0} wall_ms={wall_ms:.1} soft={soft} wait_hard={wh} abort_rate={:.3} lean={} evm={} reexec={} fb_reabort={} fra={} sra={} sb_res={} sb_def={} hsstore={} bsnap={} bcredit={} sb_clique={} jdef={} aj={} rebind={} ffc={} fvd={} fab={} cold={} occ_fast={} steal={} park_k={} mw_ms={:.1} h_ms={:.1} v_ms={:.1} park_ms={:.1} sw_ms={:.1} ea_ms={:.1} bo_ms={:.1} parks={}",
+                        "  block={bn} mode={mode:10} iter={}/{} ok={ok} tps={tps:.0} wall_ms={wall_ms:.1} soft={soft} wait_hard={wh} abort_rate={:.3} lean={} evm={} reexec={} fb_reabort={} fra={} sra={} sb_res={} sb_def={} hsstore={} bsnap={} bcredit={} sb_clique={} jdef={} aj={} rebind={} ffc={} fvd={} fab={} cold={} occ_fast={} steal={} park_k={} await_a={} await_ok={} eng_sw={} mw_ms={:.1} h_ms={:.1} v_ms={:.1} park_ms={:.1} sw_ms={:.1} ea_ms={:.1} bo_ms={:.1} parks={}",
                         i + 1,
                         iters,
                         if n == 0 { 0.0 } else { aborts as f64 / n as f64 },
@@ -267,6 +267,9 @@ fn main() {
                         m.occ_fast_first,
                         m.ready_steal_on_wait,
                         m.park_resume_at_k,
+                        m.await_at_a_arms,
+                        m.await_at_a_wake_ok,
+                        m.engagement_switches,
                         m.profile_maybe_wait_ns as f64 / 1e6,
                         m.profile_handler_ns as f64 / 1e6,
                         m.profile_validate_ns as f64 / 1e6,
@@ -324,7 +327,11 @@ fn main() {
                     "tx_full_retry": m.tx_full_retry,
                     "wait_park_count": m.wait_park_count,
                     "wait_park_ns": m.wait_park_ns,
-                    "ready_steal_on_wait": m.ready_steal_on_wait
+                    "ready_steal_on_wait": m.ready_steal_on_wait,
+                    "await_at_a_arms": m.await_at_a_arms,
+                    "await_at_a_wake_ok": m.await_at_a_wake_ok,
+                    "await_at_a_wake_reabort": m.await_at_a_wake_reabort,
+                    "engagement_switches": m.engagement_switches
                 }));
                 if let Some(row) = last_row.as_mut() {
                     row["park_count_softwait"] = serde_json::json!(m.park_count_softwait);

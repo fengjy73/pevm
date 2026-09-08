@@ -283,3 +283,10 @@ Lean seq≡par with default-on. Stretch median ≤12.1 / <10 unmet; 597 aj=0 (st
 See `specfence-abc-iter30-status.md`. Iter 31 cause: 597 arm gates
 (origin_unsafe/steps_over) or schedule ≤12.1→<10 — not fra≥16 / yield deepen /
 SoftWait Soft / BO park / mass SNAP / Validated skip / broad nested stash.
+
+### Three-pillar drop — Await@a + resolve arm + morph (post-Iter30 pause)
+Landed coherent A∧B∧C default-on after pause-rethink (not Iter31 micro-gates).
+Await@a on storm+program+live_fanout≥8 (SoftWait Soft=0); tip≡FF max_steps 8192 +
+best deferred tip → **597 aj>0**; Quiet|Storm morph actuates. G7 mean SF/OCC **0.449**
+(≈ tip 0.455); 597 wall abs↑ with slower OCC host; stretch &lt;10 unmet.
+See `specfence-three-pillar-impl.md` + `specfence-three-pillar-reflect.md`. **STOP.**

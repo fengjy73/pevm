@@ -591,10 +591,11 @@ impl PartialRetryState {
         };
         let tip_matches_ff = |s: &BoundarySnapshot| -> bool { tip_ff_status(s).0 };
         let steps_cap = |s: &BoundarySnapshot| -> u64 {
-            // Match jump_is_safe max_steps: storage/write/call → 2048 else 128.
+            // Three-pillar resolve: tip≡FF/storage/write/call → 8192 (597 Bind tips
+            // at PC 2–6k were refused steps_over under 2048); Basic-only stays 128.
             let has_storage = values.values().any(|v| matches!(v, FfValue::Storage { .. }));
             if has_storage || tip_matches_ff(s) || !s.tip_sloads.is_empty() {
-                2048
+                8192
             } else {
                 128
             }
@@ -816,6 +817,10 @@ pub(crate) struct PartialRetryTable {
     post_softwait_wake: DashMap<TxIdx, (), BuildIdentityHasher>,
     /// Tx currently parked via FenceGraph SoftWait (not EarlyAbort-only park).
     softwait_parked: DashMap<TxIdx, (), BuildIdentityHasher>,
+    /// Await@a BO park armed; next validation → await_at_a_wake_{ok,reabort}.
+    post_await_at_a_wake: DashMap<TxIdx, (), BuildIdentityHasher>,
+    /// Tx currently parked via access-grain Await@a (BO-until-Validated on hot ℓ).
+    await_at_a_parked: DashMap<TxIdx, (), BuildIdentityHasher>,
     /// Pending repair for next execute / Retry loop of `t`.
     repair: DashMap<TxIdx, RepairPlan, BuildIdentityHasher>,
     /// M1b journal-FF continuation armed with RewindTo.
@@ -865,6 +870,8 @@ impl PartialRetryTable {
             force_bind: DashMap::default(),
             post_softwait_wake: DashMap::default(),
             softwait_parked: DashMap::default(),
+            post_await_at_a_wake: DashMap::default(),
+            await_at_a_parked: DashMap::default(),
             repair: DashMap::default(),
             ff_resume: DashMap::default(),
             last_jump_applied: DashMap::default(),
@@ -1422,6 +1429,22 @@ impl PartialRetryTable {
         self.softwait_parked.remove(&tx_idx).is_some()
     }
 
+    pub(crate) fn mark_await_at_a_parked(&self, tx_idx: TxIdx) {
+        self.await_at_a_parked.insert(tx_idx, ());
+    }
+
+    pub(crate) fn take_await_at_a_parked(&self, tx_idx: TxIdx) -> bool {
+        self.await_at_a_parked.remove(&tx_idx).is_some()
+    }
+
+    pub(crate) fn mark_post_await_at_a_wake(&self, tx_idx: TxIdx) {
+        self.post_await_at_a_wake.insert(tx_idx, ());
+    }
+
+    pub(crate) fn take_post_await_at_a_wake(&self, tx_idx: TxIdx) -> bool {
+        self.post_await_at_a_wake.remove(&tx_idx).is_some()
+    }
+
     /// Count of SuffixRepair/ForceBind resolves armed for `tx` this block.
     #[inline]
     pub(crate) fn suffix_repair_depth(&self, tx_idx: TxIdx) -> usize {
@@ -1795,7 +1818,7 @@ impl PartialRetryTable {
             let why = match cont.jump_snap.as_ref() {
                 None => "snap_none",
                 Some(s) if !s.is_live_capture() => "snap_not_live",
-                Some(s) if s.opcode_steps == 0 || s.opcode_steps > 2048 => "steps",
+                Some(s) if s.opcode_steps == 0 || s.opcode_steps > 8192 => "steps",
                 Some(s) if s.call_depth > 2 => "depth",
                 Some(s) if s.bytecode_len > 4096 => "bytecode",
                 _ if cont.valued_blocks_jump => "valued_blocks",

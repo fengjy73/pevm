@@ -173,6 +173,12 @@ pub struct SpecFenceMetrics {
     pub hotset_size: usize,
     /// P0/P2: SoftWait arms created (FenceGraph.arm_soft).
     pub soft_wait_arms: usize,
+    /// Three-pillar Await@a: BO-until-Validated arms at first unresolved access a on hot ℓ.
+    pub await_at_a_arms: usize,
+    /// Await@a wake → next validation succeeded (productive Bind-when-ready).
+    pub await_at_a_wake_ok: usize,
+    /// Await@a wake → next validation aborted again.
+    pub await_at_a_wake_reabort: usize,
     /// P0: cost π WaitHard on program locations.
     pub cost_chose_wait_program: usize,
     /// P0: cost π WaitHard on handler locations (should stay ~0).
@@ -292,6 +298,9 @@ pub(crate) struct MetricsInner {
     hot_local_reads: AtomicUsize,
     hotset_size: AtomicUsize,
     soft_wait_arms: AtomicUsize,
+    await_at_a_arms: AtomicUsize,
+    await_at_a_wake_ok: AtomicUsize,
+    await_at_a_wake_reabort: AtomicUsize,
     cost_chose_wait_program: AtomicUsize,
     cost_chose_wait_handler: AtomicUsize,
     cost_chose_spec_program: AtomicUsize,
@@ -457,6 +466,18 @@ impl MetricsInner {
 
     pub(crate) fn set_soft_wait_arms(&self, n: usize) {
         self.soft_wait_arms.store(n, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_await_at_a_arm(&self) {
+        self.await_at_a_arms.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_await_at_a_wake_ok(&self) {
+        self.await_at_a_wake_ok.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_await_at_a_wake_reabort(&self) {
+        self.await_at_a_wake_reabort.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_cost_chose_wait_program(&self) {
@@ -878,6 +899,9 @@ impl MetricsInner {
             hot_local_reads: self.hot_local_reads.load(Ordering::Relaxed),
             hotset_size: self.hotset_size.load(Ordering::Relaxed),
             soft_wait_arms: self.soft_wait_arms.load(Ordering::Relaxed),
+            await_at_a_arms: self.await_at_a_arms.load(Ordering::Relaxed),
+            await_at_a_wake_ok: self.await_at_a_wake_ok.load(Ordering::Relaxed),
+            await_at_a_wake_reabort: self.await_at_a_wake_reabort.load(Ordering::Relaxed),
             cost_chose_wait_program: self.cost_chose_wait_program.load(Ordering::Relaxed),
             cost_chose_wait_handler: self.cost_chose_wait_handler.load(Ordering::Relaxed),
             cost_chose_spec_program: self.cost_chose_spec_program.load(Ordering::Relaxed),

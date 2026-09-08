@@ -1154,6 +1154,12 @@ fn try_validate(
             {
                 specfence.metrics.record_soft_wait_wake_reabort();
             }
+            if specfence
+                .partial_retry
+                .take_post_await_at_a_wake(tx_version.tx_idx)
+            {
+                specfence.metrics.record_await_at_a_wake_reabort();
+            }
             let write_locations = cached_write_locations
                 .unwrap_or_else(|| mv_memory.write_locations(tx_version.tx_idx));
             let read_locations = cached_read_locations
@@ -1668,6 +1674,12 @@ fn try_validate(
             {
                 specfence.metrics.record_soft_wait_wake_reabort();
             }
+            if specfence
+                .partial_retry
+                .take_post_await_at_a_wake(tx_version.tx_idx)
+            {
+                specfence.metrics.record_await_at_a_wake_reabort();
+            }
             specfence.metrics.record_occ_abort();
             // V5-P0: engagement.note_abort is metrics-only (no HotSet storm insert).
             let _ = specfence.engagement.note_abort();
@@ -1796,6 +1808,12 @@ fn try_validate(
             .take_post_softwait_wake(tx_version.tx_idx)
         {
             specfence.metrics.record_soft_wait_wake_ok();
+        }
+        if specfence
+            .partial_retry
+            .take_post_await_at_a_wake(tx_version.tx_idx)
+        {
+            specfence.metrics.record_await_at_a_wake_ok();
         }
         // Successful validation clears PartialRetry / RewindTo state for this tx.
         specfence
