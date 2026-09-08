@@ -1,0 +1,4 @@
+{
+  "name": "RISE Parallel EVM (pevm)",
+  "install": "rustup toolchain install stable --profile default --no-self-update && rustup default stable && git submodule update --init && cargo build"
+}
