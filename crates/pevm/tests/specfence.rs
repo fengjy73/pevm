@@ -2031,6 +2031,11 @@ fn specfence_iter22_bind_jump_production_off() {
     let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
     let width = NonZeroUsize::new(concurrency().get().min(4).max(2)).unwrap();
     for _ in 0..4 {
+        // Re-pin Off each iter — parallel tests may clear SPECFENCE_BIND_SNAP.
+        unsafe {
+            std::env::set_var("SPECFENCE_BIND_SNAP", "0");
+            std::env::set_var("SPECFENCE_BIND_SNAP_JUMP", "0");
+        }
         let (_, m, _) = run_mode_conc(
             ConcurrencyMode::SpecFence,
             &storage,
@@ -2041,6 +2046,10 @@ fn specfence_iter22_bind_jump_production_off() {
         assert_eq!(m.absolute_jump_applied, 0, "production JUMP OFF: {m:?}");
         assert_eq!(m.bind_snap_capture, 0, "production SNAP OFF: {m:?}");
         assert_eq!(m.handler_sstore_capture, 0, "stock SSTORE: {m:?}");
+    }
+    unsafe {
+        std::env::remove_var("SPECFENCE_BIND_SNAP");
+        std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP");
     }
 }
 
@@ -3273,6 +3282,59 @@ fn specfence_iter24_bind_snap_force_off() {
     unsafe {
         std::env::remove_var("SPECFENCE_BIND_SNAP");
         std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP");
+    }
+}
+
+/// Iter26: Validated-fresh FF-path tip→jump — SoftWait Soft=0; silent ResumePath;
+/// seq≡par; all-prefix Validated spin kept (no tip_sloads skip).
+#[test]
+fn specfence_iter26_validated_fresh_ff_tip_jump() {
+    unsafe {
+        std::env::remove_var("SPECFENCE_BIND_SNAP"); // silent ResumePath
+        std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP");
+    }
+    let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 12, 6);
+    state.insert(Address::ZERO, EvmAccount::default());
+    for i in 0..48 {
+        let (addr, account) = common::mock_account(97_000 + i);
+        state.insert(addr, account);
+        txs.push(self_transfer(addr, 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+    let width = NonZeroUsize::new(concurrency().get().min(4).max(2)).unwrap();
+    let chain = PevmEthereum::mainnet();
+    for _ in 0..3 {
+        unsafe {
+            std::env::remove_var("SPECFENCE_BIND_SNAP");
+            std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP");
+        }
+        let sequential = execute_revm_sequential(
+            &chain,
+            &storage,
+            Default::default(),
+            BlockEnv::default(),
+            txs.clone(),
+        )
+        .expect("sequential");
+        let mut pevm = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
+        let parallel = pevm
+            .execute_revm_parallel(
+                &chain,
+                &storage,
+                Default::default(),
+                BlockEnv::default(),
+                txs.clone(),
+                width,
+            )
+            .expect("parallel");
+        let m = pevm.last_specfence_metrics().clone();
+        assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
+        assert_eq!(m.handler_sstore_capture, 0, "stock SSTORE: {m:?}");
+        assert_eq!(
+            parallel, sequential,
+            "Validated-fresh ResumePath must stay seq≡par: {m:?}"
+        );
+        let _ = (m.absolute_jump_applied, m.bind_snap_capture, m.bind_snap_credit);
     }
 }
 

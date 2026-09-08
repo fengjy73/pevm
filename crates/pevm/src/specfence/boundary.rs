@@ -606,6 +606,9 @@ thread_local! {
     /// Iter23: cumulative Bind SLOAD (addr, slot, value) within with_bind_snap_tls.
     static BIND_SLOAD_LOG: RefCell<Vec<(Address, U256, U256)>> =
         const { RefCell::new(Vec::new()) };
+    /// Iter26: deepest tip≡FF snap deferred to TLS exit (one attach / resume).
+    static BIND_SNAP_DEFERRED: RefCell<Option<(usize, BoundarySnapshot)>> =
+        const { RefCell::new(None) };
     static PENDING_RESUME: RefCell<Option<BoundarySnapshot>> = const { RefCell::new(None) };
     /// Iter21: FF read-origin seeds applied only after successful PC restore.
     static PENDING_FF_ORIGIN_SEEDS: RefCell<Vec<(crate::MemoryLocationHash, crate::ReadOrigin)>> = const { RefCell::new(Vec::new()) };
@@ -1724,12 +1727,24 @@ pub(crate) fn with_bind_snap_tls<R>(
     PENDING_BIND_SNAP.set(false);
     BIND_SNAP_STEPS.set(0);
     BIND_SLOAD_LOG.with(|c| c.borrow_mut().clear());
+    BIND_SNAP_DEFERRED.with(|c| *c.borrow_mut() = None);
     // Iter21: clear stale PENDING_RESUME / RESUME_APPLIED from a prior jumped
     // incarnation on this worker — leftover applied flag skipped re-arm and
     // contributed to SoftWait/InconsistentRead livelock under JUMP dig.
     clear_pc_resume();
     RESUME_APPLIED.set(false);
     let out = f();
+    // Iter26: one attach_live_boundary per ResumePath TLS — deepest tip≡FF.
+    BIND_SNAP_DEFERRED.with(|c| {
+        if let Some((k, snap)) = c.borrow_mut().take() {
+            if let Some(ctx) = BIND_SNAP.get() {
+                let table = unsafe { &*ctx.partial_retry };
+                table.attach_live_boundary_at(ctx.tx_idx, k, snap, JournalBlob::default());
+                let metrics = unsafe { &*ctx.metrics };
+                metrics.record_handler_bind_snap_capture();
+            }
+        }
+    });
     BIND_SNAP.set(prev);
     PENDING_BIND_SNAP.set(false);
     clear_pc_resume();
@@ -1821,14 +1836,14 @@ fn sload_bind_snap_eth_slow<H: revm::interpreter::Host + ?Sized>(
         tip_sloads,
     };
     LAST_SNAP.with(|c| *c.borrow_mut() = Some(snap.clone()));
-    BIND_SNAP.with(|b| {
-        if let Some(ctx) = b.get() {
+    // Iter26: defer attach to TLS exit (deepest tip only — one bsnap/resume).
+    let k_now = BIND_SNAP.with(|b| {
+        b.get().map(|ctx| {
             let table = unsafe { &*ctx.partial_retry };
-            table.attach_live_boundary(ctx.tx_idx, snap, JournalBlob::default());
-            let metrics = unsafe { &*ctx.metrics };
-            metrics.record_handler_bind_snap_capture();
-        }
-    });
+            table.current_k(ctx.tx_idx)
+        })
+    }).unwrap_or(0);
+    BIND_SNAP_DEFERRED.with(|c| *c.borrow_mut() = Some((k_now, snap)));
 }
 
 /// Install SLOAD Bind-snap capture on Mainnet instruction table (Iter19).

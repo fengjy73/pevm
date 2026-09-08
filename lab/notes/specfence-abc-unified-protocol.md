@@ -236,3 +236,13 @@ tip_sloads prefix-spin skip / broad inc>0 SNAP **falsified**. SoftWait Soft=0;
 See `specfence-abc-iter25-status.md`. Iter 26 cause: Validated-fresh tip→jump
 on 597 without prefix-spin skip, or new 599-safe schedule ≤12.3→<10.
 
+### Iter 26 — Validated-fresh FF-path tip→jump (wall <13 N5)
+FF-served SLOAD arms Bind-snap (tip≡FF); Bind-on-Data snap OFF; prefer tip≡FF at
+jump_snap select; one deferred attach/resume (per-SLOAD attach tax falsified).
+Keep all-prefix Validated spin. SoftWait Soft=0; silent ResumePath.
+597 N5 med **12.4** SoftWait=0 (↓ vs Iter25 13.7; wall <13); N10 **13.3**;
+599/097 **aj>0**. Stretch <10 unmet; 597 aj=0 under fan-out.
+See `specfence-abc-iter26-status.md`. Iter 27 cause: 597 aj under fan-out without
+prefix-spin skip, or N10 schedule ≤12.3→<10.
+
+

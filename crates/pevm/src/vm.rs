@@ -245,6 +245,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 }),
                 None => ReadOrigin::Storage,
             };
+            // Iter26: FF tip≡FF by construction — arm Bind-snap. Attach deferred
+            // to TLS exit (one bsnap/resume). Jump keeps Validated-prefix spin.
+            note_pending_bind_snap();
             return Some((value, read_origin));
         }
         // Iter13: Validated-gated value-stable FF (origin bump, same U256).
@@ -263,6 +266,8 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return None;
         }
         self.specfence.metrics.record_value_stable_ff_hit();
+        // Iter26: value-stable Validated FF — same tip≡FF arm (same Validated window).
+        note_pending_bind_snap();
         Some((
             value,
             ReadOrigin::MvMemory(TxVersion {
@@ -978,7 +983,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
         v: TxVersion,
         force_prefix: bool,
     ) -> Result<(), ReadError> {
-        let _ = (address, v);
+        let _ = address;
         self.specfence.metrics.record_bind_hit();
         if force_prefix || self.specfence.rw_prior.predicts_write(location_hash) {
             self.specfence.metrics.record_prior_bind_hit();
@@ -988,8 +993,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
             .note_access_certified_checkpoint(self.tx_idx, location_hash);
         self.specfence.rem.note_checkpoint_opportunity();
         crate::specfence::arm_pending_effect_cp_only();
-        // Iter19: arm Handler SLOAD Bind-snap at certified-prefix end (k < k_fail).
-        note_pending_bind_snap();
+        // Iter26: do NOT arm Bind-snap on Bind-on-Data — even Validated Bind can
+        // append tip_sloads slots absent from FF → refuse-if-stale. FF-path only
+        // (try_ff_storage) keeps tip≡FF. Keep all-prefix Validated spin.
+        let _ = v;
         Ok(())
     }
 
@@ -2083,6 +2090,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         // already env-gated). No BO park.
         // Iter25: tip_sloads skip of this spin falsified on Lean p2 (seq≠par) —
         // keep full prefix Validated for silent-default ResumePath safety.
+        // Iter26: Validated-fresh FF-path tips still require this same window.
         if suffix_jump {
             let me = tx_version.tx_idx;
             let mut prefix_ok = me == 0;
@@ -2282,9 +2290,10 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         // (silent default) only on SuffixRepair resume / force_bind /
         // needs_live_capture — no mass-path SNAP tax on every Handler run.
         let snap_mode = bind_snap_mode();
-        // Iter24/25: ResumePath capture on SuffixRepair resume / force_bind /
+        // Iter24/25/26: ResumePath capture on SuffixRepair resume / force_bind /
         // needs_live_capture — discovery (inc=0) SNAP-free. Broad inc>0 capture
-        // falsified Iter25 (bsnap↑ wall↑, aj still 0). SoftWait Soft=0.
+        // falsified Iter25. Iter26 arms tip≡FF via try_ff_storage + Validated
+        // Bind-on-Data only. SoftWait Soft=0.
         let repair_capture = rewind_resume
             || needs_capture
             || (tx_version.tx_incarnation > 0

@@ -544,28 +544,9 @@ impl PartialRetryState {
         })
                 }
             });
-        // Iter19: among live snaps with k < k_fail, prefer Bind/read-boundary
-        // (sstore_index=0, !post_sstore) certified-prefix end — post-SSTORE plant
-        // tips are usually k≥k_fail on RAW-read fails (Iter18 aj=0). Among Bind
-        // tips pick highest k / opcode_steps. SSTORE tips remain tiebreak only.
-        let (jump_snap, journal_blob) = self
-            .live_boundaries
-            .iter()
-            .filter(|(k, (s, _))| **k < k_fail && s.is_live_capture())
-            .max_by_key(|(k, (s, _))| {
-                (
-                    u64::from(s.sstore_index == 0 && !s.post_sstore),
-                    s.opcode_steps,
-                    **k,
-                    s.sstore_index,
-                    u64::from(s.post_sstore),
-                )
-            })
-            .map(|(_, (s, b))| (Some(s.clone()), Some(b.clone())))
-            .unwrap_or((None, None));
-        let journal_blob = journal_blob.filter(|b| !b.is_empty());
         // Bound values for the whole certified prefix (k < k_fail), not only
         // up to cp — resume still force-binds those reads; FF cache skips MV walks.
+        // Built before jump_snap select so Iter26 can prefer tip_sloads≡FF tips.
         let certified_set: HashSet<MemoryLocationHash, BuildIdentityHasher> =
             certified.iter().copied().collect();
         let mut values = HashMap::with_hasher(BuildIdentityHasher::default());
@@ -575,6 +556,44 @@ impl PartialRetryState {
                 values.insert(*loc, val.clone());
             }
         }
+        // Iter19: among live snaps with k < k_fail, prefer Bind/read-boundary
+        // (sstore_index=0, !post_sstore) certified-prefix end — post-SSTORE plant
+        // tips are usually k≥k_fail on RAW-read fails (Iter18 aj=0).
+        // Iter26: among Bind tips prefer tip_sloads≡FF (Validated-fresh / FF-path
+        // captures) so refuse-if-stale can arm jump; then highest k / opcode_steps.
+        let tip_matches_ff = |s: &BoundarySnapshot| -> bool {
+            if s.tip_sloads.is_empty() {
+                return false;
+            }
+            s.tip_sloads.iter().all(|(addr, slot, snap_val)| {
+                values.values().any(|v| match v {
+                    FfValue::Storage {
+                        address,
+                        slot: ss,
+                        value,
+                        ..
+                    } if address == addr && ss == slot => value == snap_val,
+                    _ => false,
+                })
+            })
+        };
+        let (jump_snap, journal_blob) = self
+            .live_boundaries
+            .iter()
+            .filter(|(k, (s, _))| **k < k_fail && s.is_live_capture())
+            .max_by_key(|(k, (s, _))| {
+                (
+                    u64::from(s.sstore_index == 0 && !s.post_sstore),
+                    u64::from(tip_matches_ff(s)),
+                    s.opcode_steps,
+                    **k,
+                    s.sstore_index,
+                    u64::from(s.post_sstore),
+                )
+            })
+            .map(|(_, (s, b))| (Some(s.clone()), Some(b.clone())))
+            .unwrap_or((None, None));
+        let journal_blob = journal_blob.filter(|b| !b.is_empty());
         let call_outcomes: Vec<CachedCallOutcome> = self
             .call_outcomes
             .iter()
@@ -640,7 +659,16 @@ impl PartialRetryState {
         snap: BoundarySnapshot,
         blob: JournalBlob,
     ) {
-        let k = self.k;
+        self.attach_live_boundary_at(self.k, snap, blob);
+    }
+
+    /// Iter26: attach at capture-time k (TLS-deferred Bind-snap).
+    pub(crate) fn attach_live_boundary_at(
+        &mut self,
+        k: usize,
+        snap: BoundarySnapshot,
+        blob: JournalBlob,
+    ) {
         self.live_boundaries.insert(k, (snap, blob));
     }
 
@@ -1186,6 +1214,19 @@ impl PartialRetryTable {
         if tx_idx < self.states.len() {
             // SAFETY: single-executor invariant
             unsafe { self.state_mut(tx_idx) }.attach_live_boundary(snap, blob);
+        }
+    }
+
+    /// Iter26: attach Bind-snap at capture-time effect ordinal.
+    pub(crate) fn attach_live_boundary_at(
+        &self,
+        tx_idx: TxIdx,
+        k: usize,
+        snap: BoundarySnapshot,
+        blob: JournalBlob,
+    ) {
+        if tx_idx < self.states.len() {
+            unsafe { self.state_mut(tx_idx) }.attach_live_boundary_at(k, snap, blob);
         }
     }
 

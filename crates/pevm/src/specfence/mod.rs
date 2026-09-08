@@ -87,7 +87,10 @@
 //! Iter25: silent-default ResumePath (Mass JUMP was Lean hang — ResumePath+refuse
 //! hang-free + Lean seq≡par). tip_sloads skip of all-prefix Validated spin
 //! falsified (Lean p2 seq≠par); broad inc>0 SNAP falsified (tax, aj=0). SoftWait Soft ~0.
-//! Keep Iter16–17/23/24.
+//! Iter26: Validated-fresh tip→jump — arm Bind-snap on FF-served SLOAD (tip≡FF);
+//! Validated-only Bind-on-Data; prefer tip_sloads≡FF at jump_snap select; keep
+//! all-prefix Validated spin (no tip_sloads skip). SoftWait Soft ~0.
+//! Keep Iter16–17/23/24/25.
 //! Iter8 memory snap retained. Head-FF (Iter5). SoftWait Soft ~0.
 //!
 //! **Learn (C):** Inter morph selects Quiet (598 OCC-lite) vs Storm (597 Await-ready).
