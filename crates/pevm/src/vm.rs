@@ -2008,7 +2008,12 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             .needs_live_capture(tx_version.tx_idx);
         let mut ff_cont = ff_cont;
         if rewind_resume && ff_prefix {
-            attach_current_live_snap(tx_version.tx_idx, self.specfence.partial_retry);
+            // Iter28: Lean LAST_SNAP is worker-TLS; Bind-snap TLS now clears it,
+            // but attach here still races steal. ff_continuation already has
+            // jump_snap from arm_rewind live_boundaries — skip Lean attach.
+            if !lean {
+                attach_current_live_snap(tx_version.tx_idx, self.specfence.partial_retry);
+            }
             ff_cont = self
                 .specfence
                 .partial_retry

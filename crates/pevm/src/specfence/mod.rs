@@ -92,7 +92,9 @@
 //! all-prefix Validated spin (no tip_sloads skip). SoftWait Soft ~0.
 //! Iter27: tip≡FF overlap (extras OK) + steps_cap select + deeper all-prefix
 //! Validated spin (no tip_sloads skip / nested apply hang falsified). SoftWait Soft ~0.
-//! Keep Iter16–17/23/24/25.
+//! Iter28: diagnose 597 first-frame tip identity (router→token nested Bind tips;
+//! nested apply / defer-until-match hung) + LAST_SNAP TLS clear. SoftWait Soft ~0.
+//! Keep Iter16–17/23/24/25/27.
 //! Iter8 memory snap retained. Head-FF (Iter5). SoftWait Soft ~0.
 //!
 //! **Learn (C):** Inter morph selects Quiet (598 OCC-lite) vs Storm (597 Await-ready).

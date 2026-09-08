@@ -1540,8 +1540,14 @@ pub(crate) fn try_apply_pending_pc_resume<CTX>(
     if let Some(expected) = snap.code_hash {
         let actual = interp.bytecode.get_or_calculate_hash();
         if actual != expected {
+            // Iter28 diagnosis: 597 Bind tips are often nested (router→token);
+            // frame0 is tx.to. Nested apply-on-mismatch / defer-until-match both
+            // hung under concurrency — keep refuse + clear (hang-free).
             if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
-                eprintln!("JUMP_DIG apply_refuse code_hash snap_pc={} blen={}", snap.pc, snap.bytecode_len);
+                eprintln!(
+                    "JUMP_DIG apply_refuse code_hash snap_pc={} blen={} tip_sloads={}",
+                    snap.pc, snap.bytecode_len, snap.tip_sloads.len()
+                );
             }
             clear_pc_resume();
             return;
@@ -1784,6 +1790,9 @@ pub(crate) fn with_bind_snap_tls<R>(
     BIND_SNAP_STEPS.set(0);
     BIND_SLOAD_LOG.with(|c| c.borrow_mut().clear());
     BIND_SNAP_DEFERRED.with(|c| *c.borrow_mut() = None);
+    // Iter28: LAST_SNAP is worker-TLS — steal can carry nested/wrong-tx tips into
+    // attach_current_live_snap on the next rewind (apply_refuse code_hash). Clear.
+    LAST_SNAP.with(|c| *c.borrow_mut() = None);
     // Iter21: clear stale PENDING_RESUME / RESUME_APPLIED from a prior jumped
     // incarnation on this worker — leftover applied flag skipped re-arm and
     // contributed to SoftWait/InconsistentRead livelock under JUMP dig.
@@ -1801,6 +1810,7 @@ pub(crate) fn with_bind_snap_tls<R>(
             }
         }
     });
+    LAST_SNAP.with(|c| *c.borrow_mut() = None);
     BIND_SNAP.set(prev);
     PENDING_BIND_SNAP.set(false);
     clear_pc_resume();

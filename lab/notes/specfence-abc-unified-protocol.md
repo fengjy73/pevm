@@ -254,3 +254,13 @@ SoftWait Soft=0; silent ResumePath; FF-only tip≡FF.
 on 597 (code_hash first-frame); 599/097 aj>0. Stretch <10 unmet.
 See `specfence-abc-iter27-status.md`. Iter 28 cause: 597 first-frame tip identity
 (hang-free nested apply or capture-at-tx.to) for aj>0, or schedule ≤12.1→<10.
+
+### Iter 28 — first-frame tip identity diagnosed (nested apply hung)
+597 Bind tips are router→token nested (code_hash refuse on frame0). First-frame-only
+capture starved tip≡FF (wall↑); hang-free defer-until-match nested apply **hung**
+under concurrency (same family as Iter27). Production: LAST_SNAP TLS clear + skip
+Lean attach_current_live_snap; tip≡FF overlap + steps_cap kept. SoftWait Soft=0;
+597 N5 **13.7** / N10 **14.3** (noise≈ Iter27-rerun 14.1); aj=0 on 597; 599/097 aj>0.
+See `specfence-abc-iter28-status.md`. Iter 29 cause: hang-free nested Bind consume
+≠ frame_init defer, or schedule ≤12.1→<10.
+
