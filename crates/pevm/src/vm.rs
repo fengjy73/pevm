@@ -21,7 +21,8 @@ use crate::{
     specfence::{
         AccessMode, CheckpointKind, FfValue, ResolveAction, SpecFenceCtx, StorageWriteReplay,
         early_val_probability, note_pending_effect_boundary,
-        absolute_jump_eligible, attach_current_live_snap, arm_call_outcome_cache, jump_is_safe, jump_refuse_reason, resume_was_applied, steps_this_run,
+        absolute_jump_eligible, attach_current_live_snap, arm_call_outcome_cache, arm_ff_origin_seeds, take_ff_origin_seeds,
+        jump_is_safe, jump_refuse_reason, resume_was_applied, steps_this_run,
         suffix_repair_jump_env_ok, try_arm_safe_absolute_jump, try_arm_safe_absolute_jump_gated,
         with_plant_tls_journal, with_bind_snap_tls, note_pending_bind_snap,
     },
@@ -2059,13 +2060,56 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         let bind_depth_ok = ff_cont.as_ref().is_some_and(|cont| {
             cont.jump_snap.as_ref().is_some_and(|s| s.call_depth <= 1)
         });
+        // Iter22: refuse Bind jump when snap omitted memory bytes (≤8KiB cap) but
+        // MemoryGas still reports words — restore would wipe live memory → seq≠par.
+        let bind_memory_ok = ff_cont.as_ref().is_some_and(|cont| {
+            cont.jump_snap.as_ref().is_some_and(|s| {
+                s.memory_words == 0 || !s.memory.is_empty()
+            })
+        });
+        // Iter22: require a real-looking Bind tip (pc/gas/stack live).
+        let bind_tip_ok = ff_cont.as_ref().is_some_and(|cont| {
+            cont.jump_snap.as_ref().is_some_and(|s| {
+                s.pc > 0 && s.gas_remaining > 0 && !s.stack.is_empty()
+            })
+        });
         let suffix_jump_would = bind_snap_jump_env
             && suffix_jump_eligible
             && read_prefix_ok
-            && bind_depth_ok;
+            && bind_depth_ok
+            && bind_memory_ok
+            && bind_tip_ok;
         // Dig arm only when JUMP env set; production keeps aj=0 / SoftWait Soft=0.
         let mut suffix_jump = suffix_jump_would;
         let _ = suffix_jump_eligible;
+        // Iter22: Bind abs jump only behind fully Validated prefix (all tx < me).
+        // Hang-free yield spin; refuse jump if prefix not ready — eliminates MV races
+        // that made ERC-20 aj>0 ∧ seq≠par under concurrency. Dig-only (suffix_jump
+        // already env-gated). No BO park.
+        if suffix_jump {
+            let me = tx_version.tx_idx;
+            let mut prefix_ok = me == 0;
+            if !prefix_ok {
+                for _ in 0..8192 {
+                    let mut all_v = true;
+                    for i in 0..me {
+                        if !self.specfence.scheduler.is_validated(i) {
+                            all_v = false;
+                            break;
+                        }
+                    }
+                    if all_v {
+                        prefix_ok = true;
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+            }
+            if !prefix_ok {
+                suffix_jump = false;
+                self.specfence.metrics.record_absolute_jump_fallback();
+            }
+        }
         let live_prime = false;
         let _ = live_prime;
         let capture_window = false;
@@ -2080,12 +2124,14 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             && crate::specfence::research_inspect_enabled();
         let use_inspect = journal_stream || research_inspect;
 
-        // Iter20/21: Validated-safe origin seed for Bind-snap PC skip. Stale FF
+        // Iter20–22: Validated-safe origin seed for Bind-snap PC skip. Stale FF
         // origins (writer reincarnated / Estimate) caused SoftWait/InconsistentRead
         // livelock under concurrency — refuse jump rather than seed Estimate.
-        // Iter21: also require matching MvMemory origins to be Validated (not only
-        // bumped ones) — unfinished Data Bind seed hung Lean/597 under JUMP.
-        // research_inspect keeps classic seed. Lean journal-FF-only must NOT seed.
+        // Iter21: matching MvMemory origins must be Validated.
+        // Iter22: (1) matching origins also value-check against MV Data;
+        // (2) defer read_set install until after successful apply_to_interp
+        // via arm_ff_origin_seeds (pre-seed + failed apply poisoned ERC-20 seq≠par);
+        // (3) FF journal warm on apply (EIP-2929). research_inspect keeps classic seed.
         if rewind_resume && suffix_jump {
             let mut seeds: Vec<(MemoryLocationHash, ReadOrigin)> = Vec::new();
             let mut all_safe = true;
@@ -2103,6 +2149,38 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         Some((tx_idx, tx_incarnation)) => {
                             // Iter21 hang fix: matching origin must be Validated.
                             if !self.specfence.scheduler.is_validated(tx_idx) {
+                                all_safe = false;
+                                break;
+                            }
+                            // Iter22: matching incarnation must still publish FF value
+                            // (defense vs aborted/replaced Data under concurrency).
+                            let written = self.mv_memory.data.get(&location_hash);
+                            let value_ok = match (is_storage, &ff, written.as_ref()) {
+                                (
+                                    true,
+                                    FfValue::Storage { value, .. },
+                                    Some(map),
+                                ) => matches!(
+                                    map.get(&tx_idx),
+                                    Some(MemoryEntry::Data(inc, MemoryValue::Storage(v)))
+                                        if *inc == tx_incarnation && v == value
+                                ),
+                                (
+                                    false,
+                                    FfValue::Basic { basic, .. },
+                                    Some(map),
+                                ) => match map.get(&tx_idx) {
+                                    Some(MemoryEntry::Data(inc, MemoryValue::Basic(cur_b)))
+                                        if *inc == tx_incarnation =>
+                                    {
+                                        cur_b.balance == basic.balance
+                                            && cur_b.nonce == basic.nonce
+                                    }
+                                    _ => false,
+                                },
+                                _ => false,
+                            };
+                            if !value_ok {
                                 all_safe = false;
                                 break;
                             }
@@ -2163,12 +2241,15 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 seeds.push((location_hash, read_origin));
             }
             if all_safe {
+                // Iter22: pre-seed read_set (needed if any mid-exec path observes origins)
+                // AND stash copy for clear-on-failed-apply to avoid poison.
+                arm_ff_origin_seeds(seeds.clone());
                 let db = self.evm.ctx().db_mut();
                 for (location_hash, read_origin) in seeds {
-                    db.read_set
-                        .entry(location_hash)
-                        .or_default()
-                        .push(read_origin);
+                    let origins = db.read_set.entry(location_hash).or_default();
+                    if origins.is_empty() {
+                        origins.push(read_origin);
+                    }
                 }
             } else {
                 suffix_jump = false;
@@ -2282,6 +2363,10 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                             true,
                         )
                     });
+                    if !did_jump {
+                        // Armed seeds only meaningful if jump arm succeeded.
+                        let _ = take_ff_origin_seeds();
+                    }
                 }
                 // Hang-free credit consume when Bind tip exists but jump not armed
                 // (unsafe origins / jump_is_safe refuse / JUMP env off with SNAP on).
@@ -2301,7 +2386,23 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     use_inspect && self.specfence.mode == crate::ConcurrencyMode::SpecFence,
                 );
                 if did_jump {
-                    partial_retry.note_jump_applied(tx_idx, resume_was_applied());
+                    let applied = resume_was_applied();
+                    let seeds = take_ff_origin_seeds();
+                    if !applied {
+                        // Iter22: failed PC apply — drop pre-seeded FF origins so cold
+                        // re-exec / natural reads own the read_set (avoid poison).
+                        if !seeds.is_empty() {
+                            let db = self.evm.ctx().db_mut();
+                            for (location_hash, seeded) in &seeds {
+                                if let Some(origins) = db.read_set.get_mut(location_hash) {
+                                    if origins.last() == Some(seeded) && origins.len() == 1 {
+                                        db.read_set.remove(location_hash);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    partial_retry.note_jump_applied(tx_idx, applied);
                 }
                 result
             };

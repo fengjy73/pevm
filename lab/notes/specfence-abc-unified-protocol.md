@@ -201,3 +201,10 @@ SoftWait Soft=0; 597 N5 quiet **13.4** / N10 **13.6**.
 See `specfence-abc-iter21-status.md`. Iter 22 cause: correct Bind-jump restore
 seq≡par on ERC-20, or non-jump opcode cut / 599-safe critical-path ≤12.3→<10.
 
+### Iter 22 — Bind-jump restore plumbing; ERC-20 still flaky (JUMP OFF)
+FF journal warm + matching-origin value check + seed clear-on-fail + memory/tip
+gates + Validated-prefix dig spin. ERC-20 SNAP+JUMP still **flaky** aj>0∧seq≠par
+(even behind Validated prefix) → JUMP/SNAP stay OFF. SoftWait Soft=0; 597 N5
+**13.5** plateau. See `specfence-abc-iter22-status.md`. Iter 23 cause: diff-first
+restore vs cold SuffixRepair, or non-jump opcode cut / 599-safe ≤12.3→<10.
+

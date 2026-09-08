@@ -2009,6 +2009,113 @@ fn specfence_iter21_bind_jump_width2_hang_repro() {
     }
 }
 
+
+/// Iter22: production SNAP/JUMP OFF — SoftWait Soft=0; aj=0; bsnap=0; seq≡par.
+#[test]
+fn specfence_iter22_bind_jump_production_off() {
+    unsafe {
+        std::env::remove_var("SPECFENCE_BIND_SNAP");
+        std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP");
+    }
+    let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 12, 6);
+    state.insert(Address::ZERO, EvmAccount::default());
+    for i in 0..64 {
+        let (addr, account) = common::mock_account(93_000 + i);
+        state.insert(addr, account);
+        txs.push(self_transfer(addr, 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+    let width = NonZeroUsize::new(concurrency().get().min(4).max(2)).unwrap();
+    for _ in 0..4 {
+        let (_, m, _) = run_mode_conc(
+            ConcurrencyMode::SpecFence,
+            &storage,
+            txs.clone(),
+            width,
+        );
+        assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
+        assert_eq!(m.absolute_jump_applied, 0, "production JUMP OFF: {m:?}");
+        assert_eq!(m.bind_snap_capture, 0, "production SNAP OFF: {m:?}");
+        assert_eq!(m.handler_sstore_capture, 0, "stock SSTORE: {m:?}");
+    }
+}
+
+/// Iter22 dig: ERC-20 SNAP+JUMP after restore plumbing — seek aj>0∧seq≡par stability.
+/// Ignored. Production JUMP stays OFF until this dig is stably green + 597 no-hang.
+#[ignore = "Iter22 dig: ERC-20 Bind jump aj>0∧seq≡par stability; run solo --ignored --test-threads=1"]
+#[test]
+fn specfence_iter22_erc20_bind_jump_seq_eq_par_dig() {
+    unsafe {
+        std::env::set_var("SPECFENCE_BIND_SNAP", "1");
+        std::env::set_var("SPECFENCE_BIND_SNAP_JUMP", "1");
+    }
+    let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 12, 6);
+    state.insert(Address::ZERO, EvmAccount::default());
+    for i in 0..64 {
+        let (addr, account) = common::mock_account(94_000 + i);
+        state.insert(addr, account);
+        txs.push(self_transfer(addr, 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+    let width = NonZeroUsize::new(concurrency().get().min(4).max(2)).unwrap();
+    let chain = PevmEthereum::mainnet();
+    let mut success = 0usize;
+    let mut fail = 0usize;
+    let mut aj_runs = 0usize;
+    for _ in 0..16 {
+        let sequential = execute_revm_sequential(
+            &chain,
+            &storage,
+            Default::default(),
+            BlockEnv::default(),
+            txs.clone(),
+        )
+        .expect("sequential");
+        let mut pevm = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
+        let parallel = pevm
+            .execute_revm_parallel(
+                &chain,
+                &storage,
+                Default::default(),
+                BlockEnv::default(),
+                txs.clone(),
+                width,
+            )
+            .expect("parallel");
+        let m = pevm.last_specfence_metrics().clone();
+        assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
+        if m.absolute_jump_applied > 0 {
+            aj_runs += 1;
+            if parallel == sequential {
+                success += 1;
+            } else {
+                fail += 1;
+            }
+        } else if parallel != sequential {
+            fail += 1;
+        }
+    }
+    unsafe {
+        std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP");
+        std::env::remove_var("SPECFENCE_BIND_SNAP");
+    }
+    eprintln!(
+        "iter22 erc20 dig: aj_runs={aj_runs} success_seq={success} fail={fail}"
+    );
+    // Document: require success>0∧fail==0 for enable. Today restore still flaky.
+    assert!(
+        aj_runs > 0,
+        "expected some Bind jump apply under SNAP+JUMP: success={success} fail={fail}"
+    );
+    if fail > 0 {
+        eprintln!(
+            "iter22 erc20 dig: STILL FLAKY seq≠par (fail={fail}) — keep JUMP OFF"
+        );
+    } else {
+        eprintln!("iter22 erc20 dig: STABLE aj>0∧seq≡par over aj_runs={aj_runs}");
+    }
+}
+
 /// Iter21: ERC-20 + SNAP+JUMP dig — documents Bind jump seq≠par (or hang).
 /// Ignored. Run solo: `--ignored --test-threads=1`.
 /// Expected falsification: aj>0 ⇒ committed state ≠ sequential (restore wrong

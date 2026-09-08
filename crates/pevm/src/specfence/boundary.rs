@@ -602,6 +602,10 @@ thread_local! {
     static PENDING_RESUME: RefCell<Option<BoundarySnapshot>> = const { RefCell::new(None) };
     /// Iter21: FF read-origin seeds applied only after successful PC restore.
     static PENDING_FF_ORIGIN_SEEDS: RefCell<Vec<(crate::MemoryLocationHash, crate::ReadOrigin)>> = const { RefCell::new(Vec::new()) };
+    /// Iter22: certified-prefix FF Storage/Basic presents to warm in revm journal on
+    /// Bind abs jump (EIP-2929). Without this, jumped-past SLOADs leave slots cold →
+    /// later SLOAD/SSTORE gas ≠ sequential → seq≠par on ERC-20.
+    static PENDING_FF_READ_PRESENTS: RefCell<Vec<crate::specfence::rem::FfValue>> = const { RefCell::new(Vec::new()) };
     static PENDING_JOURNAL_BLOB: RefCell<Option<JournalBlob>> = const { RefCell::new(None) };
     /// Nested calls entered but not yet `call_end` (metadata for cache store).
     static PENDING_CALL_STACK: RefCell<Vec<PendingCallMeta>> = const { RefCell::new(Vec::new()) };
@@ -762,10 +766,16 @@ pub(crate) fn take_ff_origin_seeds() -> Vec<(crate::MemoryLocationHash, crate::R
     PENDING_FF_ORIGIN_SEEDS.with(|c| std::mem::take(&mut *c.borrow_mut()))
 }
 
+/// Iter22: arm FF Storage/Basic presents for hang-free journal warm on PC apply.
+pub(crate) fn arm_ff_read_presents(values: Vec<crate::specfence::rem::FfValue>) {
+    PENDING_FF_READ_PRESENTS.with(|c| *c.borrow_mut() = values);
+}
+
 pub(crate) fn clear_pc_resume() {
     PENDING_RESUME.with(|c| *c.borrow_mut() = None);
     PENDING_JOURNAL_BLOB.with(|c| *c.borrow_mut() = None);
     PENDING_FF_ORIGIN_SEEDS.with(|c| c.borrow_mut().clear());
+    PENDING_FF_READ_PRESENTS.with(|c| c.borrow_mut().clear());
     RESUME_CALL_CACHE.with(|c| c.borrow_mut().clear());
     RESUME_CALL_IDX.set(0);
     RESUME_APPLIED.set(false);
@@ -868,6 +878,13 @@ pub(crate) fn try_arm_safe_absolute_jump_gated(
     PENDING_WRITE_REPLAYS.with(|c| {
         *c.borrow_mut() = tip_writes;
     });
+    // Iter22: read-prefix Bind jump — warm FF presents so skipped SLOADs stay EIP-2929 warm.
+    if snap.sstore_index == 0 && !snap.post_sstore && cont.write_replays.is_empty() {
+        let presents: Vec<_> = cont.values.values().cloned().collect();
+        if !presents.is_empty() {
+            arm_ff_read_presents(presents);
+        }
+    }
     // CALL-boundary jump: apply nested touches on arm (Inspector::call won't fire
     // for skipped CALL). Also keep cache for any nested re-enter below jump PC.
     // M1l: seed Basics from FF values so valued transfer_loaded can succeed without
@@ -1066,6 +1083,75 @@ where
         let slot = EvmStorageSlot::new_changed(wr.original, wr.present, tx_id);
         acc.storage.insert(wr.slot, slot);
         acc.mark_touch();
+    }
+}
+
+/// Iter22: warm certified-prefix FF reads into revm journal without Db re-entry.
+/// Read-prefix Bind jump skips SLOADs; without warm slots, later SLOAD/SSTORE pay
+/// cold gas and receipts diverge (ERC-20 aj>0 ∧ seq≠par).
+fn apply_ff_read_presents<CTX>(
+    context: &mut CTX,
+    values: &[crate::specfence::rem::FfValue],
+    prefer_tx_id: Option<usize>,
+)
+where
+    CTX: ContextTr,
+    CTX::Journal: JournalExt,
+{
+    use revm::primitives::KECCAK_EMPTY;
+    use revm::state::{Account, AccountInfo, EvmStorageSlot};
+    use crate::specfence::rem::FfValue;
+    let state = context.journal_mut().evm_state_mut();
+    // Prefer callee/frame tx_id — HashMap::values().next() can pick a stale id.
+    let tx_id = prefer_tx_id
+        .or_else(|| state.values().map(|a| a.transaction_id).max())
+        .unwrap_or(0);
+    for ff in values {
+        match ff {
+            FfValue::Storage { address, slot, value, .. } => {
+                if !state.contains_key(address) {
+                    let mut acc = Account::new_not_existing(tx_id);
+                    acc.info = AccountInfo {
+                        balance: Default::default(),
+                        nonce: 0,
+                        code_hash: KECCAK_EMPTY,
+                        code: None,
+                        ..Default::default()
+                    };
+                    let _ = acc.mark_warm_with_transaction_id(tx_id);
+                    state.insert(*address, acc);
+                }
+                let Some(acc) = state.get_mut(address) else {
+                    continue;
+                };
+                let _ = acc.mark_warm_with_transaction_id(tx_id);
+                // Unchanged warm slot: original == present == FF value (read-only prefix).
+                if !acc.storage.contains_key(slot) {
+                    acc.storage.insert(*slot, EvmStorageSlot::new(*value, tx_id));
+                } else if let Some(s) = acc.storage.get_mut(slot) {
+                    let _ = s.mark_warm_with_transaction_id(tx_id);
+                }
+            }
+            FfValue::Basic { address, basic, code_hash, .. } => {
+                if state.contains_key(address) {
+                    if let Some(acc) = state.get_mut(address) {
+                        let _ = acc.mark_warm_with_transaction_id(tx_id);
+                    }
+                    continue;
+                }
+                let _ = code_hash;
+                let info = AccountInfo {
+                    balance: basic.balance,
+                    nonce: basic.nonce,
+                    code_hash: KECCAK_EMPTY,
+                    code: None,
+                    account_id: None,
+                };
+                let mut acc = Account::from(info);
+                let _ = acc.mark_warm_with_transaction_id(tx_id);
+                state.insert(*address, acc);
+            }
+        }
     }
 }
 
@@ -1383,6 +1469,13 @@ pub(crate) fn try_apply_pending_pc_resume<CTX>(
         clear_pc_resume();
         return;
     }
+    // Iter22: Bind read-prefix tips are top-level only. journal.depth()>1 means we
+    // would apply a tip onto the wrong frame (nested CALL) — refuse.
+    let jdepth = context.journal().depth();
+    if snap.sstore_index == 0 && !snap.post_sstore && jdepth > 1 {
+        clear_pc_resume();
+        return;
+    }
     let blob = PENDING_JOURNAL_BLOB.with(|c| c.borrow_mut().take());
     if let Some(blob) = blob {
         let n = blob.account_count();
@@ -1437,6 +1530,17 @@ pub(crate) fn try_apply_pending_pc_resume<CTX>(
     if !writes.is_empty() {
         apply_write_replays(context, &writes);
     }
+    // Iter22: warm FF read presents before PC restore (Bind jump read-prefix).
+    let ff_reads = PENDING_FF_READ_PRESENTS.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    if !ff_reads.is_empty() {
+        let prefer_tx = {
+            let state = context.journal().evm_state();
+            let target = interp.input.target_address();
+            state.get(&target).map(|a| a.transaction_id)
+                .or_else(|| state.values().map(|a| a.transaction_id).max())
+        };
+        apply_ff_read_presents(context, &ff_reads, prefer_tx);
+    }
     let skipped = snap.opcode_steps;
     snap.apply_to_interp(interp);
     RESUME_APPLIED.set(true);
@@ -1458,10 +1562,10 @@ pub(crate) fn note_pending_bind_snap() {
 }
 
 /// Env gate: `SPECFENCE_BIND_SNAP=1` enables hang-free Bind/SLOAD snap capture.
-/// Default **off** — capture-without-jump wall-taxes 597/599 (Iter19). Iter20/21:
+/// Default **off** — capture-without-jump wall-taxes 597/599 (Iter19). Iter20–22:
 /// abs jump dig-only via `SPECFENCE_BIND_SNAP_JUMP=1` (Validated-all origins +
-/// TLS clear); production OFF until width=1 aj∧seq≡par and width≥2 hang-free.
-/// Credit consume is hang-free but not an opcode cut.
+/// deferred origin seed + FF journal warm); production OFF until ERC-20
+/// aj>0∧seq≡par stable and 597 no-hang. Credit consume hang-free but not opcode cut.
 pub(crate) fn bind_snap_env_enabled() -> bool {
     match std::env::var_os("SPECFENCE_BIND_SNAP") {
         None => false,
@@ -1560,6 +1664,9 @@ fn sload_bind_snap_eth_slow<H: revm::interpreter::Host + ?Sized>(
             table.current_k(ctx.tx_idx) as u64
         })
     }).unwrap_or(0);
+    // Iter22: prefer PC as skip-credit proxy — rem_k is effect ordinal (often 2–5)
+    // while ERC-20 tip PC is hundreds of opcodes deep; under-crediting is fine for
+    // metrics, but rem_k-as-steps confused tip quality gates.
     let snap = BoundarySnapshot {
         pc,
         gas_remaining,
@@ -1567,7 +1674,7 @@ fn sload_bind_snap_eth_slow<H: revm::interpreter::Host + ?Sized>(
         memory_words: mem_gas.words_num,
         memory_expansion_cost: mem_gas.expansion_cost,
         call_depth: CALL_DEPTH.get(),
-        opcode_steps: rem_k.max(n).max(1),
+        opcode_steps: (pc as u64).max(rem_k).max(n).max(1),
         stack,
         memory,
         code_hash,

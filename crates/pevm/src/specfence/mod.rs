@@ -72,6 +72,10 @@
 //! clear stale PENDING_RESUME in `with_bind_snap_tls`. Prove width=1 seq≡par
 //! then width≥2 hang-free before concurrency enable. Production SNAP/JUMP OFF;
 //! SoftWait Soft ~0. Keep Iter16–17 absorb/yield-spin.
+//! Iter22: Bind-jump restore — defer FF origin seed until after successful
+//! `apply_to_interp`; warm FF Storage/Basic in journal (EIP-2929); matching-origin
+//! value check; refuse truncated-memory tips. Dig for ERC-20 aj>0∧seq≡par; JUMP
+//! stays OFF under concurrency until stable + 597 no-hang. SoftWait Soft ~0.
 //! Iter8 memory snap retained. Head-FF (Iter5). SoftWait Soft ~0.
 //!
 //! **Learn (C):** Inter morph selects Quiet (598 OCC-lite) vs Storm (597 Await-ready).
