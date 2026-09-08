@@ -67,6 +67,11 @@
 //! refuse (`bytecode_no_storage_ff`). Abs jump stays hard-OFF; hang-free credit
 //! consume (`bcredit`) when Bind tip on resume. SNAP opt-in; production OFF.
 //! SoftWait Soft ~0. Stock SSTORE. No mega-fan yield.
+//! Iter21: minimal Storage-FF Bind jump hang repro. Env-gated JUMP arm
+//! (`SPECFENCE_BIND_SNAP_JUMP=1`); matching MvMemory origins must be Validated;
+//! clear stale PENDING_RESUME in `with_bind_snap_tls`. Prove width=1 seq≡par
+//! then width≥2 hang-free before concurrency enable. Production SNAP/JUMP OFF;
+//! SoftWait Soft ~0. Keep Iter16–17 absorb/yield-spin.
 //! Iter8 memory snap retained. Head-FF (Iter5). SoftWait Soft ~0.
 //!
 //! **Learn (C):** Inter morph selects Quiet (598 OCC-lite) vs Storm (597 Await-ready).
@@ -140,7 +145,7 @@ pub(crate) use rem::PartialRetryTable;
 pub(crate) use rem::WaveParkTable;
 #[allow(unused_imports)]
 pub(crate) use boundary::{
-    absolute_jump_eligible, absolute_jump_env_enabled, suffix_repair_jump_env_ok, arm_call_outcome_cache, arm_pc_resume, clear_pc_resume, in_inspect_run,
+    absolute_jump_eligible, absolute_jump_env_enabled, suffix_repair_jump_env_ok, arm_call_outcome_cache, arm_pc_resume, arm_ff_origin_seeds, take_ff_origin_seeds, clear_pc_resume, in_inspect_run,
     jump_is_safe, jump_refuse_reason, last_boundary_snap, attach_current_live_snap, note_pending_effect_boundary,
     arm_pending_effect_cp_only,
     resume_was_applied, steps_this_run, try_arm_safe_absolute_jump, try_arm_safe_absolute_jump_gated,

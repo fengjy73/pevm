@@ -2050,15 +2050,22 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
             }
         };
-        // Iter20: drop `!memory_lite_ok` (Bind-snap restores memory) but **do not arm**
-        // absolute jump — Storage-FF Bind jump hung 597 SF (90s timeout) even with
-        // Validated-safe origin seed. JUMP env remains dig-only; hang-free consume =
-        // credit path below. Re-enable arm only after Lean aj>0∧seq≡par + 597 no-hang.
+        // Iter21: env-gated Bind-snap abs jump for dig only (`SPECFENCE_BIND_SNAP_JUMP=1`).
+        // Default OFF. Do not arm under concurrency until Lean width=1 aj>0∧seq≡par
+        // and width≥2 hang-free proven. Hang-free consume without JUMP = credit path.
+        // Iter21: top-level/shallow Bind tips only (call_depth≤1). Deeper ERC-20
+        // SLOAD tips fail apply_to_interp depth match or restore wrong frame →
+        // seeded origins without PC skip → seq≠par (aj metric was also blind).
+        let bind_depth_ok = ff_cont.as_ref().is_some_and(|cont| {
+            cont.jump_snap.as_ref().is_some_and(|s| s.call_depth <= 1)
+        });
         let suffix_jump_would = bind_snap_jump_env
             && suffix_jump_eligible
-            && read_prefix_ok;
-        let mut suffix_jump = false;
-        let _ = (suffix_jump_eligible, suffix_jump_would);
+            && read_prefix_ok
+            && bind_depth_ok;
+        // Dig arm only when JUMP env set; production keeps aj=0 / SoftWait Soft=0.
+        let mut suffix_jump = suffix_jump_would;
+        let _ = suffix_jump_eligible;
         let live_prime = false;
         let _ = live_prime;
         let capture_window = false;
@@ -2073,10 +2080,12 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             && crate::specfence::research_inspect_enabled();
         let use_inspect = journal_stream || research_inspect;
 
-        // Iter20: Validated-safe origin seed for Bind-snap PC skip. Stale FF origins
-        // (writer reincarnated / Estimate) caused SoftWait/InconsistentRead livelock
-        // under concurrency — refuse jump rather than seed Estimate. research_inspect
-        // keeps classic seed. Lean journal-FF-only (no jump) still must NOT seed.
+        // Iter20/21: Validated-safe origin seed for Bind-snap PC skip. Stale FF
+        // origins (writer reincarnated / Estimate) caused SoftWait/InconsistentRead
+        // livelock under concurrency — refuse jump rather than seed Estimate.
+        // Iter21: also require matching MvMemory origins to be Validated (not only
+        // bumped ones) — unfinished Data Bind seed hung Lean/597 under JUMP.
+        // research_inspect keeps classic seed. Lean journal-FF-only must NOT seed.
         if rewind_resume && suffix_jump {
             let mut seeds: Vec<(MemoryLocationHash, ReadOrigin)> = Vec::new();
             let mut all_safe = true;
@@ -2091,10 +2100,17 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     .map(|(tx_idx, tx_incarnation)| (tx_idx, tx_incarnation));
                 let read_origin = if current == origin {
                     match origin {
-                        Some((tx_idx, tx_incarnation)) => ReadOrigin::MvMemory(TxVersion {
-                            tx_idx,
-                            tx_incarnation,
-                        }),
+                        Some((tx_idx, tx_incarnation)) => {
+                            // Iter21 hang fix: matching origin must be Validated.
+                            if !self.specfence.scheduler.is_validated(tx_idx) {
+                                all_safe = false;
+                                break;
+                            }
+                            ReadOrigin::MvMemory(TxVersion {
+                                tx_idx,
+                                tx_incarnation,
+                            })
+                        }
                         None => ReadOrigin::Storage,
                     }
                 } else if let Some((w_idx, w_inc)) = current {

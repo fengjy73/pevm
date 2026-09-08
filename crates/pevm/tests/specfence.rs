@@ -1670,6 +1670,484 @@ fn specfence_iter20_bind_snap_consume_production_off() {
     }
 }
 
+
+/// Iter21: production Bind jump stays hard-off (SNAP/JUMP unset). SoftWait Soft=0.
+#[test]
+fn specfence_iter21_bind_jump_production_off() {
+    unsafe {
+        std::env::remove_var("SPECFENCE_BIND_SNAP");
+        std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP");
+    }
+    let probe = Address::from(U160::from(84));
+    let mut code = Vec::new();
+    code.push(0x36);
+    code.push(0x15);
+    code.push(0x60);
+    code.push(0x0b);
+    code.push(0x57);
+    code.push(0x60);
+    code.push(0x01);
+    code.push(0x60);
+    code.push(0x00);
+    code.push(0x55);
+    code.push(0x00);
+    assert_eq!(code.len(), 11);
+    code.push(0x5b);
+    for _ in 0..6 {
+        code.push(0x60);
+        code.push(0x00);
+        code.push(0x54);
+        code.push(0x50);
+    }
+    code.push(0x00);
+    let bytecode = Bytecode::new_raw(Bytes::from(code));
+    let code_hash = bytecode.hash_slow();
+    let mut state = (0..=60_000).map(common::mock_account).collect::<ChainState>();
+    state.insert(
+        probe,
+        EvmAccount {
+            balance: U256::from(1),
+            nonce: 1,
+            code_hash: Some(code_hash),
+            code: Some(bytecode.clone().into()),
+            storage: Default::default(),
+        },
+    );
+    let mut bytecodes = Bytecodes::default();
+    bytecodes.insert(code_hash, bytecode.into());
+    let mut txs: Vec<TxEnv> = Vec::new();
+    for i in 0..16 {
+        txs.push(TxEnv {
+            caller: Address::from(U160::from(3_400 + i)),
+            nonce: 1,
+            kind: TransactTo::Call(probe),
+            gas_limit: 100_000,
+            gas_price: 1,
+            data: Bytes::from(vec![0x01]),
+            ..TxEnv::default()
+        });
+    }
+    for i in 0..16 {
+        txs.push(TxEnv {
+            caller: Address::from(U160::from(4_400 + i)),
+            nonce: 1,
+            kind: TransactTo::Call(probe),
+            gas_limit: 100_000,
+            gas_price: 1,
+            ..TxEnv::default()
+        });
+    }
+    for i in 0..32 {
+        txs.push(self_transfer(Address::from(U160::from(52_400 + i)), 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+    let width = NonZeroUsize::new(concurrency().get().min(4).max(2)).unwrap();
+    for _ in 0..8 {
+        let (_, m, _) = run_mode_conc(
+            ConcurrencyMode::SpecFence,
+            &storage,
+            txs.clone(),
+            width,
+        );
+        assert_eq!(m.absolute_jump_applied, 0, "production jump OFF: {m:?}");
+        assert_eq!(m.bind_snap_capture, 0, "production SNAP OFF: {m:?}");
+        assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
+        assert_eq!(m.handler_sstore_capture, 0, "stock SSTORE: {m:?}");
+    }
+}
+
+/// Iter21: Storage-FF Bind-snap jump dig — width=1 first (seq≡par + hang-free).
+/// Opt-in SNAP+JUMP; ignored by default (env leaks under parallel cargo test).
+/// Run: `cargo test -p pevm --test specfence iter21_bind_jump_width1 -- --ignored --test-threads=1`
+/// Tiny SLOAD×N reader vs SSTORE writers; bytecode ≤256 so jump_is_safe OK.
+#[ignore = "Iter21 dig: SNAP+JUMP env; run solo --ignored --test-threads=1"]
+#[test]
+fn specfence_iter21_bind_jump_width1_seq_eq_par() {
+    unsafe {
+        std::env::set_var("SPECFENCE_BIND_SNAP", "1");
+        std::env::set_var("SPECFENCE_BIND_SNAP_JUMP", "1");
+    }
+    let probe = Address::from(U160::from(82));
+    // CALLDATASIZE; ISZERO; PUSH1 read; JUMPI;
+    // write: PUSH1 1; PUSH1 0; SSTORE; STOP;
+    // read JUMPDEST: (PUSH1 0; SLOAD; POP)×8 ; STOP
+    let mut code = Vec::new();
+    code.push(0x36);
+    code.push(0x15);
+    code.push(0x60);
+    code.push(0x0b);
+    code.push(0x57);
+    code.push(0x60);
+    code.push(0x01);
+    code.push(0x60);
+    code.push(0x00);
+    code.push(0x55);
+    code.push(0x00);
+    assert_eq!(code.len(), 11);
+    code.push(0x5b);
+    for _ in 0..8 {
+        code.push(0x60);
+        code.push(0x00);
+        code.push(0x54);
+        code.push(0x50);
+    }
+    code.push(0x00);
+    assert!(code.len() <= 256, "tiny storage probe");
+    let bytecode = Bytecode::new_raw(Bytes::from(code));
+    let code_hash = bytecode.hash_slow();
+    let mut state = (0..=60_000).map(common::mock_account).collect::<ChainState>();
+    state.insert(
+        probe,
+        EvmAccount {
+            balance: U256::from(1),
+            nonce: 1,
+            code_hash: Some(code_hash),
+            code: Some(bytecode.clone().into()),
+            storage: Default::default(),
+        },
+    );
+    let mut bytecodes = Bytecodes::default();
+    bytecodes.insert(code_hash, bytecode.into());
+    let mut txs: Vec<TxEnv> = Vec::new();
+    // Readers before writers (abort opportunity when width>1; harmless at width=1).
+    for i in 0..16 {
+        txs.push(TxEnv {
+            caller: Address::from(U160::from(4_200 + i)),
+            nonce: 1,
+            kind: TransactTo::Call(probe),
+            gas_limit: 100_000,
+            gas_price: 1,
+            ..TxEnv::default()
+        });
+    }
+    for i in 0..16 {
+        txs.push(TxEnv {
+            caller: Address::from(U160::from(3_200 + i)),
+            nonce: 1,
+            kind: TransactTo::Call(probe),
+            gas_limit: 100_000,
+            gas_price: 1,
+            data: Bytes::from(vec![0x01]),
+            ..TxEnv::default()
+        });
+    }
+    for i in 0..32 {
+        txs.push(self_transfer(Address::from(U160::from(52_200 + i)), 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+    let width = NonZeroUsize::new(1).unwrap();
+    let mut saw_resume = false;
+    let mut saw_aj = false;
+    let mut last = None;
+    for _ in 0..24 {
+        let (_, m, _) = run_mode_conc(
+            ConcurrencyMode::SpecFence,
+            &storage,
+            txs.clone(),
+            width,
+        );
+        last = Some(m.clone());
+        assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
+        if m.resume_count > 0 {
+            saw_resume = true;
+        }
+        if m.absolute_jump_applied > 0 {
+            saw_aj = true;
+            assert!(m.bind_snap_capture > 0 || m.prefix_opcodes_skipped > 0, "{m:?}");
+            break;
+        }
+    }
+    unsafe {
+        std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP");
+        std::env::remove_var("SPECFENCE_BIND_SNAP");
+    }
+    // Width=1: must be hang-free + seq≡par (asserted by run_mode_conc).
+    let m = last.expect("expected at least one run");
+    eprintln!(
+        "iter21 width1 dig: resume={} aj={} bsnap={} bcredit={} soft={} last={m:?}",
+        saw_resume, saw_aj, m.bind_snap_capture, m.bind_snap_credit, m.soft_wait_arms
+    );
+    assert!(saw_resume || m.resume_count == 0, "unexpected: {m:?}");
+    // Prefer aj>0; if Validated gate refuses all tips, credit path still hang-free.
+    if !saw_aj {
+        eprintln!("iter21 width1: aj=0 (Validated gate or no Storage-FF tip) — hang-free seq≡par OK");
+    }
+}
+
+/// Iter21: Storage-FF Bind jump under concurrency — hang repro / hang-free check.
+/// Ignored by default (hang risk). Run with `--ignored` + SNAP+JUMP to dig.
+#[ignore = "Iter21 dig: Bind abs jump under concurrency; hang risk until width≥2 proven"]
+#[test]
+fn specfence_iter21_bind_jump_width2_hang_repro() {
+    unsafe {
+        std::env::set_var("SPECFENCE_BIND_SNAP", "1");
+        std::env::set_var("SPECFENCE_BIND_SNAP_JUMP", "1");
+    }
+    let probe = Address::from(U160::from(83));
+    let mut code = Vec::new();
+    code.push(0x36);
+    code.push(0x15);
+    code.push(0x60);
+    code.push(0x0b);
+    code.push(0x57);
+    code.push(0x60);
+    code.push(0x01);
+    code.push(0x60);
+    code.push(0x00);
+    code.push(0x55);
+    code.push(0x00);
+    assert_eq!(code.len(), 11);
+    code.push(0x5b);
+    for _ in 0..8 {
+        code.push(0x60);
+        code.push(0x00);
+        code.push(0x54);
+        code.push(0x50);
+    }
+    code.push(0x00);
+    let bytecode = Bytecode::new_raw(Bytes::from(code));
+    let code_hash = bytecode.hash_slow();
+    let mut state = (0..=60_000).map(common::mock_account).collect::<ChainState>();
+    state.insert(
+        probe,
+        EvmAccount {
+            balance: U256::from(1),
+            nonce: 1,
+            code_hash: Some(code_hash),
+            code: Some(bytecode.clone().into()),
+            storage: Default::default(),
+        },
+    );
+    let mut bytecodes = Bytecodes::default();
+    bytecodes.insert(code_hash, bytecode.into());
+    let mut txs: Vec<TxEnv> = Vec::new();
+    // Writers first (lower idx) — concurrent readers Bind against unfinished /
+    // published Data (bsnap path). pevm commit order: earlier write + later read.
+    for i in 0..24 {
+        txs.push(TxEnv {
+            caller: Address::from(U160::from(3_300 + i)),
+            nonce: 1,
+            kind: TransactTo::Call(probe),
+            gas_limit: 100_000,
+            gas_price: 1,
+            data: Bytes::from(vec![0x01]),
+            ..TxEnv::default()
+        });
+    }
+    for i in 0..24 {
+        txs.push(TxEnv {
+            caller: Address::from(U160::from(4_300 + i)),
+            nonce: 1,
+            kind: TransactTo::Call(probe),
+            gas_limit: 100_000,
+            gas_price: 1,
+            ..TxEnv::default()
+        });
+    }
+    for i in 0..48 {
+        txs.push(self_transfer(Address::from(U160::from(52_300 + i)), 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+    let width = NonZeroUsize::new(concurrency().get().min(4).max(2)).unwrap();
+    // Soft timeout via thread — if join exceeds 20s, treat as hang.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = thread::spawn(move || {
+        let mut best = None;
+        let mut saw_aj = false;
+        for _ in 0..16 {
+            let (_, m, _) = run_mode_conc(
+                ConcurrencyMode::SpecFence,
+                &storage,
+                txs.clone(),
+                width,
+            );
+            assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
+            if m.absolute_jump_applied > 0 {
+                saw_aj = true;
+                best = Some(m);
+                break;
+            }
+            best = Some(m);
+        }
+        let _ = tx.send((best, saw_aj));
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+        Ok((last, saw_aj)) => {
+            let _ = handle.join();
+            unsafe {
+                std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP");
+                std::env::remove_var("SPECFENCE_BIND_SNAP");
+            }
+            let m = last.expect("metrics");
+            eprintln!(
+                "iter21 width2 dig: aj_saw={} aj={} bsnap={} bcredit={} resume={} rewind={} soft={} fb_re={} abort={} vfail={} full_retry={} fr={} lean={}",
+                saw_aj,
+                m.absolute_jump_applied,
+                m.bind_snap_capture,
+                m.bind_snap_credit,
+                m.resume_count,
+                m.rewind_to_cp,
+                m.soft_wait_arms,
+                m.force_bind_reabort,
+                m.occ_aborts,
+                m.region_validate_fail,
+                m.tx_full_retry,
+                m.full_restart,
+                m.lean_mode_txs,
+            );
+            // Hang-free under concurrency — keep JUMP OFF in production until aj>0
+            // is also proven useful on 597 without wall tax.
+            let _ = m;
+        }
+        Err(_) => {
+            unsafe {
+                std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP");
+                std::env::remove_var("SPECFENCE_BIND_SNAP");
+            }
+            panic!("Iter21 Bind jump hung under concurrency (width≥2, 20s) — keep JUMP OFF");
+        }
+    }
+}
+
+/// Iter21: ERC-20 + SNAP+JUMP dig — documents Bind jump seq≠par (or hang).
+/// Ignored. Run solo: `--ignored --test-threads=1`.
+/// Expected falsification: aj>0 ⇒ committed state ≠ sequential (restore wrong
+/// under pevm MV). Keep production JUMP OFF.
+#[ignore = "Iter21 dig: ERC-20 Bind jump seq≠par/hang falsification; run solo"]
+#[test]
+fn specfence_iter21_erc20_bind_jump_hang_repro() {
+    unsafe {
+        std::env::set_var("SPECFENCE_BIND_SNAP", "1");
+        std::env::set_var("SPECFENCE_BIND_SNAP_JUMP", "1");
+    }
+    let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 12, 6);
+    state.insert(Address::ZERO, EvmAccount::default());
+    for i in 0..64 {
+        let (addr, account) = common::mock_account(90_000 + i);
+        state.insert(addr, account);
+        txs.push(self_transfer(addr, 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+    let width = NonZeroUsize::new(concurrency().get().min(4).max(2)).unwrap();
+    let chain = PevmEthereum::mainnet();
+    let mut saw_aj = false;
+    let mut saw_seq_ne = false;
+    let mut last_m = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        let sequential = execute_revm_sequential(
+            &chain,
+            &storage,
+            Default::default(),
+            BlockEnv::default(),
+            txs.clone(),
+        )
+        .expect("sequential");
+        let mut pevm = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
+        let parallel = pevm.execute_revm_parallel(
+            &chain,
+            &storage,
+            Default::default(),
+            BlockEnv::default(),
+            txs.clone(),
+            width,
+        );
+        let m = pevm.last_specfence_metrics().clone();
+        assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
+        if m.absolute_jump_applied > 0 {
+            saw_aj = true;
+        }
+        match parallel {
+            Ok(par) if par == sequential => {
+                last_m = Some(m.clone());
+                if saw_aj {
+                    // Rare: aj>0 ∧ seq≡par — success path for a future iter.
+                    eprintln!(
+                        "iter21 erc20 dig SUCCESS aj>0∧seq≡par: aj={} bsnap={} resume={}",
+                        m.absolute_jump_applied, m.bind_snap_capture, m.resume_count
+                    );
+                    unsafe {
+                        std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP");
+                        std::env::remove_var("SPECFENCE_BIND_SNAP");
+                    }
+                    return;
+                }
+            }
+            Ok(_) => {
+                saw_seq_ne = true;
+                last_m = Some(m.clone());
+                eprintln!(
+                    "iter21 erc20 dig FALSIFIED seq≠par: aj={} bsnap={} skipped={} resume={}",
+                    m.absolute_jump_applied,
+                    m.bind_snap_capture,
+                    m.prefix_opcodes_skipped,
+                    m.resume_count,
+                );
+                break;
+            }
+            Err(e) => panic!("parallel err: {e:?}"),
+        }
+    }
+    unsafe {
+        std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP");
+        std::env::remove_var("SPECFENCE_BIND_SNAP");
+    }
+    let m = last_m.expect("expected at least one run");
+    assert!(
+        saw_seq_ne || saw_aj,
+        "expected Bind jump seq≠par falsification or aj>0: {m:?}"
+    );
+    // Documented: keep JUMP OFF until aj>0∧seq≡par.
+    assert!(
+        saw_seq_ne,
+        "Bind jump applied without seq≠par — recheck before enable: {m:?}"
+    );
+}
+
+/// Iter21: ERC-20 + SNAP=1 JUMP=0 — isolate capture seq≡par (no abs jump).
+#[ignore = "Iter21 dig: SNAP-only seq≡par isolate; run solo --ignored --test-threads=1"]
+#[test]
+fn specfence_iter21_erc20_bind_snap_only_seq_eq_par() {
+    unsafe {
+        std::env::set_var("SPECFENCE_BIND_SNAP", "1");
+        std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP");
+    }
+    let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 12, 6);
+    state.insert(Address::ZERO, EvmAccount::default());
+    for i in 0..64 {
+        let (addr, account) = common::mock_account(91_000 + i);
+        state.insert(addr, account);
+        txs.push(self_transfer(addr, 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+    let width = NonZeroUsize::new(concurrency().get().min(4).max(2)).unwrap();
+    let mut last = None;
+    for _ in 0..8 {
+        let (_, m, _) = run_mode_conc(
+            ConcurrencyMode::SpecFence,
+            &storage,
+            txs.clone(),
+            width,
+        );
+        last = Some(m.clone());
+        assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
+        assert_eq!(m.absolute_jump_applied, 0, "JUMP off: {m:?}");
+    }
+    unsafe {
+        std::env::remove_var("SPECFENCE_BIND_SNAP");
+    }
+    let m = last.expect("metrics");
+    eprintln!(
+        "iter21 erc20 snap-only: bsnap={} bcredit={} resume={} rewind={} abort={} aj={}",
+        m.bind_snap_capture,
+        m.bind_snap_credit,
+        m.resume_count,
+        m.rewind_to_cp,
+        m.occ_aborts,
+        m.absolute_jump_applied,
+    );
+}
+
 /// M1i-A: write-prefix absolute jump — SSTORE then BALANCE(hot).
 /// Post-SSTORE EffectBoundary snap + write_replays; seq≡par; absolute_jump_applied > 0.
 #[ignore = "R0: M1* inspect/jump research-only (SPECFENCE_ENABLE_INSPECT); hang risk on default path"]

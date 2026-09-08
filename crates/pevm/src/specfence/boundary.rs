@@ -600,6 +600,8 @@ thread_local! {
     /// Bind-snap ordinal this incarnation (opcode_steps proxy for jump credit).
     static BIND_SNAP_STEPS: Cell<u64> = const { Cell::new(0) };
     static PENDING_RESUME: RefCell<Option<BoundarySnapshot>> = const { RefCell::new(None) };
+    /// Iter21: FF read-origin seeds applied only after successful PC restore.
+    static PENDING_FF_ORIGIN_SEEDS: RefCell<Vec<(crate::MemoryLocationHash, crate::ReadOrigin)>> = const { RefCell::new(Vec::new()) };
     static PENDING_JOURNAL_BLOB: RefCell<Option<JournalBlob>> = const { RefCell::new(None) };
     /// Nested calls entered but not yet `call_end` (metadata for cache store).
     static PENDING_CALL_STACK: RefCell<Vec<PendingCallMeta>> = const { RefCell::new(Vec::new()) };
@@ -748,9 +750,22 @@ pub(crate) fn arm_pc_resume_with_blob(snap: BoundarySnapshot, blob: Option<Journ
     RESUME_APPLIED.set(false);
 }
 
+/// Iter21: stash FF read origins to install into Db read_set only after PC restore
+/// succeeds — seeding before a failed apply poisoned seq≠par (ERC-20 depth mismatch).
+pub(crate) fn arm_ff_origin_seeds(
+    seeds: Vec<(crate::MemoryLocationHash, crate::ReadOrigin)>,
+) {
+    PENDING_FF_ORIGIN_SEEDS.with(|c| *c.borrow_mut() = seeds);
+}
+
+pub(crate) fn take_ff_origin_seeds() -> Vec<(crate::MemoryLocationHash, crate::ReadOrigin)> {
+    PENDING_FF_ORIGIN_SEEDS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
 pub(crate) fn clear_pc_resume() {
     PENDING_RESUME.with(|c| *c.borrow_mut() = None);
     PENDING_JOURNAL_BLOB.with(|c| *c.borrow_mut() = None);
+    PENDING_FF_ORIGIN_SEEDS.with(|c| c.borrow_mut().clear());
     RESUME_CALL_CACHE.with(|c| c.borrow_mut().clear());
     RESUME_CALL_IDX.set(0);
     RESUME_APPLIED.set(false);
@@ -971,14 +986,29 @@ fn push_cp(kind: CheckpointKind, snap: Option<BoundarySnapshot>) {
 
 fn record_pc_resume(skipped: u64) {
     LAST_SKIPPED.set(skipped);
+    // Iter21: Bind-snap Lean jumps apply via Handler run_exec_loop without PLANT
+    // TLS — still record aj/pc_resume via BIND_SNAP metrics so digs aren't blind
+    // (aj=0 while jump applied → silent seq≠par).
+    let mut recorded = false;
     PLANT.with(|p| {
         if let Some(plant) = p.get() {
             let metrics = unsafe { &*plant.metrics };
             metrics.record_pc_resume(skipped);
             metrics.record_live_pc_resume();
             metrics.record_absolute_jump_applied();
+            recorded = true;
         }
     });
+    if !recorded {
+        BIND_SNAP.with(|b| {
+            if let Some(ctx) = b.get() {
+                let metrics = unsafe { &*ctx.metrics };
+                metrics.record_pc_resume(skipped);
+                metrics.record_live_pc_resume();
+                metrics.record_absolute_jump_applied();
+            }
+        });
+    }
 }
 
 fn record_journal_blob_ff(accounts: usize) {
@@ -1428,9 +1458,10 @@ pub(crate) fn note_pending_bind_snap() {
 }
 
 /// Env gate: `SPECFENCE_BIND_SNAP=1` enables hang-free Bind/SLOAD snap capture.
-/// Default **off** — capture-without-jump wall-taxes 597/599 (Iter19). Iter20:
-/// abs jump stays hard-OFF (Storage-FF Bind jump hung 597); credit consume is
-/// hang-free but not an opcode cut. `SPECFENCE_BIND_SNAP_JUMP` is dig-only.
+/// Default **off** — capture-without-jump wall-taxes 597/599 (Iter19). Iter20/21:
+/// abs jump dig-only via `SPECFENCE_BIND_SNAP_JUMP=1` (Validated-all origins +
+/// TLS clear); production OFF until width=1 aj∧seq≡par and width≥2 hang-free.
+/// Credit consume is hang-free but not an opcode cut.
 pub(crate) fn bind_snap_env_enabled() -> bool {
     match std::env::var_os("SPECFENCE_BIND_SNAP") {
         None => false,
@@ -1469,9 +1500,16 @@ pub(crate) fn with_bind_snap_tls<R>(
     }));
     PENDING_BIND_SNAP.set(false);
     BIND_SNAP_STEPS.set(0);
+    // Iter21: clear stale PENDING_RESUME / RESUME_APPLIED from a prior jumped
+    // incarnation on this worker — leftover applied flag skipped re-arm and
+    // contributed to SoftWait/InconsistentRead livelock under JUMP dig.
+    clear_pc_resume();
+    RESUME_APPLIED.set(false);
     let out = f();
     BIND_SNAP.set(prev);
     PENDING_BIND_SNAP.set(false);
+    clear_pc_resume();
+    RESUME_APPLIED.set(false);
     out
 }
 

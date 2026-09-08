@@ -192,3 +192,12 @@ Validated-safe origin seed. Basic-only tips refuse (`bytecode_no_storage_ff`).
 SoftWait Soft=0; production SNAP OFF (no default tax). 597 N5 ~15.1 under load.
 See `specfence-abc-iter20-status.md`. Iter 21 cause: minimal Storage-FF Bind jump
 hang repro (seq≡par) or non-jump opcode cut / 599-safe critical-path.
+
+### Iter 21 — Bind jump hang/seq≠par understood (JUMP OFF)
+Minimal Storage-FF Bind jump dig: ERC-20 SNAP+JUMP → **aj>0 ∧ seq≠par** (restore
+wrong under pevm MV); aj metric was PLANT-blind (fixed via BIND_SNAP). Validated-all
+origins + TLS clear + depth≤1 gate. SNAP-only seq≡par. Production JUMP/SNAP OFF.
+SoftWait Soft=0; 597 N5 quiet **13.4** / N10 **13.6**.
+See `specfence-abc-iter21-status.md`. Iter 22 cause: correct Bind-jump restore
+seq≡par on ERC-20, or non-jump opcode cut / 599-safe critical-path ≤12.3→<10.
+
