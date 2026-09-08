@@ -1589,6 +1589,10 @@ fn specfence_iter11_handler_multi_sstore_jump_seq_eq_par() {
 /// SLOAD reader/writer RAW conflicts; seq≡par; SoftWait Soft=0; aj=0; bsnap=0.
 #[test]
 fn specfence_iter20_bind_snap_consume_production_off() {
+    unsafe {
+        std::env::set_var("SPECFENCE_BIND_SNAP", "0");
+        std::env::set_var("SPECFENCE_BIND_SNAP_JUMP", "0");
+    }
     let probe = Address::from(U160::from(81));
     // CALLDATASIZE; ISZERO; PUSH1 read; JUMPI;
     // write: PUSH1 1; PUSH1 0; SSTORE; STOP;
@@ -1675,8 +1679,8 @@ fn specfence_iter20_bind_snap_consume_production_off() {
 #[test]
 fn specfence_iter21_bind_jump_production_off() {
     unsafe {
-        std::env::remove_var("SPECFENCE_BIND_SNAP");
-        std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP");
+        std::env::set_var("SPECFENCE_BIND_SNAP", "0");
+        std::env::set_var("SPECFENCE_BIND_SNAP_JUMP", "0");
     }
     let probe = Address::from(U160::from(84));
     let mut code = Vec::new();
@@ -2010,12 +2014,12 @@ fn specfence_iter21_bind_jump_width2_hang_repro() {
 }
 
 
-/// Iter22: production SNAP/JUMP OFF — SoftWait Soft=0; aj=0; bsnap=0; seq≡par.
+/// Iter22: forced SNAP/JUMP OFF — SoftWait Soft=0; aj=0; bsnap=0; seq≡par.
 #[test]
 fn specfence_iter22_bind_jump_production_off() {
     unsafe {
-        std::env::remove_var("SPECFENCE_BIND_SNAP");
-        std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP");
+        std::env::set_var("SPECFENCE_BIND_SNAP", "0");
+        std::env::set_var("SPECFENCE_BIND_SNAP_JUMP", "0");
     }
     let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 12, 6);
     state.insert(Address::ZERO, EvmAccount::default());
@@ -2116,12 +2120,12 @@ fn specfence_iter22_erc20_bind_jump_seq_eq_par_dig() {
     }
 }
 
-/// Iter23: production SNAP/JUMP OFF — SoftWait Soft=0; aj=0; bsnap=0; seq≡par.
+/// Iter23: forced SNAP/JUMP OFF — SoftWait Soft=0; aj=0; bsnap=0; seq≡par.
 #[test]
 fn specfence_iter23_bind_jump_production_off() {
     unsafe {
-        std::env::remove_var("SPECFENCE_BIND_SNAP");
-        std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP");
+        std::env::set_var("SPECFENCE_BIND_SNAP", "0");
+        std::env::set_var("SPECFENCE_BIND_SNAP_JUMP", "0");
     }
     let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 12, 6);
     state.insert(Address::ZERO, EvmAccount::default());
@@ -2133,6 +2137,10 @@ fn specfence_iter23_bind_jump_production_off() {
     let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
     let width = NonZeroUsize::new(concurrency().get().min(4).max(2)).unwrap();
     for _ in 0..4 {
+        unsafe {
+            std::env::set_var("SPECFENCE_BIND_SNAP", "0");
+            std::env::set_var("SPECFENCE_BIND_SNAP_JUMP", "0");
+        }
         let (_, m, _) = run_mode_conc(
             ConcurrencyMode::SpecFence,
             &storage,
@@ -3189,4 +3197,146 @@ fn specfence_r1_hot_multiwriter_hotset() {
         }
     }
     panic!("expected HotSet non-empty on multi-writer: last={last:?}");
+}
+
+
+/// Iter24: production ResumePath SNAP + JUMP — SoftWait Soft=0; seq≡par.
+/// Capture may fire on SuffixRepair resume only (bsnap can be >0); mass path OFF.
+#[test]
+fn specfence_iter24_bind_jump_resume_path_production() {
+    unsafe {
+        std::env::set_var("SPECFENCE_BIND_SNAP", "resume");
+        std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP"); // JUMP follows mode
+    }
+    let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 12, 6);
+    state.insert(Address::ZERO, EvmAccount::default());
+    for i in 0..64 {
+        let (addr, account) = common::mock_account(97_000 + i);
+        state.insert(addr, account);
+        txs.push(self_transfer(addr, 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+    let width = NonZeroUsize::new(concurrency().get().min(4).max(2)).unwrap();
+    let chain = PevmEthereum::mainnet();
+    for _ in 0..4 {
+        let sequential = execute_revm_sequential(
+            &chain,
+            &storage,
+            Default::default(),
+            BlockEnv::default(),
+            txs.clone(),
+        )
+        .expect("sequential");
+        let mut pevm = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
+        let parallel = pevm
+            .execute_revm_parallel(
+                &chain,
+                &storage,
+                Default::default(),
+                BlockEnv::default(),
+                txs.clone(),
+                width,
+            )
+            .expect("parallel");
+        let m = pevm.last_specfence_metrics().clone();
+        assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
+        assert_eq!(m.handler_sstore_capture, 0, "stock SSTORE: {m:?}");
+        assert_eq!(parallel, sequential, "ResumePath JUMP must stay seq≡par: {m:?}");
+    }
+}
+
+/// Iter24: SPECFENCE_BIND_SNAP=0 forces capture+jump off.
+#[test]
+fn specfence_iter24_bind_snap_force_off() {
+    unsafe {
+        std::env::set_var("SPECFENCE_BIND_SNAP", "0");
+        std::env::set_var("SPECFENCE_BIND_SNAP_JUMP", "0");
+    }
+    let (mut state, bytecodes, mut txs) = erc20::generate_cluster(2, 8, 4);
+    state.insert(Address::ZERO, EvmAccount::default());
+    for i in 0..32 {
+        let (addr, account) = common::mock_account(97_500 + i);
+        state.insert(addr, account);
+        txs.push(self_transfer(addr, 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+    let width = NonZeroUsize::new(concurrency().get().min(4).max(2)).unwrap();
+    let (_, m, _) = run_mode_conc(
+        ConcurrencyMode::SpecFence,
+        &storage,
+        txs,
+        width,
+    );
+    assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
+    assert_eq!(m.absolute_jump_applied, 0, "force-off JUMP: {m:?}");
+    assert_eq!(m.bind_snap_capture, 0, "force-off SNAP: {m:?}");
+    unsafe {
+        std::env::remove_var("SPECFENCE_BIND_SNAP");
+        std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP");
+    }
+}
+
+/// Iter24 dig: Mass SNAP+JUMP still aj>0∧fail=0 (refuse-if-stale). Ignored.
+#[ignore = "Iter24 dig: Mass SNAP+JUMP refuse-if-stale; run solo --ignored --test-threads=1"]
+#[test]
+fn specfence_iter24_erc20_mass_bind_jump_dig() {
+    unsafe {
+        std::env::set_var("SPECFENCE_BIND_SNAP", "1");
+        std::env::set_var("SPECFENCE_BIND_SNAP_JUMP", "1");
+    }
+    let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 12, 6);
+    state.insert(Address::ZERO, EvmAccount::default());
+    for i in 0..64 {
+        let (addr, account) = common::mock_account(98_000 + i);
+        state.insert(addr, account);
+        txs.push(self_transfer(addr, 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+    let width = NonZeroUsize::new(concurrency().get().min(4).max(2)).unwrap();
+    let chain = PevmEthereum::mainnet();
+    let mut success = 0usize;
+    let mut fail = 0usize;
+    let mut aj_runs = 0usize;
+    for run in 0..16 {
+        let sequential = execute_revm_sequential(
+            &chain,
+            &storage,
+            Default::default(),
+            BlockEnv::default(),
+            txs.clone(),
+        )
+        .expect("sequential");
+        let mut pevm = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
+        let parallel = pevm
+            .execute_revm_parallel(
+                &chain,
+                &storage,
+                Default::default(),
+                BlockEnv::default(),
+                txs.clone(),
+                width,
+            )
+            .expect("parallel");
+        let m = pevm.last_specfence_metrics().clone();
+        assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
+        if m.absolute_jump_applied > 0 {
+            aj_runs += 1;
+            if parallel == sequential {
+                success += 1;
+            } else {
+                fail += 1;
+                eprintln!("iter24 mass dig FAIL seq≠par run={run} aj={} bsnap={}", m.absolute_jump_applied, m.bind_snap_capture);
+            }
+        } else if parallel != sequential {
+            fail += 1;
+            eprintln!("iter24 mass dig seq≠par without aj run={run}");
+        }
+    }
+    unsafe {
+        std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP");
+        std::env::remove_var("SPECFENCE_BIND_SNAP");
+    }
+    eprintln!("iter24 mass dig: aj_runs={aj_runs} success={success} fail={fail}");
+    assert_eq!(fail, 0, "Mass SNAP+JUMP must stay fail=0");
+    assert!(aj_runs > 0, "expected some aj>0 under Mass dig");
 }

@@ -1621,39 +1621,96 @@ pub(crate) fn note_pending_bind_snap() {
     }
 }
 
-/// Env gate: `SPECFENCE_BIND_SNAP=1` enables hang-free Bind/SLOAD snap capture.
-/// Default **off** — capture-without-jump wall-taxes 597/599 (Iter19). Iter20–22:
-/// abs jump dig-only via `SPECFENCE_BIND_SNAP_JUMP=1` (Validated-all origins +
-/// deferred origin seed + FF journal warm); production OFF until ERC-20
-/// aj>0∧seq≡par stable and 597 no-hang. Credit consume hang-free but not opcode cut.
-pub(crate) fn bind_snap_env_enabled() -> bool {
+/// Iter24 Bind-snap capture mode.
+/// - `Off`: no Handler wrap / no TLS (SPECFENCE_BIND_SNAP=0).
+/// - `ResumePath` (`SPECFENCE_BIND_SNAP=resume`): capture only on SuffixRepair resume /
+///   force_bind / needs_live_capture — **no mass-path SNAP tax**.
+/// - `Mass`: every Lean SpecFence execute (`SPECFENCE_BIND_SNAP=1` dig).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BindSnapMode {
+    Off,
+    ResumePath,
+    Mass,
+}
+
+/// Resolve Bind-snap mode from `SPECFENCE_BIND_SNAP`.
+/// Iter24: default Off (Lean fixtures hang if JUMP default-on). Production
+/// enable: `SPECFENCE_BIND_SNAP=resume` (no every-Handler tax).
+pub(crate) fn bind_snap_mode() -> BindSnapMode {
     match std::env::var_os("SPECFENCE_BIND_SNAP") {
-        None => false,
+        None => BindSnapMode::Off,
         Some(v) => {
             let s = v.to_string_lossy();
-            s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
+            if s == "0"
+                || s.eq_ignore_ascii_case("false")
+                || s.eq_ignore_ascii_case("off")
+                || s.eq_ignore_ascii_case("no")
+            {
+                BindSnapMode::Off
+            } else if s == "1"
+                || s.eq_ignore_ascii_case("true")
+                || s.eq_ignore_ascii_case("yes")
+                || s.eq_ignore_ascii_case("mass")
+            {
+                BindSnapMode::Mass
+            } else if s.eq_ignore_ascii_case("resume") {
+                BindSnapMode::ResumePath
+            } else {
+                BindSnapMode::Off
+            }
         }
     }
 }
 
-/// Install SLOAD Bind-snap wrap when Iter19 capture may run (default on).
+/// Env gate (compat): true only for **Mass** dig (`SPECFENCE_BIND_SNAP=1`).
+pub(crate) fn bind_snap_env_enabled() -> bool {
+    bind_snap_mode() == BindSnapMode::Mass
+}
+
+/// True when any Bind-snap capture path may run (ResumePath or Mass).
+pub(crate) fn bind_snap_capture_wanted() -> bool {
+    !matches!(bind_snap_mode(), BindSnapMode::Off)
+}
+
+/// Iter24: absolute Bind jump enabled when capture mode is on, unless
+/// `SPECFENCE_BIND_SNAP_JUMP=0`. Explicit `=1` forces on (dig). Refuse-if-stale
+/// still gates arming. SoftWait Soft stays ~0.
+pub(crate) fn bind_snap_jump_enabled() -> bool {
+    match std::env::var_os("SPECFENCE_BIND_SNAP_JUMP") {
+        Some(v) => {
+            let s = v.to_string_lossy();
+            if s == "0"
+                || s.eq_ignore_ascii_case("false")
+                || s.eq_ignore_ascii_case("off")
+                || s.eq_ignore_ascii_case("no")
+            {
+                false
+            } else {
+                s == "1"
+                    || s.eq_ignore_ascii_case("true")
+                    || s.eq_ignore_ascii_case("yes")
+            }
+        }
+        None => bind_snap_capture_wanted(),
+    }
+}
+
+/// Install SLOAD Bind-snap wrap when ResumePath/Mass/inspect may capture.
 pub(crate) fn handler_bind_snap_install_wanted() -> bool {
     if crate::specfence::research_inspect_enabled() {
         return true;
     }
-    bind_snap_env_enabled()
+    bind_snap_capture_wanted()
 }
 
 /// Scoped Bind-snap TLS for Lean SpecFence execute (no IN_INSPECT / no WaitHard demote).
+/// Caller selects when to invoke (Mass = every Lean run; ResumePath = repair only).
 pub(crate) fn with_bind_snap_tls<R>(
     tx_idx: TxIdx,
     partial_retry: &PartialRetryTable,
     metrics: &MetricsInner,
     mut f: impl FnMut() -> R,
 ) -> R {
-    if !bind_snap_env_enabled() {
-        return f();
-    }
     let prev = BIND_SNAP.replace(Some(PlantTls {
         tx_idx,
         incarnation: 0,

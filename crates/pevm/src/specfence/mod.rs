@@ -79,8 +79,13 @@
 //! Iter23: diff-first Bind-jump vs cold SuffixRepair — tip_sloads log; refuse
 //! jump when Bind SLOAD ≠ FF (stale consumed into require/SUB → ERC-20 revert
 //! dgas=+661); journal warm prefer_tx=min. Non-jump: high-fan (≥32) first-repair
-//! pre-yield skip-park (cut park_ms). JUMP/SNAP OFF until aj>0∧fail=0 + 597
-//! no-hang. SoftWait Soft ~0. Keep Iter16–17 absorb/yield 64/32.
+//! pre-yield skip-park (cut park_ms). Dig aj>0∧fail=0 + 597 SNAP+JUMP no-hang;
+//! production stayed OFF (mass SNAP tax). SoftWait Soft ~0. Keep Iter16–17.
+//! Iter24: cautious Bind-jump enable — `SPECFENCE_BIND_SNAP=resume` ResumePath
+//! SNAP (capture only on SuffixRepair resume / force_bind / needs_live_capture;
+//! not every Handler run) + JUMP follows with refuse-if-stale. Default Off (Lean
+//! hang if JUMP silent-default). Mass=`=1`. SoftWait Soft ~0. Wall-prove no
+//! mass-path tax; aj>0 on 599. Keep Iter16–17/23.
 //! Iter8 memory snap retained. Head-FF (Iter5). SoftWait Soft ~0.
 //!
 //! **Learn (C):** Inter morph selects Quiet (598 OCC-lite) vs Storm (597 Await-ready).
@@ -161,6 +166,7 @@ pub(crate) use boundary::{
     with_plant_tls, with_plant_tls_journal, BoundarySnapshot, CachedCallOutcome, JournalBlob,
     plant_tls_active, pending_resume_armed, try_apply_pending_pc_resume, handler_sstore_plant_install_wanted, install_handler_sstore_plant_capture,
     handler_bind_snap_install_wanted, install_handler_bind_snap_capture, with_bind_snap_tls, note_pending_bind_snap, bind_snap_env_enabled,
+    bind_snap_mode, bind_snap_capture_wanted, bind_snap_jump_enabled, BindSnapMode,
 };
 pub use boundary::SpecFenceInspector;
 #[allow(unused_imports)]

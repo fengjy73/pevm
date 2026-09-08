@@ -1510,6 +1510,7 @@ fn try_validate(
                     // park; if writer already done, skip park (cut park_ms on 597
                     // without SoftWait Soft / BO). Fan≥32 targets storm fan-out;
                     // 599 mixed fans stay classic park. SoftWait Soft=0.
+                    // Iter24: fan≥16 deepen falsified (599 wall/p90↑) — keep ≥32/64.
                     if fan >= 32 {
                         for _ in 0..64 {
                             if !scheduler.is_executing(w) {

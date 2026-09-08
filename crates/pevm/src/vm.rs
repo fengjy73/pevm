@@ -25,6 +25,7 @@ use crate::{
         jump_is_safe, jump_refuse_reason, resume_was_applied, steps_this_run,
         suffix_repair_jump_env_ok, try_arm_safe_absolute_jump, try_arm_safe_absolute_jump_gated,
         with_plant_tls_journal, with_bind_snap_tls, note_pending_bind_snap,
+        bind_snap_mode, bind_snap_jump_enabled, BindSnapMode,
     },
 };
 
@@ -2044,16 +2045,10 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         // seed (refuse jump if any certified origin is Estimate/unstable); credit
         // fallback when jump not armed. Production JUMP/SNAP stay OFF (no default tax).
         // SoftWait Soft=0. Stock SSTORE. No mega-fan yield.
-        let bind_snap_jump_env = match std::env::var_os("SPECFENCE_BIND_SNAP_JUMP") {
-            None => false,
-            Some(v) => {
-                let s = v.to_string_lossy();
-                s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
-            }
-        };
-        // Iter21: env-gated Bind-snap abs jump for dig only (`SPECFENCE_BIND_SNAP_JUMP=1`).
-        // Default OFF. Do not arm under concurrency until Lean width=1 aj>0∧seq≡par
-        // and width≥2 hang-free proven. Hang-free consume without JUMP = credit path.
+        // Iter24: JUMP follows BindSnapMode (ResumePath/Mass default-on) unless
+        // SPECFENCE_BIND_SNAP_JUMP=0. Mass SNAP still opt-in (`SPECFENCE_BIND_SNAP=1`).
+        // Refuse-if-stale + Validated-prefix gates remain. SoftWait Soft=0.
+        let bind_snap_jump_env = bind_snap_jump_enabled();
         // Iter21: top-level/shallow Bind tips only (call_depth≤1). Deeper ERC-20
         // SLOAD tips fail apply_to_interp depth match or restore wrong frame →
         // seeded origins without PC skip → seq≠par (aj metric was also blind).
@@ -2113,7 +2108,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         let live_prime = false;
         let _ = live_prime;
         let capture_window = false;
-        let _ = (needs_capture, rewind_resume, memory_lite_ok);
+        let _ = memory_lite_ok; // Iter8 path retained; Bind-snap uses read_prefix_ok
 
         let journal_stream = self
             .specfence
@@ -2281,9 +2276,24 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         // demote / SSTORE plant). Plant TLS only for research inspect / capture_window.
         let plant_handler = self.specfence.mode == crate::ConcurrencyMode::SpecFence
             && (use_inspect || capture_window);
-        // Iter19: hang-free Bind-snap TLS on every Lean SpecFence execute so
-        // discovery incarnations plant k < k_fail tips for the next SuffixRepair.
-        let use_bind_snap = self.specfence.mode == crate::ConcurrencyMode::SpecFence && lean;
+        // Iter24: Bind-snap TLS — Mass (=1 dig) on every Lean execute; ResumePath
+        // (production default) only on SuffixRepair resume / force_bind /
+        // needs_live_capture — no mass-path SNAP tax on every Handler run.
+        let snap_mode = bind_snap_mode();
+        let repair_capture = rewind_resume
+            || needs_capture
+            || (tx_version.tx_incarnation > 0
+                && self
+                    .specfence
+                    .partial_retry
+                    .has_force_bind(tx_version.tx_idx));
+        let use_bind_snap = self.specfence.mode == crate::ConcurrencyMode::SpecFence
+            && lean
+            && match snap_mode {
+                BindSnapMode::Off => false,
+                BindSnapMode::Mass => true,
+                BindSnapMode::ResumePath => repair_capture,
+            };
         let run_result = if plant_handler {
             let partial_retry = self.specfence.partial_retry;
             let metrics = self.specfence.metrics;

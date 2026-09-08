@@ -218,3 +218,14 @@ Non-jump: high-fan (≥32) first-repair pre-yield skip-park. SoftWait Soft=0.
 cautious enable Bind jump under concurrency (wall proof) or deepen 599-safe
 schedule ≤12.3→<10.
 
+### Iter 24 — ResumePath Bind-jump enable (no mass SNAP tax)
+Cautious production enable via `SPECFENCE_BIND_SNAP=resume` (default Off — Lean
+fixtures hang if JUMP silent-default). Capture only on SuffixRepair resume /
+force_bind / needs_live_capture (not every Handler run). JUMP follows resume/mass
+with refuse-if-stale. Mass SNAP still `=1`. Wall proof: resume 597 N5 **13.0** ≈
+Off / no mass tax; SoftWait Soft=0; 599 N10 **aj=1**. fra≥16 deepen **falsified**.
+Stretch <10 unmet. See `specfence-abc-iter24-status.md`. Iter 25 cause: opcode
+cut that arms aj on 597 discovery without mass SNAP, or new 599-safe schedule
+≤12.3→<10 (not fra≥16 / yield deepen / SoftWait Soft / BO park); or hang-free
+silent-default ResumePath.
+

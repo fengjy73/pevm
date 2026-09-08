@@ -133,7 +133,8 @@ impl PevmChain for PevmEthereum {
             .with_block(block_env)
             .with_db(db)
             .build_mainnet_with_inspector(SpecFenceInspector::new());
-        // Iter19: hang-free SLOAD Bind-snap (certified-prefix end) — default on.
+        // Iter24: hang-free SLOAD Bind-snap wrap when ResumePath/Mass/inspect.
+        // ResumePath default — TLS only on SuffixRepair resume (no mass SNAP tax).
         // Distinct from SSTORE plant; stock SSTORE unless capture/jump/inspect arms.
         if handler_bind_snap_install_wanted() {
             install_handler_bind_snap_capture(&mut evm.instruction);
