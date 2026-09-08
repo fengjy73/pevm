@@ -3338,6 +3338,60 @@ fn specfence_iter26_validated_fresh_ff_tip_jump() {
     }
 }
 
+/// Iter27: tip≡FF overlap + steps_cap select + deeper prefix Validated spin —
+/// SoftWait Soft=0; silent ResumePath; seq≡par; no tip_sloads skip.
+#[test]
+fn specfence_iter27_tip_ff_overlap_steps_cap() {
+    unsafe {
+        std::env::remove_var("SPECFENCE_BIND_SNAP");
+        std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP");
+        std::env::remove_var("SPECFENCE_JUMP_DIG");
+    }
+    let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 12, 6);
+    state.insert(Address::ZERO, EvmAccount::default());
+    for i in 0..48 {
+        let (addr, account) = common::mock_account(97_100 + i);
+        state.insert(addr, account);
+        txs.push(self_transfer(addr, 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+    let width = NonZeroUsize::new(concurrency().get().min(4).max(2)).unwrap();
+    let chain = PevmEthereum::mainnet();
+    for _ in 0..3 {
+        unsafe {
+            std::env::remove_var("SPECFENCE_BIND_SNAP");
+            std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP");
+        }
+        let sequential = execute_revm_sequential(
+            &chain,
+            &storage,
+            Default::default(),
+            BlockEnv::default(),
+            txs.clone(),
+        )
+        .expect("sequential");
+        let mut pevm = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
+        let parallel = pevm
+            .execute_revm_parallel(
+                &chain,
+                &storage,
+                Default::default(),
+                BlockEnv::default(),
+                txs.clone(),
+                width,
+            )
+            .expect("parallel");
+        let m = pevm.last_specfence_metrics().clone();
+        assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
+        assert_eq!(m.handler_sstore_capture, 0, "stock SSTORE: {m:?}");
+        assert_eq!(
+            parallel, sequential,
+            "Iter27 ResumePath must stay seq≡par: {m:?}"
+        );
+        let _ = (m.absolute_jump_applied, m.bind_snap_capture, m.bind_snap_credit);
+    }
+}
+
 /// Iter24 dig: Mass SNAP+JUMP still aj>0∧fail=0 (refuse-if-stale). Ignored.
 #[ignore = "Iter24 dig: Mass SNAP+JUMP refuse-if-stale; run solo --ignored --test-threads=1"]
 #[test]

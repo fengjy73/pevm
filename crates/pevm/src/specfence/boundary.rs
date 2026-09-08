@@ -256,6 +256,19 @@ pub(crate) fn jump_is_safe(cont: &ResumeContinuation) -> bool {
     let has_basic = cont.values.values().any(|v| {
         matches!(v, crate::specfence::rem::FfValue::Basic { .. })
     });
+    // Iter27: Bind tip with ≥1 tip_sload overlapping FF Storage counts as
+    // storage-FF for large-bytecode gate (same Validated-fresh identity).
+    let tip_sload_ff = snap.tip_sloads.iter().any(|(addr, slot, snap_val)| {
+        cont.values.values().any(|v| match v {
+            crate::specfence::rem::FfValue::Storage {
+                address,
+                slot: ss,
+                value,
+                ..
+            } if address == addr && ss == slot => value == snap_val,
+            _ => false,
+        })
+    });
     let has_write_effects = cont.effects.iter().any(|e| e.mode == AccessMode::Write);
     // Tiny Basic-only (M1f) always OK. Larger bytecode only when Storage FF,
     // write_replays, and/or CALL-boundary make post-jump ≡ sequential under pevm MV.
@@ -266,7 +279,7 @@ pub(crate) fn jump_is_safe(cont: &ResumeContinuation) -> bool {
         if snap.bytecode_len > MAX_STORAGE {
             return false;
         }
-        if !has_storage && !snap.at_call_boundary && cont.write_replays.is_empty() {
+        if !has_storage && !tip_sload_ff && !snap.at_call_boundary && cont.write_replays.is_empty() {
             return false;
         }
     }
@@ -276,7 +289,11 @@ pub(crate) fn jump_is_safe(cont: &ResumeContinuation) -> bool {
     // M1j: multi-SSTORE+LOG prefixes can exceed 128 steps; allow up to 512 when
     // write_replays and/or call_outcomes certify a controlled jump.
     // Iter2: Storage/write_replay prefixes on 597 often need >512 prefix steps.
-    let max_steps = if !cont.write_replays.is_empty() || !cont.call_outcomes.is_empty() || has_storage {
+    let max_steps = if !cont.write_replays.is_empty()
+        || !cont.call_outcomes.is_empty()
+        || has_storage
+        || tip_sload_ff
+    {
         2048u64
     } else {
         128u64
@@ -433,6 +450,17 @@ pub(crate) fn jump_refuse_reason(cont: &ResumeContinuation) -> &'static str {
     let has_basic = cont.values.values().any(|v| {
         matches!(v, crate::specfence::rem::FfValue::Basic { .. })
     });
+    let tip_sload_ff = snap.tip_sloads.iter().any(|(addr, slot, snap_val)| {
+        cont.values.values().any(|v| match v {
+            crate::specfence::rem::FfValue::Storage {
+                address,
+                slot: ss,
+                value,
+                ..
+            } if address == addr && ss == slot => value == snap_val,
+            _ => false,
+        })
+    });
     let has_write_effects = cont.effects.iter().any(|e| e.mode == AccessMode::Write);
     const MAX_TINY: usize = 256;
     const MAX_STORAGE: usize = 24_576;
@@ -440,14 +468,18 @@ pub(crate) fn jump_refuse_reason(cont: &ResumeContinuation) -> &'static str {
         if snap.bytecode_len > MAX_STORAGE {
             return "bytecode_huge";
         }
-        if !has_storage && !snap.at_call_boundary && cont.write_replays.is_empty() {
+        if !has_storage && !tip_sload_ff && !snap.at_call_boundary && cont.write_replays.is_empty() {
             return "bytecode_no_storage_ff";
         }
     }
     if cont.cp.k == 0 && cont.effects.is_empty() && snap.opcode_steps == 0 {
         return "empty_cp0";
     }
-    let max_steps = if !cont.write_replays.is_empty() || !cont.call_outcomes.is_empty() || has_storage {
+    let max_steps = if !cont.write_replays.is_empty()
+        || !cont.call_outcomes.is_empty()
+        || has_storage
+        || tip_sload_ff
+    {
         2048u64
     } else {
         128u64
@@ -865,11 +897,15 @@ pub(crate) fn try_arm_safe_absolute_jump_gated(
         return false;
     }
     let snap = cont.jump_snap.clone().expect("jump_is_safe implies jump_snap");
-    // Iter23: when Bind tip_sloads is present, require exact FF match — stale
-    // SLOAD values are often already consumed into require/SUB (ERC-20 revert
-    // dgas=+661); patching tops is insufficient → refuse, cold SuffixRepair.
+    // Iter23: when Bind tip_sloads is present, require FF match on overlapping
+    // slots — stale SLOAD values already consumed into require/SUB (ERC-20
+    // revert dgas=+661); patching tops is insufficient → refuse.
+    // Iter27: cumulative Bind SLOAD log includes slots absent from certified
+    // FF values — missing FF entry is OK; conflict (FF≠tip) still refuses;
+    // require ≥1 overlapping match so tip still has Validated-fresh identity.
     // Empty tip_sloads: allow legacy M1f/Inspector snaps (no Bind identity).
     if snap.sstore_index == 0 && !snap.post_sstore && !snap.tip_sloads.is_empty() {
+        let mut any_match = false;
         for (addr, slot, snap_val) in &snap.tip_sloads {
             let ff = cont.values.values().find_map(|v| match v {
                 crate::specfence::rem::FfValue::Storage {
@@ -881,12 +917,17 @@ pub(crate) fn try_arm_safe_absolute_jump_gated(
                 _ => None,
             });
             match ff {
-                Some(v) if v == *snap_val => {}
-                _ => {
+                Some(v) if v == *snap_val => any_match = true,
+                Some(_) => {
                     metrics.record_absolute_jump_fallback();
                     return false;
                 }
+                None => {}
             }
+        }
+        if !any_match {
+            metrics.record_absolute_jump_fallback();
+            return false;
         }
     }
     // Never restore storage present_values (poison pevm Db / MV).
@@ -1490,17 +1531,26 @@ pub(crate) fn try_apply_pending_pc_resume<CTX>(
         return;
     };
     if snap.call_depth != call_depth && !(snap.call_depth <= 1 && call_depth <= 1) {
+        if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
+            eprintln!("JUMP_DIG apply_refuse depth snap={} frame={}", snap.call_depth, call_depth);
+        }
         clear_pc_resume();
         return;
     }
     if let Some(expected) = snap.code_hash {
         let actual = interp.bytecode.get_or_calculate_hash();
         if actual != expected {
+            if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
+                eprintln!("JUMP_DIG apply_refuse code_hash snap_pc={} blen={}", snap.pc, snap.bytecode_len);
+            }
             clear_pc_resume();
             return;
         }
     }
     if snap.bytecode_len > 0 && snap.pc >= snap.bytecode_len {
+        if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
+            eprintln!("JUMP_DIG apply_refuse pc_oob");
+        }
         clear_pc_resume();
         return;
     }
@@ -1508,6 +1558,9 @@ pub(crate) fn try_apply_pending_pc_resume<CTX>(
     // would apply a tip onto the wrong frame (nested CALL) — refuse.
     let jdepth = context.journal().depth();
     if snap.sstore_index == 0 && !snap.post_sstore && jdepth > 1 {
+        if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
+            eprintln!("JUMP_DIG apply_refuse jdepth={jdepth}");
+        }
         clear_pc_resume();
         return;
     }
@@ -1609,6 +1662,9 @@ pub(crate) fn try_apply_pending_pc_resume<CTX>(
     RESUME_APPLIED.set(true);
     PENDING_RESUME.with(|c| *c.borrow_mut() = None);
     OPCODE_STEPS.set(0);
+    if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
+        eprintln!("JUMP_DIG apply_ok steps={skipped} pc={} tip_sloads={}", snap.pc, snap.tip_sloads.len());
+    }
     record_pc_resume(skipped);
 }
 

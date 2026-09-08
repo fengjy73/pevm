@@ -560,33 +560,64 @@ impl PartialRetryState {
         // (sstore_index=0, !post_sstore) certified-prefix end — post-SSTORE plant
         // tips are usually k≥k_fail on RAW-read fails (Iter18 aj=0).
         // Iter26: among Bind tips prefer tip_sloads≡FF (Validated-fresh / FF-path
-        // captures) so refuse-if-stale can arm jump; then highest k / opcode_steps.
-        let tip_matches_ff = |s: &BoundarySnapshot| -> bool {
+        // captures) so refuse-if-stale can arm jump.
+        // Iter27: tip≡FF = ≥1 tip_sload matches FF Storage and none conflict
+        // (cumulative Bind SLOAD log often has extras absent from certified
+        // values — old all-match refused every 597 arm). Prefer steps within
+        // jump_is_safe cap (not max steps — that selected steps_over tips).
+        let tip_ff_status = |s: &BoundarySnapshot| -> (bool, bool) {
             if s.tip_sloads.is_empty() {
-                return false;
+                return (false, false);
             }
-            s.tip_sloads.iter().all(|(addr, slot, snap_val)| {
-                values.values().any(|v| match v {
+            let mut any_match = false;
+            let mut conflict = false;
+            for (addr, slot, snap_val) in &s.tip_sloads {
+                let ff = values.values().find_map(|v| match v {
                     FfValue::Storage {
                         address,
                         slot: ss,
                         value,
                         ..
-                    } if address == addr && ss == slot => value == snap_val,
-                    _ => false,
-                })
-            })
+                    } if address == addr && ss == slot => Some(*value),
+                    _ => None,
+                });
+                match ff {
+                    Some(v) if v == *snap_val => any_match = true,
+                    Some(_) => conflict = true,
+                    None => {}
+                }
+            }
+            (any_match && !conflict, any_match)
+        };
+        let tip_matches_ff = |s: &BoundarySnapshot| -> bool { tip_ff_status(s).0 };
+        let steps_cap = |s: &BoundarySnapshot| -> u64 {
+            // Match jump_is_safe max_steps: storage/write/call → 2048 else 128.
+            let has_storage = values.values().any(|v| matches!(v, FfValue::Storage { .. }));
+            if has_storage || tip_matches_ff(s) || !s.tip_sloads.is_empty() {
+                2048
+            } else {
+                128
+            }
         };
         let (jump_snap, journal_blob) = self
             .live_boundaries
             .iter()
             .filter(|(k, (s, _))| **k < k_fail && s.is_live_capture())
             .max_by_key(|(k, (s, _))| {
+                let steps = s.opcode_steps;
+                let cap = steps_cap(s);
+                let steps_ok = steps > 0 && steps <= cap;
+                // Iter27: fewer tip_sloads → likelier first-frame apply (Lean
+                // CALL_DEPTH stuck at 0; nested tips fail code_hash on frame0).
+                let tip_n = s.tip_sloads.len() as u64;
+                let tip_compact = if tip_n == 0 { 0 } else { 64u64.saturating_sub(tip_n.min(64)) };
                 (
                     u64::from(s.sstore_index == 0 && !s.post_sstore),
                     u64::from(tip_matches_ff(s)),
-                    s.opcode_steps,
-                    **k,
+                    u64::from(steps_ok),
+                    tip_compact,
+                    if steps_ok { **k as u64 } else { 0 },
+                    if steps_ok { steps } else { 0 },
                     s.sstore_index,
                     u64::from(s.post_sstore),
                 )

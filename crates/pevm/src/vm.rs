@@ -2095,7 +2095,9 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             let me = tx_version.tx_idx;
             let mut prefix_ok = me == 0;
             if !prefix_ok {
-                for _ in 0..8192 {
+                // Iter27: deeper all-prefix Validated spin under 597 fan-out
+                // (not tip_sloads skip — same gate, more yield budget).
+                for _ in 0..32768 {
                     let mut all_v = true;
                     for i in 0..me {
                         if !self.specfence.scheduler.is_validated(i) {
@@ -2113,6 +2115,9 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             if !prefix_ok {
                 suffix_jump = false;
                 self.specfence.metrics.record_absolute_jump_fallback();
+                if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
+                    eprintln!("JUMP_DIG prefix_timeout me={me}");
+                }
             }
         }
         let live_prime = false;
@@ -2259,6 +2264,9 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             } else {
                 suffix_jump = false;
                 self.specfence.metrics.record_absolute_jump_fallback();
+                if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
+                    eprintln!("JUMP_DIG origin_unsafe tx={}", tx_version.tx_idx);
+                }
             }
         } else if rewind_resume && research_inspect {
             let db = self.evm.ctx().db_mut();
@@ -2379,17 +2387,29 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 let mut did_jump = false;
                 if suffix_jump && rewind_resume {
                     did_jump = partial_retry.ff_continuation(tx_idx).is_some_and(|cont| {
-                        try_arm_safe_absolute_jump_gated(
+                        let ok = try_arm_safe_absolute_jump_gated(
                             tx_idx,
                             partial_retry,
                             &cont,
                             metrics,
                             true,
-                        )
+                        );
+                        if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
+                            eprintln!(
+                                "JUMP_DIG try_arm ok={ok} refuse={} tip_sloads={} steps={}",
+                                jump_refuse_reason(&cont),
+                                cont.jump_snap.as_ref().map(|s| s.tip_sloads.len()).unwrap_or(0),
+                                cont.jump_snap.as_ref().map(|s| s.opcode_steps).unwrap_or(0),
+                            );
+                        }
+                        ok
                     });
                     if !did_jump {
                         // Armed seeds only meaningful if jump arm succeeded.
                         let _ = take_ff_origin_seeds();
+                        if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
+                            eprintln!("JUMP_DIG arm_or_cont_miss tx={tx_idx}");
+                        }
                     }
                 }
                 // Hang-free credit consume when Bind tip exists but jump not armed
@@ -2401,8 +2421,61 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                                 metrics.record_bind_snap_credit(snap.opcode_steps);
                             }
                         }
-                        // Iter20 dig helper retained (no stderr spam on hot path).
-                        let _ = (bind_snap_jump_env, jump_is_safe(&cont), jump_refuse_reason(&cont));
+                        // Iter27 dig: classify why suffix_jump stayed false / arm refused.
+                        if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
+                            use std::sync::atomic::{AtomicUsize, Ordering as Ord};
+                            static DIG_CREDIT: AtomicUsize = AtomicUsize::new(0);
+                            static DIG_SAFE: AtomicUsize = AtomicUsize::new(0);
+                            static DIG_DEPTH: AtomicUsize = AtomicUsize::new(0);
+                            static DIG_DEPTH_GT1: AtomicUsize = AtomicUsize::new(0);
+                            static DIG_MEM: AtomicUsize = AtomicUsize::new(0);
+                            static DIG_TIP: AtomicUsize = AtomicUsize::new(0);
+                            static DIG_ELIG: AtomicUsize = AtomicUsize::new(0);
+                            static DIG_WOULD: AtomicUsize = AtomicUsize::new(0);
+                            static DIG_ENV: AtomicUsize = AtomicUsize::new(0);
+                            DIG_CREDIT.fetch_add(1, Ord::Relaxed);
+                            let safe = jump_is_safe(&cont);
+                            if safe { DIG_SAFE.fetch_add(1, Ord::Relaxed); }
+                            let depth = cont.jump_snap.as_ref().map(|s| s.call_depth).unwrap_or(999);
+                            if depth <= 1 { DIG_DEPTH.fetch_add(1, Ord::Relaxed); }
+                            if depth > 1 { DIG_DEPTH_GT1.fetch_add(1, Ord::Relaxed); }
+                            let mem_ok = cont.jump_snap.as_ref().is_some_and(|s| s.memory_words == 0 || !s.memory.is_empty());
+                            if mem_ok { DIG_MEM.fetch_add(1, Ord::Relaxed); }
+                            let tip_ok = cont.jump_snap.as_ref().is_some_and(|s| s.pc > 0 && s.gas_remaining > 0 && !s.stack.is_empty());
+                            if tip_ok { DIG_TIP.fetch_add(1, Ord::Relaxed); }
+                            if suffix_jump_eligible { DIG_ELIG.fetch_add(1, Ord::Relaxed); }
+                            if suffix_jump_would { DIG_WOULD.fetch_add(1, Ord::Relaxed); }
+                            if bind_snap_jump_env { DIG_ENV.fetch_add(1, Ord::Relaxed); }
+                            let reason = jump_refuse_reason(&cont);
+                            let n = DIG_CREDIT.load(Ord::Relaxed);
+                            if n <= 8 || n % 32 == 0 {
+                                eprintln!(
+                                    "JUMP_DIG credit=#{n} safe={safe} depth={depth} mem={mem_ok} tip={tip_ok} elig={} would={} env={} refuse={reason} tip_sloads={} steps={}",
+                                    suffix_jump_eligible,
+                                    suffix_jump_would,
+                                    bind_snap_jump_env,
+                                    cont.jump_snap.as_ref().map(|s| s.tip_sloads.len()).unwrap_or(0),
+                                    cont.jump_snap.as_ref().map(|s| s.opcode_steps).unwrap_or(0),
+                                );
+                            }
+                            // Periodically dump totals
+                            if n == 1 || n % 64 == 0 {
+                                eprintln!(
+                                    "JUMP_DIG totals credit={} safe={} depth<=1={} depth>1={} mem={} tip={} elig={} would={} env={}",
+                                    DIG_CREDIT.load(Ord::Relaxed),
+                                    DIG_SAFE.load(Ord::Relaxed),
+                                    DIG_DEPTH.load(Ord::Relaxed),
+                                    DIG_DEPTH_GT1.load(Ord::Relaxed),
+                                    DIG_MEM.load(Ord::Relaxed),
+                                    DIG_TIP.load(Ord::Relaxed),
+                                    DIG_ELIG.load(Ord::Relaxed),
+                                    DIG_WOULD.load(Ord::Relaxed),
+                                    DIG_ENV.load(Ord::Relaxed),
+                                );
+                            }
+                        } else {
+                            let _ = (bind_snap_jump_env, jump_is_safe(&cont), jump_refuse_reason(&cont));
+                        }
                     }
                 }
                 let result = self.chain.run_pevm_tx(

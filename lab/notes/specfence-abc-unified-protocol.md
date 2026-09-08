@@ -245,4 +245,12 @@ Keep all-prefix Validated spin. SoftWait Soft=0; silent ResumePath.
 See `specfence-abc-iter26-status.md`. Iter 27 cause: 597 aj under fan-out without
 prefix-spin skip, or N10 schedule ≤12.3→<10.
 
-
+### Iter 27 — tip≡FF overlap + steps_cap + deeper prefix spin (wall↓)
+Cumulative tip_sloads extras no longer refuse-if-stale (overlap match); jump_snap
+select prefers tip≡FF ∧ steps≤cap (not max steps→steps_over); all-prefix Validated
+spin 8192→32768 (no tip_sloads skip). Nested apply-on-hash-mismatch **hung** — OFF.
+SoftWait Soft=0; silent ResumePath; FF-only tip≡FF.
+597 N5 med **12.1** SoftWait=0 (↓ vs Iter26 12.4); N10 **12.5** (↓ vs 13.3); aj=0
+on 597 (code_hash first-frame); 599/097 aj>0. Stretch <10 unmet.
+See `specfence-abc-iter27-status.md`. Iter 28 cause: 597 first-frame tip identity
+(hang-free nested apply or capture-at-tx.to) for aj>0, or schedule ≤12.1→<10.
