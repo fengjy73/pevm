@@ -1,3 +1,8 @@
 .vscode
 /target
 perf.*
+
+lab/results/
+lab/notes/*.log
+
+lab/.venv/

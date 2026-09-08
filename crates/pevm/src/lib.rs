@@ -75,7 +75,7 @@ fn hash_deterministic<T: Hash>(x: T) -> u64 {
 // TODO: It would be nice if we could tie the different cases of
 // memory locations & values at the type level, to prevent lots of
 // matches & potentially dangerous mismatch mistakes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum MemoryValue {
     Basic(AccountBasic),
     CodeHash(B256),
@@ -220,11 +220,22 @@ mod mv_memory;
 mod pevm;
 pub use pevm::{Pevm, PevmError, PevmResult, execute_revm_sequential};
 mod scheduler;
+pub mod specfence;
+pub use specfence::{
+    AbortEvent, AccountGrainObserve, ConcurrencyMode, ConsumerFirstCross, DagStats, EffectClass,
+    EffectLogEntry, FineGrainCollector, FineGrainSnapshot, EffectStreamDiag, HotLocation,
+    L1DagSummary, LocationKind, MaMdProxy, MeasurementMethod, RawEdge, RawEffectEdge,
+    SpecFenceMetrics, TxRw, TxWorkTotal, analyze_dag, classify_raw_edges, dependency_edges,
+    effect_raw_longest_chain, effect_raw_max_fanout, estimate_ma_md, filter_effect_edges,
+    hot_locations, kind_histogram, l1_dag_summary, percentile_f64, producer_status_canonical,
+    program_raw_longest_chain,
+};
 mod storage;
 pub use storage::{
     AccountBasic, BlockHashes, Bytecodes, ChainState, EvmAccount, EvmCode, InMemoryStorage,
     Storage, StorageWrapper,
 };
+mod tx_runner;
 mod vm;
 pub use vm::{ExecutionError, PevmTxExecutionResult};
 

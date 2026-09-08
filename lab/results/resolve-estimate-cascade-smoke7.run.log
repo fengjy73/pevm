@@ -1,0 +1,157 @@
+warning: unused imports: `MorphWeights` and `TopLocPrior`
+  --> crates/pevm/src/specfence/mod.rs:73:51
+   |
+73 |     AdaptiveParams, InterBlockPrior, LiveLearner, MorphWeights, TopLocPrior,
+   |                                                   ^^^^^^^^^^^^  ^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `early_abort_candidate`
+   --> crates/pevm/src/specfence/mod.rs:106:67
+    |
+106 | pub(crate) use resolve::{PolicyCtx, ResolveAction, choose_action, early_abort_candidate};
+    |                                                                   ^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `params`
+   --> crates/pevm/src/specfence/learner.rs:667:41
+    |
+667 |     pub(crate) fn meta_tax_ratio(&self, params: &AdaptiveParams) -> f64 {
+    |                                         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_params`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: methods `set_adaptive_params` and `adaptive_params` are never used
+   --> crates/pevm/src/pevm.rs:215:19
+    |
+200 | impl Pevm {
+    | --------- methods in this implementation
+...
+215 |     pub(crate) fn set_adaptive_params(&mut self, params: AdaptiveParams) {
+    |                   ^^^^^^^^^^^^^^^^^^^
+...
+220 |     pub(crate) const fn adaptive_params(&self) -> &AdaptiveParams {
+    |                         ^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `tau` is never read
+   --> crates/pevm/src/specfence/mod.rs:186:9
+    |
+179 | pub(crate) struct SpecFenceCtx<'a> {
+    |                   ------------ field in this struct
+...
+186 |     pub tau: f64,
+    |         ^^^
+    |
+    = note: `SpecFenceCtx` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: methods `decide_account`, `should_wait_hard`, `note_wait_decision`, `note_wait_decision_account`, `conflict_mass`, and `hot_conflict_count` are never used
+   --> crates/pevm/src/specfence/bayes.rs:188:19
+    |
+ 88 | impl BayesMap {
+    | ------------- methods in this implementation
+...
+188 |     pub(crate) fn decide_account(&self, address: &Address, tau: f64) -> RegionMode {
+    |                   ^^^^^^^^^^^^^^
+...
+211 |     pub(crate) fn should_wait_hard(
+    |                   ^^^^^^^^^^^^^^^^
+...
+223 |     pub(crate) fn note_wait_decision(&self, location: MemoryLocationHash, address: Option<&Address>) {
+    |                   ^^^^^^^^^^^^^^^^^^
+...
+227 |     pub(crate) fn note_wait_decision_account(&self, address: &Address) {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+419 |     pub(crate) fn conflict_mass(&self) -> f64 {
+    |                   ^^^^^^^^^^^^^
+...
+435 |     pub(crate) fn hot_conflict_count(&self, tau: f64) -> usize {
+    |                   ^^^^^^^^^^^^^^^^^^
+
+warning: method `insert` is never used
+   --> crates/pevm/src/specfence/hotset.rs:166:19
+    |
+ 66 | impl HotSet {
+    | ----------- method in this implementation
+...
+166 |     pub(crate) fn insert(&self, location: MemoryLocationHash) {
+    |                   ^^^^^^
+
+warning: methods `record_bayes_wait`, `record_bayes_speculate`, and `record_tx_head_reexec` are never used
+   --> crates/pevm/src/specfence/metrics.rs:326:19
+    |
+283 | impl MetricsInner {
+    | ----------------- methods in this implementation
+...
+326 |     pub(crate) fn record_bayes_wait(&self) {
+    |                   ^^^^^^^^^^^^^^^^^
+...
+330 |     pub(crate) fn record_bayes_speculate(&self) {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^
+...
+504 |     pub(crate) fn record_tx_head_reexec(&self) {
+    |                   ^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `clear_account_wait` is never used
+  --> crates/pevm/src/specfence/region.rs:85:19
+   |
+28 | impl RegionTable {
+   | ---------------- method in this implementation
+...
+85 |     pub(crate) fn clear_account_wait(&self, address: Address) -> bool {
+   |                   ^^^^^^^^^^^^^^^^^^
+
+warning: method `take_pending_park_location` is never used
+    --> crates/pevm/src/vm.rs:1398:19
+     |
+1323 | impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
+     | ----------------------------------------------- method in this implementation
+...
+1398 |     pub(crate) fn take_pending_park_location(&self) -> Option<crate::MemoryLocationHash> {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `pevm` (lib) generated 10 warnings (run `cargo fix --lib -p pevm` to apply 3 suggestions)
+warning: field `number` is never read
+  --> crates/pevm/examples/specfence_g7_smoke.rs:51:5
+   |
+50 | struct LoadedBlock {
+   |        ----------- field in this struct
+51 |     number: u64,
+   |     ^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `pevm` (example "specfence_g7_smoke") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.35s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running `target/release/examples/specfence_g7_smoke`
+G7 dig tag="resolve-estimate-cascade" softwait_disabled=false
+=== G7 flip smoke 19606598 → 19606599 ===
+  block=19606598 ok=true tps=22015 soft_wait_arms=2 wait_hard=2 aborts=6 flip_count=0
+  block=19606599 ok=true tps=10221 soft_wait_arms=30 wait_hard=30 aborts=78 flip_count=1
+wrote "/workspace/specfence/crates/pevm/../../lab/results/resolve-estimate-cascade-flip.json"
+=== G7 SF vs OCC@8 cores iters=7 ===
+  block=14689597 mode=occ        iter=7/7 ok=true tps=176831 wall_ms=3.2 soft=0 wait_hard=0 abort_rate=0.059 lean=0 evm=1272 reexec=708 fb_reabort=0 rebind=0 cold=0 occ_fast=0 steal=0 park_k=0 mw_ms=0.0 h_ms=0.0 v_ms=0.0 park_ms=0.0 sw_ms=0.0 ea_ms=0.0 bo_ms=0.0 parks=0
+  block=14689597 mode=occ        SUMMARY n=7 wall_ms median=3.3 p90=3.6 min=3.2 mean=3.4 soft_med=0 abort_med=53
+  block=14689597 mode=specfence  iter=7/7 ok=true tps=18524 wall_ms=30.4 soft=87 wait_hard=87 abort_rate=0.555 lean=1312 evm=908 reexec=344 fb_reabort=169 rebind=1 cold=5238 occ_fast=2396 steal=271 park_k=80 mw_ms=0.0 h_ms=0.0 v_ms=0.0 park_ms=236.0 sw_ms=24.2 ea_ms=0.0 bo_ms=211.8 parks=291
+  block=14689597 mode=specfence  SUMMARY n=7 wall_ms median=28.8 p90=33.3 min=24.6 mean=29.9 soft_med=87 abort_med=220
+  block=19606599 mode=occ        iter=7/7 ok=true tps=36281 wall_ms=10.1 soft=0 wait_hard=0 abort_rate=0.223 lean=0 evm=701 reexec=334 fb_reabort=0 rebind=0 cold=0 occ_fast=0 steal=0 park_k=0 mw_ms=0.0 h_ms=0.0 v_ms=0.0 park_ms=0.0 sw_ms=0.0 ea_ms=0.0 bo_ms=0.0 parks=0
+  block=19606599 mode=occ        SUMMARY n=7 wall_ms median=9.8 p90=10.2 min=9.5 mean=9.9 soft_med=0 abort_med=84
+  block=19606599 mode=specfence  iter=7/7 ok=true tps=12474 wall_ms=29.4 soft=28 wait_hard=28 abort_rate=0.207 lean=617 evm=492 reexec=125 fb_reabort=10 rebind=0 cold=5248 occ_fast=3069 steal=134 park_k=20 mw_ms=0.0 h_ms=0.0 v_ms=0.0 park_ms=184.9 sw_ms=34.9 ea_ms=0.0 bo_ms=150.0 parks=104
+  block=19606599 mode=specfence  SUMMARY n=7 wall_ms median=29.4 p90=31.7 min=28.6 mean=30.2 soft_med=28 abort_med=79
+  block=19469097 mode=occ        iter=7/7 ok=true tps=49330 wall_ms=6.8 soft=0 wait_hard=0 abort_rate=0.268 lean=0 evm=613 reexec=277 fb_reabort=0 rebind=0 cold=0 occ_fast=0 steal=0 park_k=0 mw_ms=0.0 h_ms=0.0 v_ms=0.0 park_ms=0.0 sw_ms=0.0 ea_ms=0.0 bo_ms=0.0 parks=0
+  block=19469097 mode=occ        SUMMARY n=7 wall_ms median=6.5 p90=7.0 min=5.2 mean=6.3 soft_med=0 abort_med=90
+  block=19469097 mode=specfence  iter=7/7 ok=true tps=18268 wall_ms=18.4 soft=72 wait_hard=73 abort_rate=0.268 lean=593 evm=427 reexec=91 fb_reabort=26 rebind=0 cold=3055 occ_fast=2119 steal=133 park_k=55 mw_ms=0.0 h_ms=0.0 v_ms=0.0 park_ms=45.8 sw_ms=31.5 ea_ms=0.0 bo_ms=14.3 parks=96
+  block=19469097 mode=specfence  SUMMARY n=7 wall_ms median=18.4 p90=18.6 min=16.3 mean=17.9 soft_med=82 abort_med=85
+  block=19606598 mode=occ        iter=7/7 ok=true tps=83587 wall_ms=1.1 soft=0 wait_hard=0 abort_rate=0.088 lean=0 evm=109 reexec=18 fb_reabort=0 rebind=0 cold=0 occ_fast=0 steal=0 park_k=0 mw_ms=0.0 h_ms=0.0 v_ms=0.0 park_ms=0.0 sw_ms=0.0 ea_ms=0.0 bo_ms=0.0 parks=0
+  block=19606598 mode=occ        SUMMARY n=7 wall_ms median=1.1 p90=1.3 min=1.1 mean=1.2 soft_med=0 abort_med=8
+  block=19606598 mode=specfence  iter=7/7 ok=true tps=27169 wall_ms=3.3 soft=6 wait_hard=6 abort_rate=0.066 lean=117 evm=107 reexec=16 fb_reabort=0 rebind=0 cold=644 occ_fast=549 steal=9 park_k=3 mw_ms=0.0 h_ms=0.0 v_ms=0.0 park_ms=1.1 sw_ms=1.1 ea_ms=0.0 bo_ms=0.0 parks=6
+  block=19606598 mode=specfence  SUMMARY n=7 wall_ms median=3.3 p90=3.4 min=3.2 mean=3.3 soft_med=3 abort_med=5
+  SF/OCC@8 block=14689597: 0.105
+  SF/OCC@8 block=19606599: 0.344
+  SF/OCC@8 block=19469097: 0.370
+  SF/OCC@8 block=19606598: 0.325
+  mean SF/OCC@8 = 0.286 (v8 baseline ~0.325 on different block set)
+wrote "/workspace/specfence/crates/pevm/../../lab/results/resolve-estimate-cascade-sf-occ.json"

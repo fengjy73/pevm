@@ -1,0 +1,55 @@
+{
+  "block": 14689597,
+  "cores": 8,
+  "base_tip": "2e141f2",
+  "iters": 7,
+  "authority": [
+    "lab/notes/specfence-resolve-park-steal-status.md",
+    "lab/notes/specfence-resolve-profile-strip-status.md"
+  ],
+  "wall_ms": {
+    "tip_2e141f2_recorded_unprofiled_median": 29.958735,
+    "tip_2e141f2_same_machine_medians": [
+      28.3,
+      28.8,
+      26.3
+    ],
+    "blocking_other_unprofiled_median": 25.980966000000002,
+    "blocking_other_unprofiled_min": 21.138149,
+    "blocking_other_unprofiled_p90": 33.951486,
+    "occ_median_unprofiled": 3.358839,
+    "triplicate_medians": [
+      29.6,
+      28.2,
+      26.0
+    ]
+  },
+  "park_subtype_split_last_iter_unprofiled_ms": {
+    "softwait_park_idle_total": 459.872047,
+    "softwait_soft": 24.433432,
+    "early_abort": 0.0,
+    "blocking_other": 435.438615,
+    "park_count_softwait": 50,
+    "park_count_early_abort": 0,
+    "park_count_blocking_other": 1519,
+    "wait_park_count": 1569,
+    "ready_steal_on_wait": 257
+  },
+  "counters": {
+    "soft_wait_arms_median_unprofiled": 47.0,
+    "occ_aborts_median_unprofiled": 194.0
+  },
+  "diagnosis": {
+    "blocking_other_call_sites": [
+      "vm basic/storage: MemoryEntry::Estimate -> Blocking + set_pending_park_location (BlockingOther)",
+      "vm basic/storage: aborted incarnation -> Blocking + set_pending_park_location",
+      "vm maybe_wait_specfence cold WaitHard hints.prev -> set_pending_park_location BlockingOther",
+      "vm nonce mismatch / code_hash abort -> Blocking unwrap_or BlockingOther",
+      "pevm Blocking handler parks with pending kind or BlockingOther default"
+    ],
+    "why_more_than_occ": "OCC Blocking only on ESTIMATE/abort/nonce; SpecFence also SoftWait WaitHard + cold hints + EarlyAbort, and abort cascades mint more ESTIMATE for readers",
+    "levers_landed": "ESTIMATE/abort pending park tagging for wake; prefer-steal ESTIMATE writer when Ready after park",
+    "tried_reverted": "cold-hint SpecRead; finish handoff under lock (deadlock); Validation->woken Execution; no-promote-on-ESTIMATE (abort storm); post-finish steal-over-None (noisy)",
+    "wall_delta": "best N=7 median 26.0 vs tip recorded 30.0; triplicate 29.6/28.2/26.0; SoftWait med 47 <<428"
+  }
+}

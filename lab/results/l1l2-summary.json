@@ -1,0 +1,138 @@
+{
+  "method": {
+    "location": "MemoryLocation",
+    "warm_policy": "emit_warm_true",
+    "primary_depth": "gross_work",
+    "primary_depth_formula": "gas_used_so_far/tx_gas_used",
+    "raw_instance": true,
+    "excluded_from_effective_gstar": [
+      "coinbase_beneficiary",
+      "basic_lazy"
+    ],
+    "producer_status_sampled_at": "discovering_incarnation",
+    "account_grain": "diagnostic_only",
+    "schema_version": "l1l2-v1"
+  },
+  "blocks": [
+    {
+      "block": 14689597,
+      "n_tx": 564,
+      "morphology": "fan_out",
+      "l1_raw": 647,
+      "l1_log": 3600,
+      "l2_occ1_raw": 647,
+      "l2_occ8_raw": 1987,
+      "l2_occ8_bind_frac": 0.8706592853548062,
+      "method": {
+        "location": "MemoryLocation",
+        "warm_policy": "emit_warm_true",
+        "primary_depth": "gross_work",
+        "primary_depth_formula": "gas_used_so_far/tx_gas_used",
+        "raw_instance": true,
+        "excluded_from_effective_gstar": [
+          "coinbase_beneficiary",
+          "basic_lazy"
+        ],
+        "producer_status_sampled_at": "discovering_incarnation",
+        "account_grain": "diagnostic_only",
+        "schema_version": "l1l2-v1"
+      }
+    },
+    {
+      "block": 19606599,
+      "n_tx": 367,
+      "morphology": "long_chain",
+      "l1_raw": 584,
+      "l1_log": 7955,
+      "l2_occ1_raw": 584,
+      "l2_occ8_raw": 1183,
+      "l2_occ8_bind_frac": 0.8672865595942519,
+      "method": {
+        "location": "MemoryLocation",
+        "warm_policy": "emit_warm_true",
+        "primary_depth": "gross_work",
+        "primary_depth_formula": "gas_used_so_far/tx_gas_used",
+        "raw_instance": true,
+        "excluded_from_effective_gstar": [
+          "coinbase_beneficiary",
+          "basic_lazy"
+        ],
+        "producer_status_sampled_at": "discovering_incarnation",
+        "account_grain": "diagnostic_only",
+        "schema_version": "l1l2-v1"
+      }
+    },
+    {
+      "block": 19469097,
+      "n_tx": 336,
+      "morphology": "long_chain",
+      "l1_raw": 410,
+      "l1_log": 4805,
+      "l2_occ1_raw": 410,
+      "l2_occ8_raw": 852,
+      "l2_occ8_bind_frac": 0.8849765258215962,
+      "method": {
+        "location": "MemoryLocation",
+        "warm_policy": "emit_warm_true",
+        "primary_depth": "gross_work",
+        "primary_depth_formula": "gas_used_so_far/tx_gas_used",
+        "raw_instance": true,
+        "excluded_from_effective_gstar": [
+          "coinbase_beneficiary",
+          "basic_lazy"
+        ],
+        "producer_status_sampled_at": "discovering_incarnation",
+        "account_grain": "diagnostic_only",
+        "schema_version": "l1l2-v1"
+      }
+    },
+    {
+      "block": 19606598,
+      "n_tx": 91,
+      "morphology": "quiet",
+      "l1_raw": 44,
+      "l1_log": 1167,
+      "l2_occ1_raw": 44,
+      "l2_occ8_raw": 52,
+      "l2_occ8_bind_frac": 1.0,
+      "method": {
+        "location": "MemoryLocation",
+        "warm_policy": "emit_warm_true",
+        "primary_depth": "gross_work",
+        "primary_depth_formula": "gas_used_so_far/tx_gas_used",
+        "raw_instance": true,
+        "excluded_from_effective_gstar": [
+          "coinbase_beneficiary",
+          "basic_lazy"
+        ],
+        "producer_status_sampled_at": "discovering_incarnation",
+        "account_grain": "diagnostic_only",
+        "schema_version": "l1l2-v1"
+      }
+    },
+    {
+      "block": 19469096,
+      "n_tx": 250,
+      "morphology": "long_chain",
+      "l1_raw": 232,
+      "l1_log": 2128,
+      "l2_occ1_raw": 232,
+      "l2_occ8_raw": 574,
+      "l2_occ8_bind_frac": 0.867595818815331,
+      "method": {
+        "location": "MemoryLocation",
+        "warm_policy": "emit_warm_true",
+        "primary_depth": "gross_work",
+        "primary_depth_formula": "gas_used_so_far/tx_gas_used",
+        "raw_instance": true,
+        "excluded_from_effective_gstar": [
+          "coinbase_beneficiary",
+          "basic_lazy"
+        ],
+        "producer_status_sampled_at": "discovering_incarnation",
+        "account_grain": "diagnostic_only",
+        "schema_version": "l1l2-v1"
+      }
+    }
+  ]
+}

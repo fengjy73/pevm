@@ -1,0 +1,7 @@
+{
+  "blocks": [19807137, 14683600, 13217637, 14383540, 15199017, 14029313, 19434587],
+  "cores": [1, 2, 4, 8],
+  "repeats": 3,
+  "modes": ["sequential", "occ", "pcc", "specfence"],
+  "notes": "8-core box. Sequential only measured at 1 worker. Heat reset each repeat for reproducibility."
+}

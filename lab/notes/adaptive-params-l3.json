@@ -1,0 +1,26 @@
+{
+  "source": "lab/results/l3-offline-ev.json",
+  "mapping": {
+    "d_wait": "L3 Wait-if-program-fanout assumption d>=0.5 (method.l3_assumptions)",
+    "d_early": "learn-from-blocks early-heavy minority gw~0.11; D_EARLY=0.15 envelope",
+    "tau_very_high": "safety valve retained (cost model); not recalibrated by L3 waste\u0394",
+    "c_retry": "SpecRead expected redo factor (control law v3); L3 M-A redo baseline",
+    "cost_margin": "Wait must beat Spec*margin (control law v3)",
+    "tau_revoke": "sticky Wait revoke (Bayes); not L3 waste\u0394",
+    "waw_writer_floor": "WAW spine morphology (096); schedule \u226b WaitHard",
+    "heavy_gas_limit": "tx_heavy_hint band for EarlyAbort niche (597 heavy ~352k)"
+  },
+  "adaptive_params": {
+    "d_wait": 0.5,
+    "d_early": 0.15,
+    "tau_very_high": 0.75,
+    "tau_w": 0.35,
+    "tau_s": 0.5,
+    "tau_revoke": 0.2,
+    "c_retry": 3.0,
+    "cost_margin": 0.4,
+    "waw_writer_floor": 8,
+    "heavy_gas_limit": 200000
+  },
+  "notes": "Do not invent numbers without L3/evidence. Values equal L3-authorized choose_action v3 defaults."
+}
