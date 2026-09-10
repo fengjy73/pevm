@@ -125,13 +125,8 @@ impl HotSketch {
         self.note_hot(location);
         let e = self.locs.entry(location).or_default();
         e.publishes.fetch_add(1, Ordering::Relaxed);
-        let _ = e.predicted_writer.compare_exchange(
-            usize::MAX,
-            writer,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
         drop(e);
+        self.note_writer(location, writer);
         if self.avoid.insert(location, ()).is_none() {
             self.avoid_broadcasts.fetch_add(1, Ordering::Relaxed);
             true
@@ -146,14 +141,22 @@ impl HotSketch {
     }
 
     /// Observe a writer identity for the spine (admission).
+    /// Keep the **lowest** index — first-to-publish later txs must not become
+    /// the WaitFor target for earlier readers (preset-order inversion).
     pub(crate) fn note_writer(&self, location: MemoryLocationHash, writer: TxIdx) {
         let e = self.locs.entry(location).or_default();
-        let _ = e.predicted_writer.compare_exchange(
-            usize::MAX,
-            writer,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
+        loop {
+            let cur = e.predicted_writer.load(Ordering::Relaxed);
+            if writer >= cur {
+                break;
+            }
+            if e.predicted_writer
+                .compare_exchange_weak(cur, writer, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+        }
     }
 
     pub(crate) fn predicted_writer(&self, location: MemoryLocationHash) -> Option<TxIdx> {
@@ -293,6 +296,15 @@ mod tests {
         assert!(!s.try_canary(1));
         s.note_spec(1);
         assert!(s.clique_gated(1));
+    }
+
+    #[test]
+    fn spine_keeps_lowest_writer() {
+        let s = HotSketch::new();
+        s.broadcast_avoid(1, 20);
+        s.note_writer(1, 7);
+        s.note_writer(1, 12);
+        assert_eq!(s.predicted_writer(1), Some(7));
     }
 
     #[test]

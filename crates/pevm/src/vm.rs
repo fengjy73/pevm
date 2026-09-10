@@ -478,9 +478,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
         } else {
             None
         };
-        let writer = mv_writer.or(residual_writer).or_else(|| {
-            self.specfence.sketch.predicted_writer(location_hash)
-        });
+        let writer = mv_writer
+            .or(residual_writer)
+            .or_else(|| self.specfence.sketch.predicted_writer(location_hash))
+            .filter(|&w| w < self.tx_idx);
         if let Some(w) = writer {
             self.specfence.sketch.note_writer(location_hash, w);
         }
@@ -565,6 +566,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
             essential_antidep: essential,
             force_prefix,
             clique_gated,
+            writer_admitted: writer.is_some_and(|w| {
+                w < self.tx_idx && self.specfence.scheduler.is_executing(w)
+            }),
         };
         let action = choose_edge_action(&view);
 
@@ -585,6 +589,14 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 // D6: unpublished essential only. SoftWait Soft stays 0.
                 // Plant TLS mid-capture must not park (Iter4 livelock).
                 if crate::specfence::plant_tls_active() {
+                    self.specfence.metrics.record_edge_spec();
+                    self.specfence.metrics.record_spec_read();
+                    note_pending_effect_boundary(self.tx_idx, self.specfence.partial_retry);
+                    return Ok(());
+                }
+                // Inversion / unadmitted: never add_dependency on w ≥ reader
+                // or a writer that is not Executing (Ready/Aborting hang family).
+                if w >= self.tx_idx || !self.specfence.scheduler.is_executing(w) {
                     self.specfence.metrics.record_edge_spec();
                     self.specfence.metrics.record_spec_read();
                     note_pending_effect_boundary(self.tx_idx, self.specfence.partial_retry);

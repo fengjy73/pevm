@@ -90,6 +90,10 @@ pub(crate) struct EdgeView {
     pub force_prefix: bool,
     /// A1: mass Spec on this clique is gated.
     pub clique_gated: bool,
+    /// D6 work-conserving: writer is Executing (admitted). Never WaitFor a
+    /// Ready/Aborting or higher-index identity — that inverts preset order
+    /// (`add_dependency(early, late)` ∧ `WaitFor(early)` = deadlock).
+    pub writer_admitted: bool,
 }
 
 /// Decide the protocol verb. Bounded optimism: known essential → Bind or WaitFor.
@@ -112,6 +116,9 @@ pub(crate) fn choose_edge_action(v: &EdgeView) -> EdgeAction {
     }
 
     // D6 / A1 / A2: unpublished essential → WaitFor, never Spec+retry.
+    // Hang-freedom: only WaitFor a *lower* admitted (Executing) writer.
+    // Predicted later-tx identity or a writer that has not started is Spec
+    // (work-conserving discovery) until the spine is actually running.
     let must_wait = v.essential_antidep
         || v.avoid_broadcast
         || v.force_prefix
@@ -119,7 +126,9 @@ pub(crate) fn choose_edge_action(v: &EdgeView) -> EdgeAction {
         || (v.in_hot_set && !v.canary_ok && !v.independence_certified);
     if must_wait {
         if let Some(w) = v.writer {
-            return EdgeAction::WaitFor(w);
+            if w < v.reader && v.writer_admitted {
+                return EdgeAction::WaitFor(w);
+            }
         }
     }
 
@@ -255,6 +264,7 @@ mod tests {
             essential_antidep: essential,
             force_prefix: false,
             clique_gated: clique,
+            writer_admitted: true,
         }
     }
 
@@ -342,11 +352,40 @@ mod tests {
     }
 
     #[test]
+    fn never_wait_for_higher_or_self() {
+        let mut v = view(
+            None, Some(9), false, false, true, true, false, false, true, true,
+        );
+        v.reader = 4;
+        v.writer = Some(9);
+        assert_eq!(
+            choose_edge_action(&v),
+            EdgeAction::SpecRead,
+            "WaitFor(later) inverts preset order"
+        );
+        v.writer = Some(4);
+        assert_eq!(choose_edge_action(&v), EdgeAction::SpecRead);
+    }
+
+    #[test]
+    fn never_wait_for_unadmitted_writer() {
+        let mut v = view(
+            None, Some(3), false, false, true, true, false, false, true, true,
+        );
+        v.writer_admitted = false;
+        assert_eq!(
+            choose_edge_action(&v),
+            EdgeAction::SpecRead,
+            "WaitFor(Ready) is SoftWait-family hang"
+        );
+    }
+
+    #[test]
     fn never_spec_known_essential() {
         let a = choose_edge_action(&view(
-            None, Some(9), false, false, true, false, false, false, true, false,
+            None, Some(3), false, false, true, false, false, false, true, false,
         ));
-        assert!(matches!(a, EdgeAction::WaitFor(9)));
+        assert!(matches!(a, EdgeAction::WaitFor(3)));
         assert!(!matches!(a, EdgeAction::SpecRead));
     }
 
