@@ -388,7 +388,9 @@ impl Scheduler {
 
     fn set_ready_status(&self, tx_idx: TxIdx) {
         let mut tx = index_mutex!(self.transactions_status, tx_idx);
-        debug_assert_eq!(tx.status, IncarnationStatus::Aborting);
+        if tx.status != IncarnationStatus::Aborting {
+            return;
+        }
         tx.status = IncarnationStatus::ReadyToExecute;
         tx.incarnation += 1;
         self.set_done_flag(tx_idx, false);

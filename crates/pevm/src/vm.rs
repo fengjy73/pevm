@@ -1399,24 +1399,14 @@ pub(crate) struct Vm<'a, S: Storage, C: PevmChain> {
 }
 
 impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
-    /// A2 progressive DAG: published Data wakes Blocking waiters (not SoftWait Soft).
+    /// A2 progressive DAG: published Data notifies Blocking waiters (not SoftWait Soft).
+    /// Ready transition stays in `finish_execution` (dependents drain) — do not
+    /// `try_ready` here or release builds double-incarnate and corrupt.
     fn wake_on_data_publish(&self, writer: crate::TxIdx, locs: &[crate::MemoryLocationHash]) {
         for &loc in locs {
             self.specfence.sketch.push_spine(loc, writer);
-            let mut woken = self.specfence.wave.wake_location(loc);
-            woken.extend(self.specfence.dag.wake_on_data(loc, writer));
-            woken.sort_unstable();
-            woken.dedup();
-            for waiter in woken {
-                let detached = self.specfence.scheduler.detach_dependent(writer, waiter);
-                let readied = self.specfence.scheduler.try_ready_waiter(waiter);
-                if readied || detached {
-                    self.specfence.wave.push_ready(waiter);
-                    self.specfence
-                        .scheduler
-                        .admit_spine(waiter, self.specfence.wave);
-                }
-            }
+            let _ = self.specfence.wave.wake_location(loc);
+            let _ = self.specfence.dag.wake_on_data(loc, writer);
             self.specfence.metrics.record_data_publish_wake();
         }
     }
