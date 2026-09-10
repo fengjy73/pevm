@@ -3670,3 +3670,46 @@ fn specfence_iter25_silent_default_resume_path() {
         assert_eq!(parallel, sequential, "silent ResumePath must stay seq≡par: {m:?}");
     }
 }
+
+/// Complete-arch: SoftWait Soft=0; edge π records Bind/Spec/WaitFor; seq≡par on
+/// an ERC-20 cluster plus a second warm block (A6 prior).
+#[test]
+fn complete_arch_edge_pi_seq_eq_par_softwait0() {
+    let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 12, 6);
+    for i in 0..8 {
+        let (addr, account) = common::mock_account(77_000 + i);
+        state.insert(addr, account);
+        txs.push(self_transfer(addr, 1));
+    }
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+    let (par, m, mut pevm) = run_mode(ConcurrencyMode::SpecFence, &storage, txs.clone());
+    let chain = PevmEthereum::mainnet();
+    let sequential = execute_revm_sequential(
+        &chain,
+        &storage,
+        Default::default(),
+        BlockEnv::default(),
+        txs.clone(),
+    )
+    .expect("sequential");
+    assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
+    assert_eq!(par, sequential, "complete-arch must stay seq≡par: {m:?}");
+    assert!(
+        m.edge_bind + m.edge_spec + m.edge_wait_for > 0 || m.spec_read_count + m.bind_hits > 0,
+        "edge π or Bind/Spec path should fire: {m:?}"
+    );
+    // A6 warm second block on the same Pevm (prior H + templates).
+    let parallel = pevm
+        .execute_revm_parallel(
+            &chain,
+            &storage,
+            Default::default(),
+            BlockEnv::default(),
+            txs,
+            concurrency(),
+        )
+        .expect("parallel-warm");
+    let m2 = pevm.last_specfence_metrics().clone();
+    assert_eq!(m2.soft_wait_arms, 0, "warm SoftWait Soft=0: {m2:?}");
+    assert_eq!(parallel, sequential, "warm complete-arch seq≡par: {m2:?}");
+}

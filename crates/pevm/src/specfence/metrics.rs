@@ -224,6 +224,22 @@ pub struct SpecFenceMetrics {
     pub fanout_validate_defer: usize,
     /// Iter16: true_suffix SuffixRepair+barrier absorb (no FullRestart) on fan≥8 spine.
     pub fanout_absorb: usize,
+    /// A3: `choose_edge_action` Bind (published Data, no writer_done gate).
+    pub edge_bind: usize,
+    /// D6: essential wait-for (unpublished anti-dep).
+    pub edge_wait_for: usize,
+    /// A4/A2: independence-certified or canary Spec.
+    pub edge_spec: usize,
+    /// A2: first-wave Avoid broadcasts on publish.
+    pub avoid_broadcasts: usize,
+    /// A2: canary probes consumed.
+    pub canary_probes: usize,
+    /// A4: independence-certified Specs.
+    pub independent_specs: usize,
+    /// A1: clique/spine WaitFor (mass Spec gated).
+    pub spine_waits: usize,
+    /// A1: |H| at block end.
+    pub sketch_hot_size: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -323,6 +339,14 @@ pub(crate) struct MetricsInner {
     fanout_fr_collapse: AtomicUsize,
     fanout_validate_defer: AtomicUsize,
     fanout_absorb: AtomicUsize,
+    edge_bind: AtomicUsize,
+    edge_wait_for: AtomicUsize,
+    edge_spec: AtomicUsize,
+    avoid_broadcasts: AtomicUsize,
+    canary_probes: AtomicUsize,
+    independent_specs: AtomicUsize,
+    spine_waits: AtomicUsize,
+    sketch_hot_size: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -687,6 +711,38 @@ impl MetricsInner {
         self.fanout_absorb.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_edge_bind(&self) {
+        self.edge_bind.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_edge_wait_for(&self) {
+        self.edge_wait_for.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_edge_spec(&self) {
+        self.edge_spec.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_avoid_broadcast(&self) {
+        self.avoid_broadcasts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_canary_probe(&self) {
+        self.canary_probes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_independent_spec(&self) {
+        self.independent_specs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_spine_wait(&self) {
+        self.spine_waits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_sketch_hot_size(&self, n: usize) {
+        self.sketch_hot_size.store(n, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_jump_defer(&self) {
         self.jump_defer.fetch_add(1, Ordering::Relaxed);
     }
@@ -924,6 +980,14 @@ impl MetricsInner {
             fanout_fr_collapse: self.fanout_fr_collapse.load(Ordering::Relaxed),
             fanout_validate_defer: self.fanout_validate_defer.load(Ordering::Relaxed),
             fanout_absorb: self.fanout_absorb.load(Ordering::Relaxed),
+            edge_bind: self.edge_bind.load(Ordering::Relaxed),
+            edge_wait_for: self.edge_wait_for.load(Ordering::Relaxed),
+            edge_spec: self.edge_spec.load(Ordering::Relaxed),
+            avoid_broadcasts: self.avoid_broadcasts.load(Ordering::Relaxed),
+            canary_probes: self.canary_probes.load(Ordering::Relaxed),
+            independent_specs: self.independent_specs.load(Ordering::Relaxed),
+            spine_waits: self.spine_waits.load(Ordering::Relaxed),
+            sketch_hot_size: self.sketch_hot_size.load(Ordering::Relaxed),
         }
     }
 }

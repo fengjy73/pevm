@@ -1,18 +1,19 @@
-//! SpecFence **A+B+C unified** — access-grain Await + cheap resolve + dual-horizon π.
+//! SpecFence **complete CC** — A1–A6 / D1–D7 (not OCC-lite as control plane).
 //!
-//! Authoritative: `lab/notes/specfence-abc-unified-protocol.md` (+ native resolve).
-//! SpecFence is its **own** CC protocol — not optimized OCC.
+//! Authoritative: `lab/notes/specfence-complete-cc-architecture.md`.
+//! Family: preset-order hybrid OCC + ahead sketch + ordered admission +
+//! early-visible Bind + first-wave Avoid + piece-restricted resolve.
 //!
 //! # Single algorithm (hot path)
 //! ```text
-//! Inter prior → Quiet|Storm engagement     # C — actuates Await set
-//! Block-STM scheduler + MvMemory           # L0
+//! Inter prior → H + chain templates (A6)   # warm-start; decay on flip
+//! Block-STM scheduler + MvMemory           # L0 work-conserving
 //!     ↑
-//! Hot ℓ: BO Await→Bind; cold: OCC-lite     # A — SoftWait Soft ~0
+//! choose_edge_action (A1–A4, D6)           # Bind Data / WaitFor essential / Spec indep
 //!     ↑
-//! π = choose_action on hot candidates only # C intra
+//! First-wave Avoid on publish (A2)         # not block-end EMA
 //!     ↑
-//! Resolve: RebindOnly | SuffixRepair|Jump  # B — escalate→serial-barrier
+//! Resolve R1→R2→R3; R4 = failure (A5)
 //! ```
 //!
 //! **Avoid (A):** unfinished writer on hot program ℓ → BlockingOther prefer-steal
@@ -140,6 +141,8 @@ use alloy_primitives::Address;
 use hashbrown::HashMap;
 
 mod bayes;
+mod edge;
+mod sketch;
 mod engagement;
 mod prior;
 mod boundary;
@@ -155,14 +158,14 @@ mod rem;
 mod resolve;
 
 pub(crate) use bayes::{BayesMap, DEFAULT_TAU};
-pub(crate) use engagement::{AdaptiveEngagement, BlockEngagementMode, await_at_a_disabled, profile_timing_enabled, research_inspect_enabled, softwait_disabled};
+pub(crate) use engagement::{AdaptiveEngagement, profile_timing_enabled, research_inspect_enabled};
 pub(crate) use hotset::HotSet;
 #[allow(unused_imports)]
 pub(crate) use hotset::{H_A, H_W};
 pub(crate) use prior::RwPriorMap;
 pub(crate) use dag::{FenceGraph, SpecDag};
 pub(crate) use learner::{
-    AdaptiveParams, InterBlockPrior, LiveLearner, MorphWeights, TopLocPrior,
+    AdaptiveParams, InterBlockPrior, LiveLearner,
 };
 pub(crate) use heat::HeatMap;
 pub(crate) use metrics::MetricsInner;
@@ -199,7 +202,11 @@ pub(crate) use rem::{
     PendingPark, RegionAccess, RemTask, RepairPlan, ResearchAbortRepair, ResumeContinuation,
     StorageWriteReplay,
 };
-pub(crate) use resolve::{PolicyCtx, ResolveAction, choose_action, early_abort_candidate};
+pub(crate) use edge::{
+    choose_edge_action, EdgeAction, EdgeKey, EdgeKind, EdgeState, EdgeTable, EdgeView,
+};
+pub(crate) use sketch::HotSketch;
+pub(crate) use resolve::{PolicyCtx, ResolveAction, choose_action};
 #[allow(unused_imports)]
 pub(crate) use resolve::{
     BindTarget, EvScores, SelectiveOutcome, C_RETRY, COST_MARGIN, D_EARLY, D_WAIT, TAU_REVOKE,
@@ -217,7 +224,7 @@ pub enum ConcurrencyMode {
     Occ,
     /// Conservative PCC: hinted `from`/`to` accounts start in Wait.
     Pcc,
-    /// SpecFence v5: AEC π + FenceGraph SoftWait at location grain (Bayes = θ features).
+    /// SpecFence complete CC: sketch + edge π + early-visible Bind + R1–R4 resolve.
     SpecFence,
 }
 
@@ -295,6 +302,10 @@ pub(crate) struct SpecFenceCtx<'a> {
     pub learner: &'a LiveLearner,
     /// P1 tunable π constants.
     pub params: &'a AdaptiveParams,
+    /// D5: multi-touch EdgeTable `(ℓ, reader, k, depth)`.
+    pub edges: &'a EdgeTable,
+    /// A1/A2/A6: hot set H + chain templates + Avoid broadcast.
+    pub sketch: &'a HotSketch,
     /// Opt-in lab fine-grain OCC/RW tracer (None = disabled, zero cost).
     pub finegrain: Option<&'a crate::specfence::FineGrainCollector>,
 }

@@ -251,6 +251,8 @@ pub(crate) struct InterBlockPrior {
     top_l: Mutex<Vec<TopLocPrior>>,
     last_morph_hat: Mutex<MorphWeights>,
     flip_count: AtomicUsize,
+    /// A6: last `end_block` saw a morphology flip (warm-start decay).
+    last_flipped: AtomicUsize,
 }
 
 impl InterBlockPrior {
@@ -270,6 +272,11 @@ impl InterBlockPrior {
         self.flip_count.load(Ordering::Relaxed)
     }
 
+    /// A6: consume last-block morphology flip for sketch decay.
+    pub(crate) fn take_last_flipped(&self) -> bool {
+        self.last_flipped.swap(0, Ordering::Relaxed) != 0
+    }
+
     /// End-of-block: pack morph hat + top-ℓ; raise α on morphology flip.
     pub(crate) fn end_block(
         &self,
@@ -279,10 +286,13 @@ impl InterBlockPrior {
         let morph_hat = morph_hat.normalize();
         let mut ema = self.morph_ema.lock().unwrap();
         let kl = ema.divergence(morph_hat);
-        let alpha = if kl > FLIP_KL {
+        let flipped = kl > FLIP_KL;
+        let alpha = if flipped {
             self.flip_count.fetch_add(1, Ordering::Relaxed);
+            self.last_flipped.store(1, Ordering::Relaxed);
             ALPHA_FLIP
         } else {
+            self.last_flipped.store(0, Ordering::Relaxed);
             ALPHA_NORMAL
         };
         *ema = ema.ema(morph_hat, alpha);
@@ -300,6 +310,7 @@ impl InterBlockPrior {
         self.top_l.lock().unwrap().clear();
         *self.last_morph_hat.lock().unwrap() = MorphWeights::default();
         self.flip_count.store(0, Ordering::Relaxed);
+        self.last_flipped.store(0, Ordering::Relaxed);
     }
 }
 
@@ -860,6 +871,18 @@ impl LiveLearner {
 
     pub(crate) fn tx_heavy_hint(&self, gas_limit: u64, params: &AdaptiveParams) -> bool {
         gas_limit >= params.heavy_gas_limit
+    }
+
+    /// A6: per-ℓ abort rate for warm-seed decay.
+    pub(crate) fn abort_rate_of(&self, location: MemoryLocationHash) -> f64 {
+        self.locs
+            .get(&location)
+            .map(|e| {
+                let readers = e.readers.load(Ordering::Relaxed) as f64;
+                let aborts = e.aborts.load(Ordering::Relaxed) as f64;
+                aborts / readers.max(1.0)
+            })
+            .unwrap_or(0.0)
     }
 
     /// Pack top-ℓ for InterBlockPrior (by fanout then abort).

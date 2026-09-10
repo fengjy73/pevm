@@ -29,9 +29,9 @@ use crate::{
     scheduler::Scheduler,
     specfence::{
         AccountHints, AdaptiveEngagement, AdaptiveParams, BayesMap, ConcurrencyMode, DEFAULT_TAU,
-        HotSet, FineGrainCollector, FineGrainSnapshot, HeatMap, InterBlockPrior, LiveLearner,
-        LeanAbortRepair, MetricsInner, PartialRetryTable, RemCounters, ResearchAbortRepair, RwPriorMap, SpecDag,
-        SpecFenceCtx, SpecFenceMetrics, WaveParkTable, seed_wait_regions, update_bayes,
+        EdgeTable, HotSet, HotSketch, FineGrainCollector, FineGrainSnapshot, HeatMap, InterBlockPrior,
+        LiveLearner, LeanAbortRepair, MetricsInner, PartialRetryTable, RemCounters, ResearchAbortRepair,
+        RwPriorMap, SpecDag, SpecFenceCtx, SpecFenceMetrics, WaveParkTable, seed_wait_regions, update_bayes,
         update_heat, update_rw_prior,
     },
     storage::StorageWrapper,
@@ -437,6 +437,12 @@ impl Pevm {
         let rem = RemCounters::default();
         let partial_retry = PartialRetryTable::new(block_size);
         let wave = WaveParkTable::new();
+        let edges = EdgeTable::new();
+        let sketch = HotSketch::new();
+        if self.concurrency_mode == ConcurrencyMode::SpecFence {
+            let flipped = self.inter_prior.take_last_flipped();
+            sketch.seed_from_prior(&self.inter_prior.top_locations(), flipped);
+        }
         let wave_ref = if self.concurrency_mode == ConcurrencyMode::SpecFence {
             Some(&wave)
         } else {
@@ -477,6 +483,8 @@ impl Pevm {
             hotset: &self.hotset,
             learner: &learner,
             params: &self.adaptive_params,
+            edges: &edges,
+            sketch: &sketch,
             finegrain: finegrain_ref,
         };
 
@@ -594,7 +602,9 @@ impl Pevm {
             let morph_hat = learner.morph_hat();
             let top = learner.pack_top_locations();
             let _alpha = self.inter_prior.end_block(morph_hat, top);
+            sketch.decay_warm_failures(|loc| learner.abort_rate_of(loc));
             metrics_inner.set_soft_wait_arms(dag.soft_arm_count());
+            metrics_inner.set_sketch_hot_size(sketch.hot_size());
         }
         metrics_inner.set_engagement_metrics(
             engagement.lean_mode_txs(),
@@ -992,11 +1002,8 @@ fn try_validate(
         // (no park; SoftWait Soft=0), then recheck value_stable. Distinct from
         // abort-path escalate spins (Iter12/13a falsified). Measured: helps N5
         // median vs fra-only 14b (12.4 vs 13.1).
-        if !value_stable
-            && estimate_cleared
-            && specfence.engagement.is_storm()
-            && !invalid.is_empty()
-        {
+        // A5/R1: value-stable collapse is the resolve ladder, not Storm morph.
+        if !value_stable && estimate_cleared && !invalid.is_empty() {
             let mut need_validated = false;
             for &loc in &invalid {
                 let w = mv_memory

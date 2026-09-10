@@ -403,6 +403,133 @@ fn main() {
         ratios.iter().map(|r| r["sf_occ"].as_f64().unwrap()).sum::<f64>() / ratios.len() as f64
     };
     println!("  mean SF/OCC@8 = {mean:.3} (v8 baseline ~0.325 on different block set)");
+
+    // --- xblock: continuous warm/cold/OCC on 597/599/097 families ---
+    let xblock = std::env::var_os("SPECFENCE_G7_XBLOCK").is_some_and(|v| {
+        let s = v.to_string_lossy();
+        s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
+    }) || tag.contains("xblock")
+        || tag.contains("complete-arch");
+    if xblock {
+        println!("=== complete-arch xblock contiguous families ===");
+        let families: &[(&str, &[u64])] = &[
+            ("597", &[14_689_595, 14_689_596, 14_689_597, 14_689_598, 14_689_599]),
+            ("599", &[19_606_597, 19_606_598, 19_606_599, 19_606_600]),
+            ("097", &[19_469_096, 19_469_097, 19_469_098, 19_469_099]),
+        ];
+        let mut x_rows = Vec::new();
+        for (fam, blocks) in families {
+            // Warm SpecFence: one Pevm, inter-prior carries H + templates.
+            let mut warm = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
+            warm.reset_heat();
+            warm.reset_inter_prior();
+            for &bn in *blocks {
+                let Some(loaded) = load_block(
+                    &data_dir,
+                    bn,
+                    Arc::clone(&bytecodes),
+                    Arc::clone(&block_hashes),
+                ) else {
+                    continue;
+                };
+                let (ok, tps, wall_ms, soft, wh, aborts) =
+                    run_one(&chain, &mut warm, &loaded, 8);
+                let m = warm.last_specfence_metrics();
+                println!(
+                    "  fam={fam} block={bn} mode=sf-warm ok={ok} tps={tps:.0} wall_ms={wall_ms:.1} soft={soft} wait_hard={wh} aborts={aborts} edge_bind={} edge_wait={} edge_spec={} avoid={} canary={} indep={} spine={} hot={}",
+                    m.edge_bind,
+                    m.edge_wait_for,
+                    m.edge_spec,
+                    m.avoid_broadcasts,
+                    m.canary_probes,
+                    m.independent_specs,
+                    m.spine_waits,
+                    m.sketch_hot_size,
+                );
+                x_rows.push(serde_json::json!({
+                    "family": fam,
+                    "block": bn,
+                    "mode": "sf-warm",
+                    "ok": ok,
+                    "tps": tps,
+                    "wall_ms": wall_ms,
+                    "soft_wait_arms": soft,
+                    "wait_hard": wh,
+                    "occ_aborts": aborts,
+                    "full_restart": m.full_restart,
+                    "rebind_only": m.rebind_only,
+                    "edge_bind": m.edge_bind,
+                    "edge_wait_for": m.edge_wait_for,
+                    "edge_spec": m.edge_spec,
+                    "avoid_broadcasts": m.avoid_broadcasts,
+                    "canary_probes": m.canary_probes,
+                    "independent_specs": m.independent_specs,
+                    "spine_waits": m.spine_waits,
+                    "sketch_hot_size": m.sketch_hot_size,
+                    "wait_park_count": m.wait_park_count,
+                }));
+            }
+            for &bn in *blocks {
+                let Some(loaded) = load_block(
+                    &data_dir,
+                    bn,
+                    Arc::clone(&bytecodes),
+                    Arc::clone(&block_hashes),
+                ) else {
+                    continue;
+                };
+                for (label, mode) in [
+                    ("sf-cold", ConcurrencyMode::SpecFence),
+                    ("occ", ConcurrencyMode::Occ),
+                ] {
+                    let mut pevm = Pevm::with_concurrency_mode(mode);
+                    pevm.reset_heat();
+                    pevm.reset_inter_prior();
+                    let (ok, tps, wall_ms, soft, wh, aborts) =
+                        run_one(&chain, &mut pevm, &loaded, 8);
+                    let m = pevm.last_specfence_metrics();
+                    println!(
+                        "  fam={fam} block={bn} mode={label} ok={ok} tps={tps:.0} wall_ms={wall_ms:.1} soft={soft} wait_hard={wh} aborts={aborts}"
+                    );
+                    x_rows.push(serde_json::json!({
+                        "family": fam,
+                        "block": bn,
+                        "mode": label,
+                        "ok": ok,
+                        "tps": tps,
+                        "wall_ms": wall_ms,
+                        "soft_wait_arms": soft,
+                        "wait_hard": wh,
+                        "occ_aborts": aborts,
+                        "full_restart": m.full_restart,
+                        "rebind_only": m.rebind_only,
+                        "edge_bind": m.edge_bind,
+                        "edge_wait_for": m.edge_wait_for,
+                        "edge_spec": m.edge_spec,
+                        "avoid_broadcasts": m.avoid_broadcasts,
+                        "wait_park_count": m.wait_park_count,
+                    }));
+                }
+            }
+        }
+        let x_path = out_dir.join(if tag.is_empty() {
+            "complete-arch-xblock.json".to_string()
+        } else {
+            format!("{tag}-xblock.json")
+        });
+        std::fs::write(
+            &x_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "test": "complete-arch xblock warm/cold/OCC",
+                "tag": if tag.is_empty() { serde_json::Value::Null } else { serde_json::json!(tag) },
+                "families": ["597", "599", "097"],
+                "rows": x_rows,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        println!("wrote {x_path:?}");
+    }
     let sweep_path = out_dir.join(&sweep_name);
     std::fs::write(&sweep_path, serde_json::to_string_pretty(&serde_json::json!({
         "test": "SF vs OCC@8 architecture cores",
