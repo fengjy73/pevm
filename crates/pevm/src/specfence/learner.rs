@@ -235,6 +235,8 @@ pub(crate) struct TopLocPrior {
     pub location: MemoryLocationHash,
     pub fanout_ema: f64,
     pub abort_rate: f64,
+    /// Predicted wr-chain length (A1 spine), not a fanout stub.
+    pub chain_len_ema: f64,
 }
 
 const MAX_TOP_L: usize = 64;
@@ -898,6 +900,7 @@ impl LiveLearner {
                     location: *e.key(),
                     fanout_ema: readers,
                     abort_rate: aborts / obs,
+                    chain_len_ema: e.writers.load(Ordering::Relaxed) as f64,
                 }
             })
             .collect();
@@ -1008,6 +1011,7 @@ mod tests {
                 location: 42,
                 fanout_ema: 100.0,
                 abort_rate: 0.2,
+                chain_len_ema: 8.0,
             }],
         );
         assert!(alpha >= ALPHA_NORMAL);

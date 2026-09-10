@@ -5,6 +5,7 @@
 //! confidence (A6). SoftWait Soft is never armed from a sketch.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use dashmap::{DashMap, DashSet};
 
@@ -12,11 +13,15 @@ use crate::{BuildIdentityHasher, MemoryLocationHash, TxIdx};
 
 use super::learner::TopLocPrior;
 
-/// Predicted wr spine on a hot location.
+/// Live confidence floor — below this the template is not a Wait/H prior (A6).
+const CONF_LIVE: f64 = 0.20;
+
+/// Predicted wr spine on a hot location (order = preset tx index).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ChainTemplate {
     pub location: MemoryLocationHash,
     pub predicted_fanout: f64,
+    pub predicted_chain_len: f64,
     pub confidence: f64,
 }
 
@@ -62,6 +67,8 @@ const CLIQUE_SPEC_CAP: usize = 1;
 pub(crate) struct HotSketch {
     hot: DashSet<MemoryLocationHash, BuildIdentityHasher>,
     templates: DashMap<MemoryLocationHash, ChainTemplate, BuildIdentityHasher>,
+    /// Ordered writer indices per ℓ (version spine). Not fanout stubs.
+    spines: DashMap<MemoryLocationHash, Mutex<Vec<TxIdx>>, BuildIdentityHasher>,
     locs: DashMap<MemoryLocationHash, LocSketch, BuildIdentityHasher>,
     avoid: DashMap<MemoryLocationHash, (), BuildIdentityHasher>,
     warm_seeded: DashSet<MemoryLocationHash, BuildIdentityHasher>,
@@ -89,7 +96,7 @@ impl HotSketch {
             } else {
                 0.50 * decay
             };
-            if conf < 0.20 {
+            if conf < CONF_LIVE {
                 self.decay_events.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
@@ -102,6 +109,7 @@ impl HotSketch {
                 ChainTemplate {
                     location: top.location,
                     predicted_fanout: top.fanout_ema,
+                    predicted_chain_len: top.chain_len_ema.max(1.0),
                     confidence: conf,
                 },
             );
@@ -126,7 +134,7 @@ impl HotSketch {
         let e = self.locs.entry(location).or_default();
         e.publishes.fetch_add(1, Ordering::Relaxed);
         drop(e);
-        self.note_writer(location, writer);
+        self.push_spine(location, writer);
         if self.avoid.insert(location, ()).is_none() {
             self.avoid_broadcasts.fetch_add(1, Ordering::Relaxed);
             true
@@ -160,7 +168,55 @@ impl HotSketch {
     }
 
     pub(crate) fn predicted_writer(&self, location: MemoryLocationHash) -> Option<TxIdx> {
+        if let Some(e) = self.spines.get(&location) {
+            let v = e.lock().unwrap();
+            if let Some(&w) = v.first() {
+                return Some(w);
+            }
+        }
         self.locs.get(&location).and_then(|e| e.predicted_writer())
+    }
+
+    /// Push a writer onto the ordered spine (sorted unique).
+    pub(crate) fn push_spine(&self, location: MemoryLocationHash, writer: TxIdx) {
+        self.note_writer(location, writer);
+        let e = self.spines.entry(location).or_insert_with(|| Mutex::new(Vec::new()));
+        let mut v = e.lock().unwrap();
+        if let Err(i) = v.binary_search(&writer) {
+            v.insert(i, writer);
+        }
+    }
+
+    /// Closest lower writer on the version spine (A1 ordered admission).
+    pub(crate) fn next_writer_before(
+        &self,
+        location: MemoryLocationHash,
+        reader: TxIdx,
+    ) -> Option<TxIdx> {
+        if let Some(e) = self.spines.get(&location) {
+            let v = e.lock().unwrap();
+            if let Some(&w) = v.iter().rev().find(|&&w| w < reader) {
+                return Some(w);
+            }
+        }
+        self.locs
+            .get(&location)
+            .and_then(|e| e.predicted_writer())
+            .filter(|&w| w < reader)
+    }
+
+    pub(crate) fn spine_len(&self, location: MemoryLocationHash) -> usize {
+        self.spines
+            .get(&location)
+            .map(|e| e.lock().unwrap().len())
+            .unwrap_or(0)
+    }
+
+    /// A6: template is a live Wait/H prior only while confidence holds.
+    pub(crate) fn template_live(&self, location: MemoryLocationHash) -> bool {
+        self.templates
+            .get(&location)
+            .is_some_and(|t| t.confidence >= CONF_LIVE)
     }
 
     /// Try to consume the single canary Spec grant (A2).
@@ -204,11 +260,14 @@ impl HotSketch {
         }
     }
 
-    /// A4: no H, no Avoid, no template → independence-certified Spec.
+    /// A4: no H, no Avoid, no live template → independence-certified Spec.
     pub(crate) fn independence_certified(&self, location: MemoryLocationHash) -> bool {
-        !self.in_h(location)
-            && !self.avoid_broadcast(location)
-            && !self.templates.contains_key(&location)
+        !self.in_serial_lane(location)
+    }
+
+    /// Hot-record serialization lane (A4 contention-split).
+    pub(crate) fn in_serial_lane(&self, location: MemoryLocationHash) -> bool {
+        self.in_h(location) || self.avoid_broadcast(location) || self.template_live(location)
     }
 
     /// Essential unpublished anti-dep: H / Avoid / template / known writer.
@@ -228,7 +287,7 @@ impl HotSketch {
         self.in_h(location)
             || self.avoid_broadcast(location)
             || prior_ws
-            || self.templates.contains_key(&location)
+            || self.template_live(location)
     }
 
     pub(crate) fn hot_size(&self) -> usize {
@@ -252,14 +311,24 @@ impl HotSketch {
     }
 
     /// A6: decay warm-seeded ℓ that aborted heavily this block (warm≥cold fail).
+    /// Confidence drop below [`CONF_LIVE`] removes H + template (live, not stub).
     pub(crate) fn decay_warm_failures(&self, abort_rate: impl Fn(MemoryLocationHash) -> f64) {
         for loc in self.warm_seeded.iter() {
             let loc = *loc;
             if abort_rate(loc) >= 0.40 {
-                if let Some(mut t) = self.templates.get_mut(&loc) {
+                let drop = if let Some(mut t) = self.templates.get_mut(&loc) {
                     t.confidence *= 0.35;
-                }
+                    t.confidence < CONF_LIVE
+                } else {
+                    true
+                };
                 self.decay_events.fetch_add(1, Ordering::Relaxed);
+                if drop {
+                    self.templates.remove(&loc);
+                    if self.hot.remove(&loc).is_some() {
+                        self.hot_size.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
             }
         }
     }
@@ -277,6 +346,7 @@ mod tests {
                 location: 9,
                 fanout_ema: 32.0,
                 abort_rate: 0.1,
+                chain_len_ema: 4.0,
             }],
             false,
         );
@@ -302,9 +372,43 @@ mod tests {
     fn spine_keeps_lowest_writer() {
         let s = HotSketch::new();
         s.broadcast_avoid(1, 20);
-        s.note_writer(1, 7);
-        s.note_writer(1, 12);
+        s.push_spine(1, 7);
+        s.push_spine(1, 12);
         assert_eq!(s.predicted_writer(1), Some(7));
+    }
+
+    #[test]
+    fn ordered_spine_next_writer() {
+        let s = HotSketch::new();
+        s.push_spine(1, 20);
+        s.push_spine(1, 7);
+        s.push_spine(1, 12);
+        assert_eq!(s.next_writer_before(1, 15), Some(12));
+        assert_eq!(s.next_writer_before(1, 8), Some(7));
+        assert_eq!(s.next_writer_before(1, 7), None);
+        assert_eq!(s.spine_len(1), 3);
+        s.note_hot(1);
+        assert!(s.in_serial_lane(1));
+        assert!(!s.independence_certified(1));
+    }
+
+    #[test]
+    fn decay_drops_live_template() {
+        let s = HotSketch::new();
+        s.seed_from_prior(
+            &[TopLocPrior {
+                location: 4,
+                fanout_ema: 4.0,
+                abort_rate: 0.1,
+                chain_len_ema: 6.0,
+            }],
+            false,
+        );
+        assert!(s.template_live(4));
+        s.decay_warm_failures(|_| 0.9);
+        assert!(!s.template_live(4));
+        assert!(!s.in_h(4));
+        assert!(s.independence_certified(4));
     }
 
     #[test]
@@ -315,6 +419,7 @@ mod tests {
                 location: 3,
                 fanout_ema: 4.0,
                 abort_rate: 0.5,
+                chain_len_ema: 2.0,
             }],
             true,
         );

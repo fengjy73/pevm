@@ -920,6 +920,13 @@ fn try_validate(
             .iter()
             .filter_map(|l| specfence.partial_retry.first_k(tx_version.tx_idx, *l))
             .min();
+        // A5: EdgeKey (ℓ,reader,k,depth) drives piece-restricted k_fail.
+        if let Some(ek) = specfence
+            .edges
+            .min_k_of_invalid(tx_version.tx_idx, &invalid)
+        {
+            k_fail = Some(k_fail.map_or(ek, |k| k.min(ek)));
+        }
         let mut plan = None;
         if k_fail.is_none() {
             plan = specfence.partial_retry.plan_partial_retry(
@@ -1787,6 +1794,16 @@ fn try_validate(
         // OCC / PCC: full write-set ESTIMATE (unchanged).
         let occ_write_locs = mv_memory.write_locations(tx_version.tx_idx);
         mv_memory.convert_writes_to_estimates(tx_version.tx_idx);
+        // A2: ESTIMATE is a confirmed wr — flip Avoid in-batch for later readers.
+        if specfence.mode == ConcurrencyMode::SpecFence {
+            for &loc in &occ_write_locs {
+                specfence.sketch.push_spine(loc, tx_version.tx_idx);
+                if specfence.sketch.broadcast_avoid(loc, tx_version.tx_idx) {
+                    specfence.edges.broadcast_avoid(loc);
+                    specfence.metrics.record_avoid_broadcast();
+                }
+            }
+        }
         specfence.metrics.record_occ_abort();
         // OCC/PCC abort always restarts interpreter from tx head on next incarnation.
         specfence.metrics.record_full_restart();

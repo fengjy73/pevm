@@ -394,6 +394,42 @@ impl Scheduler {
         self.set_done_flag(tx_idx, false);
     }
 
+    /// A1/D6: pull the spine writer into the ready queue so WaitFor targets
+    /// make progress without Speccing known essentials.
+    pub(crate) fn admit_spine(&self, tx_idx: TxIdx, wave: &WaveParkTable) {
+        if tx_idx >= self.block_size {
+            return;
+        }
+        wave.push_ready(tx_idx);
+        self.execution_idx.fetch_min(tx_idx, Ordering::Relaxed);
+    }
+
+    /// Detach a waiter from a writer's dependents (Data-publish progressive wake).
+    pub(crate) fn detach_dependent(&self, writer: TxIdx, waiter: TxIdx) -> bool {
+        if writer >= self.block_size {
+            return false;
+        }
+        let mut deps = index_mutex!(self.transactions_dependents, writer);
+        let before = deps.len();
+        deps.retain(|t| *t != waiter);
+        before != deps.len()
+    }
+
+    /// Ready an Aborting waiter after Data publish (incarnation++). No-op otherwise.
+    pub(crate) fn try_ready_waiter(&self, tx_idx: TxIdx) -> bool {
+        if tx_idx >= self.block_size {
+            return false;
+        }
+        let mut tx = index_mutex!(self.transactions_status, tx_idx);
+        if tx.status != IncarnationStatus::Aborting {
+            return false;
+        }
+        tx.status = IncarnationStatus::ReadyToExecute;
+        tx.incarnation += 1;
+        self.set_done_flag(tx_idx, false);
+        true
+    }
+
     #[allow(dead_code)]
     pub(crate) fn finish_execution(
         &self,

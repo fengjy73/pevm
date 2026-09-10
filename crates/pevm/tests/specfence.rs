@@ -3713,3 +3713,44 @@ fn complete_arch_edge_pi_seq_eq_par_softwait0() {
     assert_eq!(m2.soft_wait_arms, 0, "warm SoftWait Soft=0: {m2:?}");
     assert_eq!(parallel, sequential, "warm complete-arch seq≡par: {m2:?}");
 }
+
+/// Gaps-closed: known essentials WaitFor or Bind (not Spec leak); SoftWait Soft=0;
+/// Avoid broadcast and Data-publish wake are live; seq≡par.
+#[test]
+fn gaps_closed_waitfor_avoid_publish_wake() {
+    let (state, bytecodes, txs) = erc20::generate_cluster(4, 12, 6);
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+    let (par, m, mut pevm) = run_mode(ConcurrencyMode::SpecFence, &storage, txs.clone());
+    let chain = PevmEthereum::mainnet();
+    let sequential = execute_revm_sequential(
+        &chain,
+        &storage,
+        Default::default(),
+        BlockEnv::default(),
+        txs.clone(),
+    )
+    .expect("sequential");
+    assert_eq!(par, sequential, "gaps-closed seq≡par: {m:?}");
+    assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
+    assert!(
+        m.avoid_broadcasts > 0 || m.edge_bind > 0,
+        "first-wave Avoid or Bind must fire: {m:?}"
+    );
+    let warm = pevm
+        .execute_revm_parallel(
+            &chain,
+            &storage,
+            Default::default(),
+            BlockEnv::default(),
+            txs,
+            concurrency(),
+        )
+        .expect("warm");
+    let m2 = pevm.last_specfence_metrics().clone();
+    assert_eq!(warm, sequential, "gaps-closed warm seq≡par: {m2:?}");
+    assert_eq!(m2.soft_wait_arms, 0, "warm SoftWait Soft=0: {m2:?}");
+    assert!(
+        m2.edge_wait_for + m2.edge_bind > 0,
+        "known essentials must Bind or WaitFor, not Spec-only: {m2:?}"
+    );
+}

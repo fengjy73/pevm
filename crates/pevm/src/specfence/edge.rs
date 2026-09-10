@@ -90,10 +90,6 @@ pub(crate) struct EdgeView {
     pub force_prefix: bool,
     /// A1: mass Spec on this clique is gated.
     pub clique_gated: bool,
-    /// D6 work-conserving: writer is Executing (admitted). Never WaitFor a
-    /// Ready/Aborting or higher-index identity — that inverts preset order
-    /// (`add_dependency(early, late)` ∧ `WaitFor(early)` = deadlock).
-    pub writer_admitted: bool,
 }
 
 /// Decide the protocol verb. Bounded optimism: known essential → Bind or WaitFor.
@@ -116,9 +112,8 @@ pub(crate) fn choose_edge_action(v: &EdgeView) -> EdgeAction {
     }
 
     // D6 / A1 / A2: unpublished essential → WaitFor, never Spec+retry.
-    // Hang-freedom: only WaitFor a *lower* admitted (Executing) writer.
-    // Predicted later-tx identity or a writer that has not started is Spec
-    // (work-conserving discovery) until the spine is actually running.
+    // Hang-freedom is admission (admit lower spine writers), not Spec.
+    // Inversion (w ≥ reader) is the only WaitFor reject.
     let must_wait = v.essential_antidep
         || v.avoid_broadcast
         || v.force_prefix
@@ -126,7 +121,7 @@ pub(crate) fn choose_edge_action(v: &EdgeView) -> EdgeAction {
         || (v.in_hot_set && !v.canary_ok && !v.independence_certified);
     if must_wait {
         if let Some(w) = v.writer {
-            if w < v.reader && v.writer_admitted {
+            if w < v.reader {
                 return EdgeAction::WaitFor(w);
             }
         }
@@ -229,6 +224,38 @@ impl EdgeTable {
     pub(crate) fn ww_count(&self) -> usize {
         self.ww_count.load(Ordering::Relaxed)
     }
+
+    /// A5: min access `k` among invalid ℓ for this reader (piece-restricted R2).
+    pub(crate) fn min_k_of_invalid(
+        &self,
+        reader: TxIdx,
+        invalid: &[MemoryLocationHash],
+    ) -> Option<usize> {
+        let mut min_k: Option<u32> = None;
+        for &loc in invalid {
+            for (key, _) in self.accesses_of(loc, reader) {
+                min_k = Some(min_k.map_or(key.access_k, |m| m.min(key.access_k)));
+            }
+        }
+        min_k.map(|k| k as usize)
+    }
+
+    /// Multi-touch: later frames of the same `(ℓ, reader)` after `access_k`.
+    pub(crate) fn later_touches(
+        &self,
+        location: MemoryLocationHash,
+        reader: TxIdx,
+        access_k: u32,
+    ) -> usize {
+        self.edges
+            .iter()
+            .filter(|e| {
+                e.key().location == location
+                    && e.key().reader == reader
+                    && e.key().access_k > access_k
+            })
+            .count()
+    }
 }
 
 #[cfg(test)]
@@ -264,7 +291,6 @@ mod tests {
             essential_antidep: essential,
             force_prefix: false,
             clique_gated: clique,
-            writer_admitted: true,
         }
     }
 
@@ -368,16 +394,12 @@ mod tests {
     }
 
     #[test]
-    fn never_wait_for_unadmitted_writer() {
-        let mut v = view(
+    fn wait_for_ready_known_essential() {
+        // Ready is not a Spec door — admission makes the writer progress.
+        let a = choose_edge_action(&view(
             None, Some(3), false, false, true, true, false, false, true, true,
-        );
-        v.writer_admitted = false;
-        assert_eq!(
-            choose_edge_action(&v),
-            EdgeAction::SpecRead,
-            "WaitFor(Ready) is SoftWait-family hang"
-        );
+        ));
+        assert_eq!(a, EdgeAction::WaitFor(3));
     }
 
     #[test]
@@ -412,5 +434,7 @@ mod tests {
         assert!(t.avoid_broadcast(5));
         assert!(!t.broadcast_avoid(5));
         assert_eq!(t.avoid_count(), 1);
+        assert_eq!(t.min_k_of_invalid(10, &[5]), Some(1));
+        assert_eq!(t.later_touches(5, 10, 1), 1);
     }
 }

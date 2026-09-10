@@ -71,6 +71,10 @@ pub(crate) struct FenceGraph {
     ready_hints: DashSet<TxIdx, BuildIdentityHasher>,
     /// Arm timestamps (best-effort revoke age / SoftWait latency).
     arm_started: DashMap<u64, Instant, BuildIdentityHasher>,
+    /// Blocking WaitFor (not SoftWait Soft): ℓ → [(waiter, writer)].
+    hard_waits: DashMap<MemoryLocationHash, Vec<(TxIdx, TxIdx)>, BuildIdentityHasher>,
+    /// Data-publish wakes of hard waiters (A2 progressive DAG).
+    hard_wake_count: AtomicUsize,
 }
 
 /// Backward-compatible name used across pevm / SpecFenceCtx.
@@ -317,6 +321,59 @@ impl FenceGraph {
         self.wake_count.load(Ordering::Relaxed)
     }
 
+    /// Arm a Blocking WaitFor edge. Does **not** increment SoftWait Soft.
+    pub(crate) fn arm_hard_wait(
+        &self,
+        location: MemoryLocationHash,
+        waiter: TxIdx,
+        writer: TxIdx,
+    ) {
+        self.hard_waits
+            .entry(location)
+            .or_default()
+            .push((waiter, writer));
+        self.ready_hints.remove(&waiter);
+    }
+
+    /// Progressive DAG: Data published by `writer` wakes Blocking waiters on ℓ.
+    pub(crate) fn wake_on_data(
+        &self,
+        location: MemoryLocationHash,
+        writer: TxIdx,
+    ) -> Vec<TxIdx> {
+        let mut woken = Vec::new();
+        let mut keep = Vec::new();
+        if let Some(mut v) = self.hard_waits.get_mut(&location) {
+            for (waiter, w) in v.drain(..) {
+                if w == writer || w < writer {
+                    if !woken.contains(&waiter) {
+                        woken.push(waiter);
+                    }
+                    self.ready_hints.insert(waiter);
+                } else {
+                    keep.push((waiter, w));
+                }
+            }
+            *v = keep;
+        }
+        if self
+            .hard_waits
+            .get(&location)
+            .is_none_or(|v| v.is_empty())
+        {
+            self.hard_waits.remove(&location);
+        }
+        if !woken.is_empty() {
+            self.hard_wake_count.fetch_add(woken.len(), Ordering::Relaxed);
+            self.wake_count.fetch_add(woken.len(), Ordering::Relaxed);
+        }
+        woken
+    }
+
+    pub(crate) fn hard_wake_count(&self) -> usize {
+        self.hard_wake_count.load(Ordering::Relaxed)
+    }
+
     // --- Legacy SpecDag facade (mirrors SoftWait) ---
 
     pub(crate) fn set_wait(&self, location: MemoryLocationHash) -> bool {
@@ -419,5 +476,19 @@ mod tests {
         assert_eq!(arms[0].waiter, 5);
         assert_eq!(arms[0].armed_at_k, 11);
         assert!(!g.has_soft_wait(1));
+    }
+
+    #[test]
+    fn hard_wait_wakes_on_data_not_soft() {
+        let g = FenceGraph::new();
+        g.arm_hard_wait(9, 4, 1);
+        g.arm_hard_wait(9, 5, 2);
+        assert_eq!(g.soft_arm_count(), 0);
+        let woken = g.wake_on_data(9, 1);
+        assert_eq!(woken, vec![4]);
+        assert_eq!(g.hard_wake_count(), 1);
+        let woken2 = g.wake_on_data(9, 2);
+        assert_eq!(woken2, vec![5]);
+        assert_eq!(g.soft_arm_count(), 0);
     }
 }

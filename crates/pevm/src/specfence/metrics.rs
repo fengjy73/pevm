@@ -240,6 +240,8 @@ pub struct SpecFenceMetrics {
     pub spine_waits: usize,
     /// A1: |H| at block end.
     pub sketch_hot_size: usize,
+    /// A2: Data-publish progressive wakes (Blocking, not SoftWait Soft).
+    pub data_publish_wakes: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -347,6 +349,7 @@ pub(crate) struct MetricsInner {
     independent_specs: AtomicUsize,
     spine_waits: AtomicUsize,
     sketch_hot_size: AtomicUsize,
+    data_publish_wakes: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -743,6 +746,10 @@ impl MetricsInner {
         self.sketch_hot_size.store(n, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_data_publish_wake(&self) {
+        self.data_publish_wakes.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_jump_defer(&self) {
         self.jump_defer.fetch_add(1, Ordering::Relaxed);
     }
@@ -988,6 +995,7 @@ impl MetricsInner {
             independent_specs: self.independent_specs.load(Ordering::Relaxed),
             spine_waits: self.spine_waits.load(Ordering::Relaxed),
             sketch_hot_size: self.sketch_hot_size.load(Ordering::Relaxed),
+            data_publish_wakes: self.data_publish_wakes.load(Ordering::Relaxed),
         }
     }
 }

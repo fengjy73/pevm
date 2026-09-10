@@ -480,10 +480,14 @@ impl<'a, S: Storage> VmDb<'a, S> {
         };
         let writer = mv_writer
             .or(residual_writer)
-            .or_else(|| self.specfence.sketch.predicted_writer(location_hash))
+            .or_else(|| {
+                self.specfence
+                    .sketch
+                    .next_writer_before(location_hash, self.tx_idx)
+            })
             .filter(|&w| w < self.tx_idx);
         if let Some(w) = writer {
-            self.specfence.sketch.note_writer(location_hash, w);
+            self.specfence.sketch.push_spine(location_hash, w);
         }
 
         let access_k = self.specfence.partial_retry.current_k(self.tx_idx) as u32;
@@ -566,9 +570,6 @@ impl<'a, S: Storage> VmDb<'a, S> {
             essential_antidep: essential,
             force_prefix,
             clique_gated,
-            writer_admitted: writer.is_some_and(|w| {
-                w < self.tx_idx && self.specfence.scheduler.is_executing(w)
-            }),
         };
         let action = choose_edge_action(&view);
 
@@ -594,9 +595,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     note_pending_effect_boundary(self.tx_idx, self.specfence.partial_retry);
                     return Ok(());
                 }
-                // Inversion / unadmitted: never add_dependency on w ≥ reader
-                // or a writer that is not Executing (Ready/Aborting hang family).
-                if w >= self.tx_idx || !self.specfence.scheduler.is_executing(w) {
+                // Inversion only: never add_dependency on w ≥ reader.
+                // Ready writers are admitted onto the spine queue (hang-freedom
+                // without Speccing a known essential).
+                if w >= self.tx_idx {
                     self.specfence.metrics.record_edge_spec();
                     self.specfence.metrics.record_spec_read();
                     note_pending_effect_boundary(self.tx_idx, self.specfence.partial_retry);
@@ -609,12 +611,19 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     note_pending_effect_boundary(self.tx_idx, self.specfence.partial_retry);
                     return Ok(());
                 }
-                if clique_gated || in_h {
+                if clique_gated || in_h || self.specfence.sketch.in_serial_lane(location_hash)
+                {
                     self.specfence.metrics.record_spine_wait();
                 }
                 self.specfence.metrics.record_edge_wait_for();
                 self.specfence.metrics.record_wait_hard();
                 self.specfence.metrics.record_wait(address);
+                self.specfence
+                    .dag
+                    .arm_hard_wait(location_hash, self.tx_idx, w);
+                self.specfence
+                    .scheduler
+                    .admit_spine(w, self.specfence.wave);
                 let armed_at_k =
                     self.specfence.partial_retry.current_k(self.tx_idx) as u64;
                 self.specfence.wave.set_pending_park(
@@ -1390,6 +1399,28 @@ pub(crate) struct Vm<'a, S: Storage, C: PevmChain> {
 }
 
 impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
+    /// A2 progressive DAG: published Data wakes Blocking waiters (not SoftWait Soft).
+    fn wake_on_data_publish(&self, writer: crate::TxIdx, locs: &[crate::MemoryLocationHash]) {
+        for &loc in locs {
+            self.specfence.sketch.push_spine(loc, writer);
+            let mut woken = self.specfence.wave.wake_location(loc);
+            woken.extend(self.specfence.dag.wake_on_data(loc, writer));
+            woken.sort_unstable();
+            woken.dedup();
+            for waiter in woken {
+                let detached = self.specfence.scheduler.detach_dependent(writer, waiter);
+                let readied = self.specfence.scheduler.try_ready_waiter(waiter);
+                if readied || detached {
+                    self.specfence.wave.push_ready(waiter);
+                    self.specfence
+                        .scheduler
+                        .admit_spine(waiter, self.specfence.wave);
+                }
+            }
+            self.specfence.metrics.record_data_publish_wake();
+        }
+    }
+
     pub(crate) fn new(
         chain: &'a C,
         spec_id: C::EvmSpecId,
@@ -2511,6 +2542,9 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     for loc in hotset_writer_locs {
                         self.specfence.hotset.note_writer(loc, tx_version.tx_idx);
                     }
+                    // A2: progressive DAG — Data is visible; wake Blocking waiters
+                    // before is_done (SoftWait Soft stays 0).
+                    self.wake_on_data_publish(tx_version.tx_idx, &locs);
                 }
                 if wrote_new_location {
                     flags |= FinishExecFlags::WroteNewLocation;
