@@ -87,11 +87,25 @@ impl HotSketch {
         Self::default()
     }
 
-    /// A6: warm-start H + templates from inter-block top-ℓ.
-    /// Flip / low-confidence priors decay; they do **not** arm Wait.
+    /// A6 / U6: warm-start H + templates from inter-block top-ℓ.
+    /// Flip / quiet / low-confidence priors decay; they do **not** arm Wait.
     pub(crate) fn seed_from_prior(&self, tops: &[TopLocPrior], flipped: bool) {
+        self.seed_from_prior_morph(tops, flipped, false);
+    }
+
+    /// U6: quiet morph (098↔599) extra-decays the prior so Fence bits do not
+    /// stick across a quiet follow-on block.
+    pub(crate) fn seed_from_prior_morph(
+        &self,
+        tops: &[TopLocPrior],
+        flipped: bool,
+        quiet: bool,
+    ) {
         for top in tops {
-            let decay = if flipped { 0.45 } else { 1.0 };
+            let mut decay = if flipped { 0.45 } else { 1.0 };
+            if quiet {
+                decay *= 0.40;
+            }
             let conf = if top.abort_rate >= 0.40 {
                 0.25 * decay
             } else if top.fanout_ema >= 8.0 {
@@ -191,6 +205,8 @@ impl HotSketch {
     }
 
     /// Closest lower writer on the version spine (A1 ordered admission).
+    /// U2: spine only — do not fall back to a sticky predicted-writer from a
+    /// prior incarnation that may no longer write ℓ.
     pub(crate) fn next_writer_before(
         &self,
         location: MemoryLocationHash,
@@ -202,10 +218,7 @@ impl HotSketch {
                 return Some(w);
             }
         }
-        self.locs
-            .get(&location)
-            .and_then(|e| e.predicted_writer())
-            .filter(|&w| w < reader)
+        None
     }
 
     pub(crate) fn spine_len(&self, location: MemoryLocationHash) -> usize {
@@ -318,22 +331,81 @@ impl HotSketch {
     }
 
     /// Closest unfinished lower writer on the spine (Fence target, not reader-1).
+    /// U2: no predicted-writer fallback (repair incarnations must not stick).
     pub(crate) fn next_unfinished_writer_before(
         &self,
         location: MemoryLocationHash,
         reader: TxIdx,
         is_done: impl Fn(TxIdx) -> bool,
     ) -> Option<TxIdx> {
+        self.unfinished_writers_before(location, reader, is_done)
+            .into_iter()
+            .next_back()
+    }
+
+    /// S4: every unfinished lower writer on this ℓ's spine (not only the tip).
+    pub(crate) fn unfinished_writers_before(
+        &self,
+        location: MemoryLocationHash,
+        reader: TxIdx,
+        is_done: impl Fn(TxIdx) -> bool,
+    ) -> Vec<TxIdx> {
         if let Some(e) = self.spines.get(&location) {
             let v = e.lock().unwrap();
-            if let Some(&w) = v.iter().rev().find(|&&w| w < reader && !is_done(w)) {
-                return Some(w);
-            }
+            return v
+                .iter()
+                .copied()
+                .filter(|&w| w < reader && !is_done(w))
+                .collect();
         }
-        self.locs
-            .get(&location)
-            .and_then(|e| e.predicted_writer())
-            .filter(|&w| w < reader && !is_done(w))
+        Vec::new()
+    }
+
+    /// U2: drop a writer that no longer publishes ℓ (suffix invalidate / abort).
+    /// Refreshes `predicted_writer` from the remaining spine — no min-sticky ghost.
+    pub(crate) fn forget_writer(&self, location: MemoryLocationHash, writer: TxIdx) {
+        if let Some(e) = self.spines.get(&location) {
+            let mut v = e.lock().unwrap();
+            if let Ok(i) = v.binary_search(&writer) {
+                v.remove(i);
+            }
+            let next = v.first().copied().unwrap_or(usize::MAX);
+            drop(v);
+            if let Some(loc) = self.locs.get(&location) {
+                loc.predicted_writer.store(next, Ordering::Relaxed);
+            }
+        } else if let Some(loc) = self.locs.get(&location) {
+            let _ = loc.predicted_writer.compare_exchange(
+                writer,
+                usize::MAX,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// U6: revoke warm-seeded H/templates that have no live Avoid.
+    /// Quiet morph (098↔599) must not keep prior Fences; live Avoid stays.
+    pub(crate) fn revoke_prior_fences_if_quiet(&self, quiet: bool) -> usize {
+        if !quiet {
+            return 0;
+        }
+        let mut n = 0usize;
+        for loc in self.warm_seeded.iter() {
+            let loc = *loc;
+            if self.avoid_broadcast(loc) {
+                continue;
+            }
+            if self.templates.remove(&loc).is_some() {
+                n += 1;
+            }
+            if self.hot.remove(&loc).is_some() {
+                self.hot_size.fetch_sub(1, Ordering::Relaxed);
+                n += 1;
+            }
+            self.decay_events.fetch_add(1, Ordering::Relaxed);
+        }
+        n
     }
 
     /// Essential unpublished anti-dep: H / Avoid / template / known writer.
@@ -541,5 +613,78 @@ mod tests {
             s.essential_antidep(2, false, false, false),
             "Avoid ∧ writer=None is still essential"
         );
+    }
+
+    #[test]
+    fn forget_writer_drops_predicted_stickiness() {
+        let s = HotSketch::new();
+        s.push_spine(1, 3);
+        s.push_spine(1, 9);
+        assert_eq!(s.next_writer_before(1, 10), Some(9));
+        s.forget_writer(1, 9);
+        assert_eq!(
+            s.next_writer_before(1, 10),
+            Some(3),
+            "U2: repair must not keep a dropped writer as the predicted tip"
+        );
+        s.forget_writer(1, 3);
+        assert_eq!(s.next_writer_before(1, 10), None);
+        assert_eq!(s.predicted_writer(1), None);
+    }
+
+    #[test]
+    fn multi_spine_unfinished_all_writers() {
+        let s = HotSketch::new();
+        s.push_spine(7, 2);
+        s.push_spine(7, 5);
+        s.push_spine(7, 11);
+        let live = s.unfinished_writers_before(7, 12, |w| w == 5);
+        assert_eq!(live, vec![2, 11], "S4: every unfinished writer on ℓ");
+    }
+
+    #[test]
+    fn quiet_revoke_drops_warm_fence_keeps_avoid() {
+        let s = HotSketch::new();
+        s.seed_from_prior_morph(
+            &[TopLocPrior {
+                location: 4,
+                fanout_ema: 16.0,
+                abort_rate: 0.05,
+                chain_len_ema: 3.0,
+            }],
+            true,
+            true,
+        );
+        // quiet × flip decay of 0.85 → 0.85*0.45*0.40 = 0.153 < CONF_LIVE
+        assert!(
+            !s.in_h(4),
+            "U6: quiet+flip must not seed a Fence prior"
+        );
+        s.seed_from_prior(
+            &[TopLocPrior {
+                location: 8,
+                fanout_ema: 16.0,
+                abort_rate: 0.05,
+                chain_len_ema: 3.0,
+            }],
+            false,
+        );
+        assert!(s.in_h(8));
+        assert!(s.broadcast_avoid(8, 1));
+        s.seed_from_prior(
+            &[TopLocPrior {
+                location: 9,
+                fanout_ema: 16.0,
+                abort_rate: 0.05,
+                chain_len_ema: 3.0,
+            }],
+            false,
+        );
+        assert!(s.in_h(9));
+        let n = s.revoke_prior_fences_if_quiet(true);
+        assert!(n >= 1, "warm ℓ without Avoid revoked: {n}");
+        assert!(!s.in_h(9));
+        assert!(s.in_h(8), "live Avoid is not a quiet-revoke target");
+        assert!(s.avoid_broadcast(8));
     }
 }

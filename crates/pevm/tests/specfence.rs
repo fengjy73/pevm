@@ -3805,3 +3805,58 @@ fn fence_cover_hot_region_after_canary() {
         "warm must Fence: {p2:?}"
     );
 }
+
+/// U1–U6 / S1 / S4: force_prefix carries a writer or serial Fence; no
+/// must_wait→Unfenced leak; SoftWait Soft=0; independents may still Unfence.
+#[test]
+fn general_fixes_force_prefix_writer_and_multi_spine() {
+    let (state, bytecodes, txs) = erc20::generate_cluster(5, 14, 7);
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+    let (par, m, mut pevm) = run_mode(ConcurrencyMode::SpecFence, &storage, txs.clone());
+    let chain = PevmEthereum::mainnet();
+    let sequential = execute_revm_sequential(
+        &chain,
+        &storage,
+        Default::default(),
+        BlockEnv::default(),
+        txs.clone(),
+    )
+    .expect("sequential");
+    assert_eq!(par, sequential, "general-fixes seq≡par: {m:?}");
+    assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
+    assert_eq!(
+        m.await_at_a_arms, 0,
+        "no EV Await@a door: {m:?}"
+    );
+    let p = pevm.last_exec_process();
+    assert_eq!(
+        p.force_prefix_none_unfenced, 0,
+        "U1: force_prefix ∧ live pred must not Unfence: {p:?}"
+    );
+    assert!(
+        p.bind_total + p.wait_for_total > 0 || m.edge_bind + m.edge_wait_for > 0,
+        "Fence verbs must fire: process={p:?} metrics={m:?}"
+    );
+    let warm = pevm
+        .execute_revm_parallel(
+            &chain,
+            &storage,
+            Default::default(),
+            BlockEnv::default(),
+            txs,
+            concurrency(),
+        )
+        .expect("warm");
+    let m2 = pevm.last_specfence_metrics().clone();
+    let p2 = pevm.last_exec_process();
+    assert_eq!(warm, sequential, "general-fixes warm seq≡par: {m2:?}");
+    assert_eq!(m2.soft_wait_arms, 0, "warm SoftWait Soft=0: {m2:?}");
+    assert_eq!(
+        p2.force_prefix_none_unfenced, 0,
+        "U1 warm: force_prefix Unfenced leak: {p2:?}"
+    );
+    assert!(
+        p2.independent_unfenced_total > 0 || m2.independent_unfenced > 0 || p2.unfenced_total > 0,
+        "S2: independents may still Unfence: {p2:?}"
+    );
+}

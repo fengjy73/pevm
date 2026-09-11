@@ -125,6 +125,7 @@ pub(crate) struct ProcessTrace {
     reasons: [AtomicUsize; REASON_N],
     seq: AtomicU64,
     locs: DashMap<MemoryLocationHash, LocProc, FxBuildHasher>,
+    force_prefix_none_unfenced: AtomicUsize,
 }
 
 /// One location's Fence / Unfenced split.
@@ -159,6 +160,8 @@ pub struct ExecProcessSnapshot {
     pub hot_fanout_l: Option<LocProcessSnap>,
     pub unfenced_after_fence_on_hot_l: usize,
     pub independent_unfenced_total: usize,
+    /// U1 leak counter: force_prefix ∧ writer unresolved → Unfenced (target 0).
+    pub force_prefix_none_unfenced: usize,
 }
 
 impl ProcessTrace {
@@ -233,6 +236,11 @@ impl ProcessTrace {
                 }
             }
         }
+    }
+
+    pub(crate) fn note_force_prefix_none_unfenced(&self) {
+        self.force_prefix_none_unfenced
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn note_avoid(&self, location: MemoryLocationHash) {
@@ -327,6 +335,9 @@ impl ProcessTrace {
             hot_fanout_l,
             unfenced_after_fence_on_hot_l,
             independent_unfenced_total,
+            force_prefix_none_unfenced: self
+                .force_prefix_none_unfenced
+                .load(Ordering::Relaxed),
         }
     }
 }

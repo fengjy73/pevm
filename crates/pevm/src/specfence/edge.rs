@@ -95,6 +95,10 @@ pub(crate) struct EdgeView {
     pub force_prefix: bool,
     /// A1: mass Unfenced on this clique is gated.
     pub clique_gated: bool,
+    /// U3: writer is actively Executing (WaitFor target).
+    pub writer_executing: bool,
+    /// S1: writer is ReadyToExecute (prefer-admit, not Unfenced hang-freedom).
+    pub writer_ready: bool,
 }
 
 /// Decide the protocol verb. Bounded Unfenced: known essential → Bind or WaitFor.
@@ -117,16 +121,16 @@ pub(crate) fn choose_edge_action(v: &EdgeView) -> EdgeAction {
         }
     }
 
-    // D6 / A1 / A2: unpublished essential → WaitFor, never Unfenced+retry.
+    // D6 / A1 / A2 / U1: unpublished essential → WaitFor, never Unfenced+retry.
     // Hang-freedom is admission (admit lower spine writers), not Unfenced.
+    // U3: runtime WaitFor-parks only Executing; Ready is prefer-admitted (S1).
+    // choose_edge_action still returns WaitFor(w) so the Region stays Fenced.
     // Inversion (w ≥ reader) is the only known-writer WaitFor reject.
-    // Clique gate is not independence-shortable when a writer is known.
     // Serial-lane WaitFor(reader-1) is only for known essentials without a
-    // resolved writer (force_prefix / Avoid / essential_antidep) — not for
-    // every forming clique (that WaitFor+admit_spine broke seq≡par).
-    let must_fence = v.essential_antidep
-        || v.avoid_broadcast
-        || v.force_prefix
+    // resolved writer (force_prefix / Avoid / essential_antidep).
+    let _ = (v.writer_executing, v.writer_ready);
+    let must_wait = v.essential_antidep || v.avoid_broadcast || v.force_prefix;
+    let must_fence = must_wait
         || (v.clique_gated && !v.canary_ok)
         || (v.in_hot_set && !v.canary_ok && !v.independence_certified);
     if must_fence {
@@ -135,10 +139,8 @@ pub(crate) fn choose_edge_action(v: &EdgeView) -> EdgeAction {
                 return EdgeAction::WaitFor(w);
             }
             // inversion: later/self writer is not a preset-order anti-dep
-        } else if v.reader > 0
-            && (v.force_prefix || v.avoid_broadcast || v.essential_antidep)
-        {
-            // Known essential, writer unresolved: serial-lane Fence.
+        } else if v.reader > 0 && must_wait {
+            // U1: force_prefix / Avoid / essential with no writer → serial Fence.
             return EdgeAction::WaitFor(v.reader - 1);
         }
         // Clique forming, no writer yet: first-wave Unfenced (not serial-all).
@@ -308,6 +310,8 @@ mod tests {
             essential_antidep: essential,
             force_prefix: false,
             clique_gated: clique,
+            writer_executing: false,
+            writer_ready: false,
         }
     }
 
@@ -469,6 +473,38 @@ mod tests {
             choose_edge_action(&v),
             EdgeAction::Unfenced,
             "tx0 has no serial pred"
+        );
+    }
+
+    #[test]
+    fn force_prefix_with_writer_never_unfenced() {
+        let mut v = view(
+            None, Some(2), false, false, true, false, false, true, false, false,
+        );
+        v.force_prefix = true;
+        v.writer_ready = true;
+        v.independence_certified = true;
+        assert_eq!(
+            choose_edge_action(&v),
+            EdgeAction::WaitFor(2),
+            "U1: force_prefix ∧ writer carries WaitFor, not indep Unfenced"
+        );
+        v.writer_executing = true;
+        v.writer_ready = false;
+        assert_eq!(choose_edge_action(&v), EdgeAction::WaitFor(2));
+    }
+
+    #[test]
+    fn prefer_admit_ready_does_not_unfence_must_wait() {
+        let mut v = view(
+            None, Some(3), false, false, true, true, false, true, true, true,
+        );
+        v.writer_ready = true;
+        v.writer_executing = false;
+        assert_eq!(
+            choose_edge_action(&v),
+            EdgeAction::WaitFor(3),
+            "S1+U3: Ready spine writer stays a Fence; admit is the hang door"
         );
     }
 

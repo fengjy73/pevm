@@ -505,6 +505,10 @@ impl<'a> SpecFenceCtx<'a> {
         if morph_revoke || bayes_revoke {
             let cleared_region = regions.clear_location_wait(location);
             let cleared_fence = self.dag.clear(location) > 0 || self.dag.clear_wait(location);
+            if morph.dominant_quiet() {
+                let n = self.sketch.revoke_prior_fences_if_quiet(true);
+                self.metrics.record_quiet_fence_revoke(n);
+            }
             if cleared_region || cleared_fence {
                 self.metrics.record_soft_edge_revoke();
                 return true;

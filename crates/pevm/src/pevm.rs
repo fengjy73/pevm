@@ -449,7 +449,16 @@ impl Pevm {
         let process = ProcessTrace::new();
         if self.concurrency_mode == ConcurrencyMode::SpecFence {
             let flipped = self.inter_prior.take_last_flipped();
-            sketch.seed_from_prior(&self.inter_prior.top_locations(), flipped);
+            let quiet = abc_prior_morph.is_some_and(|m| m.dominant_quiet());
+            sketch.seed_from_prior_morph(
+                &self.inter_prior.top_locations(),
+                flipped,
+                quiet,
+            );
+            if quiet {
+                let n = sketch.revoke_prior_fences_if_quiet(true);
+                metrics_inner.record_quiet_fence_revoke(n);
+            }
         }
         let wave_ref = if self.concurrency_mode == ConcurrencyMode::SpecFence {
             Some(&wave)
@@ -1088,6 +1097,7 @@ fn try_validate(
             specfence.metrics.record_partial_retry();
             specfence.metrics.record_rebind_only();
             specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
+            specfence.partial_retry.clear_force_writers(tx_version.tx_idx);
             specfence.partial_retry.clear_repair(tx_version.tx_idx);
             specfence.partial_retry.clear_ff_head(tx_version.tx_idx);
             specfence
@@ -1161,6 +1171,27 @@ fn try_validate(
         // SpecFence-native Lean resolve: SuffixRepair-first (RewindTo+FF when
         // checkpoint exists). Research inspect (`!lean_tx`) keeps separate plant API.
         if lean_tx {
+            // U4: R2/R4 keep ℓ→writer identity for the next incarnation.
+            for &loc in &invalid {
+                let w = mv_memory
+                    .last_writer_before(loc, tx_version.tx_idx)
+                    .or_else(|| {
+                        mv_memory.residual_writer_before(loc, tx_version.tx_idx)
+                    })
+                    .or_else(|| {
+                        specfence
+                            .sketch
+                            .next_writer_before(loc, tx_version.tx_idx)
+                    });
+                if let Some(w) = w.filter(|&w| w < tx_version.tx_idx) {
+                    specfence.partial_retry.note_force_writer(
+                        tx_version.tx_idx,
+                        loc,
+                        w,
+                    );
+                    specfence.metrics.record_writer_identity_preserved();
+                }
+            }
             // Dig: abort while prior ForceBind / SoftWait-wake still armed.
             let prior_force_bind = specfence
                 .partial_retry
@@ -1379,6 +1410,11 @@ fn try_validate(
                             .metrics
                             .record_selective_invalidate(estimated.len());
                     }
+                    for &loc in &estimated {
+                        specfence
+                            .sketch
+                            .forget_writer(loc, tx_version.tx_idx);
+                    }
                     if estimated.is_empty() {
                         if suffix_writes.is_empty() {
                             write_locations.clone()
@@ -1399,6 +1435,11 @@ fn try_validate(
                         specfence
                             .metrics
                             .record_selective_invalidate(estimated.len());
+                    }
+                    for &loc in &estimated {
+                        specfence
+                            .sketch
+                            .forget_writer(loc, tx_version.tx_idx);
                     }
                     if estimated.is_empty() {
                         if suffix_writes.is_empty() {
@@ -1856,6 +1897,9 @@ fn try_validate(
         specfence
             .partial_retry
             .clear_force_bind(tx_version.tx_idx);
+        specfence
+            .partial_retry
+            .clear_force_writers(tx_version.tx_idx);
         specfence.partial_retry.clear_repair(tx_version.tx_idx);
         specfence.partial_retry.clear_ff_head(tx_version.tx_idx);
         specfence

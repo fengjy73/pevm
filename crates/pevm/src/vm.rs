@@ -475,24 +475,28 @@ impl<'a, S: Storage> VmDb<'a, S> {
             .as_ref()
             .map(|v| v.tx_idx)
             .or_else(|| self.mv_memory.last_writer_before(location_hash, self.tx_idx));
-        // Resolve writer for Fence: residual is not force-only. Avoid / repair
-        // with writer=None must still produce WaitFor/Bind, not Unfenced.
+        // U1/U4: residual + repair-carried writer id. U2: do not use a sticky
+        // predicted-writer from a prior incarnation as the identity.
         let residual_writer = if mv_writer.is_none() {
             self.mv_memory.residual_writer_before(location_hash, self.tx_idx)
         } else {
             None
         };
-        let writer = mv_writer
-            .or(residual_writer)
+        let force_writer = self
+            .specfence
+            .partial_retry
+            .force_writer(self.tx_idx, location_hash);
+        let observed = mv_writer.or(residual_writer).or(force_writer);
+        if let Some(w) = observed.filter(|&w| w < self.tx_idx) {
+            self.specfence.sketch.push_spine(location_hash, w);
+        }
+        let writer = observed
             .or_else(|| {
                 self.specfence
                     .sketch
                     .next_writer_before(location_hash, self.tx_idx)
             })
             .filter(|&w| w < self.tx_idx);
-        if let Some(w) = writer {
-            self.specfence.sketch.push_spine(location_hash, w);
-        }
 
         let access_k = self.specfence.partial_retry.current_k(self.tx_idx) as u32;
         let access_depth = self
@@ -583,9 +587,36 @@ impl<'a, S: Storage> VmDb<'a, S> {
             essential_antidep: essential,
             force_prefix,
             clique_gated,
+            writer_executing: writer
+                .is_some_and(|w| self.specfence.scheduler.is_executing(w)),
+            writer_ready: writer.is_some_and(|w| self.specfence.scheduler.is_ready(w)),
         };
         let action = choose_edge_action(&view);
         let canary_taken = self.specfence.sketch.canary_taken(location_hash);
+        let must_wait = force_prefix || avoid || essential;
+
+        // S1+S4: prefer-admit every unfinished spine writer on this ℓ (096/097
+        // multi-spine), including Ready, before independence Unfenced.
+        let is_done = |t: TxIdx| self.specfence.scheduler.is_done(t);
+        let unfinished = self.specfence.sketch.unfinished_writers_before(
+            location_hash,
+            self.tx_idx,
+            is_done,
+        );
+        if !unfinished.is_empty() {
+            self.specfence
+                .scheduler
+                .admit_spine_writers(&unfinished, self.specfence.wave);
+            if unfinished
+                .iter()
+                .any(|&w| self.specfence.scheduler.is_ready(w))
+            {
+                self.specfence.metrics.record_prefer_admit();
+            }
+            if unfinished.len() > 1 {
+                self.specfence.metrics.record_multi_spine_admit();
+            }
+        }
 
         match action {
             EdgeAction::Bind(v) => {
@@ -616,8 +647,31 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 clique_gated,
                 canary_taken,
                 force_prefix,
+                must_wait,
             ),
             EdgeAction::Unfenced => {
+                // U5/U1: force_prefix must not Unfence. Do **not** serial-lane
+                // every Avoid/essential (that WaitFor(reader-1) broke seq≡par).
+                if force_prefix {
+                    debug_assert!(
+                        writer.is_some_and(|w| w >= self.tx_idx),
+                        "U5: force_prefix ∧ writer < reader must not Unfence (writer={writer:?})"
+                    );
+                    let target = writer.filter(|&w| w < self.tx_idx).unwrap_or_else(|| {
+                        self.tx_idx.saturating_sub(1)
+                    });
+                    return self.fence_wait_for(
+                        address,
+                        location_hash,
+                        target,
+                        avoid,
+                        in_h,
+                        clique_gated,
+                        canary_taken,
+                        force_prefix,
+                        true,
+                    );
+                }
                 let reason = if avoid {
                     ProcessReason::UnfencedAfterAvoid
                 } else if canary_ok {
@@ -668,8 +722,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
         clique_gated: bool,
         canary_taken: bool,
         force_prefix: bool,
+        must_wait: bool,
     ) -> Result<(), ReadError> {
-        if crate::specfence::plant_tls_active() {
+        // U1: plant TLS must not Unfence a force_prefix / must_wait Region.
+        if crate::specfence::plant_tls_active() && !must_wait {
             self.specfence.process.record(
                 location_hash,
                 self.tx_idx,
@@ -708,15 +764,50 @@ impl<'a, S: Storage> VmDb<'a, S> {
         }
 
         let is_done = |t: TxIdx| self.specfence.scheduler.is_done(t);
-        let unfinished = self.specfence.sketch.next_unfinished_writer_before(
+        let is_executing = |t: TxIdx| self.specfence.scheduler.is_executing(t);
+        let unfinished_all = self.specfence.sketch.unfinished_writers_before(
             location_hash,
             self.tx_idx,
             is_done,
         );
-        let requested_live = (requested < self.tx_idx && !is_done(requested)).then_some(requested);
+        // S4: admit the whole ℓ spine, not only the WaitFor tip.
+        if !unfinished_all.is_empty() {
+            self.specfence
+                .scheduler
+                .admit_spine_writers(&unfinished_all, self.specfence.wave);
+            if unfinished_all.len() > 1 {
+                self.specfence.metrics.record_multi_spine_admit();
+            }
+        }
+        // U3: park only on a lower Executing writer; Ready is already admitted.
+        let unfinished_exec = unfinished_all
+            .iter()
+            .copied()
+            .rev()
+            .find(|&w| is_executing(w));
+        let requested_exec =
+            (requested < self.tx_idx && is_executing(requested)).then_some(requested);
+        let requested_live =
+            (requested < self.tx_idx && !is_done(requested)).then_some(requested);
 
-        let (target, reason) = if let Some(w) = unfinished {
+        let (target, reason) = if let Some(w) = unfinished_exec.or(requested_exec) {
             (Some(w), ProcessReason::WaitForWriter)
+        } else if force_prefix {
+            // U1: repair prefix stays Fenced. Prefer a live spine writer after
+            // admit; else serial-lane pred. Not used for plain Avoid (seq≠par).
+            if let Some(w) = unfinished_all.iter().copied().rev().next().or(requested_live)
+            {
+                let r = if w + 1 == self.tx_idx {
+                    ProcessReason::WaitForSerial
+                } else {
+                    ProcessReason::WaitForPrefix
+                };
+                (Some(w), r)
+            } else if self.tx_idx > 0 && !is_done(self.tx_idx - 1) {
+                (Some(self.tx_idx - 1), ProcessReason::WaitForSerial)
+            } else {
+                (None, ProcessReason::UnfencedWriterDone)
+            }
         } else if let Some(w) = requested_live {
             let r = if w + 1 == self.tx_idx {
                 ProcessReason::WaitForSerial
@@ -770,10 +861,17 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return Err(ReadError::Blocking(t));
         }
 
-        // No live wait target and no Data. Storage-origin if Avoid already
-        // fired (writer finished without a readable version). Not hang-freedom
-        // Unfenced on a still-unpublished essential — that case WaitFor'd above.
-        let leak = if avoid {
+        // No live wait target and no Data. Storage-origin if the writer
+        // finished without a readable version. must_wait already tried serial
+        // lane above — Unfenced here is not hang-freedom.
+        // U1 leak: force_prefix Unfenced while a serial pred is still live.
+        if force_prefix && self.tx_idx > 0 && !is_done(self.tx_idx - 1) {
+            self.specfence.process.note_force_prefix_none_unfenced();
+            self.specfence.metrics.record_force_prefix_unfenced();
+        }
+        let leak = if must_wait {
+            ProcessReason::UnfencedWriterDone
+        } else if avoid {
             ProcessReason::UnfencedAfterAvoid
         } else {
             ProcessReason::UnfencedWriterDone

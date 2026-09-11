@@ -239,23 +239,28 @@ fn main() {
                 walls.push(wall_ms);
                 softs.push(soft as f64);
                 aborts_v.push(aborts as f64);
-                if bn == 14_689_597 && mode == "specfence" && (iters == 1 || i + 1 == iters) {
+                if matches!(bn, 14_689_597 | 19_606_599 | 19_469_097)
+                    && mode == "specfence"
+                    && (iters == 1 || i + 1 == iters)
+                {
                     let proc = pevm.last_exec_process();
                     let pname = if tag.is_empty() {
-                        "exec-process-597-fence-cover.json".to_string()
+                        format!("exec-process-{bn}-fence-cover.json")
                     } else {
-                        format!("exec-process-597-fence-{tag}.json")
+                        format!("exec-process-{bn}-{tag}.json")
                     };
                     let ppath = out_dir.join(&pname);
                     let hot = proc.hot_fanout_l.as_ref();
                     println!(
-                        "  process-597 unfenced={} wait={} bind={} unfenced_after_avoid={} hot_l_unfenced_after_fence={} indep={} hot_l={:?}",
+                        "  process-{bn} unfenced={} wait={} bind={} unfenced_after_avoid={} force_prefix_none_unfenced={} hot_l_unfenced_after_fence={} indep={} reasons={:?} hot_l={:?}",
                         proc.unfenced_total,
                         proc.wait_for_total,
                         proc.bind_total,
                         proc.unfenced_after_avoid_total,
+                        proc.force_prefix_none_unfenced,
                         proc.unfenced_after_fence_on_hot_l,
                         proc.independent_unfenced_total,
+                        proc.reason_histogram,
                         hot.map(|h| (h.location, h.unfenced, h.wait_for, h.bind, h.unfenced_after_avoid, h.unfenced_after_canary)),
                     );
                     std::fs::write(
@@ -275,6 +280,11 @@ fn main() {
                                 "independent_unfenced": m.independent_unfenced,
                                 "soft_wait_arms": m.soft_wait_arms,
                                 "occ_aborts": m.occ_aborts,
+                                "force_prefix_unfenced": m.force_prefix_unfenced,
+                                "prefer_admit": m.prefer_admit,
+                                "multi_spine_admit": m.multi_spine_admit,
+                                "quiet_fence_revoke": m.quiet_fence_revoke,
+                                "writer_identity_preserved": m.writer_identity_preserved,
                             },
                             "process": proc,
                         }))
@@ -551,6 +561,11 @@ fn main() {
                     "spine_waits": m.spine_waits,
                     "sketch_hot_size": m.sketch_hot_size,
                     "wait_park_count": m.wait_park_count,
+                    "force_prefix_unfenced": m.force_prefix_unfenced,
+                    "prefer_admit": m.prefer_admit,
+                    "multi_spine_admit": m.multi_spine_admit,
+                    "quiet_fence_revoke": m.quiet_fence_revoke,
+                    "writer_identity_preserved": m.writer_identity_preserved,
                 }));
             }
             for &bn in *blocks {

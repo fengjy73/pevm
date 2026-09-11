@@ -406,6 +406,24 @@ impl Scheduler {
         self.execution_idx.fetch_min(tx_idx, Ordering::Relaxed);
     }
 
+    /// S4: admit every unfinished writer on one ℓ (096/097 multi-spine), not
+    /// only the closest / max-writers tip.
+    pub(crate) fn admit_spine_writers(&self, writers: &[TxIdx], wave: &WaveParkTable) {
+        for &w in writers {
+            self.admit_spine(w, wave);
+        }
+    }
+
+    /// True when the incarnation is queued `ReadyToExecute` (S1 prefer-admit).
+    #[inline]
+    pub(crate) fn is_ready(&self, tx_idx: TxIdx) -> bool {
+        if tx_idx >= self.block_size {
+            return false;
+        }
+        let tx = index_mutex!(self.transactions_status, tx_idx);
+        tx.status == IncarnationStatus::ReadyToExecute
+    }
+
     /// Detach a waiter from a writer's dependents (Data-publish progressive wake).
     pub(crate) fn detach_dependent(&self, writer: TxIdx, waiter: TxIdx) -> bool {
         if writer >= self.block_size {

@@ -813,6 +813,12 @@ pub(crate) struct PartialRetryTable {
     states: Vec<UnsafeCell<PartialRetryState>>,
     /// Locations π must Bind/WaitHard on the next incarnation of `t`.
     force_bind: DashMap<TxIdx, Vec<MemoryLocationHash>, BuildIdentityHasher>,
+    /// U4: ℓ→writer identity preserved across R2/R4 (not predicted-writer sticky).
+    force_writers: DashMap<
+        TxIdx,
+        HashMap<MemoryLocationHash, TxIdx, BuildIdentityHasher>,
+        BuildIdentityHasher,
+    >,
     /// SoftWait wake consumed; next validation outcome → soft_wait_wake_{ok,reabort}.
     post_softwait_wake: DashMap<TxIdx, (), BuildIdentityHasher>,
     /// Tx currently parked via FenceGraph SoftWait (not EarlyAbort-only park).
@@ -868,6 +874,7 @@ impl PartialRetryTable {
                 .map(|_| UnsafeCell::new(PartialRetryState::default()))
                 .collect(),
             force_bind: DashMap::default(),
+            force_writers: DashMap::default(),
             post_softwait_wake: DashMap::default(),
             softwait_parked: DashMap::default(),
             post_await_at_a_wake: DashMap::default(),
@@ -1378,6 +1385,38 @@ impl PartialRetryTable {
         self.force_bind.remove(&tx_idx);
     }
 
+    /// U4: record the observed writer of ℓ for the next incarnation.
+    pub(crate) fn note_force_writer(
+        &self,
+        tx_idx: TxIdx,
+        location: MemoryLocationHash,
+        writer: TxIdx,
+    ) {
+        if writer >= tx_idx {
+            return;
+        }
+        self.force_writers
+            .entry(tx_idx)
+            .or_default()
+            .insert(location, writer);
+    }
+
+    /// U1/U4: resolvable writer id carried on force_prefix / repair.
+    pub(crate) fn force_writer(
+        &self,
+        tx_idx: TxIdx,
+        location: MemoryLocationHash,
+    ) -> Option<TxIdx> {
+        self.force_writers
+            .get(&tx_idx)
+            .and_then(|m| m.get(&location).copied())
+            .filter(|&w| w < tx_idx)
+    }
+
+    pub(crate) fn clear_force_writers(&self, tx_idx: TxIdx) {
+        self.force_writers.remove(&tx_idx);
+    }
+
     /// True when a certified-prefix force_bind set is armed for this tx.
     pub(crate) fn has_force_bind(&self, tx_idx: TxIdx) -> bool {
         self.force_bind
@@ -1531,6 +1570,8 @@ impl PartialRetryTable {
             }
         }
         self.clear_force_bind(tx_idx);
+        // U4: keep ℓ→writer identity through R4 FullRestart. force_prefix may
+        // be cleared; the next incarnation still resolves the same writer.
         self.clear_repair(tx_idx);
         self.clear_suffix_repair_depth(tx_idx);
         self.needs_live_capture.remove(&tx_idx);
@@ -2920,6 +2961,23 @@ mod abort_cheapening_tests {
         assert!(table.ff_value(0, loc).is_some(), "ff_value via ff_head");
         table.clear_ff_head(0);
         assert!(table.ff_value(0, loc).is_none());
+    }
+
+    #[test]
+    fn r2_r4_preserve_location_writer_identity() {
+        let table = PartialRetryTable::new(4);
+        table.note_force_writer(2, 99, 1);
+        assert_eq!(table.force_writer(2, 99), Some(1));
+        table.set_force_bind(2, vec![99]);
+        let _ = table.escalate_full_restart(2);
+        assert!(!table.has_force_bind(2), "R4 drops force_bind");
+        assert_eq!(
+            table.force_writer(2, 99),
+            Some(1),
+            "U4: R4 keeps ℓ→writer identity"
+        );
+        table.clear_force_writers(2);
+        assert_eq!(table.force_writer(2, 99), None);
     }
 
     #[test]

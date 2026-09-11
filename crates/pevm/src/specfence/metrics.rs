@@ -242,6 +242,16 @@ pub struct SpecFenceMetrics {
     pub sketch_hot_size: usize,
     /// A2: Data-publish progressive wakes (Blocking, not SoftWait Soft).
     pub data_publish_wakes: usize,
+    /// U1/U5: must_wait/force_prefix fell through to Unfenced (should stay ~0).
+    pub force_prefix_unfenced: usize,
+    /// S1: Ready spine writer prefer-admitted before independence Unfenced.
+    pub prefer_admit: usize,
+    /// S4: admitted more than one unfinished writer on the same ℓ.
+    pub multi_spine_admit: usize,
+    /// U6: quiet morph revoked a prior-seeded Fence (not live Avoid).
+    pub quiet_fence_revoke: usize,
+    /// U4: ℓ→writer identity stored across R2/R4.
+    pub writer_identity_preserved: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -350,6 +360,11 @@ pub(crate) struct MetricsInner {
     spine_waits: AtomicUsize,
     sketch_hot_size: AtomicUsize,
     data_publish_wakes: AtomicUsize,
+    force_prefix_unfenced: AtomicUsize,
+    prefer_admit: AtomicUsize,
+    multi_spine_admit: AtomicUsize,
+    quiet_fence_revoke: AtomicUsize,
+    writer_identity_preserved: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -750,6 +765,29 @@ impl MetricsInner {
         self.data_publish_wakes.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_force_prefix_unfenced(&self) {
+        self.force_prefix_unfenced.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_prefer_admit(&self) {
+        self.prefer_admit.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_multi_spine_admit(&self) {
+        self.multi_spine_admit.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_quiet_fence_revoke(&self, n: usize) {
+        if n > 0 {
+            self.quiet_fence_revoke.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn record_writer_identity_preserved(&self) {
+        self.writer_identity_preserved
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_jump_defer(&self) {
         self.jump_defer.fetch_add(1, Ordering::Relaxed);
     }
@@ -996,6 +1034,11 @@ impl MetricsInner {
             spine_waits: self.spine_waits.load(Ordering::Relaxed),
             sketch_hot_size: self.sketch_hot_size.load(Ordering::Relaxed),
             data_publish_wakes: self.data_publish_wakes.load(Ordering::Relaxed),
+            force_prefix_unfenced: self.force_prefix_unfenced.load(Ordering::Relaxed),
+            prefer_admit: self.prefer_admit.load(Ordering::Relaxed),
+            multi_spine_admit: self.multi_spine_admit.load(Ordering::Relaxed),
+            quiet_fence_revoke: self.quiet_fence_revoke.load(Ordering::Relaxed),
+            writer_identity_preserved: self.writer_identity_preserved.load(Ordering::Relaxed),
         }
     }
 }
