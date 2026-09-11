@@ -686,7 +686,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
         Ok(())
     }
 
-    /// P2 EarlyVal after a SpecRead origin is recorded: certify or abort early.
+    /// P2 EarlyVal after an Unfenced origin is recorded: certify or abort early.
     fn maybe_early_val(
         &mut self,
         address: Address,
@@ -706,7 +706,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
             .specfence
             .bayes
             .conflict_probability(location_hash, Some(&address));
-        // Only EarlyVal when cheap/pressure: high P_conflict or hot SpecRead.
+        // Only EarlyVal when cheap/pressure: high P_conflict or hot Unfenced.
         if early_val_probability(posterior) < 0.35
             && self.mv_memory.regions.location_mode(location_hash)
                 != crate::specfence::RegionMode::Wait
