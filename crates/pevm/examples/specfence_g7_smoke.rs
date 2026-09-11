@@ -232,6 +232,12 @@ fn main() {
                 };
                 pevm.reset_heat();
                 pevm.reset_inter_prior();
+                let dump_pertx = matches!(bn, 14_689_597 | 19_606_599 | 19_469_097)
+                    && mode == "specfence"
+                    && (iters == 1 || i + 1 == iters);
+                if dump_pertx {
+                    pevm.set_finegrain_trace(true);
+                }
                 let (ok, tps, wall_ms, soft, wh, aborts) = run_one(&chain, &mut pevm, &loaded, 8);
                 let m = pevm.last_specfence_metrics();
                 let n = n_tx(&loaded.block);
@@ -252,7 +258,7 @@ fn main() {
                     let ppath = out_dir.join(&pname);
                     let hot = proc.hot_fanout_l.as_ref();
                     println!(
-                        "  process-{bn} unfenced={} wait={} bind={} unfenced_after_avoid={} force_prefix_none_unfenced={} hot_l_unfenced_after_fence={} indep={} reasons={:?} hot_l={:?}",
+                        "  process-{bn} unfenced={} wait={} bind={} unfenced_after_avoid={} force_prefix_none_unfenced={} hot_l_unfenced_after_fence={} indep={} per_tx={} reasons={:?} hot_l={:?}",
                         proc.unfenced_total,
                         proc.wait_for_total,
                         proc.bind_total,
@@ -260,9 +266,33 @@ fn main() {
                         proc.force_prefix_none_unfenced,
                         proc.unfenced_after_fence_on_hot_l,
                         proc.independent_unfenced_total,
+                        proc.per_tx.len(),
                         proc.reason_histogram,
                         hot.map(|h| (h.location, h.unfenced, h.wait_for, h.bind, h.unfenced_after_avoid, h.unfenced_after_canary)),
                     );
+                    let metrics_json = serde_json::json!({
+                        "edge_bind": m.edge_bind,
+                        "edge_wait_for": m.edge_wait_for,
+                        "edge_unfenced": m.edge_unfenced,
+                        "avoid_broadcasts": m.avoid_broadcasts,
+                        "canary_probes": m.canary_probes,
+                        "independent_unfenced": m.independent_unfenced,
+                        "soft_wait_arms": m.soft_wait_arms,
+                        "occ_aborts": m.occ_aborts,
+                        "force_prefix_unfenced": m.force_prefix_unfenced,
+                        "prefer_admit": m.prefer_admit,
+                        "multi_spine_admit": m.multi_spine_admit,
+                        "quiet_fence_revoke": m.quiet_fence_revoke,
+                        "writer_identity_preserved": m.writer_identity_preserved,
+                        "ready_steal_on_wait": m.ready_steal_on_wait,
+                        "wait_park_count": m.wait_park_count,
+                        "wait_park_ns": m.wait_park_ns,
+                        "evm_entries": m.evm_entries,
+                        "rebind_only": m.rebind_only,
+                        "full_restart": m.full_restart,
+                        "rewind_to_cp": m.rewind_to_cp,
+                        "force_bind_reabort": m.force_bind_reabort,
+                    });
                     std::fs::write(
                         &ppath,
                         serde_json::to_string_pretty(&serde_json::json!({
@@ -271,27 +301,112 @@ fn main() {
                             "tag": if tag.is_empty() { serde_json::Value::Null } else { serde_json::json!(tag) },
                             "wall_ms": wall_ms,
                             "ok": ok,
-                            "metrics": {
-                                "edge_bind": m.edge_bind,
-                                "edge_wait_for": m.edge_wait_for,
-                                "edge_unfenced": m.edge_unfenced,
-                                "avoid_broadcasts": m.avoid_broadcasts,
-                                "canary_probes": m.canary_probes,
-                                "independent_unfenced": m.independent_unfenced,
-                                "soft_wait_arms": m.soft_wait_arms,
-                                "occ_aborts": m.occ_aborts,
-                                "force_prefix_unfenced": m.force_prefix_unfenced,
-                                "prefer_admit": m.prefer_admit,
-                                "multi_spine_admit": m.multi_spine_admit,
-                                "quiet_fence_revoke": m.quiet_fence_revoke,
-                                "writer_identity_preserved": m.writer_identity_preserved,
-                            },
+                            "metrics": metrics_json,
                             "process": proc,
                         }))
                         .unwrap(),
                     )
                     .unwrap();
                     println!("wrote {ppath:?}");
+
+                    // Post-U1 per-tx lean (+ finegrain abort/incarnation when armed).
+                    let short = match bn {
+                        14_689_597 => "597",
+                        19_606_599 => "599",
+                        19_469_097 => "097",
+                        _ => "x",
+                    };
+                    let fg = pevm.take_finegrain_snapshot();
+                    let mut abort_by_tx = serde_json::Map::new();
+                    let mut incarnations = serde_json::Value::Null;
+                    let mut abort_events = serde_json::Value::Null;
+                    if let Some(ref snap) = fg {
+                        incarnations = serde_json::json!(snap.final_incarnations);
+                        abort_events = serde_json::to_value(&snap.abort_events).unwrap_or_default();
+                        for a in &snap.abort_events {
+                            let e = abort_by_tx
+                                .entry(a.tx_idx.to_string())
+                                .or_insert_with(|| serde_json::json!({"n_abort": 0, "max_incarnation": 0, "cascade_sum": 0}));
+                            e["n_abort"] = serde_json::json!(e["n_abort"].as_u64().unwrap_or(0) + 1);
+                            e["max_incarnation"] = serde_json::json!(
+                                e["max_incarnation"].as_u64().unwrap_or(0).max(a.incarnation as u64)
+                            );
+                            e["cascade_sum"] = serde_json::json!(
+                                e["cascade_sum"].as_u64().unwrap_or(0) + a.cascade_validations as u64
+                            );
+                        }
+                    }
+                    // Rank failing txs: parks, unfenced_after_avoid, force_prefix_none, aborts
+                    let mut ranked: Vec<serde_json::Value> = proc
+                        .per_tx
+                        .iter()
+                        .map(|t| {
+                            let ab = abort_by_tx.get(&t.tx.to_string());
+                            let n_abort = ab.and_then(|v| v["n_abort"].as_u64()).unwrap_or(0);
+                            let final_inc = fg
+                                .as_ref()
+                                .and_then(|s| s.final_incarnations.get(t.tx).copied())
+                                .unwrap_or(0);
+                            serde_json::json!({
+                                "tx": t.tx,
+                                "n_bind": t.n_bind,
+                                "n_wait_for": t.n_wait_for,
+                                "n_unfenced": t.n_unfenced,
+                                "n_unfenced_after_avoid": t.n_unfenced_after_avoid,
+                                "n_force_prefix_none": t.n_force_prefix_none,
+                                "n_park": t.n_park,
+                                "n_abort": n_abort,
+                                "final_incarnation": final_inc,
+                                "reasons": t.reasons,
+                                "fail_score": t.n_unfenced_after_avoid
+                                    + t.n_force_prefix_none * 2
+                                    + t.n_park
+                                    + (n_abort as usize) * 3
+                                    + final_inc.saturating_mul(2),
+                            })
+                        })
+                        .collect();
+                    ranked.sort_by(|a, b| {
+                        b["fail_score"]
+                            .as_u64()
+                            .unwrap_or(0)
+                            .cmp(&a["fail_score"].as_u64().unwrap_or(0))
+                    });
+                    let pertx_path = out_dir.join(format!("post-u1-per-tx-{short}-c8.json"));
+                    std::fs::write(
+                        &pertx_path,
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "block": bn,
+                            "short": short,
+                            "tag": if tag.is_empty() { "post-u1" } else { &tag },
+                            "cores": 8,
+                            "wall_ms": wall_ms,
+                            "ok": ok,
+                            "n_tx": n,
+                            "tps": tps,
+                            "metrics": metrics_json,
+                            "process_summary": {
+                                "reason_histogram": proc.reason_histogram,
+                                "unfenced_total": proc.unfenced_total,
+                                "wait_for_total": proc.wait_for_total,
+                                "bind_total": proc.bind_total,
+                                "unfenced_after_avoid_total": proc.unfenced_after_avoid_total,
+                                "force_prefix_none_unfenced": proc.force_prefix_none_unfenced,
+                                "independent_unfenced_total": proc.independent_unfenced_total,
+                                "unfenced_after_fence_on_hot_l": proc.unfenced_after_fence_on_hot_l,
+                                "hot_fanout_l": proc.hot_fanout_l,
+                            },
+                            "per_tx": proc.per_tx,
+                            "per_tx_ranked_top40": ranked.into_iter().take(40).collect::<Vec<_>>(),
+                            "abort_by_tx": abort_by_tx,
+                            "final_incarnations": incarnations,
+                            "abort_events_sample": abort_events,
+                            "head": "b50f336",
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    println!("per-tx lean -> {pertx_path:?}");
                 }
                 if iters == 1 || i + 1 == iters {
                     println!(

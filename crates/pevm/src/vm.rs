@@ -858,6 +858,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 armed_at_k,
                 crate::specfence::ParkKind::BlockingOther,
             );
+            self.specfence.process.note_park(self.tx_idx);
             return Err(ReadError::Blocking(t));
         }
 
@@ -866,7 +867,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
         // lane above — Unfenced here is not hang-freedom.
         // U1 leak: force_prefix Unfenced while a serial pred is still live.
         if force_prefix && self.tx_idx > 0 && !is_done(self.tx_idx - 1) {
-            self.specfence.process.note_force_prefix_none_unfenced();
+            self.specfence.process.note_force_prefix_none_unfenced(self.tx_idx);
             self.specfence.metrics.record_force_prefix_unfenced();
         }
         let leak = if must_wait {

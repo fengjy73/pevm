@@ -207,7 +207,7 @@ pub(crate) use rem::{
 pub(crate) use edge::{
     choose_edge_action, EdgeAction, EdgeKey, EdgeKind, EdgeState, EdgeTable, EdgeView,
 };
-pub use process::{ExecProcessSnapshot, LocProcessSnap, ProcessReason};
+pub use process::{ExecProcessSnapshot, LocProcessSnap, PerTxProcessSnap, ProcessReason};
 pub(crate) use process::ProcessTrace;
 pub(crate) use sketch::HotSketch;
 pub(crate) use resolve::{PolicyCtx, ResolveAction, choose_action};

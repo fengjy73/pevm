@@ -119,12 +119,24 @@ struct LocProc {
     reasons: [AtomicUsize; REASON_N],
 }
 
+#[derive(Debug, Default)]
+struct PerTxProc {
+    bind: AtomicUsize,
+    wait_for: AtomicUsize,
+    unfenced: AtomicUsize,
+    unfenced_after_avoid: AtomicUsize,
+    force_prefix_none: AtomicUsize,
+    n_park: AtomicUsize,
+    reasons: [AtomicUsize; REASON_N],
+}
+
 /// Live process tracer (one block).
 #[derive(Debug, Default)]
 pub(crate) struct ProcessTrace {
     reasons: [AtomicUsize; REASON_N],
     seq: AtomicU64,
     locs: DashMap<MemoryLocationHash, LocProc, FxBuildHasher>,
+    txs: DashMap<TxIdx, PerTxProc, FxBuildHasher>,
     force_prefix_none_unfenced: AtomicUsize,
 }
 
@@ -147,6 +159,20 @@ pub struct LocProcessSnap {
     pub reasons: BTreeMap<String, usize>,
 }
 
+/// Per-tx Fence / Unfenced / park split (diagnosis).
+#[allow(missing_docs)]
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct PerTxProcessSnap {
+    pub tx: usize,
+    pub n_bind: usize,
+    pub n_wait_for: usize,
+    pub n_unfenced: usize,
+    pub n_unfenced_after_avoid: usize,
+    pub n_force_prefix_none: usize,
+    pub n_park: usize,
+    pub reasons: BTreeMap<String, usize>,
+}
+
 /// Block-level process snapshot (JSON).
 #[allow(missing_docs)]
 #[derive(Debug, Clone, Serialize, Default)]
@@ -162,6 +188,8 @@ pub struct ExecProcessSnapshot {
     pub independent_unfenced_total: usize,
     /// U1 leak counter: force_prefix ∧ writer unresolved → Unfenced (target 0).
     pub force_prefix_none_unfenced: usize,
+    /// Per-reader process verbs (sorted by tx).
+    pub per_tx: Vec<PerTxProcessSnap>,
 }
 
 impl ProcessTrace {
@@ -172,7 +200,7 @@ impl ProcessTrace {
     pub(crate) fn record(
         &self,
         location: MemoryLocationHash,
-        _reader: TxIdx,
+        reader: TxIdx,
         reason: ProcessReason,
         avoid: bool,
         canary_taken: bool,
@@ -180,6 +208,26 @@ impl ProcessTrace {
         let i = reason.idx();
         self.reasons[i].fetch_add(1, Ordering::Relaxed);
         let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let txe = self.txs.entry(reader).or_default();
+        txe.reasons[i].fetch_add(1, Ordering::Relaxed);
+        match reason {
+            ProcessReason::BindPublished => {
+                txe.bind.fetch_add(1, Ordering::Relaxed);
+            }
+            ProcessReason::WaitForWriter
+            | ProcessReason::WaitForCanary
+            | ProcessReason::WaitForSerial
+            | ProcessReason::WaitForPrefix => {
+                txe.wait_for.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {
+                txe.unfenced.fetch_add(1, Ordering::Relaxed);
+                if avoid {
+                    txe.unfenced_after_avoid.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        drop(txe);
         let e = self.locs.entry(location).or_default();
         e.reasons[i].fetch_add(1, Ordering::Relaxed);
         match reason {
@@ -238,8 +286,21 @@ impl ProcessTrace {
         }
     }
 
-    pub(crate) fn note_force_prefix_none_unfenced(&self) {
+    pub(crate) fn note_force_prefix_none_unfenced(&self, reader: TxIdx) {
         self.force_prefix_none_unfenced
+            .fetch_add(1, Ordering::Relaxed);
+        self.txs
+            .entry(reader)
+            .or_default()
+            .force_prefix_none
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_park(&self, reader: TxIdx) {
+        self.txs
+            .entry(reader)
+            .or_default()
+            .n_park
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -325,6 +386,34 @@ impl ProcessTrace {
         if locs.len() > top_n {
             locs.truncate(top_n);
         }
+        let mut per_tx: Vec<PerTxProcessSnap> = self
+            .txs
+            .iter()
+            .map(|e| {
+                let tx = *e.key();
+                let v = e.value();
+                let mut reasons = BTreeMap::new();
+                for i in 0..REASON_N {
+                    let n = v.reasons[i].load(Ordering::Relaxed);
+                    if n > 0 {
+                        if let Some(r) = ProcessReason::from_idx(i) {
+                            reasons.insert(r.as_str().to_string(), n);
+                        }
+                    }
+                }
+                PerTxProcessSnap {
+                    tx,
+                    n_bind: v.bind.load(Ordering::Relaxed),
+                    n_wait_for: v.wait_for.load(Ordering::Relaxed),
+                    n_unfenced: v.unfenced.load(Ordering::Relaxed),
+                    n_unfenced_after_avoid: v.unfenced_after_avoid.load(Ordering::Relaxed),
+                    n_force_prefix_none: v.force_prefix_none.load(Ordering::Relaxed),
+                    n_park: v.n_park.load(Ordering::Relaxed),
+                    reasons,
+                }
+            })
+            .collect();
+        per_tx.sort_by_key(|t| t.tx);
         ExecProcessSnapshot {
             reason_histogram: hist,
             unfenced_total,
@@ -338,6 +427,7 @@ impl ProcessTrace {
             force_prefix_none_unfenced: self
                 .force_prefix_none_unfenced
                 .load(Ordering::Relaxed),
+            per_tx,
         }
     }
 }
