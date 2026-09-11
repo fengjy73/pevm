@@ -120,10 +120,14 @@ pub(crate) fn choose_edge_action(v: &EdgeView) -> EdgeAction {
     // D6 / A1 / A2: unpublished essential → WaitFor, never Unfenced+retry.
     // Hang-freedom is admission (admit lower spine writers), not Unfenced.
     // Inversion (w ≥ reader) is the only known-writer WaitFor reject.
+    // Clique gate is not independence-shortable when a writer is known.
+    // Serial-lane WaitFor(reader-1) is only for known essentials without a
+    // resolved writer (force_prefix / Avoid / essential_antidep) — not for
+    // every forming clique (that WaitFor+admit_spine broke seq≡par).
     let must_fence = v.essential_antidep
         || v.avoid_broadcast
         || v.force_prefix
-        || (v.clique_gated && !v.canary_ok && !v.independence_certified)
+        || (v.clique_gated && !v.canary_ok)
         || (v.in_hot_set && !v.canary_ok && !v.independence_certified);
     if must_fence {
         if let Some(w) = v.writer {
@@ -131,10 +135,13 @@ pub(crate) fn choose_edge_action(v: &EdgeView) -> EdgeAction {
                 return EdgeAction::WaitFor(w);
             }
             // inversion: later/self writer is not a preset-order anti-dep
-        } else if v.reader > 0 {
-            // force_prefix / Avoid / essential with no writer: serial-lane Fence.
+        } else if v.reader > 0
+            && (v.force_prefix || v.avoid_broadcast || v.essential_antidep)
+        {
+            // Known essential, writer unresolved: serial-lane Fence.
             return EdgeAction::WaitFor(v.reader - 1);
         }
+        // Clique forming, no writer yet: first-wave Unfenced (not serial-all).
     }
 
     // A2 canary or A4 independence or cold discovery.
@@ -385,6 +392,31 @@ mod tests {
             None, Some(1), false, false, true, false, false, false, false, true,
         ));
         assert_eq!(a, EdgeAction::WaitFor(1));
+    }
+
+    #[test]
+    fn clique_none_writer_first_wave_unfenced() {
+        let a = choose_edge_action(&view(
+            None, None, false, false, false, false, false, true, false, true,
+        ));
+        assert_eq!(
+            a,
+            EdgeAction::Unfenced,
+            "clique ∧ writer=None ∧ !Avoid is first-wave, not serial-all"
+        );
+    }
+
+    #[test]
+    fn clique_gate_not_shorted_by_independence() {
+        // Forming clique: canary consumed, independence still stale-true.
+        let a = choose_edge_action(&view(
+            None, Some(2), false, false, false, false, false, true, false, true,
+        ));
+        assert_eq!(
+            a,
+            EdgeAction::WaitFor(2),
+            "clique_gated ∧ !canary must Fence even if independence bit is set"
+        );
     }
 
     #[test]

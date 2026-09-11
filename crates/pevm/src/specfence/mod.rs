@@ -143,6 +143,7 @@ use hashbrown::HashMap;
 
 mod bayes;
 mod edge;
+mod process;
 mod sketch;
 mod engagement;
 mod prior;
@@ -206,6 +207,8 @@ pub(crate) use rem::{
 pub(crate) use edge::{
     choose_edge_action, EdgeAction, EdgeKey, EdgeKind, EdgeState, EdgeTable, EdgeView,
 };
+pub use process::{ExecProcessSnapshot, LocProcessSnap, ProcessReason};
+pub(crate) use process::ProcessTrace;
 pub(crate) use sketch::HotSketch;
 pub(crate) use resolve::{PolicyCtx, ResolveAction, choose_action};
 #[allow(unused_imports)]
@@ -307,6 +310,8 @@ pub(crate) struct SpecFenceCtx<'a> {
     pub edges: &'a EdgeTable,
     /// A1/A2/A6: hot set H + chain templates + Avoid broadcast.
     pub sketch: &'a HotSketch,
+    /// Process-level Fence/Unfenced reason + per-ℓ timeline (lab / G7).
+    pub process: &'a ProcessTrace,
     /// Opt-in lab fine-grain OCC/RW tracer (None = disabled, zero cost).
     pub finegrain: Option<&'a crate::specfence::FineGrainCollector>,
 }

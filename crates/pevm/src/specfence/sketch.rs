@@ -33,6 +33,8 @@ struct LocSketch {
     live_unfenced: AtomicUsize,
     /// `usize::MAX` = unknown.
     predicted_writer: AtomicUsize,
+    /// Reader that consumed the live canary grant (`usize::MAX` = none).
+    canary_tx: AtomicUsize,
 }
 
 impl Default for LocSketch {
@@ -42,6 +44,7 @@ impl Default for LocSketch {
             publishes: AtomicUsize::new(0),
             live_unfenced: AtomicUsize::new(0),
             predicted_writer: AtomicUsize::new(usize::MAX),
+            canary_tx: AtomicUsize::new(usize::MAX),
         }
     }
 }
@@ -220,18 +223,55 @@ impl HotSketch {
     }
 
     /// Try to consume the single canary Unfenced grant (A2).
-    pub(crate) fn try_canary(&self, location: MemoryLocationHash) -> bool {
+    /// Does **not** require H — first-wave discovery on a forming clique.
+    pub(crate) fn try_canary(&self, location: MemoryLocationHash, reader: TxIdx) -> bool {
         if self.avoid_broadcast(location) {
             return false;
         }
         let e = self.locs.entry(location).or_default();
         let n = e.canaries.fetch_add(1, Ordering::Relaxed);
         if n < CANARY_GRANT {
+            e.canary_tx.store(reader, Ordering::Relaxed);
             self.canary_probes.fetch_add(1, Ordering::Relaxed);
+            self.note_hot(location);
             true
         } else {
             false
         }
+    }
+
+    /// Re-open the canary after the probe finished without Avoid (first-wave).
+    /// Concurrent Unfenced on this ℓ stays 1; not a mass-Unfenced grant.
+    pub(crate) fn reopen_canary_if_probe_done(
+        &self,
+        location: MemoryLocationHash,
+        probe_done: bool,
+    ) -> bool {
+        if self.avoid_broadcast(location) || !probe_done {
+            return false;
+        }
+        let e = self.locs.entry(location).or_default();
+        e.canaries.store(0, Ordering::Relaxed);
+        e.canary_tx.store(usize::MAX, Ordering::Relaxed);
+        true
+    }
+
+    pub(crate) fn canary_tx(&self, location: MemoryLocationHash) -> Option<TxIdx> {
+        self.locs.get(&location).and_then(|e| {
+            let t = e.canary_tx.load(Ordering::Relaxed);
+            if t == usize::MAX {
+                None
+            } else {
+                Some(t)
+            }
+        })
+    }
+
+    /// First-wave probe already consumed (serial lane, even before H/Avoid).
+    pub(crate) fn canary_taken(&self, location: MemoryLocationHash) -> bool {
+        self.locs
+            .get(&location)
+            .is_some_and(|e| e.canaries.load(Ordering::Relaxed) >= CANARY_GRANT)
     }
 
     pub(crate) fn note_unfenced(&self, location: MemoryLocationHash) {
@@ -244,7 +284,10 @@ impl HotSketch {
 
     /// A1: mass Unfenced on unpublished clique is gated after the canary.
     pub(crate) fn clique_gated(&self, location: MemoryLocationHash) -> bool {
-        if !self.in_h(location) && !self.avoid_broadcast(location) {
+        if !self.in_h(location)
+            && !self.avoid_broadcast(location)
+            && !self.canary_taken(location)
+        {
             return false;
         }
         let unfenced = self
@@ -252,7 +295,7 @@ impl HotSketch {
             .get(&location)
             .map(|e| e.live_unfenced.load(Ordering::Relaxed))
             .unwrap_or(0);
-        if unfenced >= CLIQUE_UNFENCED_CAP {
+        if unfenced >= CLIQUE_UNFENCED_CAP || self.canary_taken(location) {
             self.clique_gates.fetch_add(1, Ordering::Relaxed);
             true
         } else {
@@ -260,14 +303,37 @@ impl HotSketch {
         }
     }
 
-    /// A4: no H, no Avoid, no live template → independence-certified Unfenced.
+    /// A4: no H, no Avoid, no live template, no canary taken → Unfenced.
     pub(crate) fn independence_certified(&self, location: MemoryLocationHash) -> bool {
         !self.in_serial_lane(location)
     }
 
     /// Hot-record serialization lane (A4 contention-split).
+    /// Canary-taken means a second reader of ℓ is no longer independent.
     pub(crate) fn in_serial_lane(&self, location: MemoryLocationHash) -> bool {
-        self.in_h(location) || self.avoid_broadcast(location) || self.template_live(location)
+        self.in_h(location)
+            || self.avoid_broadcast(location)
+            || self.template_live(location)
+            || self.canary_taken(location)
+    }
+
+    /// Closest unfinished lower writer on the spine (Fence target, not reader-1).
+    pub(crate) fn next_unfinished_writer_before(
+        &self,
+        location: MemoryLocationHash,
+        reader: TxIdx,
+        is_done: impl Fn(TxIdx) -> bool,
+    ) -> Option<TxIdx> {
+        if let Some(e) = self.spines.get(&location) {
+            let v = e.lock().unwrap();
+            if let Some(&w) = v.iter().rev().find(|&&w| w < reader && !is_done(w)) {
+                return Some(w);
+            }
+        }
+        self.locs
+            .get(&location)
+            .and_then(|e| e.predicted_writer())
+            .filter(|&w| w < reader && !is_done(w))
     }
 
     /// Essential unpublished anti-dep: H / Avoid / template / known writer.
@@ -358,13 +424,39 @@ mod tests {
     fn canary_then_avoid_then_gate() {
         let s = HotSketch::new();
         s.note_hot(1);
-        assert!(s.try_canary(1));
-        assert!(!s.try_canary(1));
+        assert!(s.try_canary(1, 3));
+        assert_eq!(s.canary_tx(1), Some(3));
+        assert!(s.canary_taken(1));
+        assert!(s.in_serial_lane(1));
+        assert!(!s.independence_certified(1));
+        assert!(!s.try_canary(1, 4));
         assert!(s.broadcast_avoid(1, 0));
         assert!(s.avoid_broadcast(1));
-        assert!(!s.try_canary(1));
+        assert!(!s.try_canary(1, 5));
         s.note_unfenced(1);
         assert!(s.clique_gated(1));
+    }
+
+    #[test]
+    fn canary_without_h_serializes_second_reader() {
+        let s = HotSketch::new();
+        assert!(s.try_canary(9, 2));
+        assert!(s.in_h(9), "canary promotes ℓ into H");
+        assert!(s.canary_taken(9));
+        assert!(!s.independence_certified(9));
+        assert!(s.clique_gated(9));
+        assert!(!s.try_canary(9, 8));
+    }
+
+    #[test]
+    fn reopen_canary_after_probe() {
+        let s = HotSketch::new();
+        assert!(s.try_canary(2, 1));
+        assert!(!s.try_canary(2, 4));
+        assert!(s.reopen_canary_if_probe_done(2, true));
+        assert!(s.try_canary(2, 4));
+        assert_eq!(s.canary_tx(2), Some(4));
+        assert!(!s.reopen_canary_if_probe_done(2, false));
     }
 
     #[test]
@@ -385,6 +477,11 @@ mod tests {
         assert_eq!(s.next_writer_before(1, 15), Some(12));
         assert_eq!(s.next_writer_before(1, 8), Some(7));
         assert_eq!(s.next_writer_before(1, 7), None);
+        assert_eq!(
+            s.next_unfinished_writer_before(1, 15, |w| w == 12),
+            Some(7),
+            "skip finished 12, take 7"
+        );
         assert_eq!(s.spine_len(1), 3);
         s.note_hot(1);
         assert!(s.in_serial_lane(1));

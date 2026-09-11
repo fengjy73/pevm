@@ -239,6 +239,50 @@ fn main() {
                 walls.push(wall_ms);
                 softs.push(soft as f64);
                 aborts_v.push(aborts as f64);
+                if bn == 14_689_597 && mode == "specfence" && (iters == 1 || i + 1 == iters) {
+                    let proc = pevm.last_exec_process();
+                    let pname = if tag.is_empty() {
+                        "exec-process-597-fence-cover.json".to_string()
+                    } else {
+                        format!("exec-process-597-fence-{tag}.json")
+                    };
+                    let ppath = out_dir.join(&pname);
+                    let hot = proc.hot_fanout_l.as_ref();
+                    println!(
+                        "  process-597 unfenced={} wait={} bind={} unfenced_after_avoid={} hot_l_unfenced_after_fence={} indep={} hot_l={:?}",
+                        proc.unfenced_total,
+                        proc.wait_for_total,
+                        proc.bind_total,
+                        proc.unfenced_after_avoid_total,
+                        proc.unfenced_after_fence_on_hot_l,
+                        proc.independent_unfenced_total,
+                        hot.map(|h| (h.location, h.unfenced, h.wait_for, h.bind, h.unfenced_after_avoid, h.unfenced_after_canary)),
+                    );
+                    std::fs::write(
+                        &ppath,
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "block": bn,
+                            "mode": mode,
+                            "tag": if tag.is_empty() { serde_json::Value::Null } else { serde_json::json!(tag) },
+                            "wall_ms": wall_ms,
+                            "ok": ok,
+                            "metrics": {
+                                "edge_bind": m.edge_bind,
+                                "edge_wait_for": m.edge_wait_for,
+                                "edge_unfenced": m.edge_unfenced,
+                                "avoid_broadcasts": m.avoid_broadcasts,
+                                "canary_probes": m.canary_probes,
+                                "independent_unfenced": m.independent_unfenced,
+                                "soft_wait_arms": m.soft_wait_arms,
+                                "occ_aborts": m.occ_aborts,
+                            },
+                            "process": proc,
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    println!("wrote {ppath:?}");
+                }
                 if iters == 1 || i + 1 == iters {
                     println!(
                         "  block={bn} mode={mode:10} iter={}/{} ok={ok} tps={tps:.0} wall_ms={wall_ms:.1} soft={soft} wait_hard={wh} abort_rate={:.3} lean={} evm={} reexec={} fb_reabort={} fra={} sra={} sb_res={} sb_def={} hsstore={} bsnap={} bcredit={} sb_clique={} jdef={} aj={} rebind={} ffc={} fvd={} fab={} cold={} occ_fast={} steal={} park_k={} await_a={} await_ok={} eng_sw={} mw_ms={:.1} h_ms={:.1} v_ms={:.1} park_ms={:.1} sw_ms={:.1} ea_ms={:.1} bo_ms={:.1} parks={}",
@@ -446,6 +490,46 @@ fn main() {
                     m.spine_waits,
                     m.sketch_hot_size,
                 );
+                if bn == 14_689_597 {
+                    let proc = warm.last_exec_process();
+                    let pname = if tag.is_empty() {
+                        "exec-process-597-fence-cover-warm.json".to_string()
+                    } else {
+                        format!("exec-process-597-fence-{tag}-warm.json")
+                    };
+                    let ppath = out_dir.join(&pname);
+                    std::fs::write(
+                        &ppath,
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "block": bn,
+                            "mode": "sf-warm",
+                            "tag": if tag.is_empty() { serde_json::Value::Null } else { serde_json::json!(tag) },
+                            "wall_ms": wall_ms,
+                            "ok": ok,
+                            "metrics": {
+                                "edge_bind": m.edge_bind,
+                                "edge_wait_for": m.edge_wait_for,
+                                "edge_unfenced": m.edge_unfenced,
+                                "avoid_broadcasts": m.avoid_broadcasts,
+                                "canary_probes": m.canary_probes,
+                                "independent_unfenced": m.independent_unfenced,
+                                "soft_wait_arms": soft,
+                                "occ_aborts": aborts,
+                            },
+                            "process": proc,
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    println!(
+                        "  process-597-warm unfenced={} wait={} bind={} unfenced_after_avoid={} hot_after_fence={} wrote {ppath:?}",
+                        proc.unfenced_total,
+                        proc.wait_for_total,
+                        proc.bind_total,
+                        proc.unfenced_after_avoid_total,
+                        proc.unfenced_after_fence_on_hot_l,
+                    );
+                }
                 x_rows.push(serde_json::json!({
                     "family": fam,
                     "block": bn,

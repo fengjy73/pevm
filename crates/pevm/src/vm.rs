@@ -20,7 +20,7 @@ use crate::{
     TxIdx, TxVersion, WriteSet, chain::PevmChain, hash_deterministic, mv_memory::MvMemory,
     specfence::{
         AccessMode, CheckpointKind, EdgeAction, EdgeKey, EdgeKind, EdgeState, EdgeView, FfValue,
-        SpecFenceCtx, StorageWriteReplay, choose_edge_action,
+        ProcessReason, SpecFenceCtx, StorageWriteReplay, choose_edge_action,
         early_val_probability, note_pending_effect_boundary,
         absolute_jump_eligible, attach_current_live_snap, arm_call_outcome_cache, arm_ff_origin_seeds, take_ff_origin_seeds,
         jump_is_safe, jump_refuse_reason, resume_was_applied, steps_this_run,
@@ -523,11 +523,14 @@ impl<'a, S: Storage> VmDb<'a, S> {
             || residual_writer.is_some();
         let hotset = self.specfence.hotset.contains(location_hash);
         let sticky = self.specfence.learner.is_sticky_resolve(location_hash);
-        if is_program && (hotset || prior_ws || sticky) {
-            self.specfence.sketch.note_hot(location_hash);
+        // Fan-out must accumulate on every program access (not only pre-hot).
+        if is_program {
             self.specfence
                 .learner
                 .note_hot_touch(location_hash, is_program);
+        }
+        if is_program && (hotset || prior_ws || sticky || writer.is_some()) {
+            self.specfence.sketch.note_hot(location_hash);
         }
         if self.specfence.learner.live_fanout_hot(location_hash) && is_program {
             self.specfence.sketch.note_hot(location_hash);
@@ -536,17 +539,23 @@ impl<'a, S: Storage> VmDb<'a, S> {
         let avoid = self.specfence.sketch.avoid_broadcast(location_hash)
             || self.specfence.edges.avoid_broadcast(location_hash);
         let in_h = self.specfence.sketch.in_h(location_hash);
-        let independence = self.specfence.sketch.independence_certified(location_hash)
-            && !force_prefix
-            && !sticky
-            && !prior_ws;
+        // One canary Unfenced per program ℓ (no H required). Handler/Basic
+        // keep the H-gated canary so account chatter does not serialize.
         let canary_ok = !published
             && !avoid
-            && in_h
-            && self.specfence.sketch.try_canary(location_hash);
+            && (is_program || in_h)
+            && self
+                .specfence
+                .sketch
+                .try_canary(location_hash, self.tx_idx);
         if canary_ok {
             self.specfence.metrics.record_canary_probe();
         }
+        let independence = self.specfence.sketch.independence_certified(location_hash)
+            && !force_prefix
+            && !sticky
+            && !prior_ws
+            && !canary_ok;
         let writer_known_unfinished =
             writer.is_some_and(|w| !self.specfence.scheduler.is_done(w));
         let essential = self.specfence.sketch.essential_antidep(
@@ -576,10 +585,18 @@ impl<'a, S: Storage> VmDb<'a, S> {
             clique_gated,
         };
         let action = choose_edge_action(&view);
+        let canary_taken = self.specfence.sketch.canary_taken(location_hash);
 
         match action {
             EdgeAction::Bind(v) => {
                 self.specfence.metrics.record_edge_bind();
+                self.specfence.process.record(
+                    location_hash,
+                    self.tx_idx,
+                    ProcessReason::BindPublished,
+                    avoid,
+                    canary_taken,
+                );
                 self.specfence.edges.set_state(
                     &key,
                     if self.specfence.scheduler.is_validated(v.tx_idx) {
@@ -590,54 +607,33 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 );
                 self.bind_on_data_lite(address, location_hash, v, force_prefix)
             }
-            EdgeAction::WaitFor(w) => {
-                // D6: unpublished essential / serial-lane Fence. SoftWait Soft stays 0.
-                // Plant TLS mid-capture must not park (Iter4 livelock).
-                if crate::specfence::plant_tls_active() {
-                    self.specfence.metrics.record_edge_unfenced();
-                    self.specfence.metrics.record_spec_read();
-                    note_pending_effect_boundary(self.tx_idx, self.specfence.partial_retry);
-                    return Ok(());
-                }
-                // Inversion only: never add_dependency on w ≥ reader.
-                // Ready writers are admitted onto the spine queue (hang-freedom
-                // without Unfenced on a known essential).
-                if w >= self.tx_idx {
-                    self.specfence.metrics.record_edge_unfenced();
-                    self.specfence.metrics.record_spec_read();
-                    note_pending_effect_boundary(self.tx_idx, self.specfence.partial_retry);
-                    return Ok(());
-                }
-                if self.specfence.scheduler.is_done(w) {
-                    // Writer finished without Data we can Bind — discover.
-                    self.specfence.metrics.record_edge_unfenced();
-                    self.specfence.metrics.record_spec_read();
-                    note_pending_effect_boundary(self.tx_idx, self.specfence.partial_retry);
-                    return Ok(());
-                }
-                if clique_gated || in_h || self.specfence.sketch.in_serial_lane(location_hash)
-                {
-                    self.specfence.metrics.record_spine_wait();
-                }
-                self.specfence.metrics.record_edge_wait_for();
-                self.specfence.metrics.record_wait_hard();
-                self.specfence.metrics.record_wait(address);
-                self.specfence
-                    .dag
-                    .arm_hard_wait(location_hash, self.tx_idx, w);
-                self.specfence
-                    .scheduler
-                    .admit_spine(w, self.specfence.wave);
-                let armed_at_k =
-                    self.specfence.partial_retry.current_k(self.tx_idx) as u64;
-                self.specfence.wave.set_pending_park(
-                    location_hash,
-                    armed_at_k,
-                    crate::specfence::ParkKind::BlockingOther,
-                );
-                Err(ReadError::Blocking(w))
-            }
+            EdgeAction::WaitFor(w) => self.fence_wait_for(
+                address,
+                location_hash,
+                w,
+                avoid,
+                in_h,
+                clique_gated,
+                canary_taken,
+                force_prefix,
+            ),
             EdgeAction::Unfenced => {
+                let reason = if avoid {
+                    ProcessReason::UnfencedAfterAvoid
+                } else if canary_ok {
+                    ProcessReason::UnfencedCanary
+                } else if independence {
+                    ProcessReason::UnfencedIndependence
+                } else {
+                    ProcessReason::UnfencedCold
+                };
+                self.specfence.process.record(
+                    location_hash,
+                    self.tx_idx,
+                    reason,
+                    avoid,
+                    canary_taken,
+                );
                 self.specfence.partial_retry.note_access(
                     self.tx_idx,
                     location_hash,
@@ -657,6 +653,142 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 Ok(())
             }
         }
+    }
+
+    /// Fence WaitFor: never convert a known-essential / post-Avoid Region to
+    /// Unfenced for hang-freedom. Re-resolve unfinished spine writer or the
+    /// live canary; Bind if Data appeared. SoftWait Soft stays 0.
+    fn fence_wait_for(
+        &self,
+        address: Address,
+        location_hash: MemoryLocationHash,
+        requested: TxIdx,
+        avoid: bool,
+        in_h: bool,
+        clique_gated: bool,
+        canary_taken: bool,
+        force_prefix: bool,
+    ) -> Result<(), ReadError> {
+        if crate::specfence::plant_tls_active() {
+            self.specfence.process.record(
+                location_hash,
+                self.tx_idx,
+                ProcessReason::UnfencedPlantTls,
+                avoid,
+                canary_taken,
+            );
+            self.specfence.metrics.record_edge_unfenced();
+            self.specfence.metrics.record_spec_read();
+            note_pending_effect_boundary(self.tx_idx, self.specfence.partial_retry);
+            return Ok(());
+        }
+
+        // Data may have landed between π and park.
+        if let Some((tx_idx, tx_incarnation)) = self
+            .mv_memory
+            .last_data_before(location_hash, self.tx_idx)
+        {
+            self.specfence.metrics.record_edge_bind();
+            self.specfence.process.record(
+                location_hash,
+                self.tx_idx,
+                ProcessReason::BindPublished,
+                avoid,
+                canary_taken,
+            );
+            return self.bind_on_data_lite(
+                address,
+                location_hash,
+                TxVersion {
+                    tx_idx,
+                    tx_incarnation,
+                },
+                force_prefix,
+            );
+        }
+
+        let is_done = |t: TxIdx| self.specfence.scheduler.is_done(t);
+        let unfinished = self.specfence.sketch.next_unfinished_writer_before(
+            location_hash,
+            self.tx_idx,
+            is_done,
+        );
+        let requested_live = (requested < self.tx_idx && !is_done(requested)).then_some(requested);
+
+        let (target, reason) = if let Some(w) = unfinished {
+            (Some(w), ProcessReason::WaitForWriter)
+        } else if let Some(w) = requested_live {
+            let r = if w + 1 == self.tx_idx {
+                ProcessReason::WaitForSerial
+            } else {
+                ProcessReason::WaitForWriter
+            };
+            (Some(w), r)
+        } else {
+            (None, ProcessReason::UnfencedWriterDone)
+        };
+
+        if let Some(t) = target {
+            if t >= self.tx_idx {
+                self.specfence.process.record(
+                    location_hash,
+                    self.tx_idx,
+                    ProcessReason::UnfencedInversion,
+                    avoid,
+                    canary_taken,
+                );
+                self.specfence.metrics.record_edge_unfenced();
+                self.specfence.metrics.record_spec_read();
+                note_pending_effect_boundary(self.tx_idx, self.specfence.partial_retry);
+                return Ok(());
+            }
+            if clique_gated || in_h || self.specfence.sketch.in_serial_lane(location_hash) {
+                self.specfence.metrics.record_spine_wait();
+            }
+            self.specfence.process.record(
+                location_hash,
+                self.tx_idx,
+                reason,
+                avoid,
+                canary_taken,
+            );
+            self.specfence.metrics.record_edge_wait_for();
+            self.specfence.metrics.record_wait_hard();
+            self.specfence.metrics.record_wait(address);
+            self.specfence
+                .dag
+                .arm_hard_wait(location_hash, self.tx_idx, t);
+            self.specfence
+                .scheduler
+                .admit_spine(t, self.specfence.wave);
+            let armed_at_k = self.specfence.partial_retry.current_k(self.tx_idx) as u64;
+            self.specfence.wave.set_pending_park(
+                location_hash,
+                armed_at_k,
+                crate::specfence::ParkKind::BlockingOther,
+            );
+            return Err(ReadError::Blocking(t));
+        }
+
+        // No live wait target and no Data. Storage-origin if Avoid already
+        // fired (writer finished without a readable version). Not hang-freedom
+        // Unfenced on a still-unpublished essential — that case WaitFor'd above.
+        let leak = if avoid {
+            ProcessReason::UnfencedAfterAvoid
+        } else {
+            ProcessReason::UnfencedWriterDone
+        };
+        self.specfence.process.record(
+            location_hash,
+            self.tx_idx,
+            leak,
+            avoid,
+            canary_taken,
+        );
+        self.specfence.metrics.record_edge_unfenced();
+        self.specfence.metrics.record_spec_read();
+        note_pending_effect_boundary(self.tx_idx, self.specfence.partial_retry);
+        Ok(())
     }
 
     /// Bind-on-Data: OCC-like certify of published MV Data without `is_done` park.
@@ -2466,6 +2598,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                             self.specfence.edges.broadcast_avoid(*loc);
                             self.specfence.metrics.record_avoid_broadcast();
                         }
+                        self.specfence.process.note_avoid(*loc);
                         let kind = match value {
                             MemoryValue::Basic(_)
                             | MemoryValue::LazySender(_)

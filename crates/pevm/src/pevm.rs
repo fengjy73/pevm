@@ -29,10 +29,10 @@ use crate::{
     scheduler::Scheduler,
     specfence::{
         AccountHints, AdaptiveEngagement, AdaptiveParams, BayesMap, ConcurrencyMode, DEFAULT_TAU,
-        EdgeTable, HotSet, HotSketch, FineGrainCollector, FineGrainSnapshot, HeatMap, InterBlockPrior,
-        LiveLearner, LeanAbortRepair, MetricsInner, PartialRetryTable, RemCounters, ResearchAbortRepair,
-        RwPriorMap, SpecDag, SpecFenceCtx, SpecFenceMetrics, WaveParkTable, seed_wait_regions, update_bayes,
-        update_heat, update_rw_prior,
+        EdgeTable, ExecProcessSnapshot, HotSet, HotSketch, FineGrainCollector, FineGrainSnapshot,
+        HeatMap, InterBlockPrior, LiveLearner, LeanAbortRepair, MetricsInner, PartialRetryTable,
+        ProcessTrace, RemCounters, ResearchAbortRepair, RwPriorMap, SpecDag, SpecFenceCtx,
+        SpecFenceMetrics, WaveParkTable, seed_wait_regions, update_bayes, update_heat, update_rw_prior,
     },
     storage::StorageWrapper,
     vm::{
@@ -167,6 +167,7 @@ pub struct Pevm {
     /// P1: tunable π constants (process-level).
     adaptive_params: AdaptiveParams,
     last_metrics: SpecFenceMetrics,
+    last_process: ExecProcessSnapshot,
     last_initial_wait_accounts: std::collections::HashSet<alloy_primitives::Address>,
     /// M4: abort rate from the previous SpecFence block (`occ_aborts / n_tx`).
     last_abort_rate: f64,
@@ -189,6 +190,7 @@ impl Default for Pevm {
             inter_prior: InterBlockPrior::new(),
             adaptive_params: AdaptiveParams::from_l3(),
             last_metrics: SpecFenceMetrics::default(),
+            last_process: ExecProcessSnapshot::default(),
             last_initial_wait_accounts: std::collections::HashSet::new(),
             last_abort_rate: 0.0,
             finegrain_enabled: false,
@@ -229,6 +231,11 @@ impl Pevm {
     /// Metrics from the last parallel execution (OCC/PCC/`SpecFence`).
     pub const fn last_specfence_metrics(&self) -> &SpecFenceMetrics {
         &self.last_metrics
+    }
+
+    /// Process-level Fence/Unfenced reason histogram + hot-ℓ split (last block).
+    pub const fn last_exec_process(&self) -> &ExecProcessSnapshot {
+        &self.last_process
     }
 
     /// Enable/disable lab fine-grain RW + abort tracing for subsequent parallel blocks.
@@ -439,6 +446,7 @@ impl Pevm {
         let wave = WaveParkTable::new();
         let edges = EdgeTable::new();
         let sketch = HotSketch::new();
+        let process = ProcessTrace::new();
         if self.concurrency_mode == ConcurrencyMode::SpecFence {
             let flipped = self.inter_prior.take_last_flipped();
             sketch.seed_from_prior(&self.inter_prior.top_locations(), flipped);
@@ -485,6 +493,7 @@ impl Pevm {
             params: &self.adaptive_params,
             edges: &edges,
             sketch: &sketch,
+            process: &process,
             finegrain: finegrain_ref,
         };
 
@@ -605,6 +614,9 @@ impl Pevm {
             sketch.decay_warm_failures(|loc| learner.abort_rate_of(loc));
             metrics_inner.set_soft_wait_arms(dag.soft_arm_count());
             metrics_inner.set_sketch_hot_size(sketch.hot_size());
+            self.last_process = process.snapshot(16);
+        } else {
+            self.last_process = ExecProcessSnapshot::default();
         }
         metrics_inner.set_engagement_metrics(
             engagement.lean_mode_txs(),
@@ -1802,6 +1814,7 @@ fn try_validate(
                     specfence.edges.broadcast_avoid(loc);
                     specfence.metrics.record_avoid_broadcast();
                 }
+                specfence.process.note_avoid(loc);
             }
         }
         specfence.metrics.record_occ_abort();

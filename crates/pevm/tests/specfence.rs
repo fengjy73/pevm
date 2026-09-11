@@ -3754,3 +3754,54 @@ fn gaps_closed_waitfor_avoid_publish_wake() {
         "known essentials must Bind or WaitFor, not Unfenced-only: {m2:?}"
     );
 }
+
+/// Fence cover: after first-wave canary / Avoid, hot cluster Regions Bind or
+/// WaitFor. SoftWait Soft=0. Process Unfenced-after-Avoid on the hottest ℓ
+/// must not dominate Bind+Wait.
+#[test]
+fn fence_cover_hot_region_after_canary() {
+    let (state, bytecodes, txs) = erc20::generate_cluster(6, 16, 8);
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+    let (par, m, mut pevm) = run_mode(ConcurrencyMode::SpecFence, &storage, txs.clone());
+    let chain = PevmEthereum::mainnet();
+    let sequential = execute_revm_sequential(
+        &chain,
+        &storage,
+        Default::default(),
+        BlockEnv::default(),
+        txs.clone(),
+    )
+    .expect("sequential");
+    assert_eq!(par, sequential, "fence-cover seq≡par: {m:?}");
+    assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
+    let p = pevm.last_exec_process();
+    assert!(
+        p.bind_total + p.wait_for_total > 0 || m.edge_bind + m.edge_wait_for > 0,
+        "Fence verbs must fire on the cluster: process={p:?} metrics={m:?}"
+    );
+    if let Some(hot) = &p.hot_fanout_l {
+        assert!(
+            hot.unfenced_after_avoid <= hot.bind_after_avoid + hot.wait_after_avoid
+                || hot.unfenced_after_avoid == 0,
+            "hot ℓ Unfenced-after-Avoid must not dominate Fence: {hot:?}"
+        );
+    }
+    let warm = pevm
+        .execute_revm_parallel(
+            &chain,
+            &storage,
+            Default::default(),
+            BlockEnv::default(),
+            txs,
+            concurrency(),
+        )
+        .expect("warm");
+    let m2 = pevm.last_specfence_metrics().clone();
+    let p2 = pevm.last_exec_process();
+    assert_eq!(warm, sequential, "fence-cover warm seq≡par: {m2:?}");
+    assert_eq!(m2.soft_wait_arms, 0, "warm SoftWait Soft=0: {m2:?}");
+    assert!(
+        p2.wait_for_total + p2.bind_total > 0,
+        "warm must Fence: {p2:?}"
+    );
+}
