@@ -37,6 +37,43 @@ Unfenced = optimistic access (not Spec).
 
 ---
 
+## Process traces (N=3 @8, last SF iter)
+
+`force_prefix ∧ writer=None` Unfenced (**U1 leak**) is **0** on 597 / 599 / 097.
+Reason `unfenced_after_avoid` as a verb is **0** (fence-cover 597 had 265).
+Residual `unfenced_after_avoid_total` is writer-done storage-origin while Avoid
+is on — not a must_wait fallthrough.
+
+| Block | force_prefix_none | unfenced_after_avoid reason | writer_done | indep | bind | wait | multi_spine | identity |
+|------:|------------------:|----------------------------:|------------:|------:|-----:|-----:|------------:|---------:|
+| **14689597** | **0** | **0** | 595 | 1141 | 754 | 26 | 31 | 157 |
+| **19606599** | **0** | **0** | 2899 | 1432 | 528 | 37 | 12 | 163 |
+| **19469097** | **0** | **0** | 1520 | 1017 | 449 | 17 | 30 | 182 |
+
+597 warm: Unfenced 4231 / Wait 90 / Bind 800 / after-Avoid reason 0 / hot-after-fence 0.
+
+Independents stay Unfenced (S2). SoftWait Soft = 0. Await@a = 0. xblock **598 sf-cold did not hang** (fence-cover did).
+
+JSON: `lab/results/exec-process-{14689597,19606599,19469097}-general-fixes.json`,
+`lab/results/general-fixes-xblock-{sf-occ,flip,xblock}.json`
+
+---
+
+## Wall / TPS honesty vs OCC (N=3 @8, this host)
+
+This host matches the **rename-cut** OCC 597 median (**6.6 ms**), not the slower fence-cover host (OCC 13.3). Compare **ratios**.
+
+| Block | SF wall med | OCC wall med | SF/OCC TPS | SF abort med | OCC abort med | Soft |
+|------:|------------:|-------------:|-----------:|-------------:|--------------:|-----:|
+| **14689597** | **20.5** | **6.6** | **0.288** | **47** | **117** | 0 |
+| **19606599** | **32.8** | **10.5** | **0.349** | **139** | **78** | 0 |
+| **19469097** | **20.1** | **7.6** | **0.376** | **174** | **109** | 0 |
+| **19606598** | **2.9** | **1.3** | **0.492** | **18** | **7** | 0 |
+
+Mean SF/OCC = **0.376**. Rename-cut mean was 0.353; fence-cover on a slower host was 0.268. **Not a makespan win vs OCC** (597 still ~3.1×). Abort↓ on 597 is not the bar. Prefer-admit is rare (Ready already Executing); multi-spine admit is live on 097 (40 on warm).
+
+---
+
 ## Hard bans (this cut)
 
 | Ban | Status |
