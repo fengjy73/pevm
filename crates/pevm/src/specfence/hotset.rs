@@ -9,7 +9,7 @@
 //!    (needs repeated reinforcement; decays when unseen so wide blocks stay lean).
 //!
 //! Control law v3 / P0: HotSet is a **fanout / tracking cache hint** for `choose_action`,
-//! not a hard Wait gate (handler / cold locs still SpecRead via π).
+//! not a hard Wait gate (handler / cold locs still Unfenced via edge π).
 //! Inter-block prior may seed membership for dense tracking only — never SoftWait.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
