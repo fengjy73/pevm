@@ -51,7 +51,7 @@ pub struct SpecFenceMetrics {
     pub bind_hits: usize,
     /// WaitHard decisions / admissions at location grain.
     pub wait_hard_count: usize,
-    /// SpecRead (OrderedDirtyRead) path counts.
+    /// Legacy AEC Unfenced path counts (not Spec — Spec = Region).
     pub spec_read_count: usize,
     /// Selective invalidate applications.
     pub selective_invalidate_count: usize,
@@ -228,15 +228,15 @@ pub struct SpecFenceMetrics {
     pub edge_bind: usize,
     /// D6: essential wait-for (unpublished anti-dep).
     pub edge_wait_for: usize,
-    /// A4/A2: independence-certified or canary Spec.
-    pub edge_spec: usize,
+    /// A4/A2: independence-certified or canary Unfenced (not Spec — Spec = Region).
+    pub edge_unfenced: usize,
     /// A2: first-wave Avoid broadcasts on publish.
     pub avoid_broadcasts: usize,
     /// A2: canary probes consumed.
     pub canary_probes: usize,
-    /// A4: independence-certified Specs.
-    pub independent_specs: usize,
-    /// A1: clique/spine WaitFor (mass Spec gated).
+    /// A4: independence-certified Unfenced.
+    pub independent_unfenced: usize,
+    /// A1: clique/spine WaitFor (mass Unfenced gated).
     pub spine_waits: usize,
     /// A1: |H| at block end.
     pub sketch_hot_size: usize,
@@ -343,10 +343,10 @@ pub(crate) struct MetricsInner {
     fanout_absorb: AtomicUsize,
     edge_bind: AtomicUsize,
     edge_wait_for: AtomicUsize,
-    edge_spec: AtomicUsize,
+    edge_unfenced: AtomicUsize,
     avoid_broadcasts: AtomicUsize,
     canary_probes: AtomicUsize,
-    independent_specs: AtomicUsize,
+    independent_unfenced: AtomicUsize,
     spine_waits: AtomicUsize,
     sketch_hot_size: AtomicUsize,
     data_publish_wakes: AtomicUsize,
@@ -722,8 +722,8 @@ impl MetricsInner {
         self.edge_wait_for.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_edge_spec(&self) {
-        self.edge_spec.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn record_edge_unfenced(&self) {
+        self.edge_unfenced.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_avoid_broadcast(&self) {
@@ -734,8 +734,8 @@ impl MetricsInner {
         self.canary_probes.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_independent_spec(&self) {
-        self.independent_specs.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn record_independent_unfenced(&self) {
+        self.independent_unfenced.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_spine_wait(&self) {
@@ -989,10 +989,10 @@ impl MetricsInner {
             fanout_absorb: self.fanout_absorb.load(Ordering::Relaxed),
             edge_bind: self.edge_bind.load(Ordering::Relaxed),
             edge_wait_for: self.edge_wait_for.load(Ordering::Relaxed),
-            edge_spec: self.edge_spec.load(Ordering::Relaxed),
+            edge_unfenced: self.edge_unfenced.load(Ordering::Relaxed),
             avoid_broadcasts: self.avoid_broadcasts.load(Ordering::Relaxed),
             canary_probes: self.canary_probes.load(Ordering::Relaxed),
-            independent_specs: self.independent_specs.load(Ordering::Relaxed),
+            independent_unfenced: self.independent_unfenced.load(Ordering::Relaxed),
             spine_waits: self.spine_waits.load(Ordering::Relaxed),
             sketch_hot_size: self.sketch_hot_size.load(Ordering::Relaxed),
             data_publish_wakes: self.data_publish_wakes.load(Ordering::Relaxed),

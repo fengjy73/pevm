@@ -436,13 +436,13 @@ fn main() {
                     run_one(&chain, &mut warm, &loaded, 8);
                 let m = warm.last_specfence_metrics();
                 println!(
-                    "  fam={fam} block={bn} mode=sf-warm ok={ok} tps={tps:.0} wall_ms={wall_ms:.1} soft={soft} wait_hard={wh} aborts={aborts} edge_bind={} edge_wait={} edge_spec={} avoid={} canary={} indep={} spine={} hot={}",
+                    "  fam={fam} block={bn} mode=sf-warm ok={ok} tps={tps:.0} wall_ms={wall_ms:.1} soft={soft} wait_hard={wh} aborts={aborts} edge_bind={} edge_wait={} edge_unfenced={} avoid={} canary={} indep={} spine={} hot={}",
                     m.edge_bind,
                     m.edge_wait_for,
-                    m.edge_spec,
+                    m.edge_unfenced,
                     m.avoid_broadcasts,
                     m.canary_probes,
-                    m.independent_specs,
+                    m.independent_unfenced,
                     m.spine_waits,
                     m.sketch_hot_size,
                 );
@@ -460,10 +460,10 @@ fn main() {
                     "rebind_only": m.rebind_only,
                     "edge_bind": m.edge_bind,
                     "edge_wait_for": m.edge_wait_for,
-                    "edge_spec": m.edge_spec,
+                    "edge_unfenced": m.edge_unfenced,
                     "avoid_broadcasts": m.avoid_broadcasts,
                     "canary_probes": m.canary_probes,
-                    "independent_specs": m.independent_specs,
+                    "independent_unfenced": m.independent_unfenced,
                     "spine_waits": m.spine_waits,
                     "sketch_hot_size": m.sketch_hot_size,
                     "wait_park_count": m.wait_park_count,
@@ -505,7 +505,7 @@ fn main() {
                         "rebind_only": m.rebind_only,
                         "edge_bind": m.edge_bind,
                         "edge_wait_for": m.edge_wait_for,
-                        "edge_spec": m.edge_spec,
+                        "edge_unfenced": m.edge_unfenced,
                         "avoid_broadcasts": m.avoid_broadcasts,
                         "wait_park_count": m.wait_park_count,
                     }));

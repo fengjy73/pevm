@@ -30,7 +30,7 @@ pub(crate) struct ChainTemplate {
 struct LocSketch {
     canaries: AtomicUsize,
     publishes: AtomicUsize,
-    live_specs: AtomicUsize,
+    live_unfenced: AtomicUsize,
     /// `usize::MAX` = unknown.
     predicted_writer: AtomicUsize,
 }
@@ -40,7 +40,7 @@ impl Default for LocSketch {
         Self {
             canaries: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
-            live_specs: AtomicUsize::new(0),
+            live_unfenced: AtomicUsize::new(0),
             predicted_writer: AtomicUsize::new(usize::MAX),
         }
     }
@@ -57,10 +57,10 @@ impl LocSketch {
     }
 }
 
-/// One canary Spec per hot ℓ before Avoid (A2).
+/// One canary Unfenced per hot ℓ before Avoid (A2).
 const CANARY_GRANT: usize = 1;
-/// Clique size at which further Spec on unpublished ℓ is gated (A1).
-const CLIQUE_SPEC_CAP: usize = 1;
+/// Clique size at which further Unfenced on unpublished ℓ is gated (A1).
+const CLIQUE_UNFENCED_CAP: usize = 1;
 
 /// Ahead sketch: H + chain templates + Avoid + admission grants.
 #[derive(Debug, Default)]
@@ -219,7 +219,7 @@ impl HotSketch {
             .is_some_and(|t| t.confidence >= CONF_LIVE)
     }
 
-    /// Try to consume the single canary Spec grant (A2).
+    /// Try to consume the single canary Unfenced grant (A2).
     pub(crate) fn try_canary(&self, location: MemoryLocationHash) -> bool {
         if self.avoid_broadcast(location) {
             return false;
@@ -234,25 +234,25 @@ impl HotSketch {
         }
     }
 
-    pub(crate) fn note_spec(&self, location: MemoryLocationHash) {
+    pub(crate) fn note_unfenced(&self, location: MemoryLocationHash) {
         self.locs
             .entry(location)
             .or_default()
-            .live_specs
+            .live_unfenced
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A1: mass Spec on unpublished clique is gated after the canary.
+    /// A1: mass Unfenced on unpublished clique is gated after the canary.
     pub(crate) fn clique_gated(&self, location: MemoryLocationHash) -> bool {
         if !self.in_h(location) && !self.avoid_broadcast(location) {
             return false;
         }
-        let specs = self
+        let unfenced = self
             .locs
             .get(&location)
-            .map(|e| e.live_specs.load(Ordering::Relaxed))
+            .map(|e| e.live_unfenced.load(Ordering::Relaxed))
             .unwrap_or(0);
-        if specs >= CLIQUE_SPEC_CAP {
+        if unfenced >= CLIQUE_UNFENCED_CAP {
             self.clique_gates.fetch_add(1, Ordering::Relaxed);
             true
         } else {
@@ -260,7 +260,7 @@ impl HotSketch {
         }
     }
 
-    /// A4: no H, no Avoid, no live template → independence-certified Spec.
+    /// A4: no H, no Avoid, no live template → independence-certified Unfenced.
     pub(crate) fn independence_certified(&self, location: MemoryLocationHash) -> bool {
         !self.in_serial_lane(location)
     }
@@ -278,16 +278,15 @@ impl HotSketch {
         prior_ws: bool,
         force_prefix: bool,
     ) -> bool {
-        if force_prefix {
-            return writer_known;
+        if force_prefix || self.avoid_broadcast(location) {
+            // Repair prefix / Avoid are essential even before the writer is resolved.
+            // Hang-freedom is serial-lane admission, not Unfenced.
+            return true;
         }
         if !writer_known {
             return false;
         }
-        self.in_h(location)
-            || self.avoid_broadcast(location)
-            || prior_ws
-            || self.template_live(location)
+        self.in_h(location) || prior_ws || self.template_live(location)
     }
 
     pub(crate) fn hot_size(&self) -> usize {
@@ -364,7 +363,7 @@ mod tests {
         assert!(s.broadcast_avoid(1, 0));
         assert!(s.avoid_broadcast(1));
         assert!(!s.try_canary(1));
-        s.note_spec(1);
+        s.note_unfenced(1);
         assert!(s.clique_gated(1));
     }
 
@@ -426,5 +425,24 @@ mod tests {
         // abort 0.5 * flip decay → skipped
         assert!(!s.in_h(3));
         assert!(s.decay_events() >= 1);
+    }
+
+    #[test]
+    fn force_prefix_essential_without_writer() {
+        let s = HotSketch::new();
+        assert!(
+            s.essential_antidep(1, false, false, true),
+            "force_prefix ∧ writer=None is still essential (serial-lane Fence)"
+        );
+    }
+
+    #[test]
+    fn avoid_essential_without_writer() {
+        let s = HotSketch::new();
+        assert!(s.broadcast_avoid(2, 0));
+        assert!(
+            s.essential_antidep(2, false, false, false),
+            "Avoid ∧ writer=None is still essential"
+        );
     }
 }

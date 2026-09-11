@@ -3695,8 +3695,8 @@ fn complete_arch_edge_pi_seq_eq_par_softwait0() {
     assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
     assert_eq!(par, sequential, "complete-arch must stay seq≡par: {m:?}");
     assert!(
-        m.edge_bind + m.edge_spec + m.edge_wait_for > 0 || m.spec_read_count + m.bind_hits > 0,
-        "edge π or Bind/Spec path should fire: {m:?}"
+        m.edge_bind + m.edge_unfenced + m.edge_wait_for > 0 || m.spec_read_count + m.bind_hits > 0,
+        "edge π or Bind/Unfenced path should fire: {m:?}"
     );
     // A6 warm second block on the same Pevm (prior H + templates).
     let parallel = pevm
@@ -3714,7 +3714,7 @@ fn complete_arch_edge_pi_seq_eq_par_softwait0() {
     assert_eq!(parallel, sequential, "warm complete-arch seq≡par: {m2:?}");
 }
 
-/// Gaps-closed: known essentials WaitFor or Bind (not Spec leak); SoftWait Soft=0;
+/// Gaps-closed: known essentials WaitFor or Bind (not Unfenced leak); SoftWait Soft=0;
 /// Avoid broadcast and Data-publish wake are live; seq≡par.
 #[test]
 fn gaps_closed_waitfor_avoid_publish_wake() {
@@ -3751,6 +3751,6 @@ fn gaps_closed_waitfor_avoid_publish_wake() {
     assert_eq!(m2.soft_wait_arms, 0, "warm SoftWait Soft=0: {m2:?}");
     assert!(
         m2.edge_wait_for + m2.edge_bind > 0,
-        "known essentials must Bind or WaitFor, not Spec-only: {m2:?}"
+        "known essentials must Bind or WaitFor, not Unfenced-only: {m2:?}"
     );
 }

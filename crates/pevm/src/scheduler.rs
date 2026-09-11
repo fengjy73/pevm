@@ -397,7 +397,7 @@ impl Scheduler {
     }
 
     /// A1/D6: pull the spine writer into the ready queue so WaitFor targets
-    /// make progress without Speccing known essentials.
+    /// make progress without Unfenced on known essentials.
     pub(crate) fn admit_spine(&self, tx_idx: TxIdx, wave: &WaveParkTable) {
         if tx_idx >= self.block_size {
             return;

@@ -378,7 +378,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.specfence.metrics.mark_hot(address);
     }
 
-    /// SpecFence π at location granularity: WaitHard / Bind / SpecRead / EarlyAbort.
+    /// SpecFence π at location granularity: WaitFor / Bind / Unfenced.
     /// PCC keeps sticky Wait. Beneficiary never waits.
     /// P2: force Bind/WaitHard on certified-prefix locations after PartialRetry.
     /// P3: EarlyAbort cuts incarnation (rem RewindTo/FullRetry) + Blocking (hang-free);
@@ -434,9 +434,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
 
     /// SpecFence complete-CC π (A1–A4 / D5 / D6).
     ///
+    /// Spec = Region (`EdgeKey`). Fence = Bind / WaitFor / serial-lane admission.
     /// Bind published Data immediately (A3) — no writer_done∨Validated gate.
-    /// WaitFor only unpublished essential anti-deps (D6), BlockingOther + steal.
-    /// SoftWait Soft stays 0. Spec only when no readable version and not essential.
+    /// WaitFor unpublished essentials (D6) and force_prefix/Avoid with no writer
+    /// (serial pred + admit_spine). SoftWait Soft stays 0.
+    /// Unfenced only when no readable version and the Region is not essential.
     fn maybe_wait_specfence(
         &self,
         address: Address,
@@ -473,7 +475,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
             .as_ref()
             .map(|v| v.tx_idx)
             .or_else(|| self.mv_memory.last_writer_before(location_hash, self.tx_idx));
-        let residual_writer = if mv_writer.is_none() && (tx_has_force || force_prefix) {
+        // Resolve writer for Fence: residual is not force-only. Avoid / repair
+        // with writer=None must still produce WaitFor/Bind, not Unfenced.
+        let residual_writer = if mv_writer.is_none() {
             self.mv_memory.residual_writer_before(location_hash, self.tx_idx)
         } else {
             None
@@ -587,26 +591,26 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 self.bind_on_data_lite(address, location_hash, v, force_prefix)
             }
             EdgeAction::WaitFor(w) => {
-                // D6: unpublished essential only. SoftWait Soft stays 0.
+                // D6: unpublished essential / serial-lane Fence. SoftWait Soft stays 0.
                 // Plant TLS mid-capture must not park (Iter4 livelock).
                 if crate::specfence::plant_tls_active() {
-                    self.specfence.metrics.record_edge_spec();
+                    self.specfence.metrics.record_edge_unfenced();
                     self.specfence.metrics.record_spec_read();
                     note_pending_effect_boundary(self.tx_idx, self.specfence.partial_retry);
                     return Ok(());
                 }
                 // Inversion only: never add_dependency on w ≥ reader.
                 // Ready writers are admitted onto the spine queue (hang-freedom
-                // without Speccing a known essential).
+                // without Unfenced on a known essential).
                 if w >= self.tx_idx {
-                    self.specfence.metrics.record_edge_spec();
+                    self.specfence.metrics.record_edge_unfenced();
                     self.specfence.metrics.record_spec_read();
                     note_pending_effect_boundary(self.tx_idx, self.specfence.partial_retry);
                     return Ok(());
                 }
                 if self.specfence.scheduler.is_done(w) {
                     // Writer finished without Data we can Bind — discover.
-                    self.specfence.metrics.record_edge_spec();
+                    self.specfence.metrics.record_edge_unfenced();
                     self.specfence.metrics.record_spec_read();
                     note_pending_effect_boundary(self.tx_idx, self.specfence.partial_retry);
                     return Ok(());
@@ -633,17 +637,17 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 );
                 Err(ReadError::Blocking(w))
             }
-            EdgeAction::SpecRead => {
+            EdgeAction::Unfenced => {
                 self.specfence.partial_retry.note_access(
                     self.tx_idx,
                     location_hash,
                     AccessMode::Read,
                 );
-                self.specfence.sketch.note_spec(location_hash);
-                self.specfence.metrics.record_edge_spec();
+                self.specfence.sketch.note_unfenced(location_hash);
+                self.specfence.metrics.record_edge_unfenced();
                 self.specfence.metrics.record_spec_read();
                 if independence {
-                    self.specfence.metrics.record_independent_spec();
+                    self.specfence.metrics.record_independent_unfenced();
                     self.specfence.metrics.record_cold_spec_fast();
                     if self.tx_incarnation == 0 {
                         self.specfence.metrics.record_occ_fast_first();

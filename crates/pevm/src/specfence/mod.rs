@@ -9,7 +9,8 @@
 //! Inter prior → H + chain templates (A6)   # warm-start; decay on flip
 //! Block-STM scheduler + MvMemory           # L0 work-conserving
 //!     ↑
-//! choose_edge_action (A1–A4, D6)           # Bind Data / WaitFor essential / Spec indep
+//! choose_edge_action (A1–A4, D6)           # Bind Data / WaitFor essential / Unfenced indep
+//!                                          # Spec = Region, not Unfenced
 //!     ↑
 //! First-wave Avoid on publish (A2)         # not block-end EMA
 //!     ↑

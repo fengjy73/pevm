@@ -1,6 +1,9 @@
 //! Fine-grained Detect (D5) + `choose_edge_action` (A1–A4, D6).
 //!
-//! Conflict identity is **not** a flat `(ℓ, reader)`:
+//! **Spec = Region** (this `EdgeKey`), not speculate. Optimistic access is
+//! [`EdgeAction::Unfenced`]. Fence = Bind / WaitFor / serial-lane admission.
+//!
+//! Conflict identity is **not** a flat `(ℓ, reader)` and not `RegionMode`:
 //! - `L_record` = location hash
 //! - `L_access` = `(reader, k, depth)` (multi-touch / frames)
 //! - `L_edge` = typed wr/rw/ww with unpublished | published-uncommitted | validated
@@ -54,14 +57,16 @@ pub(crate) struct EdgeRec {
 }
 
 /// Protocol action — verbs, not EV scores.
+/// Spec is the Region (`EdgeKey`); it is not a verb on this enum.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum EdgeAction {
-    /// Install a published version (A3). Writer need not be Validated.
+    /// Fence: install a published version (A3). Writer need not be Validated.
     Bind(TxVersion),
-    /// Ordered wait-for an unpublished essential anti-dep (D6).
+    /// Fence: ordered wait-for an unpublished essential / serial-lane pred (D6).
     WaitFor(TxIdx),
-    /// Independence-certified or first-wave canary discovery.
-    SpecRead,
+    /// No Region barrier — independence, canary, or cold discovery.
+    /// Not Spec. Spec = Region.
+    Unfenced,
 }
 
 /// Features for `choose_edge_action`. No AdaptiveParams. No morph mode.
@@ -88,11 +93,12 @@ pub(crate) struct EdgeView {
     /// Known/predicted unpublished essential anti-dep.
     pub essential_antidep: bool,
     pub force_prefix: bool,
-    /// A1: mass Spec on this clique is gated.
+    /// A1: mass Unfenced on this clique is gated.
     pub clique_gated: bool,
 }
 
-/// Decide the protocol verb. Bounded optimism: known essential → Bind or WaitFor.
+/// Decide the protocol verb. Bounded Unfenced: known essential → Bind or WaitFor.
+/// `force_prefix` / Avoid with `writer=None` must Fence (serial-lane pred), not Unfenced.
 pub(crate) fn choose_edge_action(v: &EdgeView) -> EdgeAction {
     let _ = (v.location, v.reader, v.access_k, v.access_depth, v.is_program);
     // writer_validated is Detect state only — never a Bind door (A3).
@@ -111,31 +117,35 @@ pub(crate) fn choose_edge_action(v: &EdgeView) -> EdgeAction {
         }
     }
 
-    // D6 / A1 / A2: unpublished essential → WaitFor, never Spec+retry.
-    // Hang-freedom is admission (admit lower spine writers), not Spec.
-    // Inversion (w ≥ reader) is the only WaitFor reject.
-    let must_wait = v.essential_antidep
+    // D6 / A1 / A2: unpublished essential → WaitFor, never Unfenced+retry.
+    // Hang-freedom is admission (admit lower spine writers), not Unfenced.
+    // Inversion (w ≥ reader) is the only known-writer WaitFor reject.
+    let must_fence = v.essential_antidep
         || v.avoid_broadcast
         || v.force_prefix
         || (v.clique_gated && !v.canary_ok && !v.independence_certified)
         || (v.in_hot_set && !v.canary_ok && !v.independence_certified);
-    if must_wait {
+    if must_fence {
         if let Some(w) = v.writer {
             if w < v.reader {
                 return EdgeAction::WaitFor(w);
             }
+            // inversion: later/self writer is not a preset-order anti-dep
+        } else if v.reader > 0 {
+            // force_prefix / Avoid / essential with no writer: serial-lane Fence.
+            return EdgeAction::WaitFor(v.reader - 1);
         }
     }
 
     // A2 canary or A4 independence or cold discovery.
-    EdgeAction::SpecRead
+    EdgeAction::Unfenced
 }
 
 /// Multi-touch EdgeTable. Key = `(ℓ, reader, k, depth)`.
 #[derive(Debug, Default)]
 pub(crate) struct EdgeTable {
     edges: DashMap<EdgeKey, EdgeRec, FxBuildHasher>,
-    /// Per-location Avoid verb (A2). Subsequent similar edges Avoid, not Spec.
+    /// Per-location Avoid verb (A2). Subsequent similar edges Fence, not Unfenced.
     avoid: DashMap<MemoryLocationHash, (), FxBuildHasher>,
     /// Distinct access keys recorded (Detect completeness).
     access_count: AtomicUsize,
@@ -346,7 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn a2_avoid_broadcast_waits_not_spec() {
+    fn a2_avoid_broadcast_waits_not_unfenced() {
         let a = choose_edge_action(&view(
             None, Some(4), false, false, true, true, false, false, false, false,
         ));
@@ -354,19 +364,19 @@ mod tests {
     }
 
     #[test]
-    fn a4_independence_specs() {
+    fn a4_independence_unfenced() {
         let a = choose_edge_action(&view(
             None, None, false, false, false, false, false, true, false, false,
         ));
-        assert_eq!(a, EdgeAction::SpecRead);
+        assert_eq!(a, EdgeAction::Unfenced);
     }
 
     #[test]
-    fn a2_canary_specs_before_avoid() {
+    fn a2_canary_unfenced_before_avoid() {
         let a = choose_edge_action(&view(
             None, Some(1), false, false, true, false, true, false, false, true,
         ));
-        assert_eq!(a, EdgeAction::SpecRead);
+        assert_eq!(a, EdgeAction::Unfenced);
     }
 
     #[test]
@@ -386,16 +396,16 @@ mod tests {
         v.writer = Some(9);
         assert_eq!(
             choose_edge_action(&v),
-            EdgeAction::SpecRead,
+            EdgeAction::Unfenced,
             "WaitFor(later) inverts preset order"
         );
         v.writer = Some(4);
-        assert_eq!(choose_edge_action(&v), EdgeAction::SpecRead);
+        assert_eq!(choose_edge_action(&v), EdgeAction::Unfenced);
     }
 
     #[test]
     fn wait_for_ready_known_essential() {
-        // Ready is not a Spec door — admission makes the writer progress.
+        // Ready is not an Unfenced door — admission makes the writer progress.
         let a = choose_edge_action(&view(
             None, Some(3), false, false, true, true, false, false, true, true,
         ));
@@ -403,12 +413,43 @@ mod tests {
     }
 
     #[test]
-    fn never_spec_known_essential() {
+    fn never_unfenced_known_essential() {
         let a = choose_edge_action(&view(
             None, Some(3), false, false, true, false, false, false, true, false,
         ));
         assert!(matches!(a, EdgeAction::WaitFor(3)));
-        assert!(!matches!(a, EdgeAction::SpecRead));
+        assert!(!matches!(a, EdgeAction::Unfenced));
+    }
+
+    #[test]
+    fn force_prefix_none_writer_serial_lane_fence() {
+        let mut v = view(
+            None, None, false, false, true, false, false, false, false, false,
+        );
+        v.force_prefix = true;
+        assert_eq!(
+            choose_edge_action(&v),
+            EdgeAction::WaitFor(6),
+            "force_prefix ∧ writer=None must Fence serial pred, not Unfenced"
+        );
+        v.reader = 0;
+        assert_eq!(
+            choose_edge_action(&v),
+            EdgeAction::Unfenced,
+            "tx0 has no serial pred"
+        );
+    }
+
+    #[test]
+    fn avoid_none_writer_serial_lane_fence() {
+        let a = choose_edge_action(&view(
+            None, None, false, false, true, true, false, false, false, false,
+        ));
+        assert_eq!(
+            a,
+            EdgeAction::WaitFor(6),
+            "avoid ∧ writer=None must WaitFor serial pred, not Unfenced"
+        );
     }
 
     #[test]

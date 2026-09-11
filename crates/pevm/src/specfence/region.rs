@@ -1,20 +1,21 @@
-//! Per-region Wait vs Speculate **mirrors** for the current block.
+//! Hollow PCC/legacy `RegionMode` bits — **not** SpecFence π.
 //!
-//! SpecFence v5: FenceGraph SoftWait is the source of truth for Wait arms.
-//! `RegionTable` bits may mirror promotions for metrics / PCC; SpecFence π
-//! (`choose_action`) must not treat `should_wait` / sticky bits as authority.
+//! Spec = Region = `EdgeKey` (ℓ + k + depth + typed edge).
+//! `RegionMode::Speculate|Wait` is a PCC mirror only. Avoid-path π is
+//! `choose_edge_action` (Bind / WaitFor / Unfenced). Do not treat these bits
+//! as Spec=speculate.
 
 use alloy_primitives::Address;
 use dashmap::DashMap;
 
 use crate::{BuildIdentityHasher, BuildSuffixHasher, MemoryLocationHash};
 
-/// Concurrency mode of one region for the rest of the current block.
+/// Hollow PCC/legacy bit. Not the SpecFence Avoid protocol face.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegionMode {
-    /// Optimistic read/write; validate and abort on conflict.
+    /// PCC/legacy “no Wait bit”. Not Spec. Spec = Region.
     Speculate,
-    /// Later accessors wait for the last lower-idx writer (PCC).
+    /// PCC sticky Wait mirror. Avoid-path Fence is WaitFor/Bind, not this bit.
     Wait,
 }
 

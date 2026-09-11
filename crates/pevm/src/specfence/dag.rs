@@ -389,6 +389,7 @@ impl FenceGraph {
         self.has_soft_wait(location) || self.wait_locations.contains_key(&location)
     }
 
+    /// Hollow PCC/legacy mirror. Not Avoid π (Spec = Region, not this bit).
     pub(crate) fn mode(&self, location: MemoryLocationHash) -> RegionMode {
         if self.is_wait(location) {
             RegionMode::Wait
