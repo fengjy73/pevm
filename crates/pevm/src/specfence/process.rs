@@ -70,6 +70,7 @@ impl ProcessReason {
         })
     }
 
+    /// Stable JSON key for this reason.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::BindPublished => "bind_published",
@@ -87,6 +88,7 @@ impl ProcessReason {
         }
     }
 
+    /// True when this verb is Unfenced (not a Fence).
     pub fn is_unfenced(self) -> bool {
         matches!(
             self,
@@ -119,7 +121,7 @@ struct LocProc {
 
 /// Live process tracer (one block).
 #[derive(Debug, Default)]
-pub struct ProcessTrace {
+pub(crate) struct ProcessTrace {
     reasons: [AtomicUsize; REASON_N],
     seq: AtomicU64,
     locs: DashMap<MemoryLocationHash, LocProc, FxBuildHasher>,
@@ -293,19 +295,22 @@ impl ProcessTrace {
                 }
             })
             .collect();
+        // Fan-out clique = max post-Avoid Bind/Wait, not max raw Unfenced
+        // (independence chatter can out-count the star ℓ).
         locs.sort_by(|a, b| {
-            let sa = a.unfenced + a.wait_for + a.bind;
-            let sb = b.unfenced + b.wait_for + b.bind;
+            let sa = a.bind_after_avoid + a.wait_after_avoid;
+            let sb = b.bind_after_avoid + b.wait_after_avoid;
             sb.cmp(&sa).then_with(|| {
-                (b.unfenced_after_avoid + b.wait_after_avoid + b.bind_after_avoid)
-                    .cmp(&(a.unfenced_after_avoid + a.wait_after_avoid + a.bind_after_avoid))
+                (b.bind + b.wait_for).cmp(&(a.bind + a.wait_for)).then_with(|| {
+                    (b.unfenced + b.wait_for + b.bind).cmp(&(a.unfenced + a.wait_for + a.bind))
+                })
             })
         });
         let unfenced_after_avoid_total = locs.iter().map(|l| l.unfenced_after_avoid).sum();
         let hot_fanout_l = locs.first().cloned();
         let unfenced_after_fence_on_hot_l = hot_fanout_l
             .as_ref()
-            .map(|l| l.unfenced_after_avoid + l.unfenced_after_canary)
+            .map(|l| l.unfenced_after_avoid)
             .unwrap_or(0);
         let independent_unfenced_total = self.reasons[ProcessReason::UnfencedIndependence.idx()]
             .load(Ordering::Relaxed);
