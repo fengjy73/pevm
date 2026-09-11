@@ -1,0 +1,152 @@
+{
+  "test": "fence-cover xblock warm/cold/OCC",
+  "tag": "fence-cover-xblock",
+  "incomplete": "killed after 597 occ: 598 sf-cold spun ~5min at 100% CPU (1 thread). 599/097 families not run.",
+  "families": [
+    "597"
+  ],
+  "rows": [
+    {
+      "family": "597",
+      "block": 14689595,
+      "mode": "sf-warm",
+      "ok": true,
+      "tps": 22785,
+      "wall_ms": 1.0,
+      "soft_wait_arms": 0,
+      "wait_hard": 0,
+      "occ_aborts": 0,
+      "edge_bind": 0,
+      "edge_wait_for": 0,
+      "edge_unfenced": 0,
+      "avoid_broadcasts": 0
+    },
+    {
+      "family": "597",
+      "block": 14689596,
+      "mode": "sf-warm",
+      "ok": true,
+      "tps": 10477,
+      "wall_ms": 3.0,
+      "soft_wait_arms": 0,
+      "wait_hard": 0,
+      "occ_aborts": 0,
+      "edge_bind": 41,
+      "edge_wait_for": 0,
+      "edge_unfenced": 461,
+      "avoid_broadcasts": 226,
+      "canary_probes": 260,
+      "independent_unfenced": 104,
+      "sketch_hot_size": 302
+    },
+    {
+      "family": "597",
+      "block": 14689597,
+      "mode": "sf-warm",
+      "ok": true,
+      "tps": 10055,
+      "wall_ms": 56.1,
+      "soft_wait_arms": 0,
+      "wait_hard": 92,
+      "occ_aborts": 90,
+      "edge_bind": 793,
+      "edge_wait_for": 92,
+      "edge_unfenced": 4467,
+      "avoid_broadcasts": 911,
+      "canary_probes": 634,
+      "independent_unfenced": 1173,
+      "spine_waits": 75,
+      "sketch_hot_size": 1207
+    },
+    {
+      "family": "597",
+      "block": 14689598,
+      "mode": "sf-warm",
+      "ok": true,
+      "tps": 10010,
+      "wall_ms": 11.1,
+      "soft_wait_arms": 0,
+      "wait_hard": 0,
+      "occ_aborts": 0,
+      "edge_bind": 37,
+      "edge_wait_for": 0,
+      "edge_unfenced": 669,
+      "avoid_broadcasts": 221
+    },
+    {
+      "family": "597",
+      "block": 14689599,
+      "mode": "sf-warm",
+      "ok": true,
+      "tps": 293662,
+      "wall_ms": 0.1,
+      "soft_wait_arms": 0,
+      "note": "tiny/empty snapshot; metrics look reused from 598"
+    },
+    {
+      "family": "597",
+      "block": 14689595,
+      "mode": "sf-cold",
+      "ok": true,
+      "tps": 28449,
+      "wall_ms": 0.8,
+      "soft_wait_arms": 0
+    },
+    {
+      "family": "597",
+      "block": 14689595,
+      "mode": "occ",
+      "ok": true,
+      "tps": 30078,
+      "wall_ms": 0.8,
+      "soft_wait_arms": 0
+    },
+    {
+      "family": "597",
+      "block": 14689596,
+      "mode": "sf-cold",
+      "ok": true,
+      "tps": 2664,
+      "wall_ms": 11.6,
+      "soft_wait_arms": 0,
+      "occ_aborts": 12
+    },
+    {
+      "family": "597",
+      "block": 14689596,
+      "mode": "occ",
+      "ok": true,
+      "tps": 8328,
+      "wall_ms": 3.7,
+      "soft_wait_arms": 0,
+      "occ_aborts": 8
+    },
+    {
+      "family": "597",
+      "block": 14689597,
+      "mode": "sf-cold",
+      "ok": true,
+      "tps": 12553,
+      "wall_ms": 44.9,
+      "soft_wait_arms": 0,
+      "occ_aborts": 0
+    },
+    {
+      "family": "597",
+      "block": 14689597,
+      "mode": "occ",
+      "ok": true,
+      "tps": 29676,
+      "wall_ms": 19.0,
+      "soft_wait_arms": 0,
+      "occ_aborts": 327
+    }
+  ],
+  "597_honesty": {
+    "sf_warm_wall_ms": 56.1,
+    "sf_cold_wall_ms": 44.9,
+    "occ_wall_ms": 19.0,
+    "sf_warm_over_occ": 2.9526315789473685,
+    "soft_wait_arms": 0
+  }
+}

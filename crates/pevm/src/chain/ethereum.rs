@@ -9,7 +9,7 @@ use revm::{
     Context, Database, MainBuilder, MainContext, MainnetEvm,
     context::{
         BlockEnv, CfgEnv, TxEnv,
-        result::{HaltReason, InvalidTransaction},
+        result::{EVMError, ExecutionResult, HaltReason, InvalidTransaction},
     },
     context_interface::either::Either,
     handler::MainnetContext,
@@ -24,6 +24,8 @@ use super::{CalculateReceiptRootError, PevmChain};
 use crate::{
     BuildIdentityHasher, MemoryLocation, MemoryLocationHash, PevmTxExecutionResult, TxIdx,
     hash_deterministic, mv_memory::MvMemory,
+    specfence::{handler_bind_snap_install_wanted, handler_sstore_plant_install_wanted, install_handler_bind_snap_capture, install_handler_sstore_plant_capture, SpecFenceInspector},
+
 };
 
 /// Implementation of [`PevmChain`] for Ethereum
@@ -62,7 +64,7 @@ impl PevmChain for PevmEthereum {
     type Network = alloy_provider::network::Ethereum;
     type Transaction = alloy_rpc_types_eth::Transaction;
     type Envelope = TxEnvelope;
-    type Evm<DB: Database> = MainnetEvm<MainnetContext<DB>>;
+    type Evm<DB: Database> = MainnetEvm<MainnetContext<DB>, SpecFenceInspector>;
     type EvmSpecId = SpecId;
     type EvmTx = TxEnv;
     type EvmHaltReason = HaltReason;
@@ -126,11 +128,23 @@ impl PevmChain for PevmEthereum {
         } else if spec_id >= SpecId::CANCUN {
             cfg = cfg.with_max_blobs_per_tx(MAX_BLOB_NUMBER_PER_BLOCK_CANCUN);
         }
-        Context::mainnet()
+        let mut evm = Context::mainnet()
             .with_cfg(cfg)
             .with_block(block_env)
             .with_db(db)
-            .build_mainnet()
+            .build_mainnet_with_inspector(SpecFenceInspector::new());
+        // Iter24: hang-free SLOAD Bind-snap wrap when ResumePath/Mass/inspect.
+        // ResumePath default — TLS only on SuffixRepair resume (no mass SNAP tax).
+        // Distinct from SSTORE plant; stock SSTORE unless capture/jump/inspect arms.
+        if handler_bind_snap_install_wanted() {
+            install_handler_bind_snap_capture(&mut evm.instruction);
+        }
+        // Iter4/10: hang-free post-SSTORE plant only when capture/jump/inspect may arm.
+        // Production jump/capture OFF → stock SSTORE (no per-opcode TLS tax).
+        if handler_sstore_plant_install_wanted() {
+            install_handler_sstore_plant_capture(&mut evm.instruction);
+        }
+        evm
     }
 
     /// Get the REVM tx envs of an Alloy block.
@@ -236,6 +250,17 @@ impl PevmChain for PevmEthereum {
         }
         Ok(hash_builder.root())
     }
+
+    fn run_pevm_tx<DB: Database>(
+        &self,
+        evm: &mut Self::Evm<DB>,
+        use_inspect: bool,
+    ) -> Result<ExecutionResult<Self::EvmHaltReason>, EVMError<DB::Error, InvalidTransaction>> {
+        crate::tx_runner::run_ethereum_tx(evm, use_inspect)
+    }
+
+
+
 
     fn is_eip_1559_enabled(&self, spec_id: SpecId) -> bool {
         spec_id >= SpecId::LONDON

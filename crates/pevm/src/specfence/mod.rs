@@ -1,0 +1,587 @@
+//! SpecFence **complete CC** — A1–A6 / D1–D7 (not OCC-lite as control plane).
+//!
+//! Authoritative: `lab/notes/specfence-complete-cc-architecture.md`.
+//! Family: preset-order hybrid OCC + ahead sketch + ordered admission +
+//! early-visible Bind + first-wave Avoid + piece-restricted resolve.
+//!
+//! # Single algorithm (hot path)
+//! ```text
+//! Inter prior → H + chain templates (A6)   # warm-start; decay on flip
+//! Block-STM scheduler + MvMemory           # L0 work-conserving
+//!     ↑
+//! choose_edge_action (A1–A4, D6)           # Bind Data / WaitFor essential / Unfenced indep
+//!                                          # Spec = Region, not Unfenced
+//!     ↑
+//! First-wave Avoid on publish (A2)         # not block-end EMA
+//!     ↑
+//! Resolve R1→R2→R3; R4 = failure (A5)
+//! ```
+//!
+//! **Avoid (A):** unfinished writer on hot program ℓ → BlockingOther prefer-steal
+//! Await until Executed/Validated, then Bind. Fence intent at first-cross `a`
+//! records `armed_at_k`. SoftWait Soft stays ~0 unless wake EV re-proven.
+//!
+//! **Resolve (B):** RebindOnly when value-stable (Iter6: Estimate→Data spin +
+//! multi-origin Basic snap / prior match); else SuffixRepair + journal FF.
+//! Escalate FullRestart after depth≥2 when RewindTo/FF armed (one extra
+//! SuffixRepair vs classic fb escalate-at-1; depth≥3 measured wall↑). Iter7:
+//! after first SuffixRepair fail, sticky BO Await on fail locs (+ force_bind
+//! extend) until writers Validated before 2nd resume. Iter10: strip Iter9 hot-path
+//! tax (stock SSTORE unless plant install wanted; no first_k-from-gas on finalize).
+//! Iter11: multi-SSTORE last-tip + k<k_fail snap select; jump/capture OFF.
+//! Iter12: Validated-strict spin on 2nd-repair prefer_await (no park tax);
+//! force_prefix ESTIMATE→BO when writer Executing; doomed-2nd-repair escalate to
+//! serial-barrier when ESTIMATE/Aborting∧Executing spine; longer RebindOnly spin
+//! on force_bind/ff_head. Abort-path Validated evidence spins falsified (wall↑).
+//! Iter13: Validated-gated Storage+Basic value-stable journal FF (origin bump,
+//! same value; Iter10 bare value-stable falsified); serial-barrier multi-candidate
+//! claim (no sibling park; Executed→Validated escalate spin falsified). Jump/
+//! capture OFF (single-SSTORE env trial hung). SoftWait Soft ~0.
+//! Iter14: schedule-side first-SuffixRepair Await behind Executing conflict writer
+//! (prevent doomed first repair; Estimate park falsified Iter8) + RebindOnly
+//! Validated collapse spin (Executed tip→Validated). Keep Iter12 2nd-repair +
+//! Validated-gated FF. Jump/capture OFF. SoftWait Soft ~0.
+//! Iter15: fan-out FR collapse — first-fail true_suffix + fan≥8 Executing spine
+//! → escalate+serial-barrier (fr↓; SoftWait Soft=0). Widen storm serial-barrier;
+//! longer true_suffix Validated RebindOnly spin. Pre-abort drain / BO-OR Await
+//! falsified. Keep Iter12–14. Jump/capture OFF. SoftWait Soft ~0.
+//! Iter16: cheap absorb — !true_suffix validate-defer behind Executing spine
+//! (RebindOnly-after-spine, no invalidate); true_suffix SuffixRepair+fra absorb
+//! instead of early FullRestart (FR collapse reserved for Estimate/Aborting
+//! doomed spines). Keep Iter12–15 barrier widen / vs-spin / fra. Jump/capture
+//! OFF. SoftWait Soft ~0. No 15b drain / 15c BO-OR.
+//! Iter17: schedule Await before SpecRead via yield-spin on storm+program
+//! live_fanout≥8 unfinished writers (no BO park). Falsified: 17a/f BO park,
+//! 17b true_suffix defer, 17d long RebindOnly wait, 17g cut vs_spin. Keep
+//! Iter16 absorb-no-sticky. Jump/capture OFF. SoftWait Soft ~0.
+//! Iter18: diagnose hang-free opcode skip on successful SuffixRepair. Falsified:
+//! Handler plant+capture (hsstore>0, aj=0 — SSTORE snaps at k≥k_fail on RAW-read
+//! fails); synthetic mid RewindTo; late-k yield192; ForceBind/park ff_head seed
+//! (599 wall↑). Production remains Iter17 tip. Jump/capture OFF. SoftWait Soft ~0.
+//! Iter19: hang-free Bind/SLOAD snap at certified-prefix end (not post-SSTORE).
+//! Opt-in `SPECFENCE_BIND_SNAP=1` → bsnap>0 with k<k_fail on 597 RAW-read fails.
+//! Absolute jump (`SPECFENCE_BIND_SNAP_JUMP=1`) hung Lean fixtures — production OFF.
+//! Capture-without-jump wall↑/599↑ — default capture OFF. Keep Iter17 yield-spin +
+//! Iter16 absorb; stock SSTORE; SoftWait Soft ~0.
+//! Iter20: hang-free Bind-snap *consume* diagnosis. Iter19 `!memory_lite_ok` left
+//! aj=0 on mainnet (Bind snaps clone memory). Fixing the gate + Validated-safe
+//! origin seed still **hangs 597** once Storage-FF Bind jump arms; Basic-only tips
+//! refuse (`bytecode_no_storage_ff`). Abs jump stays hard-OFF; hang-free credit
+//! consume (`bcredit`) when Bind tip on resume. SNAP opt-in; production OFF.
+//! SoftWait Soft ~0. Stock SSTORE. No mega-fan yield.
+//! Iter21: minimal Storage-FF Bind jump hang repro. Env-gated JUMP arm
+//! (`SPECFENCE_BIND_SNAP_JUMP=1`); matching MvMemory origins must be Validated;
+//! clear stale PENDING_RESUME in `with_bind_snap_tls`. Prove width=1 seq≡par
+//! then width≥2 hang-free before concurrency enable. Production SNAP/JUMP OFF;
+//! SoftWait Soft ~0. Keep Iter16–17 absorb/yield-spin.
+//! Iter22: Bind-jump restore — defer FF origin seed until after successful
+//! `apply_to_interp`; warm FF Storage/Basic in journal (EIP-2929); matching-origin
+//! value check; refuse truncated-memory tips. Dig for ERC-20 aj>0∧seq≡par; JUMP
+//! stays OFF under concurrency until stable + 597 no-hang. SoftWait Soft ~0.
+//! Iter23: diff-first Bind-jump vs cold SuffixRepair — tip_sloads log; refuse
+//! jump when Bind SLOAD ≠ FF (stale consumed into require/SUB → ERC-20 revert
+//! dgas=+661); journal warm prefer_tx=min. Non-jump: high-fan (≥32) first-repair
+//! pre-yield skip-park (cut park_ms). Dig aj>0∧fail=0 + 597 SNAP+JUMP no-hang;
+//! production stayed OFF (mass SNAP tax). SoftWait Soft ~0. Keep Iter16–17.
+//! Iter24: cautious Bind-jump enable — `SPECFENCE_BIND_SNAP=resume` ResumePath
+//! SNAP (capture only on SuffixRepair resume / force_bind / needs_live_capture;
+//! not every Handler run) + JUMP follows with refuse-if-stale. Mass=`=1`. SoftWait Soft ~0.
+//! Iter25: silent-default ResumePath (Mass JUMP was Lean hang — ResumePath+refuse
+//! hang-free + Lean seq≡par). tip_sloads skip of all-prefix Validated spin
+//! falsified (Lean p2 seq≠par); broad inc>0 SNAP falsified (tax, aj=0). SoftWait Soft ~0.
+//! Iter26: Validated-fresh tip→jump — arm Bind-snap on FF-served SLOAD (tip≡FF);
+//! Validated-only Bind-on-Data; prefer tip_sloads≡FF at jump_snap select; keep
+//! all-prefix Validated spin (no tip_sloads skip). SoftWait Soft ~0.
+//! Iter27: tip≡FF overlap (extras OK) + steps_cap select + deeper all-prefix
+//! Validated spin (no tip_sloads skip / nested apply hang falsified). SoftWait Soft ~0.
+//! Iter28: diagnose 597 first-frame tip identity (router→token nested Bind tips;
+//! nested apply / defer-until-match hung) + LAST_SNAP TLS clear. SoftWait Soft ~0.
+//! Iter29: hang-free nested Bind consume ≠ frame_init defer — stash+natural CALL
+//! apply dig hang-free; Iter29 default-on was Lean seq≠par — stayed opt-in then.
+//! Iter30: Lean-safe nested apply **default-on** — tip_sloads addr≡target ∧
+//! depth≤2 ∧ tip≡FF only (opt-out `SPECFENCE_NESTED_BIND=0`); multi-addr / deep
+//! tips still credit. SoftWait Soft ~0. Keep tip≡FF + steps_cap + LAST_SNAP.
+//! Keep Iter16–17/23/24/25/27/28/29.
+//! Iter8 memory snap retained. Head-FF (Iter5). SoftWait Soft ~0.
+//!
+//! **Three-pillar (default-on):**
+//! 1. Await@a — storm+program+live_fanout≥8 unfinished writer → BO until done +
+//!    Validated yield-spin, then Bind. SoftWait Soft stays ~0. Escape:
+//!    `SPECFENCE_DISABLE_AWAIT_AT_A=1`.
+//! 2. Resolve ≠ FullRestart — ResumePath Bind tips; tip≡FF max_steps 8192;
+//!    best deferred tip; Lean-safe nested apply; refuse unsafe jumps.
+//! 3. Morph mode — Quiet OCC-lite vs Storm Await-ready from inter morph + live
+//!    fanout flip; Await/choose_action only on hot candidates.
+//!
+//! **Learn (C):** Inter morph selects Quiet (598 OCC-lite) vs Storm (597 Await-ready).
+//! Intra `choose_action` / learner updates only on hot candidates.
+//!
+//! # Shoveled off SpecFence control (V5-P0)
+//! - Heat / `seed_wait_regions` SoftWait arming (PCC may still seed account Wait)
+//! - Account Wait / `promote_account` (diagnostic stub; always false)
+//! - `RegionTable` Wait as decision authority (mirrors only; FenceGraph SoT)
+//! - Bayes `should_wait_hard` Boolean second π (Beta posteriors = EV features)
+//! - AdaptiveEngagement abort_rate mode ladders (always Lean execute)
+//! - HotSet as Wait gate (`H_w`/`H_a` = optional dense-stat / fanout features)
+//!
+//! # Research-only (not default behavior) — V5-P3
+//! Inspect / absolute jump / CallOutcome SC stay behind `SPECFENCE_ENABLE_INSPECT=1`.
+//! Plant M1a–M1l + [`research_apply_abort_repair`] remain research; **not** graduated
+//! (A/B: inspect hangs on 597 path). Lean SoftWait wake may still arm hang-free
+//! journal FF via `try_arm_park_resume_at_k` (no absolute jump).
+//! Finegrain collectors are lab opt-in.
+//!
+//! Correctness shield: cascade fence + Block-STM validate / ESTIMATE unchanged.
+//! Learning never commits. SpecFence ≡ sequential on Ethereum fixtures.
+
+use crate::{
+    BuildSuffixHasher, MemoryLocation, TxIdx, chain::PevmChain, hash_deterministic,
+    scheduler::Scheduler,
+};
+use alloy_primitives::Address;
+use hashbrown::HashMap;
+
+mod bayes;
+mod edge;
+mod process;
+mod sketch;
+mod engagement;
+mod prior;
+mod boundary;
+mod dag;
+#[allow(missing_docs)]
+mod finegrain;
+mod heat;
+mod hotset;
+mod learner;
+mod metrics;
+mod region;
+mod rem;
+mod resolve;
+
+pub(crate) use bayes::{BayesMap, DEFAULT_TAU};
+pub(crate) use engagement::{AdaptiveEngagement, profile_timing_enabled, research_inspect_enabled};
+pub(crate) use hotset::HotSet;
+#[allow(unused_imports)]
+pub(crate) use hotset::{H_A, H_W};
+pub(crate) use prior::RwPriorMap;
+pub(crate) use dag::{FenceGraph, SpecDag};
+pub(crate) use learner::{
+    AdaptiveParams, InterBlockPrior, LiveLearner,
+};
+pub(crate) use heat::HeatMap;
+pub(crate) use metrics::MetricsInner;
+pub use metrics::SpecFenceMetrics;
+pub use finegrain::{
+    AbortEvent, AccountGrainObserve, ConsumerFirstCross, DagStats, EffectClass, EffectLogEntry,
+    FineGrainCollector, FineGrainSnapshot, EffectStreamDiag, HotLocation, L1DagSummary,
+    LocationKind, MaMdProxy, MeasurementMethod, RawEffectEdge, TxRw, RawEdge, TxWorkTotal,
+    analyze_dag, classify_raw_edges, dependency_edges, effect_raw_longest_chain,
+    effect_raw_max_fanout, estimate_ma_md, filter_effect_edges, hot_locations, kind_histogram,
+    l1_dag_summary, percentile_f64, producer_status_canonical, program_raw_longest_chain,
+};
+pub use region::RegionMode;
+pub(crate) use region::RegionTable;
+pub(crate) use rem::RemCounters;
+pub(crate) use rem::PartialRetryTable;
+pub(crate) use rem::WaveParkTable;
+#[allow(unused_imports)]
+pub(crate) use boundary::{
+    absolute_jump_eligible, absolute_jump_env_enabled, suffix_repair_jump_env_ok, arm_call_outcome_cache, arm_pc_resume, arm_ff_origin_seeds, take_ff_origin_seeds, clear_pc_resume, in_inspect_run,
+    jump_is_safe, jump_refuse_reason, last_boundary_snap, attach_current_live_snap, note_pending_effect_boundary,
+    arm_pending_effect_cp_only,
+    resume_was_applied, steps_this_run, try_arm_safe_absolute_jump, try_arm_safe_absolute_jump_gated,
+    with_plant_tls, with_plant_tls_journal, BoundarySnapshot, CachedCallOutcome, JournalBlob,
+    plant_tls_active, pending_resume_armed, try_apply_pending_pc_resume, nested_bind_consume_enabled, nested_bind_stash_armed, try_consume_nested_bind_resume, handler_sstore_plant_install_wanted, install_handler_sstore_plant_capture,
+    handler_bind_snap_install_wanted, install_handler_bind_snap_capture, with_bind_snap_tls, note_pending_bind_snap, bind_snap_env_enabled,
+    bind_snap_mode, bind_snap_capture_wanted, bind_snap_jump_enabled, BindSnapMode,
+};
+pub use boundary::SpecFenceInspector;
+#[allow(unused_imports)]
+pub(crate) use rem::{
+    AccessMode, Checkpoint, CheckpointId, CheckpointKind, EffectOrdinal, FfValue, LeanAbortRepair,
+    ParkedWait, ParkKind, ParkResumeIntent, ParkResumeKind, PartialRetryPlan, PartialRetryState,
+    PendingPark, RegionAccess, RemTask, RepairPlan, ResearchAbortRepair, ResumeContinuation,
+    StorageWriteReplay,
+};
+pub(crate) use edge::{
+    choose_edge_action, EdgeAction, EdgeKey, EdgeKind, EdgeState, EdgeTable, EdgeView,
+};
+pub use process::{ExecProcessSnapshot, LocProcessSnap, PerTxProcessSnap, ProcessReason};
+pub(crate) use process::ProcessTrace;
+pub(crate) use sketch::HotSketch;
+pub(crate) use resolve::{PolicyCtx, ResolveAction, choose_action};
+#[allow(unused_imports)]
+pub(crate) use resolve::{
+    BindTarget, EvScores, SelectiveOutcome, C_RETRY, COST_MARGIN, D_EARLY, D_WAIT, TAU_REVOKE,
+    TAU_S, TAU_VERY_HIGH, TAU_W, compute_ev, cost_prefers_wait, early_val_probability,
+};
+
+/// Selectable concurrency control for parallel block execution.
+///
+/// Default is current PEVM Block-STM (OCC). `SpecFence` mixes Wait and Speculate
+/// in the same block; PCC waits on hinted prior writers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConcurrencyMode {
+    /// Block-STM optimistic concurrency. Unchanged default path.
+    #[default]
+    Occ,
+    /// Conservative PCC: hinted `from`/`to` accounts start in Wait.
+    Pcc,
+    /// SpecFence complete CC: sketch + edge π + early-visible Bind + R1–R4 resolve.
+    SpecFence,
+}
+
+impl ConcurrencyMode {
+    /// Whether this mode uses per-region Wait/Speculate state.
+    pub const fn uses_regions(self) -> bool {
+        matches!(self, Self::Pcc | Self::SpecFence)
+    }
+}
+
+/// Cheap `from`/`to` index: which transactions hint they touch an account.
+#[derive(Debug, Default)]
+pub(crate) struct AccountHints {
+    by_account: HashMap<Address, Vec<TxIdx>, BuildSuffixHasher>,
+}
+
+impl AccountHints {
+    pub(crate) fn build<C: PevmChain>(chain: &C, txs: &[C::EvmTx]) -> Self {
+        let mut by_account: HashMap<Address, Vec<TxIdx>, BuildSuffixHasher> =
+            HashMap::with_hasher(BuildSuffixHasher::default());
+        for (idx, tx) in txs.iter().enumerate() {
+            let env = chain.tx_env(tx);
+            by_account.entry(env.caller).or_default().push(idx);
+            if let Some(to) = env.kind.to() {
+                by_account.entry(*to).or_default().push(idx);
+            }
+        }
+        for list in by_account.values_mut() {
+            list.sort_unstable();
+            list.dedup();
+        }
+        Self { by_account }
+    }
+
+    pub(crate) fn accounts(&self) -> impl Iterator<Item = Address> + '_ {
+        self.by_account.keys().copied()
+    }
+
+    pub(crate) fn writer_count(&self, address: &Address) -> usize {
+        self.by_account.get(address).map(Vec::len).unwrap_or(0)
+    }
+
+    /// Last transaction before `tx_idx` that hinted this account.
+    pub(crate) fn prev(&self, address: &Address, tx_idx: TxIdx) -> Option<TxIdx> {
+        let list = self.by_account.get(address)?;
+        match list.binary_search(&tx_idx) {
+            Ok(i) | Err(i) if i > 0 => Some(list[i - 1]),
+            _ => None,
+        }
+    }
+}
+
+/// Shared `SpecFence` context for one block (copied into workers).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SpecFenceCtx<'a> {
+    pub mode: ConcurrencyMode,
+    pub hints: &'a AccountHints,
+    pub metrics: &'a MetricsInner,
+    pub scheduler: &'a Scheduler,
+    pub beneficiary: Address,
+    pub bayes: &'a BayesMap,
+    pub tau: f64,
+    pub dag: &'a SpecDag,
+    pub rem: &'a RemCounters,
+    pub partial_retry: &'a PartialRetryTable,
+    /// M2 wave park / ready deque (SpecFence only; unused by OCC/PCC).
+    pub wave: &'a WaveParkTable,
+    /// M3 process-local online WŜ/RŜ prior (Bind-before-touch).
+    pub rw_prior: &'a RwPriorMap,
+    /// M4/R1 adaptive lean engagement (SpecFence only).
+    pub engagement: &'a AdaptiveEngagement,
+    /// R1 location-local HotSet (fanout/tracking hint only).
+    pub hotset: &'a HotSet,
+    /// P1 dual-horizon live learner (morph / fanout).
+    pub learner: &'a LiveLearner,
+    /// P1 tunable π constants.
+    pub params: &'a AdaptiveParams,
+    /// D5: multi-touch EdgeTable `(ℓ, reader, k, depth)`.
+    pub edges: &'a EdgeTable,
+    /// A1/A2/A6: hot set H + chain templates + Avoid broadcast.
+    pub sketch: &'a HotSketch,
+    /// Process-level Fence/Unfenced reason + per-ℓ timeline (lab / G7).
+    pub process: &'a ProcessTrace,
+    /// Opt-in lab fine-grain OCC/RW tracer (None = disabled, zero cost).
+    pub finegrain: Option<&'a crate::specfence::FineGrainCollector>,
+}
+
+impl<'a> SpecFenceCtx<'a> {
+    pub(crate) fn should_wait_account(&self, regions: &RegionTable, address: &Address) -> bool {
+        if !self.mode.uses_regions() || *address == self.beneficiary {
+            return false;
+        }
+        if self.mode == ConcurrencyMode::Pcc {
+            return true;
+        }
+        // V5-P0: SpecFence conflict key = MemoryLocation only. Account Wait is
+        // a diagnostic stub — never schedules SoftWait / never promotes.
+        let _ = (regions, address);
+        false
+    }
+
+    /// PCC sticky Wait probe. SpecFence v5: **always false**.
+    ///
+    /// SpecFence Wait is decided only by `choose_action` → FenceGraph SoftWait
+    /// inside `Vm::maybe_wait`. Bayes Bool / RegionTable sticky / account Wait
+    /// must not OR into SpecFence π (V5-P0 shovel).
+    pub(crate) fn should_wait_location(
+        &self,
+        regions: &RegionTable,
+        location: crate::MemoryLocationHash,
+        address: &Address,
+    ) -> bool {
+        if !self.mode.uses_regions() || *address == self.beneficiary {
+            return false;
+        }
+        if self.mode == ConcurrencyMode::Pcc {
+            return true;
+        }
+        // SpecFence: diagnostic no-op. SoftWait arms only via choose_action.
+        let _ = (regions, location, address);
+        false
+    }
+
+    /// Choose ResolveAction for a SpecFence location read (AEC argmin EV).
+    pub(crate) fn choose_resolve(
+        &self,
+        location: crate::MemoryLocationHash,
+        address: &Address,
+        writer: Option<TxIdx>,
+        writer_done: bool,
+        bind_version: Option<crate::TxVersion>,
+        residual_predicts: bool,
+        prior_ws_predicts: bool,
+        is_program: bool,
+        fanout_hint: bool,
+        live_fanout: f64,
+        gross_work_depth: Option<f64>,
+        waw_spine_hint: bool,
+        tx_heavy_hint: bool,
+    ) -> ResolveAction {
+        let posterior_conflict = self.bayes.conflict_probability(location, Some(address));
+        let posterior_bind = self.bayes.bind_useful_probability(location)
+            .max(self.rw_prior.write_confidence(location));
+        // M3: residual / process prior makes a published version a Bind placeholder.
+        let prior = residual_predicts || prior_ws_predicts;
+        let morph_weights = self.learner.morph_weights();
+        let e_wait_time = self.learner.e_wait_time(location);
+        let e_cascade = self.learner.e_cascade(location);
+        let e_reexec = self.learner.e_reexec();
+        let e_idle_steal = self.learner.e_idle_steal();
+        let meta_tax = self.learner.meta_tax_ratio(self.params);
+        let meta_budget_exceeded = self.learner.meta_budget_exceeded(self.params);
+        // G3: pass published Data version into π even when writer not yet is_done —
+        // choose_action decides Bind via prior_ws / high P / placeholder_ready.
+        let ctx = PolicyCtx {
+            location,
+            writer_known: writer.is_some() || bind_version.is_some(),
+            writer,
+            writer_done,
+            posterior_conflict,
+            posterior_bind_success: posterior_bind,
+            placeholder_ready: prior && (writer_done || bind_version.is_some()),
+            bind_version,
+            prior_ws_predicts: prior,
+            is_program,
+            fanout_hint,
+            live_fanout,
+            e_wait_time,
+            e_cascade,
+            e_reexec,
+            e_idle_steal,
+            meta_tax,
+            meta_budget_exceeded,
+            gross_work_depth,
+            morph_weights,
+            waw_spine_hint,
+            tx_heavy_hint,
+            sticky_resolve: self.learner.is_sticky_resolve(location),
+            params: *self.params,
+        };
+        let action = choose_action(ctx);
+        match &action {
+            ResolveAction::WaitHard => {
+                self.metrics.record_cost_chose_wait();
+                self.learner.note_meta_op();
+                if is_program {
+                    self.metrics.record_cost_chose_wait_program();
+                } else {
+                    self.metrics.record_cost_chose_wait_handler();
+                }
+                self.bayes.note_cost_decision_posterior(posterior_conflict, true);
+            }
+            ResolveAction::EarlyAbort => {
+                // EarlyAbort niche — count as wait-side cost choice + early_abort.
+                self.metrics.record_cost_chose_wait();
+                if is_program {
+                    self.metrics.record_cost_chose_wait_program();
+                } else {
+                    self.metrics.record_cost_chose_wait_handler();
+                }
+                self.metrics.record_early_abort();
+                self.bayes.note_cost_decision_posterior(posterior_conflict, true);
+            }
+            ResolveAction::SpecRead => {
+                self.metrics.record_cost_chose_spec();
+                if is_program {
+                    self.metrics.record_cost_chose_spec_program();
+                } else {
+                    self.metrics.record_cost_chose_spec_handler();
+                }
+                self.bayes.note_cost_decision_posterior(posterior_conflict, false);
+            }
+            ResolveAction::Bind(_) => {
+                self.metrics.record_cost_chose_bind();
+            }
+        }
+        action
+    }
+
+    /// Proactive PCC / cold-start: previous hinted writer that has not finished.
+    pub(crate) fn wait_blocker(
+        &self,
+        regions: &RegionTable,
+        address: &Address,
+        tx_idx: TxIdx,
+    ) -> Option<TxIdx> {
+        if !self.should_wait_account(regions, address) {
+            return None;
+        }
+        let prev = self.hints.prev(address, tx_idx)?;
+        if self.scheduler.is_done(prev) {
+            None
+        } else {
+            Some(prev)
+        }
+    }
+
+    /// Promote location Wait **mirror** (FenceGraph SoftWait remains authority for arms).
+    /// Abort/conflict densifies tracking; does not arm SoftWait by itself.
+    pub(crate) fn promote_from_bayes(
+        &self,
+        regions: &RegionTable,
+        location: crate::MemoryLocationHash,
+        address: Option<Address>,
+    ) -> bool {
+        let promoted = regions.promote_location(location);
+        // Mirror only — SoftWait arms come from choose_action→WaitHard→arm_soft.
+        let _ = self.dag.set_wait(location);
+        if promoted {
+            self.metrics.record_promotion(address);
+            self.metrics.record_wave_promotion();
+            self.bayes.bump_wave();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Unified SoftWait revoke: τ_revoke and/or morph quiet|waw.
+    pub(crate) fn try_revoke_unified(
+        &self,
+        regions: &RegionTable,
+        location: crate::MemoryLocationHash,
+        address: Option<&Address>,
+    ) -> bool {
+        let morph = self.learner.morph_weights();
+        let morph_revoke = morph.dominant_quiet() || morph.dominant_waw();
+        let bayes_revoke = self.bayes.should_revoke(location, address);
+        if !bayes_revoke && !morph_revoke {
+            return false;
+        }
+        // Only morph-revoke SoftWaits when posterior is also not insisting on Wait,
+        // or when quiet/waw dominates (schedule/steal ≫ sticky Wait).
+        if morph_revoke || bayes_revoke {
+            let cleared_region = regions.clear_location_wait(location);
+            let cleared_fence = self.dag.clear(location) > 0 || self.dag.clear_wait(location);
+            if morph.dominant_quiet() {
+                let n = self.sketch.revoke_prior_fences_if_quiet(true);
+                self.metrics.record_quiet_fence_revoke(n);
+            }
+            if cleared_region || cleared_fence {
+                self.metrics.record_soft_edge_revoke();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Attempt revoke of sticky Wait when posterior dropped (delegates to unified).
+    pub(crate) fn try_revoke(
+        &self,
+        regions: &RegionTable,
+        location: crate::MemoryLocationHash,
+        address: Option<&Address>,
+    ) -> bool {
+        self.try_revoke_unified(regions, location, address)
+    }
+}
+
+/// Seed account Wait for **PCC only**.
+///
+/// SpecFence v5: this is a **no-op** for SoftWait / Region Wait. Heat and Bayes
+/// priors must never arm SoftWait at block start (V5-P0 shovel). Callers should
+/// gate on `ConcurrencyMode::Pcc` (see `pevm.rs`).
+pub(crate) fn seed_wait_regions(
+    regions: &RegionTable,
+    hints: &AccountHints,
+    bayes: &BayesMap,
+    mode: ConcurrencyMode,
+    beneficiary: Address,
+    tau: f64,
+    initial_wait: &mut std::collections::HashSet<Address>,
+) {
+    if mode != ConcurrencyMode::Pcc {
+        let _ = (regions, hints, bayes, beneficiary, tau, initial_wait);
+        return;
+    }
+    for address in hints.accounts() {
+        if address == beneficiary {
+            continue;
+        }
+        let _ = (bayes, tau);
+        regions.seed_account_wait(address);
+        regions.promote_location(hash_deterministic(MemoryLocation::Basic(address)));
+        initial_wait.insert(address);
+    }
+}
+
+/// Apply bounded EWMA updates (PCC / legacy heat path). SpecFence uses Bayes.
+pub(crate) fn update_heat(
+    heat: &HeatMap,
+    hints: &AccountHints,
+    metrics: &MetricsInner,
+    beneficiary: Address,
+) {
+    for address in hints.accounts() {
+        if address != beneficiary && hints.writer_count(&address) >= 2 {
+            heat.observe(address);
+        }
+    }
+    for address in metrics.hot_accounts() {
+        if address != beneficiary {
+            heat.observe(address);
+        }
+    }
+}
+
+/// End-of-block Bayesian maintenance for SpecFence.
+pub(crate) fn update_bayes(bayes: &BayesMap) {
+    bayes.decay_block();
+}
+
+/// End-of-block RW prior decay (M3).
+pub(crate) fn update_rw_prior(rw_prior: &RwPriorMap) {
+    rw_prior.decay_block();
+}

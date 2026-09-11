@@ -1,0 +1,44 @@
+{
+  "block": 14689597,
+  "cores": 8,
+  "base_tip": "1dddbce",
+  "cuts": [
+    "fail-path plan reuse + apply_suffix_repair_planned",
+    "value_stable_match without FfValue clone",
+    "try_rebind verify-before-apply (no full re-collect)",
+    "success-path O(1) checkpoint + Wait revoke only (no bayes success storm)",
+    "defer read_locations until fail/success need"
+  ],
+  "wall_ms": {
+    "tip_n7_median": 14.0,
+    "tip_n11_median": 13.7,
+    "this_n7_median": 13.6,
+    "this_n11_median": 15.6,
+    "this_n7_min": 12.8,
+    "this_n11_min": 13.3,
+    "occ_median_n7": 3.5,
+    "occ_median_n11": 4.1
+  },
+  "soft_wait_arms_median": {
+    "tip": 0,
+    "this_n7": 0,
+    "this_n11": 0
+  },
+  "profile_buckets_last_iter_approx_ms": {
+    "validate_tip": 40.0,
+    "validate_this": 34.5,
+    "maybe_wait_tip": 30.5,
+    "maybe_wait_this": 23.7,
+    "rebind_this": 1,
+    "resume_this": 176
+  },
+  "validation": {
+    "lib_tests": 92,
+    "specfence_tests": "23 passed, 13 ignored",
+    "hang": false,
+    "abort_storm": false,
+    "seq_eq_par": true
+  },
+  "stretch_lt10": false,
+  "note": "validate ~40\u219234.5; SoftWait 0; N=7 wall 14.0\u219213.6; N=11 noisy 15.6; RebindOnly still rare; SuffixRepair/reexec residual blocks <10."
+}

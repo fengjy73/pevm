@@ -1,0 +1,60 @@
+{
+  "block": 14689597,
+  "cores": 8,
+  "base_tip": "c1c2d20",
+  "diagnosis": {
+    "resume_eq_force_bind_reabort": true,
+    "rebind_blocked_by": [
+      "true_suffix",
+      "value_change",
+      "estimate_at_validate",
+      "lazy_unsafe"
+    ],
+    "bo_on_data_park": "regressed wall \u2014 not landed as default",
+    "lazy_value_stable": "broke seq\u2261par \u2014 reverted"
+  },
+  "cuts": [
+    "yield-spin before Bind on force/sticky/hot_inc0 unfinished Data",
+    "force_prefix ESTIMATE spin\u2192Bind or WaitHard\u2192BO",
+    "sticky Await allowed under force_prefix (no Data)",
+    "prior_read_value_stable + multi-origin rebind when value_stable"
+  ],
+  "wall_ms": {
+    "tip_n7_median": 13.6,
+    "tip_n11_median": 15.6,
+    "this_n7_median": 13.4,
+    "this_n11_median": 13.7,
+    "this_n7_min": 12.7,
+    "this_n11_min": 12.4,
+    "occ_median_n7": 3.7,
+    "occ_median_n11": 3.4
+  },
+  "soft_wait_arms_median": {
+    "tip": 0,
+    "this_n7": 0,
+    "this_n11": 0
+  },
+  "resume_last_iter": {
+    "tip": 176,
+    "this_n7": 160,
+    "this_n11": 149
+  },
+  "force_bind_reabort_last": {
+    "tip": 175,
+    "this_n7": 154,
+    "this_n11": 145
+  },
+  "rebind_only_last": {
+    "tip": 1,
+    "this_n7": 0,
+    "this_n11": 4
+  },
+  "validation": {
+    "lib_tests": 92,
+    "specfence_tests": "23 passed, 13 ignored",
+    "hang": false,
+    "seq_eq_par": true
+  },
+  "stretch_lt10": false,
+  "note": "PARTIAL: resume 176\u2192160/149; SoftWait 0; N=7 wall flat; N=11 15.6\u219213.7; RebindOnly scarce; <10 not met."
+}

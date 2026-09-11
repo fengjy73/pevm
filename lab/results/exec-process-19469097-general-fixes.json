@@ -1,0 +1,367 @@
+{
+  "block": 19469097,
+  "mode": "specfence",
+  "tag": "general-fixes",
+  "wall_ms": 20.140686000000002,
+  "ok": true,
+  "metrics": {
+    "edge_bind": 449,
+    "edge_wait_for": 17,
+    "edge_unfenced": 4302,
+    "avoid_broadcasts": 1071,
+    "canary_probes": 1431,
+    "independent_unfenced": 1017,
+    "soft_wait_arms": 0,
+    "occ_aborts": 174,
+    "force_prefix_unfenced": 0,
+    "prefer_admit": 0,
+    "multi_spine_admit": 30,
+    "quiet_fence_revoke": 0,
+    "writer_identity_preserved": 182
+  },
+  "process": {
+    "reason_histogram": {
+      "bind_published": 449,
+      "unfenced_after_avoid": 0,
+      "unfenced_canary": 1431,
+      "unfenced_cold": 334,
+      "unfenced_independence": 1017,
+      "unfenced_inversion": 0,
+      "unfenced_plant_tls": 0,
+      "unfenced_writer_done": 1520,
+      "wait_for_canary": 0,
+      "wait_for_prefix": 0,
+      "wait_for_serial": 7,
+      "wait_for_writer": 10
+    },
+    "unfenced_total": 4302,
+    "wait_for_total": 17,
+    "bind_total": 449,
+    "unfenced_after_avoid_total": 663,
+    "hot_locations": [
+      {
+        "location": 5756944208085735096,
+        "bind": 150,
+        "wait_for": 0,
+        "unfenced": 2,
+        "unfenced_before_avoid": 2,
+        "unfenced_after_avoid": 0,
+        "wait_after_avoid": 0,
+        "bind_after_avoid": 150,
+        "unfenced_after_canary": 1,
+        "first_avoid_seq": 791,
+        "first_canary_seq": 788,
+        "first_fence_seq": 793,
+        "reasons": {
+          "bind_published": 150,
+          "unfenced_canary": 1,
+          "unfenced_cold": 1
+        }
+      },
+      {
+        "location": 13758554269703882113,
+        "bind": 99,
+        "wait_for": 0,
+        "unfenced": 5,
+        "unfenced_before_avoid": 4,
+        "unfenced_after_avoid": 1,
+        "wait_after_avoid": 0,
+        "bind_after_avoid": 99,
+        "unfenced_after_canary": 0,
+        "first_avoid_seq": 164,
+        "first_canary_seq": 0,
+        "first_fence_seq": 215,
+        "reasons": {
+          "bind_published": 99,
+          "unfenced_independence": 4,
+          "unfenced_writer_done": 1
+        }
+      },
+      {
+        "location": 6156966760139355624,
+        "bind": 49,
+        "wait_for": 1,
+        "unfenced": 1,
+        "unfenced_before_avoid": 1,
+        "unfenced_after_avoid": 0,
+        "wait_after_avoid": 1,
+        "bind_after_avoid": 49,
+        "unfenced_after_canary": 0,
+        "first_avoid_seq": 323,
+        "first_canary_seq": 318,
+        "first_fence_seq": 324,
+        "reasons": {
+          "bind_published": 49,
+          "unfenced_canary": 1,
+          "wait_for_writer": 1
+        }
+      },
+      {
+        "location": 10357899511347443885,
+        "bind": 18,
+        "wait_for": 0,
+        "unfenced": 3,
+        "unfenced_before_avoid": 3,
+        "unfenced_after_avoid": 0,
+        "wait_after_avoid": 0,
+        "bind_after_avoid": 18,
+        "unfenced_after_canary": 0,
+        "first_avoid_seq": 3258,
+        "first_canary_seq": 0,
+        "first_fence_seq": 3983,
+        "reasons": {
+          "bind_published": 18,
+          "unfenced_independence": 1,
+          "unfenced_writer_done": 2
+        }
+      },
+      {
+        "location": 12002167462798944181,
+        "bind": 4,
+        "wait_for": 1,
+        "unfenced": 3,
+        "unfenced_before_avoid": 1,
+        "unfenced_after_avoid": 2,
+        "wait_after_avoid": 1,
+        "bind_after_avoid": 4,
+        "unfenced_after_canary": 2,
+        "first_avoid_seq": 621,
+        "first_canary_seq": 595,
+        "first_fence_seq": 733,
+        "reasons": {
+          "bind_published": 4,
+          "unfenced_canary": 1,
+          "unfenced_writer_done": 2,
+          "wait_for_writer": 1
+        }
+      },
+      {
+        "location": 374026756458220942,
+        "bind": 5,
+        "wait_for": 0,
+        "unfenced": 3,
+        "unfenced_before_avoid": 1,
+        "unfenced_after_avoid": 2,
+        "wait_after_avoid": 0,
+        "bind_after_avoid": 5,
+        "unfenced_after_canary": 2,
+        "first_avoid_seq": 621,
+        "first_canary_seq": 578,
+        "first_fence_seq": 728,
+        "reasons": {
+          "bind_published": 5,
+          "unfenced_canary": 1,
+          "unfenced_writer_done": 2
+        }
+      },
+      {
+        "location": 6775151257255550366,
+        "bind": 5,
+        "wait_for": 0,
+        "unfenced": 3,
+        "unfenced_before_avoid": 1,
+        "unfenced_after_avoid": 2,
+        "wait_after_avoid": 0,
+        "bind_after_avoid": 5,
+        "unfenced_after_canary": 2,
+        "first_avoid_seq": 621,
+        "first_canary_seq": 555,
+        "first_fence_seq": 706,
+        "reasons": {
+          "bind_published": 5,
+          "unfenced_canary": 1,
+          "unfenced_writer_done": 2
+        }
+      },
+      {
+        "location": 7242912284647832413,
+        "bind": 5,
+        "wait_for": 0,
+        "unfenced": 1,
+        "unfenced_before_avoid": 1,
+        "unfenced_after_avoid": 0,
+        "wait_after_avoid": 0,
+        "bind_after_avoid": 5,
+        "unfenced_after_canary": 0,
+        "first_avoid_seq": 1826,
+        "first_canary_seq": 1815,
+        "first_fence_seq": 1857,
+        "reasons": {
+          "bind_published": 5,
+          "unfenced_canary": 1
+        }
+      },
+      {
+        "location": 5249012626508274354,
+        "bind": 4,
+        "wait_for": 0,
+        "unfenced": 3,
+        "unfenced_before_avoid": 1,
+        "unfenced_after_avoid": 2,
+        "wait_after_avoid": 0,
+        "bind_after_avoid": 4,
+        "unfenced_after_canary": 2,
+        "first_avoid_seq": 621,
+        "first_canary_seq": 585,
+        "first_fence_seq": 742,
+        "reasons": {
+          "bind_published": 4,
+          "unfenced_canary": 1,
+          "unfenced_writer_done": 2
+        }
+      },
+      {
+        "location": 5571831401313774584,
+        "bind": 4,
+        "wait_for": 0,
+        "unfenced": 2,
+        "unfenced_before_avoid": 2,
+        "unfenced_after_avoid": 0,
+        "wait_after_avoid": 0,
+        "bind_after_avoid": 4,
+        "unfenced_after_canary": 1,
+        "first_avoid_seq": 72,
+        "first_canary_seq": 24,
+        "first_fence_seq": 231,
+        "reasons": {
+          "bind_published": 4,
+          "unfenced_canary": 1,
+          "unfenced_cold": 1
+        }
+      },
+      {
+        "location": 16216398866791966285,
+        "bind": 4,
+        "wait_for": 0,
+        "unfenced": 2,
+        "unfenced_before_avoid": 1,
+        "unfenced_after_avoid": 1,
+        "wait_after_avoid": 0,
+        "bind_after_avoid": 4,
+        "unfenced_after_canary": 1,
+        "first_avoid_seq": 529,
+        "first_canary_seq": 361,
+        "first_fence_seq": 3137,
+        "reasons": {
+          "bind_published": 4,
+          "unfenced_canary": 1,
+          "unfenced_writer_done": 1
+        }
+      },
+      {
+        "location": 9943007405427446629,
+        "bind": 4,
+        "wait_for": 0,
+        "unfenced": 2,
+        "unfenced_before_avoid": 1,
+        "unfenced_after_avoid": 1,
+        "wait_after_avoid": 0,
+        "bind_after_avoid": 4,
+        "unfenced_after_canary": 1,
+        "first_avoid_seq": 528,
+        "first_canary_seq": 333,
+        "first_fence_seq": 3124,
+        "reasons": {
+          "bind_published": 4,
+          "unfenced_canary": 1,
+          "unfenced_writer_done": 1
+        }
+      },
+      {
+        "location": 1134252982565531770,
+        "bind": 4,
+        "wait_for": 0,
+        "unfenced": 2,
+        "unfenced_before_avoid": 1,
+        "unfenced_after_avoid": 1,
+        "wait_after_avoid": 0,
+        "bind_after_avoid": 4,
+        "unfenced_after_canary": 1,
+        "first_avoid_seq": 525,
+        "first_canary_seq": 345,
+        "first_fence_seq": 3116,
+        "reasons": {
+          "bind_published": 4,
+          "unfenced_canary": 1,
+          "unfenced_writer_done": 1
+        }
+      },
+      {
+        "location": 3980158569742776693,
+        "bind": 4,
+        "wait_for": 0,
+        "unfenced": 1,
+        "unfenced_before_avoid": 1,
+        "unfenced_after_avoid": 0,
+        "wait_after_avoid": 0,
+        "bind_after_avoid": 4,
+        "unfenced_after_canary": 0,
+        "first_avoid_seq": 49,
+        "first_canary_seq": 8,
+        "first_fence_seq": 2707,
+        "reasons": {
+          "bind_published": 4,
+          "unfenced_canary": 1
+        }
+      },
+      {
+        "location": 9495673275323199801,
+        "bind": 4,
+        "wait_for": 0,
+        "unfenced": 1,
+        "unfenced_before_avoid": 1,
+        "unfenced_after_avoid": 0,
+        "wait_after_avoid": 0,
+        "bind_after_avoid": 4,
+        "unfenced_after_canary": 0,
+        "first_avoid_seq": 4133,
+        "first_canary_seq": 4131,
+        "first_fence_seq": 4185,
+        "reasons": {
+          "bind_published": 4,
+          "unfenced_canary": 1
+        }
+      },
+      {
+        "location": 4608851390494091502,
+        "bind": 4,
+        "wait_for": 0,
+        "unfenced": 1,
+        "unfenced_before_avoid": 1,
+        "unfenced_after_avoid": 0,
+        "wait_after_avoid": 0,
+        "bind_after_avoid": 4,
+        "unfenced_after_canary": 0,
+        "first_avoid_seq": 4133,
+        "first_canary_seq": 0,
+        "first_fence_seq": 4136,
+        "reasons": {
+          "bind_published": 4,
+          "unfenced_independence": 1
+        }
+      }
+    ],
+    "hot_fanout_l": {
+      "location": 5756944208085735096,
+      "bind": 150,
+      "wait_for": 0,
+      "unfenced": 2,
+      "unfenced_before_avoid": 2,
+      "unfenced_after_avoid": 0,
+      "wait_after_avoid": 0,
+      "bind_after_avoid": 150,
+      "unfenced_after_canary": 1,
+      "first_avoid_seq": 791,
+      "first_canary_seq": 788,
+      "first_fence_seq": 793,
+      "reasons": {
+        "bind_published": 150,
+        "unfenced_canary": 1,
+        "unfenced_cold": 1
+      }
+    },
+    "unfenced_after_fence_on_hot_l": 0,
+    "independent_unfenced_total": 1017,
+    "force_prefix_none_unfenced": 0
+  }
+}

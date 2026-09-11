@@ -20,6 +20,7 @@ alloy-trie.workspace = true
 
 bitflags.workspace = true
 dashmap.workspace = true
+parking_lot.workspace = true
 hashbrown.workspace = true
 rustc-hash.workspace = true
 serde.workspace = true

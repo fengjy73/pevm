@@ -1,0 +1,45 @@
+{
+  "block": 14689597,
+  "cores": 8,
+  "base_tip": "c794c67",
+  "cuts": [
+    "maybe_wait common path = single last_data_before (OCC-like)",
+    "Bind-on-Data lite: no sticky/HotSet/prior/learner/Bayes/choose_action/dag; one rem certify+boundary lock",
+    "incarnation 0 no force_bind: cold SpecRead skips residual/sticky/HotSet/full \u03c0; unfinished+prior \u2192 BlockingOther (no SoftWait Soft)",
+    "Full \u03c0 only for sticky force_bind / program-prior Await / repair reincarnation",
+    "Skip EffectBoundary plant on cold OCC SpecRead (note_access journals first_k)"
+  ],
+  "wall_ms": {
+    "tip_n7_median": 21.3,
+    "tip_n11_median": 22.2,
+    "this_n7_median": 14.1,
+    "this_n11_median": 14.7,
+    "this_n7_min": 13.1,
+    "this_n11_min": 12.9,
+    "occ_median_n7": 3.6,
+    "occ_median_n11": 4.0
+  },
+  "soft_wait_arms_median": {
+    "tip": 1,
+    "this_n7": 0,
+    "this_n11": 0
+  },
+  "profile_buckets_last_iter_approx_ms": {
+    "maybe_wait_tip": 77.6,
+    "maybe_wait_this": 40.6,
+    "handler_this": 68.6,
+    "validate_this": 55.5,
+    "bo_idle_this": 18.7,
+    "softwait_soft_idle_this": 0.0
+  },
+  "validation": {
+    "lib_tests": 92,
+    "specfence_tests": "23 passed, 13 ignored",
+    "hang": false,
+    "abort_storm": false,
+    "seq_eq_par": true
+  },
+  "stretch_lt15": true,
+  "stretch_lt10": false,
+  "note": "maybe_wait ~78\u2192~41; wall N=7 21.3\u219214.1, N=11 22.2\u219214.7; SoftWait 0. Stretch <15 met; <10 not. Residual BO steal idle + validate + rem note_access."
+}

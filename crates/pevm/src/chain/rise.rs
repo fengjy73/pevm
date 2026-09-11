@@ -281,6 +281,42 @@ impl PevmChain for PevmRise {
         !is_deposit
     }
 
+    fn run_pevm_tx<DB: Database>(
+        &self,
+        evm: &mut Self::Evm<DB>,
+        use_inspect: bool,
+    ) -> Result<
+        revm::context::result::ExecutionResult<Self::EvmHaltReason>,
+        revm::context::result::EVMError<DB::Error, revm::context::result::InvalidTransaction>,
+    > {
+        let _ = use_inspect;
+        // Rise SpecFence live inspect not wired (Ethereum-only in M1d).
+        use revm::handler::Handler as _;
+        struct RiseNoBenef<DB>(core::marker::PhantomData<DB>);
+        impl<DB: Database> Default for RiseNoBenef<DB> {
+            fn default() -> Self {
+                Self(core::marker::PhantomData)
+            }
+        }
+        impl<DB: Database> revm::handler::Handler for RiseNoBenef<DB> {
+            type Evm = OpEvm<OpContext<DB>, ()>;
+            type Error = revm::context::result::EVMError<
+                DB::Error,
+                revm::context::result::InvalidTransaction,
+            >;
+            type HaltReason = OpHaltReason;
+            fn reward_beneficiary(
+                &self,
+                _: &mut Self::Evm,
+                _: &mut revm::handler::FrameResult,
+            ) -> Result<(), Self::Error> {
+                Ok(())
+            }
+        }
+        RiseNoBenef::<DB>::default().run(evm)
+    }
+
+
     fn is_eip_1559_enabled(&self, _: OpSpecId) -> bool {
         true
     }

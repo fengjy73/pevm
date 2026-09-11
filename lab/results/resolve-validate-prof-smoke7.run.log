@@ -1,0 +1,28 @@
+G7 dig tag="resolve-validate-prof" softwait_disabled=false
+=== G7 flip smoke 19606598 → 19606599 ===
+  block=19606598 ok=true tps=22843 soft_wait_arms=0 wait_hard=1 aborts=18 flip_count=0
+  block=19606599 ok=true tps=15874 soft_wait_arms=0 wait_hard=0 aborts=249 flip_count=1
+wrote "/workspace/specfence/crates/pevm/../../lab/results/resolve-validate-prof-flip.json"
+=== G7 SF vs OCC@8 cores iters=7 ===
+  block=14689597 mode=occ        iter=7/7 ok=true tps=80614 wall_ms=7.0 soft=0 wait_hard=0 abort_rate=0.105 lean=0 evm=1364 reexec=800 fb_reabort=0 rebind=0 cold=0 occ_fast=0 steal=0 park_k=0 mw_ms=0.0 h_ms=16.0 v_ms=11.3 park_ms=0.0 sw_ms=0.0 ea_ms=0.0 bo_ms=0.0 parks=0
+  block=14689597 mode=occ        SUMMARY n=7 wall_ms median=5.0 p90=5.3 min=3.6 mean=4.9 soft_med=0 abort_med=60
+  block=14689597 mode=specfence  iter=7/7 ok=true tps=35486 wall_ms=15.9 soft=0 wait_hard=3 abort_rate=0.429 lean=841 evm=627 reexec=63 fb_reabort=208 rebind=1 cold=2912 occ_fast=2667 steal=35 park_k=0 mw_ms=23.7 h_ms=43.7 v_ms=34.5 park_ms=1.2 sw_ms=0.0 ea_ms=0.0 bo_ms=1.2 parks=5
+  block=14689597 mode=specfence  SUMMARY n=7 wall_ms median=15.5 p90=15.9 min=14.1 mean=15.9 soft_med=0 abort_med=228
+  block=19606599 mode=occ        iter=7/7 ok=true tps=38216 wall_ms=9.6 soft=0 wait_hard=0 abort_rate=0.226 lean=0 evm=712 reexec=345 fb_reabort=0 rebind=0 cold=0 occ_fast=0 steal=0 park_k=0 mw_ms=0.0 h_ms=43.6 v_ms=3.7 park_ms=0.0 sw_ms=0.0 ea_ms=0.0 bo_ms=0.0 parks=0
+  block=19606599 mode=occ        SUMMARY n=7 wall_ms median=10.3 p90=12.3 min=9.6 mean=11.2 soft_med=0 abort_med=83
+  block=19606599 mode=specfence  iter=7/7 ok=true tps=19694 wall_ms=18.6 soft=0 wait_hard=0 abort_rate=0.708 lean=639 evm=447 reexec=80 fb_reabort=188 rebind=2 cold=4164 occ_fast=4048 steal=9 park_k=0 mw_ms=21.8 h_ms=75.2 v_ms=34.2 park_ms=0.8 sw_ms=0.0 ea_ms=0.0 bo_ms=0.8 parks=6
+  block=19606599 mode=specfence  SUMMARY n=7 wall_ms median=20.0 p90=21.5 min=18.6 mean=20.4 soft_med=0 abort_med=260
+  block=19469097 mode=occ        iter=7/7 ok=true tps=56462 wall_ms=6.0 soft=0 wait_hard=0 abort_rate=0.432 lean=0 evm=719 reexec=383 fb_reabort=0 rebind=0 cold=0 occ_fast=0 steal=0 park_k=0 mw_ms=0.0 h_ms=23.1 v_ms=2.9 park_ms=0.0 sw_ms=0.0 ea_ms=0.0 bo_ms=0.0 parks=0
+  block=19469097 mode=occ        SUMMARY n=7 wall_ms median=6.0 p90=6.6 min=5.6 mean=6.3 soft_med=0 abort_med=97
+  block=19469097 mode=specfence  iter=7/7 ok=true tps=23449 wall_ms=14.3 soft=0 wait_hard=0 abort_rate=0.818 lean=647 evm=461 reexec=125 fb_reabort=141 rebind=2 cold=2647 occ_fast=2497 steal=10 park_k=0 mw_ms=11.8 h_ms=40.1 v_ms=34.7 park_ms=1.5 sw_ms=0.0 ea_ms=0.0 bo_ms=1.5 parks=6
+  block=19469097 mode=specfence  SUMMARY n=7 wall_ms median=13.0 p90=14.3 min=11.9 mean=15.1 soft_med=0 abort_med=250
+  block=19606598 mode=occ        iter=7/7 ok=true tps=83797 wall_ms=1.1 soft=0 wait_hard=0 abort_rate=0.088 lean=0 evm=116 reexec=25 fb_reabort=0 rebind=0 cold=0 occ_fast=0 steal=0 park_k=0 mw_ms=0.0 h_ms=2.7 v_ms=0.3 park_ms=0.0 sw_ms=0.0 ea_ms=0.0 bo_ms=0.0 parks=0
+  block=19606598 mode=occ        SUMMARY n=7 wall_ms median=1.2 p90=1.3 min=1.1 mean=1.2 soft_med=0 abort_med=8
+  block=19606598 mode=specfence  iter=7/7 ok=true tps=39417 wall_ms=2.3 soft=0 wait_hard=0 abort_rate=0.209 lean=116 evm=104 reexec=13 fb_reabort=10 rebind=0 cold=625 occ_fast=606 steal=6 park_k=0 mw_ms=0.9 h_ms=4.3 v_ms=3.1 park_ms=0.0 sw_ms=0.0 ea_ms=0.0 bo_ms=0.0 parks=0
+  block=19606598 mode=specfence  SUMMARY n=7 wall_ms median=2.4 p90=2.5 min=1.9 mean=2.4 soft_med=0 abort_med=23
+  SF/OCC@8 block=14689597: 0.440
+  SF/OCC@8 block=19606599: 0.515
+  SF/OCC@8 block=19469097: 0.415
+  SF/OCC@8 block=19606598: 0.470
+  mean SF/OCC@8 = 0.460 (v8 baseline ~0.325 on different block set)
+wrote "/workspace/specfence/crates/pevm/../../lab/results/resolve-validate-prof-sf-occ.json"
