@@ -65,16 +65,18 @@ Unfenced = optimistic access (not Spec).
 
 ---
 
-## Process (N=3 @8, last SF iter)
+## Process (N=3 @8, last SF iter on tip `6057a77` + hope-spin removal)
 
 `unfenced_writer_done` = **0** on 597 / 599 / 097 (post-U1: 589 / 3237 / 1595).
 `unfenced_after_avoid` reason = 0. SoftWait Soft = 0. Await@a = 0.
 
 | Block | writer_done | bind | wait | indep | prefer_admit | R1 | rewind | bind_residual | canary_reopen |
 |------:|------------:|-----:|-----:|------:|-------------:|---:|-------:|--------------:|--------------:|
-| **14689597** | **0** | 1576 | 80 | 605 | 4 | 0 | 111 | 781 | 22 |
-| **19606599** | **0** | 5150 | 47 | 1094 | 14 | 10 | 211 | 4371 | 288 |
-| **19469097** | **0** | 2439 | 51 | 687 | 4 | 7 | 212 | 1920 | 84 |
+| **14689597** | **0** | 1630 | 70 | 677 | 0 | **3** | **84** | 871 | 23 |
+| **19606599** | **0** | 3305 | 25 | 1080 | **3** | **15** | **133** | 2778 | 299 |
+| **19469097** | **0** | 1974 | 11 | 708 | 0 | **23** | **203** | 1493 | 79 |
+
+R1↑ / rewind↓ vs post-U1 (R1 0/8/4; rewind 88/170/211). Last-iter `prefer_admit` is Ready-window-dependent (0 on 597/097 this dump; **3** on 599). xblock warm proves the law: 19606597 **27**, 19606600 **10**, 19469096 **3**, 19469097 **11**, 19469099 **2**.
 
 Reason histograms: Bind-after-Avoid covers the star; residual Bind absorbed Done∅Data. Independents stay Unfenced.
 
@@ -83,19 +85,19 @@ JSON: `lab/results/exec-process-{14689597,19606599,19469097}-subgrain-fixes.json
 
 ---
 
-## Wall / TPS honesty vs OCC (N=3 @8)
+## Wall / TPS honesty vs OCC (N=3 @8, this tip)
 
-Compare **ratios** to post-U1 (mean SF/OCC 0.376; 597 ~3.1×). This cut mean SF/OCC = **0.260**.
+Compare **ratios** to post-U1 (mean SF/OCC 0.376; 597 ~3.1×). This cut mean SF/OCC = **0.281**.
 
 | Block | SF wall med | OCC wall med | SF/OCC wall | SF/OCC TPS | Soft |
 |------:|------------:|-------------:|------------:|-----------:|-----:|
-| **14689597** | **23.3** | **6.3** | **3.7×** | **0.202** | 0 |
-| **19606599** | **62.1** | **10.7** | **5.8×** | **0.241** | 0 |
-| **19469097** | **30.0** | **9.1** | **3.3×** | **0.235** | 0 |
-| **19606598** | **4.1** | **1.5** | **2.8×** | **0.362** | 0 |
+| **14689597** | **22.9** | **5.6** | **4.1×** | **0.235** | 0 |
+| **19606599** | **36.6** | **11.7** | **3.1×** | **0.319** | 0 |
+| **19469097** | **23.5** | **7.3** | **3.2×** | **0.311** | 0 |
+| **19606598** | **4.2** | **1.3** | **3.1×** | **0.258** | 0 |
 
-597/097 sit in the post-U1 3–4.5× band. 599 is **5.8×** — residual Bind + repair still inflate wall; not a makespan win. 597 p90 (106) shows one slow iter; median is the honest figure.
+All three focus blocks sit in the post-U1 **3–4.5×** band (599 recovered from a 5.8× Ready-park/hope-spin cut). Still **not a makespan win** vs OCC. 597 p90 (24.4) is honest; no one-iter blow-up this run.
 
 xblock 598 sf-cold did not hang. Soft=0 throughout.
 
-Wall-recovery after the first cut (Ready-park / full-spine walk / canary mill / `wait_depth`∨essential): park Executing only; PreferAdmit Avoid-only cap 8 on Unfenced; one reopen per ℓ; `wait_depth_prior` is H only; no Done hope-spin. Numbers above are the recovered N=3 @8 (pre hope-spin removal). Fresh xblock on this tip is recorded in the same JSON names.
+Wall-recovery: park Executing only; PreferAdmit Avoid-only cap 8 on Unfenced; one reopen per ℓ; `wait_depth_prior` is H only; Done∅Data binds residual immediately (no hope-spin).

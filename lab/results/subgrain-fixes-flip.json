@@ -8,19 +8,19 @@
     {
       "block": 19606598,
       "ok": true,
-      "tps": 16117.482633412463,
+      "tps": 16650.336528917152,
       "soft_wait_arms": 0,
-      "wait_hard": 1,
-      "occ_aborts": 13,
+      "wait_hard": 2,
+      "occ_aborts": 9,
       "inter_prior_flip_count": 1
     },
     {
       "block": 19606599,
       "ok": true,
-      "tps": 6445.957888223402,
+      "tps": 9670.374609759543,
       "soft_wait_arms": 0,
-      "wait_hard": 56,
-      "occ_aborts": 208,
+      "wait_hard": 36,
+      "occ_aborts": 136,
       "inter_prior_flip_count": 2
     }
   ],
