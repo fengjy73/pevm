@@ -299,7 +299,9 @@ fn run_mode(
                 walls.push(wall_ms);
                 tpss.push(tps);
                 let m = pevm.last_specfence_metrics().clone();
-                if process_trace && mode == "specfence" && i + 1 == iters {
+                if mode == "specfence" && i + 1 == iters {
+                    // Always keep process snapshot for decision-field contingencies;
+                    // full process_summary still gated by process_trace / process_top.
                     last_process = Some(pevm.last_exec_process().clone());
                 }
                 last_metrics = Some(m);
@@ -348,18 +350,21 @@ fn run_mode(
         "metrics": metrics,
     });
     if let Some(proc) = last_process {
-        row["process_summary"] = serde_json::json!({
-            "unfenced_total": proc.unfenced_total,
-            "wait_for_total": proc.wait_for_total,
-            "bind_total": proc.bind_total,
-            "unfenced_after_avoid_total": proc.unfenced_after_avoid_total,
-            "force_prefix_none_unfenced": proc.force_prefix_none_unfenced,
-            "independent_unfenced_total": proc.independent_unfenced_total,
-            "unfenced_after_fence_on_hot_l": proc.unfenced_after_fence_on_hot_l,
-            "reason_histogram": proc.reason_histogram,
-            "hot_fanout_l": proc.hot_fanout_l,
-            "per_tx_len": proc.per_tx.len(),
-        });
+        row["decision_fields"] = serde_json::to_value(&proc.decision_fields).unwrap_or_default();
+        if process_trace {
+            row["process_summary"] = serde_json::json!({
+                "unfenced_total": proc.unfenced_total,
+                "wait_for_total": proc.wait_for_total,
+                "bind_total": proc.bind_total,
+                "unfenced_after_avoid_total": proc.unfenced_after_avoid_total,
+                "force_prefix_none_unfenced": proc.force_prefix_none_unfenced,
+                "independent_unfenced_total": proc.independent_unfenced_total,
+                "unfenced_after_fence_on_hot_l": proc.unfenced_after_fence_on_hot_l,
+                "reason_histogram": proc.reason_histogram,
+                "hot_fanout_l": proc.hot_fanout_l,
+                "per_tx_len": proc.per_tx.len(),
+            });
+        }
     }
     row
 }

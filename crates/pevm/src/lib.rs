@@ -223,7 +223,7 @@ mod scheduler;
 pub mod specfence;
 pub use specfence::{
     AbortEvent, AccountGrainObserve, ConcurrencyMode, ConsumerFirstCross, DagStats, EffectClass,
-    EffectLogEntry, EffectStreamDiag, ExecProcessSnapshot, FineGrainCollector, FineGrainSnapshot,
+    DecisionFieldSnap, EffectLogEntry, EffectStreamDiag, ExecProcessSnapshot, FineGrainCollector, FineGrainSnapshot,
     HotLocation, L1DagSummary, LocationKind, MaMdProxy, MeasurementMethod, PerTxProcessSnap,
     RawEdge, RawEffectEdge, SpecFenceMetrics, TxRw, TxWorkTotal, analyze_dag, classify_raw_edges,
     dependency_edges, effect_raw_longest_chain, effect_raw_max_fanout, estimate_ma_md,

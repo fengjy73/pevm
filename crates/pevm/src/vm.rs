@@ -23,7 +23,7 @@ use crate::{
     mv_memory::MvMemory,
     specfence::{
         AccessMode, BindSnapMode, CheckpointKind, EdgeAction, EdgeKey, EdgeKind, EdgeState,
-        EdgeView, FfValue, ProcessReason, SpecFenceCtx, StorageWriteReplay, absolute_jump_eligible,
+        DecisionFeat, DecisionVerb, EdgeView, FfValue, ProcessReason, SpecFenceCtx, StorageWriteReplay, absolute_jump_eligible,
         arm_call_outcome_cache, arm_ff_origin_seeds, attach_current_live_snap,
         bind_snap_jump_enabled, bind_snap_mode, choose_edge_action, early_val_probability,
         jump_is_safe, jump_refuse_reason, note_pending_bind_snap, note_pending_effect_boundary,
@@ -619,6 +619,34 @@ impl<'a, S: Storage> VmDb<'a, S> {
             writer_ready: writer.is_some_and(|w| self.specfence.scheduler.is_ready(w)),
         };
         let action = choose_edge_action(&view);
+        {
+            let verb = match &action {
+                EdgeAction::Bind(_) => DecisionVerb::Bind,
+                EdgeAction::WaitFor(_) => DecisionVerb::WaitFor,
+                EdgeAction::Unfenced => DecisionVerb::Unfenced,
+            };
+            self.specfence.process.record_decision(DecisionFeat {
+                verb,
+                access_k,
+                depth: access_depth,
+                incarnation: self.tx_incarnation,
+                is_program,
+                writer_published: published,
+                writer_validated: view.writer_validated,
+                writer_executing: view.writer_executing,
+                writer_ready: view.writer_ready,
+                writer_present: writer.is_some(),
+                avoid_broadcast: avoid,
+                canary_ok,
+                independence_certified: independence,
+                essential_antidep: essential,
+                force_prefix,
+                clique_gated,
+                in_hot_set: in_h,
+                prior_warm: prior_ws || sticky,
+                mode_read: true,
+            });
+        }
         let canary_taken = self.specfence.sketch.canary_taken(location_hash);
         let must_wait = force_prefix || avoid || essential;
 

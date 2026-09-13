@@ -12,6 +12,8 @@ use serde::Serialize;
 
 use crate::{MemoryLocationHash, TxIdx};
 
+use super::decision_field::{DecisionFeat, DecisionFieldAgg, DecisionFieldSnap, DecisionVerb};
+
 /// Why an access was Unfenced (or which Fence verb fired).
 #[allow(missing_docs)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -138,6 +140,8 @@ pub(crate) struct ProcessTrace {
     locs: DashMap<MemoryLocationHash, LocProc, FxBuildHasher>,
     txs: DashMap<TxIdx, PerTxProc, FxBuildHasher>,
     force_prefix_none_unfenced: AtomicUsize,
+    /// Temporary lab: feature × verb contingencies for π field selection.
+    decision_fields: DecisionFieldAgg,
 }
 
 /// One location's Fence / Unfenced split.
@@ -190,6 +194,8 @@ pub struct ExecProcessSnapshot {
     pub force_prefix_none_unfenced: usize,
     /// Per-reader process verbs (sorted by tx).
     pub per_tx: Vec<PerTxProcessSnap>,
+    /// Temporary lab: decision-field contingencies.
+    pub decision_fields: DecisionFieldSnap,
 }
 
 impl ProcessTrace {
@@ -317,6 +323,14 @@ impl ProcessTrace {
         }
     }
 
+    pub(crate) fn record_decision(&self, feat: DecisionFeat) {
+        self.decision_fields.record(feat);
+    }
+
+    pub(crate) fn decision_fields_snapshot(&self) -> DecisionFieldSnap {
+        self.decision_fields.snapshot()
+    }
+
     pub(crate) fn snapshot(&self, top_n: usize) -> ExecProcessSnapshot {
         let mut hist = BTreeMap::new();
         let mut unfenced_total = 0usize;
@@ -431,6 +445,7 @@ impl ProcessTrace {
             independent_unfenced_total,
             force_prefix_none_unfenced: self.force_prefix_none_unfenced.load(Ordering::Relaxed),
             per_tx,
+            decision_fields: self.decision_fields.snapshot(),
         }
     }
 }
