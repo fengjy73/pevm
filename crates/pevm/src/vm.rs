@@ -459,7 +459,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
         // off this path — learner updates on abort / end_block / PCC.
         self.specfence.metrics.record_detect_access();
 
-        if !self.specfence.learner.has_any_predicted() {
+        if crate::specfence::specfence_plant_is_occ(
+            crate::ConcurrencyMode::SpecFence,
+            self.specfence.learner,
+        ) {
             return self.occ_unfenced();
         }
 
@@ -1973,14 +1976,10 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             self.specfence.metrics.record_resume();
         } else if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
             self.specfence.metrics.record_evm_entry();
-            // Lean + research: CallEntry so SuffixRepair can find 0 < cp.k < k_fail
-            // together with mid-tx EffectBoundary / write checkpoints.
-            if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
-                let _ = self
-                    .specfence
-                    .partial_retry
-                    .push_checkpoint(tx_version.tx_idx, CheckpointKind::CallEntry);
-            }
+            let _ = self
+                .specfence
+                .partial_retry
+                .push_checkpoint(tx_version.tx_idx, CheckpointKind::CallEntry);
         }
 
         // Hang-free SuffixRepair prefix skip + live-snap capture (Iter2):

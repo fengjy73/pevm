@@ -202,7 +202,8 @@ pub(crate) use edge::{
 };
 pub(crate) use engagement::{AdaptiveEngagement, profile_timing_enabled, research_inspect_enabled};
 pub(crate) use executor::{
-    fence_for_mode, hinted_wait_enabled, occ_read_set_valid, uses_specfence_resolve, wave_for_mode,
+    fence_for_mode, hinted_wait_enabled, occ_read_set_valid, specfence_plant_is_occ,
+    uses_specfence_resolve, wave_for_mode,
 };
 pub use finegrain::{
     AbortEvent, AccountGrainObserve, ConsumerFirstCross, DagStats, EffectClass, EffectLogEntry,

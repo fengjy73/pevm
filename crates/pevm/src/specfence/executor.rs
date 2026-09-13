@@ -7,6 +7,7 @@
 
 use super::ConcurrencyMode;
 use super::dag::FenceGraph;
+use super::learner::LiveLearner;
 use super::rem::WaveParkTable;
 use crate::TxIdx;
 use crate::mv_memory::MvMemory;
@@ -39,6 +40,13 @@ pub(crate) fn hinted_wait_enabled(mode: ConcurrencyMode) -> bool {
 #[inline]
 pub(crate) fn uses_specfence_resolve(mode: ConcurrencyMode) -> bool {
     mode == ConcurrencyMode::SpecFence
+}
+
+/// Quiet / empty-PE: SpecFence **plant** is OCC (no rem write journal, no
+/// collect_invalid_reads repair, no CallEntry). PCC overlay stays off via π.
+#[inline]
+pub(crate) fn specfence_plant_is_occ(mode: ConcurrencyMode, learner: &LiveLearner) -> bool {
+    mode != ConcurrencyMode::SpecFence || !learner.has_any_predicted()
 }
 
 #[cfg(test)]

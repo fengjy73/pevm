@@ -407,5 +407,5 @@ Anti-pattern: `unfenced_occ_fast` + residual-Bind + skip-ESTIMATE on \(k{=}0..5\
 
 - Write this SoT first in the same PR as the reimplementation.  
 - Impl map after land: `lab/notes/specfence-clean-slate-impl.md`.  
-- Sweeps: `lab/results/clean-slate-*.json`.  
-- **Do not claim success without numbers.** Median vs 0.436; quiet vs 1.0.
+- Sweeps: `lab/results/clean-slate-*.json` (gitignored) + `lab/notes/clean-slate-sweep-summary.json`.  
+- Honesty (this cut): nonempty all-blocks N=1 median **0.464** vs 0.436; quiet median **0.716** (not ≈1.0). **Do not claim ≥0.7.**

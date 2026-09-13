@@ -29,7 +29,7 @@ pub(crate) fn decide(
     location: MemoryLocationHash,
     access_k: u32,
 ) -> AccessDecision {
-    if !learner.has_any_predicted() {
+    if !learner.has_any_predicted() || learner.quiet_fence_off() {
         return AccessDecision::UnfencedOcc {
             predicted: false,
             roi_skip: false,
@@ -119,10 +119,12 @@ mod tests {
         let live = LiveLearner::new();
         live.begin_block(MorphWeights::default());
         live.note_abort_access(7, 2, Some(6));
-        let d = decide(&live, 7, 6);
-        assert!(
-            matches!(d, AccessDecision::UnfencedOcc { .. }),
-            "quiet_fence_off must not open PCC: {d:?}"
+        assert_eq!(
+            decide(&live, 7, 6),
+            AccessDecision::UnfencedOcc {
+                predicted: false,
+                roi_skip: false
+            }
         );
     }
 }
