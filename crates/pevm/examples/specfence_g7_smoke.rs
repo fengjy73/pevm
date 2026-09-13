@@ -404,13 +404,15 @@ fn main() {
                             .unwrap_or(0)
                             .cmp(&a["fail_score"].as_u64().unwrap_or(0))
                     });
-                    let pertx_path = out_dir.join(format!("post-u1-per-tx-{short}-c8.json"));
+                    let pertx_tag = if tag.is_empty() { "post-u1" } else { tag.as_str() };
+                    let pertx_path = out_dir.join(format!("{pertx_tag}-per-tx-{short}-c8.json"));
+                    let head_sha = option_env!("SPECFENCE_BUILD_HEAD").unwrap_or("dbf9f15");
                     std::fs::write(
                         &pertx_path,
                         serde_json::to_string_pretty(&serde_json::json!({
                             "block": bn,
                             "short": short,
-                            "tag": if tag.is_empty() { "post-u1" } else { &tag },
+                            "tag": pertx_tag,
                             "cores": 8,
                             "wall_ms": wall_ms,
                             "ok": ok,
@@ -433,7 +435,7 @@ fn main() {
                             "abort_by_tx": abort_by_tx,
                             "final_incarnations": incarnations,
                             "abort_events_sample": abort_events,
-                            "head": "b50f336",
+                            "head": head_sha,
                         }))
                         .unwrap(),
                     )
