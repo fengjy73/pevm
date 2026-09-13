@@ -113,12 +113,10 @@ impl HotSketch {
         for top in tops {
             let mut decay = if flipped { 0.45 } else { 1.0 };
             if quiet {
-                decay *= 0.25;
-                // Quiet Fence-off: never plant H from fanout-only (quiet→fan_out leak).
-                if top.abort_rate < 0.40 {
-                    self.decay_events.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
+                // Quiet follow-on: never plant H (quiet→fan_out leak), including
+                // high-abort leftovers from a prior fan_out block.
+                self.decay_events.fetch_add(1, Ordering::Relaxed);
+                continue;
             }
             let conf = if top.abort_rate >= 0.40 {
                 0.25 * decay
@@ -744,6 +742,17 @@ mod tests {
             !s.in_h(11),
             "quiet + fanout-only must not plant a Fence prior"
         );
+        s.seed_from_prior_morph(
+            &[TopLocPrior {
+                location: 12,
+                fanout_ema: 64.0,
+                abort_rate: 0.90,
+                chain_len_ema: 4.0,
+            }],
+            false,
+            true,
+        );
+        assert!(!s.in_h(12), "quiet follow-on must not plant high-abort H");
     }
 
     #[test]

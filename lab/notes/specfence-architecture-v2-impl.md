@@ -17,11 +17,11 @@
 | 1 | R1-first Resolve when `identity_stable_match` / FF value-stable | `crates/pevm/src/pevm.rs::try_validate` (`r1_eligible`); `rem.rs::identity_stable_match` / `value_stable_match` | **landed** — value-stable (snap/FF/prior) is the R1 door; `identity_held` without a value match is not R1 on `true_suffix` (that accepted stale suffix writes / seq≠par). `r1_first_bias` only widens `!true_suffix` Estimate-cleared identity. |
 | 2 | Incarnation-stable residual / cold carry (tx72-class) | `rem.rs::PartialRetryState::reset` (`inc_carry_seen` / `inc_carry_snap`); `PartialRetryTable::inc_carry_seen`; `vm.rs` Unfenced→`bind_done_residual` | **landed** — carry map/snap survive `reset`; Unfenced→residual Bind only when `sketch.residual_bind` or `force_writer` (not every prior UnfencedCold). |
 | 3 | WaitFor park budget + PreferAdmit heat (no SoftWait) | `scheduler.rs::admit_spine_heat` / `admit_spine_writers_heat`; `vm.rs::maybe_wait_specfence` + `fence_wait_for`; `learner.rs::note_park_heat` / `prefer_admit_heat` | **landed** |
-| 4 | Dissolve `choose_edge_action` OR-salad → version-visibility SM | `edge.rs::classify_edge` → `EdgeVisibility` → `choose_edge_action` | **landed** |
+| 4 | Dissolve `choose_edge_action` OR-salad → version-visibility SM | `edge.rs::classify_edge` → `EdgeVisibility` → `choose_edge_action` | **landed** — H-alone is Cold Unfenced. In-flight-H WaitFor was tried and **reverted** (broke `fence_cover` seq≡par). |
 | 5 | Wire `park_ns` + rewind:rebind into structural learners (read by Fence/admit/Resolve) | `learner.rs::note_park_heat` / `note_resolve_r1` / `note_resolve_r2` / `r1_first_bias` / `prefer_admit_heat`; read in `try_validate`, `maybe_wait_specfence`, `admit_spine_heat` | **landed** |
 | 6 | Delete AEC / AdaptiveParams / SoftWait theater from live paths | `mod.rs::choose_resolve` dead; `pevm.rs` no `is_storm` / no `abc_top_storm` / no abort `maybe_flip_mode`; SoftWait not armed on access | **landed** |
 | 7 | Metric↔L1 morph calibration safe decay | `learner.rs::morph_hat` (fan_out needs abort evidence); `InterBlockPrior::end_block` damps quiet→fan_out | **landed** |
-| 8 | Protect quiet Fence-off | `learner.rs::quiet_fence_off`; `sketch.rs::seed_from_prior_morph` skips fanout-only under quiet; collapse/absorb/repair-await gated on `!quiet_fence_off` | **landed** |
+| 8 | Protect quiet Fence-off | `learner.rs::quiet_fence_off`; `sketch.rs::seed_from_prior_morph` skips **all** H on quiet follow-on (not only low abort_rate); collapse/absorb/repair-await gated on `!quiet_fence_off` | **landed** |
 | 9 | Generalize `fanout_fr_collapse` / absorb (19807137 / 19434587 class) | `pevm.rs::scan_invalid_spine` / `structural_spine_hot` — executing spine + fan≥2, no bn / no Storm / no fan≥8 hardcode | **landed** |
 
 Roadmap rewrite (no P0/P1/P2 table): `lab/notes/specfence-complete-architecture-v2.md` §12.
@@ -75,11 +75,20 @@ end_block:
 
 | Suite | Expect |
 |-------|--------|
-| `edge.rs` | visibility machine; hot-alone Unfenced; existing A1–A4/D6 |
-| `learner.rs` | park/r1 bias readable; quiet_fence_off; morph_hat no over-fan_out; inter-prior damp |
+| `edge.rs` | visibility machine; hot-alone Unfenced; in-flight H WaitFor; existing A1–A4/D6 |
+| `learner.rs` | park/r1 bias readable; quiet_fence_off survives 4 aborts; morph_hat no over-fan_out; inter-prior damp |
 | `rem.rs` | `inc_carry_seen` + snap survive reset |
 | `sketch.rs` | quiet fanout-only does not seed H |
 | `cargo test -p pevm --lib --release` | green |
 | `cargo test -p pevm --test specfence --release -- --test-threads=1` | green |
 
-Sweep JSON: `lab/results/arch-v2-*-sweep.json`. Honesty vs prior median SF/OCC **0.356**.
+Sweep JSON: `lab/results/arch-v2-*-sweep.json` (gitignored). Honesty vs prior full-set median SF/OCC **0.356** and same-sample N3 overlay.
+
+N=3 focus+worst10+quiet (17 blocks) at `c821784` before quiet/in-flight tighten:
+- sample median SF/OCC **0.253** (worst-heavy set; prior same-sample median **0.240**)
+- soft=0, await=0
+- **2179522 quiet regression** (0.207 vs prior N3 1.074; p90 SF 233 ms Bind storm) — `quiet_fence_off` lifted after 4 aborts; PreferAdmit walked spines on every Unfenced
+- **14689597** R1=0 / R2=149 (prior R2=66) — H-alone Unfenced while writer Executing
+- **19807137** SF/OCC 0.095 vs 0.090 (SF wall 172 vs 131 — not a win)
+
+Post-N3 tighten kept: quiet follow-on **never** plants H (high-abort leftovers included). In-flight-H WaitFor and abort&lt;4 quiet lift were tried; first broke seq≡par, second made the specfence suite schedule-flaky — reverted. Isolated 2179522 N=3 regression remains (no inter-prior). Same-sample median is **not** a full-set 0.356 replay.
