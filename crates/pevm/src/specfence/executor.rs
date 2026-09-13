@@ -71,6 +71,16 @@ pub(crate) fn specfence_plant_is_occ(mode: ConcurrencyMode, learner: &LiveLearne
     mode != ConcurrencyMode::SpecFence || !learner.has_any_predicted()
 }
 
+/// Per-access OCC fast path: empty PE **or** this \(\ell\) has no PE class.
+#[inline]
+pub(crate) fn specfence_access_is_occ(
+    mode: ConcurrencyMode,
+    learner: &LiveLearner,
+    location: crate::MemoryLocationHash,
+) -> bool {
+    specfence_plant_is_occ(mode, learner) || !learner.location_predicted(location)
+}
+
 /// OCC schedule — zero SpecFence symbols.
 #[inline]
 pub(crate) fn next_occ_task(scheduler: &Scheduler) -> Option<Task> {

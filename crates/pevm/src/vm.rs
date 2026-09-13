@@ -465,10 +465,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return Ok(());
         }
 
-        // T6: plant_is_occ **before** note / detect / PE probe.
-        if crate::specfence::specfence_plant_is_occ(
+        // T6: empty PE **or** this ℓ has no PE class → byte-identical OCC.
+        if crate::specfence::specfence_access_is_occ(
             crate::ConcurrencyMode::SpecFence,
             self.specfence.learner,
+            location_hash,
         ) {
             return Ok(());
         }

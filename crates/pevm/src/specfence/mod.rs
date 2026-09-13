@@ -216,8 +216,9 @@ pub(crate) use edge::{
 };
 pub(crate) use engagement::{AdaptiveEngagement, profile_timing_enabled, research_inspect_enabled};
 pub(crate) use executor::{
-    fence_for_mode, hinted_wait_enabled, next_occ_task, occ_read_set_valid, specfence_plant_is_occ,
-    specfence_r1_validate, uses_specfence_resolve, validate_occ_kernel, validate_occ_stage,
+    fence_for_mode, hinted_wait_enabled, next_occ_task, occ_read_set_valid, specfence_access_is_occ,
+    specfence_plant_is_occ, specfence_r1_validate, uses_specfence_resolve, validate_occ_kernel,
+    validate_occ_stage,
     wave_for_mode,
 };
 pub use finegrain::{

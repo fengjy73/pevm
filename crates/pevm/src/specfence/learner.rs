@@ -417,6 +417,8 @@ pub(crate) struct LiveLearner {
     predicted_intra: DashMap<(MemoryLocationHash, u8), AtomicUsize, FxBuildHasher>,
     /// Cheap emptiness for the Unfenced≡OCC fast path (no DashMap scan).
     predicted_n: AtomicUsize,
+    /// Locations with any PE class — T6: non-PE ℓ stays byte-identical OCC.
+    predicted_locs: DashMap<MemoryLocationHash, (), BuildIdentityHasher>,
 }
 
 impl LiveLearner {
@@ -465,6 +467,7 @@ impl LiveLearner {
         self.identity_hits.store(0, Ordering::Relaxed);
         self.predicted.clear();
         self.predicted_intra.clear();
+        self.predicted_locs.clear();
         self.predicted_n.store(0, Ordering::Relaxed);
     }
 
@@ -631,6 +634,13 @@ impl LiveLearner {
             .or_insert_with(|| AtomicUsize::new(0))
             .fetch_add(1, Ordering::Relaxed);
         self.predicted_n.fetch_add(1, Ordering::Relaxed);
+        self.predicted_locs.insert(location, ());
+    }
+
+    /// True when any PE class exists for \(\ell\) (T6: other ℓ stay OCC).
+    #[inline]
+    pub(crate) fn location_predicted(&self, location: MemoryLocationHash) -> bool {
+        self.predicted_locs.contains_key(&location)
     }
 
     /// Inter-block prior seed. Quiet callers must not invoke this.
@@ -644,6 +654,7 @@ impl LiveLearner {
             .or_insert_with(|| AtomicUsize::new(0))
             .fetch_add(1, Ordering::Relaxed);
         self.predicted_n.fetch_add(1, Ordering::Relaxed);
+        self.predicted_locs.insert(location, ());
     }
 
     /// Always-on cheap Detect at \(a\). Observe-only features stay here.
@@ -770,6 +781,13 @@ impl LiveLearner {
         *m = m.normalize();
         if let Some(k) = k.filter(|&k| k > 0) {
             self.mark_predicted_essential(location, k);
+        } else {
+            // Quiet first-wave has no AccessOrdinalLog. Still train PE so
+            // reincarnation can Bind/WaitFor (otherwise plant_is_occ sticks
+            // and Fence never opens after B0).
+            for template in [1u32, 6, 10, 20] {
+                self.mark_predicted_essential(location, template);
+            }
         }
     }
 
