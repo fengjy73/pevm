@@ -65,10 +65,14 @@ pub(crate) fn specfence_r1_validate(
         && repair_grain(cert, tx_idx, invalid) == RepairGrain::R1
 }
 
-/// Empty PE table: quiet path is byte-identical OCC (no ordinal / PE probe).
+/// Empty PE **or** quiet-fence-off: byte-identical OCC computer
+/// (schedule / execute / access). A lone quiet abort must not flip the
+/// ready-set to wave+refuse (13287210 / 2179522 tax).
 #[inline]
 pub(crate) fn specfence_plant_is_occ(mode: ConcurrencyMode, learner: &LiveLearner) -> bool {
-    mode != ConcurrencyMode::SpecFence || !learner.has_any_predicted()
+    mode != ConcurrencyMode::SpecFence
+        || !learner.has_any_predicted()
+        || learner.quiet_fence_off()
 }
 
 /// Per-access OCC fast path: empty PE **or** this \(\ell\) has no PE class.
@@ -318,5 +322,20 @@ mod tests {
             0,
             &[7, 9]
         ));
+    }
+
+    #[test]
+    fn quiet_lone_pe_keeps_occ_computer() {
+        let live = LiveLearner::new();
+        live.begin_block(crate::specfence::learner::MorphWeights::default());
+        live.note_abort_access(7, 2, Some(6));
+        assert!(
+            live.has_any_predicted(),
+            "intra abort may arm PE"
+        );
+        assert!(
+            specfence_plant_is_occ(ConcurrencyMode::SpecFence, &live),
+            "quiet_fence_off must not flip the PC ready-set"
+        );
     }
 }

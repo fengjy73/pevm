@@ -521,11 +521,15 @@ impl Pevm {
                         chain, spec_id, &block_env, &txs, storage, &mv_memory, specfence,
                     );
                     let profile = crate::specfence::profile_timing_enabled();
-                    // Empty PE ⇒ OCC computer (T6). After abort trains PE,
-                    // ready-edge + wave steal (incarnation>0 refuse).
+                    // Empty PE ∨ quiet_fence_off ⇒ OCC computer (T6 / quiet).
+                    // After abort heat lifts quiet-off, PC⊗CC ready-set + refuse.
                     let occ_mode = self.concurrency_mode == ConcurrencyMode::Occ;
                     let mut sched_t0 = profile.then(Instant::now);
-                    let mut task = if occ_mode || !specfence.learner.has_any_predicted() {
+                    let mut task = if occ_mode
+                        || crate::specfence::specfence_plant_is_occ(
+                            self.concurrency_mode,
+                            specfence.learner,
+                        ) {
                         crate::specfence::next_occ_task(&scheduler)
                     } else if let Some(w) = wave_ref {
                         crate::specfence::next_sf_task(
@@ -543,8 +547,12 @@ impl Pevm {
                     while task.is_some() {
                         task = match task.unwrap() {
                             Task::Execution(tx_version) => {
-                                let pe = specfence.learner.has_any_predicted();
-                                if occ_mode || !pe {
+                                let occ_exec = occ_mode
+                                    || crate::specfence::specfence_plant_is_occ(
+                                        self.concurrency_mode,
+                                        specfence.learner,
+                                    );
+                                if occ_exec {
                                     self.try_execute(&mut vm, &scheduler, tx_version, None, None)
                                 } else {
                                     let fence_ref = crate::specfence::fence_for_mode(
@@ -595,7 +603,11 @@ impl Pevm {
 
                         if task.is_none() {
                             sched_t0 = profile.then(Instant::now);
-                            task = if occ_mode || !specfence.learner.has_any_predicted() {
+                            task = if occ_mode
+                                || crate::specfence::specfence_plant_is_occ(
+                                    self.concurrency_mode,
+                                    specfence.learner,
+                                ) {
                                 crate::specfence::next_occ_task(&scheduler)
                             } else if let Some(w) = wave_ref {
                                 crate::specfence::next_sf_task(

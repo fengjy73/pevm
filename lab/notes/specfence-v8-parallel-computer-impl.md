@@ -26,7 +26,7 @@
 | SoT item | file:fn | Live |
 |----------|---------|------|
 | PC ⊗ CC peer frame | SoT v8 §0.1; `mod.rs` | yes |
-| Empty-PE OCC (T6) | `specfence_plant_is_occ` / gate early return | **kept** |
+| Empty-PE OCC (T6) | `specfence_plant_is_occ` / gate early return; **quiet_fence_off also OCC computer** | **kept** |
 | ProducerStage-safe refuse | `producer_stage.rs`; `try_execute_ready` refuse iff producer Executing; `next_sf_task` drops Aborting reservations | yes |
 | ReadyEdge + predicted RAW tip | `ready_edge.rs` | yes |
 | Bind rare (tip==conflict ∧ EV) | `access_policy::decide`; `AccessVis.tip_is_conflict_producer` | yes |
