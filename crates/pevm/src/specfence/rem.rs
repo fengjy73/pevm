@@ -421,8 +421,8 @@ impl PartialRetryState {
         k
     }
 
-    /// Cheap per-tx \(k\) bump for the PE probe. No `first_k` / journal
-    /// (Unfenced miss → B0; PrefixSkip requires a PCC-journaled prefix).
+    /// Cheap per-tx \(k\) bump without `first_k`. Prefer `note_access_k_only`
+    /// on the live SpecFence path (AccessOrdinalLog / true-\(k\) PE train).
     #[inline]
     pub(crate) fn bump_k_only(&mut self) -> usize {
         self.k += 1;

@@ -572,7 +572,14 @@ impl LiveLearner {
         if unfinished > 1 || !writer_executing {
             return false;
         }
-        self.park_heat.load(Ordering::Relaxed) < 8
+        !self.park_storm()
+    }
+
+    /// Park heat already losing to OCC reincarnation — `decide()` stays Spec
+    /// except Bind-on-Data.
+    #[inline]
+    pub(crate) fn park_storm(&self) -> bool {
+        self.park_heat.load(Ordering::Relaxed) >= 8
     }
 
     /// Intra-block abort / first-wave mark (survives quiet_fence_off).

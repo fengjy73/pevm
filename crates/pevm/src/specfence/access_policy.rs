@@ -1,60 +1,96 @@
-//! SpecFence access policy — frozen-π gate, not a `Vm` intercept.
+//! SpecFence access policy — Mode(a) from \(a + e_{\mathrm{vis}} + \mathrm{PE} + learning\).
 //!
-//! Authoritative plant: `lab/notes/specfence-clean-slate-architecture.md`.
+//! Authoritative plant: `lab/notes/specfence-complete-architecture-v5-pc-cc-fusion.md`.
 //! π: `lab/notes/specfence-complete-architecture-v4-frozen-grain.md`.
 //!
 //! Unfenced ⇒ caller **must** invoke the shared OCC read helper. This module
-//! never touches Edge / rem journal / process DashMap / FF.
+//! never touches rem journal / FF.
 
-use crate::MemoryLocationHash;
+use crate::{MemoryLocationHash, TxIdx};
 
 use super::learner::LiveLearner;
 
-/// Live verb after the PredictedEssential / ROI gate.
+/// Visibility + learning features gathered **only** on a PE hit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AccessVis {
+    pub published_data: bool,
+    pub writer: Option<TxIdx>,
+    pub writer_executing: bool,
+    pub unfinished: usize,
+    pub in_serial_lane: bool,
+    pub hot: bool,
+    pub ws_hat: bool,
+}
+
+/// Live verb after the PredictedEssential / \(e_{\mathrm{vis}}\) gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AccessDecision {
     /// Compile to OCC `storage`/`basic` (no SpecFence body).
     UnfencedOcc { predicted: bool, roi_skip: bool },
-    /// Open the thin PCC overlay (Bind / WaitFor using \(e_{\mathrm{vis}}\)).
-    TryPcc { access_k: u32 },
+    /// Fence: Bind published Data for this \(a\).
+    Bind,
+    /// Fence: WaitFor a **single** executing writer.
+    WaitFor { writer: TxIdx },
+    /// Fence: serial-lane / ordered-admit on multi-writer PE class.
+    SerialLane { writer: TxIdx },
 }
 
-/// Frozen-π gate for **this** access \(a=(t,k,\mathrm{depth},\ell)\).
+/// Frozen-π + v5 fusion gate for **this** access \(a=(t,k,\mathrm{depth},\ell)\).
 ///
-/// `inc` is not an Avoid key. `force_prefix` / canary / H-OR / morph actuator
-/// are not consulted.
+/// `vis` is `None` when the caller has not gathered \(e_{\mathrm{vis}}\)
+/// (empty PE / ¬PE). Prior PE **may** Fence when `vis` says Data or a
+/// single executing writer — that is the fusion hinge, not `mark_pcc(tx)`.
 #[inline]
 pub(crate) fn decide(
     learner: &LiveLearner,
     location: MemoryLocationHash,
     access_k: u32,
+    vis: Option<&AccessVis>,
 ) -> AccessDecision {
-    if !learner.has_any_predicted() || learner.quiet_fence_off() {
+    if !learner.has_any_predicted() {
         return AccessDecision::UnfencedOcc {
             predicted: false,
             roi_skip: false,
         };
     }
-    let mut predicted = learner.predicted_essential(location, access_k);
-    if predicted
-        && learner.quiet_fence_off()
-        && !learner.predicted_essential_intra(location, access_k)
-    {
-        predicted = false;
-    }
+    let predicted = learner.predicted_essential(location, access_k);
     if !predicted {
         return AccessDecision::UnfencedOcc {
             predicted: false,
             roi_skip: false,
         };
     }
-    if !learner.pcc_makespan_win(location, access_k) {
+    let Some(vis) = vis else {
+        // Prior PE with empty visibility stays Spec (quiet Bind-tax protection).
         return AccessDecision::UnfencedOcc {
             predicted: true,
             roi_skip: true,
         };
+    };
+
+    // SoT §3.2 — event-driven. Deleted live gates: quiet_fence_off,
+    // pcc_makespan_win, park_storm. HotSet / WŜ are observe → PE posterior,
+    // not SerialLane / Wait OR-doors.
+    // Multi-writer PE class first — do **not** Bind stale Data (theater).
+    if vis.unfinished > 1 || (vis.in_serial_lane && vis.unfinished > 0) {
+        if let Some(w) = vis.writer {
+            return AccessDecision::SerialLane { writer: w };
+        }
     }
-    AccessDecision::TryPcc { access_k }
+    if vis.unfinished == 1 && vis.writer_executing {
+        if let Some(w) = vis.writer {
+            return AccessDecision::WaitFor { writer: w };
+        }
+    }
+    // PE ∧ published Data ∧ no unfinished lower writer → Bind.
+    // Prior PE may take this path. writer_validated is not a Bind gate.
+    if vis.published_data && vis.unfinished == 0 {
+        return AccessDecision::Bind;
+    }
+    AccessDecision::UnfencedOcc {
+        predicted: true,
+        roi_skip: true,
+    }
 }
 
 #[cfg(test)]
@@ -62,12 +98,71 @@ mod tests {
     use super::*;
     use crate::specfence::learner::{LiveLearner, MorphWeights};
 
+    fn fan_out_learner() -> LiveLearner {
+        let live = LiveLearner::new();
+        live.begin_block(MorphWeights {
+            fan_out: 0.70,
+            mixed: 0.15,
+            waw_spine: 0.10,
+            quiet: 0.05,
+        });
+        live
+    }
+
+    fn data_vis() -> AccessVis {
+        AccessVis {
+            published_data: true,
+            writer: Some(1),
+            writer_executing: false,
+            unfinished: 0,
+            in_serial_lane: false,
+            hot: false,
+            ws_hat: true,
+        }
+    }
+
+    fn data_plus_multi() -> AccessVis {
+        AccessVis {
+            published_data: true,
+            writer: Some(0),
+            writer_executing: true,
+            unfinished: 3,
+            in_serial_lane: false,
+            hot: true,
+            ws_hat: true,
+        }
+    }
+
+    fn exec_vis(w: usize) -> AccessVis {
+        AccessVis {
+            published_data: false,
+            writer: Some(w),
+            writer_executing: true,
+            unfinished: 1,
+            in_serial_lane: false,
+            hot: false,
+            ws_hat: false,
+        }
+    }
+
+    fn multi_vis(w: usize) -> AccessVis {
+        AccessVis {
+            published_data: false,
+            writer: Some(w),
+            writer_executing: true,
+            unfinished: 3,
+            in_serial_lane: false,
+            hot: true,
+            ws_hat: false,
+        }
+    }
+
     #[test]
     fn empty_pe_is_unfenced_occ() {
         let live = LiveLearner::new();
         live.begin_block(MorphWeights::default());
         assert_eq!(
-            decide(&live, 7, 6),
+            decide(&live, 7, 6, None),
             AccessDecision::UnfencedOcc {
                 predicted: false,
                 roi_skip: false
@@ -76,17 +171,11 @@ mod tests {
     }
 
     #[test]
-    fn prior_only_pe_is_unfenced_roi_skip() {
-        let live = LiveLearner::new();
-        live.begin_block(MorphWeights {
-            fan_out: 0.70,
-            mixed: 0.15,
-            waw_spine: 0.10,
-            quiet: 0.05,
-        });
+    fn prior_pe_without_vis_is_roi_skip() {
+        let live = fan_out_learner();
         live.seed_predicted_essential(7, 6);
         assert_eq!(
-            decide(&live, 7, 6),
+            decide(&live, 7, 6, None),
             AccessDecision::UnfencedOcc {
                 predicted: true,
                 roi_skip: true
@@ -95,18 +184,47 @@ mod tests {
     }
 
     #[test]
-    fn intra_abort_pe_opens_pcc() {
-        let live = LiveLearner::new();
-        live.begin_block(MorphWeights {
-            fan_out: 0.70,
-            mixed: 0.15,
-            waw_spine: 0.10,
-            quiet: 0.05,
-        });
-        live.note_abort_access(7, 2, Some(6));
-        assert_eq!(decide(&live, 7, 6), AccessDecision::TryPcc { access_k: 6 });
+    fn prior_pe_plus_data_is_bind() {
+        let live = fan_out_learner();
+        live.seed_predicted_essential(7, 6);
+        assert_eq!(decide(&live, 7, 6, Some(&data_vis())), AccessDecision::Bind);
+    }
+
+    #[test]
+    fn prior_pe_plus_executing_writer_is_waitfor() {
+        let live = fan_out_learner();
+        live.seed_predicted_essential(7, 6);
         assert_eq!(
-            decide(&live, 7, 12),
+            decide(&live, 7, 6, Some(&exec_vis(2))),
+            AccessDecision::WaitFor { writer: 2 }
+        );
+    }
+
+    #[test]
+    fn multi_writer_pe_is_serial_lane() {
+        let live = fan_out_learner();
+        live.seed_predicted_essential(7, 6);
+        assert_eq!(
+            decide(&live, 7, 6, Some(&multi_vis(0))),
+            AccessDecision::SerialLane { writer: 0 }
+        );
+        assert_eq!(
+            decide(&live, 7, 6, Some(&data_plus_multi())),
+            AccessDecision::SerialLane { writer: 0 },
+            "published Data must not Bind-theater a multi-writer PE class"
+        );
+    }
+
+    #[test]
+    fn intra_abort_pe_opens_pcc() {
+        let live = fan_out_learner();
+        live.note_abort_access(7, 2, Some(6));
+        assert_eq!(
+            decide(&live, 7, 6, Some(&exec_vis(1))),
+            AccessDecision::WaitFor { writer: 1 }
+        );
+        assert_eq!(
+            decide(&live, 7, 12, None),
             AccessDecision::UnfencedOcc {
                 predicted: false,
                 roi_skip: false
@@ -115,16 +233,29 @@ mod tests {
     }
 
     #[test]
-    fn quiet_lone_abort_stays_unfenced() {
+    fn quiet_intra_pe_may_fence_on_events() {
+        // SoT: quiet_fence_off is not a live Fire ban. Intra PE + e_vis Fences.
         let live = LiveLearner::new();
         live.begin_block(MorphWeights::default());
         live.note_abort_access(7, 2, Some(6));
         assert_eq!(
-            decide(&live, 7, 6),
-            AccessDecision::UnfencedOcc {
-                predicted: false,
-                roi_skip: false
-            }
+            decide(&live, 7, 6, Some(&exec_vis(1))),
+            AccessDecision::WaitFor { writer: 1 }
+        );
+        assert_eq!(decide(&live, 7, 6, Some(&data_vis())), AccessDecision::Bind);
+    }
+
+    #[test]
+    fn hot_is_not_a_serial_lane_door() {
+        let live = fan_out_learner();
+        live.seed_predicted_essential(7, 6);
+        let mut vis = exec_vis(2);
+        vis.hot = true;
+        vis.unfinished = 1;
+        assert_eq!(
+            decide(&live, 7, 6, Some(&vis)),
+            AccessDecision::WaitFor { writer: 2 },
+            "HotSet must not promote a single writer to SerialLane"
         );
     }
 }

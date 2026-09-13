@@ -444,6 +444,7 @@ impl Pevm {
         let partial_retry = PartialRetryTable::new(block_size);
         let wave = WaveParkTable::new();
         let kernel = KernelTable::new(block_size);
+        let access_log = crate::specfence::AccessOrdinalLog::new(block_size);
         let edges = EdgeTable::new();
         let sketch = HotSketch::new();
         let process = ProcessTrace::new();
@@ -500,6 +501,7 @@ impl Pevm {
             sketch: &sketch,
             process: &process,
             kernel: &kernel,
+            access_log: &access_log,
             finegrain: finegrain_ref,
         };
 
@@ -546,7 +548,7 @@ impl Pevm {
                                         Some(&metrics_inner),
                                     )
                                 } else if specfence.mode == ConcurrencyMode::SpecFence
-                                    && specfence.kernel.is_occ(tx_version.tx_idx)
+                                    && !specfence.kernel.may_resolve(tx_version.tx_idx)
                                 {
                                     crate::specfence::validate_occ_kernel(
                                         &mv_memory,
@@ -995,7 +997,9 @@ fn try_validate(
             Some(specfence.metrics),
         );
     }
-    if specfence.mode == ConcurrencyMode::SpecFence && specfence.kernel.is_occ(tx_version.tx_idx) {
+    if specfence.mode == ConcurrencyMode::SpecFence
+        && !specfence.kernel.may_resolve(tx_version.tx_idx)
+    {
         return crate::specfence::validate_occ_kernel(mv_memory, scheduler, tx_version, specfence);
     }
     // OCC-like first pass: one read-set walk. Defer read_locations until fail

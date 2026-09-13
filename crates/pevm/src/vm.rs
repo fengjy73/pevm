@@ -23,9 +23,9 @@ use crate::{
     hash_deterministic,
     mv_memory::MvMemory,
     specfence::{
-        AccessDecision, AccessMode, BindSnapMode, CheckpointKind, DecisionFeat, DecisionVerb,
-        EdgeKey, EdgeKind, EdgeState, FfValue, ProcessReason, SpecFenceCtx, StorageWriteReplay,
-        absolute_jump_eligible, arm_call_outcome_cache, arm_ff_origin_seeds,
+        AccessDecision, AccessMode, AccessVis, BindSnapMode, CheckpointKind, DecisionFeat,
+        DecisionVerb, EdgeKey, EdgeKind, EdgeState, FfValue, ProcessReason, SpecFenceCtx,
+        StorageWriteReplay, absolute_jump_eligible, arm_call_outcome_cache, arm_ff_origin_seeds,
         attach_current_live_snap, bind_snap_jump_enabled, bind_snap_mode, early_val_probability,
         jump_is_safe, jump_refuse_reason, note_pending_bind_snap, note_pending_effect_boundary,
         resume_was_applied, steps_this_run, suffix_repair_jump_env_ok, take_ff_origin_seeds,
@@ -190,11 +190,12 @@ impl<'a, S: Storage> VmDb<'a, S> {
             let repair_armed = self.specfence.partial_retry.is_rewind_resume(tx_idx)
                 || self.specfence.partial_retry.has_ff_head(tx_idx);
             self.specfence.kernel.begin_execute(tx_idx, repair_armed);
+            self.specfence.access_log.begin_incarnation(tx_idx);
             self.specfence
                 .partial_retry
                 .reset_incarnation(tx_idx, incarnation);
-            // FF replay is PccKernel / Repair only — OccKernel never arms rem.
-            if self.specfence.kernel.is_pcc(tx_idx) {
+            // FF replay is a prefix certificate — Spec-only incarnations never arm rem.
+            if self.specfence.kernel.repair_armed(tx_idx) {
                 let n = self.specfence.partial_retry.replay_ff_if_armed(tx_idx);
                 if n > 0 {
                     self.specfence.metrics.record_journal_ff_entries(n);
@@ -447,8 +448,8 @@ impl<'a, S: Storage> VmDb<'a, S> {
         Ok(())
     }
 
-    /// SpecFence access gate. Unfenced ⇒ OCC proceed (`pcc_armed=false`).
-    /// PCC overlay only when `access_policy` returns `TryPcc`.
+    /// SpecFence access gate. Mode(a) from \(a + e_{\mathrm{vis}} + \mathrm{PE}\).
+    /// Spec ⇒ OCC proceed (`pcc_armed=false`). Fence verbs certificate rem/R1.
     fn specfence_access_gate(
         &self,
         address: Address,
@@ -464,6 +465,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
         // off this path — learner updates on abort / end_block / PCC.
         self.specfence.metrics.record_detect_access();
 
+        // AccessOrdinalLog: true k even on empty PE / Spec (no rem DashMap).
+        let access_k = self.specfence.access_log.note(self.tx_idx, location_hash);
+
         if crate::specfence::specfence_plant_is_occ(
             crate::ConcurrencyMode::SpecFence,
             self.specfence.learner,
@@ -471,8 +475,21 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return self.occ_unfenced();
         }
 
-        let access_k = self.specfence.partial_retry.bump_k_only(self.tx_idx) as u32;
-        match crate::specfence::decide_access(self.specfence.learner, location_hash, access_k) {
+        if !self
+            .specfence
+            .learner
+            .predicted_essential(location_hash, access_k)
+        {
+            return self.occ_unfenced();
+        }
+
+        let vis = self.access_vis(location_hash);
+        match crate::specfence::decide_access(
+            self.specfence.learner,
+            location_hash,
+            access_k,
+            Some(&vis),
+        ) {
             AccessDecision::UnfencedOcc {
                 predicted,
                 roi_skip,
@@ -485,11 +502,111 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 }
                 self.occ_unfenced()
             }
-            AccessDecision::TryPcc { access_k } => {
+            AccessDecision::Bind => {
                 self.specfence.metrics.record_predicted_essential();
-                self.pcc_overlay(address, location_hash, access_k, is_program)
+                self.note_fence_certificate();
+                let Some(v) = self
+                    .mv_memory
+                    .last_data_before(location_hash, self.tx_idx)
+                    .map(|(tx_idx, tx_incarnation)| TxVersion {
+                        tx_idx,
+                        tx_incarnation,
+                    })
+                else {
+                    self.specfence.metrics.record_pcc_roi_skip();
+                    return self.occ_unfenced();
+                };
+                self.pcc_bind_published(address, location_hash, access_k, is_program, v)
+            }
+            AccessDecision::WaitFor { writer } => {
+                self.specfence.metrics.record_predicted_essential();
+                self.note_fence_certificate();
+                self.pcc_wait_for_writer(address, location_hash, access_k, is_program, writer)
+            }
+            AccessDecision::SerialLane { writer } => {
+                self.specfence.metrics.record_predicted_essential();
+                self.pcc_serial_lane(address, location_hash, access_k, is_program, writer)
             }
         }
+    }
+
+    /// \(e_{\mathrm{vis}}\) + learning features. Gathered only on a PE hit.
+    fn access_vis(&self, location_hash: MemoryLocationHash) -> AccessVis {
+        let published_data = self
+            .mv_memory
+            .last_data_before(location_hash, self.tx_idx)
+            .is_some();
+        let is_done = |t: TxIdx| self.specfence.scheduler.is_done(t);
+        let mut unfinished =
+            self.specfence
+                .sketch
+                .unfinished_writers_before(location_hash, self.tx_idx, is_done);
+        let writer = self
+            .mv_memory
+            .last_writer_before(location_hash, self.tx_idx)
+            .or_else(|| {
+                self.mv_memory
+                    .residual_writer_before(location_hash, self.tx_idx)
+            })
+            .or_else(|| {
+                self.specfence
+                    .partial_retry
+                    .force_writer(self.tx_idx, location_hash)
+            })
+            .filter(|&w| w < self.tx_idx)
+            .or_else(|| unfinished.iter().copied().min());
+        if unfinished.is_empty() {
+            if let Some(w) = writer {
+                unfinished.push(w);
+            }
+        }
+        let writer_executing = writer.is_some_and(|w| self.specfence.scheduler.is_executing(w));
+        AccessVis {
+            published_data,
+            writer,
+            writer_executing,
+            unfinished: unfinished.len(),
+            in_serial_lane: self.specfence.sketch.in_serial_lane(location_hash),
+            hot: self.specfence.hotset.contains(location_hash)
+                || self.specfence.hotset.writer_count(location_hash) >= 2
+                || self.specfence.learner.writer_count_live(location_hash) >= 2
+                || ((self.specfence.rw_prior.predicts_write(location_hash)
+                    || self.specfence.rw_prior.write_confidence(location_hash) > 0.25)
+                    && !unfinished.is_empty()),
+            ws_hat: self.specfence.rw_prior.predicts_write(location_hash)
+                || self.specfence.rw_prior.write_confidence(location_hash) > 0.25,
+        }
+    }
+
+    /// First Fence event this incarnation — certificate, not a kernel fork.
+    fn note_fence_certificate(&self) {
+        let first = !self.specfence.kernel.had_fence(self.tx_idx);
+        self.specfence.kernel.note_fence(self.tx_idx);
+        if first {
+            self.specfence.metrics.record_pcc_kernel_exec();
+        }
+    }
+
+    /// Serial-lane: admit earliest unfinished writer; park only if executing.
+    fn pcc_serial_lane(
+        &self,
+        address: Address,
+        location_hash: MemoryLocationHash,
+        access_k: u32,
+        is_program: bool,
+        w: TxIdx,
+    ) -> Result<(), ReadError> {
+        self.specfence
+            .sketch
+            .mark_access_class(location_hash, access_k);
+        self.specfence.scheduler.admit_spine(w, self.specfence.wave);
+        self.specfence.metrics.record_prefer_admit();
+        if self.specfence.scheduler.is_executing(w) {
+            self.note_fence_certificate();
+            return self.pcc_wait_for_writer(address, location_hash, access_k, is_program, w);
+        }
+        // Lane head Ready: ordered-admit without fleet park.
+        self.occ_unfenced()
     }
 
     /// Shared OCC proceed: no rem journal / first_k / Edge / process / Detect DashMap.
@@ -515,59 +632,6 @@ impl<'a, S: Storage> VmDb<'a, S> {
             || self.specfence.partial_retry.has_ff_head(self.tx_idx)
     }
 
-    /// Thin PCC overlay (PE ∩ ROI only). Bind Data or WaitFor one executing writer.
-    fn pcc_overlay(
-        &self,
-        address: Address,
-        location_hash: MemoryLocationHash,
-        access_k: u32,
-        is_program: bool,
-    ) -> Result<(), ReadError> {
-        if self.specfence.kernel.is_occ(self.tx_idx) {
-            self.specfence.kernel.mark_pcc(self.tx_idx);
-            self.specfence.metrics.record_pcc_kernel_exec();
-        }
-        self.pcc_armed.set(true);
-        self.pcc_this_tx
-            .set(self.pcc_this_tx.get().saturating_add(1));
-        let bind_version = self
-            .mv_memory
-            .last_data_before(location_hash, self.tx_idx)
-            .map(|(tx_idx, tx_incarnation)| TxVersion {
-                tx_idx,
-                tx_incarnation,
-            });
-        if let Some(v) = bind_version {
-            return self.pcc_bind_published(address, location_hash, access_k, is_program, v);
-        }
-        let writer = self
-            .mv_memory
-            .last_writer_before(location_hash, self.tx_idx)
-            .or_else(|| {
-                self.mv_memory
-                    .residual_writer_before(location_hash, self.tx_idx)
-            })
-            .or_else(|| {
-                self.specfence
-                    .partial_retry
-                    .force_writer(self.tx_idx, location_hash)
-            })
-            .filter(|&w| w < self.tx_idx);
-        let writer_executing = writer.is_some_and(|w| self.specfence.scheduler.is_executing(w));
-        let unfinished = if writer.is_some() { 1 } else { 0 };
-        if let Some(w) = writer {
-            if self
-                .specfence
-                .learner
-                .waitfor_makespan_win(unfinished, writer_executing)
-            {
-                return self.pcc_wait_for_writer(address, location_hash, access_k, is_program, w);
-            }
-        }
-        self.specfence.metrics.record_pcc_roi_skip();
-        self.occ_unfenced()
-    }
-
     fn pcc_bind_published(
         &self,
         address: Address,
@@ -576,6 +640,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
         is_program: bool,
         v: TxVersion,
     ) -> Result<(), ReadError> {
+        self.pcc_armed.set(true);
+        self.pcc_this_tx
+            .set(self.pcc_this_tx.get().saturating_add(1));
         self.specfence.metrics.record_pcc_fire_at_a();
         self.specfence.metrics.record_edge_bind();
         self.specfence.learner.note_bind_success(location_hash);
@@ -638,6 +705,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
         is_program: bool,
         w: TxIdx,
     ) -> Result<(), ReadError> {
+        self.pcc_armed.set(true);
+        self.pcc_this_tx
+            .set(self.pcc_this_tx.get().saturating_add(1));
         self.specfence.metrics.record_pcc_fire_at_a();
         let access_depth = 0u8;
         let key = EdgeKey {
@@ -1981,21 +2051,14 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 .partial_retry
                 .is_rewind_resume(tx_version.tx_idx)
                 || self.specfence.partial_retry.has_ff_head(tx_version.tx_idx));
-        let occ_kernel = if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
-            let k = self
-                .specfence
-                .kernel
-                .begin_execute(tx_version.tx_idx, repair_armed);
-            if k == crate::specfence::IncarnationKernel::Occ {
-                self.specfence.metrics.record_occ_kernel_exec();
-            } else {
+        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            if repair_armed {
                 self.specfence.metrics.record_pcc_kernel_exec();
+            } else {
+                self.specfence.metrics.record_occ_kernel_exec();
             }
-            k == crate::specfence::IncarnationKernel::Occ
-        } else {
-            true
-        };
-        let rewind_resume = !occ_kernel
+        }
+        let rewind_resume = repair_armed
             && self
                 .specfence
                 .partial_retry
@@ -2003,14 +2066,14 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         if rewind_resume {
             // M1b/M1d: journal FF in set_tx; optional live PC arm inside inspect_run.
             self.specfence.metrics.record_resume();
-        } else if self.specfence.mode == crate::ConcurrencyMode::SpecFence && !occ_kernel {
-            self.specfence.metrics.record_evm_entry();
-            let _ = self
-                .specfence
-                .partial_retry
-                .push_checkpoint(tx_version.tx_idx, CheckpointKind::CallEntry);
         } else if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
             self.specfence.metrics.record_evm_entry();
+            if repair_armed {
+                let _ = self
+                    .specfence
+                    .partial_retry
+                    .push_checkpoint(tx_version.tx_idx, CheckpointKind::CallEntry);
+            }
         }
 
         // Hang-free SuffixRepair prefix skip + live-snap capture (Iter2):
@@ -2683,7 +2746,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         // + absolute-jump journal slot replay (never journal-blob poison).
                         // gas_remaining_after filled from Inspector post-SSTORE captures.
                         if self.specfence.mode == crate::ConcurrencyMode::SpecFence
-                            && self.specfence.kernel.is_pcc(tx_version.tx_idx)
+                            && self.specfence.kernel.rem_legal(tx_version.tx_idx)
                         {
                             self.specfence.partial_retry.note_write_replay(
                                 tx_version.tx_idx,
@@ -2806,14 +2869,8 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 };
 
                 if self.specfence.mode == crate::ConcurrencyMode::SpecFence
-                    && self.specfence.kernel.is_pcc(tx_version.tx_idx)
+                    && self.specfence.kernel.rem_legal(tx_version.tx_idx)
                 {
-                    if occ_kernel {
-                        let _ = self
-                            .specfence
-                            .partial_retry
-                            .push_checkpoint(tx_version.tx_idx, CheckpointKind::CallEntry);
-                    }
                     for (loc, value) in &write_set {
                         // G2: plant Write ordinal always (HotSet not required).
                         self.specfence.partial_retry.note_access(
@@ -2904,22 +2961,46 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 // M3: learn process WŜ from this incarnation's writes (no residual publish).
                 // R1/R3: feed HotSet writer counts (H_w) from non-lazy writes only.
                 if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
-                    if self.specfence.kernel.is_pcc(tx_version.tx_idx) {
+                    // Learning is consumed by decide() — always observe HotSet / WŜ.
+                    if self.specfence.kernel.rem_legal(tx_version.tx_idx) {
                         let locs: Vec<_> = self.mv_memory.write_locations(tx_version.tx_idx);
                         self.specfence.rw_prior.observe_write_set(&locs, None);
-                        for loc in hotset_writer_locs {
-                            self.specfence.hotset.note_writer(loc, tx_version.tx_idx);
+                        for loc in &hotset_writer_locs {
+                            self.specfence.hotset.note_writer(*loc, tx_version.tx_idx);
                         }
                         // A2: progressive DAG — Data is visible; wake Blocking waiters
                         // before is_done (SoftWait Soft stays 0).
                         self.wake_on_data_publish(tx_version.tx_idx, &locs);
                     } else {
-                        // OccKernel: observe-only HotSet / WŜ (not rem, not wake).
                         self.specfence
                             .rw_prior
                             .observe_write_set(&hotset_writer_locs, None);
-                        for loc in hotset_writer_locs {
-                            self.specfence.hotset.note_writer(loc, tx_version.tx_idx);
+                        for loc in &hotset_writer_locs {
+                            self.specfence.hotset.note_writer(*loc, tx_version.tx_idx);
+                        }
+                        // Spec publishers of a PE ℓ still wake / Avoid — not rem-gated.
+                        if self.specfence.learner.has_any_predicted() {
+                            let pe_locs: Vec<_> = hotset_writer_locs
+                                .iter()
+                                .copied()
+                                .filter(|&loc| {
+                                    let k = self.specfence.learner.dominant_k(loc);
+                                    self.specfence.learner.predicted_essential(loc, k.max(1))
+                                })
+                                .collect();
+                            if !pe_locs.is_empty() {
+                                for &loc in &pe_locs {
+                                    if self
+                                        .specfence
+                                        .sketch
+                                        .broadcast_avoid(loc, tx_version.tx_idx)
+                                    {
+                                        self.specfence.edges.broadcast_avoid(loc);
+                                        self.specfence.metrics.record_avoid_broadcast();
+                                    }
+                                }
+                                self.wake_on_data_publish(tx_version.tx_idx, &pe_locs);
+                            }
                         }
                     }
                 }

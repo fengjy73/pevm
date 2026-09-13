@@ -1,12 +1,13 @@
-//! SpecFence **parallel computer** — stages + frozen-π CC overlay.
+//! SpecFence **parallel computer** — stages + access-local Mode(a) CC.
 //!
-//! Plant SoT: `lab/notes/specfence-parallel-compute-architecture.md`.
+//! Plant SoT: `lab/notes/specfence-complete-architecture-v5-pc-cc-fusion.md`.
 //! π SoT: `lab/notes/specfence-complete-architecture-v4-frozen-grain.md`.
 //!
 //! `ConcurrencyMode::OCC` is pristine Block-STM (**zero** SpecFence ticks).
 //! `ConcurrencyMode::SpecFence` owns schedule / execute wrap / validate / rem.
-//! Unfenced incarnations are **OccKernel** (same OCC read + bool validate + B0).
-//! PCC overlay is PE-only. Learning is off the Unfenced critical path.
+//! Default Spec ≡ OCC-cost (`occ_read` + bool validate + B0). Fence verbs
+//! fire only on \(a + e_{\mathrm{vis}} + \mathrm{PE}(\mathrm{true}\,k)\).
+//! Mode is **access-local**, not an incarnation Occ\|Pcc fork.
 //!
 //! Frozen π: \(a=(t,k,\mathrm{depth},ℓ,\mathrm{mode})\) + \(e_{\mathrm{vis}}\) +
 //! gate `PredictedEssential(ℓ,k,morph) ∨ independence_certified`.
@@ -155,6 +156,7 @@ use crate::{
 use alloy_primitives::Address;
 use hashbrown::HashMap;
 
+mod access_log;
 mod access_policy;
 mod bayes;
 mod boundary;
@@ -177,7 +179,8 @@ mod rem;
 mod resolve;
 mod sketch;
 
-pub(crate) use access_policy::{AccessDecision, decide as decide_access};
+pub(crate) use access_log::AccessOrdinalLog;
+pub(crate) use access_policy::{AccessDecision, AccessVis, decide as decide_access};
 pub(crate) use bayes::{BayesMap, DEFAULT_TAU};
 pub use boundary::SpecFenceInspector;
 #[allow(unused_imports)]
@@ -219,7 +222,7 @@ pub(crate) use heat::HeatMap;
 pub(crate) use hotset::HotSet;
 #[allow(unused_imports)]
 pub(crate) use hotset::{H_A, H_W};
-pub(crate) use kernel::{IncarnationKernel, KernelTable};
+pub(crate) use kernel::KernelTable;
 pub(crate) use learner::{AdaptiveParams, InterBlockPrior, LiveLearner};
 pub(crate) use metrics::MetricsInner;
 pub use metrics::SpecFenceMetrics;
@@ -341,8 +344,10 @@ pub(crate) struct SpecFenceCtx<'a> {
     pub sketch: &'a HotSketch,
     /// Process-level Fence/Unfenced reason + per-ℓ timeline (lab / G7).
     pub process: &'a ProcessTrace,
-    /// Per-incarnation OccKernel / PccKernel (SpecFence computer).
+    /// Mode(a) Fence / prefix certificates (not an Occ\|Pcc incarnation fork).
     pub kernel: &'a crate::specfence::KernelTable,
+    /// Spec-safe AccessOrdinalLog — true \(k\) without rem DashMap.
+    pub access_log: &'a crate::specfence::AccessOrdinalLog,
     /// Opt-in lab fine-grain OCC/RW tracer (None = disabled, zero cost).
     pub finegrain: Option<&'a crate::specfence::FineGrainCollector>,
 }
