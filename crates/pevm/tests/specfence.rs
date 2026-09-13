@@ -3986,8 +3986,8 @@ fn general_fixes_force_prefix_writer_and_multi_spine() {
     );
 }
 
-/// Sub-grain native laws: Done→Bind residual, R1 value-stable, canary
-/// reopen, PreferAdmit live. SoftWait Soft=0; no Await@a; independents Unfence.
+/// Sub-grain frozen π: Detect/Unfenced≡OCC first-pass; Bind after abort+Data;
+/// SoftWait Soft=0; no Await@a; PreferAdmit is WaitFor-only (not required).
 #[test]
 fn subgrain_done_bind_r1_canary_prefer_admit() {
     let (state, bytecodes, txs) = erc20::generate_cluster(6, 16, 8);
