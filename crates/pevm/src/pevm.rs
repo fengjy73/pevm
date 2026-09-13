@@ -447,6 +447,7 @@ impl Pevm {
         let access_log = crate::specfence::AccessOrdinalLog::new(block_size);
         let certificates = crate::specfence::CertificateTable::new(block_size);
         let ready_edges = crate::specfence::ReadyEdgeTable::new();
+        let producer_stages = crate::specfence::ProducerStageTable::new();
         let lanes = crate::specfence::LaneTable::new();
         let edges = EdgeTable::new();
         let sketch = HotSketch::new();
@@ -507,6 +508,7 @@ impl Pevm {
             access_log: &access_log,
             certificates: &certificates,
             ready_edges: &ready_edges,
+            producer_stages: &producer_stages,
             lanes: &lanes,
             finegrain: finegrain_ref,
         };
@@ -526,7 +528,12 @@ impl Pevm {
                     let mut task = if occ_mode || !specfence.learner.has_any_predicted() {
                         crate::specfence::next_occ_task(&scheduler)
                     } else if let Some(w) = wave_ref {
-                        crate::specfence::next_sf_task(&scheduler, w, specfence.ready_edges)
+                        crate::specfence::next_sf_task(
+                            &scheduler,
+                            w,
+                            specfence.ready_edges,
+                            specfence.producer_stages,
+                        )
                     } else {
                         crate::specfence::next_occ_task(&scheduler)
                     };
@@ -559,7 +566,7 @@ impl Pevm {
                                         Some(&metrics_inner),
                                     )
                                 } else if specfence.mode == ConcurrencyMode::SpecFence {
-                                    crate::specfence::validate_occ_kernel(
+                                    crate::specfence::validate_specfence(
                                         &mv_memory,
                                         &scheduler,
                                         &tx_version,
@@ -591,7 +598,12 @@ impl Pevm {
                             task = if occ_mode || !specfence.learner.has_any_predicted() {
                                 crate::specfence::next_occ_task(&scheduler)
                             } else if let Some(w) = wave_ref {
-                                crate::specfence::next_sf_task(&scheduler, w, specfence.ready_edges)
+                                crate::specfence::next_sf_task(
+                                    &scheduler,
+                                    w,
+                                    specfence.ready_edges,
+                                    specfence.producer_stages,
+                                )
                             } else {
                                 crate::specfence::next_occ_task(&scheduler)
                             };
@@ -1016,10 +1028,8 @@ fn try_validate(
             Some(specfence.metrics),
         );
     }
-    if specfence.mode == ConcurrencyMode::SpecFence
-        && !specfence.kernel.may_resolve(tx_version.tx_idx)
-    {
-        return crate::specfence::validate_occ_kernel(mv_memory, scheduler, tx_version, specfence);
+    if specfence.mode == ConcurrencyMode::SpecFence {
+        return crate::specfence::validate_specfence(mv_memory, scheduler, tx_version, specfence);
     }
     // OCC-like first pass: one read-set walk. Defer read_locations until fail
     // (avoids a second last_locations lock on the common success path).

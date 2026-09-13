@@ -1,10 +1,10 @@
 //! SpecFence parallel computer — Spec validate / OCC helpers.
 //!
-//! Owns SpecFence **validate**. Ready/steal lives in `computer.rs`.
+//! Owns SpecFence **validate** (CC Resolve). Ready/steal lives in `computer.rs` (PC).
 //! Spec-only incarnations use the shared OCC validate kernel (bool walk + B0).
 //! R1 Resolve runs only when a certificate **strip** covers fail locations.
 //!
-//! Plant SoT: `lab/notes/specfence-complete-architecture-v6-essence.md`.
+//! Plant SoT: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md`.
 
 use super::ConcurrencyMode;
 use super::SpecFenceCtx;
@@ -170,8 +170,9 @@ pub(crate) fn validate_occ_kernel(
             && w < tx_version.tx_idx
             && !scheduler.is_done(w)
         {
-            specfence.ready_edges.note_unpublished(*location, w);
+            specfence.ready_edges.note_raw_producer(*location, w);
             specfence.ready_edges.note_consumer(tx_version.tx_idx, w);
+            specfence.producer_stages.reserve(w);
             specfence.sketch.push_spine(*location, w);
         }
     }
@@ -198,6 +199,67 @@ pub(crate) fn validate_occ_kernel(
         Some(tx_version.tx_idx + 1),
         Some(specfence.wave),
     )
+}
+
+/// CC Resolve: split RS_spec / RS_fence. Never always-B0 while certs exist.
+///
+/// No strip → OCC B0 + PE(true k). `covers_all` → R1a rebind; else B0.
+pub(crate) fn validate_specfence(
+    mv_memory: &MvMemory,
+    scheduler: &Scheduler,
+    tx_version: &TxVersion,
+    specfence: SpecFenceCtx<'_>,
+) -> Option<Task> {
+    let has_cert = specfence.certificates.has_any(tx_version.tx_idx)
+        || specfence.kernel.may_resolve(tx_version.tx_idx);
+    if !has_cert {
+        return validate_occ_kernel(mv_memory, scheduler, tx_version, specfence);
+    }
+
+    specfence.metrics.record_occ_kernel_validate();
+    if occ_read_set_valid(mv_memory, tx_version.tx_idx) {
+        return scheduler.finish_validation(tx_version, false);
+    }
+
+    let invalid = mv_memory.collect_invalid_reads(tx_version.tx_idx);
+    if !invalid.is_empty()
+        && specfence
+            .certificates
+            .covers_all(tx_version.tx_idx, &invalid)
+    {
+        // Caller must prove same-output before value-stable rebind
+        // (`try_rebind_*_value_stable` only relaxes multi-origin, it does
+        // not check values — patching without this proof is seq≠par).
+        let estimate_cleared = invalid.iter().all(|&loc| {
+            mv_memory
+                .current_data_value(tx_version.tx_idx, loc)
+                .is_some()
+        });
+        let value_stable = estimate_cleared
+            && invalid
+                .iter()
+                .all(|&loc| mv_memory.prior_read_value_stable(tx_version.tx_idx, loc));
+        if value_stable
+            && mv_memory.try_rebind_invalid_reads_value_stable(tx_version.tx_idx, &invalid)
+        {
+            specfence.learner.note_resolve_r1();
+            specfence.metrics.record_rebind_only();
+            specfence.metrics.record_partial_retry();
+            specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
+            specfence
+                .partial_retry
+                .clear_force_writers(tx_version.tx_idx);
+            specfence.partial_retry.clear_repair(tx_version.tx_idx);
+            specfence.partial_retry.clear_ff_head(tx_version.tx_idx);
+            specfence
+                .partial_retry
+                .clear_suffix_repair_depth(tx_version.tx_idx);
+            specfence.learner.note_reexec_cost(0.1);
+            return scheduler.finish_validation(tx_version, false);
+        }
+    }
+
+    validate_occ_kernel(mv_memory, scheduler, tx_version, specfence)
 }
 
 #[cfg(test)]
