@@ -1,5 +1,8 @@
 # SpecFence complete architecture v4 — Learned OCC–PCC Hybrid (standalone SoT)
 
+> **Grain supersession (2026-09-13):** For Detect / Avoid / Resolve / learning **decision grain**, read **`lab/notes/specfence-complete-architecture-v4-finegrain.md` (v4.1)** as authoritative. This v4.0 note remains the parent statement of **OCC–PCC hybrid identity** (OCC default + learned PCC overlay). Tx-coarse reading of this file is **not** SoT — see `lab/notes/specfence-v4-txgrain-errata.md`.
+
+
 **Date:** 2026-09-13 (Asia/Shanghai, UTC+8)  
 **Status:** AUTHORITATIVE design SoT — **analysis + design only**; pause for user confirm before coding.  
 **Branch / HEAD at write:** `cursor/specfence-complete-cc-63b0` @ `40903a3`  
