@@ -333,11 +333,24 @@ impl EdgeTable {
     ) -> Option<usize> {
         let mut min_k: Option<u32> = None;
         for &loc in invalid {
-            for (key, _) in self.accesses_of(loc, reader) {
-                min_k = Some(min_k.map_or(key.access_k, |m| m.min(key.access_k)));
+            if let Some(k) = self.min_k_of_location(reader, loc) {
+                min_k = Some(min_k.map_or(k, |m| m.min(k)));
             }
         }
         min_k.map(|k| k as usize)
+    }
+
+    /// Per-ℓ abort grain — do not copy the tx-min \(k\) onto every invalid loc.
+    pub(crate) fn min_k_of_location(
+        &self,
+        reader: TxIdx,
+        location: MemoryLocationHash,
+    ) -> Option<u32> {
+        let mut min_k: Option<u32> = None;
+        for (key, _) in self.accesses_of(location, reader) {
+            min_k = Some(min_k.map_or(key.access_k, |m| m.min(key.access_k)));
+        }
+        min_k
     }
 
     /// Multi-touch: later frames of the same `(ℓ, reader)` after `access_k`.
@@ -923,6 +936,24 @@ mod tests {
         assert!(!t.broadcast_avoid(5));
         assert_eq!(t.avoid_count(), 1);
         assert_eq!(t.min_k_of_invalid(10, &[5]), Some(1));
+        assert_eq!(t.min_k_of_location(10, 5), Some(1));
+        let other = EdgeKey {
+            location: 9,
+            reader: 10,
+            access_k: 12,
+            depth: 0,
+        };
+        t.record(other, Some(2), EdgeKind::Wr, EdgeState::Unpublished);
+        assert_eq!(
+            t.min_k_of_invalid(10, &[5, 9]),
+            Some(1),
+            "tx-min k is still 1"
+        );
+        assert_eq!(
+            t.min_k_of_location(10, 9),
+            Some(12),
+            "sibling ℓ keeps its own k — do not copy tx-min onto it"
+        );
         assert_eq!(t.later_touches(5, 10, 1), 1);
     }
 }

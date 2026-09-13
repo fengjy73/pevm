@@ -103,21 +103,21 @@ end_block:
 
 Sweep JSON: `lab/results/frozen-grain-*-sweep.json` (gitignored dir).
 
-### Honesty (focus+worst+quiet N=3 @ `9dd65ef` Bind-gate cut, 8-block set)
+### Honesty (focus+worst+quiet N=3 @ `4602ba0`, 8-block **worst-heavy** set)
 
-This 8-block set is **worst-heavy**, not a full-set replay. Do **not** claim median ≥0.7 or quiet≡OCC from it.
+Not a full-set replay. Do **not** claim median ≥0.7 or quiet≡OCC.
 
-| Block | Role | last-iter SF/OCC | Notes |
-|------:|------|-----------------:|-------|
-| 14689597 | focus fan_out | ~0.30 | similar to prior ~0.32–0.33 |
-| 19606599 | focus | ~0.29 | |
-| 19469097 | focus | ~0.30 | |
-| 19807137 | worst | ~0.071 | still ≪0.08 bar; Bind leftover from last_k plant |
-| 6196166 | park worst | ~0.13 | still park-heavy |
-| 6137495 | worst-ish | ~0.19 | |
-| 2179522 | quiet | OCC row pathological this iter (SF wall 3.4ms vs OCC 158ms); **bind=210** | Bind tax from publish/`last_k` PE plant — **fixed this tip** |
-| 19606598 | quiet neighbor | ~0.31 | not ≡OCC |
+Printed median **0.315** / mean **2.79** (mean is the OCC outlier on 2179522 — do not celebrate). Prior full-set median to beat: **≈0.32–0.36**. Soft=0, await=0.
 
-Printed median **0.296** / mean **5.99** (mean is the OCC outlier on 2179522 — do not celebrate). Soft=0, await=0. Prior full-set median to beat: **≈0.32–0.36**.
+| Block | Role | last-iter SF/OCC | bind | notes |
+|------:|------|-----------------:|-----:|-------|
+| 14689597 | focus | 22934/78556 ≈0.29 | 1230 | in prior 0.32–0.33 band |
+| 19606599 | focus | 9999/31675 ≈0.32 | 1434 | |
+| 19469097 | focus | 14031/44582 ≈0.31 | 1063 | |
+| 19807137 | worst | 2767/36407 ≈0.076 | 7066 | still ≪0.08; rewind=1938 (PrefixSkip labeled R2) |
+| 6196166 | park | 6620/55507 ≈0.12 | 1302 | still park-heavy |
+| 6137495 | worst-ish | 14855/54900 ≈0.27 | 301 | |
+| 2179522 | quiet | SF 2.6ms / OCC 54ms (OCC pathological); bind=145, abort=1 | 145 | one abort trained PE; last_k plant removed |
+| 19606598 | quiet neighbor | 25948/62516 ≈0.42 | 111 | not ≡OCC |
 
-This tip additionally: PredictedEssential = abort + abort-`k_template` prior only; Detect `last_k` / publish cannot plant PCC; PreferAdmit and `force_prefix` `WaitFor(reader-1)` removed from Unfenced / exclude-set. Re-sweep after this cut.
+This tip additionally plants PE per **(ℓ, k)** of the aborting access — not the tx-min \(k\) copied onto every invalid ℓ. Re-sweep after that grain fix.

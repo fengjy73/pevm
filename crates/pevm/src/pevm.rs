@@ -1536,21 +1536,22 @@ fn try_validate(
                 specfence.promote_from_bayes(&mv_memory.regions, *location, None);
             }
             let cascade_hint = invalid.len().max(1);
-            let abort_k = specfence
-                .edges
-                .min_k_of_invalid(tx_version.tx_idx, &invalid)
-                .or_else(|| {
-                    invalid
-                        .iter()
-                        .filter_map(|l| specfence.partial_retry.first_k(tx_version.tx_idx, *l))
-                        .min()
-                })
-                .map(|k| k as u32);
             for location in &invalid {
+                // PredictedEssential is per (ℓ, k) — never copy the tx-min k
+                // onto every invalid location (that over-Fences siblings).
+                let loc_k = specfence
+                    .edges
+                    .min_k_of_location(tx_version.tx_idx, *location)
+                    .or_else(|| {
+                        specfence
+                            .partial_retry
+                            .first_k(tx_version.tx_idx, *location)
+                            .map(|k| k as u32)
+                    });
                 specfence
                     .learner
-                    .note_abort_access(*location, cascade_hint, abort_k);
-                if let Some(k) = abort_k.filter(|&k| k > 0) {
+                    .note_abort_access(*location, cascade_hint, loc_k);
+                if let Some(k) = loc_k.filter(|&k| k > 0) {
                     specfence.sketch.mark_access_class(*location, k);
                 }
             }
@@ -1768,19 +1769,24 @@ fn try_validate(
             specfence.rw_prior.observe_write_set(&write_locations, None);
             let mut first_pass = 0usize;
             let cascade_hint = invalid.len().max(1);
-            let abort_k = specfence
-                .edges
-                .min_k_of_invalid(tx_version.tx_idx, &invalid)
-                .map(|k| k as u32);
             for location in &invalid {
                 specfence.bayes.observe_conflict_location_always(*location);
                 specfence.metrics.record_bayes_conflict();
                 specfence.rw_prior.observe_co_access(*location);
                 specfence.hotset.note_abort(*location);
+                let loc_k = specfence
+                    .edges
+                    .min_k_of_location(tx_version.tx_idx, *location)
+                    .or_else(|| {
+                        specfence
+                            .partial_retry
+                            .first_k(tx_version.tx_idx, *location)
+                            .map(|k| k as u32)
+                    });
                 specfence
                     .learner
-                    .note_abort_access(*location, cascade_hint, abort_k);
-                if let Some(k) = abort_k.filter(|&k| k > 0) {
+                    .note_abort_access(*location, cascade_hint, loc_k);
+                if let Some(k) = loc_k.filter(|&k| k > 0) {
                     specfence.sketch.mark_access_class(*location, k);
                 }
                 if specfence.rw_prior.predicts_write(*location)
