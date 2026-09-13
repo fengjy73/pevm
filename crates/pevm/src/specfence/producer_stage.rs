@@ -1,12 +1,11 @@
-//! ProducerStage — PC progress reservation so CC ready-edges cannot deadlock.
+//! ProducerStage — PC progress reservation co-designed with CC ReadyEdges.
 //!
 //! Plant SoT: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md`.
 //!
-//! Parallel computer owns the Stage (Execute/Repair of writer \(w\)).
-//! Concurrency control owns the ReadyEdge that gates consumer \(t\).
-//! They fuse: refuse \(t\) only when a ProducerStage(\(w\)) is reserved and
-//! runnable. If the collaborative index cannot see \(w\), **promote** \(w\)
-//! — never spin.
+//! PC owns the Stage (Execute/Repair of writer \(w\)). CC co-owns when
+//! consumer \(t\) may enter ready. They are peers: refuse \(t\) only when a
+//! ProducerStage(\(w\)) is reserved and runnable. If the collaborative index
+//! cannot see \(w\), **promote** \(w\) — never spin.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 

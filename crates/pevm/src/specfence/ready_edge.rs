@@ -1,4 +1,4 @@
-//! Ready-edge graph — CC Avoid edges fused with PC ProducerStage refuse.
+//! Ready-edge graph — PC ⊗ CC shared ready membership (not CC annotation).
 //!
 //! Plant SoT: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md`.
 //! First-wave Avoid at **schedule** for **known** consumers only.

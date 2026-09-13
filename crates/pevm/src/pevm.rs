@@ -915,12 +915,13 @@ impl Pevm {
                         continue;
                     }
                     if let Some(wave) = wave {
+                        let ready = Some(vm.ready_edges());
                         if park_kind == crate::specfence::ParkKind::BlockingOther {
                             wave.arm_steal_convert_without_park();
                             if let Some(stolen) = scheduler.next_task_steal_after_park_prefer(
                                 wave,
                                 Some(blocking_tx_idx),
-                                None,
+                                ready,
                             ) {
                                 return Some(stolen);
                             }
@@ -935,7 +936,7 @@ impl Pevm {
                         if let Some(stolen) = scheduler.next_task_steal_after_park_prefer(
                             wave,
                             Some(blocking_tx_idx),
-                            None,
+                            ready,
                         ) {
                             return Some(stolen);
                         }

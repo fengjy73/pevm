@@ -152,9 +152,12 @@ impl Scheduler {
                     && !edges.may_execute(tx_idx)
                     && let Some(w) = edges.blocking_producer(tx_idx)
                 {
-                    // Refuse only while the producer is mid-Execute (progress
-                    // visible). Ready-only refuse was the v6 hang.
-                    if self.is_executing(w) {
+                    // Known consumer (inc>0): refuse while the producer has a
+                    // live Stage (Ready/Executing/Validated). Aborting has no
+                    // progress path — fall through to one canary. ProducerStage
+                    // promote keeps Ready writers runnable (v6 Ready-refuse hang
+                    // was refuse-without-promote).
+                    if self.is_executing(w) || self.is_ready(w) || self.is_validated(w) {
                         edges.defer(tx_idx);
                         if let Some(wave) = wave {
                             drop(tx);
@@ -257,7 +260,7 @@ impl Scheduler {
                             && tx.incarnation > 0
                             && !edges.may_execute(tx_idx)
                             && let Some(w) = edges.blocking_producer(tx_idx)
-                            && self.is_executing(w)
+                            && (self.is_executing(w) || self.is_ready(w) || self.is_validated(w))
                         {
                             edges.defer(tx_idx);
                             if let Some(wave) = wave {

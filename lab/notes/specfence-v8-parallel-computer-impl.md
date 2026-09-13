@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-13  
 **Branch:** `cursor/specfence-v8-pc-cc-computer-f6cf`  
-**Base:** `cursor/specfence-v6-essence-af82` @ `d5b3f8d` (docs) / plant `3376ac4`  
+**Base:** `cursor/specfence-v6-essence-af82` @ `d6e77f2` (v8 PC⊗CC SoT) / plant `3376ac4`  
 **Plant SoT:** `lab/notes/specfence-complete-architecture-v8-parallel-computer.md` (parent `d6e77f2`, **PC⊗CC co-equal**)  
 **Land brief:** `lab/notes/specfence-v8-land-brief.md`  
 **Frame:** PC and CC are **first-class peers**. Not “PC primary / CC annotates edges.” Official SoT absorbed from `origin/cursor/specfence-v6-essence-af82`.
@@ -27,11 +27,11 @@
 |----------|---------|------|
 | PC ⊗ CC peer frame | SoT v8 §0.1; `mod.rs` | yes |
 | Empty-PE OCC (T6) | `specfence_plant_is_occ` / gate early return | **kept** |
-| ProducerStage-safe refuse | `producer_stage.rs`; `scheduler::try_execute_ready`; `computer::next_sf_task` | yes |
+| ProducerStage-safe refuse | `producer_stage.rs`; `scheduler::try_execute_ready` (Ready/Executing/Validated); `computer::next_sf_task` drops Aborting reservations | yes |
 | ReadyEdge + predicted RAW tip | `ready_edge.rs` | yes |
 | Bind rare (tip==conflict ∧ EV) | `access_policy::decide`; `AccessVis.tip_is_conflict_producer` | yes |
 | WaitFor / SerialLane primary | `decide`; `pcc_wait_for_writer`; `pcc_serial_lane` | yes |
-| SerialLane exclusive | `pcc_serial_lane` WaitFor if executing; Ready = canary + ProducerStage/edge (hang-safe) | yes |
+| SerialLane exclusive | `pcc_serial_lane` WaitFor if executing; Ready/Validated = BlockingOther steal (never `occ_unfenced`) | yes |
 | Live true-\(k\) when PE-on | `vm.rs` `access_log.note` on PE-on stream | yes |
 | No fan_out templates `[1,6,10,20]` | `learner::note_abort_access` → `arm_location_any_k` | yes |
 | Validate split → R1a | `executor::validate_specfence` | yes |

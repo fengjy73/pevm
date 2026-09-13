@@ -3,8 +3,10 @@
 //! Plant SoT: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md`.
 //! π SoT: `lab/notes/specfence-complete-architecture-v4-frozen-grain.md`.
 //! PC owns Stages / ready-set / steal / ProducerStage / wall.
-//! CC owns Detect / Avoid / Resolve / Mode(a) / PE / certs / R1.
-//! They fuse on the ready-set. CC is **not** an edge-annotation layer.
+//! CC owns Detect / Avoid / Resolve / Mode(a) / Fence / PE / certs / R1.
+//! They **co-design** the same ready-set and Repair plans. Neither is
+//! demoted — CC is not an edge-annotation layer; PC is not a schedule
+//! shell around Mode(a).
 //!
 //! `ConcurrencyMode::OCC` is pristine Block-STM (**zero** SpecFence ticks).
 //! `ConcurrencyMode::SpecFence` owns schedule / execute wrap / validate / rem.

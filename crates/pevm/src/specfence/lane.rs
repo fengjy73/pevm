@@ -1,10 +1,11 @@
 //! SerialLane / OrderedAdmit **progress tokens** — not prefer_admit+Spec.
 //!
-//! Plant SoT: `lab/notes/specfence-complete-architecture-v6-essence.md` §4.
+//! Plant SoT: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md` §3.4.
 //!
 //! Token is held by the earliest unfinished producer (or admitted head).
 //! Consumers are blocked in the ready-set or park via WaitFor — they must
-//! **not** `occ_unfenced` while the holder is live.
+//! **not** `occ_unfenced` while the holder is live. CC lane tokens co-own
+//! PC ready membership.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
