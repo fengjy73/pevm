@@ -1,7 +1,10 @@
 # SpecFence complete architecture v4.1 — Fine-Grain Learned OCC–PCC Hybrid (standalone SoT)
 
+> **SUPERSEDED (grain SoT):** This is the **pre-freeze v4.1** fine-grain sketch (\(a\) still included `inc`). **AUTHORITATIVE** frozen grain lives in `lab/notes/specfence-complete-architecture-v4-frozen-grain.md` (user confirmed field selection from `specfence-decision-field-selection-from-99.md` @ `a13c4bd`). Hybrid OCC–PCC *identity* is absorbed there; do **not** implement from this file.
+
+
 **Date:** 2026-09-13 (Asia/Shanghai, UTC+8)  
-**Status:** AUTHORITATIVE design SoT — **analysis + design only**; pause for user confirm before coding.  
+**Status:** **SUPERSEDED** (pre-freeze v4.1) — historical grain sketch only; see frozen SoT.  
 **Branch / HEAD at write:** `cursor/specfence-complete-cc-63b0` @ `10c7249`  
 **Supersedes (grain reading):** `lab/notes/specfence-complete-architecture-v4-occ-pcc-hybrid.md` — hybrid *identity* (OCC default + learned PCC overlay) **kept**; **decision / Avoid / Resolve / learning grain** pushed from transaction-level policy to **access-event / typed-edge / call-frame**.  
 **Errata (why tx-grain hybrid is not enough):** `lab/notes/specfence-v4-txgrain-errata.md`  

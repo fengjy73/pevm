@@ -1,10 +1,13 @@
 # SpecFence complete architecture v4 — Learned OCC–PCC Hybrid (standalone SoT)
 
-> **Grain supersession (2026-09-13):** For Detect / Avoid / Resolve / learning **decision grain**, read **`lab/notes/specfence-complete-architecture-v4-finegrain.md` (v4.1)** as authoritative. This v4.0 note remains the parent statement of **OCC–PCC hybrid identity** (OCC default + learned PCC overlay). Tx-coarse reading of this file is **not** SoT — see `lab/notes/specfence-v4-txgrain-errata.md`.
+> **SUPERSEDED (grain SoT):** v4.0 OCC–PCC hybrid *identity* (OCC default + learned PCC) is **kept** in `lab/notes/specfence-complete-architecture-v4-frozen-grain.md`. Tx-coarse decision grain is replaced by frozen π; do **not** implement Avoid/Resolve from this file.
+
+
+> **Grain supersession (2026-09-13, updated):** For Detect / Avoid / Resolve / learning **decision grain**, read **`lab/notes/specfence-complete-architecture-v4-frozen-grain.md` (v4.1-frozen)** as authoritative. Pre-freeze finegrain sketch is also superseded. This v4.0 note remains the parent statement of **OCC–PCC hybrid identity** (OCC default + learned PCC overlay). Tx-coarse reading of this file is **not** SoT — see `lab/notes/specfence-v4-txgrain-errata.md`.
 
 
 **Date:** 2026-09-13 (Asia/Shanghai, UTC+8)  
-**Status:** AUTHORITATIVE design SoT — **analysis + design only**; pause for user confirm before coding.  
+**Status:** **SUPERSEDED** (v4.0 grain) — hybrid *identity* parent only; AUTHORITATIVE grain SoT is `specfence-complete-architecture-v4-frozen-grain.md`.  
 **Branch / HEAD at write:** `cursor/specfence-complete-cc-63b0` @ `40903a3`  
 **Evidence base:** post-v2 all-blocks SF/OCC@8 across **99** ethereum snapshots (corrected n=98, median SF/OCC **0.326**); focus subgrain 597/599/097; tip process digests; v3 CostGate critique  
 **Companion evidence:** `lab/notes/specfence-post-v2-all-blocks-deep-evidence.md`  

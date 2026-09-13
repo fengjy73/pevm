@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-13 (Asia/Shanghai, UTC+8)  
 **Branch / tip at run:** `cursor/specfence-complete-cc-63b0` @ `712db83` (+ this note/results)  
-**Status:** **RECOMMENDATION ONLY** — do **not** freeze / rewrite v4.1 SoT grain yet; pause for user confirm of field set.  
+**Status:** **CONFIRMED → FROZEN** — user confirmed field set (`可以，改写吧`); authoritative SoT: `lab/notes/specfence-complete-architecture-v4-frozen-grain.md`. This note remains the **empirical basis** (99-block DecisionFieldAgg); do not re-open exclude set without new evidence.  
 **Vocab:** Spec = Region; Fence = Bind / WaitFor / serial-lane / ordered-admission; Unfenced = OCC-cost optimistic for this access.  
 **Companion JSON:** `lab/results/decision-field-99-selection.json`, `lab/results/decision-field-99-aggregate.json`, `lab/results/decision-field-99-sf-occ-sweep.json`
 
@@ -136,7 +136,7 @@ This empirical pass **supports** the v4.1 access-event sketch \(a=(t,\mathrm{inc
 - Live Avoid key ≈ \((t,k,\mathrm{depth},\ell,\mathrm{mode})\) + EdgeVisibility + PredictedEssential\((\ell,k,\mathrm{morph})\).  
 - Do **not** promote `force_prefix` / canary / H-OR despite high MI.
 
-**No SoT rewrite in this commit** — recommendation only.
+**SoT rewrite:** done in `specfence-complete-architecture-v4-frozen-grain.md` (follow-up commit after confirm).
 
 ---
 
@@ -158,8 +158,9 @@ SPECFENCE_ALL_ITERS=1 SPECFENCE_ALL_PROCESS_TOP=10 \
 
 ---
 
-## Next (user confirm)
+## Next (after freeze)
 
-1. Confirm π field set above (or amend).  
-2. **Then** freeze v4.1 architecture grain / EdgeKey SoT.  
-3. Optional follow-up: access→abort linkage + leave-one-out ablations; drop/gate temporary `DecisionFieldAgg` once grain frozen.
+1. ~~Confirm π field set~~ — **done**.  
+2. ~~Freeze v4.1 architecture grain / EdgeKey SoT~~ — **done** (`specfence-complete-architecture-v4-frozen-grain.md`).  
+3. Optional follow-up: access→abort linkage + leave-one-out ablations; drop/gate temporary `DecisionFieldAgg` once coding starts.  
+4. **Pause before protocol coding** until explicit go-ahead.
