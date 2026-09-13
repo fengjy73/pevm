@@ -1,7 +1,15 @@
-//! SpecFence **complete CC v2** — Region/Fence state machine + R1-first Resolve.
+//! SpecFence **v4.1-frozen** — Frozen-Grain Learned OCC–PCC Hybrid.
 //!
-//! Authoritative: `lab/notes/specfence-complete-architecture-v2.md`.
-//! Landed map: `lab/notes/specfence-architecture-v2-impl.md`.
+//! Authoritative: `lab/notes/specfence-complete-architecture-v4-frozen-grain.md`.
+//! Landed map: `lab/notes/specfence-frozen-grain-impl.md`.
+//!
+//! Frozen π: \(a=(t,k,\mathrm{depth},ℓ,\mathrm{mode})\) + \(e_{\mathrm{vis}}\) +
+//! gate `PredictedEssential(ℓ,k,morph) ∨ independence_certified`.
+//! `inc` / ForcePrefix / canary / H-OR / morph actuator are **not** Avoid keys.
+//!
+//! Historical (superseded grain):
+//! Authoritative v2: `lab/notes/specfence-complete-architecture-v2.md`.
+//! Landed map v2: `lab/notes/specfence-architecture-v2-impl.md`.
 //! Family: preset-order hybrid OCC + ahead sketch + ordered admission +
 //! early-visible Bind + first-wave Avoid + piece-restricted resolve.
 //!
@@ -180,7 +188,7 @@ pub(crate) use boundary::{
 pub(crate) use dag::{FenceGraph, SpecDag};
 pub(crate) use edge::{
     EdgeAction, EdgeKey, EdgeKind, EdgeState, EdgeTable, EdgeView, EdgeVisibility,
-    choose_edge_action, classify_edge,
+    access_k_class, choose_edge_action, classify_edge,
 };
 pub(crate) use engagement::{AdaptiveEngagement, profile_timing_enabled, research_inspect_enabled};
 pub use finegrain::{

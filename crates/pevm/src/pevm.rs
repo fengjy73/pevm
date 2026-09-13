@@ -450,6 +450,13 @@ impl Pevm {
             let flipped = self.inter_prior.take_last_flipped();
             let quiet = abc_prior_morph.is_some_and(|m| m.dominant_quiet());
             sketch.seed_from_prior_morph(&self.inter_prior.top_locations(), flipped, quiet);
+            if !quiet {
+                for top in self.inter_prior.top_locations() {
+                    if top.k_template > 0 {
+                        learner.seed_predicted_essential(top.location, top.k_template);
+                    }
+                }
+            }
             if quiet {
                 let n = sketch.revoke_prior_fences_if_quiet(true);
                 metrics_inner.record_quiet_fence_revoke(n);
@@ -1529,8 +1536,20 @@ fn try_validate(
                 specfence.promote_from_bayes(&mv_memory.regions, *location, None);
             }
             let cascade_hint = invalid.len().max(1);
+            let abort_k = specfence
+                .edges
+                .min_k_of_invalid(tx_version.tx_idx, &invalid)
+                .or_else(|| {
+                    invalid
+                        .iter()
+                        .filter_map(|l| specfence.partial_retry.first_k(tx_version.tx_idx, *l))
+                        .min()
+                })
+                .map(|k| k as u32);
             for location in &invalid {
-                specfence.learner.note_abort(*location, cascade_hint);
+                specfence
+                    .learner
+                    .note_abort_access(*location, cascade_hint, abort_k);
             }
             // Morph label is decay-only (not an Await / collapse actuator).
             let rewind_to = mv_memory.min_higher_reader_of(tx_version.tx_idx, &fence_locs);
@@ -1746,12 +1765,18 @@ fn try_validate(
             specfence.rw_prior.observe_write_set(&write_locations, None);
             let mut first_pass = 0usize;
             let cascade_hint = invalid.len().max(1);
+            let abort_k = specfence
+                .edges
+                .min_k_of_invalid(tx_version.tx_idx, &invalid)
+                .map(|k| k as u32);
             for location in &invalid {
                 specfence.bayes.observe_conflict_location_always(*location);
                 specfence.metrics.record_bayes_conflict();
                 specfence.rw_prior.observe_co_access(*location);
                 specfence.hotset.note_abort(*location);
-                specfence.learner.note_abort(*location, cascade_hint);
+                specfence
+                    .learner
+                    .note_abort_access(*location, cascade_hint, abort_k);
                 if specfence.rw_prior.predicts_write(*location)
                     || mv_memory
                         .residual_writer_before(*location, tx_version.tx_idx)

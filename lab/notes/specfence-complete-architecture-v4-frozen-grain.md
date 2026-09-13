@@ -584,9 +584,10 @@ No staged P0/P1/P2. Partial land (PCC without OCC-identical baseline accesses, o
 
 ---
 
-## 15. Pause
+## 15. Implementation
 
-**No protocol coding in this task.** User confirmed field selection (`可以，改写吧`); this note **freezes** the grain SoT. Implementation map only after explicit go-ahead to code. Design-only land list in §13.
+**Landed** in one iteration: `lab/notes/specfence-frozen-grain-impl.md`.
+Frozen π is the live Avoid/Resolve SoT. No P0/P1/P2 remainder.
 
 ---
 

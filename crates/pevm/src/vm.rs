@@ -431,13 +431,13 @@ impl<'a, S: Storage> VmDb<'a, S> {
         return self.maybe_wait_specfence(address, location_hash, is_program);
     }
 
-    /// SpecFence complete-CC π (A1–A4 / D5 / D6).
+    /// Frozen-grain SpecFence π: \(a=(t,k,\mathrm{depth},ℓ)\) + \(e_{\mathrm{vis}}\) + gate.
     ///
-    /// Spec = Region (`EdgeKey`). Fence = Bind / WaitFor / serial-lane admission.
-    /// Bind published Data immediately (A3) — no writer_done∨Validated gate.
-    /// WaitFor unpublished essentials (D6) and force_prefix/Avoid with no writer
-    /// (serial pred + admit_spine). SoftWait Soft stays 0.
-    /// Unfenced only when no readable version and the Region is not essential.
+    /// Spec = Region (`EdgeKey`). Fence = Bind / WaitFor / serial-lane / ordered-admit
+    /// **for this \(a\) only**. Bind published Data immediately (A3) — no
+    /// `writer_validated` gate. WaitFor unpublished PredictedEssential writers.
+    /// Unfenced ≡ OCC when ¬PredictedEssential (no canary / ForcePrefix / H-OR /
+    /// `inc` Avoid). SoftWait Soft stays 0.
     fn maybe_wait_specfence(
         &self,
         address: Address,
@@ -452,6 +452,8 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return Ok(());
         }
 
+        // force_prefix / inc-repair is **exclude-set** — observe / Resolve
+        // bookkeeping only. Never an Avoid key (99-block inc1+ fence≈74% smell).
         let tx_has_force =
             self.tx_incarnation > 0 && self.specfence.partial_retry.has_force_bind(self.tx_idx);
         let force_prefix = tx_has_force
@@ -523,80 +525,57 @@ impl<'a, S: Storage> VmDb<'a, S> {
             .edges
             .record(key, writer, EdgeKind::Wr, state);
 
+        // Always-on cheap Detect at a — observe features feed learning only.
+        self.specfence
+            .learner
+            .note_detect(location_hash, access_k, access_depth, is_program);
+        self.specfence.metrics.record_detect_access();
+
         let prior_ws =
             self.specfence.rw_prior.predicts_write(location_hash) || residual_writer.is_some();
         let hotset = self.specfence.hotset.contains(location_hash);
         let sticky = self.specfence.learner.is_sticky_resolve(location_hash);
-        // Fan-out must accumulate on every program access (not only pre-hot).
-        if is_program {
-            self.specfence
-                .learner
-                .note_hot_touch(location_hash, is_program);
-        }
+        // H / prior_warm / sticky are observe/prior — never OR into the verb.
         if is_program && (hotset || prior_ws || sticky || writer.is_some()) {
             self.specfence.sketch.note_hot(location_hash);
         }
         if self.specfence.learner.live_fanout_hot(location_hash) && is_program {
             self.specfence.sketch.note_hot(location_hash);
         }
-
-        let avoid = self.specfence.sketch.avoid_broadcast(location_hash)
-            || self.specfence.edges.avoid_broadcast(location_hash);
-        // First-wave: reopen canary after the probe tx is Done without Avoid
-        // so later similar edges are not stuck cold-Unfenced until publish.
-        if !avoid {
-            if let Some(probe) = self.specfence.sketch.canary_tx(location_hash) {
-                let probe_done = self.specfence.scheduler.is_done(probe);
-                if self
-                    .specfence
-                    .sketch
-                    .reopen_canary_if_probe_done(location_hash, probe_done)
-                {
-                    self.specfence.metrics.record_canary_reopen();
-                }
-            }
-        }
-        // Live priors: bind_success / writer_done / u_aa promote into H.
         if self.specfence.learner.bind_cover(location_hash)
             || self.specfence.learner.writer_done_hot(location_hash)
         {
             self.specfence.sketch.note_hot(location_hash);
         }
         let in_h = self.specfence.sketch.in_h(location_hash);
-        // One canary Unfenced per program ℓ (no H required). Handler/Basic
-        // keep the H-gated canary so account chatter does not serialize.
-        let canary_ok = !published
-            && !avoid
-            && (is_program || in_h)
-            && self.specfence.sketch.try_canary(location_hash, self.tx_idx);
-        if canary_ok {
-            self.specfence.metrics.record_canary_probe();
-        }
-        let independence = self.specfence.sketch.independence_certified(location_hash)
-            && !force_prefix
-            && !sticky
-            && !prior_ws
-            && !canary_ok;
-        let writer_known_unfinished = writer.is_some_and(|w| !self.specfence.scheduler.is_done(w));
-        // wait_depth_prior is read as a structural H actuator (not EV Await).
-        if self
+        let loc_avoid = self.specfence.sketch.avoid_broadcast(location_hash)
+            || self.specfence.edges.avoid_broadcast(location_hash);
+
+        // Frozen gate: PredictedEssential(ℓ, k, morph) for THIS a.
+        // Quiet priors never plant; intra abort / first-wave still mark.
+        let mut predicted = self
             .specfence
             .learner
-            .morph_weights()
-            .wait_depth_prior()
-            .is_some()
-            && (self.specfence.learner.writer_done_hot(location_hash)
-                || self.specfence.learner.bind_cover(location_hash))
+            .predicted_essential(location_hash, access_k)
+            || self
+                .specfence
+                .sketch
+                .access_class_predicted(location_hash, access_k);
+        if self.specfence.learner.quiet_fence_off()
+            && !self
+                .specfence
+                .learner
+                .predicted_essential_intra(location_hash, access_k)
         {
-            self.specfence.sketch.note_hot(location_hash);
+            predicted = false;
         }
-        let essential = self.specfence.sketch.essential_antidep(
-            location_hash,
-            writer_known_unfinished,
-            prior_ws || sticky,
-            force_prefix,
-        );
-        let clique_gated = !published && self.specfence.sketch.clique_gated(location_hash);
+        // Canary live verb deleted. Clique / force_prefix / H-OR / morph
+        // actuator / writer_validated Bind gate are exclude-set.
+        let canary_ok = false;
+        let independence = !predicted;
+        let essential = predicted;
+        let clique_gated = false;
+        let avoid = predicted || loc_avoid;
 
         let view = EdgeView {
             location: location_hash,
@@ -609,9 +588,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
             writer_validated: writer.is_some_and(|w| self.specfence.scheduler.is_validated(w)),
             is_program,
             in_hot_set: in_h,
-            avoid_broadcast: avoid,
+            avoid_broadcast: loc_avoid,
             canary_ok,
             independence_certified: independence,
+            predicted_essential: predicted,
             essential_antidep: essential,
             force_prefix,
             clique_gated,
@@ -647,27 +627,30 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 mode_read: true,
             });
         }
-        let canary_taken = self.specfence.sketch.canary_taken(location_hash);
-        let must_wait = force_prefix || avoid || essential;
+        let canary_taken = false;
+        // Live Fence iff PredictedEssential for THIS a. Exclude-set is not π.
+        let must_wait = predicted;
+        if predicted {
+            self.specfence.metrics.record_predicted_essential();
+            self.specfence.metrics.record_pcc_fire_at_a();
+        }
 
-        // S1+S4 + v2 park budget: PreferAdmit Ready spines on WaitFor *and*
-        // Unfenced. Park heat skips execution_idx fetch_min so P stays on independents.
+        // Ordered admission on PredictedEssential WaitFor only.
+        // PreferAdmit-as-primary park fix on Unfenced is deleted (serial-lane lands).
         let is_done = |t: TxIdx| self.specfence.scheduler.is_done(t);
         let is_ready = |t: TxIdx| self.specfence.scheduler.is_ready(t);
         let unfinished =
             self.specfence
                 .sketch
                 .unfinished_writers_before(location_hash, self.tx_idx, is_done);
-        let park_heat =
-            matches!(action, EdgeAction::WaitFor(_)) || self.specfence.learner.prefer_admit_heat();
-        let ready_spines =
-            if matches!(action, EdgeAction::WaitFor(_) | EdgeAction::Unfenced) || park_heat {
-                self.specfence
-                    .sketch
-                    .ready_spine_writers(self.tx_idx, is_ready, is_done)
-            } else {
-                Vec::new()
-            };
+        let park_heat = matches!(action, EdgeAction::WaitFor(_));
+        let ready_spines = if matches!(action, EdgeAction::WaitFor(_)) {
+            self.specfence
+                .sketch
+                .ready_spine_writers(self.tx_idx, is_ready, is_done)
+        } else {
+            Vec::new()
+        };
         let mut admit = unfinished.clone();
         for w in &ready_spines {
             if !admit.contains(w) {
@@ -750,33 +733,8 @@ impl<'a, S: Storage> VmDb<'a, S> {
                         canary_taken,
                     );
                 }
-                // U5/U1: force_prefix must not Unfence. Do **not** serial-lane
-                // every Avoid/essential (that WaitFor(reader-1) broke seq≡par).
-                if force_prefix {
-                    debug_assert!(
-                        writer.is_some_and(|w| w >= self.tx_idx),
-                        "U5: force_prefix ∧ writer < reader must not Unfence (writer={writer:?})"
-                    );
-                    let target = writer
-                        .filter(|&w| w < self.tx_idx)
-                        .unwrap_or_else(|| self.tx_idx.saturating_sub(1));
-                    return self.fence_wait_for(
-                        address,
-                        location_hash,
-                        target,
-                        avoid,
-                        in_h,
-                        clique_gated,
-                        canary_taken,
-                        force_prefix,
-                        true,
-                    );
-                }
-                let reason = if avoid {
-                    ProcessReason::UnfencedAfterAvoid
-                } else if canary_ok {
-                    ProcessReason::UnfencedCanary
-                } else if independence {
+                // ¬PredictedEssential → Unfenced≡OCC. force_prefix is not π.
+                let reason = if independence {
                     ProcessReason::UnfencedIndependence
                 } else {
                     ProcessReason::UnfencedCold
@@ -1018,12 +976,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
         }
 
         // Cold / non-Fence: storage-origin Unfenced is allowed.
-        if force_prefix && self.tx_idx > 0 && !is_done(self.tx_idx - 1) {
-            self.specfence
-                .process
-                .note_force_prefix_none_unfenced(self.tx_idx);
-            self.specfence.metrics.record_force_prefix_unfenced();
-        }
+        // force_prefix is exclude-set — do not count as a live Unfenced leak.
         let leak = if avoid {
             ProcessReason::UnfencedAfterAvoid
         } else {
@@ -2958,6 +2911,16 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         {
                             self.specfence.edges.broadcast_avoid(*loc);
                             self.specfence.metrics.record_avoid_broadcast();
+                        }
+                        // First-wave per access class: if we already know the
+                        // consumer k template, arm PredictedEssential(ℓ, k) —
+                        // not sticky Wait for every later SLOAD in the consumer.
+                        let k_tmpl = self.specfence.learner.dominant_k(*loc);
+                        if k_tmpl > 0 {
+                            self.specfence.sketch.mark_access_class(*loc, k_tmpl);
+                            self.specfence
+                                .learner
+                                .mark_predicted_essential(*loc, k_tmpl);
                         }
                         self.specfence.process.note_avoid(*loc);
                         let kind = match value {

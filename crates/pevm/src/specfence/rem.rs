@@ -1614,17 +1614,16 @@ impl PartialRetryTable {
         LeanAbortRepair::FullRestart { reexec_cost: 2.2 }
     }
 
-    /// SpecFence-native Lean resolve: **R1-first** at validate (`try_validate`);
-    /// this arms **R2 SuffixRepair** only when identity/FF is lost.
+    /// Frozen-grain Resolve: **R1a RebindThis** at validate (`try_validate`);
+    /// this arms **R1b CertifiedPrefixSkip** only when a mid-tx checkpoint
+    /// exists. No checkpoint / grain identity lost → **B0 FullRestart**
+    /// (OCC residual). SuffixRepair / ForcePrefix is **not** the default.
     ///
     /// ```text
     /// if plan_partial_retry + checkpoint with 0 < cp.k < k_fail:
-    ///   arm_rewind_to + journal FF + set_force_bind  → SuffixRepair
-    ///   (same hang-free subset as SoftWait wake / try_arm_park_resume_at_k)
-    /// else if certified prefix (no mid-tx cp):
-    ///   set_force_bind; clear RewindTo → ForceBind (head reexec fallback)
+    ///   arm_rewind_to + journal FF  → CertifiedPrefixSkip (SuffixRepair rust name)
     /// else:
-    ///   clear_force_bind; clear_repair → FullRestart
+    ///   clear_force_bind; clear_repair → B0 FullRestart
     /// ```
     ///
     /// Absolute PC jump is **not** armed here — the execute path may hang-free
@@ -1673,15 +1672,12 @@ impl PartialRetryTable {
                         }
                     }
                 }
-                // Certified prefix but no usable mid-tx checkpoint → head ForceBind.
-                // Still ESTIMATE only failed suffix — never poison certified prefix Data.
-                self.set_force_bind(tx_idx, plan.certified.clone());
+                // Certified prefix but no usable mid-tx checkpoint → B0
+                // residual reincarnation (OCC-identical). ForceBind / whole-tx
+                // ForcePrefix is excluded from live π.
+                self.clear_force_bind(tx_idx);
                 self.clear_repair(tx_idx);
-                LeanAbortRepair::ForceBind {
-                    certified: plan.certified,
-                    suffix_writes: plan.suffix_writes,
-                    reexec_cost: 1.2,
-                }
+                LeanAbortRepair::FullRestart { reexec_cost: 2.2 }
             }
             _ => {
                 self.clear_force_bind(tx_idx);
@@ -2905,7 +2901,7 @@ mod abort_cheapening_tests {
         );
     }
 
-    /// Certified prefix but only k=0 CallEntry → ForceBind head (no RewindTo).
+    /// Certified prefix but only k=0 CallEntry → B0 FullRestart (no ForcePrefix π).
     #[test]
     fn apply_suffix_repair_force_bind_without_mid_tx_checkpoint() {
         let table = PartialRetryTable::new(1);
@@ -2918,27 +2914,15 @@ mod abort_cheapening_tests {
         table.note_access(0, 20, AccessMode::Write);
 
         match table.apply_suffix_repair(0, &[10, 11], &[11], &[10, 20]) {
-            LeanAbortRepair::ForceBind {
-                certified,
-                suffix_writes,
-                reexec_cost,
-            } => {
-                assert!(certified.contains(&10));
-                assert!(!certified.contains(&11));
-                // 10 is certified write (prefix); 20 is failed-suffix write.
-                assert!(
-                    suffix_writes.contains(&20),
-                    "suffix_writes={suffix_writes:?}"
-                );
-                assert!(
-                    !suffix_writes.contains(&10),
-                    "must not ESTIMATE certified prefix write"
-                );
-                assert!((reexec_cost - 1.2).abs() < 1e-9);
+            LeanAbortRepair::FullRestart { reexec_cost } => {
+                assert!((reexec_cost - 2.2).abs() < 1e-9);
             }
-            other => panic!("expected ForceBind fallback, got {other:?}"),
+            other => panic!("expected B0 FullRestart (no ForcePrefix default), got {other:?}"),
         }
-        assert!(table.must_force_bind(0, 10));
+        assert!(
+            !table.must_force_bind(0, 10),
+            "ForceBind / ForcePrefix must not arm without a certified prefix skip"
+        );
         assert!(
             !table.is_rewind_resume(0),
             "k=0-only checkpoint must not arm RewindTo (hang-free SoftWait subset)"

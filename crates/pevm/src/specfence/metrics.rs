@@ -258,6 +258,26 @@ pub struct SpecFenceMetrics {
     pub canary_reopen: usize,
     /// writer_done / u_aa learned into H/Avoid priors.
     pub writer_done_learned: usize,
+    /// Frozen-grain: Detect records at access boundaries (coverage).
+    pub detect_accesses: usize,
+    /// Frozen-grain: PredictedEssential gate true at this \(a\).
+    pub predicted_essential_hits: usize,
+    /// Frozen-grain: PCC Bind/WaitFor fired at this access (not tx-sticky).
+    pub pcc_fire_at_a: usize,
+    /// Falsifier: ForcePrefix used as live Avoid key (target 0).
+    pub force_prefix_as_pi: usize,
+    /// Falsifier: canary live verb (target 0).
+    pub canary_live_verb: usize,
+    /// Falsifier: `inc` used as Avoid key (target 0).
+    pub inc_avoid_hits: usize,
+    /// Falsifier: H as Wait OR-door (target 0).
+    pub h_or_wait_door: usize,
+    /// Falsifier: morph Storm/Quiet as Fence actuator (target 0).
+    pub morph_fence_actuator: usize,
+    /// Falsifier: writer_validated Bind gate (target 0).
+    pub writer_validated_bind_gate: usize,
+    /// Falsifier: flat EdgeKey(\(ℓ\),reader) control SoT (target 0).
+    pub flat_edgekey_sot: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -374,6 +394,16 @@ pub(crate) struct MetricsInner {
     bind_residual: AtomicUsize,
     canary_reopen: AtomicUsize,
     writer_done_learned: AtomicUsize,
+    detect_accesses: AtomicUsize,
+    predicted_essential_hits: AtomicUsize,
+    pcc_fire_at_a: AtomicUsize,
+    force_prefix_as_pi: AtomicUsize,
+    canary_live_verb: AtomicUsize,
+    inc_avoid_hits: AtomicUsize,
+    h_or_wait_door: AtomicUsize,
+    morph_fence_actuator: AtomicUsize,
+    writer_validated_bind_gate: AtomicUsize,
+    flat_edgekey_sot: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -808,6 +838,19 @@ impl MetricsInner {
         self.writer_done_learned.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_detect_access(&self) {
+        self.detect_accesses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_predicted_essential(&self) {
+        self.predicted_essential_hits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_pcc_fire_at_a(&self) {
+        self.pcc_fire_at_a.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_jump_defer(&self) {
         self.jump_defer.fetch_add(1, Ordering::Relaxed);
     }
@@ -1061,6 +1104,16 @@ impl MetricsInner {
             bind_residual: self.bind_residual.load(Ordering::Relaxed),
             canary_reopen: self.canary_reopen.load(Ordering::Relaxed),
             writer_done_learned: self.writer_done_learned.load(Ordering::Relaxed),
+            detect_accesses: self.detect_accesses.load(Ordering::Relaxed),
+            predicted_essential_hits: self.predicted_essential_hits.load(Ordering::Relaxed),
+            pcc_fire_at_a: self.pcc_fire_at_a.load(Ordering::Relaxed),
+            force_prefix_as_pi: self.force_prefix_as_pi.load(Ordering::Relaxed),
+            canary_live_verb: self.canary_live_verb.load(Ordering::Relaxed),
+            inc_avoid_hits: self.inc_avoid_hits.load(Ordering::Relaxed),
+            h_or_wait_door: self.h_or_wait_door.load(Ordering::Relaxed),
+            morph_fence_actuator: self.morph_fence_actuator.load(Ordering::Relaxed),
+            writer_validated_bind_gate: self.writer_validated_bind_gate.load(Ordering::Relaxed),
+            flat_edgekey_sot: self.flat_edgekey_sot.load(Ordering::Relaxed),
         }
     }
 }

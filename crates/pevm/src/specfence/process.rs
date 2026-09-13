@@ -196,6 +196,8 @@ pub struct ExecProcessSnapshot {
     pub per_tx: Vec<PerTxProcessSnap>,
     /// Temporary lab: decision-field contingencies.
     pub decision_fields: DecisionFieldSnap,
+    /// Frozen-grain: txs that mixed Fence + Unfenced (expected >0 on fan_out).
+    pub mixed_verb_intra_tx: usize,
 }
 
 impl ProcessTrace {
@@ -433,6 +435,10 @@ impl ProcessTrace {
             })
             .collect();
         per_tx.sort_by_key(|t| t.tx);
+        let mixed_verb_intra_tx = per_tx
+            .iter()
+            .filter(|t| (t.n_bind + t.n_wait_for) > 0 && t.n_unfenced > 0)
+            .count();
         ExecProcessSnapshot {
             reason_histogram: hist,
             unfenced_total,
@@ -446,6 +452,7 @@ impl ProcessTrace {
             force_prefix_none_unfenced: self.force_prefix_none_unfenced.load(Ordering::Relaxed),
             per_tx,
             decision_fields: self.decision_fields.snapshot(),
+            mixed_verb_intra_tx,
         }
     }
 }
