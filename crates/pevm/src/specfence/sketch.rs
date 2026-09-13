@@ -4,14 +4,27 @@
 //! Not Storm/Quiet morph-as-protocol. Morph flip only **decays** template
 //! confidence (A6). SoftWait Soft is never armed from a sketch.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use dashmap::{DashMap, DashSet};
 
-use crate::{BuildIdentityHasher, MemoryLocationHash, TxIdx};
+use crate::{BuildIdentityHasher, MemoryLocationHash, TxIdx, TxIncarnation};
 
 use super::learner::TopLocPrior;
+
+/// Done→Data residual Bind install. Region SoT: a Fenced ℓ always has a
+/// residual version (last committed Data, or Storage after writer Done∅Data).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResidualBind {
+    /// Last committed MV Data (may predate the Done writer).
+    Data {
+        tx_idx: TxIdx,
+        tx_incarnation: TxIncarnation,
+    },
+    /// Writer Finished without readable Data — storage origin is the Fence.
+    Storage { writer: TxIdx },
+}
 
 /// Live confidence floor — below this the template is not a Wait/H prior (A6).
 const CONF_LIVE: f64 = 0.20;
@@ -52,11 +65,7 @@ impl Default for LocSketch {
 impl LocSketch {
     fn predicted_writer(&self) -> Option<TxIdx> {
         let w = self.predicted_writer.load(Ordering::Relaxed);
-        if w == usize::MAX {
-            None
-        } else {
-            Some(w)
-        }
+        if w == usize::MAX { None } else { Some(w) }
     }
 }
 
@@ -74,6 +83,8 @@ pub(crate) struct HotSketch {
     spines: DashMap<MemoryLocationHash, Mutex<Vec<TxIdx>>, BuildIdentityHasher>,
     locs: DashMap<MemoryLocationHash, LocSketch, BuildIdentityHasher>,
     avoid: DashMap<MemoryLocationHash, (), BuildIdentityHasher>,
+    /// Done→Data residual per ℓ (Bind SoT when writer is Done∅Data).
+    residuals: DashMap<MemoryLocationHash, ResidualBind, BuildIdentityHasher>,
     warm_seeded: DashSet<MemoryLocationHash, BuildIdentityHasher>,
     hot_size: AtomicUsize,
     avoid_broadcasts: AtomicUsize,
@@ -95,12 +106,7 @@ impl HotSketch {
 
     /// U6: quiet morph (098↔599) extra-decays the prior so Fence bits do not
     /// stick across a quiet follow-on block.
-    pub(crate) fn seed_from_prior_morph(
-        &self,
-        tops: &[TopLocPrior],
-        flipped: bool,
-        quiet: bool,
-    ) {
+    pub(crate) fn seed_from_prior_morph(&self, tops: &[TopLocPrior], flipped: bool, quiet: bool) {
         for top in tops {
             let mut decay = if flipped { 0.45 } else { 1.0 };
             if quiet {
@@ -152,12 +158,49 @@ impl HotSketch {
         e.publishes.fetch_add(1, Ordering::Relaxed);
         drop(e);
         self.push_spine(location, writer);
+        // Publish installs Data residual (incarnation 0 until Bind refreshes).
+        self.install_data_residual(location, writer, 0);
         if self.avoid.insert(location, ()).is_none() {
             self.avoid_broadcasts.fetch_add(1, Ordering::Relaxed);
             true
         } else {
             false
         }
+    }
+
+    /// Install last committed Data as the Region residual (Done→Bind SoT).
+    pub(crate) fn install_data_residual(
+        &self,
+        location: MemoryLocationHash,
+        tx_idx: TxIdx,
+        tx_incarnation: TxIncarnation,
+    ) {
+        self.residuals.insert(
+            location,
+            ResidualBind::Data {
+                tx_idx,
+                tx_incarnation,
+            },
+        );
+    }
+
+    /// Writer Done without Data: keep last Data residual, else Storage residual.
+    pub(crate) fn install_done_residual(
+        &self,
+        location: MemoryLocationHash,
+        writer: TxIdx,
+    ) -> ResidualBind {
+        if let Some(e) = self.residuals.get(&location) {
+            return *e;
+        }
+        let r = ResidualBind::Storage { writer };
+        self.residuals.insert(location, r);
+        r
+    }
+
+    #[inline]
+    pub(crate) fn residual_bind(&self, location: MemoryLocationHash) -> Option<ResidualBind> {
+        self.residuals.get(&location).map(|e| *e)
     }
 
     #[inline]
@@ -197,7 +240,10 @@ impl HotSketch {
     /// Push a writer onto the ordered spine (sorted unique).
     pub(crate) fn push_spine(&self, location: MemoryLocationHash, writer: TxIdx) {
         self.note_writer(location, writer);
-        let e = self.spines.entry(location).or_insert_with(|| Mutex::new(Vec::new()));
+        let e = self
+            .spines
+            .entry(location)
+            .or_insert_with(|| Mutex::new(Vec::new()));
         let mut v = e.lock().unwrap();
         if let Err(i) = v.binary_search(&writer) {
             v.insert(i, writer);
@@ -272,11 +318,7 @@ impl HotSketch {
     pub(crate) fn canary_tx(&self, location: MemoryLocationHash) -> Option<TxIdx> {
         self.locs.get(&location).and_then(|e| {
             let t = e.canary_tx.load(Ordering::Relaxed);
-            if t == usize::MAX {
-                None
-            } else {
-                Some(t)
-            }
+            if t == usize::MAX { None } else { Some(t) }
         })
     }
 
@@ -297,10 +339,7 @@ impl HotSketch {
 
     /// A1: mass Unfenced on unpublished clique is gated after the canary.
     pub(crate) fn clique_gated(&self, location: MemoryLocationHash) -> bool {
-        if !self.in_h(location)
-            && !self.avoid_broadcast(location)
-            && !self.canary_taken(location)
-        {
+        if !self.in_h(location) && !self.avoid_broadcast(location) && !self.canary_taken(location) {
             return false;
         }
         let unfenced = self
@@ -359,6 +398,33 @@ impl HotSketch {
                 .collect();
         }
         Vec::new()
+    }
+
+    /// Ready writers on every live (Avoid / H / template) spine before `reader`.
+    /// Scheduler law: ready-set ⊆ Region unfinished spine (secondary ℓs, not
+    /// only the star). PreferAdmit is this set, not a counter on one access.
+    pub(crate) fn ready_spine_writers(
+        &self,
+        reader: TxIdx,
+        is_ready: impl Fn(TxIdx) -> bool,
+        is_done: impl Fn(TxIdx) -> bool,
+    ) -> Vec<TxIdx> {
+        let mut out = Vec::new();
+        for s in self.spines.iter() {
+            let loc = *s.key();
+            if !self.in_serial_lane(loc) {
+                continue;
+            }
+            let v = s.value().lock().unwrap();
+            for &w in v.iter() {
+                if w < reader && !is_done(w) && is_ready(w) {
+                    out.push(w);
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
     /// U2: drop a writer that no longer publishes ℓ (suffix invalidate / abort).
@@ -656,10 +722,7 @@ mod tests {
             true,
         );
         // quiet × flip decay of 0.85 → 0.85*0.45*0.40 = 0.153 < CONF_LIVE
-        assert!(
-            !s.in_h(4),
-            "U6: quiet+flip must not seed a Fence prior"
-        );
+        assert!(!s.in_h(4), "U6: quiet+flip must not seed a Fence prior");
         s.seed_from_prior(
             &[TopLocPrior {
                 location: 8,
@@ -686,5 +749,44 @@ mod tests {
         assert!(!s.in_h(9));
         assert!(s.in_h(8), "live Avoid is not a quiet-revoke target");
         assert!(s.avoid_broadcast(8));
+    }
+
+    #[test]
+    fn done_without_data_installs_storage_residual() {
+        let s = HotSketch::new();
+        let r = s.install_done_residual(3, 4);
+        assert_eq!(r, ResidualBind::Storage { writer: 4 });
+        assert_eq!(
+            s.residual_bind(3),
+            Some(ResidualBind::Storage { writer: 4 })
+        );
+        s.install_data_residual(3, 2, 1);
+        assert!(matches!(
+            s.residual_bind(3),
+            Some(ResidualBind::Data {
+                tx_idx: 2,
+                tx_incarnation: 1
+            })
+        ));
+        // Done after Data keeps the Data residual.
+        assert!(matches!(
+            s.install_done_residual(3, 9),
+            ResidualBind::Data { tx_idx: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn ready_spine_writers_covers_secondary_l() {
+        let s = HotSketch::new();
+        s.broadcast_avoid(1, 2);
+        s.push_spine(1, 5);
+        s.broadcast_avoid(9, 3);
+        s.push_spine(9, 7);
+        let ready = s.ready_spine_writers(10, |w| w == 5 || w == 7, |w| w == 2 || w == 3);
+        assert_eq!(
+            ready,
+            vec![5, 7],
+            "secondary ℓ Ready writers are PreferAdmit"
+        );
     }
 }

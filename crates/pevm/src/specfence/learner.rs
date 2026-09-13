@@ -10,8 +10,8 @@
 //! **not** Boolean Wait cuts (`D_WAIT` / fanout ladders).
 
 #![allow(dead_code)]
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use dashmap::DashMap;
 
@@ -182,7 +182,7 @@ impl AdaptiveParams {
             tau_s: 0.50,
             tau_revoke: 0.20,
             c_retry: 3.0,
-            d_wait: 0.50, // deprecated for π
+            d_wait: 0.50,      // deprecated for π
             cost_margin: 0.40, // deprecated for π
             waw_writer_floor: 8,
             heavy_gas_limit: 200_000,
@@ -280,11 +280,7 @@ impl InterBlockPrior {
     }
 
     /// End-of-block: pack morph hat + top-ℓ; raise α on morphology flip.
-    pub(crate) fn end_block(
-        &self,
-        morph_hat: MorphWeights,
-        top: Vec<TopLocPrior>,
-    ) -> f64 {
+    pub(crate) fn end_block(&self, morph_hat: MorphWeights, top: Vec<TopLocPrior>) -> f64 {
         let morph_hat = morph_hat.normalize();
         let mut ema = self.morph_ema.lock().unwrap();
         let kl = ema.divergence(morph_hat);
@@ -342,8 +338,11 @@ struct LocLive {
     e_cascade_bits: AtomicU64,
     /// Sticky resolve: conflict ℓ after force_bind_reabort (Bind/Await bias).
     sticky_resolve: AtomicUsize,
+    /// Done∅Data Unfenced / residual Bind — long-tail H/Avoid prior.
+    writer_done: AtomicUsize,
+    /// Avoid ∧ Done∅Data (u_aa) — serial_lane fuel for secondary ℓs.
+    u_aa: AtomicUsize,
 }
-
 
 #[inline]
 fn fp_encode(x: f64) -> u64 {
@@ -461,14 +460,17 @@ impl LiveLearner {
             entry.handler_reads.fetch_add(1, Ordering::Relaxed);
             self.handler_obs.fetch_add(1, Ordering::Relaxed);
         }
-        self.bump_morph_from_observe(is_program, writer_count, entry.readers.load(Ordering::Relaxed));
+        self.bump_morph_from_observe(
+            is_program,
+            writer_count,
+            entry.readers.load(Ordering::Relaxed),
+        );
     }
 
     pub(crate) fn note_abort(&self, location: MemoryLocationHash, cascade_hint: usize) {
         let c = cascade_hint.max(1);
         self.abort_events.fetch_add(1, Ordering::Relaxed);
-        self.cascade_sum
-            .fetch_add(c as u64, Ordering::Relaxed);
+        self.cascade_sum.fetch_add(c as u64, Ordering::Relaxed);
         let entry = self.locs.entry(location).or_default();
         entry.aborts.fetch_add(1, Ordering::Relaxed);
         entry.cascade_sum.fetch_add(c as u64, Ordering::Relaxed);
@@ -482,7 +484,9 @@ impl LiveLearner {
             prev
         };
         let next = (1.0 - lr) * prev + lr * (c as f64);
-        entry.e_cascade_bits.store(fp_encode(next), Ordering::Relaxed);
+        entry
+            .e_cascade_bits
+            .store(fp_encode(next), Ordering::Relaxed);
         let g_prev = fp_decode(self.global_e_cascade_bits.load(Ordering::Relaxed));
         let g_next = (1.0 - lr) * g_prev + lr * (c as f64);
         self.global_e_cascade_bits
@@ -511,6 +515,37 @@ impl LiveLearner {
         self.locs
             .get(&location)
             .is_some_and(|e| e.sticky_resolve.load(Ordering::Relaxed) > 0)
+    }
+
+    /// Learn writer_done / u_aa into live H/Avoid priors (read by Fence/admit).
+    pub(crate) fn note_writer_done(&self, location: MemoryLocationHash, after_avoid: bool) {
+        let entry = self.locs.entry(location).or_default();
+        entry.writer_done.fetch_add(1, Ordering::Relaxed);
+        entry.readers.fetch_add(1, Ordering::Relaxed);
+        if after_avoid {
+            entry.u_aa.fetch_add(1, Ordering::Relaxed);
+        }
+        // Long-tail ℓ that emit Done∅Data become fan-out-ish (serial_lane).
+        let mut m = self.morph_bits.lock().unwrap();
+        m.fan_out += 0.02;
+        m.quiet = (m.quiet - 0.01).max(0.01);
+        *m = m.normalize();
+    }
+
+    /// Live prior: this ℓ already saw Done∅Data this block → H / Fence.
+    #[inline]
+    pub(crate) fn writer_done_hot(&self, location: MemoryLocationHash) -> bool {
+        self.locs
+            .get(&location)
+            .is_some_and(|e| e.writer_done.load(Ordering::Relaxed) > 0)
+    }
+
+    /// Live prior: Bind already succeeded on ℓ (`bind_success_total` reader).
+    #[inline]
+    pub(crate) fn bind_cover(&self, location: MemoryLocationHash) -> bool {
+        self.locs
+            .get(&location)
+            .is_some_and(|e| e.bind_hits.load(Ordering::Relaxed) > 0)
     }
 
     /// Cheap reader bump on hot-candidate first-cross (no morph/π tax).
@@ -654,9 +689,8 @@ impl LiveLearner {
                 return v;
             }
         }
-        fp_decode(self.global_e_wait_bits.load(Ordering::Relaxed)).max(
-            self.params_bits.lock().unwrap().e_wait_prior,
-        )
+        fp_decode(self.global_e_wait_bits.load(Ordering::Relaxed))
+            .max(self.params_bits.lock().unwrap().e_wait_prior)
     }
 
     /// E_cascade(ℓ) — per-ℓ EMA or global prior.
@@ -714,8 +748,8 @@ impl LiveLearner {
 
     /// Continuous meta tax ratio meta_ops/useful (0 before warmup). Feeds tiny-gap Spec bias.
     pub(crate) fn meta_tax_ratio(&self, params: &AdaptiveParams) -> f64 {
-        let obs = self.program_obs.load(Ordering::Relaxed)
-            + self.handler_obs.load(Ordering::Relaxed);
+        let obs =
+            self.program_obs.load(Ordering::Relaxed) + self.handler_obs.load(Ordering::Relaxed);
         if obs < 64 {
             return 0.0;
         }
@@ -741,8 +775,8 @@ impl LiveLearner {
     /// Meta budget exceeded: SoftWait/meta_ops over useful effects > ρ.
     /// Requires warmup observes so cold start cannot OCC-fallback the whole block.
     pub(crate) fn meta_budget_exceeded(&self, params: &AdaptiveParams) -> bool {
-        let obs = self.program_obs.load(Ordering::Relaxed)
-            + self.handler_obs.load(Ordering::Relaxed);
+        let obs =
+            self.program_obs.load(Ordering::Relaxed) + self.handler_obs.load(Ordering::Relaxed);
         if obs < 64 {
             return false;
         }
@@ -896,10 +930,13 @@ impl LiveLearner {
                 let readers = e.readers.load(Ordering::Relaxed) as f64;
                 let aborts = e.aborts.load(Ordering::Relaxed) as f64;
                 let obs = readers.max(1.0);
+                let writer_done = e.writer_done.load(Ordering::Relaxed) as f64;
+                let u_aa = e.u_aa.load(Ordering::Relaxed) as f64;
                 TopLocPrior {
                     location: *e.key(),
-                    fanout_ema: readers,
-                    abort_rate: aborts / obs,
+                    // Long-tail Done∅Data ℓs rank into H (not only top-16 fanout).
+                    fanout_ema: readers + writer_done,
+                    abort_rate: (aborts + u_aa) / obs,
                     chain_len_ema: e.writers.load(Ordering::Relaxed) as f64,
                 }
             })
@@ -1046,6 +1083,25 @@ mod tests {
         assert_eq!(live.bind_success_total(), 2); // bind + publish
         assert_eq!(live.wait_useful_total(), 1);
         assert!((live.mean_depth_sample().unwrap() - 0.9).abs() < 1e-6);
+        assert!(
+            live.bind_cover(1),
+            "bind_success_total is a live Avoid prior"
+        );
+        assert!(live.bind_cover(2));
+    }
+
+    #[test]
+    fn writer_done_enters_hot_prior() {
+        let live = LiveLearner::new();
+        live.begin_block(MorphWeights::default());
+        live.note_writer_done(77, true);
+        live.note_writer_done(77, false);
+        assert!(live.writer_done_hot(77));
+        let tops = live.pack_top_locations();
+        assert_eq!(tops.len(), 1);
+        assert_eq!(tops[0].location, 77);
+        assert!(tops[0].fanout_ema >= 2.0);
+        assert!(tops[0].abort_rate > 0.0, "u_aa ranks into inter-block H");
     }
 
     #[test]

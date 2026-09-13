@@ -1,4 +1,3 @@
-use std::time::Instant;
 use alloy_primitives::{Address, B256, TxKind, U256};
 use alloy_rpc_types_eth::Receipt;
 use hashbrown::HashMap;
@@ -13,20 +12,24 @@ use revm::{
     state::{AccountInfo, Bytecode, EvmState},
 };
 use smallvec::SmallVec;
+use std::time::Instant;
 
 use crate::{
     AccountBasic, BuildIdentityHasher, BuildSuffixHasher, EvmAccount, FinishExecFlags, MemoryEntry,
     MemoryLocation, MemoryLocationHash, MemoryValue, ReadOrigin, ReadOrigins, ReadSet, Storage,
-    TxIdx, TxVersion, WriteSet, chain::PevmChain, hash_deterministic, mv_memory::MvMemory,
+    TxIdx, TxVersion, WriteSet,
+    chain::PevmChain,
+    hash_deterministic,
+    mv_memory::MvMemory,
     specfence::{
-        AccessMode, CheckpointKind, EdgeAction, EdgeKey, EdgeKind, EdgeState, EdgeView, FfValue,
-        ProcessReason, SpecFenceCtx, StorageWriteReplay, choose_edge_action,
-        early_val_probability, note_pending_effect_boundary,
-        absolute_jump_eligible, attach_current_live_snap, arm_call_outcome_cache, arm_ff_origin_seeds, take_ff_origin_seeds,
-        jump_is_safe, jump_refuse_reason, resume_was_applied, steps_this_run,
-        suffix_repair_jump_env_ok, try_arm_safe_absolute_jump, try_arm_safe_absolute_jump_gated,
-        with_plant_tls_journal, with_bind_snap_tls, note_pending_bind_snap,
-        bind_snap_mode, bind_snap_jump_enabled, BindSnapMode,
+        AccessMode, BindSnapMode, CheckpointKind, EdgeAction, EdgeKey, EdgeKind, EdgeState,
+        EdgeView, FfValue, ProcessReason, SpecFenceCtx, StorageWriteReplay, absolute_jump_eligible,
+        arm_call_outcome_cache, arm_ff_origin_seeds, attach_current_live_snap,
+        bind_snap_jump_enabled, bind_snap_mode, choose_edge_action, early_val_probability,
+        jump_is_safe, jump_refuse_reason, note_pending_bind_snap, note_pending_effect_boundary,
+        resume_was_applied, steps_this_run, suffix_repair_jump_env_ok, take_ff_origin_seeds,
+        try_arm_safe_absolute_jump, try_arm_safe_absolute_jump_gated, with_bind_snap_tls,
+        with_plant_tls_journal,
     },
 };
 
@@ -201,7 +204,6 @@ impl<'a, S: Storage> VmDb<'a, S> {
         Ok(())
     }
 
-
     /// M1b: try serving a certified-prefix read from the FF value cache.
     /// Returns Some when origin is unchanged — caller skips MV lazy walk.
 
@@ -216,21 +218,17 @@ impl<'a, S: Storage> VmDb<'a, S> {
             .note_value(self.tx_idx, location_hash, value);
     }
 
-    fn try_ff_storage(
-        &self,
-        location_hash: MemoryLocationHash,
-    ) -> Option<(U256, ReadOrigin)> {
+    fn try_ff_storage(&self, location_hash: MemoryLocationHash) -> Option<(U256, ReadOrigin)> {
         // Iter5: RewindTo resume OR escalate head-FF retain.
-        if !self
-            .specfence
-            .partial_retry
-            .is_rewind_resume(self.tx_idx)
+        if !self.specfence.partial_retry.is_rewind_resume(self.tx_idx)
             && !self.specfence.partial_retry.has_ff_head(self.tx_idx)
         {
             return None;
         }
-        let FfValue::Storage { value, origin, .. } =
-            self.specfence.partial_retry.ff_value(self.tx_idx, location_hash)?
+        let FfValue::Storage { value, origin, .. } = self
+            .specfence
+            .partial_retry
+            .ff_value(self.tx_idx, location_hash)?
         else {
             return None;
         };
@@ -282,10 +280,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
         &self,
         location_hash: MemoryLocationHash,
     ) -> Option<(AccountBasic, Option<B256>, ReadOrigin)> {
-        if !self
-            .specfence
-            .partial_retry
-            .is_rewind_resume(self.tx_idx)
+        if !self.specfence.partial_retry.is_rewind_resume(self.tx_idx)
             && !self.specfence.partial_retry.has_ff_head(self.tx_idx)
         {
             return None;
@@ -295,7 +290,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
             code_hash,
             origin,
             ..
-        } = self.specfence.partial_retry.ff_value(self.tx_idx, location_hash)?
+        } = self
+            .specfence
+            .partial_retry
+            .ff_value(self.tx_idx, location_hash)?
         else {
             return None;
         };
@@ -396,10 +394,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
         }
 
         if self.specfence.mode != crate::ConcurrencyMode::SpecFence {
-            if !self
-                .specfence
-                .should_wait_location(&self.mv_memory.regions, location_hash, &address)
-            {
+            if !self.specfence.should_wait_location(
+                &self.mv_memory.regions,
+                location_hash,
+                &address,
+            ) {
                 return Ok(());
             }
             if let Some(prev) = self
@@ -446,17 +445,15 @@ impl<'a, S: Storage> VmDb<'a, S> {
         is_program: bool,
     ) -> Result<(), ReadError> {
         if address == self.specfence.beneficiary || self.is_lazy {
-            self.specfence.partial_retry.note_access(
-                self.tx_idx,
-                location_hash,
-                AccessMode::Read,
-            );
+            self.specfence
+                .partial_retry
+                .note_access(self.tx_idx, location_hash, AccessMode::Read);
             self.specfence.metrics.record_spec_read();
             return Ok(());
         }
 
-        let tx_has_force = self.tx_incarnation > 0
-            && self.specfence.partial_retry.has_force_bind(self.tx_idx);
+        let tx_has_force =
+            self.tx_incarnation > 0 && self.specfence.partial_retry.has_force_bind(self.tx_idx);
         let force_prefix = tx_has_force
             && self
                 .specfence
@@ -471,14 +468,15 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 tx_incarnation,
             });
 
-        let mv_writer = bind_version
-            .as_ref()
-            .map(|v| v.tx_idx)
-            .or_else(|| self.mv_memory.last_writer_before(location_hash, self.tx_idx));
+        let mv_writer = bind_version.as_ref().map(|v| v.tx_idx).or_else(|| {
+            self.mv_memory
+                .last_writer_before(location_hash, self.tx_idx)
+        });
         // U1/U4: residual + repair-carried writer id. U2: do not use a sticky
         // predicted-writer from a prior incarnation as the identity.
         let residual_writer = if mv_writer.is_none() {
-            self.mv_memory.residual_writer_before(location_hash, self.tx_idx)
+            self.mv_memory
+                .residual_writer_before(location_hash, self.tx_idx)
         } else {
             None
         };
@@ -521,10 +519,12 @@ impl<'a, S: Storage> VmDb<'a, S> {
         } else {
             EdgeState::Unpublished
         };
-        self.specfence.edges.record(key, writer, EdgeKind::Wr, state);
+        self.specfence
+            .edges
+            .record(key, writer, EdgeKind::Wr, state);
 
-        let prior_ws = self.specfence.rw_prior.predicts_write(location_hash)
-            || residual_writer.is_some();
+        let prior_ws =
+            self.specfence.rw_prior.predicts_write(location_hash) || residual_writer.is_some();
         let hotset = self.specfence.hotset.contains(location_hash);
         let sticky = self.specfence.learner.is_sticky_resolve(location_hash);
         // Fan-out must accumulate on every program access (not only pre-hot).
@@ -542,16 +542,33 @@ impl<'a, S: Storage> VmDb<'a, S> {
 
         let avoid = self.specfence.sketch.avoid_broadcast(location_hash)
             || self.specfence.edges.avoid_broadcast(location_hash);
+        // First-wave: reopen canary after the probe tx is Done without Avoid
+        // so later similar edges are not stuck cold-Unfenced until publish.
+        if !avoid {
+            if let Some(probe) = self.specfence.sketch.canary_tx(location_hash) {
+                let probe_done = self.specfence.scheduler.is_done(probe);
+                if self
+                    .specfence
+                    .sketch
+                    .reopen_canary_if_probe_done(location_hash, probe_done)
+                {
+                    self.specfence.metrics.record_canary_reopen();
+                }
+            }
+        }
+        // Live priors: bind_success / writer_done / u_aa promote into H.
+        if self.specfence.learner.bind_cover(location_hash)
+            || self.specfence.learner.writer_done_hot(location_hash)
+        {
+            self.specfence.sketch.note_hot(location_hash);
+        }
         let in_h = self.specfence.sketch.in_h(location_hash);
         // One canary Unfenced per program ℓ (no H required). Handler/Basic
         // keep the H-gated canary so account chatter does not serialize.
         let canary_ok = !published
             && !avoid
             && (is_program || in_h)
-            && self
-                .specfence
-                .sketch
-                .try_canary(location_hash, self.tx_idx);
+            && self.specfence.sketch.try_canary(location_hash, self.tx_idx);
         if canary_ok {
             self.specfence.metrics.record_canary_probe();
         }
@@ -560,14 +577,23 @@ impl<'a, S: Storage> VmDb<'a, S> {
             && !sticky
             && !prior_ws
             && !canary_ok;
-        let writer_known_unfinished =
-            writer.is_some_and(|w| !self.specfence.scheduler.is_done(w));
+        let writer_known_unfinished = writer.is_some_and(|w| !self.specfence.scheduler.is_done(w));
+        // wait_depth_prior is a structural fan-out actuator (not EV Await).
+        let fan_out_fence = self
+            .specfence
+            .learner
+            .morph_weights()
+            .wait_depth_prior()
+            .is_some()
+            && (in_h
+                || self.specfence.learner.writer_done_hot(location_hash)
+                || self.specfence.learner.bind_cover(location_hash));
         let essential = self.specfence.sketch.essential_antidep(
             location_hash,
             writer_known_unfinished,
             prior_ws || sticky,
             force_prefix,
-        );
+        ) || (fan_out_fence && (writer_known_unfinished || avoid || prior_ws));
         let clique_gated = !published && self.specfence.sketch.clique_gated(location_hash);
 
         let view = EdgeView {
@@ -587,33 +613,39 @@ impl<'a, S: Storage> VmDb<'a, S> {
             essential_antidep: essential,
             force_prefix,
             clique_gated,
-            writer_executing: writer
-                .is_some_and(|w| self.specfence.scheduler.is_executing(w)),
+            writer_executing: writer.is_some_and(|w| self.specfence.scheduler.is_executing(w)),
             writer_ready: writer.is_some_and(|w| self.specfence.scheduler.is_ready(w)),
         };
         let action = choose_edge_action(&view);
         let canary_taken = self.specfence.sketch.canary_taken(location_hash);
         let must_wait = force_prefix || avoid || essential;
 
-        // S1+S4: prefer-admit every unfinished spine writer on this ℓ (096/097
-        // multi-spine), including Ready, before independence Unfenced.
+        // S1+S4: ready-set ⊆ Region unfinished spine (this ℓ + secondary live
+        // spines). PreferAdmit is the scheduler law, not a star-ℓ counter.
         let is_done = |t: TxIdx| self.specfence.scheduler.is_done(t);
-        let unfinished = self.specfence.sketch.unfinished_writers_before(
-            location_hash,
-            self.tx_idx,
-            is_done,
-        );
-        if !unfinished.is_empty() {
+        let is_ready = |t: TxIdx| self.specfence.scheduler.is_ready(t);
+        let unfinished =
+            self.specfence
+                .sketch
+                .unfinished_writers_before(location_hash, self.tx_idx, is_done);
+        let ready_spines =
+            self.specfence
+                .sketch
+                .ready_spine_writers(self.tx_idx, is_ready, is_done);
+        let mut admit = unfinished.clone();
+        for w in &ready_spines {
+            if !admit.contains(w) {
+                admit.push(*w);
+            }
+        }
+        if !admit.is_empty() {
             self.specfence
                 .scheduler
-                .admit_spine_writers(&unfinished, self.specfence.wave);
-            if unfinished
-                .iter()
-                .any(|&w| self.specfence.scheduler.is_ready(w))
-            {
+                .admit_spine_writers(&admit, self.specfence.wave);
+            if admit.iter().any(|&w| is_ready(w)) {
                 self.specfence.metrics.record_prefer_admit();
             }
-            if unfinished.len() > 1 {
+            if unfinished.len() > 1 || ready_spines.len() > 1 {
                 self.specfence.metrics.record_multi_spine_admit();
             }
         }
@@ -621,6 +653,12 @@ impl<'a, S: Storage> VmDb<'a, S> {
         match action {
             EdgeAction::Bind(v) => {
                 self.specfence.metrics.record_edge_bind();
+                self.specfence.learner.note_bind_success(location_hash);
+                self.specfence.sketch.install_data_residual(
+                    location_hash,
+                    v.tx_idx,
+                    v.tx_incarnation,
+                );
                 self.specfence.process.record(
                     location_hash,
                     self.tx_idx,
@@ -657,9 +695,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
                         writer.is_some_and(|w| w >= self.tx_idx),
                         "U5: force_prefix ∧ writer < reader must not Unfence (writer={writer:?})"
                     );
-                    let target = writer.filter(|&w| w < self.tx_idx).unwrap_or_else(|| {
-                        self.tx_idx.saturating_sub(1)
-                    });
+                    let target = writer
+                        .filter(|&w| w < self.tx_idx)
+                        .unwrap_or_else(|| self.tx_idx.saturating_sub(1));
                     return self.fence_wait_for(
                         address,
                         location_hash,
@@ -740,11 +778,14 @@ impl<'a, S: Storage> VmDb<'a, S> {
         }
 
         // Data may have landed between π and park.
-        if let Some((tx_idx, tx_incarnation)) = self
-            .mv_memory
-            .last_data_before(location_hash, self.tx_idx)
+        if let Some((tx_idx, tx_incarnation)) =
+            self.mv_memory.last_data_before(location_hash, self.tx_idx)
         {
+            self.specfence
+                .sketch
+                .install_data_residual(location_hash, tx_idx, tx_incarnation);
             self.specfence.metrics.record_edge_bind();
+            self.specfence.learner.note_bind_success(location_hash);
             self.specfence.process.record(
                 location_hash,
                 self.tx_idx,
@@ -765,21 +806,36 @@ impl<'a, S: Storage> VmDb<'a, S> {
 
         let is_done = |t: TxIdx| self.specfence.scheduler.is_done(t);
         let is_executing = |t: TxIdx| self.specfence.scheduler.is_executing(t);
-        let unfinished_all = self.specfence.sketch.unfinished_writers_before(
-            location_hash,
-            self.tx_idx,
-            is_done,
-        );
-        // S4: admit the whole ℓ spine, not only the WaitFor tip.
-        if !unfinished_all.is_empty() {
+        let is_ready = |t: TxIdx| self.specfence.scheduler.is_ready(t);
+        let unfinished_all =
+            self.specfence
+                .sketch
+                .unfinished_writers_before(location_hash, self.tx_idx, is_done);
+        let ready_spines =
+            self.specfence
+                .sketch
+                .ready_spine_writers(self.tx_idx, is_ready, is_done);
+        let mut admit = unfinished_all.clone();
+        for w in &ready_spines {
+            if !admit.contains(w) {
+                admit.push(*w);
+            }
+        }
+        // S4 + PreferAdmit law: ready-set ⊆ Region unfinished spine.
+        if !admit.is_empty() {
             self.specfence
                 .scheduler
-                .admit_spine_writers(&unfinished_all, self.specfence.wave);
-            if unfinished_all.len() > 1 {
+                .admit_spine_writers(&admit, self.specfence.wave);
+            if admit.iter().any(|&w| is_ready(w)) {
+                self.specfence.metrics.record_prefer_admit();
+            }
+            if unfinished_all.len() > 1 || ready_spines.len() > 1 {
                 self.specfence.metrics.record_multi_spine_admit();
             }
         }
-        // U3: park only on a lower Executing writer; Ready is already admitted.
+        // Park Executing first. On Fence/Avoid, also WaitFor unfinished
+        // Ready/Aborting after prefer-admit (visibility install) — never
+        // UnfencedWriterDone as hang-freedom.
         let unfinished_exec = unfinished_all
             .iter()
             .copied()
@@ -787,15 +843,40 @@ impl<'a, S: Storage> VmDb<'a, S> {
             .find(|&w| is_executing(w));
         let requested_exec =
             (requested < self.tx_idx && is_executing(requested)).then_some(requested);
-        let requested_live =
-            (requested < self.tx_idx && !is_done(requested)).then_some(requested);
+        let requested_live = (requested < self.tx_idx && !is_done(requested)).then_some(requested);
 
         let (target, reason) = if let Some(w) = unfinished_exec.or(requested_exec) {
             (Some(w), ProcessReason::WaitForWriter)
+        } else if must_wait {
+            // Visibility Fence: park Ready (prefer-admitted) or a live
+            // requested writer. Aborting-only → Bind residual (no hang).
+            if let Some(w) = unfinished_all
+                .iter()
+                .copied()
+                .rev()
+                .find(|&w| is_ready(w))
+                .or(requested_live.filter(|&w| is_ready(w) || is_executing(w)))
+            {
+                let r = if w + 1 == self.tx_idx {
+                    ProcessReason::WaitForSerial
+                } else if force_prefix {
+                    ProcessReason::WaitForPrefix
+                } else {
+                    ProcessReason::WaitForWriter
+                };
+                (Some(w), r)
+            } else if force_prefix && self.tx_idx > 0 && !is_done(self.tx_idx - 1) {
+                (Some(self.tx_idx - 1), ProcessReason::WaitForSerial)
+            } else {
+                (None, ProcessReason::BindPublished)
+            }
         } else if force_prefix {
-            // U1: repair prefix stays Fenced. Prefer a live spine writer after
-            // admit; else serial-lane pred. Not used for plain Avoid (seq≠par).
-            if let Some(w) = unfinished_all.iter().copied().rev().next().or(requested_live)
+            if let Some(w) = unfinished_all
+                .iter()
+                .copied()
+                .rev()
+                .next()
+                .or(requested_live)
             {
                 let r = if w + 1 == self.tx_idx {
                     ProcessReason::WaitForSerial
@@ -836,22 +917,16 @@ impl<'a, S: Storage> VmDb<'a, S> {
             if clique_gated || in_h || self.specfence.sketch.in_serial_lane(location_hash) {
                 self.specfence.metrics.record_spine_wait();
             }
-            self.specfence.process.record(
-                location_hash,
-                self.tx_idx,
-                reason,
-                avoid,
-                canary_taken,
-            );
+            self.specfence
+                .process
+                .record(location_hash, self.tx_idx, reason, avoid, canary_taken);
             self.specfence.metrics.record_edge_wait_for();
             self.specfence.metrics.record_wait_hard();
             self.specfence.metrics.record_wait(address);
             self.specfence
                 .dag
                 .arm_hard_wait(location_hash, self.tx_idx, t);
-            self.specfence
-                .scheduler
-                .admit_spine(t, self.specfence.wave);
+            self.specfence.scheduler.admit_spine(t, self.specfence.wave);
             let armed_at_k = self.specfence.partial_retry.current_k(self.tx_idx) as u64;
             self.specfence.wave.set_pending_park(
                 location_hash,
@@ -862,32 +937,165 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return Err(ReadError::Blocking(t));
         }
 
-        // No live wait target and no Data. Storage-origin if the writer
-        // finished without a readable version. must_wait already tried serial
-        // lane above — Unfenced here is not hang-freedom.
-        // U1 leak: force_prefix Unfenced while a serial pred is still live.
+        // No live wait target and no Data. Avoid/essential: Bind residual
+        // (Done→Data SoT). UnfencedWriterDone is not a hang-freedom escape.
+        self.specfence
+            .learner
+            .note_writer_done(location_hash, avoid);
+        self.specfence.sketch.note_hot(location_hash);
+        self.specfence.metrics.record_writer_done_learned();
+
+        if must_wait {
+            // Visibility spin: version may still be installing.
+            for _ in 0..16 {
+                if let Some((tx_idx, tx_incarnation)) =
+                    self.mv_memory.last_data_before(location_hash, self.tx_idx)
+                {
+                    self.specfence.sketch.install_data_residual(
+                        location_hash,
+                        tx_idx,
+                        tx_incarnation,
+                    );
+                    return self.bind_residual_data(
+                        address,
+                        location_hash,
+                        TxVersion {
+                            tx_idx,
+                            tx_incarnation,
+                        },
+                        force_prefix,
+                        avoid,
+                        canary_taken,
+                    );
+                }
+                std::thread::yield_now();
+            }
+            return self.bind_done_residual(
+                address,
+                location_hash,
+                requested,
+                force_prefix,
+                avoid,
+                canary_taken,
+            );
+        }
+
+        // Cold / non-Fence: storage-origin Unfenced is allowed.
         if force_prefix && self.tx_idx > 0 && !is_done(self.tx_idx - 1) {
-            self.specfence.process.note_force_prefix_none_unfenced(self.tx_idx);
+            self.specfence
+                .process
+                .note_force_prefix_none_unfenced(self.tx_idx);
             self.specfence.metrics.record_force_prefix_unfenced();
         }
-        let leak = if must_wait {
-            ProcessReason::UnfencedWriterDone
-        } else if avoid {
+        let leak = if avoid {
             ProcessReason::UnfencedAfterAvoid
         } else {
             ProcessReason::UnfencedWriterDone
         };
-        self.specfence.process.record(
-            location_hash,
-            self.tx_idx,
-            leak,
-            avoid,
-            canary_taken,
-        );
+        self.specfence
+            .process
+            .record(location_hash, self.tx_idx, leak, avoid, canary_taken);
         self.specfence.metrics.record_edge_unfenced();
         self.specfence.metrics.record_spec_read();
         note_pending_effect_boundary(self.tx_idx, self.specfence.partial_retry);
         Ok(())
+    }
+
+    /// Bind last committed / residual Data after writer Done∅Data.
+    fn bind_residual_data(
+        &self,
+        address: Address,
+        location_hash: MemoryLocationHash,
+        v: TxVersion,
+        force_prefix: bool,
+        avoid: bool,
+        canary_taken: bool,
+    ) -> Result<(), ReadError> {
+        self.specfence.metrics.record_edge_bind();
+        self.specfence.metrics.record_bind_residual();
+        self.specfence.learner.note_bind_success(location_hash);
+        self.specfence.process.record(
+            location_hash,
+            self.tx_idx,
+            ProcessReason::BindPublished,
+            avoid,
+            canary_taken,
+        );
+        self.bind_on_data_lite(address, location_hash, v, force_prefix)
+    }
+
+    /// Region residual Bind: last Data residual, else Storage residual.
+    fn bind_done_residual(
+        &self,
+        address: Address,
+        location_hash: MemoryLocationHash,
+        requested: TxIdx,
+        force_prefix: bool,
+        avoid: bool,
+        canary_taken: bool,
+    ) -> Result<(), ReadError> {
+        if let Some((tx_idx, tx_incarnation)) =
+            self.mv_memory.last_data_before(location_hash, self.tx_idx)
+        {
+            self.specfence
+                .sketch
+                .install_data_residual(location_hash, tx_idx, tx_incarnation);
+            return self.bind_residual_data(
+                address,
+                location_hash,
+                TxVersion {
+                    tx_idx,
+                    tx_incarnation,
+                },
+                force_prefix,
+                avoid,
+                canary_taken,
+            );
+        }
+        match self
+            .specfence
+            .sketch
+            .residual_bind(location_hash)
+            .unwrap_or_else(|| {
+                self.specfence.sketch.install_done_residual(
+                    location_hash,
+                    requested.min(self.tx_idx.saturating_sub(1)),
+                )
+            }) {
+            crate::specfence::ResidualBind::Data {
+                tx_idx,
+                tx_incarnation,
+            } => self.bind_residual_data(
+                address,
+                location_hash,
+                TxVersion {
+                    tx_idx,
+                    tx_incarnation,
+                },
+                force_prefix,
+                avoid,
+                canary_taken,
+            ),
+            crate::specfence::ResidualBind::Storage { .. } => {
+                self.specfence.metrics.record_edge_bind();
+                self.specfence.metrics.record_bind_residual();
+                self.specfence.learner.note_bind_success(location_hash);
+                self.specfence.process.record(
+                    location_hash,
+                    self.tx_idx,
+                    ProcessReason::BindPublished,
+                    avoid,
+                    canary_taken,
+                );
+                self.specfence
+                    .partial_retry
+                    .note_access_certified_checkpoint(self.tx_idx, location_hash);
+                self.specfence.rem.note_checkpoint_opportunity();
+                crate::specfence::arm_pending_effect_cp_only();
+                let _ = address;
+                Ok(())
+            }
+        }
     }
 
     /// Bind-on-Data: OCC-like certify of published MV Data without `is_done` park.
@@ -1304,7 +1512,11 @@ impl<S: Storage> Database for VmDb<'_, S> {
         // Deep: one DB-effect for this basic() call; emit edge per MV origin observed.
         if let Some(fg) = self.specfence.finegrain {
             if fg.deep_enabled() {
-                let origins_now = self.read_set.get(&location_hash).cloned().unwrap_or_default();
+                let origins_now = self
+                    .read_set
+                    .get(&location_hash)
+                    .cloned()
+                    .unwrap_or_default();
                 let mv_origins: Vec<_> = origins_now
                     .iter()
                     .filter_map(|o| match o {
@@ -1397,7 +1609,8 @@ impl<S: Storage> Database for VmDb<'_, S> {
                 } else {
                     None
                 };
-                self.maybe_note_value(location_hash,
+                self.maybe_note_value(
+                    location_hash,
                     FfValue::Basic {
                         address,
                         basic: account.clone(),
@@ -1447,7 +1660,8 @@ impl<S: Storage> Database for VmDb<'_, S> {
             );
             self.specfence.metrics.record_journal_ff_hit();
             if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
-                self.maybe_note_value(location_hash,
+                self.maybe_note_value(
+                    location_hash,
                     FfValue::Storage {
                         address,
                         slot: index,
@@ -1478,9 +1692,8 @@ impl<S: Storage> Database for VmDb<'_, S> {
                     {
                         // SpecFence OrderedDirtyRead: try prior live Data without parking.
                         if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
-                            if let Some((idx, inc)) = self
-                                .mv_memory
-                                .last_data_before(location_hash, self.tx_idx)
+                            if let Some((idx, inc)) =
+                                self.mv_memory.last_data_before(location_hash, self.tx_idx)
                             {
                                 if let Some(written) = self.mv_memory.data.get(&location_hash)
                                     && let Some(MemoryEntry::Data(i2, MemoryValue::Storage(v2))) =
@@ -1499,7 +1712,8 @@ impl<S: Storage> Database for VmDb<'_, S> {
                                         crate::specfence::LocationKind::Storage,
                                         Some(&origin),
                                     );
-                                    self.maybe_note_value(location_hash,
+                                    self.maybe_note_value(
+                                        location_hash,
                                         FfValue::Storage {
                                             address,
                                             slot: index,
@@ -1528,7 +1742,8 @@ impl<S: Storage> Database for VmDb<'_, S> {
                         Some(&origin),
                     );
                     if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
-                        self.maybe_note_value(location_hash,
+                        self.maybe_note_value(
+                            location_hash,
                             FfValue::Storage {
                                 address,
                                 slot: index,
@@ -1563,7 +1778,8 @@ impl<S: Storage> Database for VmDb<'_, S> {
                                     crate::specfence::LocationKind::Storage,
                                     Some(&origin),
                                 );
-                                self.maybe_note_value(location_hash,
+                                self.maybe_note_value(
+                                    location_hash,
                                     FfValue::Storage {
                                         address,
                                         slot: index,
@@ -1599,7 +1815,8 @@ impl<S: Storage> Database for VmDb<'_, S> {
             .storage(&address, &index)
             .map_err(|err| ReadError::StorageError(err.to_string()))?;
         if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
-            self.maybe_note_value(location_hash,
+            self.maybe_note_value(
+                location_hash,
                 FfValue::Storage {
                     address,
                     slot: index,
@@ -1713,9 +1930,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
     }
 
     /// SpecFence M2/P4: location + SoftWait `k` of WaitHard that returned Blocking.
-    pub(crate) fn take_pending_park(
-        &self,
-    ) -> Option<crate::specfence::PendingPark> {
+    pub(crate) fn take_pending_park(&self) -> Option<crate::specfence::PendingPark> {
         self.specfence.wave.take_pending_park()
     }
 
@@ -1737,9 +1952,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         };
         // Dig: SoftWait (FenceGraph) wakes — not EarlyAbort-only parks.
         if self.specfence.partial_retry.take_softwait_parked(tx_idx) {
-            self.specfence
-                .partial_retry
-                .mark_post_softwait_wake(tx_idx);
+            self.specfence.partial_retry.mark_post_softwait_wake(tx_idx);
         }
         // Three-pillar Await@a wake credit (BO-until-Validated on hot ℓ).
         if self.specfence.partial_retry.take_await_at_a_parked(tx_idx) {
@@ -1845,7 +2058,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         &mut self,
         tx_version: &TxVersion,
         result_slot: &mut Option<PevmTxExecutionResult>,
-) -> Result<FinishExecFlags, VmExecutionError> {
+    ) -> Result<FinishExecFlags, VmExecutionError> {
         // SAFETY: A correct scheduler would guarantee this index to be inbound.
         let full_tx = unsafe { self.txs.get_unchecked(tx_version.tx_idx) };
         let tx = self.chain.tx_env(full_tx);
@@ -1899,10 +2112,10 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             // Lean + research: CallEntry so SuffixRepair can find 0 < cp.k < k_fail
             // together with mid-tx EffectBoundary / write checkpoints.
             if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
-                let _ = self.specfence.partial_retry.push_checkpoint(
-                    tx_version.tx_idx,
-                    CheckpointKind::CallEntry,
-                );
+                let _ = self
+                    .specfence
+                    .partial_retry
+                    .push_checkpoint(tx_version.tx_idx, CheckpointKind::CallEntry);
             }
         }
 
@@ -1923,14 +2136,14 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             .partial_retry
             .is_jump_disabled(tx_version.tx_idx);
         let storage_prefix = ff_cont.as_ref().is_some_and(|cont| {
-            cont.values.values().any(|v| {
-                matches!(v, FfValue::Storage { .. })
-            })
+            cont.values
+                .values()
+                .any(|v| matches!(v, FfValue::Storage { .. }))
         });
         let basic_prefix = ff_cont.as_ref().is_some_and(|cont| {
-            cont.values.values().any(|v| {
-                matches!(v, FfValue::Basic { .. })
-            })
+            cont.values
+                .values()
+                .any(|v| matches!(v, FfValue::Basic { .. }))
         });
         // Hang-free jump/prime when Storage or Basic FF values exist (M1f Basic-only).
         let ff_prefix = storage_prefix || basic_prefix;
@@ -1970,10 +2183,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     && s.sstore_index == 0
                     && !s.post_sstore
                     && cont.write_replays.is_empty()
-                    && !cont
-                        .effects
-                        .iter()
-                        .any(|e| e.mode == AccessMode::Write)
+                    && !cont.effects.iter().any(|e| e.mode == AccessMode::Write)
             })
         });
         let suffix_jump_eligible = lean
@@ -1999,21 +2209,21 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         // Iter21: top-level/shallow Bind tips only (call_depth≤1). Deeper ERC-20
         // SLOAD tips fail apply_to_interp depth match or restore wrong frame →
         // seeded origins without PC skip → seq≠par (aj metric was also blind).
-        let bind_depth_ok = ff_cont.as_ref().is_some_and(|cont| {
-            cont.jump_snap.as_ref().is_some_and(|s| s.call_depth <= 1)
-        });
+        let bind_depth_ok = ff_cont
+            .as_ref()
+            .is_some_and(|cont| cont.jump_snap.as_ref().is_some_and(|s| s.call_depth <= 1));
         // Iter22: refuse Bind jump when snap omitted memory bytes (≤8KiB cap) but
         // MemoryGas still reports words — restore would wipe live memory → seq≠par.
         let bind_memory_ok = ff_cont.as_ref().is_some_and(|cont| {
-            cont.jump_snap.as_ref().is_some_and(|s| {
-                s.memory_words == 0 || !s.memory.is_empty()
-            })
+            cont.jump_snap
+                .as_ref()
+                .is_some_and(|s| s.memory_words == 0 || !s.memory.is_empty())
         });
         // Iter22: require a real-looking Bind tip (pc/gas/stack live).
         let bind_tip_ok = ff_cont.as_ref().is_some_and(|cont| {
-            cont.jump_snap.as_ref().is_some_and(|s| {
-                s.pc > 0 && s.gas_remaining > 0 && !s.stack.is_empty()
-            })
+            cont.jump_snap
+                .as_ref()
+                .is_some_and(|s| s.pc > 0 && s.gas_remaining > 0 && !s.stack.is_empty())
         });
         let suffix_jump_would = bind_snap_jump_env
             && suffix_jump_eligible
@@ -2106,25 +2316,18 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                             // (defense vs aborted/replaced Data under concurrency).
                             let written = self.mv_memory.data.get(&location_hash);
                             let value_ok = match (is_storage, &ff, written.as_ref()) {
-                                (
-                                    true,
-                                    FfValue::Storage { value, .. },
-                                    Some(map),
-                                ) => matches!(
+                                (true, FfValue::Storage { value, .. }, Some(map)) => matches!(
                                     map.get(&tx_idx),
                                     Some(MemoryEntry::Data(inc, MemoryValue::Storage(v)))
                                         if *inc == tx_incarnation && v == value
                                 ),
-                                (
-                                    false,
-                                    FfValue::Basic { basic, .. },
-                                    Some(map),
-                                ) => match map.get(&tx_idx) {
+                                (false, FfValue::Basic { basic, .. }, Some(map)) => match map
+                                    .get(&tx_idx)
+                                {
                                     Some(MemoryEntry::Data(inc, MemoryValue::Basic(cur_b)))
                                         if *inc == tx_incarnation =>
                                     {
-                                        cur_b.balance == basic.balance
-                                            && cur_b.nonce == basic.nonce
+                                        cur_b.balance == basic.balance && cur_b.nonce == basic.nonce
                                     }
                                     _ => false,
                                 },
@@ -2149,20 +2352,12 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     }
                     let written = self.mv_memory.data.get(&location_hash);
                     let value_ok = match (is_storage, &ff, written.as_ref()) {
-                        (
-                            true,
-                            FfValue::Storage { value, .. },
-                            Some(map),
-                        ) => matches!(
+                        (true, FfValue::Storage { value, .. }, Some(map)) => matches!(
                             map.get(&w_idx),
                             Some(MemoryEntry::Data(inc, MemoryValue::Storage(v)))
                                 if *inc == w_inc && v == value
                         ),
-                        (
-                            false,
-                            FfValue::Basic { basic, .. },
-                            Some(map),
-                        ) => match map.get(&w_idx) {
+                        (false, FfValue::Basic { basic, .. }, Some(map)) => match map.get(&w_idx) {
                             // Match try_ff_basic Validated value-stable (balance+nonce).
                             Some(MemoryEntry::Data(inc, MemoryValue::Basic(cur_b)))
                                 if *inc == w_inc =>
@@ -2210,8 +2405,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             }
         } else if rewind_resume && research_inspect {
             let db = self.evm.ctx().db_mut();
-            for (location_hash, ff) in self.specfence.partial_retry.ff_values(tx_version.tx_idx)
-            {
+            for (location_hash, ff) in self.specfence.partial_retry.ff_values(tx_version.tx_idx) {
                 let origin = match &ff {
                     FfValue::Storage { origin, .. } | FfValue::Basic { origin, .. } => *origin,
                 };
@@ -2301,10 +2495,8 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     }
                     // Consume one-shot capture flag after non-Blocking run.
                     if needs_capture {
-                        let blocked = matches!(
-                            &result,
-                            Err(EVMError::Database(ReadError::Blocking(_)))
-                        );
+                        let blocked =
+                            matches!(&result, Err(EVMError::Database(ReadError::Blocking(_))));
                         if !blocked {
                             let _ = partial_retry.take_needs_live_capture(tx_idx);
                         }
@@ -2338,7 +2530,10 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                             eprintln!(
                                 "JUMP_DIG try_arm ok={ok} refuse={} tip_sloads={} steps={}",
                                 jump_refuse_reason(&cont),
-                                cont.jump_snap.as_ref().map(|s| s.tip_sloads.len()).unwrap_or(0),
+                                cont.jump_snap
+                                    .as_ref()
+                                    .map(|s| s.tip_sloads.len())
+                                    .unwrap_or(0),
                                 cont.jump_snap.as_ref().map(|s| s.opcode_steps).unwrap_or(0),
                             );
                         }
@@ -2375,17 +2570,39 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                             static DIG_ENV: AtomicUsize = AtomicUsize::new(0);
                             DIG_CREDIT.fetch_add(1, Ord::Relaxed);
                             let safe = jump_is_safe(&cont);
-                            if safe { DIG_SAFE.fetch_add(1, Ord::Relaxed); }
-                            let depth = cont.jump_snap.as_ref().map(|s| s.call_depth).unwrap_or(999);
-                            if depth <= 1 { DIG_DEPTH.fetch_add(1, Ord::Relaxed); }
-                            if depth > 1 { DIG_DEPTH_GT1.fetch_add(1, Ord::Relaxed); }
-                            let mem_ok = cont.jump_snap.as_ref().is_some_and(|s| s.memory_words == 0 || !s.memory.is_empty());
-                            if mem_ok { DIG_MEM.fetch_add(1, Ord::Relaxed); }
-                            let tip_ok = cont.jump_snap.as_ref().is_some_and(|s| s.pc > 0 && s.gas_remaining > 0 && !s.stack.is_empty());
-                            if tip_ok { DIG_TIP.fetch_add(1, Ord::Relaxed); }
-                            if suffix_jump_eligible { DIG_ELIG.fetch_add(1, Ord::Relaxed); }
-                            if suffix_jump_would { DIG_WOULD.fetch_add(1, Ord::Relaxed); }
-                            if bind_snap_jump_env { DIG_ENV.fetch_add(1, Ord::Relaxed); }
+                            if safe {
+                                DIG_SAFE.fetch_add(1, Ord::Relaxed);
+                            }
+                            let depth =
+                                cont.jump_snap.as_ref().map(|s| s.call_depth).unwrap_or(999);
+                            if depth <= 1 {
+                                DIG_DEPTH.fetch_add(1, Ord::Relaxed);
+                            }
+                            if depth > 1 {
+                                DIG_DEPTH_GT1.fetch_add(1, Ord::Relaxed);
+                            }
+                            let mem_ok = cont
+                                .jump_snap
+                                .as_ref()
+                                .is_some_and(|s| s.memory_words == 0 || !s.memory.is_empty());
+                            if mem_ok {
+                                DIG_MEM.fetch_add(1, Ord::Relaxed);
+                            }
+                            let tip_ok = cont.jump_snap.as_ref().is_some_and(|s| {
+                                s.pc > 0 && s.gas_remaining > 0 && !s.stack.is_empty()
+                            });
+                            if tip_ok {
+                                DIG_TIP.fetch_add(1, Ord::Relaxed);
+                            }
+                            if suffix_jump_eligible {
+                                DIG_ELIG.fetch_add(1, Ord::Relaxed);
+                            }
+                            if suffix_jump_would {
+                                DIG_WOULD.fetch_add(1, Ord::Relaxed);
+                            }
+                            if bind_snap_jump_env {
+                                DIG_ENV.fetch_add(1, Ord::Relaxed);
+                            }
                             let reason = jump_refuse_reason(&cont);
                             let n = DIG_CREDIT.load(Ord::Relaxed);
                             if n <= 8 || n % 32 == 0 {
@@ -2394,7 +2611,10 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                                     suffix_jump_eligible,
                                     suffix_jump_would,
                                     bind_snap_jump_env,
-                                    cont.jump_snap.as_ref().map(|s| s.tip_sloads.len()).unwrap_or(0),
+                                    cont.jump_snap
+                                        .as_ref()
+                                        .map(|s| s.tip_sloads.len())
+                                        .unwrap_or(0),
                                     cont.jump_snap.as_ref().map(|s| s.opcode_steps).unwrap_or(0),
                                 );
                             }
@@ -2414,7 +2634,11 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                                 );
                             }
                         } else {
-                            let _ = (bind_snap_jump_env, jump_is_safe(&cont), jump_refuse_reason(&cont));
+                            let _ = (
+                                bind_snap_jump_env,
+                                jump_is_safe(&cont),
+                                jump_refuse_reason(&cont),
+                            );
                         }
                     }
                 }
@@ -2456,10 +2680,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         }
         // Iter2: consume live_prime only after inspect completed (keep on Blocking).
         if live_prime {
-            let blocked = matches!(
-                &run_result,
-                Err(EVMError::Database(ReadError::Blocking(_)))
-            );
+            let blocked = matches!(&run_result, Err(EVMError::Database(ReadError::Blocking(_))));
             if !blocked {
                 let _ = self
                     .specfence
@@ -2469,7 +2690,6 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         }
 
         match run_result {
-
             Ok(exec_result) => {
                 // M1f: jumped Success may commit when jump_is_safe. Validation abort
                 // still disables further jumps via pevm.rs circuit breaker (anti-livelock).
@@ -2607,13 +2827,14 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     }
                     // M1h: SpecFence-captured write presents (source of truth when
                     // residual was ESTIMATEd or jump skipped SSTORE in revm journal).
-                    if let Some(cont) = self.specfence.partial_retry.ff_continuation(tx_version.tx_idx)
+                    if let Some(cont) = self
+                        .specfence
+                        .partial_retry
+                        .ff_continuation(tx_version.tx_idx)
                     {
                         for wr in &cont.write_replays {
-                            let loc = hash_deterministic(MemoryLocation::Storage(
-                                wr.address,
-                                wr.slot,
-                            ));
+                            let loc =
+                                hash_deterministic(MemoryLocation::Storage(wr.address, wr.slot));
                             if suffix.contains(&loc) {
                                 continue;
                             }
@@ -2693,7 +2914,11 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         // G4: Publish → bind prior credit.
                         self.specfence.learner.note_publish(*loc);
                         // A2: first confirmed wr/publish → immediate Avoid broadcast.
-                        if self.specfence.sketch.broadcast_avoid(*loc, tx_version.tx_idx) {
+                        if self
+                            .specfence
+                            .sketch
+                            .broadcast_avoid(*loc, tx_version.tx_idx)
+                        {
                             self.specfence.edges.broadcast_avoid(*loc);
                             self.specfence.metrics.record_avoid_broadcast();
                         }
@@ -2712,15 +2937,14 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                             .partial_retry
                             .push_checkpoint(tx_version.tx_idx, kind);
                     }
-                    let _ = self.specfence.partial_retry.push_checkpoint(
-                        tx_version.tx_idx,
-                        CheckpointKind::CallExit,
-                    );
+                    let _ = self
+                        .specfence
+                        .partial_retry
+                        .push_checkpoint(tx_version.tx_idx, CheckpointKind::CallExit);
                     // G1: persist k + tx_gas_used for next-incarnation effect-depth proxy.
-                    self.specfence.partial_retry.note_incarnation_finish(
-                        tx_version.tx_idx,
-                        exec_result.tx_gas_used(),
-                    );
+                    self.specfence
+                        .partial_retry
+                        .note_incarnation_finish(tx_version.tx_idx, exec_result.tx_gas_used());
                 }
 
                 // R3: HotSet H_w ignores LazyRecipient multi-writer noise (popular

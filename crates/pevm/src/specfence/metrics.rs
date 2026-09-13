@@ -252,6 +252,12 @@ pub struct SpecFenceMetrics {
     pub quiet_fence_revoke: usize,
     /// U4: ℓ→writer identity stored across R2/R4.
     pub writer_identity_preserved: usize,
+    /// Done→Data residual Bind (Avoid/Fence, not UnfencedWriterDone).
+    pub bind_residual: usize,
+    /// First-wave canary reopened after probe Done without Avoid.
+    pub canary_reopen: usize,
+    /// writer_done / u_aa learned into H/Avoid priors.
+    pub writer_done_learned: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -365,6 +371,9 @@ pub(crate) struct MetricsInner {
     multi_spine_admit: AtomicUsize,
     quiet_fence_revoke: AtomicUsize,
     writer_identity_preserved: AtomicUsize,
+    bind_residual: AtomicUsize,
+    canary_reopen: AtomicUsize,
+    writer_done_learned: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -541,7 +550,6 @@ impl MetricsInner {
     pub(crate) fn record_early_abort(&self) {
         self.early_abort_count.fetch_add(1, Ordering::Relaxed);
     }
-
 
     /// Fresh EVM session / interpreter start from tx head (plant v2 L1 denominator).
     pub(crate) fn record_evm_entry(&self) {
@@ -788,6 +796,18 @@ impl MetricsInner {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_bind_residual(&self) {
+        self.bind_residual.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_canary_reopen(&self) {
+        self.canary_reopen.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_writer_done_learned(&self) {
+        self.writer_done_learned.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_jump_defer(&self) {
         self.jump_defer.fetch_add(1, Ordering::Relaxed);
     }
@@ -891,7 +911,8 @@ impl MetricsInner {
         self.full_mode_txs.store(full_mode_txs, Ordering::Relaxed);
         self.engagement_switches
             .store(engagement_switches, Ordering::Relaxed);
-        self.hot_local_reads.store(hot_local_reads, Ordering::Relaxed);
+        self.hot_local_reads
+            .store(hot_local_reads, Ordering::Relaxed);
         self.hotset_size.store(hotset_size, Ordering::Relaxed);
     }
 
@@ -948,9 +969,7 @@ impl MetricsInner {
             selective_fallback_full: self.selective_fallback_full.load(Ordering::Relaxed),
             checkpoint_opportunities: self.checkpoint_opportunities.load(Ordering::Relaxed),
             partial_retry_count: self.partial_retry_count.load(Ordering::Relaxed),
-            partial_retry_fallback_full: self
-                .partial_retry_fallback_full
-                .load(Ordering::Relaxed),
+            partial_retry_fallback_full: self.partial_retry_fallback_full.load(Ordering::Relaxed),
             cost_chose_wait: self.cost_chose_wait.load(Ordering::Relaxed),
             cost_chose_spec: self.cost_chose_spec.load(Ordering::Relaxed),
             cost_chose_bind: self.cost_chose_bind.load(Ordering::Relaxed),
@@ -1039,6 +1058,9 @@ impl MetricsInner {
             multi_spine_admit: self.multi_spine_admit.load(Ordering::Relaxed),
             quiet_fence_revoke: self.quiet_fence_revoke.load(Ordering::Relaxed),
             writer_identity_preserved: self.writer_identity_preserved.load(Ordering::Relaxed),
+            bind_residual: self.bind_residual.load(Ordering::Relaxed),
+            canary_reopen: self.canary_reopen.load(Ordering::Relaxed),
+            writer_done_learned: self.writer_done_learned.load(Ordering::Relaxed),
         }
     }
 }

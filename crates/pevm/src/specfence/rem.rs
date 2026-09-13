@@ -27,19 +27,19 @@
 //! M2 `WaveParkTable` + P4 SoftWait `(t,k)` wake stay on Lean (journal FF only).
 
 #![allow(dead_code)]
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use parking_lot::Mutex;
 use std::cell::UnsafeCell;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use dashmap::DashMap;
 use hashbrown::{HashMap, HashSet};
 
-use alloy_primitives::{Address, U256};
-use crate::{BuildIdentityHasher, MemoryLocationHash, TxIdx, TxIncarnation};
 use super::boundary::{BoundarySnapshot, CachedCallOutcome, JournalBlob};
+use crate::{BuildIdentityHasher, MemoryLocationHash, TxIdx, TxIncarnation};
+use alloy_primitives::{Address, U256};
 
 /// Spec v1 REM task kinds (plant vocabulary).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,9 +210,7 @@ pub(crate) struct PartialRetryPlan {
 #[derive(Debug, Clone)]
 pub(crate) enum RepairPlan {
     /// Origins wrong but suffix empty — patched in place (no new incarnation).
-    RebindOnly {
-        locations: Vec<MemoryLocationHash>,
-    },
+    RebindOnly { locations: Vec<MemoryLocationHash> },
     /// Certified prefix OK — resume from last good checkpoint (not tx head).
     ///
     /// M1b/M1c: pairs with [`ResumeContinuation`] — SpecFence journal FF +
@@ -252,9 +250,7 @@ pub(crate) enum LeanAbortRepair {
         reexec_cost: f64,
     },
     /// No usable certified prefix / control-flow broken → FullRestart from tx head.
-    FullRestart {
-        reexec_cost: f64,
-    },
+    FullRestart { reexec_cost: f64 },
 }
 
 impl LeanAbortRepair {
@@ -292,9 +288,7 @@ pub(crate) enum ResearchAbortRepair {
         reexec_cost: f64,
     },
     /// No usable checkpoint → FullRestart (caller selective/full invalidate).
-    FullRestart {
-        reexec_cost: f64,
-    },
+    FullRestart { reexec_cost: f64 },
 }
 
 impl ResearchAbortRepair {
@@ -539,9 +533,9 @@ impl PartialRetryState {
                         at_call_boundary: false,
                         post_sstore: false,
                         sstore_index: 0,
-            write_replays_at_tip: Vec::new(),
-            tip_sloads: Vec::new(),
-        })
+                        write_replays_at_tip: Vec::new(),
+                        tip_sloads: Vec::new(),
+                    })
                 }
             });
         // Bound values for the whole certified prefix (k < k_fail), not only
@@ -593,7 +587,9 @@ impl PartialRetryState {
         let steps_cap = |s: &BoundarySnapshot| -> u64 {
             // Three-pillar resolve: tip≡FF/storage/write/call → 8192 (597 Bind tips
             // at PC 2–6k were refused steps_over under 2048); Basic-only stays 128.
-            let has_storage = values.values().any(|v| matches!(v, FfValue::Storage { .. }));
+            let has_storage = values
+                .values()
+                .any(|v| matches!(v, FfValue::Storage { .. }));
             if has_storage || tip_matches_ff(s) || !s.tip_sloads.is_empty() {
                 8192
             } else {
@@ -613,7 +609,11 @@ impl PartialRetryState {
                 // Iter29: keep prefer-fewer (richer tip select raised 597 wall);
                 // hang-free nested consume still applies nested tips when armed.
                 let tip_n = s.tip_sloads.len() as u64;
-                let tip_compact = if tip_n == 0 { 0 } else { 64u64.saturating_sub(tip_n.min(64)) };
+                let tip_compact = if tip_n == 0 {
+                    0
+                } else {
+                    64u64.saturating_sub(tip_n.min(64))
+                };
                 (
                     u64::from(s.sstore_index == 0 && !s.post_sstore),
                     u64::from(tip_matches_ff(s)),
@@ -640,8 +640,8 @@ impl PartialRetryState {
             .call_outcomes
             .iter()
             .any(|c| c.depth > 1 && !c.value.is_zero() && c.k_end <= cp.k);
-        let valued_blocks_jump = valued_before_tip
-            && !call_outcomes.iter().any(|c| !c.value.is_zero());
+        let valued_blocks_jump =
+            valued_before_tip && !call_outcomes.iter().any(|c| !c.value.is_zero());
         let prefix_set: HashSet<MemoryLocationHash, BuildIdentityHasher> =
             prefix_writes.iter().copied().collect();
         // Include writes whose first touch was before k_fail (effect order), even
@@ -688,11 +688,7 @@ impl PartialRetryState {
     ///
     /// Does **not** mutate checkpoint.boundary (lite snaps stay for repair/metrics);
     /// live data lives only in `live_boundaries` / `ResumeContinuation.jump_*`.
-    pub(crate) fn attach_live_boundary(
-        &mut self,
-        snap: BoundarySnapshot,
-        blob: JournalBlob,
-    ) {
+    pub(crate) fn attach_live_boundary(&mut self, snap: BoundarySnapshot, blob: JournalBlob) {
         self.attach_live_boundary_at(self.k, snap, blob);
     }
 
@@ -748,11 +744,7 @@ impl PartialRetryState {
 
     /// Last checkpoint with `k < k_fail` (certified-prefix end).
     pub(crate) fn last_checkpoint_before(&self, k_fail: usize) -> Option<CheckpointId> {
-        let tx_idx = self
-            .journal
-            .first()
-            .map(|a| a.tx_idx)
-            .unwrap_or(0);
+        let tx_idx = self.journal.first().map(|a| a.tx_idx).unwrap_or(0);
         self.checkpoints
             .iter()
             .rev()
@@ -910,8 +902,7 @@ impl PartialRetryTable {
     }
 
     pub(crate) fn note_certified(&self, tx_idx: TxIdx, location: MemoryLocationHash) {
-        unsafe { self.state_mut(tx_idx) }
-            .note_certified(location);
+        unsafe { self.state_mut(tx_idx) }.note_certified(location);
     }
 
     /// Bind-on-Data lite: journal Read access + certify + lightweight EffectBoundary
@@ -959,7 +950,10 @@ impl PartialRetryTable {
     ) -> Option<FfValue> {
         (tx_idx < self.states.len()).then(|| ()).and_then(|_| {
             // SAFETY: single-executor invariant
-            unsafe { self.state_ref(tx_idx) }.value_snap.get(&location).cloned()
+            unsafe { self.state_ref(tx_idx) }
+                .value_snap
+                .get(&location)
+                .cloned()
         })
     }
 
@@ -981,10 +975,9 @@ impl PartialRetryTable {
         };
         match (snap, cur) {
             (FfValue::Storage { value, .. }, crate::MemoryValue::Storage(v)) => value == v,
-            (
-                FfValue::Basic { basic, .. },
-                crate::MemoryValue::Basic(b),
-            ) => basic.balance == b.balance && basic.nonce == b.nonce,
+            (FfValue::Basic { basic, .. }, crate::MemoryValue::Basic(b)) => {
+                basic.balance == b.balance && basic.nonce == b.nonce
+            }
             _ => false,
         }
     }
@@ -1149,9 +1142,7 @@ impl PartialRetryTable {
             prefix_writes,
         );
         self.set_force_bind(tx_idx, certified);
-        ParkResumeKind::ResumeAtK {
-            checkpoint_k: cp.k,
-        }
+        ParkResumeKind::ResumeAtK { checkpoint_k: cp.k }
     }
 
     /// After `reset_incarnation`, replay FF continuation into the fresh journal.
@@ -1160,15 +1151,10 @@ impl PartialRetryTable {
         let Some(cont) = self.ff_resume.get(&tx_idx).map(|c| c.clone()) else {
             return 0;
         };
-        unsafe { self.state_mut(tx_idx) }
-            .replay_continuation(&cont)
+        unsafe { self.state_mut(tx_idx) }.replay_continuation(&cont)
     }
 
-    pub(crate) fn ff_value(
-        &self,
-        tx_idx: TxIdx,
-        location: MemoryLocationHash,
-    ) -> Option<FfValue> {
+    pub(crate) fn ff_value(&self, tx_idx: TxIdx, location: MemoryLocationHash) -> Option<FfValue> {
         if let Some(v) = self
             .ff_resume
             .get(&tx_idx)
@@ -1184,9 +1170,7 @@ impl PartialRetryTable {
 
     /// True when escalate retained certified-prefix FF for head reexec DB skip.
     pub(crate) fn has_ff_head(&self, tx_idx: TxIdx) -> bool {
-        self.ff_head
-            .get(&tx_idx)
-            .is_some_and(|m| !m.is_empty())
+        self.ff_head.get(&tx_idx).is_some_and(|m| !m.is_empty())
     }
 
     /// Iter6: armed SuffixRepair FF continuation still has values (cheap resume).
@@ -1234,9 +1218,7 @@ impl PartialRetryTable {
 
     /// Boundary snap attached to the rewind target checkpoint, if any.
     pub(crate) fn ff_boundary(&self, tx_idx: TxIdx) -> Option<BoundarySnapshot> {
-        self.ff_resume
-            .get(&tx_idx)
-            .and_then(|c| c.boundary.clone())
+        self.ff_resume.get(&tx_idx).and_then(|c| c.boundary.clone())
     }
 
     /// M1e: full FF continuation (for safety-gated absolute jump).
@@ -1311,10 +1293,7 @@ impl PartialRetryTable {
             .unwrap_or(true)
     }
 
-    pub(crate) fn ff_values(
-        &self,
-        tx_idx: TxIdx,
-    ) -> Vec<(MemoryLocationHash, FfValue)> {
+    pub(crate) fn ff_values(&self, tx_idx: TxIdx) -> Vec<(MemoryLocationHash, FfValue)> {
         self.ff_resume
             .get(&tx_idx)
             .map(|c| c.values.iter().map(|(k, v)| (*k, v.clone())).collect())
@@ -1417,19 +1396,43 @@ impl PartialRetryTable {
         self.force_writers.remove(&tx_idx);
     }
 
+    /// U4 identity is a wall: every invalid ℓ still names a lower writer.
+    pub(crate) fn identity_held(&self, tx_idx: TxIdx, invalid: &[MemoryLocationHash]) -> bool {
+        !invalid.is_empty()
+            && invalid
+                .iter()
+                .all(|&loc| self.force_writer(tx_idx, loc).is_some())
+    }
+
+    /// Value-stable via snap **or** certified-prefix FF (thin identity → R1).
+    pub(crate) fn identity_stable_match(
+        &self,
+        tx_idx: TxIdx,
+        location: MemoryLocationHash,
+        cur: &crate::MemoryValue,
+    ) -> bool {
+        if self.value_stable_match(tx_idx, location, cur) {
+            return true;
+        }
+        let Some(ff) = self.ff_value(tx_idx, location) else {
+            return false;
+        };
+        match (ff, cur) {
+            (FfValue::Storage { value, .. }, crate::MemoryValue::Storage(v)) => value == *v,
+            (FfValue::Basic { basic, .. }, crate::MemoryValue::Basic(b)) => {
+                basic.balance == b.balance && basic.nonce == b.nonce
+            }
+            _ => false,
+        }
+    }
+
     /// True when a certified-prefix force_bind set is armed for this tx.
     pub(crate) fn has_force_bind(&self, tx_idx: TxIdx) -> bool {
-        self.force_bind
-            .get(&tx_idx)
-            .is_some_and(|v| !v.is_empty())
+        self.force_bind.get(&tx_idx).is_some_and(|v| !v.is_empty())
     }
 
     /// Sticky resolve: union conflict locations into the armed force_bind set.
-    pub(crate) fn extend_force_bind(
-        &self,
-        tx_idx: TxIdx,
-        locations: &[MemoryLocationHash],
-    ) {
+    pub(crate) fn extend_force_bind(&self, tx_idx: TxIdx, locations: &[MemoryLocationHash]) {
         if locations.is_empty() {
             return;
         }
@@ -1726,11 +1729,13 @@ impl PartialRetryTable {
         let k_fail = self
             .first_k(tx_idx, fail_location)
             .unwrap_or_else(|| self.current_k(tx_idx));
-        let cp = self.last_checkpoint_before(tx_idx, k_fail).unwrap_or(CheckpointId {
-            tx_idx,
-            incarnation: 0,
-            k: 0,
-        });
+        let cp = self
+            .last_checkpoint_before(tx_idx, k_fail)
+            .unwrap_or(CheckpointId {
+                tx_idx,
+                incarnation: 0,
+                k: 0,
+            });
         if cp.k > 0 {
             self.arm_rewind_to(
                 tx_idx,
@@ -1881,7 +1886,6 @@ impl PartialRetryTable {
         (true, "ok")
     }
 
-
     /// True when any write's first effect ordinal is at/after `k_fail` (true failed suffix).
     /// Writes before `k_fail` that PartialRetry classified as suffix (uncertified) are
     /// **not** true suffix — RebindOnly may still restore serializability.
@@ -1981,11 +1985,7 @@ impl PartialRetryTable {
     /// (patch origins in place without abort). Otherwise prefer `RewindTo`
     /// when a checkpoint exists; `FullRestart` only if prefix/control-flow
     /// cannot be recovered.
-    pub(crate) fn plan_repair(
-        &self,
-        tx_idx: TxIdx,
-        plan: &PartialRetryPlan,
-    ) -> RepairPlan {
+    pub(crate) fn plan_repair(&self, tx_idx: TxIdx, plan: &PartialRetryPlan) -> RepairPlan {
         if plan.certified.is_empty() {
             return RepairPlan::FullRestart;
         }
@@ -2132,8 +2132,7 @@ pub(crate) struct WaveParkTable {
     /// Min-heap: lower `TxIdx` first (frozen choice §8.3).
     ready: Mutex<BinaryHeap<Reverse<TxIdx>>>,
     /// Waiters parked on location ℓ (PublishWrite / writer-done wake).
-    waiters_by_loc:
-        DashMap<MemoryLocationHash, Vec<ParkedWait>, BuildIdentityHasher>,
+    waiters_by_loc: DashMap<MemoryLocationHash, Vec<ParkedWait>, BuildIdentityHasher>,
     /// Waiters indexed by writer for `finish_execution` wake.
     waiters_by_writer: DashMap<TxIdx, Vec<ParkedWait>, BuildIdentityHasher>,
     /// Best-effort park start for `wait_park_ns`.
@@ -2182,11 +2181,7 @@ impl WaveParkTable {
     }
 
     /// SoftWait Soft arm pending park (FenceGraph arm present).
-    pub(crate) fn set_pending_park_softwait(
-        &self,
-        location: MemoryLocationHash,
-        armed_at_k: u64,
-    ) {
+    pub(crate) fn set_pending_park_softwait(&self, location: MemoryLocationHash, armed_at_k: u64) {
         self.set_pending_park(location, armed_at_k, ParkKind::SoftWaitSoft);
     }
 
@@ -2247,10 +2242,7 @@ impl WaveParkTable {
             armed_at_k,
             kind,
         };
-        self.waiters_by_loc
-            .entry(location)
-            .or_default()
-            .push(entry);
+        self.waiters_by_loc.entry(location).or_default().push(entry);
         self.waiters_by_writer
             .entry(writer)
             .or_default()
@@ -2266,7 +2258,8 @@ impl WaveParkTable {
                 self.park_count_early_abort.fetch_add(1, Ordering::Relaxed);
             }
             ParkKind::BlockingOther => {
-                self.park_count_blocking_other.fetch_add(1, Ordering::Relaxed);
+                self.park_count_blocking_other
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
         let depth = self.ready.lock().len();
@@ -2387,7 +2380,10 @@ impl WaveParkTable {
                 if let Some(mut v) = self.waiters_by_loc.get_mut(&p.location) {
                     v.retain(|x| x.waiter != p.waiter);
                 }
-                if !woken.iter().any(|i: &ParkResumeIntent| i.waiter == p.waiter) {
+                if !woken
+                    .iter()
+                    .any(|i: &ParkResumeIntent| i.waiter == p.waiter)
+                {
                     self.record_resume_intent(&p);
                     let intent = ParkResumeIntent {
                         waiter: p.waiter,
@@ -2422,7 +2418,10 @@ impl WaveParkTable {
                 if let Some(mut v) = self.waiters_by_writer.get_mut(&p.writer) {
                     v.retain(|x| x.waiter != p.waiter || x.location != location);
                 }
-                if !woken.iter().any(|i: &ParkResumeIntent| i.waiter == p.waiter) {
+                if !woken
+                    .iter()
+                    .any(|i: &ParkResumeIntent| i.waiter == p.waiter)
+                {
                     self.record_resume_intent(&p);
                     woken.push(ParkResumeIntent {
                         waiter: p.waiter,
@@ -2714,7 +2713,6 @@ mod p3_early_abort_tests {
     }
 }
 
-
 #[cfg(test)]
 mod abort_cheapening_tests {
     use super::*;
@@ -2741,9 +2739,7 @@ mod abort_cheapening_tests {
         assert!(!plan.certified.contains(&11));
         match table.plan_repair(0, &plan) {
             RepairPlan::RewindTo {
-                certified,
-                k_fail,
-                ..
+                certified, k_fail, ..
             } => {
                 assert!(certified.contains(&10));
                 assert!(k_fail >= 1);
@@ -2778,9 +2774,7 @@ mod abort_cheapening_tests {
         table.reset_incarnation(0, 0);
         table.note_access(0, 1, AccessMode::Read);
         assert!(
-            table
-                .plan_partial_retry(0, &[1], &[1], &[])
-                .is_none(),
+            table.plan_partial_retry(0, &[1], &[1], &[]).is_none(),
             "all-invalid → no PartialRetry plan → FullRestart caller path"
         );
     }
@@ -2793,9 +2787,7 @@ mod abort_cheapening_tests {
         table.note_access(0, 5, AccessMode::Read);
         table.note_certified(0, 5);
         table.note_access(0, 6, AccessMode::Read);
-        let plan = table
-            .plan_partial_retry(0, &[5, 6], &[6], &[])
-            .unwrap();
+        let plan = table.plan_partial_retry(0, &[5, 6], &[6], &[]).unwrap();
         let RepairPlan::RewindTo {
             cp,
             certified,
@@ -2871,8 +2863,14 @@ mod abort_cheapening_tests {
                 assert!(certified.contains(&10));
                 assert!(!certified.contains(&11));
                 // 10 is certified write (prefix); 20 is failed-suffix write.
-                assert!(suffix_writes.contains(&20), "suffix_writes={suffix_writes:?}");
-                assert!(!suffix_writes.contains(&10), "must not ESTIMATE certified prefix write");
+                assert!(
+                    suffix_writes.contains(&20),
+                    "suffix_writes={suffix_writes:?}"
+                );
+                assert!(
+                    !suffix_writes.contains(&10),
+                    "must not ESTIMATE certified prefix write"
+                );
                 assert!((reexec_cost - 1.2).abs() < 1e-9);
             }
             other => panic!("expected ForceBind fallback, got {other:?}"),
@@ -2928,7 +2926,6 @@ mod abort_cheapening_tests {
         assert!(!table.is_rewind_resume(0));
     }
 
-
     #[test]
     fn escalate_full_restart_retains_ff_head_for_db_skip() {
         let table = PartialRetryTable::new(1);
@@ -2978,6 +2975,27 @@ mod abort_cheapening_tests {
         );
         table.clear_force_writers(2);
         assert_eq!(table.force_writer(2, 99), None);
+    }
+
+    #[test]
+    fn r1_value_stable_when_identity_and_ff_match() {
+        let table = PartialRetryTable::new(4);
+        table.note_force_writer(3, 11, 1);
+        table.note_force_writer(3, 12, 2);
+        assert!(table.identity_held(3, &[11, 12]));
+        assert!(!table.identity_held(3, &[11, 99]));
+        table.note_value(
+            3,
+            12,
+            FfValue::Storage {
+                address: Address::ZERO,
+                slot: U256::from(2),
+                value: U256::from(7),
+                origin: None,
+            },
+        );
+        assert!(table.identity_stable_match(3, 12, &crate::MemoryValue::Storage(U256::from(7)),));
+        assert!(!table.identity_stable_match(3, 12, &crate::MemoryValue::Storage(U256::from(8)),));
     }
 
     #[test]
@@ -3051,7 +3069,10 @@ mod abort_cheapening_tests {
         let _ = table.push_checkpoint(0, CheckpointKind::EffectBoundary);
         let _ = table.note_access(0, 2, AccessMode::Read);
         let repair = table.apply_suffix_repair(0, &[1, 2], &[2], &[]);
-        assert!(matches!(repair, LeanAbortRepair::SuffixRepair { .. }) || matches!(repair, LeanAbortRepair::ForceBind { .. }));
+        assert!(
+            matches!(repair, LeanAbortRepair::SuffixRepair { .. })
+                || matches!(repair, LeanAbortRepair::ForceBind { .. })
+        );
         assert!(table.has_force_bind(0));
         table.extend_force_bind(0, &[2, 3]);
         assert!(table.must_force_bind(0, 2));
@@ -3064,10 +3085,11 @@ mod abort_cheapening_tests {
         table.reset_incarnation(0, 0);
         let _ = table.note_access(0, 10, AccessMode::Write); // k=1
         let _ = table.note_access(0, 20, AccessMode::Read); // k=2 fail
-        assert!(!table.has_true_suffix_writes(0, 2, &[10]), "write before k_fail is not true suffix");
+        assert!(
+            !table.has_true_suffix_writes(0, 2, &[10]),
+            "write before k_fail is not true suffix"
+        );
         let _ = table.note_access(0, 30, AccessMode::Write); // k=3 after fail
         assert!(table.has_true_suffix_writes(0, 2, &[10, 30]));
     }
-
-
 }

@@ -19,8 +19,6 @@ fn concurrency() -> NonZeroUsize {
     thread::available_parallelism().unwrap_or(NonZeroUsize::MIN)
 }
 
-
-
 fn self_transfer(address: Address, nonce: u64) -> TxEnv {
     TxEnv {
         caller: address,
@@ -90,8 +88,6 @@ where
     let metrics = pevm.last_specfence_metrics().clone();
     (parallel, metrics, pevm)
 }
-
-
 
 fn run_mode_conc<S>(
     mode: ConcurrencyMode,
@@ -225,8 +221,7 @@ fn specfence_bayes_location_isolated_from_disjoint() {
         "disjoint account must not Wait: {metrics:?}"
     );
     assert!(
-        metrics.speculate_addresses.contains(&cold)
-            || metrics.bayes_speculate_decisions > 0,
+        metrics.speculate_addresses.contains(&cold) || metrics.bayes_speculate_decisions > 0,
         "disjoint must remain Speculative: {metrics:?}"
     );
 }
@@ -260,10 +255,7 @@ fn specfence_bayes_inter_block_carry() {
         .unwrap();
     assert_eq!(seq1, par1);
     let p1 = pevm.bayes_account_conflict_prob(&sender);
-    assert!(
-        p1 >= 0.25,
-        "block1 conflicts must raise posterior: {p1}"
-    );
+    assert!(p1 >= 0.25, "block1 conflicts must raise posterior: {p1}");
     assert!(
         !pevm.last_initial_wait_accounts().contains(&sender),
         "first block is cold at seed time: {:?}",
@@ -495,7 +487,9 @@ fn specfence_bayes_storage_conflict_isolates_eoa() {
     let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
     let (_, metrics, pevm) = run_mode(ConcurrencyMode::SpecFence, &storage, txs);
     assert!(
-        metrics.bayes_conflict_updates > 0 || metrics.occ_aborts > 0 || metrics.region_promotions > 0,
+        metrics.bayes_conflict_updates > 0
+            || metrics.occ_aborts > 0
+            || metrics.region_promotions > 0,
         "ERC-20 cluster should produce bayes/abort signal: {metrics:?}"
     );
     assert!(
@@ -704,7 +698,10 @@ fn specfence_p2_partial_retry_on_localized_conflict() {
             break;
         }
     }
-    assert!(saw_occ_abort, "OCC must still count aborts on contended mock");
+    assert!(
+        saw_occ_abort,
+        "OCC must still count aborts on contended mock"
+    );
 
     let mut saw_repair = false;
     let mut last_metrics = None;
@@ -804,10 +801,7 @@ fn specfence_m1_rewind_to_skips_evm_entries() {
         last = Some(m.clone());
         if m.occ_aborts > 0 && (m.rewind_to_cp > 0 || m.rebind_only > 0) {
             saw = true;
-            assert_eq!(
-                m.tx_head_reexec, 0,
-                "M1 demotes head PartialRetry: {m:?}"
-            );
+            assert_eq!(m.tx_head_reexec, 0, "M1 demotes head PartialRetry: {m:?}");
             if m.rewind_to_cp > 0 {
                 assert!(
                     m.resume_count > 0,
@@ -876,15 +870,15 @@ fn specfence_m2_wait_hard_parks_and_steals() {
             concurrency(),
         )
         .expect("parallel");
-    assert_eq!(sequential, parallel, "M2 must preserve sequential equivalence");
+    assert_eq!(
+        sequential, parallel,
+        "M2 must preserve sequential equivalence"
+    );
 
     let m = pevm.last_specfence_metrics();
     // Park/steal is best-effort under π; either WaitHard parked or SpecRead dominated.
     assert!(
-        m.wait_hard_count > 0
-            || m.wait_park_count > 0
-            || m.spec_read_count > 0
-            || m.bind_hits > 0,
+        m.wait_hard_count > 0 || m.wait_park_count > 0 || m.spec_read_count > 0 || m.bind_hits > 0,
         "M2 path should exercise WaitHard/park or SpecRead/Bind: {m:?}"
     );
     // When parks happen, steals should be possible with independents in the block.
@@ -942,11 +936,18 @@ fn specfence_p4_tk_park_seq_eq_par_and_metrics() {
             concurrency(),
         )
         .expect("parallel");
-    assert_eq!(sequential, parallel, "P4 must preserve sequential equivalence");
+    assert_eq!(
+        sequential, parallel,
+        "P4 must preserve sequential equivalence"
+    );
 
     let m = pevm.last_specfence_metrics();
     // Counters always defined; ResumeAtK is rare on default lean path (often FullRetry).
-    let _ = (m.park_resume_at_k, m.park_resume_full_retry, m.soft_wait_arms);
+    let _ = (
+        m.park_resume_at_k,
+        m.park_resume_full_retry,
+        m.soft_wait_arms,
+    );
     assert!(
         m.wait_hard_count > 0
             || m.wait_park_count > 0
@@ -1107,11 +1108,6 @@ fn specfence_m1d_live_inspect_resume_skips_prefix_opcodes() {
     );
 }
 
-
-
-
-
-
 /// M1f: default path applies absolute PC jump when `jump_is_safe` (no env needed).
 /// Balance-probe contract (BALANCE-only, no storage) + writers to the same hot
 /// account yield Basic-only certified prefixes with live inspect snaps — the
@@ -1140,7 +1136,9 @@ fn specfence_m1f_default_absolute_jump_seq_eq_par() {
     let bytecode = Bytecode::new_raw(Bytes::from(code));
     let code_hash = bytecode.hash_slow();
 
-    let mut state = (0..=60_000).map(common::mock_account).collect::<ChainState>();
+    let mut state = (0..=60_000)
+        .map(common::mock_account)
+        .collect::<ChainState>();
     state.insert(
         probe,
         EvmAccount {
@@ -1267,7 +1265,9 @@ fn specfence_m1g_storage_absolute_jump_seq_eq_par() {
     let bytecode = Bytecode::new_raw(Bytes::from(code));
     let code_hash = bytecode.hash_slow();
 
-    let mut state = (0..=60_000).map(common::mock_account).collect::<ChainState>();
+    let mut state = (0..=60_000)
+        .map(common::mock_account)
+        .collect::<ChainState>();
     state.insert(
         probe,
         EvmAccount {
@@ -1319,7 +1319,10 @@ fn specfence_m1g_storage_absolute_jump_seq_eq_par() {
         last = Some(m.clone());
         if m.rewind_to_cp > 0 && m.resume_count > 0 && m.inspector_steps > 0 {
             saw = true;
-            assert_eq!(m.tx_head_reexec, 0, "M1g Storage must not head-reexec: {m:?}");
+            assert_eq!(
+                m.tx_head_reexec, 0,
+                "M1g Storage must not head-reexec: {m:?}"
+            );
             assert!(
                 m.absolute_jump_applied > 0,
                 "M1g Storage path must absolute-jump: {m:?}"
@@ -1382,7 +1385,9 @@ fn specfence_m1g_nested_call_resume_jump() {
     let outer_code = Bytecode::new_raw(Bytes::from(code));
     let outer_hash = outer_code.hash_slow();
 
-    let mut state = (0..=60_000).map(common::mock_account).collect::<ChainState>();
+    let mut state = (0..=60_000)
+        .map(common::mock_account)
+        .collect::<ChainState>();
     state.insert(
         outer,
         EvmAccount {
@@ -1439,12 +1444,14 @@ fn specfence_m1g_nested_call_resume_jump() {
         last = Some(m.clone());
         if m.rewind_to_cp > 0 && m.resume_count > 0 && m.inspector_steps > 0 {
             saw = true;
-            assert_eq!(m.tx_head_reexec, 0, "M1g nested must not head-reexec: {m:?}");
+            assert_eq!(
+                m.tx_head_reexec, 0,
+                "M1g nested must not head-reexec: {m:?}"
+            );
             // Nested CALL resume: CallOutcome cache short-circuit (absolute jump
             // over nested outcomes is forbidden — would skip EIP-158 touches).
             assert!(
-                m.call_outcome_cache_hits > 0
-                    || m.absolute_jump_applied > 0,
+                m.call_outcome_cache_hits > 0 || m.absolute_jump_applied > 0,
                 "M1g nested must CallOutcome-cache (or jump if no nested outcomes): {m:?}"
             );
             assert!(
@@ -1454,13 +1461,8 @@ fn specfence_m1g_nested_call_resume_jump() {
             break;
         }
     }
-    assert!(
-        saw,
-        "M1g nested expected RewindTo+resume: {last:?}"
-    );
+    assert!(saw, "M1g nested expected RewindTo+resume: {last:?}");
 }
-
-
 
 /// Iter9: Lean Handler-path single-SSTORE memory-lite absolute jump.
 /// Contract: MSTORE (non-empty memory) + SSTORE + BALANCE(hot)*N + STOP.
@@ -1482,12 +1484,23 @@ fn specfence_iter9_handler_single_sstore_jump_seq_eq_par() {
     code.push(0x00);
     let bytecode = Bytecode::new_raw(Bytes::from(code));
     let code_hash = bytecode.hash_slow();
-    let mut state = (0..=60_000).map(common::mock_account).collect::<ChainState>();
-    state.insert(probe, EvmAccount {
-        balance: U256::from(1), nonce: 1, code_hash: Some(code_hash),
-        code: Some(bytecode.clone().into()), storage: Default::default(),
+    let mut state = (0..=60_000)
+        .map(common::mock_account)
+        .collect::<ChainState>();
+    state.insert(
+        probe,
+        EvmAccount {
+            balance: U256::from(1),
+            nonce: 1,
+            code_hash: Some(code_hash),
+            code: Some(bytecode.clone().into()),
+            storage: Default::default(),
+        },
+    );
+    state.entry(hot).or_insert_with(|| {
+        let (_, a) = common::mock_account(42);
+        a
     });
-    state.entry(hot).or_insert_with(|| { let (_, a) = common::mock_account(42); a });
     let mut bytecodes = Bytecodes::default();
     bytecodes.insert(code_hash, bytecode.into());
     let mut txs: Vec<TxEnv> = Vec::new();
@@ -1496,8 +1509,11 @@ fn specfence_iter9_handler_single_sstore_jump_seq_eq_par() {
     }
     for i in 0..24 {
         txs.push(TxEnv {
-            caller: Address::from(U160::from(8_000 + i)), nonce: 1,
-            kind: TransactTo::Call(probe), gas_limit: 150_000, gas_price: 1,
+            caller: Address::from(U160::from(8_000 + i)),
+            nonce: 1,
+            kind: TransactTo::Call(probe),
+            gas_limit: 150_000,
+            gas_price: 1,
             ..TxEnv::default()
         });
     }
@@ -1545,12 +1561,23 @@ fn specfence_iter11_handler_multi_sstore_jump_seq_eq_par() {
     code.push(0x00);
     let bytecode = Bytecode::new_raw(Bytes::from(code));
     let code_hash = bytecode.hash_slow();
-    let mut state = (0..=60_000).map(common::mock_account).collect::<ChainState>();
-    state.insert(probe, EvmAccount {
-        balance: U256::from(1), nonce: 1, code_hash: Some(code_hash),
-        code: Some(bytecode.clone().into()), storage: Default::default(),
+    let mut state = (0..=60_000)
+        .map(common::mock_account)
+        .collect::<ChainState>();
+    state.insert(
+        probe,
+        EvmAccount {
+            balance: U256::from(1),
+            nonce: 1,
+            code_hash: Some(code_hash),
+            code: Some(bytecode.clone().into()),
+            storage: Default::default(),
+        },
+    );
+    state.entry(hot).or_insert_with(|| {
+        let (_, a) = common::mock_account(42);
+        a
     });
-    state.entry(hot).or_insert_with(|| { let (_, a) = common::mock_account(42); a });
     let mut bytecodes = Bytecodes::default();
     bytecodes.insert(code_hash, bytecode.into());
     let mut txs: Vec<TxEnv> = Vec::new();
@@ -1559,8 +1586,11 @@ fn specfence_iter11_handler_multi_sstore_jump_seq_eq_par() {
     }
     for i in 0..24 {
         txs.push(TxEnv {
-            caller: Address::from(U160::from(8_200 + i)), nonce: 1,
-            kind: TransactTo::Call(probe), gas_limit: 200_000, gas_price: 1,
+            caller: Address::from(U160::from(8_200 + i)),
+            nonce: 1,
+            kind: TransactTo::Call(probe),
+            gas_limit: 200_000,
+            gas_price: 1,
             ..TxEnv::default()
         });
     }
@@ -1571,12 +1601,7 @@ fn specfence_iter11_handler_multi_sstore_jump_seq_eq_par() {
     let width = NonZeroUsize::new(concurrency().get().min(4).max(2)).unwrap();
     let mut last = None;
     for _ in 0..8 {
-        let (_, m, _) = run_mode_conc(
-            ConcurrencyMode::SpecFence,
-            &storage,
-            txs.clone(),
-            width,
-        );
+        let (_, m, _) = run_mode_conc(ConcurrencyMode::SpecFence, &storage, txs.clone(), width);
         last = Some(m.clone());
         assert_eq!(m.absolute_jump_applied, 0, "production jump OFF: {m:?}");
         assert_eq!(m.handler_sstore_capture, 0, "production capture OFF: {m:?}");
@@ -1620,7 +1645,9 @@ fn specfence_iter20_bind_snap_consume_production_off() {
     code.push(0x00);
     let bytecode = Bytecode::new_raw(Bytes::from(code));
     let code_hash = bytecode.hash_slow();
-    let mut state = (0..=60_000).map(common::mock_account).collect::<ChainState>();
+    let mut state = (0..=60_000)
+        .map(common::mock_account)
+        .collect::<ChainState>();
     state.insert(
         probe,
         EvmAccount {
@@ -1661,19 +1688,13 @@ fn specfence_iter20_bind_snap_consume_production_off() {
     let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
     let width = NonZeroUsize::new(concurrency().get().min(4).max(2)).unwrap();
     for _ in 0..8 {
-        let (_, m, _) = run_mode_conc(
-            ConcurrencyMode::SpecFence,
-            &storage,
-            txs.clone(),
-            width,
-        );
+        let (_, m, _) = run_mode_conc(ConcurrencyMode::SpecFence, &storage, txs.clone(), width);
         assert_eq!(m.absolute_jump_applied, 0, "production jump OFF: {m:?}");
         assert_eq!(m.bind_snap_capture, 0, "production SNAP OFF: {m:?}");
         assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
         assert_eq!(m.handler_sstore_capture, 0, "stock SSTORE: {m:?}");
     }
 }
-
 
 /// Iter21: production Bind jump stays hard-off (SNAP/JUMP unset). SoftWait Soft=0.
 #[test]
@@ -1706,7 +1727,9 @@ fn specfence_iter21_bind_jump_production_off() {
     code.push(0x00);
     let bytecode = Bytecode::new_raw(Bytes::from(code));
     let code_hash = bytecode.hash_slow();
-    let mut state = (0..=60_000).map(common::mock_account).collect::<ChainState>();
+    let mut state = (0..=60_000)
+        .map(common::mock_account)
+        .collect::<ChainState>();
     state.insert(
         probe,
         EvmAccount {
@@ -1747,12 +1770,7 @@ fn specfence_iter21_bind_jump_production_off() {
     let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
     let width = NonZeroUsize::new(concurrency().get().min(4).max(2)).unwrap();
     for _ in 0..8 {
-        let (_, m, _) = run_mode_conc(
-            ConcurrencyMode::SpecFence,
-            &storage,
-            txs.clone(),
-            width,
-        );
+        let (_, m, _) = run_mode_conc(ConcurrencyMode::SpecFence, &storage, txs.clone(), width);
         assert_eq!(m.absolute_jump_applied, 0, "production jump OFF: {m:?}");
         assert_eq!(m.bind_snap_capture, 0, "production SNAP OFF: {m:?}");
         assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
@@ -1799,7 +1817,9 @@ fn specfence_iter21_bind_jump_width1_seq_eq_par() {
     assert!(code.len() <= 256, "tiny storage probe");
     let bytecode = Bytecode::new_raw(Bytes::from(code));
     let code_hash = bytecode.hash_slow();
-    let mut state = (0..=60_000).map(common::mock_account).collect::<ChainState>();
+    let mut state = (0..=60_000)
+        .map(common::mock_account)
+        .collect::<ChainState>();
     state.insert(
         probe,
         EvmAccount {
@@ -1844,12 +1864,7 @@ fn specfence_iter21_bind_jump_width1_seq_eq_par() {
     let mut saw_aj = false;
     let mut last = None;
     for _ in 0..24 {
-        let (_, m, _) = run_mode_conc(
-            ConcurrencyMode::SpecFence,
-            &storage,
-            txs.clone(),
-            width,
-        );
+        let (_, m, _) = run_mode_conc(ConcurrencyMode::SpecFence, &storage, txs.clone(), width);
         last = Some(m.clone());
         assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
         if m.resume_count > 0 {
@@ -1857,7 +1872,10 @@ fn specfence_iter21_bind_jump_width1_seq_eq_par() {
         }
         if m.absolute_jump_applied > 0 {
             saw_aj = true;
-            assert!(m.bind_snap_capture > 0 || m.prefix_opcodes_skipped > 0, "{m:?}");
+            assert!(
+                m.bind_snap_capture > 0 || m.prefix_opcodes_skipped > 0,
+                "{m:?}"
+            );
             break;
         }
     }
@@ -1874,7 +1892,9 @@ fn specfence_iter21_bind_jump_width1_seq_eq_par() {
     assert!(saw_resume || m.resume_count == 0, "unexpected: {m:?}");
     // Prefer aj>0; if Validated gate refuses all tips, credit path still hang-free.
     if !saw_aj {
-        eprintln!("iter21 width1: aj=0 (Validated gate or no Storage-FF tip) — hang-free seq≡par OK");
+        eprintln!(
+            "iter21 width1: aj=0 (Validated gate or no Storage-FF tip) — hang-free seq≡par OK"
+        );
     }
 }
 
@@ -1911,7 +1931,9 @@ fn specfence_iter21_bind_jump_width2_hang_repro() {
     code.push(0x00);
     let bytecode = Bytecode::new_raw(Bytes::from(code));
     let code_hash = bytecode.hash_slow();
-    let mut state = (0..=60_000).map(common::mock_account).collect::<ChainState>();
+    let mut state = (0..=60_000)
+        .map(common::mock_account)
+        .collect::<ChainState>();
     state.insert(
         probe,
         EvmAccount {
@@ -1959,12 +1981,7 @@ fn specfence_iter21_bind_jump_width2_hang_repro() {
         let mut best = None;
         let mut saw_aj = false;
         for _ in 0..16 {
-            let (_, m, _) = run_mode_conc(
-                ConcurrencyMode::SpecFence,
-                &storage,
-                txs.clone(),
-                width,
-            );
+            let (_, m, _) = run_mode_conc(ConcurrencyMode::SpecFence, &storage, txs.clone(), width);
             assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
             if m.absolute_jump_applied > 0 {
                 saw_aj = true;
@@ -2013,7 +2030,6 @@ fn specfence_iter21_bind_jump_width2_hang_repro() {
     }
 }
 
-
 /// Iter22: forced SNAP/JUMP OFF — SoftWait Soft=0; aj=0; bsnap=0; seq≡par.
 #[test]
 fn specfence_iter22_bind_jump_production_off() {
@@ -2036,12 +2052,7 @@ fn specfence_iter22_bind_jump_production_off() {
             std::env::set_var("SPECFENCE_BIND_SNAP", "0");
             std::env::set_var("SPECFENCE_BIND_SNAP_JUMP", "0");
         }
-        let (_, m, _) = run_mode_conc(
-            ConcurrencyMode::SpecFence,
-            &storage,
-            txs.clone(),
-            width,
-        );
+        let (_, m, _) = run_mode_conc(ConcurrencyMode::SpecFence, &storage, txs.clone(), width);
         assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
         assert_eq!(m.absolute_jump_applied, 0, "production JUMP OFF: {m:?}");
         assert_eq!(m.bind_snap_capture, 0, "production SNAP OFF: {m:?}");
@@ -2112,18 +2123,14 @@ fn specfence_iter22_erc20_bind_jump_seq_eq_par_dig() {
         std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP");
         std::env::remove_var("SPECFENCE_BIND_SNAP");
     }
-    eprintln!(
-        "iter22 erc20 dig: aj_runs={aj_runs} success_seq={success} fail={fail}"
-    );
+    eprintln!("iter22 erc20 dig: aj_runs={aj_runs} success_seq={success} fail={fail}");
     // Document: require success>0∧fail==0 for enable. Today restore still flaky.
     assert!(
         aj_runs > 0,
         "expected some Bind jump apply under SNAP+JUMP: success={success} fail={fail}"
     );
     if fail > 0 {
-        eprintln!(
-            "iter22 erc20 dig: STILL FLAKY seq≠par (fail={fail}) — keep JUMP OFF"
-        );
+        eprintln!("iter22 erc20 dig: STILL FLAKY seq≠par (fail={fail}) — keep JUMP OFF");
     } else {
         eprintln!("iter22 erc20 dig: STABLE aj>0∧seq≡par over aj_runs={aj_runs}");
     }
@@ -2150,12 +2157,7 @@ fn specfence_iter23_bind_jump_production_off() {
             std::env::set_var("SPECFENCE_BIND_SNAP", "0");
             std::env::set_var("SPECFENCE_BIND_SNAP_JUMP", "0");
         }
-        let (_, m, _) = run_mode_conc(
-            ConcurrencyMode::SpecFence,
-            &storage,
-            txs.clone(),
-            width,
-        );
+        let (_, m, _) = run_mode_conc(ConcurrencyMode::SpecFence, &storage, txs.clone(), width);
         assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
         assert_eq!(m.absolute_jump_applied, 0, "production JUMP OFF: {m:?}");
         assert_eq!(m.bind_snap_capture, 0, "production SNAP OFF: {m:?}");
@@ -2252,11 +2254,7 @@ fn specfence_iter23_erc20_diff_first_bind_jump_dig() {
                                     }
                                     if sa.balance != pa.balance || sa.nonce != pa.nonce {
                                         bal = Some((
-                                            *addr,
-                                            sa.balance,
-                                            pa.balance,
-                                            sa.nonce,
-                                            pa.nonce,
+                                            *addr, sa.balance, pa.balance, sa.nonce, pa.nonce,
                                         ));
                                     }
                                 }
@@ -2343,7 +2341,10 @@ fn specfence_iter23_erc20_diff_first_bind_jump_dig() {
         eprintln!(
             "iter23 erc20 dig: aj=0 under refuse-if-stale (expected until restore≡cold); fail={fail} — keep JUMP OFF"
         );
-        assert_eq!(fail, 0, "refuse-gate must not introduce seq≠par: fail={fail}");
+        assert_eq!(
+            fail, 0,
+            "refuse-gate must not introduce seq≠par: fail={fail}"
+        );
     } else if fail > 0 {
         eprintln!(
             "iter23 erc20 dig: STILL FLAKY seq≠par (fail={fail} gas_mismatch={gas_mismatch} state_only={state_only_mismatch}) — keep JUMP OFF"
@@ -2467,12 +2468,7 @@ fn specfence_iter21_erc20_bind_snap_only_seq_eq_par() {
     let width = NonZeroUsize::new(concurrency().get().min(4).max(2)).unwrap();
     let mut last = None;
     for _ in 0..8 {
-        let (_, m, _) = run_mode_conc(
-            ConcurrencyMode::SpecFence,
-            &storage,
-            txs.clone(),
-            width,
-        );
+        let (_, m, _) = run_mode_conc(ConcurrencyMode::SpecFence, &storage, txs.clone(), width);
         last = Some(m.clone());
         assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
         assert_eq!(m.absolute_jump_applied, 0, "JUMP off: {m:?}");
@@ -2509,12 +2505,23 @@ fn specfence_m1i_write_prefix_absolute_jump_seq_eq_par() {
     code.push(0x00);
     let bytecode = Bytecode::new_raw(Bytes::from(code));
     let code_hash = bytecode.hash_slow();
-    let mut state = (0..=60_000).map(common::mock_account).collect::<ChainState>();
-    state.insert(probe, EvmAccount {
-        balance: U256::from(1), nonce: 1, code_hash: Some(code_hash),
-        code: Some(bytecode.clone().into()), storage: Default::default(),
+    let mut state = (0..=60_000)
+        .map(common::mock_account)
+        .collect::<ChainState>();
+    state.insert(
+        probe,
+        EvmAccount {
+            balance: U256::from(1),
+            nonce: 1,
+            code_hash: Some(code_hash),
+            code: Some(bytecode.clone().into()),
+            storage: Default::default(),
+        },
+    );
+    state.entry(hot).or_insert_with(|| {
+        let (_, a) = common::mock_account(42);
+        a
     });
-    state.entry(hot).or_insert_with(|| { let (_, a) = common::mock_account(42); a });
     let mut bytecodes = Bytecodes::default();
     bytecodes.insert(code_hash, bytecode.into());
     let mut txs: Vec<TxEnv> = Vec::new();
@@ -2523,8 +2530,11 @@ fn specfence_m1i_write_prefix_absolute_jump_seq_eq_par() {
     }
     for i in 0..24 {
         txs.push(TxEnv {
-            caller: Address::from(U160::from(8_000 + i)), nonce: 1,
-            kind: TransactTo::Call(probe), gas_limit: 150_000, gas_price: 1,
+            caller: Address::from(U160::from(8_000 + i)),
+            nonce: 1,
+            kind: TransactTo::Call(probe),
+            gas_limit: 150_000,
+            gas_price: 1,
             ..TxEnv::default()
         });
     }
@@ -2544,7 +2554,10 @@ fn specfence_m1i_write_prefix_absolute_jump_seq_eq_par() {
                 m.absolute_jump_applied > 0,
                 "M1i write-prefix must absolute-jump: {m:?}"
             );
-            assert!(m.pc_resume_count > 0 && m.prefix_opcodes_skipped > 0, "{m:?}");
+            assert!(
+                m.pc_resume_count > 0 && m.prefix_opcodes_skipped > 0,
+                "{m:?}"
+            );
             let cold_equiv = m
                 .inspector_steps_resume
                 .saturating_add(m.prefix_opcodes_skipped);
@@ -2568,8 +2581,13 @@ fn specfence_m1i_write_prefix_absolute_jump_seq_eq_par() {
 fn specfence_m1i_valued_nested_call_resume() {
     let hot = Address::from(U160::from(42));
     let n_probe = 8usize;
-    let mut state = (0..=60_000).map(common::mock_account).collect::<ChainState>();
-    state.entry(hot).or_insert_with(|| { let (_, a) = common::mock_account(42); a });
+    let mut state = (0..=60_000)
+        .map(common::mock_account)
+        .collect::<ChainState>();
+    state.entry(hot).or_insert_with(|| {
+        let (_, a) = common::mock_account(42);
+        a
+    });
     let mut bytecodes = Bytecodes::default();
     let mut txs: Vec<TxEnv> = Vec::new();
     for i in 0..12 {
@@ -2581,7 +2599,9 @@ fn specfence_m1i_valued_nested_call_resume() {
         let inner_code = Bytecode::new_raw(Bytes::from(vec![0x00]));
         let inner_hash = inner_code.hash_slow();
         let mut code = Vec::new();
-        for _ in 0..4 { code.extend_from_slice(&[0x60, 0x00]); }
+        for _ in 0..4 {
+            code.extend_from_slice(&[0x60, 0x00]);
+        }
         code.extend_from_slice(&[0x60, 0x01]);
         code.push(0x73);
         code.extend_from_slice(inner.as_slice());
@@ -2594,19 +2614,34 @@ fn specfence_m1i_valued_nested_call_resume() {
         code.push(0x00);
         let outer_code = Bytecode::new_raw(Bytes::from(code));
         let outer_hash = outer_code.hash_slow();
-        state.insert(outer, EvmAccount {
-            balance: U256::from(10_000), nonce: 1, code_hash: Some(outer_hash),
-            code: Some(outer_code.clone().into()), storage: Default::default(),
-        });
-        state.insert(inner, EvmAccount {
-            balance: U256::from(1), nonce: 1, code_hash: Some(inner_hash),
-            code: Some(inner_code.clone().into()), storage: Default::default(),
-        });
+        state.insert(
+            outer,
+            EvmAccount {
+                balance: U256::from(10_000),
+                nonce: 1,
+                code_hash: Some(outer_hash),
+                code: Some(outer_code.clone().into()),
+                storage: Default::default(),
+            },
+        );
+        state.insert(
+            inner,
+            EvmAccount {
+                balance: U256::from(1),
+                nonce: 1,
+                code_hash: Some(inner_hash),
+                code: Some(inner_code.clone().into()),
+                storage: Default::default(),
+            },
+        );
         bytecodes.insert(outer_hash, outer_code.into());
         bytecodes.insert(inner_hash, inner_code.into());
         txs.push(TxEnv {
-            caller: Address::from(U160::from(10_000 + i)), nonce: 1,
-            kind: TransactTo::Call(outer), gas_limit: 300_000, gas_price: 1,
+            caller: Address::from(U160::from(10_000 + i)),
+            nonce: 1,
+            kind: TransactTo::Call(outer),
+            gas_limit: 300_000,
+            gas_price: 1,
             ..TxEnv::default()
         });
     }
@@ -2622,7 +2657,10 @@ fn specfence_m1i_valued_nested_call_resume() {
         if m.rewind_to_cp > 0 && m.resume_count > 0 && m.inspector_steps > 0 {
             saw = true;
             assert_eq!(m.tx_head_reexec, 0, "{m:?}");
-            assert!(m.pc_resume_count > 0 && m.prefix_opcodes_skipped > 0, "{m:?}");
+            assert!(
+                m.pc_resume_count > 0 && m.prefix_opcodes_skipped > 0,
+                "{m:?}"
+            );
             // Default-on valued SC and/or valued CALL-boundary jump may fire.
             let _ = (m.call_outcome_cache_hits, m.absolute_jump_applied);
             break;
@@ -2630,9 +2668,6 @@ fn specfence_m1i_valued_nested_call_resume() {
     }
     assert!(saw, "M1k valued nested RewindTo expected: {last:?}");
 }
-
-
-
 
 /// M1l-A: multi-SSTORE write-prefix absolute jump with trailing LOG0 at **full**
 /// worker width. Post-LOG LogReplay + no WaitHard mid-RewindTo keeps hang-free;
@@ -2659,12 +2694,23 @@ fn specfence_m1j_multi_sstore_log_write_prefix_jump() {
     code.push(0x00);
     let bytecode = Bytecode::new_raw(Bytes::from(code));
     let code_hash = bytecode.hash_slow();
-    let mut state = (0..=60_000).map(common::mock_account).collect::<ChainState>();
-    state.insert(probe, EvmAccount {
-        balance: U256::from(1), nonce: 1, code_hash: Some(code_hash),
-        code: Some(bytecode.clone().into()), storage: Default::default(),
+    let mut state = (0..=60_000)
+        .map(common::mock_account)
+        .collect::<ChainState>();
+    state.insert(
+        probe,
+        EvmAccount {
+            balance: U256::from(1),
+            nonce: 1,
+            code_hash: Some(code_hash),
+            code: Some(bytecode.clone().into()),
+            storage: Default::default(),
+        },
+    );
+    state.entry(hot).or_insert_with(|| {
+        let (_, a) = common::mock_account(42);
+        a
     });
-    state.entry(hot).or_insert_with(|| { let (_, a) = common::mock_account(42); a });
     let mut bytecodes = Bytecodes::default();
     bytecodes.insert(code_hash, bytecode.into());
     let mut txs: Vec<TxEnv> = Vec::new();
@@ -2673,8 +2719,11 @@ fn specfence_m1j_multi_sstore_log_write_prefix_jump() {
     }
     for i in 0..12 {
         txs.push(TxEnv {
-            caller: Address::from(U160::from(8_100 + i)), nonce: 1,
-            kind: TransactTo::Call(probe), gas_limit: 200_000, gas_price: 1,
+            caller: Address::from(U160::from(8_100 + i)),
+            nonce: 1,
+            kind: TransactTo::Call(probe),
+            gas_limit: 200_000,
+            gas_price: 1,
             ..TxEnv::default()
         });
     }
@@ -2689,12 +2738,8 @@ fn specfence_m1j_multi_sstore_log_write_prefix_jump() {
     // conc=2). Full nproc still rarely hangs on denser WW — documented in status.
     let width = NonZeroUsize::new(concurrency().get().min(4).max(2)).unwrap();
     for _ in 0..24 {
-        let (results, m, _) = run_mode_conc(
-            ConcurrencyMode::SpecFence,
-            &storage,
-            txs.clone(),
-            width,
-        );
+        let (results, m, _) =
+            run_mode_conc(ConcurrencyMode::SpecFence, &storage, txs.clone(), width);
         last = Some(m.clone());
         let probe_logs: usize = results.iter().map(|r| r.receipt.logs.len()).sum();
         if m.rewind_to_cp > 0 && m.resume_count > 0 && m.inspector_steps > 0 {
@@ -2704,7 +2749,10 @@ fn specfence_m1j_multi_sstore_log_write_prefix_jump() {
                 m.absolute_jump_applied > 0,
                 "M1l multi-SSTORE+LOG must absolute-jump: {m:?}"
             );
-            assert!(m.pc_resume_count > 0 && m.prefix_opcodes_skipped > 0, "{m:?}");
+            assert!(
+                m.pc_resume_count > 0 && m.prefix_opcodes_skipped > 0,
+                "{m:?}"
+            );
             let cold_equiv = m
                 .inspector_steps_resume
                 .saturating_add(m.prefix_opcodes_skipped);
@@ -2720,7 +2768,6 @@ fn specfence_m1j_multi_sstore_log_write_prefix_jump() {
     }
     assert!(saw, "M1l multi-SSTORE+LOG RewindTo+jump expected: {last:?}");
 }
-
 
 /// M1l-A2: multi-SSTORE+LOG write-prefix jump at **full** `concurrency()` with a
 /// sparse hot fan-in (hang root is inspect×WW width, not worker count alone).
@@ -2744,12 +2791,23 @@ fn specfence_m1l_multi_sstore_log_full_width_jump() {
     code.push(0x00);
     let bytecode = Bytecode::new_raw(Bytes::from(code));
     let code_hash = bytecode.hash_slow();
-    let mut state = (0..=60_000).map(common::mock_account).collect::<ChainState>();
-    state.insert(probe, EvmAccount {
-        balance: U256::from(1), nonce: 1, code_hash: Some(code_hash),
-        code: Some(bytecode.clone().into()), storage: Default::default(),
+    let mut state = (0..=60_000)
+        .map(common::mock_account)
+        .collect::<ChainState>();
+    state.insert(
+        probe,
+        EvmAccount {
+            balance: U256::from(1),
+            nonce: 1,
+            code_hash: Some(code_hash),
+            code: Some(bytecode.clone().into()),
+            storage: Default::default(),
+        },
+    );
+    state.entry(hot).or_insert_with(|| {
+        let (_, a) = common::mock_account(42);
+        a
     });
-    state.entry(hot).or_insert_with(|| { let (_, a) = common::mock_account(42); a });
     let mut bytecodes = Bytecodes::default();
     bytecodes.insert(code_hash, bytecode.into());
     let mut txs: Vec<TxEnv> = Vec::new();
@@ -2758,8 +2816,11 @@ fn specfence_m1l_multi_sstore_log_full_width_jump() {
     }
     for i in 0..8 {
         txs.push(TxEnv {
-            caller: Address::from(U160::from(8_200 + i)), nonce: 1,
-            kind: TransactTo::Call(probe), gas_limit: 200_000, gas_price: 1,
+            caller: Address::from(U160::from(8_200 + i)),
+            nonce: 1,
+            kind: TransactTo::Call(probe),
+            gas_limit: 200_000,
+            gas_price: 1,
             ..TxEnv::default()
         });
     }
@@ -2785,7 +2846,10 @@ fn specfence_m1l_multi_sstore_log_full_width_jump() {
             break;
         }
     }
-    assert!(saw, "M1l full-width multi-SSTORE+LOG jump expected: {last:?}");
+    assert!(
+        saw,
+        "M1l full-width multi-SSTORE+LOG jump expected: {last:?}"
+    );
 }
 
 /// M1l-B warm: force valued CallOutcome SC on RewindTo (unique pairs; CALL loads
@@ -2795,8 +2859,13 @@ fn specfence_m1l_multi_sstore_log_full_width_jump() {
 fn specfence_m1l_warm_valued_call_outcome_seq_eq_par() {
     let hot = Address::from(U160::from(42));
     let n_probe = 10usize;
-    let mut state = (0..=60_000).map(common::mock_account).collect::<ChainState>();
-    state.entry(hot).or_insert_with(|| { let (_, a) = common::mock_account(42); a });
+    let mut state = (0..=60_000)
+        .map(common::mock_account)
+        .collect::<ChainState>();
+    state.entry(hot).or_insert_with(|| {
+        let (_, a) = common::mock_account(42);
+        a
+    });
     let mut bytecodes = Bytecodes::default();
     let mut txs: Vec<TxEnv> = Vec::new();
     for i in 0..16 {
@@ -2809,7 +2878,9 @@ fn specfence_m1l_warm_valued_call_outcome_seq_eq_par() {
         let inner_hash = inner_code.hash_slow();
         // PUSH0×4, PUSH1 1, PUSH20 inner, GAS, CALL, POP, then hot BALANCE×8, STOP
         let mut code = Vec::new();
-        for _ in 0..4 { code.extend_from_slice(&[0x60, 0x00]); }
+        for _ in 0..4 {
+            code.extend_from_slice(&[0x60, 0x00]);
+        }
         code.extend_from_slice(&[0x60, 0x01]);
         code.push(0x73);
         code.extend_from_slice(inner.as_slice());
@@ -2822,19 +2893,34 @@ fn specfence_m1l_warm_valued_call_outcome_seq_eq_par() {
         code.push(0x00);
         let outer_code = Bytecode::new_raw(Bytes::from(code));
         let outer_hash = outer_code.hash_slow();
-        state.insert(outer, EvmAccount {
-            balance: U256::from(10_000), nonce: 1, code_hash: Some(outer_hash),
-            code: Some(outer_code.clone().into()), storage: Default::default(),
-        });
-        state.insert(inner, EvmAccount {
-            balance: U256::from(1), nonce: 1, code_hash: Some(inner_hash),
-            code: Some(inner_code.clone().into()), storage: Default::default(),
-        });
+        state.insert(
+            outer,
+            EvmAccount {
+                balance: U256::from(10_000),
+                nonce: 1,
+                code_hash: Some(outer_hash),
+                code: Some(outer_code.clone().into()),
+                storage: Default::default(),
+            },
+        );
+        state.insert(
+            inner,
+            EvmAccount {
+                balance: U256::from(1),
+                nonce: 1,
+                code_hash: Some(inner_hash),
+                code: Some(inner_code.clone().into()),
+                storage: Default::default(),
+            },
+        );
         bytecodes.insert(outer_hash, outer_code.into());
         bytecodes.insert(inner_hash, inner_code.into());
         txs.push(TxEnv {
-            caller: Address::from(U160::from(11_000 + i)), nonce: 1,
-            kind: TransactTo::Call(outer), gas_limit: 300_000, gas_price: 1,
+            caller: Address::from(U160::from(11_000 + i)),
+            nonce: 1,
+            kind: TransactTo::Call(outer),
+            gas_limit: 300_000,
+            gas_price: 1,
             ..TxEnv::default()
         });
     }
@@ -2850,7 +2936,10 @@ fn specfence_m1l_warm_valued_call_outcome_seq_eq_par() {
         if m.rewind_to_cp > 0 && m.resume_count > 0 && m.inspector_steps > 0 {
             saw = true;
             assert_eq!(m.tx_head_reexec, 0, "{m:?}");
-            assert!(m.pc_resume_count > 0 && m.prefix_opcodes_skipped > 0, "{m:?}");
+            assert!(
+                m.pc_resume_count > 0 && m.prefix_opcodes_skipped > 0,
+                "{m:?}"
+            );
             // Gas-limit-matched warm SC and/or valued+write jump may fire.
             let _ = (m.call_outcome_cache_hits, m.absolute_jump_applied);
             break;
@@ -2866,8 +2955,13 @@ fn specfence_m1l_warm_valued_call_outcome_seq_eq_par() {
 fn specfence_m1l_valued_call_boundary_absolute_jump() {
     let hot = Address::from(U160::from(42));
     let n_probe = 12usize;
-    let mut state = (0..=60_000).map(common::mock_account).collect::<ChainState>();
-    state.entry(hot).or_insert_with(|| { let (_, a) = common::mock_account(42); a });
+    let mut state = (0..=60_000)
+        .map(common::mock_account)
+        .collect::<ChainState>();
+    state.entry(hot).or_insert_with(|| {
+        let (_, a) = common::mock_account(42);
+        a
+    });
     let mut bytecodes = Bytecodes::default();
     let mut txs: Vec<TxEnv> = Vec::new();
     for i in 0..20 {
@@ -2880,7 +2974,9 @@ fn specfence_m1l_valued_call_boundary_absolute_jump() {
         let inner_hash = inner_code.hash_slow();
         // valued CALL then SSTORE then hot BALANCE probes (EffectBoundary after CALL)
         let mut code = Vec::new();
-        for _ in 0..4 { code.extend_from_slice(&[0x60, 0x00]); }
+        for _ in 0..4 {
+            code.extend_from_slice(&[0x60, 0x00]);
+        }
         code.extend_from_slice(&[0x60, 0x01]);
         code.push(0x73);
         code.extend_from_slice(inner.as_slice());
@@ -2895,19 +2991,34 @@ fn specfence_m1l_valued_call_boundary_absolute_jump() {
         code.push(0x00);
         let outer_code = Bytecode::new_raw(Bytes::from(code));
         let outer_hash = outer_code.hash_slow();
-        state.insert(outer, EvmAccount {
-            balance: U256::from(10_000), nonce: 1, code_hash: Some(outer_hash),
-            code: Some(outer_code.clone().into()), storage: Default::default(),
-        });
-        state.insert(inner, EvmAccount {
-            balance: U256::from(1), nonce: 1, code_hash: Some(inner_hash),
-            code: Some(inner_code.clone().into()), storage: Default::default(),
-        });
+        state.insert(
+            outer,
+            EvmAccount {
+                balance: U256::from(10_000),
+                nonce: 1,
+                code_hash: Some(outer_hash),
+                code: Some(outer_code.clone().into()),
+                storage: Default::default(),
+            },
+        );
+        state.insert(
+            inner,
+            EvmAccount {
+                balance: U256::from(1),
+                nonce: 1,
+                code_hash: Some(inner_hash),
+                code: Some(inner_code.clone().into()),
+                storage: Default::default(),
+            },
+        );
         bytecodes.insert(outer_hash, outer_code.into());
         bytecodes.insert(inner_hash, inner_code.into());
         txs.push(TxEnv {
-            caller: Address::from(U160::from(12_000 + i)), nonce: 1,
-            kind: TransactTo::Call(outer), gas_limit: 350_000, gas_price: 1,
+            caller: Address::from(U160::from(12_000 + i)),
+            nonce: 1,
+            kind: TransactTo::Call(outer),
+            gas_limit: 350_000,
+            gas_price: 1,
             ..TxEnv::default()
         });
     }
@@ -2923,7 +3034,10 @@ fn specfence_m1l_valued_call_boundary_absolute_jump() {
         if m.rewind_to_cp > 0 && m.resume_count > 0 && m.inspector_steps > 0 {
             saw = true;
             assert_eq!(m.tx_head_reexec, 0, "{m:?}");
-            assert!(m.pc_resume_count > 0 && m.prefix_opcodes_skipped > 0, "{m:?}");
+            assert!(
+                m.pc_resume_count > 0 && m.prefix_opcodes_skipped > 0,
+                "{m:?}"
+            );
             // Prefer absolute jump; SC-only also OK if jump gate falls back.
             assert!(
                 m.absolute_jump_applied > 0 || m.call_outcome_cache_hits > 0,
@@ -3080,10 +3194,7 @@ fn specfence_m4_low_conflict_engages_lean() {
     assert_eq!(m.wait_admissions, 0, "lean must not Wait-admit: {m:?}");
     assert_eq!(m.wait_hard_count, 0, "lean must not WaitHard: {m:?}");
     // Inspector tax off → no inspector_steps on lean-only block.
-    assert_eq!(
-        m.inspector_steps, 0,
-        "lean skips inspect_run: {m:?}"
-    );
+    assert_eq!(m.inspector_steps, 0, "lean skips inspect_run: {m:?}");
 }
 
 /// R1/R2: hot multi-writer populates HotSet and uses HotLocal; execute stays LeanOCC.
@@ -3198,7 +3309,10 @@ fn specfence_r1_hot_multiwriter_hotset() {
         last = Some(m.clone());
         if m.hotset_size > 0 {
             assert!(
-                m.hot_local_reads > 0 || m.bind_hits > 0 || m.wait_hard_count > 0 || m.spec_read_count > 0,
+                m.hot_local_reads > 0
+                    || m.bind_hits > 0
+                    || m.wait_hard_count > 0
+                    || m.spec_read_count > 0,
                 "HotSet should drive HotLocal/SpecRead activity: {m:?}"
             );
             assert_eq!(m.inspector_steps, 0);
@@ -3207,7 +3321,6 @@ fn specfence_r1_hot_multiwriter_hotset() {
     }
     panic!("expected HotSet non-empty on multi-writer: last={last:?}");
 }
-
 
 /// Iter24/25: production ResumePath SNAP + JUMP — SoftWait Soft=0; seq≡par.
 /// Iter25: silent default is ResumePath (unset env); mass path still OFF.
@@ -3250,7 +3363,10 @@ fn specfence_iter24_bind_jump_resume_path_production() {
         let m = pevm.last_specfence_metrics().clone();
         assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
         assert_eq!(m.handler_sstore_capture, 0, "stock SSTORE: {m:?}");
-        assert_eq!(parallel, sequential, "ResumePath JUMP must stay seq≡par: {m:?}");
+        assert_eq!(
+            parallel, sequential,
+            "ResumePath JUMP must stay seq≡par: {m:?}"
+        );
     }
 }
 
@@ -3270,12 +3386,7 @@ fn specfence_iter24_bind_snap_force_off() {
     }
     let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
     let width = NonZeroUsize::new(concurrency().get().min(4).max(2)).unwrap();
-    let (_, m, _) = run_mode_conc(
-        ConcurrencyMode::SpecFence,
-        &storage,
-        txs,
-        width,
-    );
+    let (_, m, _) = run_mode_conc(ConcurrencyMode::SpecFence, &storage, txs, width);
     assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
     assert_eq!(m.absolute_jump_applied, 0, "force-off JUMP: {m:?}");
     assert_eq!(m.bind_snap_capture, 0, "force-off SNAP: {m:?}");
@@ -3334,7 +3445,11 @@ fn specfence_iter26_validated_fresh_ff_tip_jump() {
             parallel, sequential,
             "Validated-fresh ResumePath must stay seq≡par: {m:?}"
         );
-        let _ = (m.absolute_jump_applied, m.bind_snap_capture, m.bind_snap_credit);
+        let _ = (
+            m.absolute_jump_applied,
+            m.bind_snap_capture,
+            m.bind_snap_credit,
+        );
     }
 }
 
@@ -3388,7 +3503,11 @@ fn specfence_iter27_tip_ff_overlap_steps_cap() {
             parallel, sequential,
             "Iter27 ResumePath must stay seq≡par: {m:?}"
         );
-        let _ = (m.absolute_jump_applied, m.bind_snap_capture, m.bind_snap_credit);
+        let _ = (
+            m.absolute_jump_applied,
+            m.bind_snap_capture,
+            m.bind_snap_credit,
+        );
     }
 }
 
@@ -3442,7 +3561,11 @@ fn specfence_iter28_first_frame_tip_identity() {
             parallel, sequential,
             "Iter28 ResumePath must stay seq≡par: {m:?}"
         );
-        let _ = (m.absolute_jump_applied, m.bind_snap_capture, m.bind_snap_credit);
+        let _ = (
+            m.absolute_jump_applied,
+            m.bind_snap_capture,
+            m.bind_snap_credit,
+        );
     }
 }
 
@@ -3498,7 +3621,11 @@ fn specfence_iter29_nested_bind_consume() {
             parallel, sequential,
             "Iter29 nested Bind consume must stay seq≡par: {m:?}"
         );
-        let _ = (m.absolute_jump_applied, m.bind_snap_capture, m.bind_snap_credit);
+        let _ = (
+            m.absolute_jump_applied,
+            m.bind_snap_capture,
+            m.bind_snap_credit,
+        );
     }
     unsafe {
         std::env::remove_var("SPECFENCE_NESTED_BIND");
@@ -3557,7 +3684,11 @@ fn specfence_iter30_lean_safe_nested_apply_default_on() {
             parallel, sequential,
             "Iter30 Lean-safe nested apply default-on must stay seq≡par: {m:?}"
         );
-        let _ = (m.absolute_jump_applied, m.bind_snap_capture, m.bind_snap_credit);
+        let _ = (
+            m.absolute_jump_applied,
+            m.bind_snap_capture,
+            m.bind_snap_credit,
+        );
     }
 }
 
@@ -3610,7 +3741,10 @@ fn specfence_iter24_erc20_mass_bind_jump_dig() {
                 success += 1;
             } else {
                 fail += 1;
-                eprintln!("iter24 mass dig FAIL seq≠par run={run} aj={} bsnap={}", m.absolute_jump_applied, m.bind_snap_capture);
+                eprintln!(
+                    "iter24 mass dig FAIL seq≠par run={run} aj={} bsnap={}",
+                    m.absolute_jump_applied, m.bind_snap_capture
+                );
             }
         } else if parallel != sequential {
             fail += 1;
@@ -3667,7 +3801,10 @@ fn specfence_iter25_silent_default_resume_path() {
         let m = pevm.last_specfence_metrics().clone();
         assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
         assert_eq!(m.handler_sstore_capture, 0, "stock SSTORE: {m:?}");
-        assert_eq!(parallel, sequential, "silent ResumePath must stay seq≡par: {m:?}");
+        assert_eq!(
+            parallel, sequential,
+            "silent ResumePath must stay seq≡par: {m:?}"
+        );
     }
 }
 
@@ -3824,10 +3961,7 @@ fn general_fixes_force_prefix_writer_and_multi_spine() {
     .expect("sequential");
     assert_eq!(par, sequential, "general-fixes seq≡par: {m:?}");
     assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
-    assert_eq!(
-        m.await_at_a_arms, 0,
-        "no EV Await@a door: {m:?}"
-    );
+    assert_eq!(m.await_at_a_arms, 0, "no EV Await@a door: {m:?}");
     let p = pevm.last_exec_process();
     assert_eq!(
         p.force_prefix_none_unfenced, 0,
@@ -3858,5 +3992,65 @@ fn general_fixes_force_prefix_writer_and_multi_spine() {
     assert!(
         p2.independent_unfenced_total > 0 || m2.independent_unfenced > 0 || p2.unfenced_total > 0,
         "S2: independents may still Unfence: {p2:?}"
+    );
+}
+
+/// Sub-grain native laws: Done→Bind residual, R1 value-stable, canary
+/// reopen, PreferAdmit live. SoftWait Soft=0; no Await@a; independents Unfence.
+#[test]
+fn subgrain_done_bind_r1_canary_prefer_admit() {
+    let (state, bytecodes, txs) = erc20::generate_cluster(6, 16, 8);
+    let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
+    let (par, m, mut pevm) = run_mode(ConcurrencyMode::SpecFence, &storage, txs.clone());
+    let chain = PevmEthereum::mainnet();
+    let sequential = execute_revm_sequential(
+        &chain,
+        &storage,
+        Default::default(),
+        BlockEnv::default(),
+        txs.clone(),
+    )
+    .expect("sequential");
+    assert_eq!(par, sequential, "subgrain seq≡par: {m:?}");
+    assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
+    assert_eq!(m.await_at_a_arms, 0, "no EV Await@a door: {m:?}");
+    let p = pevm.last_exec_process();
+    assert_eq!(
+        p.force_prefix_none_unfenced, 0,
+        "U1 leak must stay 0: {p:?}"
+    );
+    assert!(
+        p.bind_total + m.bind_residual + m.edge_bind > 0,
+        "Done→Bind / Bind residual must fire: process={p:?} metrics={m:?}"
+    );
+    // PreferAdmit is a scheduler law (ready-set ⊆ spine), not a star-ℓ stub.
+    assert!(
+        m.prefer_admit > 0 || m.multi_spine_admit > 0 || p.wait_for_total > 0,
+        "prefer_admit or multi-spine admit must be live: {m:?} {p:?}"
+    );
+    // Canary reopen is the first-wave actuator (0 if Avoid lands before probe Done).
+    let _ = m.canary_reopen;
+    let _ = m.writer_done_learned;
+    let warm = pevm
+        .execute_revm_parallel(
+            &chain,
+            &storage,
+            Default::default(),
+            BlockEnv::default(),
+            txs,
+            concurrency(),
+        )
+        .expect("warm");
+    let m2 = pevm.last_specfence_metrics().clone();
+    let p2 = pevm.last_exec_process();
+    assert_eq!(warm, sequential, "subgrain warm seq≡par: {m2:?}");
+    assert_eq!(m2.soft_wait_arms, 0, "warm SoftWait Soft=0: {m2:?}");
+    assert!(
+        p2.bind_total + m2.bind_residual + m2.edge_bind > 0,
+        "warm Done→Bind: process={p2:?} metrics={m2:?}"
+    );
+    assert!(
+        p2.independent_unfenced_total > 0 || m2.independent_unfenced > 0 || p2.unfenced_total > 0,
+        "independents may still Unfence: {p2:?}"
     );
 }

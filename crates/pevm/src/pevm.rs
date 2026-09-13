@@ -21,7 +21,8 @@ use revm::{
 };
 
 use crate::{
-    EvmAccount, MemoryEntry, MemoryLocation, MemoryLocationHash, MemoryValue, Storage, Task, TxIdx, TxVersion,
+    EvmAccount, MemoryEntry, MemoryLocation, MemoryLocationHash, MemoryValue, Storage, Task, TxIdx,
+    TxVersion,
     chain::PevmChain,
     compat::get_block_env,
     hash_deterministic,
@@ -29,10 +30,11 @@ use crate::{
     scheduler::Scheduler,
     specfence::{
         AccountHints, AdaptiveEngagement, AdaptiveParams, BayesMap, ConcurrencyMode, DEFAULT_TAU,
-        EdgeTable, ExecProcessSnapshot, HotSet, HotSketch, FineGrainCollector, FineGrainSnapshot,
-        HeatMap, InterBlockPrior, LiveLearner, LeanAbortRepair, MetricsInner, PartialRetryTable,
+        EdgeTable, ExecProcessSnapshot, FineGrainCollector, FineGrainSnapshot, HeatMap, HotSet,
+        HotSketch, InterBlockPrior, LeanAbortRepair, LiveLearner, MetricsInner, PartialRetryTable,
         ProcessTrace, RemCounters, ResearchAbortRepair, RwPriorMap, SpecDag, SpecFenceCtx,
-        SpecFenceMetrics, WaveParkTable, seed_wait_regions, update_bayes, update_heat, update_rw_prior,
+        SpecFenceMetrics, WaveParkTable, seed_wait_regions, update_bayes, update_heat,
+        update_rw_prior,
     },
     storage::StorageWrapper,
     vm::{
@@ -450,11 +452,7 @@ impl Pevm {
         if self.concurrency_mode == ConcurrencyMode::SpecFence {
             let flipped = self.inter_prior.take_last_flipped();
             let quiet = abc_prior_morph.is_some_and(|m| m.dominant_quiet());
-            sketch.seed_from_prior_morph(
-                &self.inter_prior.top_locations(),
-                flipped,
-                quiet,
-            );
+            sketch.seed_from_prior_morph(&self.inter_prior.top_locations(), flipped, quiet);
             if quiet {
                 let n = sketch.revoke_prior_fences_if_quiet(true);
                 metrics_inner.record_quiet_fence_revoke(n);
@@ -517,24 +515,29 @@ impl Pevm {
                     let mut sched_t0 = profile.then(Instant::now);
                     let mut task = scheduler.next_task_with_wave(wave_ref);
                     if let Some(t0) = sched_t0 {
-                        metrics_inner
-                            .add_profile_scheduler_ns(t0.elapsed().as_nanos() as u64);
+                        metrics_inner.add_profile_scheduler_ns(t0.elapsed().as_nanos() as u64);
                     }
                     while task.is_some() {
                         task = match task.unwrap() {
                             Task::Execution(tx_version) => {
-                                let fence_ref = if self.concurrency_mode == ConcurrencyMode::SpecFence {
-                                    Some(&dag)
-                                } else {
-                                    None
-                                };
-                                self.try_execute(&mut vm, &scheduler, tx_version, wave_ref, fence_ref)
+                                let fence_ref =
+                                    if self.concurrency_mode == ConcurrencyMode::SpecFence {
+                                        Some(&dag)
+                                    } else {
+                                        None
+                                    };
+                                self.try_execute(
+                                    &mut vm, &scheduler, tx_version, wave_ref, fence_ref,
+                                )
                             }
                             Task::Validation(tx_version) => {
                                 if profile {
                                     let v0 = Instant::now();
                                     let next = try_validate(
-                                        &mv_memory, &scheduler, &tx_version, specfence,
+                                        &mv_memory,
+                                        &scheduler,
+                                        &tx_version,
+                                        specfence,
                                     );
                                     metrics_inner
                                         .add_profile_validate_ns(v0.elapsed().as_nanos() as u64);
@@ -610,10 +613,8 @@ impl Pevm {
                 }
             }
         }
-        metrics_inner.set_park_resume_metrics(
-            wave.park_resume_at_k(),
-            wave.park_resume_full_retry(),
-        );
+        metrics_inner
+            .set_park_resume_metrics(wave.park_resume_at_k(), wave.park_resume_full_retry());
         if self.concurrency_mode == ConcurrencyMode::SpecFence {
             self.hotset.end_block();
             // P1: pack InterBlockPrior from live morph hat + top-ℓ (flip → higher α).
@@ -825,8 +826,8 @@ impl Pevm {
             return match vm.execute(&tx_version, result_slot) {
                 Ok(flags) => {
                     // PublishWrite ≈ incarnation finished: wake location waiters + ready.
-                    let task = scheduler
-                        .finish_execution_with_wave_fence(tx_version, flags, wave, fence);
+                    let task =
+                        scheduler.finish_execution_with_wave_fence(tx_version, flags, wave, fence);
                     // G4: SoftWait wake → wait_useful learner credit.
                     if let Some(fence) = fence {
                         vm.credit_softwait_wakes(fence);
@@ -879,8 +880,8 @@ impl Pevm {
                             park_k,
                             park_kind,
                         );
-                        if let Some(stolen) = scheduler
-                            .next_task_steal_after_park_prefer(wave, Some(blocking_tx_idx))
+                        if let Some(stolen) =
+                            scheduler.next_task_steal_after_park_prefer(wave, Some(blocking_tx_idx))
                         {
                             return Some(stolen);
                         }
@@ -926,9 +927,7 @@ fn try_validate(
     // Iter15: true_suffix flag for fan-out FR collapse / RebindOnly widen on abort path.
     let mut true_suffix_flag = false;
     if specfence.mode == ConcurrencyMode::SpecFence && !invalid.is_empty() {
-        specfence
-            .metrics
-            .record_region_validate_fail(invalid.len());
+        specfence.metrics.record_region_validate_fail(invalid.len());
         // RebindOnly-first (native resolve): patch origins when invalid reads now
         // have Data/Storage and there is no *true* failed-suffix write (first_k ≥
         // k_fail). Uncertified writes before k_fail must not block RebindOnly.
@@ -1010,6 +1009,9 @@ fn try_validate(
                     .current_data_value(tx_version.tx_idx, loc)
                     .is_some()
             });
+        let identity_held = specfence
+            .partial_retry
+            .identity_held(tx_version.tx_idx, &invalid);
         let mut value_stable = estimate_cleared
             && invalid.iter().all(|&loc| {
                 let cur = match mv_memory.current_data_value(tx_version.tx_idx, loc) {
@@ -1018,13 +1020,28 @@ fn try_validate(
                 };
                 if specfence
                     .partial_retry
-                    .value_stable_match(tx_version.tx_idx, loc, &cur)
+                    .identity_stable_match(tx_version.tx_idx, loc, &cur)
                 {
                     return true;
                 }
                 // Fallback: prior origin's published Basic/Storage == current.
                 mv_memory.prior_read_value_stable(tx_version.tx_idx, loc)
             });
+        // U4 identity wall: same writer + current Data + certified/FF match
+        // already covered above. If identity holds and Estimate cleared,
+        // also accept prior_read / snap after a brief yield (R1 over R2).
+        if !value_stable && identity_held && estimate_cleared && !invalid.is_empty() {
+            value_stable = invalid.iter().all(|&loc| {
+                let cur = match mv_memory.current_data_value(tx_version.tx_idx, loc) {
+                    Some(c) => c,
+                    None => return false,
+                };
+                specfence
+                    .partial_retry
+                    .identity_stable_match(tx_version.tx_idx, loc, &cur)
+                    || mv_memory.prior_read_value_stable(tx_version.tx_idx, loc)
+            });
+        }
         // Iter14 RebindOnly collapse: Estimate cleared but value not yet stable —
         // writers may be Executed without Validated tip. Brief Validated spin
         // (no park; SoftWait Soft=0), then recheck value_stable. Distinct from
@@ -1038,10 +1055,7 @@ fn try_validate(
                     .last_writer_before(loc, tx_version.tx_idx)
                     .or_else(|| mv_memory.residual_writer_before(loc, tx_version.tx_idx));
                 if let Some(w) = w {
-                    if w < tx_version.tx_idx
-                        && scheduler.is_done(w)
-                        && !scheduler.is_validated(w)
-                    {
+                    if w < tx_version.tx_idx && scheduler.is_done(w) && !scheduler.is_validated(w) {
                         need_validated = true;
                         break;
                     }
@@ -1054,9 +1068,7 @@ fn try_validate(
                     let all_ready = invalid.iter().all(|&loc| {
                         let w = mv_memory
                             .last_writer_before(loc, tx_version.tx_idx)
-                            .or_else(|| {
-                                mv_memory.residual_writer_before(loc, tx_version.tx_idx)
-                            });
+                            .or_else(|| mv_memory.residual_writer_before(loc, tx_version.tx_idx));
                         match w {
                             Some(w) if w < tx_version.tx_idx => {
                                 scheduler.is_validated(w) || !scheduler.is_done(w)
@@ -1076,7 +1088,7 @@ fn try_validate(
                     };
                     if specfence
                         .partial_retry
-                        .value_stable_match(tx_version.tx_idx, loc, &cur)
+                        .identity_stable_match(tx_version.tx_idx, loc, &cur)
                     {
                         return true;
                     }
@@ -1084,9 +1096,9 @@ fn try_validate(
                 });
             }
         }
-        // Prefer RebindOnly when !true_suffix, or when Estimate cleared + value-stable.
-        // Value-stable path allows multi-origin (lazy) → single current Data.
-        let rebound = if value_stable {
+        // Prefer RebindOnly when value-stable (incl. identity+FF). R2/R4 only
+        // when identity is truly lost. !true_suffix still tries origin patch.
+        let rebound = if value_stable || (identity_held && estimate_cleared && !true_suffix) {
             mv_memory.try_rebind_invalid_reads_value_stable(tx_version.tx_idx, &invalid)
         } else if !true_suffix {
             mv_memory.try_rebind_invalid_reads(tx_version.tx_idx, &invalid)
@@ -1097,7 +1109,9 @@ fn try_validate(
             specfence.metrics.record_partial_retry();
             specfence.metrics.record_rebind_only();
             specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
-            specfence.partial_retry.clear_force_writers(tx_version.tx_idx);
+            specfence
+                .partial_retry
+                .clear_force_writers(tx_version.tx_idx);
             specfence.partial_retry.clear_repair(tx_version.tx_idx);
             specfence.partial_retry.clear_ff_head(tx_version.tx_idx);
             specfence
@@ -1175,20 +1189,12 @@ fn try_validate(
             for &loc in &invalid {
                 let w = mv_memory
                     .last_writer_before(loc, tx_version.tx_idx)
-                    .or_else(|| {
-                        mv_memory.residual_writer_before(loc, tx_version.tx_idx)
-                    })
-                    .or_else(|| {
-                        specfence
-                            .sketch
-                            .next_writer_before(loc, tx_version.tx_idx)
-                    });
+                    .or_else(|| mv_memory.residual_writer_before(loc, tx_version.tx_idx))
+                    .or_else(|| specfence.sketch.next_writer_before(loc, tx_version.tx_idx));
                 if let Some(w) = w.filter(|&w| w < tx_version.tx_idx) {
-                    specfence.partial_retry.note_force_writer(
-                        tx_version.tx_idx,
-                        loc,
-                        w,
-                    );
+                    specfence
+                        .partial_retry
+                        .note_force_writer(tx_version.tx_idx, loc, w);
                     specfence.metrics.record_writer_identity_preserved();
                 }
             }
@@ -1234,9 +1240,7 @@ fn try_validate(
             // SuffixRepair (depth>=3) before FullRestart — head-FF still retained
             // on escalate (Iter5). Without cheap resume, keep classic escalate.
             // No Lean jump / SoftWait Soft.
-            let cheap_resume = specfence
-                .partial_retry
-                .is_rewind_resume(tx_version.tx_idx)
+            let cheap_resume = specfence.partial_retry.is_rewind_resume(tx_version.tx_idx)
                 || specfence
                     .partial_retry
                     .has_ff_resume_values(tx_version.tx_idx)
@@ -1266,9 +1270,7 @@ fn try_validate(
                 for location in &invalid {
                     let w = mv_memory
                         .last_writer_before(*location, tx_version.tx_idx)
-                        .or_else(|| {
-                            mv_memory.residual_writer_before(*location, tx_version.tx_idx)
-                        });
+                        .or_else(|| mv_memory.residual_writer_before(*location, tx_version.tx_idx));
                     if let Some(w) = w {
                         if w >= tx_version.tx_idx {
                             continue;
@@ -1305,9 +1307,7 @@ fn try_validate(
                 for location in &invalid {
                     let w = mv_memory
                         .last_writer_before(*location, tx_version.tx_idx)
-                        .or_else(|| {
-                            mv_memory.residual_writer_before(*location, tx_version.tx_idx)
-                        });
+                        .or_else(|| mv_memory.residual_writer_before(*location, tx_version.tx_idx));
                     if let Some(w) = w {
                         if w >= tx_version.tx_idx {
                             continue;
@@ -1342,7 +1342,9 @@ fn try_validate(
             }
             let repair = if escalate {
                 // Drop sticky force_bind; retain certified FF values for head reexec.
-                specfence.partial_retry.escalate_full_restart(tx_version.tx_idx)
+                specfence
+                    .partial_retry
+                    .escalate_full_restart(tx_version.tx_idx)
             } else {
                 let plan = cached_plan.clone().unwrap_or_else(|| {
                     specfence.partial_retry.plan_partial_retry(
@@ -1356,7 +1358,9 @@ fn try_validate(
                     .partial_retry
                     .apply_suffix_repair_planned(tx_version.tx_idx, plan);
                 if repair.did_force_bind() {
-                    specfence.partial_retry.note_suffix_repair(tx_version.tx_idx);
+                    specfence
+                        .partial_retry
+                        .note_suffix_repair(tx_version.tx_idx);
                 }
                 repair
             };
@@ -1392,28 +1396,25 @@ fn try_validate(
                 }
                 // C: abort morph may flip Quiet→Storm (598→599 style evidence).
                 let morph = specfence.learner.morph_weights();
-                let _ = specfence.engagement.maybe_flip_mode(
-                    morph.fan_out,
-                    morph.mixed,
-                    morph.quiet,
-                );
+                let _ =
+                    specfence
+                        .engagement
+                        .maybe_flip_mode(morph.fan_out, morph.mixed, morph.quiet);
             }
             specfence.learner.note_reexec_cost(repair.reexec_cost());
             // SuffixRepair → invalidate failed suffix only; else selective/full.
             let fence_locs: Vec<_> = match &repair {
                 LeanAbortRepair::SuffixRepair { suffix_writes, .. } => {
                     specfence.metrics.record_rewind_to_cp();
-                    let estimated = mv_memory
-                        .invalidate_partial_suffix(tx_version.tx_idx, suffix_writes);
+                    let estimated =
+                        mv_memory.invalidate_partial_suffix(tx_version.tx_idx, suffix_writes);
                     if !estimated.is_empty() {
                         specfence
                             .metrics
                             .record_selective_invalidate(estimated.len());
                     }
                     for &loc in &estimated {
-                        specfence
-                            .sketch
-                            .forget_writer(loc, tx_version.tx_idx);
+                        specfence.sketch.forget_writer(loc, tx_version.tx_idx);
                     }
                     if estimated.is_empty() {
                         if suffix_writes.is_empty() {
@@ -1429,17 +1430,15 @@ fn try_validate(
                     // Certified prefix without mid-tx cp: ESTIMATE failed suffix only.
                     // Never invalidate_selective here — aborted stamp + ESTIMATE would
                     // poison ForceBound prefix Data and drive BlockingOther parks.
-                    let estimated = mv_memory
-                        .invalidate_partial_suffix(tx_version.tx_idx, suffix_writes);
+                    let estimated =
+                        mv_memory.invalidate_partial_suffix(tx_version.tx_idx, suffix_writes);
                     if !estimated.is_empty() {
                         specfence
                             .metrics
                             .record_selective_invalidate(estimated.len());
                     }
                     for &loc in &estimated {
-                        specfence
-                            .sketch
-                            .forget_writer(loc, tx_version.tx_idx);
+                        specfence.sketch.forget_writer(loc, tx_version.tx_idx);
                     }
                     if estimated.is_empty() {
                         if suffix_writes.is_empty() {
@@ -1475,8 +1474,8 @@ fn try_validate(
                             .copied()
                             .filter(|l| !protect.contains(l))
                             .collect();
-                        let estimated = mv_memory
-                            .invalidate_partial_suffix(tx_version.tx_idx, &suffix);
+                        let estimated =
+                            mv_memory.invalidate_partial_suffix(tx_version.tx_idx, &suffix);
                         if !estimated.is_empty() {
                             specfence
                                 .metrics
@@ -1525,14 +1524,12 @@ fn try_validate(
             // C: live morph after abort may flip Quiet→Storm (actuates Await set).
             {
                 let morph = specfence.learner.morph_weights();
-                let _ = specfence.engagement.maybe_flip_mode(
-                    morph.fan_out,
-                    morph.mixed,
-                    morph.quiet,
-                );
+                let _ =
+                    specfence
+                        .engagement
+                        .maybe_flip_mode(morph.fan_out, morph.mixed, morph.quiet);
             }
-            let rewind_to =
-                mv_memory.min_higher_reader_of(tx_version.tx_idx, &fence_locs);
+            let rewind_to = mv_memory.min_higher_reader_of(tx_version.tx_idx, &fence_locs);
             let block_size = scheduler.block_size();
             let cascade_from = tx_version.tx_idx + 1;
             let (cascade, skipped) = match rewind_to {
@@ -1562,9 +1559,7 @@ fn try_validate(
                 for location in &invalid {
                     let w = mv_memory
                         .last_writer_before(*location, tx_version.tx_idx)
-                        .or_else(|| {
-                            mv_memory.residual_writer_before(*location, tx_version.tx_idx)
-                        });
+                        .or_else(|| mv_memory.residual_writer_before(*location, tx_version.tx_idx));
                     if let Some(w) = w {
                         if w < tx_version.tx_idx && scheduler.is_executing(w) {
                             let fan = mv_memory.higher_readers_of(*location, w).len();
@@ -1599,10 +1594,8 @@ fn try_validate(
                     if let Some((w, _)) = best {
                         if scheduler.add_dependency_from_aborting(tx_version.tx_idx, w) {
                             specfence.metrics.record_first_repair_await();
-                            return scheduler.finish_validation_fenced_barrier_park(
-                                tx_version,
-                                rewind_to,
-                            );
+                            return scheduler
+                                .finish_validation_fenced_barrier_park(tx_version, rewind_to);
                         }
                     }
                 }
@@ -1613,16 +1606,13 @@ fn try_validate(
             // Iter8: first-repair Estimate park falsified (wall↑ / sra↑). SoftWait Soft=0.
             // Not SoftWait Soft; not storm-wide fanout Await (fail locs only).
             if !escalate && was_force_bind && specfence.engagement.is_storm() {
-
                 // Hang-free: only park behind *Executing* fail-loc writers (Iter3
                 // lesson). Ready/Aborting deps idle the 2nd resume (wall↑ on N=5).
                 let mut best: Option<(crate::TxIdx, usize)> = None;
                 for location in &invalid {
                     let w = mv_memory
                         .last_writer_before(*location, tx_version.tx_idx)
-                        .or_else(|| {
-                            mv_memory.residual_writer_before(*location, tx_version.tx_idx)
-                        });
+                        .or_else(|| mv_memory.residual_writer_before(*location, tx_version.tx_idx));
                     if let Some(w) = w {
                         if w < tx_version.tx_idx && scheduler.is_executing(w) {
                             let fan = mv_memory.higher_readers_of(*location, w).len();
@@ -1639,10 +1629,8 @@ fn try_validate(
                 if let Some((w, _)) = best {
                     if scheduler.add_dependency_from_aborting(tx_version.tx_idx, w) {
                         specfence.metrics.record_second_repair_await();
-                        return scheduler.finish_validation_fenced_barrier_park(
-                            tx_version,
-                            rewind_to,
-                        );
+                        return scheduler
+                            .finish_validation_fenced_barrier_park(tx_version, rewind_to);
                     }
                 }
             }
@@ -1666,14 +1654,11 @@ fn try_validate(
                 // try claims in fan-desc order. Cap still 1 successful claim/tx.
                 // No sibling-park (Iter4 hang). No Executed→Validated abort-path
                 // spin (Iter12/13a wall↑ — same family as evidence spins).
-                let mut best_by_w: HashMap<TxIdx, (MemoryLocationHash, usize)> =
-                    HashMap::new();
+                let mut best_by_w: HashMap<TxIdx, (MemoryLocationHash, usize)> = HashMap::new();
                 for location in &invalid {
                     let w = mv_memory
                         .last_writer_before(*location, tx_version.tx_idx)
-                        .or_else(|| {
-                            mv_memory.residual_writer_before(*location, tx_version.tx_idx)
-                        });
+                        .or_else(|| mv_memory.residual_writer_before(*location, tx_version.tx_idx));
                     if let Some(w) = w {
                         if w >= tx_version.tx_idx {
                             continue;
@@ -1705,14 +1690,17 @@ fn try_validate(
                         if fan > 1 {
                             specfence.metrics.record_serial_barrier_clique();
                         }
-                        return scheduler.finish_validation_fenced_barrier_park(
-                            tx_version,
-                            rewind_to,
-                        );
+                        return scheduler
+                            .finish_validation_fenced_barrier_park(tx_version, rewind_to);
                     }
                 }
             }
-            return scheduler.finish_validation_fenced(tx_version, true, rewind_to, Some(specfence.wave));
+            return scheduler.finish_validation_fenced(
+                tx_version,
+                true,
+                rewind_to,
+                Some(specfence.wave),
+            );
         }
         // Snapshot write locations before invalidate (same set).
         let write_locations = if specfence.mode == ConcurrencyMode::SpecFence {
@@ -1754,9 +1742,7 @@ fn try_validate(
                 .partial_retry
                 .disable_jump_after_failed_resume(tx_version.tx_idx);
             // M3: learn WŜ from aborted incarnation + first-pass miss metrics.
-            specfence
-                .rw_prior
-                .observe_write_set(&write_locations, None);
+            specfence.rw_prior.observe_write_set(&write_locations, None);
             let mut first_pass = 0usize;
             let cascade_hint = invalid.len().max(1);
             for location in &invalid {
@@ -1766,7 +1752,9 @@ fn try_validate(
                 specfence.hotset.note_abort(*location);
                 specfence.learner.note_abort(*location, cascade_hint);
                 if specfence.rw_prior.predicts_write(*location)
-                    || mv_memory.residual_writer_before(*location, tx_version.tx_idx).is_some()
+                    || mv_memory
+                        .residual_writer_before(*location, tx_version.tx_idx)
+                        .is_some()
                 {
                     first_pass += 1;
                     specfence.metrics.record_prior_bind_miss();
@@ -1805,8 +1793,8 @@ fn try_validate(
                     specfence.metrics.record_partial_retry();
                     specfence.metrics.record_rewind_to_cp();
                     specfence.learner.note_reexec_cost(reexec_cost);
-                    let estimated = mv_memory
-                        .invalidate_partial_suffix(tx_version.tx_idx, &suffix_writes);
+                    let estimated =
+                        mv_memory.invalidate_partial_suffix(tx_version.tx_idx, &suffix_writes);
                     if !estimated.is_empty() {
                         specfence
                             .metrics
@@ -1818,14 +1806,12 @@ fn try_validate(
                         estimated
                     }
                 }
-                ResearchAbortRepair::FullRestart { .. } => {
-                    research_full_restart_invalidate(
-                        &specfence,
-                        mv_memory,
-                        tx_version,
-                        &write_locations,
-                    )
-                }
+                ResearchAbortRepair::FullRestart { .. } => research_full_restart_invalidate(
+                    &specfence,
+                    mv_memory,
+                    tx_version,
+                    &write_locations,
+                ),
             };
 
             let rewind_to = mv_memory.min_higher_reader_of(tx_version.tx_idx, &fence_locs);
@@ -1842,7 +1828,12 @@ fn try_validate(
                 None => (0, block_size.saturating_sub(cascade_from)),
             };
             specfence.metrics.record_fence_cascade(cascade, skipped);
-            return scheduler.finish_validation_fenced(tx_version, true, rewind_to, Some(specfence.wave));
+            return scheduler.finish_validation_fenced(
+                tx_version,
+                true,
+                rewind_to,
+                Some(specfence.wave),
+            );
         }
         // OCC / PCC: full write-set ESTIMATE (unchanged).
         let occ_write_locs = mv_memory.write_locations(tx_version.tx_idx);
@@ -1894,9 +1885,7 @@ fn try_validate(
             specfence.metrics.record_await_at_a_wake_ok();
         }
         // Successful validation clears PartialRetry / RewindTo state for this tx.
-        specfence
-            .partial_retry
-            .clear_force_bind(tx_version.tx_idx);
+        specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
         specfence
             .partial_retry
             .clear_force_writers(tx_version.tx_idx);
@@ -1919,9 +1908,7 @@ fn try_validate(
         specfence.rem.note_checkpoint_opportunity();
         let read_locations = mv_memory.read_locations(tx_version.tx_idx);
         for location in &read_locations {
-            if *location
-                == hash_deterministic(MemoryLocation::Basic(specfence.beneficiary))
-            {
+            if *location == hash_deterministic(MemoryLocation::Basic(specfence.beneficiary)) {
                 continue;
             }
             if mv_memory.regions.location_mode(*location) == crate::specfence::RegionMode::Wait {
@@ -1931,7 +1918,6 @@ fn try_validate(
     }
     scheduler.finish_validation(tx_version, aborted)
 }
-
 
 /// Research-inspect FullRestart arm (shared by duplicate match arms).
 /// Clears force-bind/repair, selective-invalidates, records FullRestart metrics.

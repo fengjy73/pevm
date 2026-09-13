@@ -82,7 +82,6 @@ fn load_block(
     })
 }
 
-
 fn percentile_sorted(sorted: &[f64], p: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;
@@ -125,7 +124,11 @@ fn run_one(
     let t0 = Instant::now();
     let result = pevm.execute(chain, &loaded.storage, &loaded.block, cores_nz, false);
     let elapsed = t0.elapsed().as_secs_f64();
-    let tps = if elapsed > 0.0 { n as f64 / elapsed } else { 0.0 };
+    let tps = if elapsed > 0.0 {
+        n as f64 / elapsed
+    } else {
+        0.0
+    };
     match result {
         Ok(_) => {
             let m = pevm.last_specfence_metrics();
@@ -169,7 +172,11 @@ fn main() {
     });
     println!(
         "G7 dig tag={:?} softwait_disabled={softwait_disabled}",
-        if tag.is_empty() { "default".into() } else { tag.clone() }
+        if tag.is_empty() {
+            "default".into()
+        } else {
+            tag.clone()
+        }
     );
 
     // --- Flip smoke: quiet 598 → mixed 599 on same Pevm (InterBlockPrior α flip) ---
@@ -179,7 +186,12 @@ fn main() {
     pevm.reset_inter_prior();
     let mut flip_rows = Vec::new();
     for bn in [19_606_598u64, 19_606_599u64] {
-        let Some(loaded) = load_block(&data_dir, bn, Arc::clone(&bytecodes), Arc::clone(&block_hashes)) else {
+        let Some(loaded) = load_block(
+            &data_dir,
+            bn,
+            Arc::clone(&bytecodes),
+            Arc::clone(&block_hashes),
+        ) else {
             continue;
         };
         let (ok, tps, _ms, soft, wh, aborts) = run_one(&chain, &mut pevm, &loaded, 8);
@@ -217,7 +229,12 @@ fn main() {
     let mut sweep_rows = Vec::new();
     let mut multi_summaries = Vec::new();
     for bn in cores_blocks {
-        let Some(loaded) = load_block(&data_dir, bn, Arc::clone(&bytecodes), Arc::clone(&block_hashes)) else {
+        let Some(loaded) = load_block(
+            &data_dir,
+            bn,
+            Arc::clone(&bytecodes),
+            Arc::clone(&block_hashes),
+        ) else {
             continue;
         };
         for mode in ["occ", "specfence"] {
@@ -268,7 +285,14 @@ fn main() {
                         proc.independent_unfenced_total,
                         proc.per_tx.len(),
                         proc.reason_histogram,
-                        hot.map(|h| (h.location, h.unfenced, h.wait_for, h.bind, h.unfenced_after_avoid, h.unfenced_after_canary)),
+                        hot.map(|h| (
+                            h.location,
+                            h.unfenced,
+                            h.wait_for,
+                            h.bind,
+                            h.unfenced_after_avoid,
+                            h.unfenced_after_canary
+                        )),
                     );
                     let metrics_json = serde_json::json!({
                         "edge_bind": m.edge_bind,
@@ -284,6 +308,9 @@ fn main() {
                         "multi_spine_admit": m.multi_spine_admit,
                         "quiet_fence_revoke": m.quiet_fence_revoke,
                         "writer_identity_preserved": m.writer_identity_preserved,
+                        "bind_residual": m.bind_residual,
+                        "canary_reopen": m.canary_reopen,
+                        "writer_done_learned": m.writer_done_learned,
                         "ready_steal_on_wait": m.ready_steal_on_wait,
                         "wait_park_count": m.wait_park_count,
                         "wait_park_ns": m.wait_park_ns,
@@ -327,12 +354,17 @@ fn main() {
                             let e = abort_by_tx
                                 .entry(a.tx_idx.to_string())
                                 .or_insert_with(|| serde_json::json!({"n_abort": 0, "max_incarnation": 0, "cascade_sum": 0}));
-                            e["n_abort"] = serde_json::json!(e["n_abort"].as_u64().unwrap_or(0) + 1);
+                            e["n_abort"] =
+                                serde_json::json!(e["n_abort"].as_u64().unwrap_or(0) + 1);
                             e["max_incarnation"] = serde_json::json!(
-                                e["max_incarnation"].as_u64().unwrap_or(0).max(a.incarnation as u64)
+                                e["max_incarnation"]
+                                    .as_u64()
+                                    .unwrap_or(0)
+                                    .max(a.incarnation as u64)
                             );
                             e["cascade_sum"] = serde_json::json!(
-                                e["cascade_sum"].as_u64().unwrap_or(0) + a.cascade_validations as u64
+                                e["cascade_sum"].as_u64().unwrap_or(0)
+                                    + a.cascade_validations as u64
                             );
                         }
                     }
@@ -413,7 +445,11 @@ fn main() {
                         "  block={bn} mode={mode:10} iter={}/{} ok={ok} tps={tps:.0} wall_ms={wall_ms:.1} soft={soft} wait_hard={wh} abort_rate={:.3} lean={} evm={} reexec={} fb_reabort={} fra={} sra={} sb_res={} sb_def={} hsstore={} bsnap={} bcredit={} sb_clique={} jdef={} aj={} rebind={} ffc={} fvd={} fab={} cold={} occ_fast={} steal={} park_k={} await_a={} await_ok={} eng_sw={} mw_ms={:.1} h_ms={:.1} v_ms={:.1} park_ms={:.1} sw_ms={:.1} ea_ms={:.1} bo_ms={:.1} parks={}",
                         i + 1,
                         iters,
-                        if n == 0 { 0.0 } else { aborts as f64 / n as f64 },
+                        if n == 0 {
+                            0.0
+                        } else {
+                            aborts as f64 / n as f64
+                        },
                         m.lean_mode_txs,
                         m.evm_entries,
                         reexec_entries,
@@ -507,7 +543,8 @@ fn main() {
                     row["park_ns_softwait"] = serde_json::json!(m.park_ns_softwait);
                     row["park_count_early_abort"] = serde_json::json!(m.park_count_early_abort);
                     row["park_ns_early_abort"] = serde_json::json!(m.park_ns_early_abort);
-                    row["park_count_blocking_other"] = serde_json::json!(m.park_count_blocking_other);
+                    row["park_count_blocking_other"] =
+                        serde_json::json!(m.park_count_blocking_other);
                     row["park_ns_blocking_other"] = serde_json::json!(m.park_ns_blocking_other);
                     row["inspector_steps"] = serde_json::json!(m.inspector_steps);
                     row["inspector_steps_resume"] = serde_json::json!(m.inspector_steps_resume);
@@ -556,20 +593,30 @@ fn main() {
     // Ratios
     let mut ratios = Vec::new();
     for bn in cores_blocks {
-        let occ = sweep_rows.iter().find(|r| r["block"] == bn && r["mode"] == "occ");
-        let sf = sweep_rows.iter().find(|r| r["block"] == bn && r["mode"] == "specfence");
+        let occ = sweep_rows
+            .iter()
+            .find(|r| r["block"] == bn && r["mode"] == "occ");
+        let sf = sweep_rows
+            .iter()
+            .find(|r| r["block"] == bn && r["mode"] == "specfence");
         if let (Some(o), Some(s)) = (occ, sf) {
             let ot = o["tps"].as_f64().unwrap_or(0.0);
             let st = s["tps"].as_f64().unwrap_or(0.0);
             let ratio = if ot > 0.0 { st / ot } else { 0.0 };
-            ratios.push(serde_json::json!({"block": bn, "sf_occ": ratio, "sf_tps": st, "occ_tps": ot}));
+            ratios.push(
+                serde_json::json!({"block": bn, "sf_occ": ratio, "sf_tps": st, "occ_tps": ot}),
+            );
             println!("  SF/OCC@8 block={bn}: {ratio:.3}");
         }
     }
     let mean = if ratios.is_empty() {
         0.0
     } else {
-        ratios.iter().map(|r| r["sf_occ"].as_f64().unwrap()).sum::<f64>() / ratios.len() as f64
+        ratios
+            .iter()
+            .map(|r| r["sf_occ"].as_f64().unwrap())
+            .sum::<f64>()
+            / ratios.len() as f64
     };
     println!("  mean SF/OCC@8 = {mean:.3} (v8 baseline ~0.325 on different block set)");
 
@@ -582,7 +629,10 @@ fn main() {
     if xblock {
         println!("=== complete-arch xblock contiguous families ===");
         let families: &[(&str, &[u64])] = &[
-            ("597", &[14_689_595, 14_689_596, 14_689_597, 14_689_598, 14_689_599]),
+            (
+                "597",
+                &[14_689_595, 14_689_596, 14_689_597, 14_689_598, 14_689_599],
+            ),
             ("599", &[19_606_597, 19_606_598, 19_606_599, 19_606_600]),
             ("097", &[19_469_096, 19_469_097, 19_469_098, 19_469_099]),
         ];
@@ -601,8 +651,7 @@ fn main() {
                 ) else {
                     continue;
                 };
-                let (ok, tps, wall_ms, soft, wh, aborts) =
-                    run_one(&chain, &mut warm, &loaded, 8);
+                let (ok, tps, wall_ms, soft, wh, aborts) = run_one(&chain, &mut warm, &loaded, 8);
                 let m = warm.last_specfence_metrics();
                 println!(
                     "  fam={fam} block={bn} mode=sf-warm ok={ok} tps={tps:.0} wall_ms={wall_ms:.1} soft={soft} wait_hard={wh} aborts={aborts} edge_bind={} edge_wait={} edge_unfenced={} avoid={} canary={} indep={} spine={} hot={}",
@@ -681,6 +730,9 @@ fn main() {
                     "multi_spine_admit": m.multi_spine_admit,
                     "quiet_fence_revoke": m.quiet_fence_revoke,
                     "writer_identity_preserved": m.writer_identity_preserved,
+                    "bind_residual": m.bind_residual,
+                    "canary_reopen": m.canary_reopen,
+                    "writer_done_learned": m.writer_done_learned,
                 }));
             }
             for &bn in *blocks {
@@ -745,16 +797,21 @@ fn main() {
         println!("wrote {x_path:?}");
     }
     let sweep_path = out_dir.join(&sweep_name);
-    std::fs::write(&sweep_path, serde_json::to_string_pretty(&serde_json::json!({
-        "test": "SF vs OCC@8 architecture cores",
-        "tag": if tag.is_empty() { serde_json::Value::Null } else { serde_json::json!(tag) },
-        "softwait_disabled": softwait_disabled,
-        "iters": iters,
-        "v8_mean_reference": 0.325,
-        "mean_sf_occ": mean,
-        "ratios": ratios,
-        "multi_run_597": multi_summaries,
-        "rows": sweep_rows,
-    })).unwrap()).unwrap();
+    std::fs::write(
+        &sweep_path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "test": "SF vs OCC@8 architecture cores",
+            "tag": if tag.is_empty() { serde_json::Value::Null } else { serde_json::json!(tag) },
+            "softwait_disabled": softwait_disabled,
+            "iters": iters,
+            "v8_mean_reference": 0.325,
+            "mean_sf_occ": mean,
+            "ratios": ratios,
+            "multi_run_597": multi_summaries,
+            "rows": sweep_rows,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     println!("wrote {sweep_path:?}");
 }

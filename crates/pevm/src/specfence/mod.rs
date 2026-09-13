@@ -142,80 +142,81 @@ use alloy_primitives::Address;
 use hashbrown::HashMap;
 
 mod bayes;
-mod edge;
-mod process;
-mod sketch;
-mod engagement;
-mod prior;
 mod boundary;
 mod dag;
+mod edge;
+mod engagement;
 #[allow(missing_docs)]
 mod finegrain;
 mod heat;
 mod hotset;
 mod learner;
 mod metrics;
+mod prior;
+mod process;
 mod region;
 mod rem;
 mod resolve;
+mod sketch;
 
 pub(crate) use bayes::{BayesMap, DEFAULT_TAU};
-pub(crate) use engagement::{AdaptiveEngagement, profile_timing_enabled, research_inspect_enabled};
-pub(crate) use hotset::HotSet;
+pub use boundary::SpecFenceInspector;
 #[allow(unused_imports)]
-pub(crate) use hotset::{H_A, H_W};
-pub(crate) use prior::RwPriorMap;
-pub(crate) use dag::{FenceGraph, SpecDag};
-pub(crate) use learner::{
-    AdaptiveParams, InterBlockPrior, LiveLearner,
+pub(crate) use boundary::{
+    BindSnapMode, BoundarySnapshot, CachedCallOutcome, JournalBlob, absolute_jump_eligible,
+    absolute_jump_env_enabled, arm_call_outcome_cache, arm_ff_origin_seeds, arm_pc_resume,
+    arm_pending_effect_cp_only, attach_current_live_snap, bind_snap_capture_wanted,
+    bind_snap_env_enabled, bind_snap_jump_enabled, bind_snap_mode, clear_pc_resume,
+    handler_bind_snap_install_wanted, handler_sstore_plant_install_wanted, in_inspect_run,
+    install_handler_bind_snap_capture, install_handler_sstore_plant_capture, jump_is_safe,
+    jump_refuse_reason, last_boundary_snap, nested_bind_consume_enabled, nested_bind_stash_armed,
+    note_pending_bind_snap, note_pending_effect_boundary, pending_resume_armed, plant_tls_active,
+    resume_was_applied, steps_this_run, suffix_repair_jump_env_ok, take_ff_origin_seeds,
+    try_apply_pending_pc_resume, try_arm_safe_absolute_jump, try_arm_safe_absolute_jump_gated,
+    try_consume_nested_bind_resume, with_bind_snap_tls, with_plant_tls, with_plant_tls_journal,
 };
-pub(crate) use heat::HeatMap;
-pub(crate) use metrics::MetricsInner;
-pub use metrics::SpecFenceMetrics;
+pub(crate) use dag::{FenceGraph, SpecDag};
+pub(crate) use edge::{
+    EdgeAction, EdgeKey, EdgeKind, EdgeState, EdgeTable, EdgeView, choose_edge_action,
+};
+pub(crate) use engagement::{AdaptiveEngagement, profile_timing_enabled, research_inspect_enabled};
 pub use finegrain::{
     AbortEvent, AccountGrainObserve, ConsumerFirstCross, DagStats, EffectClass, EffectLogEntry,
-    FineGrainCollector, FineGrainSnapshot, EffectStreamDiag, HotLocation, L1DagSummary,
-    LocationKind, MaMdProxy, MeasurementMethod, RawEffectEdge, TxRw, RawEdge, TxWorkTotal,
+    EffectStreamDiag, FineGrainCollector, FineGrainSnapshot, HotLocation, L1DagSummary,
+    LocationKind, MaMdProxy, MeasurementMethod, RawEdge, RawEffectEdge, TxRw, TxWorkTotal,
     analyze_dag, classify_raw_edges, dependency_edges, effect_raw_longest_chain,
     effect_raw_max_fanout, estimate_ma_md, filter_effect_edges, hot_locations, kind_histogram,
     l1_dag_summary, percentile_f64, producer_status_canonical, program_raw_longest_chain,
 };
+pub(crate) use heat::HeatMap;
+pub(crate) use hotset::HotSet;
+#[allow(unused_imports)]
+pub(crate) use hotset::{H_A, H_W};
+pub(crate) use learner::{AdaptiveParams, InterBlockPrior, LiveLearner};
+pub(crate) use metrics::MetricsInner;
+pub use metrics::SpecFenceMetrics;
+pub(crate) use prior::RwPriorMap;
+pub(crate) use process::ProcessTrace;
+pub use process::{ExecProcessSnapshot, LocProcessSnap, PerTxProcessSnap, ProcessReason};
 pub use region::RegionMode;
 pub(crate) use region::RegionTable;
-pub(crate) use rem::RemCounters;
 pub(crate) use rem::PartialRetryTable;
+pub(crate) use rem::RemCounters;
 pub(crate) use rem::WaveParkTable;
-#[allow(unused_imports)]
-pub(crate) use boundary::{
-    absolute_jump_eligible, absolute_jump_env_enabled, suffix_repair_jump_env_ok, arm_call_outcome_cache, arm_pc_resume, arm_ff_origin_seeds, take_ff_origin_seeds, clear_pc_resume, in_inspect_run,
-    jump_is_safe, jump_refuse_reason, last_boundary_snap, attach_current_live_snap, note_pending_effect_boundary,
-    arm_pending_effect_cp_only,
-    resume_was_applied, steps_this_run, try_arm_safe_absolute_jump, try_arm_safe_absolute_jump_gated,
-    with_plant_tls, with_plant_tls_journal, BoundarySnapshot, CachedCallOutcome, JournalBlob,
-    plant_tls_active, pending_resume_armed, try_apply_pending_pc_resume, nested_bind_consume_enabled, nested_bind_stash_armed, try_consume_nested_bind_resume, handler_sstore_plant_install_wanted, install_handler_sstore_plant_capture,
-    handler_bind_snap_install_wanted, install_handler_bind_snap_capture, with_bind_snap_tls, note_pending_bind_snap, bind_snap_env_enabled,
-    bind_snap_mode, bind_snap_capture_wanted, bind_snap_jump_enabled, BindSnapMode,
-};
-pub use boundary::SpecFenceInspector;
 #[allow(unused_imports)]
 pub(crate) use rem::{
     AccessMode, Checkpoint, CheckpointId, CheckpointKind, EffectOrdinal, FfValue, LeanAbortRepair,
-    ParkedWait, ParkKind, ParkResumeIntent, ParkResumeKind, PartialRetryPlan, PartialRetryState,
+    ParkKind, ParkResumeIntent, ParkResumeKind, ParkedWait, PartialRetryPlan, PartialRetryState,
     PendingPark, RegionAccess, RemTask, RepairPlan, ResearchAbortRepair, ResumeContinuation,
     StorageWriteReplay,
 };
-pub(crate) use edge::{
-    choose_edge_action, EdgeAction, EdgeKey, EdgeKind, EdgeState, EdgeTable, EdgeView,
-};
-pub use process::{ExecProcessSnapshot, LocProcessSnap, PerTxProcessSnap, ProcessReason};
-pub(crate) use process::ProcessTrace;
-pub(crate) use sketch::HotSketch;
-pub(crate) use resolve::{PolicyCtx, ResolveAction, choose_action};
 #[allow(unused_imports)]
 pub(crate) use resolve::{
-    BindTarget, EvScores, SelectiveOutcome, C_RETRY, COST_MARGIN, D_EARLY, D_WAIT, TAU_REVOKE,
+    BindTarget, C_RETRY, COST_MARGIN, D_EARLY, D_WAIT, EvScores, SelectiveOutcome, TAU_REVOKE,
     TAU_S, TAU_VERY_HIGH, TAU_W, compute_ev, cost_prefers_wait, early_val_probability,
 };
+pub(crate) use resolve::{PolicyCtx, ResolveAction, choose_action};
+pub(crate) use sketch::{HotSketch, ResidualBind};
 
 /// Selectable concurrency control for parallel block execution.
 ///
@@ -352,7 +353,10 @@ impl<'a> SpecFenceCtx<'a> {
         false
     }
 
-    /// Choose ResolveAction for a SpecFence location read (AEC argmin EV).
+    /// Retired AEC EV π. Live path is `choose_edge_action` only.
+    /// AdaptiveParams αβγδ / meta_budget / d_wait do **not** choose
+    /// Bind/WaitFor/Unfenced. Kept so lab tests still compile.
+    #[allow(dead_code)]
     pub(crate) fn choose_resolve(
         &self,
         location: crate::MemoryLocationHash,
@@ -370,7 +374,9 @@ impl<'a> SpecFenceCtx<'a> {
         tx_heavy_hint: bool,
     ) -> ResolveAction {
         let posterior_conflict = self.bayes.conflict_probability(location, Some(address));
-        let posterior_bind = self.bayes.bind_useful_probability(location)
+        let posterior_bind = self
+            .bayes
+            .bind_useful_probability(location)
             .max(self.rw_prior.write_confidence(location));
         // M3: residual / process prior makes a published version a Bind placeholder.
         let prior = residual_predicts || prior_ws_predicts;
@@ -419,7 +425,8 @@ impl<'a> SpecFenceCtx<'a> {
                 } else {
                     self.metrics.record_cost_chose_wait_handler();
                 }
-                self.bayes.note_cost_decision_posterior(posterior_conflict, true);
+                self.bayes
+                    .note_cost_decision_posterior(posterior_conflict, true);
             }
             ResolveAction::EarlyAbort => {
                 // EarlyAbort niche — count as wait-side cost choice + early_abort.
@@ -430,7 +437,8 @@ impl<'a> SpecFenceCtx<'a> {
                     self.metrics.record_cost_chose_wait_handler();
                 }
                 self.metrics.record_early_abort();
-                self.bayes.note_cost_decision_posterior(posterior_conflict, true);
+                self.bayes
+                    .note_cost_decision_posterior(posterior_conflict, true);
             }
             ResolveAction::SpecRead => {
                 self.metrics.record_cost_chose_spec();
@@ -439,7 +447,8 @@ impl<'a> SpecFenceCtx<'a> {
                 } else {
                     self.metrics.record_cost_chose_spec_handler();
                 }
-                self.bayes.note_cost_decision_posterior(posterior_conflict, false);
+                self.bayes
+                    .note_cost_decision_posterior(posterior_conflict, false);
             }
             ResolveAction::Bind(_) => {
                 self.metrics.record_cost_chose_bind();
