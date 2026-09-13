@@ -182,24 +182,26 @@ pub(crate) fn classify_edge(v: &EdgeView) -> EdgeVisibility {
     let _ = v.clique_gated;
     let _ = v.avoid_broadcast;
 
-    // e_vis: published Data → Bind (A3; no writer_validated gate).
-    if let Some(version) = v.bind_version.clone() {
-        return EdgeVisibility::PublishedData { version };
-    }
-    if v.writer_published {
-        if let Some(w) = v.writer {
-            return EdgeVisibility::PublishedData {
-                version: TxVersion {
-                    tx_idx: w,
-                    tx_incarnation: 0,
-                },
-            };
-        }
-    }
-
     // gate: PredictedEssential(ℓ, k, morph) for THIS a only.
     let predicted = v.predicted_essential || v.essential_antidep;
+
+    // e_vis Bind only under PredictedEssential (A3: Data→Bind, no
+    // writer_validated gate). ¬PredictedEssential must stay Unfenced≡OCC
+    // even when MV Data exists — that is the hybrid law (no Bind tax on cold).
     if predicted {
+        if let Some(version) = v.bind_version.clone() {
+            return EdgeVisibility::PublishedData { version };
+        }
+        if v.writer_published {
+            if let Some(w) = v.writer {
+                return EdgeVisibility::PublishedData {
+                    version: TxVersion {
+                        tx_idx: w,
+                        tx_incarnation: 0,
+                    },
+                };
+            }
+        }
         if let Some(w) = v.writer {
             if w < v.reader {
                 return EdgeVisibility::UnpublishedEssential { writer: w };
@@ -423,6 +425,7 @@ mod tests {
             tx_idx: 1,
             tx_incarnation: 0,
         };
+        // A3 still holds — but only on the PredictedEssential path.
         let a = choose_edge_action(&view(
             Some(v.clone()),
             Some(1),
@@ -432,10 +435,35 @@ mod tests {
             false,
             false,
             false,
-            false,
+            true,
             false,
         ));
         assert_eq!(a, EdgeAction::Bind(v));
+    }
+
+    #[test]
+    fn unfenced_when_data_but_not_predicted() {
+        let v = TxVersion {
+            tx_idx: 1,
+            tx_incarnation: 0,
+        };
+        let a = choose_edge_action(&view(
+            Some(v),
+            Some(1),
+            true,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+        ));
+        assert_eq!(
+            a,
+            EdgeAction::Unfenced,
+            "¬PredictedEssential must not Bind-tax published Data"
+        );
     }
 
     #[test]

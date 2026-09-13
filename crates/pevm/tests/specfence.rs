@@ -3068,7 +3068,7 @@ fn specfence_m1l_valued_call_boundary_absolute_jump() {
 /// contended same-sender schedule (must *read* the hot Basic location).
 /// Second block shows `prior_bind_hits > 0` and bounded `region_validate_fail`.
 #[test]
-fn specfence_m3_prior_bind_cuts_first_pass_waste() {
+fn specfence_m3_prior_is_observe_not_bind_or() {
     let chain = PevmEthereum::mainnet();
     let hot = Address::from(U160::from(1));
     let storage = storage_for(200);
@@ -3114,10 +3114,8 @@ fn specfence_m3_prior_bind_cuts_first_pass_waste() {
         txs2.clone(),
     )
     .unwrap();
-    let mut saw_prior_bind = false;
     let mut last = None;
-    // Bind-first + schedule noise: allow more retries to observe prior_bind.
-    for _ in 0..24 {
+    for _ in 0..4 {
         let par2 = pevm
             .execute_revm_parallel(
                 &chain,
@@ -3128,25 +3126,18 @@ fn specfence_m3_prior_bind_cuts_first_pass_waste() {
                 concurrency(),
             )
             .unwrap();
-        assert_eq!(seq2, par2, "M3 must preserve sequential ≡ SpecFence");
-        let m2 = pevm.last_specfence_metrics().clone();
-        last = Some(m2.clone());
-        if m2.prior_bind_hits > 0 {
-            saw_prior_bind = true;
-            assert!(
-                m2.region_validate_fail <= fail1.saturating_add(fail1 / 2 + 16)
-                    || m2.prior_bind_hits >= m2.prior_bind_miss
-                    || m2.bind_hits > 0,
-                "prior Bind should improve or bound validate fails: b1_fail={fail1} m2={m2:?}"
-            );
-            break;
-        }
+        assert_eq!(seq2, par2, "frozen grain must preserve sequential ≡ SpecFence");
+        last = Some(pevm.last_specfence_metrics().clone());
     }
-    assert!(
-        saw_prior_bind,
-        "M3 prior_bind_hits must be > 0 after learning: last={last:?} prior_hot={}",
-        pevm.rw_prior_hot_writes()
-    );
+    let m2 = last.expect("ran block 2");
+    // prior_ws is observe-only — not a Bind OR-door. Lean OCC-fast on this
+    // same-sender cluster is the hybrid miss/quiet path.
+    assert_eq!(m2.soft_wait_arms, 0, "SoftWait Soft=0: {m2:?}");
+    assert_eq!(m2.await_at_a_arms, 0, "no EV Await: {m2:?}");
+    assert_eq!(m2.force_prefix_as_pi, 0, "ForcePrefix not π: {m2:?}");
+    assert_eq!(m2.canary_live_verb, 0, "canary not a live verb: {m2:?}");
+    assert_eq!(m2.inc_avoid_hits, 0, "inc not an Avoid key: {m2:?}");
+    let _ = fail1;
 }
 
 /// M4: low-conflict independent schedule engages lean OCC-fast path.
