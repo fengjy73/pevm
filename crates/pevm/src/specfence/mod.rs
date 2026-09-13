@@ -253,6 +253,7 @@ pub(crate) use rem::{
     PendingPark, RegionAccess, RemTask, RepairPlan, ResearchAbortRepair, ResumeContinuation,
     StorageWriteReplay,
 };
+#[allow(unused_imports)]
 pub(crate) use repair::{RepairGrain, repair_grain};
 #[allow(unused_imports)]
 pub(crate) use resolve::{

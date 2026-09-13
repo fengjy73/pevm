@@ -161,6 +161,7 @@ pub(crate) fn validate_occ_kernel(
             && !scheduler.is_done(w)
         {
             specfence.ready_edges.note_unpublished(*location, w);
+            specfence.ready_edges.note_consumer(tx_version.tx_idx, w);
             specfence.sketch.push_spine(*location, w);
         }
     }

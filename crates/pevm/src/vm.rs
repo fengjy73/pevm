@@ -613,15 +613,34 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.specfence
             .ready_edges
             .note_unpublished(location_hash, w);
+        self.specfence.ready_edges.note_consumer(self.tx_idx, w);
         self.specfence.scheduler.admit_spine(w, self.specfence.wave);
         if self.specfence.scheduler.is_done(w) {
             return self.occ_unfenced();
         }
-        // Token progress: WaitFor if executing, else park — not Spec continue (T4).
         self.note_fence_success(location_hash);
         if self.specfence.scheduler.is_executing(w) {
             return self.pcc_wait_for_writer(address, location_hash, access_k, is_program, w);
         }
+        // Ready or Aborting head: exclusive token — park, do not Spec-continue (T4).
+        // RAW is preset-order (w < reader) so Blocking cannot cycle.
+        self.pcc_armed.set(true);
+        self.pcc_this_tx
+            .set(self.pcc_this_tx.get().saturating_add(1));
+        self.specfence.metrics.record_pcc_fire_at_a();
+        self.specfence.metrics.record_edge_wait_for();
+        self.specfence.metrics.record_wait_hard();
+        self.specfence.metrics.record_wait(address);
+        self.specfence
+            .dag
+            .arm_hard_wait(location_hash, self.tx_idx, w);
+        let armed_at_k = self.specfence.partial_retry.current_k(self.tx_idx) as u64;
+        self.specfence.wave.set_pending_park(
+            location_hash,
+            armed_at_k,
+            crate::specfence::ParkKind::BlockingOther,
+        );
+        self.specfence.process.note_park(self.tx_idx);
         Err(ReadError::Blocking(w))
     }
 
@@ -636,11 +655,15 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return;
         }
         self.specfence.learner.mark_predicted_essential(location, k);
-        self.specfence.sketch.mark_access_class(location, k);
+        // Do not mark_access_class here — that opens SerialLane for every
+        // later reader and livelocks Ready heads. Abort train still marks.
         self.specfence.sketch.push_spine(location, writer);
         self.specfence
             .ready_edges
             .note_unpublished(location, writer);
+        self.specfence
+            .ready_edges
+            .note_consumer(self.tx_idx, writer);
         let hot_or_ws = self.specfence.hotset.contains(location)
             || self.specfence.rw_prior.predicts_write(location);
         self.specfence
@@ -748,6 +771,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.pcc_this_tx
             .set(self.pcc_this_tx.get().saturating_add(1));
         self.specfence.metrics.record_pcc_fire_at_a();
+        self.specfence
+            .ready_edges
+            .note_unpublished(location_hash, w);
+        self.specfence.ready_edges.note_consumer(self.tx_idx, w);
         let access_depth = 0u8;
         let key = EdgeKey {
             location: location_hash,
