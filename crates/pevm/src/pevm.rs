@@ -546,7 +546,7 @@ impl Pevm {
                                         Some(&metrics_inner),
                                     )
                                 } else if specfence.mode == ConcurrencyMode::SpecFence
-                                    && specfence.kernel.is_occ(tx_version.tx_idx)
+                                    && !specfence.kernel.may_resolve(tx_version.tx_idx)
                                 {
                                     crate::specfence::validate_occ_kernel(
                                         &mv_memory,
@@ -995,7 +995,9 @@ fn try_validate(
             Some(specfence.metrics),
         );
     }
-    if specfence.mode == ConcurrencyMode::SpecFence && specfence.kernel.is_occ(tx_version.tx_idx) {
+    if specfence.mode == ConcurrencyMode::SpecFence
+        && !specfence.kernel.may_resolve(tx_version.tx_idx)
+    {
         return crate::specfence::validate_occ_kernel(mv_memory, scheduler, tx_version, specfence);
     }
     // OCC-like first pass: one read-set walk. Defer read_locations until fail

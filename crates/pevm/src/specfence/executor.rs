@@ -1,9 +1,10 @@
-//! SpecFence parallel computer — schedule / OccKernel validate / steal.
+//! SpecFence parallel computer — schedule / Spec validate / steal.
 //!
 //! Owns SpecFence **stages**. OCC ticks never enter here.
-//! Unfenced incarnations use the shared OCC validate kernel (bool walk + B0).
+//! Spec-only incarnations use the shared OCC validate kernel (bool walk + B0).
+//! R1 Resolve runs only with Fence / prefix certificates.
 //!
-//! Plant SoT: `lab/notes/specfence-parallel-compute-architecture.md`.
+//! Plant SoT: `lab/notes/specfence-complete-architecture-v5-pc-cc-fusion.md`.
 
 use super::ConcurrencyMode;
 use super::SpecFenceCtx;
@@ -39,25 +40,31 @@ pub(crate) fn hinted_wait_enabled(mode: ConcurrencyMode) -> bool {
     mode == ConcurrencyMode::Pcc
 }
 
-/// SpecFence Resolve overlay runs only for **PccKernel** incarnations.
+/// SpecFence Resolve overlay runs only with Fence / prefix certificates.
 #[inline]
 pub(crate) fn uses_specfence_resolve(
     mode: ConcurrencyMode,
     kernel: &KernelTable,
     tx_idx: TxIdx,
 ) -> bool {
-    mode == ConcurrencyMode::SpecFence && kernel.is_pcc(tx_idx)
+    mode == ConcurrencyMode::SpecFence && kernel.may_resolve(tx_idx)
 }
 
-/// Empty PE table: access gate skips bump_k (still OccKernel unless Repair armed).
+/// Empty PE table: no Fence events expected (AccessOrdinalLog still records \(k\)).
 #[inline]
 pub(crate) fn specfence_plant_is_occ(mode: ConcurrencyMode, learner: &LiveLearner) -> bool {
     mode != ConcurrencyMode::SpecFence || !learner.has_any_predicted()
 }
 
-/// SpecFence ready-set + steal + pipeline (wave deque + Block-STM indices).
+/// SpecFence ready-set + steal. WaitFor / serial-lane progress before
+/// OCC validation-first stampede.
 #[inline]
 pub(crate) fn next_sf_task(scheduler: &Scheduler, wave: &WaveParkTable) -> Option<Task> {
+    if wave.steal_after_park_pending() || wave.wait_park_count() > 0 {
+        if let Some(task) = scheduler.next_task_steal_after_park(wave) {
+            return Some(task);
+        }
+    }
     scheduler.next_task_with_wave(Some(wave))
 }
 
@@ -86,7 +93,7 @@ pub(crate) fn validate_occ_stage(
     scheduler.finish_validation(tx_version, aborted)
 }
 
-/// SpecFence OccKernel validate: same OCC kernel. Fail ⇒ B0 + learn PE (repair stage).
+/// Spec-only validate: same OCC kernel. Fail ⇒ B0 + learn PE at **true \(k\)**.
 /// Never RebindThis / PrefixSkip — journal-less repair is a protocol bug.
 pub(crate) fn validate_occ_kernel(
     mv_memory: &MvMemory,
@@ -124,21 +131,21 @@ pub(crate) fn validate_occ_kernel(
         specfence.bayes.observe_conflict_location_always(*location);
         specfence.metrics.record_bayes_conflict();
         specfence.hotset.note_abort(*location);
+        // True k from AccessOrdinalLog (`first_k`) / EdgeKey — never residual 1.
         let loc_k = specfence
-            .edges
-            .min_k_of_location(tx_version.tx_idx, *location)
+            .partial_retry
+            .first_k(tx_version.tx_idx, *location)
+            .map(|k| k as u32)
             .or_else(|| {
                 specfence
-                    .partial_retry
-                    .first_k(tx_version.tx_idx, *location)
-                    .map(|k| k as u32)
-            });
-        // OccKernel has no rem first_k — residual class k=1 so PE can arm.
-        let loc_k = loc_k.or(Some(1));
+                    .edges
+                    .min_k_of_location(tx_version.tx_idx, *location)
+            })
+            .filter(|&k| k > 0);
         specfence
             .learner
             .note_abort_access(*location, cascade_hint, loc_k);
-        if let Some(k) = loc_k.filter(|&k| k > 0) {
+        if let Some(k) = loc_k {
             specfence.sketch.mark_access_class(*location, k);
         }
     }
@@ -174,7 +181,7 @@ mod tests {
         let k = KernelTable::new(2);
         assert!(!uses_specfence_resolve(ConcurrencyMode::Occ, &k, 0));
         assert!(!uses_specfence_resolve(ConcurrencyMode::SpecFence, &k, 0));
-        k.mark_pcc(0);
+        k.note_fence(0);
         assert!(uses_specfence_resolve(ConcurrencyMode::SpecFence, &k, 0));
     }
 }
