@@ -6,6 +6,7 @@
 **π SoT (unchanged):** `lab/notes/specfence-complete-architecture-v4-frozen-grain.md`  
 **Supersedes (plant only):** `lab/notes/specfence-clean-slate-architecture.md` — two-mode identity kept; **execute/validate graft is not the Unfenced SoT**.  
 **Honesty baseline:** clean-slate nonempty median **SF/OCC = 0.464**; quiet heuristic **0.716** (not ≈1.0).  
+**This cut (N=1 @8, 98 nonempty):** median **0.744**; quiet median **1.020** (24/46 ≥1). Quiet tail 2179522 N=1 still **0.234**. See `specfence-parallel-compute-impl.md`.  
 **Vocab:** Spec = Region. Fence = Bind / WaitFor / serial-lane / ordered-admit on a Region-**access**. Unfenced ≡ OCC **literally** (same helpers **or** a shared pure read/validate kernel). CC = frozen π OCC⊗PCC — **one layer inside** the parallel computer, not the computer.
 
 This document specifies SpecFence as a **preset-order parallel EVM computer**: a task graph, a ready set, work-stealing, and a pipeline of compute stages. Concurrency control (frozen π) decides *which read* an execute-stage access takes. It does **not** own the schedule loop, the validate walk, or the rem journal.

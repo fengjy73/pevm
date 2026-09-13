@@ -1,0 +1,39 @@
+{
+  "plant": "parallel-compute OccKernel split",
+  "baseline_clean_slate_nonempty_median": 0.464,
+  "all_blocks_n1": {
+    "loaded": 99,
+    "nonempty": 98,
+    "dropped_empty": [19910734],
+    "median_sf_occ": 0.744,
+    "p10": 0.468,
+    "min": 0.234,
+    "mean": 1.742,
+    "quiet_n": 46,
+    "quiet_median": 1.02,
+    "quiet_ge1": "24/46",
+    "quiet_ish_n": 17,
+    "fan_out_n": 3,
+    "fan_out_median": 0.468,
+    "ge_0_7": 56,
+    "ge_1_0": 27,
+    "soft": 0,
+    "await": 0,
+    "exclude_set": 0,
+    "detect_accesses": 282061,
+    "unfenced_occ_fast": 304527,
+    "pcc_fire_at_a": 3636,
+    "occ_kernel_execs": 63597,
+    "pcc_kernel_execs": 3444,
+    "occ_kernel_validates": 116828,
+    "occ_mode_detect_pcc_unfenced": 0
+  },
+  "focus_n3_8block": {
+    "median_sf_occ": 0.606,
+    "mean": 0.936,
+    "min": 0.268,
+    "quiet_2179522": 3.565,
+    "quiet_2179522_note": "OCC wall pathology on N=3; N=1 was 0.234"
+  },
+  "honesty": "median 0.464→0.744; quiet median 0.716→1.020; 2179522 N=1 still 0.234; do not claim finished ≥0.7 product bar"
+}
