@@ -132,7 +132,6 @@ impl Scheduler {
     }
 
     /// Prefer SpecFence wave ready deque (lower TxIdx first), then collaborative indices.
-    #[allow(dead_code)]
     pub(crate) fn next_task(&self) -> Option<Task> {
         self.next_task_with_wave(None)
     }

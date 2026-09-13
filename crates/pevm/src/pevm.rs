@@ -31,10 +31,10 @@ use crate::{
     specfence::{
         AccountHints, AdaptiveEngagement, AdaptiveParams, BayesMap, ConcurrencyMode, DEFAULT_TAU,
         EdgeTable, ExecProcessSnapshot, FineGrainCollector, FineGrainSnapshot, HeatMap, HotSet,
-        HotSketch, InterBlockPrior, LeanAbortRepair, LiveLearner, MetricsInner, PartialRetryTable,
-        ProcessTrace, RemCounters, ResearchAbortRepair, RwPriorMap, SpecDag, SpecFenceCtx,
-        SpecFenceMetrics, WaveParkTable, seed_wait_regions, update_bayes, update_heat,
-        update_rw_prior,
+        HotSketch, InterBlockPrior, KernelTable, LeanAbortRepair, LiveLearner, MetricsInner,
+        PartialRetryTable, ProcessTrace, RemCounters, ResearchAbortRepair, RwPriorMap, SpecDag,
+        SpecFenceCtx, SpecFenceMetrics, WaveParkTable, seed_wait_regions, update_bayes,
+        update_heat, update_rw_prior,
     },
     storage::StorageWrapper,
     vm::{
@@ -443,6 +443,7 @@ impl Pevm {
         let rem = RemCounters::default();
         let partial_retry = PartialRetryTable::new(block_size);
         let wave = WaveParkTable::new();
+        let kernel = KernelTable::new(block_size);
         let edges = EdgeTable::new();
         let sketch = HotSketch::new();
         let process = ProcessTrace::new();
@@ -498,6 +499,7 @@ impl Pevm {
             edges: &edges,
             sketch: &sketch,
             process: &process,
+            kernel: &kernel,
             finegrain: finegrain_ref,
         };
 
@@ -509,35 +511,57 @@ impl Pevm {
                         chain, spec_id, &block_env, &txs, storage, &mv_memory, specfence,
                     );
                     let profile = crate::specfence::profile_timing_enabled();
+                    let occ_ticks = self.concurrency_mode == ConcurrencyMode::Occ;
                     let mut sched_t0 = profile.then(Instant::now);
-                    let mut task = scheduler.next_task_with_wave(wave_ref);
+                    let mut task = if let Some(w) = wave_ref {
+                        crate::specfence::next_sf_task(&scheduler, w)
+                    } else {
+                        crate::specfence::next_occ_task(&scheduler)
+                    };
                     if let Some(t0) = sched_t0 {
                         metrics_inner.add_profile_scheduler_ns(t0.elapsed().as_nanos() as u64);
                     }
                     while task.is_some() {
                         task = match task.unwrap() {
                             Task::Execution(tx_version) => {
-                                let fence_ref =
-                                    crate::specfence::fence_for_mode(self.concurrency_mode, &dag);
-                                self.try_execute(
-                                    &mut vm, &scheduler, tx_version, wave_ref, fence_ref,
-                                )
+                                if occ_ticks {
+                                    self.try_execute(&mut vm, &scheduler, tx_version, None, None)
+                                } else {
+                                    let fence_ref = crate::specfence::fence_for_mode(
+                                        self.concurrency_mode,
+                                        &dag,
+                                    );
+                                    self.try_execute(
+                                        &mut vm, &scheduler, tx_version, wave_ref, fence_ref,
+                                    )
+                                }
                             }
                             Task::Validation(tx_version) => {
-                                if profile {
-                                    let v0 = Instant::now();
-                                    let next = try_validate(
+                                let v0 = profile.then(Instant::now);
+                                let next = if occ_ticks {
+                                    crate::specfence::validate_occ_stage(
+                                        &mv_memory,
+                                        &scheduler,
+                                        &tx_version,
+                                        Some(&metrics_inner),
+                                    )
+                                } else if specfence.mode == ConcurrencyMode::SpecFence
+                                    && specfence.kernel.is_occ(tx_version.tx_idx)
+                                {
+                                    crate::specfence::validate_occ_kernel(
                                         &mv_memory,
                                         &scheduler,
                                         &tx_version,
                                         specfence,
-                                    );
-                                    metrics_inner
-                                        .add_profile_validate_ns(v0.elapsed().as_nanos() as u64);
-                                    next
+                                    )
                                 } else {
                                     try_validate(&mv_memory, &scheduler, &tx_version, specfence)
+                                };
+                                if let Some(t0) = v0 {
+                                    metrics_inner
+                                        .add_profile_validate_ns(t0.elapsed().as_nanos() as u64);
                                 }
+                                next
                             }
                         };
 
@@ -553,7 +577,11 @@ impl Pevm {
 
                         if task.is_none() {
                             sched_t0 = profile.then(Instant::now);
-                            task = scheduler.next_task_with_wave(wave_ref);
+                            task = if let Some(w) = wave_ref {
+                                crate::specfence::next_sf_task(&scheduler, w)
+                            } else {
+                                crate::specfence::next_occ_task(&scheduler)
+                            };
                             if let Some(t0) = sched_t0 {
                                 metrics_inner
                                     .add_profile_scheduler_ns(t0.elapsed().as_nanos() as u64);
@@ -958,6 +986,18 @@ fn try_validate(
     tx_version: &TxVersion,
     specfence: SpecFenceCtx<'_>,
 ) -> Option<Task> {
+    // OccKernel / OCC never enter this museum — journal-less RebindThis is banned.
+    if specfence.mode == ConcurrencyMode::Occ {
+        return crate::specfence::validate_occ_stage(
+            mv_memory,
+            scheduler,
+            tx_version,
+            Some(specfence.metrics),
+        );
+    }
+    if specfence.mode == ConcurrencyMode::SpecFence && specfence.kernel.is_occ(tx_version.tx_idx) {
+        return crate::specfence::validate_occ_kernel(mv_memory, scheduler, tx_version, specfence);
+    }
     // OCC-like first pass: one read-set walk. Defer read_locations until fail
     // (avoids a second last_locations lock on the common success path).
     let invalid = if specfence.mode.uses_regions() {
@@ -978,7 +1018,9 @@ fn try_validate(
     let mut cached_plan: Option<Option<crate::specfence::PartialRetryPlan>> = None;
     // Iter15: true_suffix flag for fan-out FR collapse / RebindOnly widen on abort path.
     let mut true_suffix_flag = false;
-    if crate::specfence::uses_specfence_resolve(specfence.mode) && !invalid.is_empty() {
+    if crate::specfence::uses_specfence_resolve(specfence.mode, specfence.kernel, tx_version.tx_idx)
+        && !invalid.is_empty()
+    {
         specfence.metrics.record_region_validate_fail(invalid.len());
         // RebindOnly-first (native resolve): patch origins when invalid reads now
         // have Data/Storage and there is no *true* failed-suffix write (first_k ≥

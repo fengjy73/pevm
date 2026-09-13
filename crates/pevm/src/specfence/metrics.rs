@@ -268,6 +268,12 @@ pub struct SpecFenceMetrics {
     pub pcc_roi_skip: usize,
     /// Unfenced≡OCC fast path (no Edge SM / sketch / checkpoint).
     pub unfenced_occ_fast: usize,
+    /// SpecFence incarnations that executed as OccKernel (no rem).
+    pub occ_kernel_execs: usize,
+    /// SpecFence incarnations that executed as PccKernel (rem / Resolve).
+    pub pcc_kernel_execs: usize,
+    /// SpecFence validates that used the OCC bool kernel (no collect_invalid_reads tax).
+    pub occ_kernel_validates: usize,
     /// Certified prefix existed but PrefixSkip lost to B0 reincarnation.
     pub prefix_skip_roi_b0: usize,
     /// Falsifier: ForcePrefix used as live Avoid key (target 0).
@@ -405,6 +411,9 @@ pub(crate) struct MetricsInner {
     pcc_fire_at_a: AtomicUsize,
     pcc_roi_skip: AtomicUsize,
     unfenced_occ_fast: AtomicUsize,
+    occ_kernel_execs: AtomicUsize,
+    pcc_kernel_execs: AtomicUsize,
+    occ_kernel_validates: AtomicUsize,
     prefix_skip_roi_b0: AtomicUsize,
     force_prefix_as_pi: AtomicUsize,
     canary_live_verb: AtomicUsize,
@@ -868,6 +877,18 @@ impl MetricsInner {
         self.unfenced_occ_fast.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_occ_kernel_exec(&self) {
+        self.occ_kernel_execs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_pcc_kernel_exec(&self) {
+        self.pcc_kernel_execs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_occ_kernel_validate(&self) {
+        self.occ_kernel_validates.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_prefix_skip_roi_b0(&self) {
         self.prefix_skip_roi_b0.fetch_add(1, Ordering::Relaxed);
     }
@@ -1130,6 +1151,9 @@ impl MetricsInner {
             pcc_fire_at_a: self.pcc_fire_at_a.load(Ordering::Relaxed),
             pcc_roi_skip: self.pcc_roi_skip.load(Ordering::Relaxed),
             unfenced_occ_fast: self.unfenced_occ_fast.load(Ordering::Relaxed),
+            occ_kernel_execs: self.occ_kernel_execs.load(Ordering::Relaxed),
+            pcc_kernel_execs: self.pcc_kernel_execs.load(Ordering::Relaxed),
+            occ_kernel_validates: self.occ_kernel_validates.load(Ordering::Relaxed),
             prefix_skip_roi_b0: self.prefix_skip_roi_b0.load(Ordering::Relaxed),
             force_prefix_as_pi: self.force_prefix_as_pi.load(Ordering::Relaxed),
             canary_live_verb: self.canary_live_verb.load(Ordering::Relaxed),
