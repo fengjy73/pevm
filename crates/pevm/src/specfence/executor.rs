@@ -56,15 +56,11 @@ pub(crate) fn specfence_plant_is_occ(mode: ConcurrencyMode, learner: &LiveLearne
     mode != ConcurrencyMode::SpecFence || !learner.has_any_predicted()
 }
 
-/// SpecFence ready-set + steal. WaitFor / serial-lane progress before
-/// OCC validation-first stampede.
+/// SpecFence ready-set + steal. Wave ready / admit_spine (WaitFor + serial-lane)
+/// first; then Block-STM indices. Do **not** key steal on cumulative
+/// `wait_park_count` — that starves validation and livelocks ESTIMATE.
 #[inline]
 pub(crate) fn next_sf_task(scheduler: &Scheduler, wave: &WaveParkTable) -> Option<Task> {
-    if wave.steal_after_park_pending() || wave.wait_park_count() > 0 {
-        if let Some(task) = scheduler.next_task_steal_after_park(wave) {
-            return Some(task);
-        }
-    }
     scheduler.next_task_with_wave(Some(wave))
 }
 
