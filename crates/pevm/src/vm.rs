@@ -618,30 +618,13 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if self.specfence.scheduler.is_done(w) {
             return self.occ_unfenced();
         }
-        self.note_fence_success(location_hash);
         if self.specfence.scheduler.is_executing(w) {
+            self.note_fence_success(location_hash);
             return self.pcc_wait_for_writer(address, location_hash, access_k, is_program, w);
         }
-        // Ready or Aborting head: exclusive token — park, do not Spec-continue (T4).
-        // RAW is preset-order (w < reader) so Blocking cannot cycle.
-        self.pcc_armed.set(true);
-        self.pcc_this_tx
-            .set(self.pcc_this_tx.get().saturating_add(1));
-        self.specfence.metrics.record_pcc_fire_at_a();
-        self.specfence.metrics.record_edge_wait_for();
-        self.specfence.metrics.record_wait_hard();
-        self.specfence.metrics.record_wait(address);
-        self.specfence
-            .dag
-            .arm_hard_wait(location_hash, self.tx_idx, w);
-        let armed_at_k = self.specfence.partial_retry.current_k(self.tx_idx) as u64;
-        self.specfence.wave.set_pending_park(
-            location_hash,
-            armed_at_k,
-            crate::specfence::ParkKind::BlockingOther,
-        );
-        self.specfence.process.note_park(self.tx_idx);
-        Err(ReadError::Blocking(w))
+        // Ready/Aborting: token is admit of the head. Parking the reader
+        // before ESTIMATE writes cascades B0 on later dependents.
+        self.occ_unfenced()
     }
 
     /// First-wave Avoid: ESTIMATE / unpublished RAW trains PE + ready-edge.

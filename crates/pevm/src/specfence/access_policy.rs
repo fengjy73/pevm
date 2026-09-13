@@ -87,7 +87,10 @@ pub(crate) fn decide(
     let intra = learner.predicted_essential_intra(location, access_k);
     let park_ok = intra || learner.prior_pe_fire_wins(vis);
     if vis.unfinished > 1 || (vis.in_serial_lane && vis.unfinished > 0) {
-        if park_ok && let Some(w) = vis.writer {
+        // SerialLane parks only the executing head. Ready-head park
+        // serializes satellites before they plant ESTIMATE and inflates
+        // B0 (14689597 abort 229 vs OCC 37).
+        if park_ok && vis.writer_executing && let Some(w) = vis.writer {
             return AccessDecision::SerialLane { writer: w };
         }
     }
@@ -229,6 +232,16 @@ mod tests {
             decide(&live, 7, 6, Some(&data_plus_multi())),
             AccessDecision::SerialLane { writer: 0 },
             "published Data must not Bind-theater a multi-writer PE class"
+        );
+        let mut ready_multi = data_plus_multi();
+        ready_multi.writer_executing = false;
+        assert_eq!(
+            decide(&live, 7, 6, Some(&ready_multi)),
+            AccessDecision::UnfencedOcc {
+                predicted: true,
+                roi_skip: true
+            },
+            "Ready multi-writer must not SerialLane-park (ESTIMATE cascade)"
         );
     }
 
