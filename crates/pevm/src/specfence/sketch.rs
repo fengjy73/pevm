@@ -48,6 +48,8 @@ struct LocSketch {
     predicted_writer: AtomicUsize,
     /// Reader that consumed the live canary grant (`usize::MAX` = none).
     canary_tx: AtomicUsize,
+    /// One reopen per ℓ per block (first-wave, not a canary mill).
+    canary_reopened: AtomicUsize,
 }
 
 impl Default for LocSketch {
@@ -58,6 +60,7 @@ impl Default for LocSketch {
             live_unfenced: AtomicUsize::new(0),
             predicted_writer: AtomicUsize::new(usize::MAX),
             canary_tx: AtomicUsize::new(usize::MAX),
+            canary_reopened: AtomicUsize::new(0),
         }
     }
 }
@@ -310,6 +313,9 @@ impl HotSketch {
             return false;
         }
         let e = self.locs.entry(location).or_default();
+        if e.canary_reopened.swap(1, Ordering::Relaxed) != 0 {
+            return false;
+        }
         e.canaries.store(0, Ordering::Relaxed);
         e.canary_tx.store(usize::MAX, Ordering::Relaxed);
         true
@@ -410,12 +416,16 @@ impl HotSketch {
         is_done: impl Fn(TxIdx) -> bool,
     ) -> Vec<TxIdx> {
         let mut out = Vec::new();
-        for s in self.spines.iter() {
-            let loc = *s.key();
-            if !self.in_serial_lane(loc) {
-                continue;
+        // Avoid spines only, bounded (per-access full walk was a wall tax).
+        for (i, loc_r) in self.avoid.iter().enumerate() {
+            if i >= 8 {
+                break;
             }
-            let v = s.value().lock().unwrap();
+            let loc = *loc_r.key();
+            let Some(s) = self.spines.get(&loc) else {
+                continue;
+            };
+            let v = s.lock().unwrap();
             for &w in v.iter() {
                 if w < reader && !is_done(w) && is_ready(w) {
                     out.push(w);
@@ -594,6 +604,10 @@ mod tests {
         assert!(s.reopen_canary_if_probe_done(2, true));
         assert!(s.try_canary(2, 4));
         assert_eq!(s.canary_tx(2), Some(4));
+        assert!(
+            !s.reopen_canary_if_probe_done(2, true),
+            "one reopen per ℓ per block"
+        );
         assert!(!s.reopen_canary_if_probe_done(2, false));
     }
 

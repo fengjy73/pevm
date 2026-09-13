@@ -578,22 +578,24 @@ impl<'a, S: Storage> VmDb<'a, S> {
             && !prior_ws
             && !canary_ok;
         let writer_known_unfinished = writer.is_some_and(|w| !self.specfence.scheduler.is_done(w));
-        // wait_depth_prior is a structural fan-out actuator (not EV Await).
-        let fan_out_fence = self
+        // wait_depth_prior is read as a structural H actuator (not EV Await).
+        if self
             .specfence
             .learner
             .morph_weights()
             .wait_depth_prior()
             .is_some()
-            && (in_h
-                || self.specfence.learner.writer_done_hot(location_hash)
-                || self.specfence.learner.bind_cover(location_hash));
+            && (self.specfence.learner.writer_done_hot(location_hash)
+                || self.specfence.learner.bind_cover(location_hash))
+        {
+            self.specfence.sketch.note_hot(location_hash);
+        }
         let essential = self.specfence.sketch.essential_antidep(
             location_hash,
             writer_known_unfinished,
             prior_ws || sticky,
             force_prefix,
-        ) || (fan_out_fence && (writer_known_unfinished || avoid || prior_ws));
+        );
         let clique_gated = !published && self.specfence.sketch.clique_gated(location_hash);
 
         let view = EdgeView {
@@ -620,18 +622,21 @@ impl<'a, S: Storage> VmDb<'a, S> {
         let canary_taken = self.specfence.sketch.canary_taken(location_hash);
         let must_wait = force_prefix || avoid || essential;
 
-        // S1+S4: ready-set ⊆ Region unfinished spine (this ℓ + secondary live
-        // spines). PreferAdmit is the scheduler law, not a star-ℓ counter.
+        // S1+S4: this-ℓ unfinished always; cross-ℓ PreferAdmit only before
+        // Unfenced (ready-set ⊆ Avoid spines, not a per-SLOAD full walk).
         let is_done = |t: TxIdx| self.specfence.scheduler.is_done(t);
         let is_ready = |t: TxIdx| self.specfence.scheduler.is_ready(t);
         let unfinished =
             self.specfence
                 .sketch
                 .unfinished_writers_before(location_hash, self.tx_idx, is_done);
-        let ready_spines =
+        let ready_spines = if matches!(action, EdgeAction::Unfenced) {
             self.specfence
                 .sketch
-                .ready_spine_writers(self.tx_idx, is_ready, is_done);
+                .ready_spine_writers(self.tx_idx, is_ready, is_done)
+        } else {
+            Vec::new()
+        };
         let mut admit = unfinished.clone();
         for w in &ready_spines {
             if !admit.contains(w) {
@@ -811,31 +816,21 @@ impl<'a, S: Storage> VmDb<'a, S> {
             self.specfence
                 .sketch
                 .unfinished_writers_before(location_hash, self.tx_idx, is_done);
-        let ready_spines =
-            self.specfence
-                .sketch
-                .ready_spine_writers(self.tx_idx, is_ready, is_done);
-        let mut admit = unfinished_all.clone();
-        for w in &ready_spines {
-            if !admit.contains(w) {
-                admit.push(*w);
-            }
-        }
-        // S4 + PreferAdmit law: ready-set ⊆ Region unfinished spine.
-        if !admit.is_empty() {
+        // S4: this-ℓ unfinished only. Other Avoid spines were prefer-admitted
+        // in maybe_wait_specfence (do not rescan here).
+        if !unfinished_all.is_empty() {
             self.specfence
                 .scheduler
-                .admit_spine_writers(&admit, self.specfence.wave);
-            if admit.iter().any(|&w| is_ready(w)) {
+                .admit_spine_writers(&unfinished_all, self.specfence.wave);
+            if unfinished_all.iter().any(|&w| is_ready(w)) {
                 self.specfence.metrics.record_prefer_admit();
             }
-            if unfinished_all.len() > 1 || ready_spines.len() > 1 {
+            if unfinished_all.len() > 1 {
                 self.specfence.metrics.record_multi_spine_admit();
             }
         }
-        // Park Executing first. On Fence/Avoid, also WaitFor unfinished
-        // Ready/Aborting after prefer-admit (visibility install) — never
-        // UnfencedWriterDone as hang-freedom.
+        // Park Executing first. Ready is prefer-admitted (not parked).
+        // Done∅Data → Bind residual — never UnfencedWriterDone on must_wait.
         let unfinished_exec = unfinished_all
             .iter()
             .copied()
@@ -848,24 +843,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
         let (target, reason) = if let Some(w) = unfinished_exec.or(requested_exec) {
             (Some(w), ProcessReason::WaitForWriter)
         } else if must_wait {
-            // Visibility Fence: park Ready (prefer-admitted) or a live
-            // requested writer. Aborting-only → Bind residual (no hang).
-            if let Some(w) = unfinished_all
-                .iter()
-                .copied()
-                .rev()
-                .find(|&w| is_ready(w))
-                .or(requested_live.filter(|&w| is_ready(w) || is_executing(w)))
-            {
-                let r = if w + 1 == self.tx_idx {
-                    ProcessReason::WaitForSerial
-                } else if force_prefix {
-                    ProcessReason::WaitForPrefix
-                } else {
-                    ProcessReason::WaitForWriter
-                };
-                (Some(w), r)
-            } else if force_prefix && self.tx_idx > 0 && !is_done(self.tx_idx - 1) {
+            // U3: park only Executing. Ready is prefer-admitted; Done∅Data
+            // → Bind residual (not UnfencedWriterDone).
+            if force_prefix && self.tx_idx > 0 && !is_done(self.tx_idx - 1) {
                 (Some(self.tx_idx - 1), ProcessReason::WaitForSerial)
             } else {
                 (None, ProcessReason::BindPublished)
@@ -946,29 +926,25 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.specfence.metrics.record_writer_done_learned();
 
         if must_wait {
-            // Visibility spin: version may still be installing.
-            for _ in 0..16 {
-                if let Some((tx_idx, tx_incarnation)) =
-                    self.mv_memory.last_data_before(location_hash, self.tx_idx)
-                {
-                    self.specfence.sketch.install_data_residual(
-                        location_hash,
+            // Writer is not Executing (that path parked). Recheck Data once;
+            // otherwise residual SoT (last Data or Storage). No hope-spin.
+            if let Some((tx_idx, tx_incarnation)) =
+                self.mv_memory.last_data_before(location_hash, self.tx_idx)
+            {
+                self.specfence
+                    .sketch
+                    .install_data_residual(location_hash, tx_idx, tx_incarnation);
+                return self.bind_residual_data(
+                    address,
+                    location_hash,
+                    TxVersion {
                         tx_idx,
                         tx_incarnation,
-                    );
-                    return self.bind_residual_data(
-                        address,
-                        location_hash,
-                        TxVersion {
-                            tx_idx,
-                            tx_incarnation,
-                        },
-                        force_prefix,
-                        avoid,
-                        canary_taken,
-                    );
-                }
-                std::thread::yield_now();
+                    },
+                    force_prefix,
+                    avoid,
+                    canary_taken,
+                );
             }
             return self.bind_done_residual(
                 address,
