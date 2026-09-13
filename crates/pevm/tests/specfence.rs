@@ -3126,7 +3126,10 @@ fn specfence_m3_prior_is_observe_not_bind_or() {
                 concurrency(),
             )
             .unwrap();
-        assert_eq!(seq2, par2, "frozen grain must preserve sequential ≡ SpecFence");
+        assert_eq!(
+            seq2, par2,
+            "frozen grain must preserve sequential ≡ SpecFence"
+        );
         last = Some(pevm.last_specfence_metrics().clone());
     }
     let m2 = last.expect("ran block 2");
@@ -4011,8 +4014,7 @@ fn subgrain_done_bind_r1_canary_prefer_admit() {
         "U1 leak must stay 0: {p:?}"
     );
     assert!(
-        p.bind_total + m.bind_residual + m.edge_bind > 0
-            || m.edge_unfenced + m.spec_read_count > 0,
+        p.bind_total + m.bind_residual + m.edge_bind > 0 || m.edge_unfenced + m.spec_read_count > 0,
         "Detect/Unfenced≡OCC or Bind must fire: process={p:?} metrics={m:?}"
     );
     // PreferAdmit-as-primary is deleted (SoT). WaitFor (if any) admits the

@@ -1,7 +1,8 @@
 //! SpecFence **v4.1-frozen** — Frozen-Grain Learned OCC–PCC Hybrid.
 //!
 //! Authoritative: `lab/notes/specfence-complete-architecture-v4-frozen-grain.md`.
-//! Landed map: `lab/notes/specfence-frozen-grain-impl.md`.
+//! Grain map: `lab/notes/specfence-frozen-grain-impl.md`.
+//! Cost-class map: `lab/notes/specfence-occ-cost-pcc-roi-impl.md`.
 //!
 //! Frozen π: \(a=(t,k,\mathrm{depth},ℓ,\mathrm{mode})\) + \(e_{\mathrm{vis}}\) +
 //! gate `PredictedEssential(ℓ,k,morph) ∨ independence_certified`.
@@ -153,6 +154,7 @@ use hashbrown::HashMap;
 mod bayes;
 mod boundary;
 mod dag;
+mod decision_field;
 mod edge;
 mod engagement;
 #[allow(missing_docs)]
@@ -163,7 +165,6 @@ mod learner;
 mod metrics;
 mod prior;
 mod process;
-mod decision_field;
 mod region;
 mod rem;
 mod resolve;
@@ -186,9 +187,11 @@ pub(crate) use boundary::{
     try_consume_nested_bind_resume, with_bind_snap_tls, with_plant_tls, with_plant_tls_journal,
 };
 pub(crate) use dag::{FenceGraph, SpecDag};
+pub(crate) use decision_field::{DecisionFeat, DecisionVerb};
+pub use decision_field::{DecisionFieldSnap, QualityProxies, VerbHist};
 pub(crate) use edge::{
-    EdgeAction, EdgeKey, EdgeKind, EdgeState, EdgeTable, EdgeView, EdgeVisibility,
-    access_k_class, choose_edge_action, classify_edge,
+    EdgeAction, EdgeKey, EdgeKind, EdgeState, EdgeTable, EdgeView, EdgeVisibility, access_k_class,
+    choose_edge_action, classify_edge,
 };
 pub(crate) use engagement::{AdaptiveEngagement, profile_timing_enabled, research_inspect_enabled};
 pub use finegrain::{
@@ -209,8 +212,6 @@ pub use metrics::SpecFenceMetrics;
 pub(crate) use prior::RwPriorMap;
 pub(crate) use process::ProcessTrace;
 pub use process::{ExecProcessSnapshot, LocProcessSnap, PerTxProcessSnap, ProcessReason};
-pub use decision_field::{DecisionFieldSnap, QualityProxies, VerbHist};
-pub(crate) use decision_field::{DecisionFeat, DecisionVerb};
 pub use region::RegionMode;
 pub(crate) use region::RegionTable;
 pub(crate) use rem::PartialRetryTable;

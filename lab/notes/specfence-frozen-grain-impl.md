@@ -6,7 +6,7 @@
 **Empirical basis:** `lab/notes/specfence-decision-field-selection-from-99.md`  
 **Vocab:** Spec = Region; Fence = Bind / WaitFor / serial-lane / ordered-admit; Unfenced ≡ OCC-cost for **this** access when ¬PredictedEssential.
 
-**Verdict:** single-iteration full land. No P0/P1/P2 remainder. Every SoT §13 land item below is **landed**.
+**Verdict:** π land complete. **Cost-class follow-up (Unfenced≡OCC + PCC ROI):** `lab/notes/specfence-occ-cost-pcc-roi-impl.md`. No P0/P1/P2 remainder on grain.
 
 Frozen π (must match code):
 

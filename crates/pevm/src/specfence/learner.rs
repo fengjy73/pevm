@@ -415,6 +415,8 @@ pub(crate) struct LiveLearner {
     /// Intra-block marks (abort / first-wave) vs prior seed — quiet must not
     /// suppress intra evidence.
     predicted_intra: DashMap<(MemoryLocationHash, u8), AtomicUsize, FxBuildHasher>,
+    /// Cheap emptiness for the Unfenced≡OCC fast path (no DashMap scan).
+    predicted_n: AtomicUsize,
 }
 
 impl LiveLearner {
@@ -463,6 +465,7 @@ impl LiveLearner {
         self.identity_hits.store(0, Ordering::Relaxed);
         self.predicted.clear();
         self.predicted_intra.clear();
+        self.predicted_n.store(0, Ordering::Relaxed);
     }
 
     /// WaitFor park observed — structural ready-weight, not EV Await.
@@ -520,10 +523,51 @@ impl LiveLearner {
     /// Morph is the block label (quiet seed never plants; intra abort still marks).
     #[inline]
     pub(crate) fn predicted_essential(&self, location: MemoryLocationHash, k: u32) -> bool {
+        if !self.has_any_predicted() {
+            return false;
+        }
         let cls = access_k_class(k);
         self.predicted
             .get(&(location, cls))
             .is_some_and(|e| e.load(Ordering::Relaxed) > 0)
+    }
+
+    /// True when any PredictedEssential mark exists this block (prior or intra).
+    #[inline]
+    pub(crate) fn has_any_predicted(&self) -> bool {
+        self.predicted_n.load(Ordering::Relaxed) > 0
+    }
+
+    /// Strict makespan: enter the Fenced path only if predicted Fence_tax
+    /// < predicted OCC_reexec_waste for this \(a\). Conservative — prior-only
+    /// PE is **not** enough (Bind tax on 19807137). Intra abort evidence is.
+    /// Park/rewind storms stay Unfenced≡OCC (miss → cheap reincarnation).
+    #[inline]
+    pub(crate) fn pcc_makespan_win(&self, location: MemoryLocationHash, k: u32) -> bool {
+        if !self.predicted_essential_intra(location, k) {
+            return false;
+        }
+        let parks = self.park_heat.load(Ordering::Relaxed);
+        let aborts = self.abort_events.load(Ordering::Relaxed);
+        // WaitFor already losing: park ≫ abort savings.
+        if parks > aborts.saturating_add(aborts / 2).saturating_add(8) {
+            return false;
+        }
+        // PrefixSkip/rewind storm: repair tax > OCC B0.
+        if self.r1_underfire() && parks >= 4 {
+            return false;
+        }
+        true
+    }
+
+    /// WaitFor park only when a **single executing** writer is cheaper than
+    /// OCC reincarnation. Never fleet-park independents (6196166 lesson).
+    #[inline]
+    pub(crate) fn waitfor_makespan_win(&self, unfinished: usize, writer_executing: bool) -> bool {
+        if unfinished > 1 || !writer_executing {
+            return false;
+        }
+        self.park_heat.load(Ordering::Relaxed) < 8
     }
 
     /// Intra-block abort / first-wave mark (survives quiet_fence_off).
@@ -550,6 +594,7 @@ impl LiveLearner {
             .entry((location, cls))
             .or_insert_with(|| AtomicUsize::new(0))
             .fetch_add(1, Ordering::Relaxed);
+        self.predicted_n.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Inter-block prior seed. Quiet callers must not invoke this.
@@ -562,6 +607,7 @@ impl LiveLearner {
             .entry((location, cls))
             .or_insert_with(|| AtomicUsize::new(0))
             .fetch_add(1, Ordering::Relaxed);
+        self.predicted_n.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Always-on cheap Detect at \(a\). Observe-only features stay here.
@@ -1553,5 +1599,48 @@ mod tests {
             "last_k must not become inter-block PredictedEssential"
         );
         assert!(!live.predicted_essential(13, 6));
+    }
+
+    #[test]
+    fn pcc_makespan_win_requires_intra_abort_not_prior_seed() {
+        let live = LiveLearner::new();
+        live.begin_block(MorphWeights::default());
+        live.seed_predicted_essential(7, 6);
+        assert!(live.predicted_essential(7, 6));
+        assert!(
+            !live.pcc_makespan_win(7, 6),
+            "prior-only PE must stay Unfenced≡OCC (Bind tax)"
+        );
+        live.note_abort_access(7, 2, Some(6));
+        assert!(
+            live.pcc_makespan_win(7, 6),
+            "intra abort evidence may fire PCC"
+        );
+        assert!(
+            !live.pcc_makespan_win(7, 12),
+            "sibling k-class stays Unfenced"
+        );
+    }
+
+    #[test]
+    fn waitfor_makespan_win_rejects_fleet_and_non_executing() {
+        let live = LiveLearner::new();
+        live.begin_block(MorphWeights::default());
+        assert!(
+            live.waitfor_makespan_win(1, true),
+            "single executing writer is the only cheap WaitFor"
+        );
+        assert!(!live.waitfor_makespan_win(2, true), "fleet park banned");
+        assert!(
+            !live.waitfor_makespan_win(1, false),
+            "Ready/Done must not park independents"
+        );
+        for _ in 0..8 {
+            live.note_park_heat();
+        }
+        assert!(
+            !live.waitfor_makespan_win(1, true),
+            "park storm → Unfenced≡OCC"
+        );
     }
 }

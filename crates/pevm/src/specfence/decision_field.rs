@@ -41,7 +41,7 @@ pub(crate) struct DecisionFieldAgg {
     /// edge kind proxy: wr only today (slot reserved)
     edge_kind_wr: [AtomicU64; VERB_N],
     /// Quality proxies
-    missed_avoid: AtomicU64,   // Unfenced while avoid/essential/force
+    missed_avoid: AtomicU64, // Unfenced while avoid/essential/force
     false_fence_wait: AtomicU64, // Wait while published already (shouldn't)
     wait_no_writer: AtomicU64,
     bind_no_publish: AtomicU64,

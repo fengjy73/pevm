@@ -22,10 +22,10 @@ use crate::{
     hash_deterministic,
     mv_memory::MvMemory,
     specfence::{
-        AccessMode, BindSnapMode, CheckpointKind, EdgeAction, EdgeKey, EdgeKind, EdgeState,
-        DecisionFeat, DecisionVerb, EdgeView, FfValue, ProcessReason, SpecFenceCtx, StorageWriteReplay, absolute_jump_eligible,
-        arm_call_outcome_cache, arm_ff_origin_seeds, attach_current_live_snap,
-        bind_snap_jump_enabled, bind_snap_mode, choose_edge_action, early_val_probability,
+        AccessMode, BindSnapMode, CheckpointKind, DecisionFeat, DecisionVerb, EdgeKey, EdgeKind,
+        EdgeState, FfValue, ProcessReason, SpecFenceCtx, StorageWriteReplay,
+        absolute_jump_eligible, arm_call_outcome_cache, arm_ff_origin_seeds,
+        attach_current_live_snap, bind_snap_jump_enabled, bind_snap_mode, early_val_probability,
         jump_is_safe, jump_refuse_reason, note_pending_bind_snap, note_pending_effect_boundary,
         resume_was_applied, steps_this_run, suffix_repair_jump_env_ok, take_ff_origin_seeds,
         try_arm_safe_absolute_jump, try_arm_safe_absolute_jump_gated, with_bind_snap_tls,
@@ -433,9 +433,15 @@ impl<'a, S: Storage> VmDb<'a, S> {
 
     /// Frozen-grain SpecFence π: \(a=(t,k,\mathrm{depth},ℓ)\) + \(e_{\mathrm{vis}}\) + gate.
     ///
+    /// **Unfenced ≡ OCC:** when ¬PredictedEssential or PCC ROI says Fence_tax
+    /// ≥ OCC_reexec, bypass Edge SM / PreferAdmit / sketch / canary / heavy
+    /// learner / checkpoint. Same cost class as pevm OCC execute→validate→reincarnate.
+    ///
     /// Spec = Region (`EdgeKey`). Fence = Bind / WaitFor / serial-lane / ordered-admit
-    /// **for this \(a\) only**. Bind published Data immediately (A3) — no
-    /// `writer_validated` gate. WaitFor unpublished PredictedEssential writers.
+    /// **for this \(a\) only**, and **only** when predicted Fence_tax < OCC_reexec.
+    /// Bind published Data immediately (A3) — no
+    /// `writer_validated` gate. WaitFor unpublished PredictedEssential writers
+    /// only if a single executing writer is cheaper than reincarnation.
     /// Unfenced ≡ OCC when ¬PredictedEssential (no canary / ForcePrefix / H-OR /
     /// `inc` Avoid). SoftWait Soft stays 0.
     fn maybe_wait_specfence(
@@ -447,119 +453,25 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if address == self.specfence.beneficiary || self.is_lazy {
             self.specfence
                 .partial_retry
-                .note_access(self.tx_idx, location_hash, AccessMode::Read);
+                .note_access_k_only(self.tx_idx, location_hash);
             self.specfence.metrics.record_spec_read();
             return Ok(());
         }
 
-        // force_prefix / inc-repair is **exclude-set** — observe / Resolve
-        // bookkeeping only. Never an Avoid key (99-block inc1+ fence≈74% smell).
-        let tx_has_force =
-            self.tx_incarnation > 0 && self.specfence.partial_retry.has_force_bind(self.tx_idx);
-        let force_prefix = tx_has_force
-            && self
-                .specfence
-                .partial_retry
-                .must_force_bind(self.tx_idx, location_hash);
-
-        let bind_version = self
-            .mv_memory
-            .last_data_before(location_hash, self.tx_idx)
-            .map(|(tx_idx, tx_incarnation)| TxVersion {
-                tx_idx,
-                tx_incarnation,
-            });
-
-        let mv_writer = bind_version.as_ref().map(|v| v.tx_idx).or_else(|| {
-            self.mv_memory
-                .last_writer_before(location_hash, self.tx_idx)
-        });
-        // U1/U4: residual + repair-carried writer id. U2: do not use a sticky
-        // predicted-writer from a prior incarnation as the identity.
-        let residual_writer = if mv_writer.is_none() {
-            self.mv_memory
-                .residual_writer_before(location_hash, self.tx_idx)
-        } else {
-            None
-        };
-        let force_writer = self
-            .specfence
-            .partial_retry
-            .force_writer(self.tx_idx, location_hash);
-        let observed = mv_writer.or(residual_writer).or(force_writer);
-        if let Some(w) = observed.filter(|&w| w < self.tx_idx) {
-            self.specfence.sketch.push_spine(location_hash, w);
-        }
-        let writer = observed
-            .or_else(|| {
-                self.specfence
-                    .sketch
-                    .next_writer_before(location_hash, self.tx_idx)
-            })
-            .filter(|&w| w < self.tx_idx);
-
-        let access_k = self.specfence.partial_retry.current_k(self.tx_idx) as u32;
-        let access_depth = self
-            .specfence
-            .partial_retry
-            .estimate_effect_depth(self.tx_idx)
-            .map(|d| (d * 8.0).clamp(0.0, 15.0) as u8)
-            .unwrap_or(0);
-        let key = EdgeKey {
-            location: location_hash,
-            reader: self.tx_idx,
-            access_k,
-            depth: access_depth,
-        };
-        let published = bind_version.is_some();
-        let state = if published {
-            if writer.is_some_and(|w| self.specfence.scheduler.is_validated(w)) {
-                EdgeState::Validated
-            } else {
-                EdgeState::PublishedUncommitted
-            }
-        } else {
-            EdgeState::Unpublished
-        };
-        self.specfence
-            .edges
-            .record(key, writer, EdgeKind::Wr, state);
-
-        // Always-on cheap Detect at a — observe features feed learning only.
-        self.specfence
-            .learner
-            .note_detect(location_hash, access_k, access_depth, is_program);
+        // Cheap Detect: always increment the coverage counter. Heavy
+        // `note_detect` (DashMap) is sampled / off the Unfenced critical path.
         self.specfence.metrics.record_detect_access();
 
-        let prior_ws =
-            self.specfence.rw_prior.predicts_write(location_hash) || residual_writer.is_some();
-        let hotset = self.specfence.hotset.contains(location_hash);
-        let sticky = self.specfence.learner.is_sticky_resolve(location_hash);
-        // H / prior_warm / sticky are observe/prior — never OR into the verb.
-        if is_program && (hotset || prior_ws || sticky || writer.is_some()) {
-            self.specfence.sketch.note_hot(location_hash);
-        }
-        if self.specfence.learner.live_fanout_hot(location_hash) && is_program {
-            self.specfence.sketch.note_hot(location_hash);
-        }
-        if self.specfence.learner.bind_cover(location_hash)
-            || self.specfence.learner.writer_done_hot(location_hash)
-        {
-            self.specfence.sketch.note_hot(location_hash);
-        }
-        let in_h = self.specfence.sketch.in_h(location_hash);
-        let loc_avoid = self.specfence.sketch.avoid_broadcast(location_hash)
-            || self.specfence.edges.avoid_broadcast(location_hash);
-
-        // Frozen gate: PredictedEssential(ℓ, k, morph) for THIS a.
-        // Learner PE is abort + inter-block prior only. Sketch access-class is
-        // serial-lane / Detect — never an OR-door into the live verb.
-        // Quiet priors never plant; intra abort still marks.
-        let mut predicted = self
-            .specfence
-            .learner
-            .predicted_essential(location_hash, access_k);
-        if self.specfence.learner.quiet_fence_off()
+        // Gate first. Empty PE table → Unfenced≡OCC (same class as OCC maybe_wait).
+        let access_k = self.specfence.partial_retry.current_k(self.tx_idx) as u32;
+        let has_pe = self.specfence.learner.has_any_predicted();
+        let mut predicted = has_pe
+            && self
+                .specfence
+                .learner
+                .predicted_essential(location_hash, access_k);
+        if predicted
+            && self.specfence.learner.quiet_fence_off()
             && !self
                 .specfence
                 .learner
@@ -567,206 +479,282 @@ impl<'a, S: Storage> VmDb<'a, S> {
         {
             predicted = false;
         }
-        // Canary live verb deleted. Clique / force_prefix / H-OR / morph
-        // actuator / writer_validated Bind gate are exclude-set.
-        let canary_ok = false;
-        let independence = !predicted;
-        let essential = predicted;
-        let clique_gated = false;
-        let avoid = predicted || loc_avoid;
 
-        let view = EdgeView {
-            location: location_hash,
-            reader: self.tx_idx,
-            access_k,
-            access_depth,
-            writer,
-            bind_version: bind_version.clone(),
-            writer_published: published,
-            writer_validated: writer.is_some_and(|w| self.specfence.scheduler.is_validated(w)),
-            is_program,
-            in_hot_set: in_h,
-            avoid_broadcast: loc_avoid,
-            canary_ok,
-            independence_certified: independence,
-            predicted_essential: predicted,
-            essential_antidep: essential,
-            force_prefix,
-            clique_gated,
-            writer_executing: writer.is_some_and(|w| self.specfence.scheduler.is_executing(w)),
-            writer_ready: writer.is_some_and(|w| self.specfence.scheduler.is_ready(w)),
-        };
-        let action = choose_edge_action(&view);
+        // Sampled Detect for learning (1/16). Never plants PE.
+        if (self.tx_idx ^ location_hash as usize ^ access_k as usize) & 15 == 0 {
+            self.specfence
+                .learner
+                .note_detect(location_hash, access_k, 0, is_program);
+        }
+
+        // PCC Fire only if predicted Fence_tax < OCC_reexec for THIS a.
+        // Prior-only PE / park storm → stay Unfenced≡OCC (miss → reincarnation).
+        if !predicted
+            || !self
+                .specfence
+                .learner
+                .pcc_makespan_win(location_hash, access_k)
         {
-            let verb = match &action {
-                EdgeAction::Bind(_) => DecisionVerb::Bind,
-                EdgeAction::WaitFor(_) => DecisionVerb::WaitFor,
-                EdgeAction::Unfenced => DecisionVerb::Unfenced,
-            };
-            self.specfence.process.record_decision(DecisionFeat {
-                verb,
-                access_k,
-                depth: access_depth,
-                incarnation: self.tx_incarnation,
-                is_program,
-                writer_published: published,
-                writer_validated: view.writer_validated,
-                writer_executing: view.writer_executing,
-                writer_ready: view.writer_ready,
-                writer_present: writer.is_some(),
-                avoid_broadcast: avoid,
-                canary_ok,
-                independence_certified: independence,
-                essential_antidep: essential,
-                force_prefix,
-                clique_gated,
-                in_hot_set: in_h,
-                prior_warm: prior_ws || sticky,
-                mode_read: true,
-            });
-        }
-        let canary_taken = false;
-        // Live Fence iff PredictedEssential for THIS a. Exclude-set is not π.
-        let must_wait = predicted;
-        if predicted {
-            self.specfence.metrics.record_predicted_essential();
-            self.specfence.metrics.record_pcc_fire_at_a();
-        }
-
-        // Ordered admission on PredictedEssential WaitFor only.
-        // PreferAdmit on Unfenced is deleted (serial-lane lands; OCC-width).
-        let is_done = |t: TxIdx| self.specfence.scheduler.is_done(t);
-        let is_ready = |t: TxIdx| self.specfence.scheduler.is_ready(t);
-        let wait_for = matches!(action, EdgeAction::WaitFor(_));
-        let unfinished = if wait_for {
-            self.specfence
-                .sketch
-                .unfinished_writers_before(location_hash, self.tx_idx, is_done)
-        } else {
-            Vec::new()
-        };
-        let park_heat = wait_for;
-        let ready_spines = if wait_for {
-            self.specfence
-                .sketch
-                .ready_spine_writers(self.tx_idx, is_ready, is_done)
-        } else {
-            Vec::new()
-        };
-        let mut admit = unfinished.clone();
-        for w in &ready_spines {
-            if !admit.contains(w) {
-                admit.push(*w);
+            if predicted {
+                self.specfence.metrics.record_predicted_essential();
+                self.specfence.metrics.record_pcc_roi_skip();
             }
-        }
-        if !admit.is_empty() {
-            self.specfence.scheduler.admit_spine_writers_heat(
-                &admit,
-                self.specfence.wave,
-                park_heat,
-            );
-            if admit.iter().any(|&w| is_ready(w)) {
-                self.specfence.metrics.record_prefer_admit();
-            }
-            if unfinished.len() > 1 || ready_spines.len() > 1 {
-                self.specfence.metrics.record_multi_spine_admit();
-            }
-        }
-
-        match action {
-            EdgeAction::Bind(v) => {
-                self.specfence.metrics.record_edge_bind();
-                self.specfence.learner.note_bind_success(location_hash);
-                self.specfence.sketch.install_data_residual(
-                    location_hash,
-                    v.tx_idx,
-                    v.tx_incarnation,
-                );
-                self.specfence.process.record(
-                    location_hash,
-                    self.tx_idx,
-                    ProcessReason::BindPublished,
-                    avoid,
-                    canary_taken,
-                );
-                self.specfence.edges.set_state(
-                    &key,
-                    if self.specfence.scheduler.is_validated(v.tx_idx) {
-                        EdgeState::Validated
-                    } else {
-                        EdgeState::PublishedUncommitted
-                    },
-                );
-                self.bind_on_data_lite(address, location_hash, v, force_prefix)
-            }
-            EdgeAction::WaitFor(w) => self.fence_wait_for(
+            return self.unfenced_occ_fast(
                 address,
                 location_hash,
-                w,
-                avoid,
-                in_h,
-                clique_gated,
-                canary_taken,
-                force_prefix,
-                must_wait,
-            ),
-            EdgeAction::Unfenced => {
-                // Incarnation carry: only residual-Bind ℓ that already have a
-                // Region residual or carried writer — not every prior UnfencedCold
-                // (that certified stale FF and broke seq≡par).
-                if self.tx_incarnation > 0
-                    && self
-                        .specfence
-                        .partial_retry
-                        .inc_carry_seen(self.tx_idx, location_hash)
-                    && (self.specfence.sketch.residual_bind(location_hash).is_some()
-                        || self
-                            .specfence
-                            .partial_retry
-                            .force_writer(self.tx_idx, location_hash)
-                            .is_some())
-                {
-                    return self.bind_done_residual(
-                        address,
-                        location_hash,
-                        writer.unwrap_or(self.tx_idx.saturating_sub(1)),
-                        force_prefix,
-                        avoid,
-                        canary_taken,
-                    );
-                }
-                // ¬PredictedEssential → Unfenced≡OCC. force_prefix is not π.
-                let reason = if independence {
+                access_k,
+                is_program,
+                !predicted,
+            );
+        }
+        self.specfence.metrics.record_predicted_essential();
+
+        // Fenced path only. One MV Data probe — Bind is the cheap PCC win.
+        let bind_version = self
+            .mv_memory
+            .last_data_before(location_hash, self.tx_idx)
+            .map(|(tx_idx, tx_incarnation)| TxVersion {
+                tx_idx,
+                tx_incarnation,
+            });
+        let published = bind_version.is_some();
+        if published {
+            if let Some(v) = bind_version {
+                return self.pcc_bind_published(address, location_hash, access_k, is_program, v);
+            }
+        }
+
+        // Unpublished: WaitFor only if a single executing writer is cheaper
+        // than OCC reincarnation. Else Unfenced≡OCC (no fleet park).
+        let writer = self
+            .mv_memory
+            .last_writer_before(location_hash, self.tx_idx)
+            .or_else(|| {
+                self.mv_memory
+                    .residual_writer_before(location_hash, self.tx_idx)
+            })
+            .or_else(|| {
+                self.specfence
+                    .partial_retry
+                    .force_writer(self.tx_idx, location_hash)
+            })
+            .filter(|&w| w < self.tx_idx);
+        let writer_executing = writer.is_some_and(|w| self.specfence.scheduler.is_executing(w));
+        let unfinished = if writer.is_some() { 1 } else { 0 };
+        if let Some(w) = writer {
+            if self
+                .specfence
+                .learner
+                .waitfor_makespan_win(unfinished, writer_executing)
+            {
+                return self.pcc_wait_for_writer(address, location_hash, access_k, is_program, w);
+            }
+        }
+        self.specfence.metrics.record_pcc_roi_skip();
+        self.unfenced_occ_fast(address, location_hash, access_k, is_program, false)
+    }
+
+    /// Unfenced ≡ OCC: rem \(k\) + first_k only. No Edge SM, sketch, PreferAdmit,
+    /// canary, process DashMap, journal, or `note_pending_effect_boundary`.
+    fn unfenced_occ_fast(
+        &self,
+        address: Address,
+        location_hash: MemoryLocationHash,
+        access_k: u32,
+        is_program: bool,
+        independence: bool,
+    ) -> Result<(), ReadError> {
+        // Reincarnation bookkeeping only (not Avoid). Residual-Bind when this
+        // ℓ already carried a writer — skipping it certified stale FF (seq≠par).
+        if self.tx_incarnation > 0
+            && self
+                .specfence
+                .partial_retry
+                .inc_carry_seen(self.tx_idx, location_hash)
+            && (self.specfence.sketch.residual_bind(location_hash).is_some()
+                || self
+                    .specfence
+                    .partial_retry
+                    .force_writer(self.tx_idx, location_hash)
+                    .is_some())
+        {
+            return self.bind_done_residual(
+                address,
+                location_hash,
+                self.tx_idx.saturating_sub(1),
+                false,
+                false,
+                false,
+            );
+        }
+        self.specfence
+            .partial_retry
+            .note_access_k_only(self.tx_idx, location_hash);
+        self.specfence.metrics.record_edge_unfenced();
+        self.specfence.metrics.record_spec_read();
+        self.specfence.metrics.record_unfenced_occ_fast();
+        if independence {
+            self.specfence.metrics.record_independent_unfenced();
+            self.specfence.metrics.record_cold_spec_fast();
+            if self.tx_incarnation == 0 {
+                self.specfence.metrics.record_occ_fast_first();
+            }
+        }
+        // Sampled process/decision for mixed_verb falsifier (1/8) only when
+        // PE exists in the block — quiet Unfenced-only stays silent.
+        if self.specfence.learner.has_any_predicted() && (self.tx_idx ^ access_k as usize) & 7 == 0
+        {
+            self.specfence.process.record(
+                location_hash,
+                self.tx_idx,
+                if independence {
                     ProcessReason::UnfencedIndependence
                 } else {
                     ProcessReason::UnfencedCold
-                };
-                self.specfence.process.record(
-                    location_hash,
-                    self.tx_idx,
-                    reason,
-                    avoid,
-                    canary_taken,
-                );
-                self.specfence.partial_retry.note_access(
-                    self.tx_idx,
-                    location_hash,
-                    AccessMode::Read,
-                );
-                self.specfence.sketch.note_unfenced(location_hash);
-                self.specfence.metrics.record_edge_unfenced();
-                self.specfence.metrics.record_spec_read();
-                if independence {
-                    self.specfence.metrics.record_independent_unfenced();
-                    self.specfence.metrics.record_cold_spec_fast();
-                    if self.tx_incarnation == 0 {
-                        self.specfence.metrics.record_occ_fast_first();
-                    }
-                }
-                note_pending_effect_boundary(self.tx_idx, self.specfence.partial_retry);
-                Ok(())
-            }
+                },
+                false,
+                false,
+            );
+            self.specfence.process.record_decision(DecisionFeat {
+                verb: DecisionVerb::Unfenced,
+                access_k,
+                depth: 0,
+                incarnation: self.tx_incarnation,
+                is_program,
+                writer_published: false,
+                writer_validated: false,
+                writer_executing: false,
+                writer_ready: false,
+                writer_present: false,
+                avoid_broadcast: false,
+                canary_ok: false,
+                independence_certified: independence,
+                essential_antidep: !independence,
+                force_prefix: false,
+                clique_gated: false,
+                in_hot_set: false,
+                prior_warm: false,
+                mode_read: true,
+            });
         }
+        Ok(())
+    }
+
+    fn pcc_bind_published(
+        &self,
+        address: Address,
+        location_hash: MemoryLocationHash,
+        access_k: u32,
+        is_program: bool,
+        v: TxVersion,
+    ) -> Result<(), ReadError> {
+        self.specfence.metrics.record_pcc_fire_at_a();
+        self.specfence.metrics.record_edge_bind();
+        self.specfence.learner.note_bind_success(location_hash);
+        let access_depth = 0u8;
+        let key = EdgeKey {
+            location: location_hash,
+            reader: self.tx_idx,
+            access_k,
+            depth: access_depth,
+        };
+        self.specfence.edges.record(
+            key,
+            Some(v.tx_idx),
+            EdgeKind::Wr,
+            if self.specfence.scheduler.is_validated(v.tx_idx) {
+                EdgeState::Validated
+            } else {
+                EdgeState::PublishedUncommitted
+            },
+        );
+        self.specfence.process.record(
+            location_hash,
+            self.tx_idx,
+            ProcessReason::BindPublished,
+            true,
+            false,
+        );
+        self.specfence.process.record_decision(DecisionFeat {
+            verb: DecisionVerb::Bind,
+            access_k,
+            depth: access_depth,
+            incarnation: self.tx_incarnation,
+            is_program,
+            writer_published: true,
+            writer_validated: self.specfence.scheduler.is_validated(v.tx_idx),
+            writer_executing: false,
+            writer_ready: false,
+            writer_present: true,
+            avoid_broadcast: false,
+            canary_ok: false,
+            independence_certified: false,
+            essential_antidep: true,
+            force_prefix: false,
+            clique_gated: false,
+            in_hot_set: false,
+            prior_warm: false,
+            mode_read: true,
+        });
+        self.specfence
+            .sketch
+            .install_data_residual(location_hash, v.tx_idx, v.tx_incarnation);
+        self.bind_on_data_lite(address, location_hash, v, false)
+    }
+
+    fn pcc_wait_for_writer(
+        &self,
+        address: Address,
+        location_hash: MemoryLocationHash,
+        access_k: u32,
+        is_program: bool,
+        w: TxIdx,
+    ) -> Result<(), ReadError> {
+        self.specfence.metrics.record_pcc_fire_at_a();
+        let access_depth = 0u8;
+        let key = EdgeKey {
+            location: location_hash,
+            reader: self.tx_idx,
+            access_k,
+            depth: access_depth,
+        };
+        self.specfence
+            .edges
+            .record(key, Some(w), EdgeKind::Wr, EdgeState::Unpublished);
+        self.specfence.process.record_decision(DecisionFeat {
+            verb: DecisionVerb::WaitFor,
+            access_k,
+            depth: access_depth,
+            incarnation: self.tx_incarnation,
+            is_program,
+            writer_published: false,
+            writer_validated: false,
+            writer_executing: true,
+            writer_ready: false,
+            writer_present: true,
+            avoid_broadcast: false,
+            canary_ok: false,
+            independence_certified: false,
+            essential_antidep: true,
+            force_prefix: false,
+            clique_gated: false,
+            in_hot_set: false,
+            prior_warm: false,
+            mode_read: true,
+        });
+        // Hang-freedom: admit the WaitFor target only — never fleet-park.
+        self.specfence.scheduler.admit_spine(w, self.specfence.wave);
+        self.fence_wait_for(
+            address,
+            location_hash,
+            w,
+            true,
+            false,
+            false,
+            false,
+            false,
+            true,
+        )
     }
 
     /// Fence WaitFor: never convert a known-essential / post-Avoid Region to
@@ -828,27 +816,12 @@ impl<'a, S: Storage> VmDb<'a, S> {
 
         let is_done = |t: TxIdx| self.specfence.scheduler.is_done(t);
         let is_executing = |t: TxIdx| self.specfence.scheduler.is_executing(t);
-        let is_ready = |t: TxIdx| self.specfence.scheduler.is_ready(t);
         let unfinished_all =
             self.specfence
                 .sketch
                 .unfinished_writers_before(location_hash, self.tx_idx, is_done);
-        // S4: this-ℓ unfinished only. Other Avoid spines were prefer-admitted
-        // in maybe_wait_specfence (do not rescan here).
-        if !unfinished_all.is_empty() {
-            let park_heat = self.specfence.learner.prefer_admit_heat();
-            self.specfence.scheduler.admit_spine_writers_heat(
-                &unfinished_all,
-                self.specfence.wave,
-                park_heat,
-            );
-            if unfinished_all.iter().any(|&w| is_ready(w)) {
-                self.specfence.metrics.record_prefer_admit();
-            }
-            if unfinished_all.len() > 1 {
-                self.specfence.metrics.record_multi_spine_admit();
-            }
-        }
+        // Hang-freedom: admit the WaitFor target only. Fleet PreferAdmit of
+        // unfinished_all / ready_spines parks independents (6196166).
         // Park Executing first. Ready is prefer-admitted (not parked).
         // Done∅Data → Bind residual — never UnfencedWriterDone on must_wait.
         let unfinished_exec = unfinished_all

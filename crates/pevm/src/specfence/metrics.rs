@@ -264,6 +264,12 @@ pub struct SpecFenceMetrics {
     pub predicted_essential_hits: usize,
     /// Frozen-grain: PCC Bind/WaitFor fired at this access (not tx-sticky).
     pub pcc_fire_at_a: usize,
+    /// PredictedEssential but ROI said Fence_tax ≥ OCC_reexec → stayed Unfenced.
+    pub pcc_roi_skip: usize,
+    /// Unfenced≡OCC fast path (no Edge SM / sketch / checkpoint).
+    pub unfenced_occ_fast: usize,
+    /// Certified prefix existed but PrefixSkip lost to B0 reincarnation.
+    pub prefix_skip_roi_b0: usize,
     /// Falsifier: ForcePrefix used as live Avoid key (target 0).
     pub force_prefix_as_pi: usize,
     /// Falsifier: canary live verb (target 0).
@@ -397,6 +403,9 @@ pub(crate) struct MetricsInner {
     detect_accesses: AtomicUsize,
     predicted_essential_hits: AtomicUsize,
     pcc_fire_at_a: AtomicUsize,
+    pcc_roi_skip: AtomicUsize,
+    unfenced_occ_fast: AtomicUsize,
+    prefix_skip_roi_b0: AtomicUsize,
     force_prefix_as_pi: AtomicUsize,
     canary_live_verb: AtomicUsize,
     inc_avoid_hits: AtomicUsize,
@@ -851,6 +860,18 @@ impl MetricsInner {
         self.pcc_fire_at_a.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_pcc_roi_skip(&self) {
+        self.pcc_roi_skip.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_unfenced_occ_fast(&self) {
+        self.unfenced_occ_fast.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_prefix_skip_roi_b0(&self) {
+        self.prefix_skip_roi_b0.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_jump_defer(&self) {
         self.jump_defer.fetch_add(1, Ordering::Relaxed);
     }
@@ -1107,6 +1128,9 @@ impl MetricsInner {
             detect_accesses: self.detect_accesses.load(Ordering::Relaxed),
             predicted_essential_hits: self.predicted_essential_hits.load(Ordering::Relaxed),
             pcc_fire_at_a: self.pcc_fire_at_a.load(Ordering::Relaxed),
+            pcc_roi_skip: self.pcc_roi_skip.load(Ordering::Relaxed),
+            unfenced_occ_fast: self.unfenced_occ_fast.load(Ordering::Relaxed),
+            prefix_skip_roi_b0: self.prefix_skip_roi_b0.load(Ordering::Relaxed),
             force_prefix_as_pi: self.force_prefix_as_pi.load(Ordering::Relaxed),
             canary_live_verb: self.canary_live_verb.load(Ordering::Relaxed),
             inc_avoid_hits: self.inc_avoid_hits.load(Ordering::Relaxed),
