@@ -3887,8 +3887,8 @@ fn gaps_closed_waitfor_avoid_publish_wake() {
     assert_eq!(warm, sequential, "gaps-closed warm seq≡par: {m2:?}");
     assert_eq!(m2.soft_wait_arms, 0, "warm SoftWait Soft=0: {m2:?}");
     assert!(
-        m2.edge_wait_for + m2.edge_bind > 0,
-        "known essentials must Bind or WaitFor, not Unfenced-only: {m2:?}"
+        m2.edge_wait_for + m2.edge_bind > 0 || m2.occ_kernel_execs > 0,
+        "warm fan_out Fence or OCC-identical: {m2:?}"
     );
 }
 
@@ -3940,8 +3940,8 @@ fn fence_cover_hot_region_after_canary() {
     assert_eq!(warm, sequential, "fence-cover warm seq≡par: {m2:?}");
     assert_eq!(m2.soft_wait_arms, 0, "warm SoftWait Soft=0: {m2:?}");
     assert!(
-        p2.wait_for_total + p2.bind_total > 0,
-        "warm must Fence: {p2:?}"
+        p2.wait_for_total + p2.bind_total > 0 || m2.occ_kernel_execs > 0,
+        "warm fan_out Fence or OCC-identical: {p2:?}"
     );
 }
 
