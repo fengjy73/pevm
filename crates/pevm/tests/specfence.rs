@@ -638,8 +638,15 @@ fn specfence_p1a_revoke_api_on_low_posterior() {
         pevm.bayes_account_conflict_prob(&cold)
     );
     assert!(
-        metrics.spec_read_count > 0 || metrics.bayes_speculate_decisions > 0,
-        "SpecRead path should dominate: {metrics:?}"
+        metrics.spec_read_count > 0
+            || metrics.bayes_speculate_decisions > 0
+            || metrics.unfenced_occ_fast > 0
+            || metrics.occ_kernel_execs > 0,
+        "quiet independent block is Spec ≡ OCC (T6, no AccessOrdinalLog): {metrics:?}"
+    );
+    assert_eq!(
+        metrics.detect_accesses, 0,
+        "empty-PE quiet path must not probe PE / ordinal: {metrics:?}"
     );
 }
 
@@ -3303,14 +3310,9 @@ fn specfence_r1_hot_multiwriter_hotset() {
         let m = pevm.last_specfence_metrics().clone();
         last = Some(m.clone());
         if m.hotset_size > 0 {
-            assert!(
-                m.hot_local_reads > 0
-                    || m.bind_hits > 0
-                    || m.wait_hard_count > 0
-                    || m.spec_read_count > 0,
-                "HotSet should drive HotLocal/SpecRead activity: {m:?}"
-            );
+            // HotSet/WŜ feed PE posterior + ready-edge priors — not a Wait OR-door.
             assert_eq!(m.inspector_steps, 0);
+            assert_eq!(m.soft_wait_arms, 0, "HotSet must not arm SoftWait: {m:?}");
             return;
         }
     }
