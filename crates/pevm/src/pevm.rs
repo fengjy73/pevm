@@ -462,11 +462,7 @@ impl Pevm {
                 metrics_inner.record_quiet_fence_revoke(n);
             }
         }
-        let wave_ref = if self.concurrency_mode == ConcurrencyMode::SpecFence {
-            Some(&wave)
-        } else {
-            None
-        };
+        let wave_ref = crate::specfence::wave_for_mode(self.concurrency_mode, &wave);
         let engagement = if self.concurrency_mode == ConcurrencyMode::SpecFence {
             AdaptiveEngagement::new(block_size, start_lean)
         } else {
@@ -522,11 +518,7 @@ impl Pevm {
                         task = match task.unwrap() {
                             Task::Execution(tx_version) => {
                                 let fence_ref =
-                                    if self.concurrency_mode == ConcurrencyMode::SpecFence {
-                                        Some(&dag)
-                                    } else {
-                                        None
-                                    };
+                                    crate::specfence::fence_for_mode(self.concurrency_mode, &dag);
                                 self.try_execute(
                                     &mut vm, &scheduler, tx_version, wave_ref, fence_ref,
                                 )
@@ -976,7 +968,7 @@ fn try_validate(
     let mut read_set_valid = if specfence.mode.uses_regions() {
         invalid.is_empty()
     } else {
-        mv_memory.validate_read_locations(tx_version.tx_idx)
+        crate::specfence::occ_read_set_valid(mv_memory, tx_version.tx_idx)
     };
     let lean_tx = specfence.mode == ConcurrencyMode::SpecFence
         && specfence.engagement.tx_was_lean(tx_version.tx_idx);
@@ -986,7 +978,7 @@ fn try_validate(
     let mut cached_plan: Option<Option<crate::specfence::PartialRetryPlan>> = None;
     // Iter15: true_suffix flag for fan-out FR collapse / RebindOnly widen on abort path.
     let mut true_suffix_flag = false;
-    if specfence.mode == ConcurrencyMode::SpecFence && !invalid.is_empty() {
+    if crate::specfence::uses_specfence_resolve(specfence.mode) && !invalid.is_empty() {
         specfence.metrics.record_region_validate_fail(invalid.len());
         // RebindOnly-first (native resolve): patch origins when invalid reads now
         // have Data/Storage and there is no *true* failed-suffix write (first_k ≥

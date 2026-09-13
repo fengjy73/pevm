@@ -421,6 +421,14 @@ impl PartialRetryState {
         k
     }
 
+    /// Cheap per-tx \(k\) bump for the PE probe. No `first_k` / journal
+    /// (Unfenced miss → B0; PrefixSkip requires a PCC-journaled prefix).
+    #[inline]
+    pub(crate) fn bump_k_only(&mut self) -> usize {
+        self.k += 1;
+        self.k
+    }
+
     pub(crate) fn note_certified(&mut self, location: MemoryLocationHash) {
         self.certified.insert(location);
     }
@@ -946,6 +954,15 @@ impl PartialRetryTable {
     pub(crate) fn note_access_k_only(&self, tx_idx: TxIdx, location: MemoryLocationHash) -> usize {
         let mut st = unsafe { self.state_mut(tx_idx) };
         st.note_access_k_only(location)
+    }
+
+    /// PE-probe ordinal only (no `first_k`). Safe on Unfenced.
+    #[inline]
+    pub(crate) fn bump_k_only(&self, tx_idx: TxIdx) -> usize {
+        if tx_idx >= self.states.len() {
+            return 0;
+        }
+        unsafe { self.state_mut(tx_idx) }.bump_k_only()
     }
 
     pub(crate) fn note_certified(&self, tx_idx: TxIdx, location: MemoryLocationHash) {

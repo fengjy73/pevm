@@ -12,6 +12,7 @@ use revm::{
     state::{AccountInfo, Bytecode, EvmState},
 };
 use smallvec::SmallVec;
+use std::cell::Cell;
 use std::time::Instant;
 
 use crate::{
@@ -22,8 +23,8 @@ use crate::{
     hash_deterministic,
     mv_memory::MvMemory,
     specfence::{
-        AccessMode, BindSnapMode, CheckpointKind, DecisionFeat, DecisionVerb, EdgeKey, EdgeKind,
-        EdgeState, FfValue, ProcessReason, SpecFenceCtx, StorageWriteReplay,
+        AccessDecision, AccessMode, BindSnapMode, CheckpointKind, DecisionFeat, DecisionVerb,
+        EdgeKey, EdgeKind, EdgeState, FfValue, ProcessReason, SpecFenceCtx, StorageWriteReplay,
         absolute_jump_eligible, arm_call_outcome_cache, arm_ff_origin_seeds,
         attach_current_live_snap, bind_snap_jump_enabled, bind_snap_mode, early_val_probability,
         jump_is_safe, jump_refuse_reason, note_pending_bind_snap, note_pending_effect_boundary,
@@ -145,6 +146,11 @@ pub(crate) struct VmDb<'a, S: Storage> {
     // Indicates if we lazy update this transaction.
     // Only applied to raw transfers' senders & recipients at the moment.
     is_lazy: bool,
+    /// PCC overlay armed for the current access (PE ∩ ROI). Unfenced = OCC read.
+    pcc_armed: Cell<bool>,
+    /// Unfenced accesses this incarnation (end-tx process flush; no DashMap).
+    unfenced_this_tx: Cell<u32>,
+    pcc_this_tx: Cell<u32>,
     // Whether to enforce the sender-nonce ordering check for this transaction.
     // False for transaction types with no nonce (e.g. OP deposits).
     has_nonce: bool,
@@ -171,10 +177,12 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.from_hash = from_hash;
         self.to_hash = to_hash;
         self.to_code_hash = None;
+        self.flush_access_census();
         self.is_lazy = false;
         self.has_nonce = has_nonce;
         self.read_set.clear();
         self.read_accounts.clear();
+        self.pcc_armed.set(false);
         if let Some(fg) = self.specfence.finegrain {
             fg.deep_begin_consumer(tx_idx, incarnation);
         }
@@ -376,140 +384,140 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.specfence.metrics.mark_hot(address);
     }
 
-    /// SpecFence π at location granularity: WaitFor / Bind / Unfenced.
-    /// PCC keeps sticky Wait. Beneficiary never waits.
-    /// P2: force Bind/WaitHard on certified-prefix locations after PartialRetry.
-    /// P3: EarlyAbort cuts incarnation (rem RewindTo/FullRetry) + Blocking (hang-free);
-    ///     only when π saw known d (effect-progress / inspect); morph prior ≠ EarlyAbort.
+    /// End-tx Unfenced census (no per-SLOAD process DashMap).
+    fn flush_access_census(&self) {
+        let n = self.unfenced_this_tx.get();
+        if n > 0 && self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            self.specfence.process.note_unfenced_occ(self.tx_idx, n);
+        }
+        self.unfenced_this_tx.set(0);
+        self.pcc_this_tx.set(0);
+        self.pcc_armed.set(false);
+    }
+
+    /// Mode dispatch. OCC is `Ok(())` with **zero** SpecFence calls.
+    /// SpecFence Unfenced compiles to the same OCC proceed (`occ_unfenced`).
     fn maybe_wait(
         &self,
         address: Address,
         location_hash: MemoryLocationHash,
         is_program: bool,
     ) -> Result<(), ReadError> {
-        // SpecFence: effect counter only here; per-location journal lives inside
-        // maybe_wait_specfence so Bind can coalesce access+certify under one rem lock.
-        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
-            let _ = self.specfence.rem.note_effect();
-        }
-
-        if self.specfence.mode != crate::ConcurrencyMode::SpecFence {
-            if !self.specfence.should_wait_location(
-                &self.mv_memory.regions,
-                location_hash,
-                &address,
-            ) {
-                return Ok(());
+        match self.specfence.mode {
+            crate::ConcurrencyMode::Occ => Ok(()),
+            crate::ConcurrencyMode::Pcc => self.maybe_wait_pcc(address, location_hash),
+            crate::ConcurrencyMode::SpecFence => {
+                self.specfence_access_gate(address, location_hash, is_program)
             }
-            if let Some(prev) = self
-                .mv_memory
-                .last_writer_before(location_hash, self.tx_idx)
-                && !self.specfence.scheduler.is_done(prev)
-            {
-                self.specfence.metrics.record_wait(address);
-                return Err(ReadError::Blocking(prev));
-            }
-            if let Some(prev) =
-                self.specfence
-                    .wait_blocker(&self.mv_memory.regions, &address, self.tx_idx)
-            {
-                self.specfence.metrics.record_wait(address);
-                return Err(ReadError::Blocking(prev));
-            }
-            return Ok(());
         }
-
-        // --- SpecFence v5 path: AEC choose_action + FenceGraph SoftWait ---
-        if crate::specfence::profile_timing_enabled() {
-            let t0 = Instant::now();
-            let mw_result = self.maybe_wait_specfence(address, location_hash, is_program);
-            self.specfence
-                .metrics
-                .add_profile_maybe_wait_ns(t0.elapsed().as_nanos() as u64);
-            return mw_result;
-        }
-        return self.maybe_wait_specfence(address, location_hash, is_program);
     }
 
-    /// Frozen-grain SpecFence π: \(a=(t,k,\mathrm{depth},ℓ)\) + \(e_{\mathrm{vis}}\) + gate.
-    ///
-    /// **Unfenced ≡ OCC:** when ¬PredictedEssential or PCC ROI says Fence_tax
-    /// ≥ OCC_reexec, bypass Edge SM / PreferAdmit / sketch / canary / heavy
-    /// learner / checkpoint. Same cost class as pevm OCC execute→validate→reincarnate.
-    ///
-    /// Spec = Region (`EdgeKey`). Fence = Bind / WaitFor / serial-lane / ordered-admit
-    /// **for this \(a\) only**, and **only** when predicted Fence_tax < OCC_reexec.
-    /// Bind published Data immediately (A3) — no
-    /// `writer_validated` gate. WaitFor unpublished PredictedEssential writers
-    /// only if a single executing writer is cheaper than reincarnation.
-    /// Unfenced ≡ OCC when ¬PredictedEssential (no canary / ForcePrefix / H-OR /
-    /// `inc` Avoid). SoftWait Soft stays 0.
-    fn maybe_wait_specfence(
+    /// Legacy PCC sticky Wait (not SpecFence π).
+    fn maybe_wait_pcc(
+        &self,
+        address: Address,
+        location_hash: MemoryLocationHash,
+    ) -> Result<(), ReadError> {
+        if !self
+            .specfence
+            .should_wait_location(&self.mv_memory.regions, location_hash, &address)
+        {
+            return Ok(());
+        }
+        if let Some(prev) = self
+            .mv_memory
+            .last_writer_before(location_hash, self.tx_idx)
+            && !self.specfence.scheduler.is_done(prev)
+        {
+            self.specfence.metrics.record_wait(address);
+            return Err(ReadError::Blocking(prev));
+        }
+        if let Some(prev) =
+            self.specfence
+                .wait_blocker(&self.mv_memory.regions, &address, self.tx_idx)
+        {
+            self.specfence.metrics.record_wait(address);
+            return Err(ReadError::Blocking(prev));
+        }
+        Ok(())
+    }
+
+    /// SpecFence access gate. Unfenced ⇒ OCC proceed (`pcc_armed=false`).
+    /// PCC overlay only when `access_policy` returns `TryPcc`.
+    fn specfence_access_gate(
         &self,
         address: Address,
         location_hash: MemoryLocationHash,
         is_program: bool,
     ) -> Result<(), ReadError> {
+        self.pcc_armed.set(false);
         if address == self.specfence.beneficiary || self.is_lazy {
-            self.specfence
-                .partial_retry
-                .note_access_k_only(self.tx_idx, location_hash);
-            self.specfence.metrics.record_spec_read();
-            return Ok(());
+            return self.occ_unfenced();
         }
 
-        // Cheap Detect: always increment the coverage counter. Heavy
-        // `note_detect` (DashMap) is sampled / off the Unfenced critical path.
+        // Detect coverage only (one Relaxed atomic). DashMap `note_detect` is
+        // off this path — learner updates on abort / end_block / PCC.
         self.specfence.metrics.record_detect_access();
 
-        // Gate first. Empty PE table → Unfenced≡OCC (same class as OCC maybe_wait).
-        let access_k = self.specfence.partial_retry.current_k(self.tx_idx) as u32;
-        let has_pe = self.specfence.learner.has_any_predicted();
-        let mut predicted = has_pe
-            && self
-                .specfence
-                .learner
-                .predicted_essential(location_hash, access_k);
-        if predicted
-            && self.specfence.learner.quiet_fence_off()
-            && !self
-                .specfence
-                .learner
-                .predicted_essential_intra(location_hash, access_k)
-        {
-            predicted = false;
+        if !self.specfence.learner.has_any_predicted() {
+            return self.occ_unfenced();
         }
 
-        // Sampled Detect for learning (1/16). Never plants PE.
-        if (self.tx_idx ^ location_hash as usize ^ access_k as usize) & 15 == 0 {
-            self.specfence
-                .learner
-                .note_detect(location_hash, access_k, 0, is_program);
-        }
-
-        // PCC Fire only if predicted Fence_tax < OCC_reexec for THIS a.
-        // Prior-only PE / park storm → stay Unfenced≡OCC (miss → reincarnation).
-        if !predicted
-            || !self
-                .specfence
-                .learner
-                .pcc_makespan_win(location_hash, access_k)
-        {
-            if predicted {
-                self.specfence.metrics.record_predicted_essential();
-                self.specfence.metrics.record_pcc_roi_skip();
+        let access_k = self.specfence.partial_retry.bump_k_only(self.tx_idx) as u32;
+        match crate::specfence::decide_access(self.specfence.learner, location_hash, access_k) {
+            AccessDecision::UnfencedOcc {
+                predicted,
+                roi_skip,
+            } => {
+                if predicted {
+                    self.specfence.metrics.record_predicted_essential();
+                }
+                if roi_skip {
+                    self.specfence.metrics.record_pcc_roi_skip();
+                }
+                self.occ_unfenced()
             }
-            return self.unfenced_occ_fast(
-                address,
-                location_hash,
-                access_k,
-                is_program,
-                !predicted,
-            );
+            AccessDecision::TryPcc { access_k } => {
+                self.specfence.metrics.record_predicted_essential();
+                self.pcc_overlay(address, location_hash, access_k, is_program)
+            }
         }
-        self.specfence.metrics.record_predicted_essential();
+    }
 
-        // Fenced path only. One MV Data probe — Bind is the cheap PCC win.
+    /// Shared OCC proceed: no rem journal / first_k / Edge / process / Detect DashMap.
+    /// PrefixSkip / FF-head resume is Resolve (not Unfenced) — `pcc_armed` stays
+    /// false so first-incarnation ¬PE still uses OCC ESTIMATE→Blocking.
+    #[inline]
+    fn occ_unfenced(&self) -> Result<(), ReadError> {
+        self.pcc_armed.set(false);
+        self.unfenced_this_tx
+            .set(self.unfenced_this_tx.get().saturating_add(1));
+        self.specfence.metrics.record_unfenced_occ_fast();
+        self.specfence.metrics.record_edge_unfenced();
+        self.specfence.metrics.record_spec_read();
+        Ok(())
+    }
+
+    /// Resolve-read overlay: PCC Fire **or** PrefixSkip/FF resume (R1b).
+    /// First-incarnation Unfenced stays OCC (no FF / OrderedDirtyRead).
+    #[inline]
+    fn resolve_read_overlay(&self) -> bool {
+        self.pcc_armed.get()
+            || self.specfence.partial_retry.is_rewind_resume(self.tx_idx)
+            || self.specfence.partial_retry.has_ff_head(self.tx_idx)
+    }
+
+    /// Thin PCC overlay (PE ∩ ROI only). Bind Data or WaitFor one executing writer.
+    fn pcc_overlay(
+        &self,
+        address: Address,
+        location_hash: MemoryLocationHash,
+        access_k: u32,
+        is_program: bool,
+    ) -> Result<(), ReadError> {
+        self.pcc_armed.set(true);
+        self.pcc_this_tx
+            .set(self.pcc_this_tx.get().saturating_add(1));
         let bind_version = self
             .mv_memory
             .last_data_before(location_hash, self.tx_idx)
@@ -517,15 +525,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 tx_idx,
                 tx_incarnation,
             });
-        let published = bind_version.is_some();
-        if published {
-            if let Some(v) = bind_version {
-                return self.pcc_bind_published(address, location_hash, access_k, is_program, v);
-            }
+        if let Some(v) = bind_version {
+            return self.pcc_bind_published(address, location_hash, access_k, is_program, v);
         }
-
-        // Unpublished: WaitFor only if a single executing writer is cheaper
-        // than OCC reincarnation. Else Unfenced≡OCC (no fleet park).
         let writer = self
             .mv_memory
             .last_writer_before(location_hash, self.tx_idx)
@@ -551,93 +553,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
             }
         }
         self.specfence.metrics.record_pcc_roi_skip();
-        self.unfenced_occ_fast(address, location_hash, access_k, is_program, false)
-    }
-
-    /// Unfenced ≡ OCC: rem \(k\) + first_k only. No Edge SM, sketch, PreferAdmit,
-    /// canary, process DashMap, journal, or `note_pending_effect_boundary`.
-    fn unfenced_occ_fast(
-        &self,
-        address: Address,
-        location_hash: MemoryLocationHash,
-        access_k: u32,
-        is_program: bool,
-        independence: bool,
-    ) -> Result<(), ReadError> {
-        // Reincarnation bookkeeping only (not Avoid). Residual-Bind when this
-        // ℓ already carried a writer — skipping it certified stale FF (seq≠par).
-        if self.tx_incarnation > 0
-            && self
-                .specfence
-                .partial_retry
-                .inc_carry_seen(self.tx_idx, location_hash)
-            && (self.specfence.sketch.residual_bind(location_hash).is_some()
-                || self
-                    .specfence
-                    .partial_retry
-                    .force_writer(self.tx_idx, location_hash)
-                    .is_some())
-        {
-            return self.bind_done_residual(
-                address,
-                location_hash,
-                self.tx_idx.saturating_sub(1),
-                false,
-                false,
-                false,
-            );
-        }
-        self.specfence
-            .partial_retry
-            .note_access_k_only(self.tx_idx, location_hash);
-        self.specfence.metrics.record_edge_unfenced();
-        self.specfence.metrics.record_spec_read();
-        self.specfence.metrics.record_unfenced_occ_fast();
-        if independence {
-            self.specfence.metrics.record_independent_unfenced();
-            self.specfence.metrics.record_cold_spec_fast();
-            if self.tx_incarnation == 0 {
-                self.specfence.metrics.record_occ_fast_first();
-            }
-        }
-        // Sampled process/decision for mixed_verb falsifier (1/8) only when
-        // PE exists in the block — quiet Unfenced-only stays silent.
-        if self.specfence.learner.has_any_predicted() && (self.tx_idx ^ access_k as usize) & 7 == 0
-        {
-            self.specfence.process.record(
-                location_hash,
-                self.tx_idx,
-                if independence {
-                    ProcessReason::UnfencedIndependence
-                } else {
-                    ProcessReason::UnfencedCold
-                },
-                false,
-                false,
-            );
-            self.specfence.process.record_decision(DecisionFeat {
-                verb: DecisionVerb::Unfenced,
-                access_k,
-                depth: 0,
-                incarnation: self.tx_incarnation,
-                is_program,
-                writer_published: false,
-                writer_validated: false,
-                writer_executing: false,
-                writer_ready: false,
-                writer_present: false,
-                avoid_broadcast: false,
-                canary_ok: false,
-                independence_certified: independence,
-                essential_antidep: !independence,
-                force_prefix: false,
-                clique_gated: false,
-                in_hot_set: false,
-                prior_warm: false,
-                mode_read: true,
-            });
-        }
-        Ok(())
+        self.occ_unfenced()
     }
 
     fn pcc_bind_published(
@@ -1259,6 +1175,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         let location_hash = self.hash_basic(&address);
         self.maybe_wait(address, location_hash, false)?;
+        let resolve = self.resolve_read_overlay();
 
         // We return a mock for non-contract addresses (for lazy updates) to avoid
         // unnecessarily evaluating its balance here.
@@ -1276,8 +1193,9 @@ impl<S: Storage> Database for VmDb<'_, S> {
             }
         }
 
-        // M1b: single-origin basic FF (no lazy chain) — skip MV walk when stable.
-        if !self.is_lazy
+        // PCC / PrefixSkip FF. First-incarnation Unfenced uses the OCC MV walk.
+        if resolve
+            && !self.is_lazy
             && let Some((account, code_hash, origin)) = self.try_ff_basic(location_hash)
         {
             let read_origins = self.read_set.entry(location_hash).or_default();
@@ -1334,11 +1252,9 @@ impl<S: Storage> Database for VmDb<'_, S> {
             loop {
                 match iter.next_back() {
                     Some((blocking_idx, MemoryEntry::Estimate)) => {
-                        // SpecFence OrderedDirtyRead: skip *leading* ESTIMATE (no lazy
-                        // chain started yet) to prior Data — avoids BlockingOther park
-                        // while the aborted writer re-executes. Mid-lazy-chain ESTIMATE
-                        // still Blocks (need republished lazy update).
-                        if self.specfence.mode == crate::ConcurrencyMode::SpecFence
+                        // PCC / PrefixSkip OrderedDirtyRead. First-incarnation
+                        // Unfenced/OCC Block on ESTIMATE (Block-STM).
+                        if resolve
                             && new_origins.is_empty()
                             && balance_addition == U256::ZERO
                             && nonce_addition == 0
@@ -1346,8 +1262,8 @@ impl<S: Storage> Database for VmDb<'_, S> {
                             self.specfence.metrics.record_spec_read();
                             continue;
                         }
-                        self.promote_on_conflict(address, location_hash);
-                        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+                        if resolve {
+                            self.promote_on_conflict(address, location_hash);
                             self.specfence.wave.set_pending_park_location(location_hash);
                         }
                         return Err(ReadError::Blocking(*blocking_idx));
@@ -1357,7 +1273,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
                             .mv_memory
                             .is_aborted_incarnation(*closest_idx, *tx_incarnation)
                         {
-                            if self.specfence.mode == crate::ConcurrencyMode::SpecFence
+                            if resolve
                                 && new_origins.is_empty()
                                 && balance_addition == U256::ZERO
                                 && nonce_addition == 0
@@ -1365,8 +1281,8 @@ impl<S: Storage> Database for VmDb<'_, S> {
                                 self.specfence.metrics.record_spec_read();
                                 continue;
                             }
-                            self.promote_on_conflict(address, location_hash);
-                            if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+                            if resolve {
+                                self.promote_on_conflict(address, location_hash);
                                 self.specfence.wave.set_pending_park_location(location_hash);
                             }
                             return Err(ReadError::Blocking(*closest_idx));
@@ -1541,7 +1457,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
             // M1b: cache basics for FF (single-origin origin) and Iter6 value-stable
             // RebindOnly (multi-origin lazy: snap balance+nonce with origin=None so
             // try_ff_basic refuses — avoids seq≠par on lazy chains).
-            if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            if resolve {
                 let origins = self.read_set.get(&location_hash);
                 let single = origins.is_some_and(|o| o.len() == 1);
                 let origin = if single {
@@ -1561,9 +1477,8 @@ impl<S: Storage> Database for VmDb<'_, S> {
                         origin,
                     },
                 );
+                self.maybe_early_val(address, location_hash)?;
             }
-
-            self.maybe_early_val(address, location_hash)?;
             return Ok(Some(AccountInfo {
                 balance: account.balance,
                 nonce: account.nonce,
@@ -1573,7 +1488,9 @@ impl<S: Storage> Database for VmDb<'_, S> {
             }));
         }
 
-        self.maybe_early_val(address, location_hash)?;
+        if resolve {
+            self.maybe_early_val(address, location_hash)?;
+        }
         Ok(None)
     }
 
@@ -1591,9 +1508,10 @@ impl<S: Storage> Database for VmDb<'_, S> {
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
         let location_hash = hash_deterministic(MemoryLocation::Storage(address, index));
         self.maybe_wait(address, location_hash, true)?;
+        let resolve = self.resolve_read_overlay();
 
-        // M1b: certified-prefix FF cache — skip MV/storage heavy path when origin stable.
-        if let Some((value, origin)) = self.try_ff_storage(location_hash) {
+        // PCC-only FF. Unfenced/OCC never consult rem journals.
+        if resolve && let Some((value, origin)) = self.try_ff_storage(location_hash) {
             let read_origins = self.read_set.entry(location_hash).or_default();
             Self::push_origin(read_origins, origin.clone())?;
             self.deep_trace_read(
@@ -1633,8 +1551,8 @@ impl<S: Storage> Database for VmDb<'_, S> {
                         .mv_memory
                         .is_aborted_incarnation(*closest_idx, *tx_incarnation)
                     {
-                        // SpecFence OrderedDirtyRead: try prior live Data without parking.
-                        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+                        // PCC OrderedDirtyRead only. Unfenced/OCC Block (Block-STM).
+                        if resolve {
                             if let Some((idx, inc)) =
                                 self.mv_memory.last_data_before(location_hash, self.tx_idx)
                             {
@@ -1669,8 +1587,8 @@ impl<S: Storage> Database for VmDb<'_, S> {
                                 }
                             }
                             self.specfence.wave.set_pending_park_location(location_hash);
+                            self.promote_on_conflict(address, location_hash);
                         }
-                        self.promote_on_conflict(address, location_hash);
                         return Err(ReadError::Blocking(*closest_idx));
                     }
                     self.specfence.metrics.record_db_heavy_op();
@@ -1684,7 +1602,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
                         crate::specfence::LocationKind::Storage,
                         Some(&origin),
                     );
-                    if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+                    if resolve {
                         self.maybe_note_value(
                             location_hash,
                             FfValue::Storage {
@@ -1694,13 +1612,13 @@ impl<S: Storage> Database for VmDb<'_, S> {
                                 origin: Some((*closest_idx, *tx_incarnation)),
                             },
                         );
+                        self.maybe_early_val(address, location_hash)?;
                     }
-                    self.maybe_early_val(address, location_hash)?;
                     return Ok(*value);
                 }
                 MemoryEntry::Estimate => {
-                    // SpecFence OrderedDirtyRead: skip ESTIMATE → prior Storage / pre-state.
-                    if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+                    // PCC may skip ESTIMATE → prior Data. Unfenced/OCC Block.
+                    if resolve {
                         if let Some((idx, inc)) =
                             self.mv_memory.last_data_before(location_hash, self.tx_idx)
                         {
@@ -1757,7 +1675,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
             .storage
             .storage(&address, &index)
             .map_err(|err| ReadError::StorageError(err.to_string()))?;
-        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+        if resolve {
             self.maybe_note_value(
                 location_hash,
                 FfValue::Storage {
@@ -1767,8 +1685,8 @@ impl<S: Storage> Database for VmDb<'_, S> {
                     origin: None,
                 },
             );
+            self.maybe_early_val(address, location_hash)?;
         }
-        self.maybe_early_val(address, location_hash)?;
         Ok(value)
     }
 
@@ -1829,6 +1747,9 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             to_hash: None,
             to_code_hash: None,
             is_lazy: false,
+            pcc_armed: Cell::new(false),
+            unfenced_this_tx: Cell::new(0),
+            pcc_this_tx: Cell::new(0),
             has_nonce: true,
             // Unless it is a raw transfer that is lazy updated, we'll
             // read at least from the sender and recipient accounts.
@@ -1851,7 +1772,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
 
     /// Hinted Wait admission: previous `from`/`to` writer that is not done yet.
     pub(crate) fn hinted_wait_blocker(&self, tx_idx: TxIdx) -> Option<(TxIdx, Address)> {
-        if !self.specfence.mode.uses_regions() {
+        if !crate::specfence::hinted_wait_enabled(self.specfence.mode) {
             return None;
         }
         // V5-P0: SpecFence should_wait_account is always false (account Wait stub).
@@ -2050,7 +1971,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         if rewind_resume {
             // M1b/M1d: journal FF in set_tx; optional live PC arm inside inspect_run.
             self.specfence.metrics.record_resume();
-        } else {
+        } else if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
             self.specfence.metrics.record_evm_entry();
             // Lean + research: CallEntry so SuffixRepair can find 0 < cp.k < k_fail
             // together with mid-tx EffectBoundary / write checkpoints.
@@ -2070,14 +1991,18 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         //       — NOT bare force_bind (that 4× evm_entries / wall↑ on 597).
         // Capture plants live jump_snap; pevm delays fb escalate once so the
         // next SuffixRepair can arm absolute jump. Honor SPECFENCE_ABSOLUTE_JUMP=0.
-        let ff_cont = self
-            .specfence
-            .partial_retry
-            .ff_continuation(tx_version.tx_idx);
-        let jump_disabled = self
-            .specfence
-            .partial_retry
-            .is_jump_disabled(tx_version.tx_idx);
+        let ff_cont = if rewind_resume {
+            self.specfence
+                .partial_retry
+                .ff_continuation(tx_version.tx_idx)
+        } else {
+            None
+        };
+        let jump_disabled = rewind_resume
+            && self
+                .specfence
+                .partial_retry
+                .is_jump_disabled(tx_version.tx_idx);
         let storage_prefix = ff_cont.as_ref().is_some_and(|cont| {
             cont.values
                 .values()
@@ -2093,10 +2018,11 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         // Iter5: capture window plants SSTORE tips with WaitHard demoted (hang-free).
         // Absolute jump stays research-only — Lean jump broke seq≡par (empty memory).
         // Production resolve bet: head-FF retain across escalate (write-prefix DB skip).
-        let needs_capture = self
-            .specfence
-            .partial_retry
-            .needs_live_capture(tx_version.tx_idx);
+        let needs_capture = rewind_resume
+            && self
+                .specfence
+                .partial_retry
+                .needs_live_capture(tx_version.tx_idx);
         let mut ff_cont = ff_cont;
         if rewind_resume && ff_prefix {
             // Iter28: Lean LAST_SNAP is worker-TLS; Bind-snap TLS now clears it,
@@ -2832,6 +2758,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
 
                 let (is_lazy, read_set) = {
                     let db = ctx.db_mut();
+                    db.flush_access_census();
                     (db.is_lazy, std::mem::take(&mut db.read_set))
                 };
 
@@ -3009,8 +2936,12 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 }
                 Ok(flags)
             }
-            Err(EVMError::Database(read_error)) => Err(VmExecutionError::from(read_error)),
+            Err(EVMError::Database(read_error)) => {
+                self.evm.ctx().db_mut().flush_access_census();
+                Err(VmExecutionError::from(read_error))
+            }
             Err(err) => {
+                self.evm.ctx().db_mut().flush_access_census();
                 // Optimistically retry in case some previous internal transactions send
                 // more fund to the sender but hasn't been executed yet.
                 // TODO: Let users define this behaviour through a mode enum or something.
