@@ -1,6 +1,6 @@
-//! SpecFence access policy — Mode(a) from \(a + e_{\mathrm{vis}} + \mathrm{PE} + learning\).
+//! SpecFence Mode(a) — decide + cost-aware prior (v6 `mode.rs`).
 //!
-//! Authoritative plant: `lab/notes/specfence-complete-architecture-v5-pc-cc-fusion.md`.
+//! Authoritative plant: `lab/notes/specfence-complete-architecture-v6-essence.md`.
 //! π: `lab/notes/specfence-complete-architecture-v4-frozen-grain.md`.
 //!
 //! Unfenced ⇒ caller **must** invoke the shared OCC read helper. This module
@@ -20,6 +20,8 @@ pub(crate) struct AccessVis {
     pub in_serial_lane: bool,
     pub hot: bool,
     pub ws_hat: bool,
+    /// Stale PE may Unfence when independence is certified (FM9 consume).
+    pub independence_certified: bool,
 }
 
 /// Live verb after the PredictedEssential / \(e_{\mathrm{vis}}\) gate.
@@ -68,22 +70,33 @@ pub(crate) fn decide(
         };
     };
 
-    // SoT §3.2 — event-driven. Deleted live gates: quiet_fence_off,
-    // pcc_makespan_win, park_storm. HotSet / WŜ are observe → PE posterior,
-    // not SerialLane / Wait OR-doors.
+    // FM9: independence Unfences a stale prior PE (not a Wait OR-door).
+    if vis.independence_certified
+        && vis.unfinished == 0
+        && !learner.predicted_essential_intra(location, access_k)
+    {
+        return AccessDecision::UnfencedOcc {
+            predicted: true,
+            roi_skip: true,
+        };
+    }
+
+    // SoT §3.2 — event-driven + cost-aware prior-PE Fire.
+    // HotSet / WŜ are posterior / ready-edge priors, not SerialLane OR-doors.
     // Multi-writer PE class first — do **not** Bind stale Data (theater).
+    let intra = learner.predicted_essential_intra(location, access_k);
+    let park_ok = intra || learner.prior_pe_fire_wins(vis);
     if vis.unfinished > 1 || (vis.in_serial_lane && vis.unfinished > 0) {
-        if let Some(w) = vis.writer {
+        if park_ok && let Some(w) = vis.writer {
             return AccessDecision::SerialLane { writer: w };
         }
     }
     if vis.unfinished == 1 && vis.writer_executing {
-        if let Some(w) = vis.writer {
+        if park_ok && let Some(w) = vis.writer {
             return AccessDecision::WaitFor { writer: w };
         }
     }
-    // PE ∧ published Data ∧ no unfinished lower writer → Bind.
-    // Prior PE may take this path. writer_validated is not a Bind gate.
+    // PE ∧ published Data ∧ no unfinished !done writer → Bind (S2 reachable).
     if vis.published_data && vis.unfinished == 0 {
         return AccessDecision::Bind;
     }
@@ -118,6 +131,7 @@ mod tests {
             in_serial_lane: false,
             hot: false,
             ws_hat: true,
+            independence_certified: false,
         }
     }
 
@@ -130,6 +144,7 @@ mod tests {
             in_serial_lane: false,
             hot: true,
             ws_hat: true,
+            independence_certified: false,
         }
     }
 
@@ -142,6 +157,7 @@ mod tests {
             in_serial_lane: false,
             hot: false,
             ws_hat: false,
+            independence_certified: false,
         }
     }
 
@@ -154,6 +170,7 @@ mod tests {
             in_serial_lane: false,
             hot: true,
             ws_hat: false,
+            independence_certified: false,
         }
     }
 
@@ -256,6 +273,43 @@ mod tests {
             decide(&live, 7, 6, Some(&vis)),
             AccessDecision::WaitFor { writer: 2 },
             "HotSet must not promote a single writer to SerialLane"
+        );
+    }
+
+    #[test]
+    fn prior_only_executing_on_quiet_is_roi_skip() {
+        let live = LiveLearner::new();
+        live.begin_block(MorphWeights::default());
+        live.seed_predicted_essential(7, 6);
+        assert_eq!(
+            decide(&live, 7, 6, Some(&exec_vis(2))),
+            AccessDecision::UnfencedOcc {
+                predicted: true,
+                roi_skip: true
+            },
+            "T3: prior-PE WaitFor without EV win is Fence tax"
+        );
+        assert_eq!(
+            decide(&live, 7, 6, Some(&data_vis())),
+            AccessDecision::Bind,
+            "Bind-on-Data stays reachable for prior PE"
+        );
+    }
+
+    #[test]
+    fn independence_unfences_stale_prior() {
+        let live = fan_out_learner();
+        live.seed_predicted_essential(7, 6);
+        let mut vis = data_vis();
+        vis.published_data = false;
+        vis.independence_certified = true;
+        vis.ws_hat = false;
+        assert_eq!(
+            decide(&live, 7, 6, Some(&vis)),
+            AccessDecision::UnfencedOcc {
+                predicted: true,
+                roi_skip: true
+            }
         );
     }
 }

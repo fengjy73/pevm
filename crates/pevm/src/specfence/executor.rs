@@ -1,20 +1,22 @@
-//! SpecFence parallel computer — schedule / Spec validate / steal.
+//! SpecFence parallel computer — Spec validate / OCC helpers.
 //!
-//! Owns SpecFence **stages**. OCC ticks never enter here.
+//! Owns SpecFence **validate**. Ready/steal lives in `computer.rs`.
 //! Spec-only incarnations use the shared OCC validate kernel (bool walk + B0).
-//! R1 Resolve runs only with Fence / prefix certificates.
+//! R1 Resolve runs only when a certificate **strip** covers fail locations.
 //!
-//! Plant SoT: `lab/notes/specfence-complete-architecture-v5-pc-cc-fusion.md`.
+//! Plant SoT: `lab/notes/specfence-complete-architecture-v6-essence.md`.
 
 use super::ConcurrencyMode;
 use super::SpecFenceCtx;
+use super::certificate::CertificateTable;
 use super::dag::FenceGraph;
 use super::kernel::KernelTable;
 use super::learner::LiveLearner;
 use super::rem::WaveParkTable;
+use super::repair::{RepairGrain, repair_grain};
 use crate::mv_memory::MvMemory;
 use crate::scheduler::Scheduler;
-use crate::{Task, TxIdx, TxVersion};
+use crate::{MemoryLocationHash, Task, TxIdx, TxVersion};
 
 /// OCC schedule / execute / validate never take wave or fence handles.
 #[inline]
@@ -40,7 +42,7 @@ pub(crate) fn hinted_wait_enabled(mode: ConcurrencyMode) -> bool {
     mode == ConcurrencyMode::Pcc
 }
 
-/// SpecFence Resolve overlay runs only with Fence / prefix certificates.
+/// SpecFence rem overlay: any successful Fence strip or repair prefix.
 #[inline]
 pub(crate) fn uses_specfence_resolve(
     mode: ConcurrencyMode,
@@ -50,18 +52,23 @@ pub(crate) fn uses_specfence_resolve(
     mode == ConcurrencyMode::SpecFence && kernel.may_resolve(tx_idx)
 }
 
-/// Empty PE table: no Fence events expected (AccessOrdinalLog still records \(k\)).
+/// R1 museum only when the strip covers **every** invalid read (v6 §5).
+#[inline]
+pub(crate) fn specfence_r1_validate(
+    mode: ConcurrencyMode,
+    cert: &CertificateTable,
+    tx_idx: TxIdx,
+    invalid: &[MemoryLocationHash],
+) -> bool {
+    mode == ConcurrencyMode::SpecFence
+        && !invalid.is_empty()
+        && repair_grain(cert, tx_idx, invalid) == RepairGrain::R1
+}
+
+/// Empty PE table: quiet path is byte-identical OCC (no ordinal / PE probe).
 #[inline]
 pub(crate) fn specfence_plant_is_occ(mode: ConcurrencyMode, learner: &LiveLearner) -> bool {
     mode != ConcurrencyMode::SpecFence || !learner.has_any_predicted()
-}
-
-/// SpecFence ready-set + steal. Wave ready / admit_spine (WaitFor + serial-lane)
-/// first; then Block-STM indices. Do **not** key steal on cumulative
-/// `wait_park_count` — that starves validation and livelocks ESTIMATE.
-#[inline]
-pub(crate) fn next_sf_task(scheduler: &Scheduler, wave: &WaveParkTable) -> Option<Task> {
-    scheduler.next_task_with_wave(Some(wave))
 }
 
 /// OCC schedule — zero SpecFence symbols.
@@ -149,6 +156,13 @@ pub(crate) fn validate_occ_kernel(
         if let Some(k) = loc_k {
             specfence.sketch.mark_access_class(*location, k);
         }
+        if let Some(w) = mv_memory.last_writer_before(*location, tx_version.tx_idx)
+            && w < tx_version.tx_idx
+            && !scheduler.is_done(w)
+        {
+            specfence.ready_edges.note_unpublished(*location, w);
+            specfence.sketch.push_spine(*location, w);
+        }
     }
 
     let rewind_to = mv_memory.min_higher_reader_of(tx_version.tx_idx, &write_locations);
@@ -184,5 +198,26 @@ mod tests {
         assert!(!uses_specfence_resolve(ConcurrencyMode::SpecFence, &k, 0));
         k.note_fence(0);
         assert!(uses_specfence_resolve(ConcurrencyMode::SpecFence, &k, 0));
+        let cert = CertificateTable::new(1);
+        cert.begin_execute(0, false);
+        assert!(!specfence_r1_validate(
+            ConcurrencyMode::SpecFence,
+            &cert,
+            0,
+            &[7]
+        ));
+        cert.note_success(0, 7);
+        assert!(specfence_r1_validate(
+            ConcurrencyMode::SpecFence,
+            &cert,
+            0,
+            &[7]
+        ));
+        assert!(!specfence_r1_validate(
+            ConcurrencyMode::SpecFence,
+            &cert,
+            0,
+            &[7, 9]
+        ));
     }
 }

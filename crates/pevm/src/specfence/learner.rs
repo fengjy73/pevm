@@ -582,6 +582,30 @@ impl LiveLearner {
         self.park_heat.load(Ordering::Relaxed) >= 8
     }
 
+    /// Cost-aware prior-PE Fire (v6 T3). Intra abort still event-drives verbs.
+    /// Observe makespan — not Soft, not `mark_pcc`. HotSet/WŜ are not Wait OR.
+    #[inline]
+    pub(crate) fn prior_pe_fire_wins(&self, vis: &super::access_policy::AccessVis) -> bool {
+        if self.quiet_fence_off() || self.park_storm() {
+            return false;
+        }
+        let m = self.morph_weights();
+        if m.dominant_quiet() {
+            return false;
+        }
+        m.dominant_fan_out() && (vis.published_data || vis.writer_executing)
+    }
+
+    /// HotSet / WŜ → PE posterior (not a SerialLane / Wait OR-door).
+    #[inline]
+    pub(crate) fn note_hot_ws_posterior(&self, location: MemoryLocationHash, hot_or_ws: bool) {
+        if !hot_or_ws {
+            return;
+        }
+        let entry = self.locs.entry(location).or_default();
+        entry.readers.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Intra-block abort / first-wave mark (survives quiet_fence_off).
     #[inline]
     pub(crate) fn predicted_essential_intra(&self, location: MemoryLocationHash, k: u32) -> bool {

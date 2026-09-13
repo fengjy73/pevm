@@ -1,6 +1,6 @@
-//! SpecFence **parallel computer** — stages + access-local Mode(a) CC.
+//! SpecFence **parallel computer** — stages + ready-edge Mode(a) CC.
 //!
-//! Plant SoT: `lab/notes/specfence-complete-architecture-v5-pc-cc-fusion.md`.
+//! Plant SoT: `lab/notes/specfence-complete-architecture-v6-essence.md`.
 //! π SoT: `lab/notes/specfence-complete-architecture-v4-frozen-grain.md`.
 //!
 //! `ConcurrencyMode::OCC` is pristine Block-STM (**zero** SpecFence ticks).
@@ -158,8 +158,11 @@ use hashbrown::HashMap;
 
 mod access_log;
 mod access_policy;
+mod access_vis;
 mod bayes;
 mod boundary;
+mod certificate;
+mod computer;
 mod dag;
 mod decision_field;
 mod edge;
@@ -170,17 +173,22 @@ mod finegrain;
 mod heat;
 mod hotset;
 mod kernel;
+mod lane;
 mod learner;
 mod metrics;
+mod mode;
 mod prior;
 mod process;
+mod ready_edge;
 mod region;
 mod rem;
+mod repair;
 mod resolve;
 mod sketch;
 
 pub(crate) use access_log::AccessOrdinalLog;
 pub(crate) use access_policy::{AccessDecision, AccessVis, decide as decide_access};
+pub(crate) use access_vis::compose_unfinished;
 pub(crate) use bayes::{BayesMap, DEFAULT_TAU};
 pub use boundary::SpecFenceInspector;
 #[allow(unused_imports)]
@@ -197,6 +205,8 @@ pub(crate) use boundary::{
     try_apply_pending_pc_resume, try_arm_safe_absolute_jump, try_arm_safe_absolute_jump_gated,
     try_consume_nested_bind_resume, with_bind_snap_tls, with_plant_tls, with_plant_tls_journal,
 };
+pub(crate) use certificate::CertificateTable;
+pub(crate) use computer::next_sf_task;
 pub(crate) use dag::{FenceGraph, SpecDag};
 pub(crate) use decision_field::{DecisionFeat, DecisionVerb};
 pub use decision_field::{DecisionFieldSnap, QualityProxies, VerbHist};
@@ -206,8 +216,8 @@ pub(crate) use edge::{
 };
 pub(crate) use engagement::{AdaptiveEngagement, profile_timing_enabled, research_inspect_enabled};
 pub(crate) use executor::{
-    fence_for_mode, hinted_wait_enabled, next_occ_task, next_sf_task, occ_read_set_valid,
-    specfence_plant_is_occ, uses_specfence_resolve, validate_occ_kernel, validate_occ_stage,
+    fence_for_mode, hinted_wait_enabled, next_occ_task, occ_read_set_valid, specfence_plant_is_occ,
+    specfence_r1_validate, uses_specfence_resolve, validate_occ_kernel, validate_occ_stage,
     wave_for_mode,
 };
 pub use finegrain::{
@@ -223,12 +233,14 @@ pub(crate) use hotset::HotSet;
 #[allow(unused_imports)]
 pub(crate) use hotset::{H_A, H_W};
 pub(crate) use kernel::KernelTable;
+pub(crate) use lane::LaneTable;
 pub(crate) use learner::{AdaptiveParams, InterBlockPrior, LiveLearner};
 pub(crate) use metrics::MetricsInner;
 pub use metrics::SpecFenceMetrics;
 pub(crate) use prior::RwPriorMap;
 pub(crate) use process::ProcessTrace;
 pub use process::{ExecProcessSnapshot, LocProcessSnap, PerTxProcessSnap, ProcessReason};
+pub(crate) use ready_edge::ReadyEdgeTable;
 pub use region::RegionMode;
 pub(crate) use region::RegionTable;
 pub(crate) use rem::PartialRetryTable;
@@ -241,6 +253,7 @@ pub(crate) use rem::{
     PendingPark, RegionAccess, RemTask, RepairPlan, ResearchAbortRepair, ResumeContinuation,
     StorageWriteReplay,
 };
+pub(crate) use repair::{RepairGrain, repair_grain};
 #[allow(unused_imports)]
 pub(crate) use resolve::{
     BindTarget, C_RETRY, COST_MARGIN, D_EARLY, D_WAIT, EvScores, SelectiveOutcome, TAU_REVOKE,
@@ -348,6 +361,12 @@ pub(crate) struct SpecFenceCtx<'a> {
     pub kernel: &'a crate::specfence::KernelTable,
     /// Spec-safe AccessOrdinalLog — true \(k\) without rem DashMap.
     pub access_log: &'a crate::specfence::AccessOrdinalLog,
+    /// Per-prefix Fence certificates (not a tx-global bit).
+    pub certificates: &'a crate::specfence::CertificateTable,
+    /// PE unpublished-RAW ready-edges (schedule Avoid).
+    pub ready_edges: &'a crate::specfence::ReadyEdgeTable,
+    /// SerialLane / OrderedAdmit progress tokens.
+    pub lanes: &'a crate::specfence::LaneTable,
     /// Opt-in lab fine-grain OCC/RW tracer (None = disabled, zero cost).
     pub finegrain: Option<&'a crate::specfence::FineGrainCollector>,
 }

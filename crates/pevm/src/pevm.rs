@@ -445,6 +445,9 @@ impl Pevm {
         let wave = WaveParkTable::new();
         let kernel = KernelTable::new(block_size);
         let access_log = crate::specfence::AccessOrdinalLog::new(block_size);
+        let certificates = crate::specfence::CertificateTable::new(block_size);
+        let ready_edges = crate::specfence::ReadyEdgeTable::new();
+        let lanes = crate::specfence::LaneTable::new();
         let edges = EdgeTable::new();
         let sketch = HotSketch::new();
         let process = ProcessTrace::new();
@@ -502,6 +505,9 @@ impl Pevm {
             process: &process,
             kernel: &kernel,
             access_log: &access_log,
+            certificates: &certificates,
+            ready_edges: &ready_edges,
+            lanes: &lanes,
             finegrain: finegrain_ref,
         };
 
@@ -516,7 +522,7 @@ impl Pevm {
                     let occ_ticks = self.concurrency_mode == ConcurrencyMode::Occ;
                     let mut sched_t0 = profile.then(Instant::now);
                     let mut task = if let Some(w) = wave_ref {
-                        crate::specfence::next_sf_task(&scheduler, w)
+                        crate::specfence::next_sf_task(&scheduler, w, specfence.ready_edges)
                     } else {
                         crate::specfence::next_occ_task(&scheduler)
                     };
@@ -547,15 +553,40 @@ impl Pevm {
                                         &tx_version,
                                         Some(&metrics_inner),
                                     )
-                                } else if specfence.mode == ConcurrencyMode::SpecFence
-                                    && !specfence.kernel.may_resolve(tx_version.tx_idx)
-                                {
-                                    crate::specfence::validate_occ_kernel(
-                                        &mv_memory,
-                                        &scheduler,
-                                        &tx_version,
-                                        specfence,
-                                    )
+                                } else if specfence.mode == ConcurrencyMode::SpecFence {
+                                    if specfence.certificates.has_any(tx_version.tx_idx)
+                                        || specfence.kernel.repair_armed(tx_version.tx_idx)
+                                    {
+                                        let invalid =
+                                            mv_memory.collect_invalid_reads(tx_version.tx_idx);
+                                        if crate::specfence::specfence_r1_validate(
+                                            specfence.mode,
+                                            specfence.certificates,
+                                            tx_version.tx_idx,
+                                            &invalid,
+                                        ) {
+                                            try_validate(
+                                                &mv_memory,
+                                                &scheduler,
+                                                &tx_version,
+                                                specfence,
+                                            )
+                                        } else {
+                                            crate::specfence::validate_occ_kernel(
+                                                &mv_memory,
+                                                &scheduler,
+                                                &tx_version,
+                                                specfence,
+                                            )
+                                        }
+                                    } else {
+                                        crate::specfence::validate_occ_kernel(
+                                            &mv_memory,
+                                            &scheduler,
+                                            &tx_version,
+                                            specfence,
+                                        )
+                                    }
                                 } else {
                                     try_validate(&mv_memory, &scheduler, &tx_version, specfence)
                                 };
@@ -580,7 +611,7 @@ impl Pevm {
                         if task.is_none() {
                             sched_t0 = profile.then(Instant::now);
                             task = if let Some(w) = wave_ref {
-                                crate::specfence::next_sf_task(&scheduler, w)
+                                crate::specfence::next_sf_task(&scheduler, w, specfence.ready_edges)
                             } else {
                                 crate::specfence::next_occ_task(&scheduler)
                             };
@@ -849,8 +880,12 @@ impl Pevm {
             return match vm.execute(&tx_version, result_slot) {
                 Ok(flags) => {
                     // PublishWrite ≈ incarnation finished: wake location waiters + ready.
+                    let done_idx = tx_version.tx_idx;
                     let task =
                         scheduler.finish_execution_with_wave_fence(tx_version, flags, wave, fence);
+                    if let Some(wave) = wave {
+                        vm.release_ready_edges(done_idx, wave);
+                    }
                     // G4: SoftWait wake → wait_useful learner credit.
                     if let Some(fence) = fence {
                         vm.credit_softwait_wakes(fence);
@@ -890,9 +925,11 @@ impl Pevm {
                     if let Some(wave) = wave {
                         if park_kind == crate::specfence::ParkKind::BlockingOther {
                             wave.arm_steal_convert_without_park();
-                            if let Some(stolen) = scheduler
-                                .next_task_steal_after_park_prefer(wave, Some(blocking_tx_idx))
-                            {
+                            if let Some(stolen) = scheduler.next_task_steal_after_park_prefer(
+                                wave,
+                                Some(blocking_tx_idx),
+                                Some(vm.ready_edges()),
+                            ) {
                                 return Some(stolen);
                             }
                         }
@@ -903,9 +940,11 @@ impl Pevm {
                             park_k,
                             park_kind,
                         );
-                        if let Some(stolen) =
-                            scheduler.next_task_steal_after_park_prefer(wave, Some(blocking_tx_idx))
-                        {
+                        if let Some(stolen) = scheduler.next_task_steal_after_park_prefer(
+                            wave,
+                            Some(blocking_tx_idx),
+                            Some(vm.ready_edges()),
+                        ) {
                             return Some(stolen);
                         }
                     }
