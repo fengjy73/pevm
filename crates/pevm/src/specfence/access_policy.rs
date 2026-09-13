@@ -99,8 +99,9 @@ pub(crate) fn decide(
             return AccessDecision::WaitFor { writer: w };
         }
     }
-    // PE ∧ published Data ∧ no unfinished !done writer → Bind (S2 reachable).
-    if vis.published_data && vis.unfinished == 0 {
+    // Bind only when EV says win: intra abort-PE or cost-aware prior.
+    // Ungated Bind-on-Data after ESTIMATE-PE was stale-Data theater.
+    if vis.published_data && vis.unfinished == 0 && park_ok {
         return AccessDecision::Bind;
     }
     AccessDecision::UnfencedOcc {
@@ -304,8 +305,11 @@ mod tests {
         );
         assert_eq!(
             decide(&live, 7, 6, Some(&data_vis())),
-            AccessDecision::Bind,
-            "Bind-on-Data stays reachable for prior PE"
+            AccessDecision::UnfencedOcc {
+                predicted: true,
+                roi_skip: true
+            },
+            "T3: quiet prior-PE Bind-on-Data is Fence tax"
         );
     }
 

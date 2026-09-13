@@ -627,19 +627,13 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.occ_unfenced()
     }
 
-    /// First-wave Avoid: ESTIMATE / unpublished RAW trains PE + ready-edge.
-    /// Learning arm — HashMap ordinal is legal here (PE becomes nonempty).
+    /// ESTIMATE observe only. Must **not** mark PE — that opens decide/ordinal
+    /// for the rest of the first wave and Bind-theaters stale Data
+    /// (14689597: 581 SF aborts vs OCC 24). Abort still trains true-k PE.
     fn note_unpublished_raw(&self, location: MemoryLocationHash, writer: TxIdx) {
         if self.specfence.mode != crate::ConcurrencyMode::SpecFence {
             return;
         }
-        let k = self.specfence.access_log.note(self.tx_idx, location);
-        if k == 0 {
-            return;
-        }
-        self.specfence.learner.mark_predicted_essential(location, k);
-        // Do not mark_access_class here — that opens SerialLane for every
-        // later reader and livelocks Ready heads. Abort train still marks.
         self.specfence.sketch.push_spine(location, writer);
         self.specfence
             .ready_edges
