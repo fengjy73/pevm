@@ -586,8 +586,9 @@ No staged P0/P1/P2. Partial land (PCC without OCC-identical baseline accesses, o
 
 ## 15. Implementation
 
-**Landed** in one iteration: `lab/notes/specfence-frozen-grain-impl.md`.
+**Landed** in one iteration: `lab/notes/specfence-frozen-grain-impl.md` @ `bff789e`.
 Frozen π is the live Avoid/Resolve SoT. No P0/P1/P2 remainder.
+Sweep honesty (do not claim ≥0.7): all-blocks N=1 median SF/OCC **0.351** (prior ≈0.32–0.36); quiet heuristic median **1.07**; worst nonempty 19807137 **0.057**.
 
 ---
 

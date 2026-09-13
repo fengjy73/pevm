@@ -27,7 +27,7 @@ verb  = Bind | WaitFor|serial-lane|ordered_admit | Unfenced≡OCC
 | 1 | Unify Unfenced baseline with OCC path per access; no canary / Edge tax on ¬PredictedEssential | `vm.rs::maybe_wait_specfence` (`predicted` gate; `canary_ok=false`); `edge.rs::classify_edge` / `choose_edge_action` | **landed** |
 | 2 | Frozen access-event SoT \(a=(t,k,\mathrm{depth},ℓ,\mathrm{mode})\) + \(e_{\mathrm{vis}}\) + gate; ban flat `(ℓ,reader)`; `inc` not in Avoid key | `edge.rs::EdgeKey` (`location,reader,access_k,depth`); `edge.rs::inc_is_not_in_avoid_key`; `vm.rs` builds `EdgeKey` without incarnation | **landed** |
 | 3 | Always-on cheap Detect at every access boundary (L_record / L_access / L_edge) | `vm.rs::maybe_wait_specfence` → `learner.note_detect` + `edges.record`; `metrics.record_detect_access` | **landed** |
-| 4 | First-class PredictedEssential(\(ℓ,k,\mathrm{morph}\)) ∨ independence_certified; first-wave per access class; strip AEC/tx-sticky/`inc`/H-OR as π | `learner.rs::predicted_essential` / `mark_predicted_essential` / `seed_predicted_essential` / `note_abort_access`; PE sources = **abort \(k>0\)** + **inter-block abort \(k_template\)** only (`pack_top` / `dominant_k` never use Detect `last_k`); `sketch.rs::mark_access_class` is serial-lane (not a live OR); `pevm.rs` prior seed (quiet skips); publish does **not** plant PE | **landed** |
+| 4 | First-class PredictedEssential(\(ℓ,k,\mathrm{morph}\)) ∨ independence_certified; first-wave per access class; strip AEC/tx-sticky/`inc`/H-OR as π | `learner.rs::predicted_essential` / `mark_predicted_essential` / `seed_predicted_essential` / `note_abort_access`; PE sources = **abort \(k>0\)** + **inter-block abort \(k_template\)** only (`pack_top` / `dominant_k` never use Detect `last_k`); abort marks **per-ℓ** `min_k_of_location` (not tx-min \(k\) on every invalid loc); `sketch.rs::mark_access_class` is serial-lane (not a live OR); `pevm.rs` prior seed (quiet skips); publish does **not** plant PE | **landed** |
 | 5 | Timely PCC Avoid at **this** \(a\): Bind / WaitFor / serial-lane / ordered-admit iff PredictedEssential; mixed verbs in one tx | `edge.rs::classify_edge` (PredictedEssential∧Data→Bind; PredictedEssential∧writer→WaitFor; else Unfenced≡OCC even if Data exists); `vm.rs` WaitFor-only `admit_spine_writers_heat` (no PreferAdmit on Unfenced); `fence_wait_for` never `WaitFor(reader-1)` via `force_prefix` | **landed** |
 | 6 | Delete exclude-set π (ForcePrefix, tx SoftWait, canary verb, H-OR, morph actuator, writer_validated Bind gate, `inc` Avoid) | `edge.rs::classify_edge` discards exclude-set; `vm.rs` never `try_canary` / never ForcePrefix-Wait; `sketch.rs::essential_antidep` ignores `force_prefix`; SoftWait Soft not armed | **landed** |
 | 7 | Hot Region-access serial lane + ordered admission (not fleet WaitFor / wait_no_writer) | `sketch.rs::in_serial_lane` = access-class; `ready_spine_writers` walks access-class spines; classify **never** WaitFor(reader-1) | **landed** |
@@ -101,23 +101,35 @@ end_block:
 | `cargo test -p pevm --lib --release` | green |
 | `cargo test -p pevm --test specfence --release -- --test-threads=1` | green |
 
-Sweep JSON: `lab/results/frozen-grain-*-sweep.json` (gitignored dir).
+Sweep JSON (gitignored): `lab/results/frozen-grain-focus-worst-quiet-sweep.json`, `lab/results/frozen-grain-all-blocks-sweep.json`. Tip `bff789e`.
 
-### Honesty (focus+worst+quiet N=3 @ `4602ba0`, 8-block **worst-heavy** set)
+### Honesty — all-blocks N=1 @8 (98 nonempty / 99 loaded)
 
-Not a full-set replay. Do **not** claim median ≥0.7 or quiet≡OCC.
+| | This tip | Prior full-set to beat |
+|--|----------|------------------------|
+| median SF/OCC | **0.351** | ≈0.32–0.36 |
+| p10 / min (nonempty) | 0.215 / **0.057** (19807137) | worst ~0.076 |
+| mean | 0.98 | — |
+| quiet heuristic (34) median | **1.07** (18/34 ≥1; 22/34 bind=0 abort=0) | ~1.10 |
+| fan_out (59) median | **0.315** | ~0.298 |
 
-Printed median **0.315** / mean **2.79** (mean is the OCC outlier on 2179522 — do not celebrate). Prior full-set median to beat: **≈0.32–0.36**. Soft=0, await=0.
+Do **not** claim median ≥0.7 or SoT “then → ≥1.0”. Mean is inflated by N=1 OCC pathology on 19434587 (OCC wall 2278ms / SF 50ms → 45×). Empty snapshot 19910734 (`n_tx=0`) is dropped from the nonempty median; it is not a protocol zero.
 
-| Block | Role | last-iter SF/OCC | bind | notes |
-|------:|------|-----------------:|-----:|-------|
-| 14689597 | focus | 22934/78556 ≈0.29 | 1230 | in prior 0.32–0.33 band |
-| 19606599 | focus | 9999/31675 ≈0.32 | 1434 | |
-| 19469097 | focus | 14031/44582 ≈0.31 | 1063 | |
-| 19807137 | worst | 2767/36407 ≈0.076 | 7066 | still ≪0.08; rewind=1938 (PrefixSkip labeled R2) |
-| 6196166 | park | 6620/55507 ≈0.12 | 1302 | still park-heavy |
-| 6137495 | worst-ish | 14855/54900 ≈0.27 | 301 | |
-| 2179522 | quiet | SF 2.6ms / OCC 54ms (OCC pathological); bind=145, abort=1 | 145 | one abort trained PE; last_k plant removed |
-| 19606598 | quiet neighbor | 25948/62516 ≈0.42 | 111 | not ≡OCC |
+Exclude-set counters = 0 on all 99 SF rows (force_prefix_as_π, canary live, inc Avoid, H-OR, morph actuator, writer_validated Bind gate, flat EdgeKey). Soft=0, await=0. Detect recorded 237 622 accesses on 80 blocks. `mixed_verb_intra_tx` on process-trace fan_out: 14689597=494, 19807137=595.
 
-This tip additionally plants PE per **(ℓ, k)** of the aborting access — not the tx-min \(k\) copied onto every invalid ℓ. Re-sweep after that grain fix.
+### Honesty — focus+worst+quiet N=3 (8-block worst-heavy set)
+
+Printed median **0.307** / mean **0.407** / min **0.085**. Soft=0.
+
+| Block | Role | SF/OCC | bind | notes |
+|------:|------|-------:|-----:|-------|
+| 14689597 | focus | 0.345 | 1151 | mixed_verb=494 |
+| 19606599 | focus | 0.307 | 1159 | |
+| 19469097 | focus | 0.293 | 879 | |
+| 19807137 | worst | 0.085 | 6657 | N=3 just above 0.08; N=1 all-blocks 0.057; rewind still dominates wall |
+| 6196166 | park | 0.097 | 1361 | still park-heavy |
+| 6137495 | worst-ish | 0.210 | 384 | |
+| 2179522 | quiet | 1.57 | 53 | N=3 OCC-comparable; N=1 all-blocks 0.40 (variance) |
+| 19606598 | quiet neighbor | 0.347 | 109 | not ≡OCC |
+
+Remaining **performance** (not leftover π land): 19807137 / 6196166 still pay PrefixSkip+abort ≫ OCC. Architecture items in §13 are landed.
