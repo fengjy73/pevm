@@ -205,6 +205,19 @@ impl ProcessTrace {
         Self::default()
     }
 
+    /// End-tx Unfenced flush (no per-SLOAD DashMap). Increments cold Unfenced
+    /// so `mixed_verb_intra_tx` still sees Bind+Unfenced in one reader.
+    pub(crate) fn note_unfenced_occ(&self, reader: TxIdx, n: u32) {
+        if n == 0 {
+            return;
+        }
+        let n = n as usize;
+        self.reasons[ProcessReason::UnfencedCold.idx()].fetch_add(n, Ordering::Relaxed);
+        let txe = self.txs.entry(reader).or_default();
+        txe.unfenced.fetch_add(n, Ordering::Relaxed);
+        txe.reasons[ProcessReason::UnfencedCold.idx()].fetch_add(n, Ordering::Relaxed);
+    }
+
     pub(crate) fn record(
         &self,
         location: MemoryLocationHash,

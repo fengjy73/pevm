@@ -1,8 +1,12 @@
-//! SpecFence **v4.1-frozen** — Frozen-Grain Learned OCC–PCC Hybrid.
+//! SpecFence **clean-slate plant** — two modes, one EVM/MV store.
 //!
-//! Authoritative: `lab/notes/specfence-complete-architecture-v4-frozen-grain.md`.
-//! Grain map: `lab/notes/specfence-frozen-grain-impl.md`.
-//! Cost-class map: `lab/notes/specfence-occ-cost-pcc-roi-impl.md`.
+//! Plant SoT: `lab/notes/specfence-clean-slate-architecture.md`.
+//! π SoT: `lab/notes/specfence-complete-architecture-v4-frozen-grain.md`.
+//!
+//! `ConcurrencyMode::OCC` is pristine Block-STM (**zero** SpecFence calls).
+//! `ConcurrencyMode::SpecFence` is a first-class executor (`access_policy` +
+//! `executor`); Unfenced accesses call the same OCC read helpers. PCC overlay
+//! is PE-only. Learning is off the Unfenced critical path.
 //!
 //! Frozen π: \(a=(t,k,\mathrm{depth},ℓ,\mathrm{mode})\) + \(e_{\mathrm{vis}}\) +
 //! gate `PredictedEssential(ℓ,k,morph) ∨ independence_certified`.
@@ -151,12 +155,14 @@ use crate::{
 use alloy_primitives::Address;
 use hashbrown::HashMap;
 
+mod access_policy;
 mod bayes;
 mod boundary;
 mod dag;
 mod decision_field;
 mod edge;
 mod engagement;
+mod executor;
 #[allow(missing_docs)]
 mod finegrain;
 mod heat;
@@ -170,6 +176,7 @@ mod rem;
 mod resolve;
 mod sketch;
 
+pub(crate) use access_policy::{AccessDecision, decide as decide_access};
 pub(crate) use bayes::{BayesMap, DEFAULT_TAU};
 pub use boundary::SpecFenceInspector;
 #[allow(unused_imports)]
@@ -194,6 +201,10 @@ pub(crate) use edge::{
     choose_edge_action, classify_edge,
 };
 pub(crate) use engagement::{AdaptiveEngagement, profile_timing_enabled, research_inspect_enabled};
+pub(crate) use executor::{
+    fence_for_mode, hinted_wait_enabled, occ_read_set_valid, specfence_plant_is_occ,
+    uses_specfence_resolve, wave_for_mode,
+};
 pub use finegrain::{
     AbortEvent, AccountGrainObserve, ConsumerFirstCross, DagStats, EffectClass, EffectLogEntry,
     EffectStreamDiag, FineGrainCollector, FineGrainSnapshot, HotLocation, L1DagSummary,
