@@ -444,6 +444,7 @@ impl Pevm {
         let partial_retry = PartialRetryTable::new(block_size);
         let wave = WaveParkTable::new();
         let kernel = KernelTable::new(block_size);
+        let access_log = crate::specfence::AccessOrdinalLog::new(block_size);
         let edges = EdgeTable::new();
         let sketch = HotSketch::new();
         let process = ProcessTrace::new();
@@ -500,6 +501,7 @@ impl Pevm {
             sketch: &sketch,
             process: &process,
             kernel: &kernel,
+            access_log: &access_log,
             finegrain: finegrain_ref,
         };
 

@@ -2,11 +2,12 @@
 
 **Date:** 2026-09-13  
 **Branch:** `cursor/specfence-v5-pc-cc-fusion-e28e` (PR #7 → `cursor/specfence-parallel-compute-68a3` / PR #6)  
-**Plant SoT:** `lab/notes/specfence-complete-architecture-v5-pc-cc-fusion.md`  
+**Plant SoT:** `lab/notes/specfence-complete-architecture-v5-pc-cc-fusion.md` (**authoritative** from `987b196`, not the recreation)  
+**Catalog:** `lab/notes/specfence-pc-cc-fusion-per-block-catalog.json`  
 **π SoT:** `lab/notes/specfence-complete-architecture-v4-frozen-grain.md` (unchanged)  
 **Honesty baseline:** parallel-compute nonempty N=1 median **SF/OCC = 0.744**; quiet **1.020**
 
-**Verdict:** one-package Mode(a) fusion landed. Incarnation Occ\|Pcc fork removed as SoT. Nonempty median **0.743** (flat vs 0.744). Quiet heuristic median **1.035** (25/44 ≥1). Soft=0. **Do not claim ≥0.7 as a finished product bar** — 0.743 is this run’s median, not a guarantee. 14689597 N=1 is **0.365** (worse than PC 0.535). 2179522 N=1 **1.567** is an OCC-slow sample; N=3 **0.112** is the honest quiet tail.
+**Verdict:** rebased onto the pushed SoT, then closed remaining plant gaps vs that document (AccessOrdinalLog module, deleted `quiet_fence_off`/`park_storm` decide gates, execute-first steal, Spec PE-publish wake). Incarnation Occ\|Pcc fork removed as SoT. Pre-rebase nonempty median **0.743** (flat vs 0.744). **Re-sweep after this cut** — numbers below are the pre-rebase honesty until the new all-blocks JSON lands. Soft=0. **Do not claim ≥0.7 as a finished product bar.**
 
 ---
 
@@ -16,17 +17,18 @@
 |---|---------|---------|--------|
 | 1 | Architecture SoT + diagnosis + switch audit | `lab/notes/specfence-complete-architecture-v5-pc-cc-fusion.md` et al. | **landed** |
 | 2 | Mode(a) certificates, not `mark_pcc(tx)` | `kernel.rs::note_fence` / `may_resolve` / `rem_legal` | **landed** |
-| 3 | `decide(a, e_vis, PE, learning)` | `access_policy.rs::decide` | **landed** |
-| 4 | AccessOrdinalLog true \(k\) | `rem.rs::note_access_k_only` on every SF access | **landed** |
+| 3 | `decide(a, e_vis, PE, learning)` — no quiet/park kill-switch | `access_policy.rs::decide` | **landed** |
+| 4 | AccessOrdinalLog true \(k\) (not rem DashMap) | `access_log.rs::note` on every SF access | **landed** |
 | 5 | Spec abort PE at true \(k\) (never residual 1) | `executor.rs::validate_occ_kernel` | **landed** |
 | 6 | Prior PE + Data / executing writer may Fence | `decide` Bind / WaitFor | **landed** |
 | 7 | Serial-lane multi-writer PE class (before Bind) | `access_policy.rs` + `vm.rs::pcc_serial_lane` | **landed** |
 | 8 | R1 only with certificates; Spec miss = B0 | `uses_specfence_resolve` = `may_resolve` | **landed** |
-| 9 | Ready/steal = wave only (no lifetime-park steal) | `executor.rs::next_sf_task` → `next_task_with_wave` | **landed** |
-| 10 | HotSet / WŜ / morph consumed by `decide` | `vm.rs::access_vis` | **landed** |
+| 9 | Ready/steal = wave + execute-first (no validation stampede) | `scheduler.rs::next_task_with_wave` when wave Some | **landed** |
+| 10 | HotSet / WŜ observe → PE posterior, not SerialLane door | `access_policy.rs::decide` | **landed** |
 | 11 | Empty PE ∧ ¬Fence ⇒ OCC (±detect, ±k-log) | `specfence_plant_is_occ` after k-log | **landed** |
+| 12 | Spec PE-publish still Avoid / Data-wake | `vm.rs` finalize | **landed** |
 
-**Not claimed:** work-stealing deques per worker; Bind/B0 on named spine/fan_out still loses to OCC reincarnation; empty-PE `note_access_k_only` HashMap is still on the Spec path.
+**Not claimed:** work-stealing deques per worker; Bind/B0 on named spine/fan_out still loses to OCC reincarnation; AccessOrdinalLog still writes a per-tx first_k map on Spec.
 
 ---
 
@@ -57,7 +59,7 @@ schedule: next_task_with_wave only
 
 | Suite | Result |
 |-------|--------|
-| `cargo +nightly test -p pevm --lib --release -- --test-threads=1` | **166 ok** |
+| `cargo +nightly test -p pevm --lib --release -- --test-threads=1` | **168 ok** |
 | `cargo +nightly test -p pevm --test specfence --release -- --test-threads=1` | **42 ok / 20 ignored** |
 | erc20 / raw_transfers / mixed / uniswap / beneficiary / small_blocks | **all ok** |
 

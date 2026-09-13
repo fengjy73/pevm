@@ -53,16 +53,7 @@ pub(crate) fn decide(
             roi_skip: false,
         };
     }
-    let mut predicted = learner.predicted_essential(location, access_k);
-    if predicted
-        && learner.quiet_fence_off()
-        && !learner.predicted_essential_intra(location, access_k)
-    {
-        // Quiet + prior-only: still allow Bind-on-Data below; other verbs stay Spec.
-        if vis.is_none_or(|v| !v.published_data) {
-            predicted = false;
-        }
-    }
+    let predicted = learner.predicted_essential(location, access_k);
     if !predicted {
         return AccessDecision::UnfencedOcc {
             predicted: false,
@@ -70,35 +61,18 @@ pub(crate) fn decide(
         };
     }
     let Some(vis) = vis else {
+        // Prior PE with empty visibility stays Spec (quiet Bind-tax protection).
         return AccessDecision::UnfencedOcc {
             predicted: true,
             roi_skip: true,
         };
     };
 
-    // Quiet: Bind-on-Data only when no unfinished lower writer (2179522).
-    // No WaitFor / lane on quiet.
-    if learner.quiet_fence_off() {
-        if vis.published_data && vis.unfinished == 0 {
-            return AccessDecision::Bind;
-        }
-        return AccessDecision::UnfencedOcc {
-            predicted: true,
-            roi_skip: true,
-        };
-    }
-    if learner.park_storm() {
-        if vis.published_data && vis.unfinished == 0 {
-            return AccessDecision::Bind;
-        }
-        return AccessDecision::UnfencedOcc {
-            predicted: true,
-            roi_skip: true,
-        };
-    }
-
+    // SoT §3.2 — event-driven. Deleted live gates: quiet_fence_off,
+    // pcc_makespan_win, park_storm. HotSet / WŜ are observe → PE posterior,
+    // not SerialLane / Wait OR-doors.
     // Multi-writer PE class first — do **not** Bind stale Data (theater).
-    if vis.unfinished > 1 || ((vis.in_serial_lane || vis.hot) && vis.unfinished > 0) {
+    if vis.unfinished > 1 || (vis.in_serial_lane && vis.unfinished > 0) {
         if let Some(w) = vis.writer {
             return AccessDecision::SerialLane { writer: w };
         }
@@ -108,7 +82,7 @@ pub(crate) fn decide(
             return AccessDecision::WaitFor { writer: w };
         }
     }
-    // A3: PE ∧ published Data ∧ no unfinished lower writer → Bind.
+    // PE ∧ published Data ∧ no unfinished lower writer → Bind.
     // Prior PE may take this path. writer_validated is not a Bind gate.
     if vis.published_data && vis.unfinished == 0 {
         return AccessDecision::Bind;
@@ -259,17 +233,29 @@ mod tests {
     }
 
     #[test]
-    fn quiet_lone_abort_stays_unfenced_unless_data() {
+    fn quiet_intra_pe_may_fence_on_events() {
+        // SoT: quiet_fence_off is not a live Fire ban. Intra PE + e_vis Fences.
         let live = LiveLearner::new();
         live.begin_block(MorphWeights::default());
         live.note_abort_access(7, 2, Some(6));
         assert_eq!(
             decide(&live, 7, 6, Some(&exec_vis(1))),
-            AccessDecision::UnfencedOcc {
-                predicted: true,
-                roi_skip: true
-            }
+            AccessDecision::WaitFor { writer: 1 }
         );
         assert_eq!(decide(&live, 7, 6, Some(&data_vis())), AccessDecision::Bind);
+    }
+
+    #[test]
+    fn hot_is_not_a_serial_lane_door() {
+        let live = fan_out_learner();
+        live.seed_predicted_essential(7, 6);
+        let mut vis = exec_vis(2);
+        vis.hot = true;
+        vis.unfinished = 1;
+        assert_eq!(
+            decide(&live, 7, 6, Some(&vis)),
+            AccessDecision::WaitFor { writer: 2 },
+            "HotSet must not promote a single writer to SerialLane"
+        );
     }
 }

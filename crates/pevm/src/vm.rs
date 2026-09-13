@@ -190,6 +190,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
             let repair_armed = self.specfence.partial_retry.is_rewind_resume(tx_idx)
                 || self.specfence.partial_retry.has_ff_head(tx_idx);
             self.specfence.kernel.begin_execute(tx_idx, repair_armed);
+            self.specfence.access_log.begin_incarnation(tx_idx);
             self.specfence
                 .partial_retry
                 .reset_incarnation(tx_idx, incarnation);
@@ -464,11 +465,8 @@ impl<'a, S: Storage> VmDb<'a, S> {
         // off this path — learner updates on abort / end_block / PCC.
         self.specfence.metrics.record_detect_access();
 
-        // AccessOrdinalLog: true k even on empty PE / Spec (PE train, not rem).
-        let access_k = self
-            .specfence
-            .partial_retry
-            .note_access_k_only(self.tx_idx, location_hash) as u32;
+        // AccessOrdinalLog: true k even on empty PE / Spec (no rem DashMap).
+        let access_k = self.specfence.access_log.note(self.tx_idx, location_hash);
 
         if crate::specfence::specfence_plant_is_occ(
             crate::ConcurrencyMode::SpecFence,
@@ -2977,8 +2975,32 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         self.specfence
                             .rw_prior
                             .observe_write_set(&hotset_writer_locs, None);
-                        for loc in hotset_writer_locs {
-                            self.specfence.hotset.note_writer(loc, tx_version.tx_idx);
+                        for loc in &hotset_writer_locs {
+                            self.specfence.hotset.note_writer(*loc, tx_version.tx_idx);
+                        }
+                        // Spec publishers of a PE ℓ still wake / Avoid — not rem-gated.
+                        if self.specfence.learner.has_any_predicted() {
+                            let pe_locs: Vec<_> = hotset_writer_locs
+                                .iter()
+                                .copied()
+                                .filter(|&loc| {
+                                    let k = self.specfence.learner.dominant_k(loc);
+                                    self.specfence.learner.predicted_essential(loc, k.max(1))
+                                })
+                                .collect();
+                            if !pe_locs.is_empty() {
+                                for &loc in &pe_locs {
+                                    if self
+                                        .specfence
+                                        .sketch
+                                        .broadcast_avoid(loc, tx_version.tx_idx)
+                                    {
+                                        self.specfence.edges.broadcast_avoid(loc);
+                                        self.specfence.metrics.record_avoid_broadcast();
+                                    }
+                                }
+                                self.wake_on_data_publish(tx_version.tx_idx, &pe_locs);
+                            }
                         }
                     }
                 }

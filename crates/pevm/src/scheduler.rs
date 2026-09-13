@@ -174,6 +174,21 @@ impl Scheduler {
                 continue;
             }
 
+            // SpecFence (wave Some): useful_EVM Execute first while the wave
+            // still has work — ban validation-first stampede (v5 §2.1).
+            // OCC (wave None) keeps Block-STM validation-first.
+            if wave.is_some() && execution_idx < self.block_size {
+                if let Some(tx_version) =
+                    self.try_execute(self.execution_idx.fetch_add(1, Ordering::Relaxed))
+                {
+                    if let Some(wave) = wave {
+                        wave.note_ready_steal_if_after_park();
+                    }
+                    return Some(Task::Execution(tx_version));
+                }
+                continue;
+            }
+
             // Prioritize a validation task to minimize re-execution
             if validation_idx < execution_idx {
                 let tx_idx = self.validation_idx.fetch_add(1, Ordering::Relaxed);

@@ -156,6 +156,7 @@ use crate::{
 use alloy_primitives::Address;
 use hashbrown::HashMap;
 
+mod access_log;
 mod access_policy;
 mod bayes;
 mod boundary;
@@ -178,6 +179,7 @@ mod rem;
 mod resolve;
 mod sketch;
 
+pub(crate) use access_log::AccessOrdinalLog;
 pub(crate) use access_policy::{AccessDecision, AccessVis, decide as decide_access};
 pub(crate) use bayes::{BayesMap, DEFAULT_TAU};
 pub use boundary::SpecFenceInspector;
@@ -344,6 +346,8 @@ pub(crate) struct SpecFenceCtx<'a> {
     pub process: &'a ProcessTrace,
     /// Mode(a) Fence / prefix certificates (not an Occ\|Pcc incarnation fork).
     pub kernel: &'a crate::specfence::KernelTable,
+    /// Spec-safe AccessOrdinalLog — true \(k\) without rem DashMap.
+    pub access_log: &'a crate::specfence::AccessOrdinalLog,
     /// Opt-in lab fine-grain OCC/RW tracer (None = disabled, zero cost).
     pub finegrain: Option<&'a crate::specfence::FineGrainCollector>,
 }

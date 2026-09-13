@@ -127,11 +127,16 @@ pub(crate) fn validate_occ_kernel(
         specfence.bayes.observe_conflict_location_always(*location);
         specfence.metrics.record_bayes_conflict();
         specfence.hotset.note_abort(*location);
-        // True k from AccessOrdinalLog (`first_k`) / EdgeKey — never residual 1.
+        // True k from AccessOrdinalLog / rem first_k / EdgeKey — never residual 1.
         let loc_k = specfence
-            .partial_retry
+            .access_log
             .first_k(tx_version.tx_idx, *location)
-            .map(|k| k as u32)
+            .or_else(|| {
+                specfence
+                    .partial_retry
+                    .first_k(tx_version.tx_idx, *location)
+                    .map(|k| k as u32)
+            })
             .or_else(|| {
                 specfence
                     .edges
