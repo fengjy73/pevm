@@ -928,7 +928,7 @@ impl Pevm {
                             if let Some(stolen) = scheduler.next_task_steal_after_park_prefer(
                                 wave,
                                 Some(blocking_tx_idx),
-                                Some(vm.ready_edges()),
+                                None, // do not PE-refuse steal (ESTIMATE must plant)
                             ) {
                                 return Some(stolen);
                             }
@@ -943,7 +943,7 @@ impl Pevm {
                         if let Some(stolen) = scheduler.next_task_steal_after_park_prefer(
                             wave,
                             Some(blocking_tx_idx),
-                            Some(vm.ready_edges()),
+                            None, // do not PE-refuse steal (ESTIMATE must plant)
                         ) {
                             return Some(stolen);
                         }
