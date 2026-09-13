@@ -85,9 +85,10 @@ pub(crate) fn decide(
     // HotSet / WŜ are posterior / ready-edge priors, not SerialLane OR-doors.
     // Multi-writer PE class first — do **not** Bind stale Data (theater).
     let intra = learner.predicted_essential_intra(location, access_k);
-    // 2179522: one abort + Bind livelocked 3s. Quiet cohort stays Spec
-    // until abort/park heat clears `quiet_fence_off`.
-    let park_ok = !learner.quiet_fence_off() && (intra || learner.prior_pe_fire_wins(vis));
+    // Fence only on fan_out (EV win). Spine/quiet intra-Fence is tax
+    // (19807137 0.30; 2179522 Bind livelock). Isolated prior is empty.
+    let fan = learner.morph_weights().dominant_fan_out();
+    let park_ok = fan && !learner.quiet_fence_off() && (intra || learner.prior_pe_fire_wins(vis));
     if vis.unfinished > 1 || (vis.in_serial_lane && vis.unfinished > 0) {
         // SerialLane parks only the executing head. Ready-head park
         // serializes satellites before they plant ESTIMATE and inflates
@@ -204,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn prior_pe_plus_data_is_bind() {
+    fn prior_pe_plus_data_is_not_stale_bind() {
         let live = fan_out_learner();
         live.seed_predicted_essential(7, 6);
         assert_eq!(
