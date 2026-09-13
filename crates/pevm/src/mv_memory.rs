@@ -388,13 +388,10 @@ impl MvMemory {
                 return false;
             };
             // Iter6: single-origin or last MvMemory in lazy multi-origin chain.
-            let mv = prior_origins
-                .iter()
-                .rev()
-                .find_map(|o| match o {
-                    ReadOrigin::MvMemory(v) => Some(v.clone()),
-                    _ => None,
-                });
+            let mv = prior_origins.iter().rev().find_map(|o| match o {
+                ReadOrigin::MvMemory(v) => Some(v.clone()),
+                _ => None,
+            });
             match mv {
                 Some(v) => v,
                 None => return false,
@@ -548,7 +545,11 @@ impl MvMemory {
     }
 
     /// True if any higher tx has this location in its last recorded read set.
-    pub(crate) fn has_higher_reader(&self, aborted_idx: TxIdx, location: MemoryLocationHash) -> bool {
+    pub(crate) fn has_higher_reader(
+        &self,
+        aborted_idx: TxIdx,
+        location: MemoryLocationHash,
+    ) -> bool {
         self.readers
             .get(&location)
             .is_some_and(|set| set.iter().any(|&t| t > aborted_idx))

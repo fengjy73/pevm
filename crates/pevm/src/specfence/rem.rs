@@ -336,11 +336,28 @@ pub(crate) struct PartialRetryState {
     last_final_k: usize,
     /// G1: last completed incarnation's tx_gas_used (survives reset; for docs / future).
     last_tx_gas_used: u64,
+    /// Incarnation-stable seen ℓ (tx72-class). Survives `reset`.
+    inc_carry_seen: HashSet<MemoryLocationHash, BuildIdentityHasher>,
+    /// First-seen value snaps carried across repair incarnations.
+    inc_carry_snap: HashMap<MemoryLocationHash, FfValue, BuildIdentityHasher>,
 }
 
 impl PartialRetryState {
     pub(crate) fn reset(&mut self, incarnation: TxIncarnation) {
-        // Preserve last_final_k / last_tx_gas_used across incarnations (G1 depth proxy).
+        // Carry seen ℓ + snaps across repair incarnations (tx72-class).
+        // Do not re-cold-miss locations already Bound / accessed on a prior inc.
+        for &loc in self.first_k.keys() {
+            self.inc_carry_seen.insert(loc);
+        }
+        for &loc in &self.certified {
+            self.inc_carry_seen.insert(loc);
+        }
+        for (loc, val) in &self.value_snap {
+            self.inc_carry_snap
+                .entry(*loc)
+                .or_insert_with(|| val.clone());
+        }
+        // Preserve last_final_k / last_tx_gas_used / inc_carry_* (G1 + v2 carry).
         self.incarnation = incarnation;
         self.k = 0;
         self.first_k.clear();
@@ -969,9 +986,13 @@ impl PartialRetryTable {
             return false;
         }
         // SAFETY: single-executor invariant
-        let snap = match unsafe { self.state_ref(tx_idx) }.value_snap.get(&location) {
-            Some(s) => s,
-            None => return false,
+        let st = unsafe { self.state_ref(tx_idx) };
+        let snap = st
+            .value_snap
+            .get(&location)
+            .or_else(|| st.inc_carry_snap.get(&location));
+        let Some(snap) = snap else {
+            return false;
         };
         match (snap, cur) {
             (FfValue::Storage { value, .. }, crate::MemoryValue::Storage(v)) => value == v,
@@ -980,6 +1001,18 @@ impl PartialRetryTable {
             }
             _ => false,
         }
+    }
+
+    /// ℓ already seen on a prior incarnation of this tx (residual Bind, not UnfencedCold).
+    #[inline]
+    pub(crate) fn inc_carry_seen(&self, tx_idx: TxIdx, location: MemoryLocationHash) -> bool {
+        if tx_idx >= self.states.len() {
+            return false;
+        }
+        // SAFETY: single-executor invariant
+        unsafe { self.state_ref(tx_idx) }
+            .inc_carry_seen
+            .contains(&location)
     }
 
     /// M1i: Inspector post-SSTORE gas capture for write-prefix jump gas-equality.
@@ -1581,7 +1614,8 @@ impl PartialRetryTable {
         LeanAbortRepair::FullRestart { reexec_cost: 2.2 }
     }
 
-    /// SpecFence-native Lean resolve: **SuffixRepair-first** (default abort path).
+    /// SpecFence-native Lean resolve: **R1-first** at validate (`try_validate`);
+    /// this arms **R2 SuffixRepair** only when identity/FF is lost.
     ///
     /// ```text
     /// if plan_partial_retry + checkpoint with 0 < cp.k < k_fail:
@@ -2700,6 +2734,35 @@ mod p3_early_abort_tests {
         table.note_access(0, 102, AccessMode::Read);
         let d = table.estimate_effect_depth(0).unwrap();
         assert!((d - 0.3).abs() < 1e-9, "d={d}");
+    }
+
+    #[test]
+    fn inc_carry_seen_and_snap_survive_reset() {
+        let table = PartialRetryTable::new(2);
+        table.reset_incarnation(0, 0);
+        table.note_access(0, 77, AccessMode::Read);
+        table.note_certified(0, 77);
+        table.note_value(
+            0,
+            77,
+            FfValue::Storage {
+                address: Address::ZERO,
+                slot: U256::from(1),
+                value: U256::from(9),
+                origin: None,
+            },
+        );
+        table.reset_incarnation(0, 1);
+        assert!(
+            table.inc_carry_seen(0, 77),
+            "tx72-class: seen ℓ must survive repair incarnation"
+        );
+        assert!(!table.inc_carry_seen(0, 99));
+        let cur = crate::MemoryValue::Storage(U256::from(9));
+        assert!(
+            table.value_stable_match(0, 77, &cur),
+            "carried snap must match for R1"
+        );
     }
 
     #[test]

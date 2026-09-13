@@ -1,7 +1,7 @@
 # SpecFence complete architecture v2 (standalone SoT)
 
 **Date:** 2026-09-13 (Asia/Shanghai, UTC+8)  
-**Status:** AUTHORITATIVE design SoT for the next cut — **analysis/design only** (no protocol code in the commit that lands this note)  
+**Status:** AUTHORITATIVE design SoT — **single-iteration full land** (no P0/P1/P2 staging). Implementation map: `lab/notes/specfence-architecture-v2-impl.md`.
 **Branch / HEAD at write:** `cursor/specfence-complete-cc-63b0` @ `87d3979`  
 **Evidence base:** all-blocks SF/OCC@8 across **99** ethereum snapshots (corrected n=98); focus subgrain 597/599/097; process digests on worst family  
 **Companion evidence:** `lab/notes/specfence-all-blocks-deep-evidence.md`  
@@ -303,21 +303,23 @@ N=1 alone is insufficient for ranking extremes (19434587 OCC spike; 2179522 Bind
 
 ---
 
-## 12. Roadmap (design order; pause before code)
+## 12. Roadmap — single-iteration full land
 
-| Pri | Work | Moves |
-|----:|------|-------|
-| **P0** | R1-first resolve when identity_stable / FF | rewind↓, worst+IQR wall↓ |
-| **P0** | Incarnation-stable residual / cold carry | tx72-class max_inc↓ |
-| **P0** | WaitFor park budget / PreferAdmit heat (no SoftWait) | 6196166 / 597 / 10760440 idle↓ |
-| **P1** | Dissolve `choose_edge_action` OR-salad → Edge state machine | gate salad↓ |
-| **P1** | Wire park_ns + rewind:rebind into structural learners | unused→used |
-| **P1** | Delete AEC/AdaptiveParams/SoftWait theater from SoT+code paths | dead priors↓ |
-| **P2** | Metric↔L1 morph calibration on 99 | morph-gated decay safe |
-| **P2** | Protect quiet Fence-off | no quiet→fan_out regression |
-| **P2** | fanout_fr_collapse / absorb generalize | 19807137 / 19434587 fr↓ |
+Phased P0/P1/P2 staging is **rejected**. This cut lands **every** item below in one iteration / one PR. There is no “later P2” list.
 
-**Do not code in this task.** Confirm roadmap with owner before implementation.
+| # | Work | Done when |
+|---|------|-----------|
+| 1 | R1-first resolve when `identity_stable_match` / FF value-stable | `rebind_only` fires; R2/R4 only when identity lost |
+| 2 | Incarnation-stable residual / cold carry | Bind residual + snaps survive repair incarnations (tx72-class) |
+| 3 | WaitFor park budget + PreferAdmit heat | P cores stay on independents during fan_out Wait; **no SoftWait** |
+| 4 | Dissolve `choose_edge_action` OR-salad → Edge/Region version-visibility SM | native CC verbs, no new θ flags |
+| 5 | Wire `park_ns` + rewind:rebind into structural learners | Fence / admit / Resolve **read** those signals |
+| 6 | Delete AEC / AdaptiveParams / SoftWait theater from live paths | Storm/Await/αβγδ not π |
+| 7 | Metric↔L1 morph calibration | safe decay, not Storm actuator |
+| 8 | Protect quiet Fence-off | no quiet→fan_out regression |
+| 9 | Generalize `fanout_fr_collapse` / absorb | morphology-agnostic (19807137 / 19434587 class); **no bn hardcodes** |
+
+Implementation file:fn map: `lab/notes/specfence-architecture-v2-impl.md` (every row marked **landed**).
 
 ---
 
@@ -367,15 +369,19 @@ N=1 alone is insufficient for ranking extremes (19434587 OCC spike; 2179522 Bind
 - Focus subgrain: `lab/notes/specfence-post-subgrain-multiblock-deep-diagnosis.md`  
 - JSON: `lab/results/all-blocks-sf-occ-*.json`, `all-blocks-process-*.json`, `post-subgrain-*`
 
-## Appendix B — File:fn map (current code → v2 law)
+## Appendix B — File:fn map (v2 land)
+
+Authoritative landed map: `lab/notes/specfence-architecture-v2-impl.md`.
 
 | Law | file:fn |
 |-----|---------|
-| Edge verb | `specfence/edge.rs::choose_edge_action` → state machine |
+| Edge verb | `specfence/edge.rs::classify_edge` → `choose_edge_action` |
 | Wait plant | `vm.rs::fence_wait_for` / `maybe_wait_specfence` |
 | Residual writer_done | `learner.rs::note_writer_done`; residual Bind path |
+| Incarnation carry | `rem.rs::PartialRetryState::reset` / `inc_carry_*` |
 | Canary reopen | `sketch.rs::reopen_canary_if_probe_done` |
-| PreferAdmit / spine | `scheduler.rs::admit_spine(_writers)`; vm Ready check |
+| PreferAdmit / park budget | `scheduler.rs::admit_spine_heat`; `learner.rs::prefer_admit_heat` |
 | Identity / R1 | `rem.rs::identity_stable_match`; `pevm.rs::try_validate` |
-| Retired AEC | `mod.rs::choose_resolve`; `resolve.rs` — delete from π |
-| Morph decay | `sketch.rs::seed_from_prior_morph`; engagement decay-only |
+| Structural collapse | `pevm.rs::scan_invalid_spine` / `structural_spine_hot` |
+| Retired AEC | `mod.rs::choose_resolve` dead; `resolve.rs` not live π |
+| Morph decay / quiet | `sketch.rs::seed_from_prior_morph`; `learner.rs::morph_hat` / `quiet_fence_off` |

@@ -318,16 +318,12 @@ impl Scheduler {
     /// `try_execute` the aborted tx (steal-first). Kept for Iter4 clique experiments;
     /// Iter3 production path uses writer-barrier park only.
     #[allow(dead_code)]
-        /// Iter16: validate-defer — park an *Executed* consumer behind an unfinished
+    /// Iter16: validate-defer — park an *Executed* consumer behind an unfinished
     /// writer without abort/invalidate. On writer finish, wake re-queues Validation
     /// (same incarnation) so RebindOnly / validate-ok can absorb once Data lands.
     /// Only safe when caller has no true_suffix writes (poison risk otherwise).
     /// Returns `false` if the writer is already Executed|Validated (race).
-    pub(crate) fn defer_validation_behind(
-        &self,
-        tx_idx: TxIdx,
-        blocking_tx_idx: TxIdx,
-    ) -> bool {
+    pub(crate) fn defer_validation_behind(&self, tx_idx: TxIdx, blocking_tx_idx: TxIdx) -> bool {
         let blocking_tx = index_mutex!(self.transactions_status, blocking_tx_idx);
         if matches!(
             blocking_tx.status,
@@ -399,18 +395,35 @@ impl Scheduler {
     /// A1/D6: pull the spine writer into the ready queue so WaitFor targets
     /// make progress without Unfenced on known essentials.
     pub(crate) fn admit_spine(&self, tx_idx: TxIdx, wave: &WaveParkTable) {
+        self.admit_spine_heat(tx_idx, wave, false);
+    }
+
+    /// Park-budget admit: `push_ready` always. `fetch_min` only when heat is
+    /// off — otherwise execution_idx stays on independents (fan_out Wait).
+    pub(crate) fn admit_spine_heat(&self, tx_idx: TxIdx, wave: &WaveParkTable, park_heat: bool) {
         if tx_idx >= self.block_size {
             return;
         }
         wave.push_ready(tx_idx);
-        self.execution_idx.fetch_min(tx_idx, Ordering::Relaxed);
+        if !park_heat {
+            self.execution_idx.fetch_min(tx_idx, Ordering::Relaxed);
+        }
     }
 
     /// S4: admit every unfinished writer on one ℓ (096/097 multi-spine), not
     /// only the closest / max-writers tip.
     pub(crate) fn admit_spine_writers(&self, writers: &[TxIdx], wave: &WaveParkTable) {
+        self.admit_spine_writers_heat(writers, wave, false);
+    }
+
+    pub(crate) fn admit_spine_writers_heat(
+        &self,
+        writers: &[TxIdx],
+        wave: &WaveParkTable,
+        park_heat: bool,
+    ) {
         for &w in writers {
-            self.admit_spine(w, wave);
+            self.admit_spine_heat(w, wave, park_heat);
         }
     }
 
@@ -627,7 +640,11 @@ impl Scheduler {
             return true;
         }
         // SAFETY: tx_idx checked against block_size above.
-        unsafe { self.done_flags.get_unchecked(tx_idx).load(Ordering::Acquire) }
+        unsafe {
+            self.done_flags
+                .get_unchecked(tx_idx)
+                .load(Ordering::Acquire)
+        }
     }
 
     /// True when the incarnation is actively `Executing` (not merely Ready/Aborting).
@@ -761,6 +778,4 @@ impl Scheduler {
         }
         None
     }
-
 }
-

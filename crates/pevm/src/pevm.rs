@@ -407,20 +407,17 @@ impl Pevm {
         // V5-P0: LeanOCC default; HotSet feature-only; inter-prior never arms SoftWait.
         let learner = LiveLearner::new();
         let mut abc_prior_morph = None;
-        let mut abc_top_storm = false;
         if self.concurrency_mode == ConcurrencyMode::SpecFence {
             self.hotset.begin_block();
             let prior_morph = self.inter_prior.morph_ema();
             learner.begin_block_with_params(prior_morph, self.adaptive_params);
             // Warm-start HotSet/Bayes from inter-block top-ℓ — NEVER arm SoftWait Soft from prior.
+            // Do **not** force Storm from fanout_ema (banned morph actuator).
             for top in self.inter_prior.top_locations() {
                 self.hotset.track_from_prior(top.location);
                 // Mild Bayes seed so conflict_probability is location-aware without Wait arm.
                 if top.abort_rate >= 0.15 || top.fanout_ema >= 16.0 {
                     let _ = self.bayes.observe_conflict_location(top.location);
-                }
-                if top.fanout_ema >= 16.0 {
-                    abc_top_storm = true;
                 }
             }
             abc_prior_morph = Some(prior_morph);
@@ -468,12 +465,9 @@ impl Pevm {
         } else {
             AdaptiveEngagement::disabled(block_size)
         };
-        // C: inter morph (+ top-ℓ fanout) selects Quiet vs Storm — actuates Await set.
+        // Decay-only morph label (not edge / resolve π). No Storm force-flip.
         if let Some(m) = abc_prior_morph {
             engagement.set_mode_from_morph(m.fan_out, m.mixed, m.quiet);
-            if abc_top_storm && !engagement.is_storm() {
-                let _ = engagement.maybe_flip_mode(0.50, 0.25, 0.15);
-            }
         }
         if self.finegrain_enabled {
             self.finegrain.clear();
@@ -900,6 +894,65 @@ impl Pevm {
     }
 }
 
+/// Executing-spine heat on invalid ℓ — morphology-agnostic (no bn / Storm gate).
+struct SpineHeat {
+    best: Option<(TxIdx, usize)>,
+    best_fan: usize,
+    has_executing: bool,
+    has_estimate_or_aborting: bool,
+}
+
+fn scan_invalid_spine(
+    mv_memory: &MvMemory,
+    scheduler: &Scheduler,
+    reader: TxIdx,
+    invalid: &[MemoryLocationHash],
+) -> SpineHeat {
+    let mut heat = SpineHeat {
+        best: None,
+        best_fan: 0,
+        has_executing: false,
+        has_estimate_or_aborting: false,
+    };
+    for &location in invalid {
+        let w = mv_memory
+            .last_writer_before(location, reader)
+            .or_else(|| mv_memory.residual_writer_before(location, reader));
+        let Some(w) = w else {
+            continue;
+        };
+        if w >= reader {
+            continue;
+        }
+        if scheduler.is_executing(w) {
+            heat.has_executing = true;
+            let fan = mv_memory.higher_readers_of(location, w).len();
+            if fan > heat.best_fan {
+                heat.best_fan = fan;
+                heat.best = Some((w, fan));
+            } else if fan == heat.best_fan {
+                match heat.best {
+                    None => heat.best = Some((w, fan)),
+                    Some((pw, _)) if w > pw => heat.best = Some((w, fan)),
+                    _ => {}
+                }
+            }
+        }
+        if scheduler.is_aborting(w) || mv_memory.entry_kind_at(location, w) == "estimate" {
+            heat.has_estimate_or_aborting = true;
+        }
+    }
+    heat
+}
+
+/// Structural repair heat: executing spine + any fan, unless quiet Fence-off.
+fn structural_spine_hot(heat: &SpineHeat, learner: &LiveLearner) -> bool {
+    if learner.quiet_fence_off() {
+        return false;
+    }
+    heat.has_executing && heat.best_fan >= 2
+}
+
 fn try_validate(
     mv_memory: &MvMemory,
     scheduler: &Scheduler,
@@ -1096,9 +1149,19 @@ fn try_validate(
                 });
             }
         }
-        // Prefer RebindOnly when value-stable (incl. identity+FF). R2/R4 only
-        // when identity is truly lost. !true_suffix still tries origin patch.
-        let rebound = if value_stable || (identity_held && estimate_cleared && !true_suffix) {
+        // R1-first: RebindOnly when values are stable (snap / carry / FF /
+        // prior-origin). Identity-held without a value match is not R1 —
+        // that accepted stale suffix writes (seq≠par). true_suffix no longer
+        // blocks a real value-stable match (the old SuffixRepair-as-default).
+        if identity_held {
+            specfence.learner.note_identity_hit();
+        }
+        let r1_eligible = value_stable
+            || (identity_held
+                && estimate_cleared
+                && !true_suffix
+                && specfence.learner.r1_first_bias());
+        let rebound = if r1_eligible || value_stable {
             mv_memory.try_rebind_invalid_reads_value_stable(tx_version.tx_idx, &invalid)
         } else if !true_suffix {
             mv_memory.try_rebind_invalid_reads(tx_version.tx_idx, &invalid)
@@ -1106,6 +1169,7 @@ fn try_validate(
             false
         };
         if rebound {
+            specfence.learner.note_resolve_r1();
             specfence.metrics.record_partial_retry();
             specfence.metrics.record_rebind_only();
             specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
@@ -1145,37 +1209,18 @@ fn try_validate(
         && !true_suffix_flag
         && specfence.mode == ConcurrencyMode::SpecFence
         && lean_tx
-        && specfence.engagement.is_storm()
         && specfence
             .partial_retry
             .try_claim_validation_defer(tx_version.tx_idx)
     {
-        let mut best: Option<(crate::TxIdx, usize)> = None;
-        for &location in &invalid {
-            let w = mv_memory
-                .last_writer_before(location, tx_version.tx_idx)
-                .or_else(|| mv_memory.residual_writer_before(location, tx_version.tx_idx));
-            if let Some(w) = w {
-                if w < tx_version.tx_idx && scheduler.is_executing(w) {
-                    let fan = mv_memory.higher_readers_of(location, w).len();
-                    let take = match best {
-                        None => true,
-                        Some((pw, pf)) => fan > pf || (fan == pf && w > pw),
-                    };
-                    if take {
-                        best = Some((w, fan));
-                    }
+        let heat = scan_invalid_spine(mv_memory, scheduler, tx_version.tx_idx, &invalid);
+        if structural_spine_hot(&heat, specfence.learner) {
+            if let Some((w, _)) = heat.best {
+                if scheduler.defer_validation_behind(tx_version.tx_idx, w) {
+                    specfence.metrics.record_fanout_validate_defer();
+                    // Stay Executed; writer finish re-queues Validation.
+                    return None;
                 }
-            }
-        }
-        const FANOUT_VALIDATE_DEFER_FAN: usize = 8;
-        if let Some((w, fan)) = best {
-            if fan >= FANOUT_VALIDATE_DEFER_FAN
-                && scheduler.defer_validation_behind(tx_version.tx_idx, w)
-            {
-                specfence.metrics.record_fanout_validate_defer();
-                // Stay Executed; writer finish re-queues Validation.
-                return None;
             }
         }
     }
@@ -1263,7 +1308,7 @@ fn try_validate(
                 && was_force_bind
                 && cheap_resume
                 && repair_depth >= 1
-                && specfence.engagement.is_storm()
+                && !specfence.learner.quiet_fence_off()
             {
                 let mut has_estimate_or_aborting = false;
                 let mut has_executing_spine = false;
@@ -1295,46 +1340,16 @@ fn try_validate(
             // Reserve Iter15 FullRestart collapse only when fail-loc writers are
             // Estimate/Aborting *and* an Executing spine exists (doomed resume).
             // SoftWait Soft=0; no sibling park; Estimate park OFF; no 15b drain.
-            if !escalate
-                && !was_force_bind
-                && repair_depth == 0
-                && true_suffix_flag
-                && specfence.engagement.is_storm()
-            {
-                let mut best_fan = 0usize;
-                let mut has_executing = false;
-                let mut has_estimate_or_aborting = false;
-                for location in &invalid {
-                    let w = mv_memory
-                        .last_writer_before(*location, tx_version.tx_idx)
-                        .or_else(|| mv_memory.residual_writer_before(*location, tx_version.tx_idx));
-                    if let Some(w) = w {
-                        if w >= tx_version.tx_idx {
-                            continue;
-                        }
-                        if scheduler.is_executing(w) {
-                            has_executing = true;
-                            let fan = mv_memory.higher_readers_of(*location, w).len();
-                            if fan > best_fan {
-                                best_fan = fan;
-                            }
-                        }
-                        if scheduler.is_aborting(w)
-                            || mv_memory.entry_kind_at(*location, w) == "estimate"
-                        {
-                            has_estimate_or_aborting = true;
-                        }
-                    }
-                }
-                const FANOUT_ABSORB_FAN: usize = 8;
-                if best_fan >= FANOUT_ABSORB_FAN && has_executing {
-                    if has_estimate_or_aborting {
-                        // Doomed SpecRead-through-ESTIMATE — keep Iter15 FR+barrier.
+            if !escalate && !was_force_bind && repair_depth == 0 && true_suffix_flag {
+                let heat = scan_invalid_spine(mv_memory, scheduler, tx_version.tx_idx, &invalid);
+                if structural_spine_hot(&heat, specfence.learner) {
+                    if heat.has_estimate_or_aborting {
+                        // Doomed SpecRead-through-ESTIMATE — FR+barrier, no Storm gate.
                         escalate = true;
                         fanout_collapse = true;
                         specfence.metrics.record_fanout_fr_collapse();
                     } else {
-                        // Executing spine → SuffixRepair+fra; skip sticky (Iter16b).
+                        // Executing spine → SuffixRepair+fra; skip sticky.
                         fanout_absorb = true;
                         specfence.metrics.record_fanout_absorb();
                     }
@@ -1394,17 +1409,13 @@ fn try_validate(
                         .partial_retry
                         .mark_needs_live_capture(tx_version.tx_idx);
                 }
-                // C: abort morph may flip Quiet→Storm (598→599 style evidence).
-                let morph = specfence.learner.morph_weights();
-                let _ =
-                    specfence
-                        .engagement
-                        .maybe_flip_mode(morph.fan_out, morph.mixed, morph.quiet);
+                // Morph is decay-only — do not flip Storm as resolve π.
             }
             specfence.learner.note_reexec_cost(repair.reexec_cost());
             // SuffixRepair → invalidate failed suffix only; else selective/full.
             let fence_locs: Vec<_> = match &repair {
                 LeanAbortRepair::SuffixRepair { suffix_writes, .. } => {
+                    specfence.learner.note_resolve_r2();
                     specfence.metrics.record_rewind_to_cp();
                     let estimated =
                         mv_memory.invalidate_partial_suffix(tx_version.tx_idx, suffix_writes);
@@ -1521,14 +1532,7 @@ fn try_validate(
             for location in &invalid {
                 specfence.learner.note_abort(*location, cascade_hint);
             }
-            // C: live morph after abort may flip Quiet→Storm (actuates Await set).
-            {
-                let morph = specfence.learner.morph_weights();
-                let _ =
-                    specfence
-                        .engagement
-                        .maybe_flip_mode(morph.fan_out, morph.mixed, morph.quiet);
-            }
+            // Morph label is decay-only (not an Await / collapse actuator).
             let rewind_to = mv_memory.min_higher_reader_of(tx_version.tx_idx, &fence_locs);
             let block_size = scheduler.block_size();
             let cascade_from = tx_version.tx_idx + 1;
@@ -1553,7 +1557,7 @@ fn try_validate(
             if !escalate
                 && !was_force_bind
                 && repair.did_force_bind()
-                && specfence.engagement.is_storm()
+                && !specfence.learner.quiet_fence_off()
             {
                 let mut best: Option<(crate::TxIdx, usize)> = None;
                 for location in &invalid {
@@ -1574,20 +1578,17 @@ fn try_validate(
                     }
                 }
                 if let Some((w, fan)) = best {
-                    // Iter23: high-fan first-repair — brief yield before dependency
-                    // park; if writer already done, skip park (cut park_ms on 597
-                    // without SoftWait Soft / BO). Fan≥32 targets storm fan-out;
-                    // 599 mixed fans stay classic park. SoftWait Soft=0.
-                    // Iter24: fan≥16 deepen falsified (599 wall/p90↑) — keep ≥32/64.
-                    if fan >= 32 {
-                        for _ in 0..64 {
+                    // Brief yield when the fail-ℓ already has a wide reader set —
+                    // skip park if the writer left Executing. Morphology-agnostic
+                    // (no 597 fan≥32 hardcode / no SoftWait).
+                    if fan >= 8 {
+                        for _ in 0..48 {
                             if !scheduler.is_executing(w) {
                                 break;
                             }
                             std::thread::yield_now();
                         }
                         if !scheduler.is_executing(w) {
-                            // Writer left Executing — resume without park.
                             best = None;
                         }
                     }
@@ -1605,7 +1606,7 @@ fn try_validate(
             // fail-loc writers until Executed/Validated before 2nd resume.
             // Iter8: first-repair Estimate park falsified (wall↑ / sra↑). SoftWait Soft=0.
             // Not SoftWait Soft; not storm-wide fanout Await (fail locs only).
-            if !escalate && was_force_bind && specfence.engagement.is_storm() {
+            if !escalate && was_force_bind && !specfence.learner.quiet_fence_off() {
                 // Hang-free: only park behind *Executing* fail-loc writers (Iter3
                 // lesson). Ready/Aborting deps idle the 2nd resume (wall↑ on N=5).
                 let mut best: Option<(crate::TxIdx, usize)> = None;
@@ -1641,11 +1642,11 @@ fn try_validate(
             // Iter13: rank ALL Executing conflict writers and try claims in order
             // (no sibling-park — Iter4 sibling hang). Executed→Validated escalate
             // spin falsified (13a wall↑).
-            // Iter15: widen to all storm escalates (incl. fanout_collapse first-fail),
-            // not only was_force_bind — Quiet still gated by is_storm().
+            // Widen escalates (incl. fanout_collapse first-fail). Quiet is
+            // `quiet_fence_off` — not Storm π.
             if escalate
                 && (was_force_bind || fanout_collapse || repair_depth >= 1)
-                && specfence.engagement.is_storm()
+                && !specfence.learner.quiet_fence_off()
                 && !specfence
                     .partial_retry
                     .serial_barrier_used(tx_version.tx_idx)

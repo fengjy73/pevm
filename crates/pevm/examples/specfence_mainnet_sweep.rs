@@ -103,11 +103,15 @@ fn repo_root() -> PathBuf {
 }
 
 fn parse_csv_u64(raw: &str) -> Vec<u64> {
-    raw.split(',').filter_map(|s| s.trim().parse().ok()).collect()
+    raw.split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect()
 }
 
 fn parse_csv_usize(raw: &str) -> Vec<usize> {
-    raw.split(',').filter_map(|s| s.trim().parse().ok()).collect()
+    raw.split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect()
 }
 
 fn load_shared(data_dir: &Path) -> (Arc<Bytecodes>, Arc<BlockHashes>) {
@@ -348,11 +352,7 @@ fn measure(
                 } else {
                     m.selective_fallback_full
                 },
-                partial_retry_count: if sequential {
-                    0
-                } else {
-                    m.partial_retry_count
-                },
+                partial_retry_count: if sequential { 0 } else { m.partial_retry_count },
                 partial_retry_fallback_full: if sequential {
                     0
                 } else {
@@ -381,29 +381,17 @@ fn measure(
                 },
                 prior_bind_hits: if sequential { 0 } else { m.prior_bind_hits },
                 prior_bind_miss: if sequential { 0 } else { m.prior_bind_miss },
-                journal_ff_entries: if sequential {
-                    0
-                } else {
-                    m.journal_ff_entries
-                },
+                journal_ff_entries: if sequential { 0 } else { m.journal_ff_entries },
                 journal_ff_hits: if sequential { 0 } else { m.journal_ff_hits },
                 prefix_opcodes_skipped: if sequential {
                     0
                 } else {
                     m.prefix_opcodes_skipped
                 },
-                ready_steal_on_wait: if sequential {
-                    0
-                } else {
-                    m.ready_steal_on_wait
-                },
+                ready_steal_on_wait: if sequential { 0 } else { m.ready_steal_on_wait },
                 lean_mode_txs: if sequential { 0 } else { m.lean_mode_txs },
                 full_mode_txs: if sequential { 0 } else { m.full_mode_txs },
-                engagement_switches: if sequential {
-                    0
-                } else {
-                    m.engagement_switches
-                },
+                engagement_switches: if sequential { 0 } else { m.engagement_switches },
                 hot_local_reads: if sequential { 0 } else { m.hot_local_reads },
                 hotset_size: if sequential { 0 } else { m.hotset_size },
                 inspector_steps: if sequential { 0 } else { m.inspector_steps },

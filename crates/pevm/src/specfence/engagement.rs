@@ -3,15 +3,13 @@
 //! Authoritative: `lab/notes/specfence-abc-unified-protocol.md`.
 //!
 //! - Execute path: always LeanOCC for `Handler::run` unless research inspect.
-//! - Block engagement mode (C): `Quiet` (598-like OCC-lite) vs `Storm`
-//!   (597-like Await-ready on hot ℓ). Selected from inter morph prior; may flip
-//!   mid-block on live morph evidence (598→599 style). Mode actuates Await set
-//!   in `maybe_wait` — not SoftWait Soft arms.
+//! - Block engagement mode (C): **decay-only label** (Quiet vs Storm hat).
+//!   v2: mode does **not** actuate Await / collapse / absorb. Live π is the
+//!   Edge visibility machine + R1-first Resolve. SoftWait Soft stays 0.
 //! - `note_abort` is **metrics-only** — does not escalate HotSet or flip π.
 //! - `SPECFENCE_ENABLE_INSPECT=1` re-enables inspect_run / jump (research only).
 //!
 //! OCC / PCC modes never consult this module.
-
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -106,7 +104,6 @@ pub(crate) fn profile_timing_enabled() -> bool {
         }
     }
 }
-
 
 /// Per-block adaptive engagement controller (SpecFence only).
 #[derive(Debug)]

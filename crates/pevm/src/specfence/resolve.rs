@@ -125,11 +125,7 @@ pub(crate) fn cost_spec_params(p_conflict: f64, c_retry: f64) -> f64 {
 /// Legacy helper retained for Bayes `should_wait_hard` facade / docs.
 /// AEC π does **not** use this as a Boolean Wait ladder.
 #[inline]
-pub(crate) fn cost_prefers_wait(
-    writer_known: bool,
-    writer_done: bool,
-    p_conflict: f64,
-) -> bool {
+pub(crate) fn cost_prefers_wait(writer_known: bool, writer_done: bool, p_conflict: f64) -> bool {
     cost_prefers_wait_params(
         writer_known,
         writer_done,
@@ -224,9 +220,7 @@ pub(crate) fn compute_ev(ctx: &PolicyCtx) -> EvScores {
     // Measured abort→reexec (V5-P1 ForceBind≈1.2 / FullRestart≈2.2) via γ.
     let e_reexec = ctx.e_reexec.max(params.e_reexec * 0.25).max(0.0);
     let ev_spec = p_abort
-        * (w_remain(ctx)
-            + params.beta_cascade * e_cascade
-            + params.gamma_reexec * e_reexec);
+        * (w_remain(ctx) + params.beta_cascade * e_cascade + params.gamma_reexec * e_reexec);
 
     let ev_early = if early_abort_candidate(ctx) {
         let w_prefix = ctx.gross_work_depth.unwrap_or(0.0).clamp(0.0, 1.0);
@@ -249,7 +243,12 @@ pub(crate) fn compute_ev(ctx: &PolicyCtx) -> EvScores {
 
 /// Tiny-gap meta bias: Wait barely beats Spec under meta pressure → SpecRead.
 #[inline]
-fn meta_tax_prefers_spec(ev_wait: f64, ev_spec: f64, meta_tax: f64, params: &AdaptiveParams) -> bool {
+fn meta_tax_prefers_spec(
+    ev_wait: f64,
+    ev_spec: f64,
+    meta_tax: f64,
+    params: &AdaptiveParams,
+) -> bool {
     if !ev_wait.is_finite() || !ev_spec.is_finite() {
         return false;
     }
@@ -305,8 +304,7 @@ pub(crate) fn choose_action(ctx: PolicyCtx) -> ResolveAction {
     } else {
         ev.ev_wait + EPS < best_ev
     };
-    if wait_ok && !meta_tax_prefers_spec(ev.ev_wait, ev.ev_spec, ctx.meta_tax, &params)
-    {
+    if wait_ok && !meta_tax_prefers_spec(ev.ev_wait, ev.ev_spec, ctx.meta_tax, &params) {
         best = ResolveAction::WaitHard;
         best_ev = ev.ev_wait;
     }
@@ -389,7 +387,15 @@ mod tests {
             tx_incarnation: 0,
         };
         let a = choose_action(ctx_aec(
-            0.2, true, true, Some(v.clone()), true, true, true, 16.0, Some(0.9),
+            0.2,
+            true,
+            true,
+            Some(v.clone()),
+            true,
+            true,
+            true,
+            16.0,
+            Some(0.9),
         ));
         assert_eq!(a, ResolveAction::Bind(v));
     }
@@ -425,7 +431,17 @@ mod tests {
     #[test]
     fn aec_no_d_wait_boolean_ladder() {
         // Late measured d must NOT Boolean-force WaitHard.
-        let a = choose_action(ctx_aec(0.20, true, false, None, false, true, false, 2.0, Some(0.94)));
+        let a = choose_action(ctx_aec(
+            0.20,
+            true,
+            false,
+            None,
+            false,
+            true,
+            false,
+            2.0,
+            Some(0.94),
+        ));
         assert_eq!(a, ResolveAction::SpecRead);
     }
 
@@ -447,7 +463,9 @@ mod tests {
 
     #[test]
     fn aec_handler_specs_even_if_fanout() {
-        let a = choose_action(ctx_aec(0.9, true, false, None, false, false, true, 32.0, None));
+        let a = choose_action(ctx_aec(
+            0.9, true, false, None, false, false, true, 32.0, None,
+        ));
         assert_eq!(a, ResolveAction::SpecRead);
     }
 
@@ -490,7 +508,10 @@ mod tests {
         // EV_Early = 0.1 + 1.5 = 1.6; may or may not win vs Spec — require known d path.
         let a = choose_action(c.clone());
         assert!(
-            matches!(a, ResolveAction::EarlyAbort | ResolveAction::SpecRead | ResolveAction::WaitHard),
+            matches!(
+                a,
+                ResolveAction::EarlyAbort | ResolveAction::SpecRead | ResolveAction::WaitHard
+            ),
             "{a:?}"
         );
         // With extreme Spec/Wait cost, EarlyAbort wins.
@@ -535,10 +556,30 @@ mod tests {
             tx_idx: 0,
             tx_incarnation: 0,
         };
-        let mut c = ctx_aec(0.2, true, false, Some(v.clone()), false, true, false, 8.0, None);
+        let mut c = ctx_aec(
+            0.2,
+            true,
+            false,
+            Some(v.clone()),
+            false,
+            true,
+            false,
+            8.0,
+            None,
+        );
         c.prior_ws_predicts = true;
         assert_eq!(choose_action(c), ResolveAction::Bind(v.clone()));
-        let c2 = ctx_aec(0.80, true, false, Some(v.clone()), false, true, false, 8.0, None);
+        let c2 = ctx_aec(
+            0.80,
+            true,
+            false,
+            Some(v.clone()),
+            false,
+            true,
+            false,
+            8.0,
+            None,
+        );
         assert_eq!(choose_action(c2), ResolveAction::Bind(v));
     }
 
@@ -549,14 +590,44 @@ mod tests {
             tx_incarnation: 0,
         };
         // writer_done → Bind (EV_Bind=0, hang-free).
-        let c = ctx_aec(0.05, true, true, Some(v.clone()), false, true, true, 32.0, None);
+        let c = ctx_aec(
+            0.05,
+            true,
+            true,
+            Some(v.clone()),
+            false,
+            true,
+            true,
+            32.0,
+            None,
+        );
         assert_eq!(choose_action(c), ResolveAction::Bind(v.clone()));
         // High bind posterior + Data → Bind (quality signal).
-        let mut c2 = ctx_aec(0.05, true, false, Some(v.clone()), false, true, false, 2.0, None);
+        let mut c2 = ctx_aec(
+            0.05,
+            true,
+            false,
+            Some(v.clone()),
+            false,
+            true,
+            false,
+            2.0,
+            None,
+        );
         c2.posterior_bind_success = 0.80;
         assert_eq!(choose_action(c2), ResolveAction::Bind(v.clone()));
         // Data alone → Bind (Bind does not SoftWait; origin install is hang-free).
-        let mut c3 = ctx_aec(0.05, true, false, Some(v.clone()), false, true, true, 32.0, None);
+        let mut c3 = ctx_aec(
+            0.05,
+            true,
+            false,
+            Some(v.clone()),
+            false,
+            true,
+            true,
+            32.0,
+            None,
+        );
         c3.e_wait_time = 2.0;
         c3.e_reexec = 0.5;
         assert_eq!(choose_action(c3), ResolveAction::Bind(v));
@@ -628,7 +699,9 @@ mod tests {
 
     #[test]
     fn g3_no_handler_waithard_from_high_p() {
-        let a = choose_action(ctx_aec(0.90, true, false, None, false, false, true, 8.0, None));
+        let a = choose_action(ctx_aec(
+            0.90, true, false, None, false, false, true, 8.0, None,
+        ));
         assert_eq!(a, ResolveAction::SpecRead);
     }
 
@@ -736,7 +809,17 @@ mod tests {
             tx_incarnation: 0,
         };
         // Sticky flag is informational for π; Bind still requires hang-free gates.
-        let mut c = ctx_aec(0.2, true, true, Some(v.clone()), false, true, false, 2.0, None);
+        let mut c = ctx_aec(
+            0.2,
+            true,
+            true,
+            Some(v.clone()),
+            false,
+            true,
+            false,
+            2.0,
+            None,
+        );
         c.sticky_resolve = true;
         assert_eq!(choose_action(c), ResolveAction::Bind(v));
 

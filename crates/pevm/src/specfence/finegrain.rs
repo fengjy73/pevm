@@ -130,7 +130,6 @@ pub fn producer_status_canonical(ready: &str, mv: &str) -> &'static str {
     }
 }
 
-
 /// One successful validation abort (OCC ESTIMATE path).
 #[derive(Debug, Clone, Serialize)]
 pub struct AbortEvent {
@@ -308,7 +307,6 @@ impl Default for FineGrainSnapshot {
         }
     }
 }
-
 
 /// Account-grain cross-tx observe: slot/location had no prior writer, but the
 /// account did (SLOAD/BALANCE/EXT*). Not primary RAW — EV-change diagnostic.
@@ -503,8 +501,7 @@ impl FineGrainCollector {
         self.journal
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
         if enabled {
-            self.deep
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.deep.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -517,16 +514,18 @@ impl FineGrainCollector {
     pub(crate) fn attach_runtime(&self, mv: &MvMemory, sched: &Scheduler) {
         self.runtime_mv
             .store(mv as *const MvMemory as *mut MvMemory, Ordering::Release);
-        self.runtime_sched
-            .store(sched as *const Scheduler as *mut Scheduler, Ordering::Release);
+        self.runtime_sched.store(
+            sched as *const Scheduler as *mut Scheduler,
+            Ordering::Release,
+        );
     }
 
     pub(crate) fn detach_runtime(&self) {
-        self.runtime_mv.store(std::ptr::null_mut(), Ordering::Release);
+        self.runtime_mv
+            .store(std::ptr::null_mut(), Ordering::Release);
         self.runtime_sched
             .store(std::ptr::null_mut(), Ordering::Release);
     }
-
 
     pub fn clear(&self) {
         self.abort_events.lock().unwrap().clear();
@@ -598,16 +597,11 @@ impl FineGrainCollector {
             }
         }
         if journal {
-            st.live_write_counters
-                .insert((tx_idx, incarnation), next_k);
+            st.live_write_counters.insert((tx_idx, incarnation), next_k);
         }
         if let Some(c) = st.consumers.get_mut(&tx_idx) {
             if c.incarnation == incarnation {
-                c.write_effects = if journal {
-                    next_k
-                } else {
-                    write_set.len()
-                };
+                c.write_effects = if journal { next_k } else { write_set.len() };
             }
         }
     }
@@ -730,7 +724,10 @@ impl FineGrainCollector {
         }
         let mut st = self.deep_state.lock().unwrap();
         let k = {
-            let ctr = st.live_write_counters.entry((tx_idx, incarnation)).or_insert(0);
+            let ctr = st
+                .live_write_counters
+                .entry((tx_idx, incarnation))
+                .or_insert(0);
             let k = *ctr;
             *ctr += 1;
             k
@@ -834,7 +831,9 @@ impl FineGrainCollector {
         }
         let mut st = self.deep_state.lock().unwrap();
         st.diag.journal_reads += 1;
-        let warm = !st.seen_locs.insert((consumer_tx, consumer_incarnation, location));
+        let warm = !st
+            .seen_locs
+            .insert((consumer_tx, consumer_incarnation, location));
         let effect_k_log = {
             let ctr = st
                 .effect_counters
@@ -859,18 +858,21 @@ impl FineGrainCollector {
             kind: kind_hint.as_str().to_string(),
         });
 
-        let producer_meta = st.last_writer.get(&location).and_then(|&(ptx, pinc, pk, kind)| {
-            if ptx >= consumer_tx {
-                None
-            } else {
-                let kind = if kind == LocationKind::Unknown {
-                    kind_hint
+        let producer_meta = st
+            .last_writer
+            .get(&location)
+            .and_then(|&(ptx, pinc, pk, kind)| {
+                if ptx >= consumer_tx {
+                    None
                 } else {
-                    kind
-                };
-                Some((ptx, pinc, pk, kind))
-            }
-        });
+                    let kind = if kind == LocationKind::Unknown {
+                        kind_hint
+                    } else {
+                        kind
+                    };
+                    Some((ptx, pinc, pk, kind))
+                }
+            });
 
         // Account-grain diag when slot/location has no prior writer.
         let account_grain = if producer_meta.is_none() {
@@ -1092,12 +1094,7 @@ impl FineGrainCollector {
         });
     }
 
-    pub(crate) fn capture(
-        &self,
-        mv: &MvMemory,
-        scheduler: &Scheduler,
-        beneficiary: Address,
-    ) {
+    pub(crate) fn capture(&self, mv: &MvMemory, scheduler: &Scheduler, beneficiary: Address) {
         let n_tx = scheduler.block_size();
         let beneficiary_hash = hash_deterministic(MemoryLocation::Basic(beneficiary));
         let final_incarnations = scheduler.incarnation_snapshot();
@@ -1212,10 +1209,7 @@ impl FineGrainCollector {
                     }
                 }
             }
-            let multi: Vec<_> = writers
-                .iter()
-                .filter(|(_, ws)| ws.len() >= 2)
-                .collect();
+            let multi: Vec<_> = writers.iter().filter(|(_, ws)| ws.len() >= 2).collect();
             stream_diag.multi_writer_locs = multi.len();
             let mut waw_only = 0usize;
             let mut no_readers = 0usize;
@@ -1349,7 +1343,9 @@ pub fn dependency_edges(
     }
     // RAW: each reader depends on closest lower writer
     for (&loc, rs) in &readers {
-        let Some(ws) = writers.get(&loc) else { continue };
+        let Some(ws) = writers.get(&loc) else {
+            continue;
+        };
         for &r in rs {
             if let Some(&w) = ws.iter().rev().find(|&&w| w < r) {
                 if edge_set.insert((w, r, loc)) {
@@ -1522,7 +1518,11 @@ pub struct HotLocation {
     pub touches: usize,
 }
 
-pub fn hot_locations(snap: &FineGrainSnapshot, top_k: usize, exclude_beneficiary: bool) -> Vec<HotLocation> {
+pub fn hot_locations(
+    snap: &FineGrainSnapshot,
+    top_k: usize,
+    exclude_beneficiary: bool,
+) -> Vec<HotLocation> {
     use std::collections::{HashMap, HashSet};
 
     let kind_map: HashMap<u64, String> = snap.location_kinds.iter().cloned().collect();
@@ -1561,7 +1561,11 @@ pub fn hot_locations(snap: &FineGrainSnapshot, top_k: usize, exclude_beneficiary
             }
         })
         .collect();
-    hot.sort_by(|a, b| b.touches.cmp(&a.touches).then(b.n_writers.cmp(&a.n_writers)));
+    hot.sort_by(|a, b| {
+        b.touches
+            .cmp(&a.touches)
+            .then(b.n_writers.cmp(&a.n_writers))
+    });
     hot.truncate(top_k);
     hot
 }
@@ -1654,7 +1658,6 @@ pub fn program_raw_longest_chain(raw: &[RawEdge]) -> usize {
     }
     dist.into_iter().max().unwrap_or(0)
 }
-
 
 /// Summarize deep effect-RAW edges (exclude beneficiary / basic_lazy when requested).
 pub fn filter_effect_edges(
@@ -1829,7 +1832,6 @@ pub fn estimate_ma_md(
     }
 }
 
-
 /// L1 sequential DAG / morphology summary from a finegrain snapshot.
 #[derive(Debug, Clone, Serialize)]
 pub struct L1DagSummary {
@@ -1901,7 +1903,11 @@ pub fn l1_dag_summary(snap: &FineGrainSnapshot) -> L1DagSummary {
     }
     let n_prog = edges.iter().filter(|e| e.class == "program").count();
     let n_hand = n_raw.saturating_sub(n_prog);
-    let prog_frac = if n_raw == 0 { 0.0 } else { n_prog as f64 / n_raw as f64 };
+    let prog_frac = if n_raw == 0 {
+        0.0
+    } else {
+        n_prog as f64 / n_raw as f64
+    };
     let morphology = if n_raw < 80 {
         "quiet".to_string()
     } else if fanout >= 100 && prog_frac > 0.8 {

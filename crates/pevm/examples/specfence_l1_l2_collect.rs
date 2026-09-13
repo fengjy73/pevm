@@ -26,15 +26,13 @@ use flate2::bufread::GzDecoder;
 use hashbrown::HashMap;
 use pevm::{
     BlockHashes, BuildSuffixHasher, Bytecodes, ConcurrencyMode, EvmAccount, FineGrainSnapshot,
-    InMemoryStorage, L1DagSummary, MeasurementMethod, Pevm, analyze_dag, filter_effect_edges,
-    l1_dag_summary,
+    InMemoryStorage, L1DagSummary, MeasurementMethod, Pevm, analyze_dag,
     chain::{PevmChain, PevmEthereum},
+    filter_effect_edges, l1_dag_summary,
 };
 use serde::Serialize;
 
-const PRIORITY: &[u64] = &[
-    14_689_597, 19_606_599, 19_469_097, 19_606_598, 19_469_096,
-];
+const PRIORITY: &[u64] = &[14_689_597, 19_606_599, 19_469_097, 19_606_598, 19_469_096];
 
 #[derive(Serialize)]
 struct ModeRun {
@@ -266,7 +264,12 @@ fn export_l2(timing: ModeRun, snap: &FineGrainSnapshot) -> L2Export {
         },
         edges_sample,
         abort_events_sample: snap.abort_events.iter().take(100).cloned().collect(),
-        consumer_first_cross_sample: snap.consumer_first_cross.iter().take(100).cloned().collect(),
+        consumer_first_cross_sample: snap
+            .consumer_first_cross
+            .iter()
+            .take(100)
+            .cloned()
+            .collect(),
     }
 }
 
@@ -303,13 +306,11 @@ fn main() {
 
     let mut summary = Vec::new();
     for &bn in PRIORITY {
-        let Some(loaded) = load_block(&data_dir, bn, bytecodes.clone(), block_hashes.clone()) else {
+        let Some(loaded) = load_block(&data_dir, bn, bytecodes.clone(), block_hashes.clone())
+        else {
             continue;
         };
-        eprintln!(
-            "=== L1/L2 block {bn} n_tx={} ===",
-            n_tx(&loaded.block)
-        );
+        eprintln!("=== L1/L2 block {bn} n_tx={} ===", n_tx(&loaded.block));
 
         // L1 oracle: OCC@1 journal (ordered serial discovery ≈ sequential G*)
         let (t1, s1) = run_journal(&chain, &loaded, 1);
@@ -322,19 +323,21 @@ fn main() {
             s1.as_ref().map(|s| l1_dag_summary(s).morphology)
         );
 
-        let l1 = s1.as_ref().map(|s| export_l1(
-            ModeRun {
-                mode: t1.mode.clone(),
-                cores: t1.cores,
-                elapsed_ms: t1.elapsed_ms,
-                ok: t1.ok,
-                error: t1.error.clone(),
-                occ_aborts: t1.occ_aborts,
-                n_effect_edges: t1.n_effect_edges,
-                n_effect_log: t1.n_effect_log,
-            },
-            s,
-        ));
+        let l1 = s1.as_ref().map(|s| {
+            export_l1(
+                ModeRun {
+                    mode: t1.mode.clone(),
+                    cores: t1.cores,
+                    elapsed_ms: t1.elapsed_ms,
+                    ok: t1.ok,
+                    error: t1.error.clone(),
+                    occ_aborts: t1.occ_aborts,
+                    n_effect_edges: t1.n_effect_edges,
+                    n_effect_log: t1.n_effect_log,
+                },
+                s,
+            )
+        });
         let l2_1 = s1.as_ref().map(|s| export_l2(t1, s));
 
         let (t8, s8) = run_journal(&chain, &loaded, 8);

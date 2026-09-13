@@ -163,7 +163,6 @@ pub trait PevmChain: Debug {
         tx_results: &[PevmTxExecutionResult],
     ) -> Result<B256, CalculateReceiptRootError>;
 
-
     /// Execute one tx with pevm's no-beneficiary handler.
     ///
     /// When `use_inspect` is true (SpecFence), chains that wire SpecFenceInspector

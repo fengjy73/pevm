@@ -31,17 +31,17 @@
 use std::cell::{Cell, RefCell};
 
 use alloy_primitives::{Address, B256, U256};
+use revm::Inspector;
 use revm::context::{ContextTr, JournalTr};
 use revm::inspector::JournalExt;
 use revm::interpreter::{
+    CallInputs, CallOutcome, CreateInputs, CreateOutcome, Interpreter,
     interpreter::EthInterpreter,
     interpreter_types::{InputsTr, Jumps, LegacyBytecode, StackTr},
-    CallInputs, CallOutcome, CreateInputs, CreateOutcome, Interpreter,
 };
 use revm::state::EvmState;
-use revm::Inspector;
 
-use crate::{hash_deterministic, MemoryLocation, TxIdx};
+use crate::{MemoryLocation, TxIdx, hash_deterministic};
 
 use super::finegrain::{FineGrainCollector, LocationKind};
 use super::metrics::MetricsInner;
@@ -250,12 +250,14 @@ pub(crate) fn jump_is_safe(cont: &ResumeContinuation) -> bool {
     if snap.bytecode_len > 0 && snap.pc >= snap.bytecode_len {
         return false;
     }
-    let has_storage = cont.values.values().any(|v| {
-        matches!(v, crate::specfence::rem::FfValue::Storage { .. })
-    });
-    let has_basic = cont.values.values().any(|v| {
-        matches!(v, crate::specfence::rem::FfValue::Basic { .. })
-    });
+    let has_storage = cont
+        .values
+        .values()
+        .any(|v| matches!(v, crate::specfence::rem::FfValue::Storage { .. }));
+    let has_basic = cont
+        .values
+        .values()
+        .any(|v| matches!(v, crate::specfence::rem::FfValue::Basic { .. }));
     // Iter27: Bind tip with ≥1 tip_sload overlapping FF Storage counts as
     // storage-FF for large-bytecode gate (same Validated-fresh identity).
     let tip_sload_ff = snap.tip_sloads.iter().any(|(addr, slot, snap_val)| {
@@ -279,7 +281,8 @@ pub(crate) fn jump_is_safe(cont: &ResumeContinuation) -> bool {
         if snap.bytecode_len > MAX_STORAGE {
             return false;
         }
-        if !has_storage && !tip_sload_ff && !snap.at_call_boundary && cont.write_replays.is_empty() {
+        if !has_storage && !tip_sload_ff && !snap.at_call_boundary && cont.write_replays.is_empty()
+        {
             return false;
         }
     }
@@ -330,9 +333,11 @@ pub(crate) fn jump_is_safe(cont: &ResumeContinuation) -> bool {
         }
         // Refuse early tip if cont still has plant replays from later SSTOREs
         // (lower gas_remaining_after). Apply those only at a later tip.
-        if cont.write_replays.iter().any(|w| {
-            w.gas_remaining_after > 0 && w.gas_remaining_after < snap.gas_remaining
-        }) {
+        if cont
+            .write_replays
+            .iter()
+            .any(|w| w.gas_remaining_after > 0 && w.gas_remaining_after < snap.gas_remaining)
+        {
             return false;
         }
         // Iter11: multi-SSTORE last tip — require memory-lite + tip == last plant
@@ -362,9 +367,11 @@ pub(crate) fn jump_is_safe(cont: &ResumeContinuation) -> bool {
         // Tip embeds must agree with continuation write_replays for same slots
         // (finalize must not have clobbered present/original under pevm MV).
         for wr in &snap.write_replays_at_tip {
-            let Some(cont_wr) = cont.write_replays.iter().find(|c| {
-                c.address == wr.address && c.slot == wr.slot
-            }) else {
+            let Some(cont_wr) = cont
+                .write_replays
+                .iter()
+                .find(|c| c.address == wr.address && c.slot == wr.slot)
+            else {
                 return false;
             };
             if cont_wr.present != wr.present || cont_wr.original != wr.original {
@@ -447,12 +454,14 @@ pub(crate) fn jump_refuse_reason(cont: &ResumeContinuation) -> &'static str {
     if snap.bytecode_len > 0 && snap.pc >= snap.bytecode_len {
         return "pc_oob";
     }
-    let has_storage = cont.values.values().any(|v| {
-        matches!(v, crate::specfence::rem::FfValue::Storage { .. })
-    });
-    let has_basic = cont.values.values().any(|v| {
-        matches!(v, crate::specfence::rem::FfValue::Basic { .. })
-    });
+    let has_storage = cont
+        .values
+        .values()
+        .any(|v| matches!(v, crate::specfence::rem::FfValue::Storage { .. }));
+    let has_basic = cont
+        .values
+        .values()
+        .any(|v| matches!(v, crate::specfence::rem::FfValue::Basic { .. }));
     let tip_sload_ff = snap.tip_sloads.iter().any(|(addr, slot, snap_val)| {
         cont.values.values().any(|v| match v {
             crate::specfence::rem::FfValue::Storage {
@@ -471,7 +480,8 @@ pub(crate) fn jump_refuse_reason(cont: &ResumeContinuation) -> &'static str {
         if snap.bytecode_len > MAX_STORAGE {
             return "bytecode_huge";
         }
-        if !has_storage && !tip_sload_ff && !snap.at_call_boundary && cont.write_replays.is_empty() {
+        if !has_storage && !tip_sload_ff && !snap.at_call_boundary && cont.write_replays.is_empty()
+        {
             return "bytecode_no_storage_ff";
         }
     }
@@ -564,7 +574,6 @@ fn write_prefix_jump_is_safe(cont: &ResumeContinuation, snap: &BoundarySnapshot)
     }
     true
 }
-
 
 /// Adaptive CC R0: absolute jump **off by default**. Enable with
 /// `SPECFENCE_ABSOLUTE_JUMP=1` or research `SPECFENCE_ENABLE_INSPECT=1`.
@@ -796,7 +805,6 @@ pub(crate) fn in_inspect_run() -> bool {
     IN_INSPECT.get()
 }
 
-
 /// Arm PC resume for the next matching-depth interpreter init (RewindTo path).
 pub(crate) fn arm_pc_resume(snap: BoundarySnapshot) {
     arm_pc_resume_with_blob(snap, None);
@@ -811,9 +819,7 @@ pub(crate) fn arm_pc_resume_with_blob(snap: BoundarySnapshot, blob: Option<Journ
 
 /// Iter21: stash FF read origins to install into Db read_set only after PC restore
 /// succeeds — seeding before a failed apply poisoned seq≠par (ERC-20 depth mismatch).
-pub(crate) fn arm_ff_origin_seeds(
-    seeds: Vec<(crate::MemoryLocationHash, crate::ReadOrigin)>,
-) {
+pub(crate) fn arm_ff_origin_seeds(seeds: Vec<(crate::MemoryLocationHash, crate::ReadOrigin)>) {
     PENDING_FF_ORIGIN_SEEDS.with(|c| *c.borrow_mut() = seeds);
 }
 
@@ -861,10 +867,12 @@ fn record_call_outcome_hit() {
 
 fn current_effect_k() -> usize {
     PLANT.with(|p| {
-        p.get().map(|plant| {
-            let table = unsafe { &*plant.partial_retry };
-            table.current_k(plant.tx_idx)
-        }).unwrap_or(0)
+        p.get()
+            .map(|plant| {
+                let table = unsafe { &*plant.partial_retry };
+                table.current_k(plant.tx_idx)
+            })
+            .unwrap_or(0)
     })
 }
 
@@ -913,7 +921,10 @@ pub(crate) fn try_arm_safe_absolute_jump_gated(
         metrics.record_absolute_jump_fallback();
         return false;
     }
-    let snap = cont.jump_snap.clone().expect("jump_is_safe implies jump_snap");
+    let snap = cont
+        .jump_snap
+        .clone()
+        .expect("jump_is_safe implies jump_snap");
     // Iter23: when Bind tip_sloads is present, require FF match on overlapping
     // slots — stale SLOAD values already consumed into require/SUB (ERC-20
     // revert dgas=+661); patching tops is insufficient → refuse.
@@ -1035,10 +1046,7 @@ pub(crate) fn arm_pending_effect_cp_only() {
     PENDING_EFFECT_CP.set(true);
 }
 
-pub(crate) fn note_pending_effect_boundary(
-    tx_idx: TxIdx,
-    partial_retry: &PartialRetryTable,
-) {
+pub(crate) fn note_pending_effect_boundary(tx_idx: TxIdx, partial_retry: &PartialRetryTable) {
     let k = partial_retry.current_k(tx_idx);
     let live_steps = LAST_SNAP.with(|c| c.borrow().as_ref().map(|s| s.opcode_steps));
     let snap = BoundarySnapshot {
@@ -1055,10 +1063,10 @@ pub(crate) fn note_pending_effect_boundary(
         bytecode_len: 0,
         at_call_boundary: false,
         post_sstore: false,
-            sstore_index: 0,
-            write_replays_at_tip: Vec::new(),
-            tip_sloads: Vec::new(),
-        };
+        sstore_index: 0,
+        write_replays_at_tip: Vec::new(),
+        tip_sloads: Vec::new(),
+    };
     let _ = partial_retry.push_checkpoint_with_boundary(
         tx_idx,
         CheckpointKind::EffectBoundary,
@@ -1186,14 +1194,13 @@ fn apply_ff_read_presents<CTX>(
     context: &mut CTX,
     values: &[crate::specfence::rem::FfValue],
     prefer_tx_id: Option<usize>,
-)
-where
+) where
     CTX: ContextTr,
     CTX::Journal: JournalExt,
 {
+    use crate::specfence::rem::FfValue;
     use revm::primitives::KECCAK_EMPTY;
     use revm::state::{Account, AccountInfo, EvmStorageSlot};
-    use crate::specfence::rem::FfValue;
     let state = context.journal_mut().evm_state_mut();
     // Prefer callee/frame tx_id — HashMap::values().next() can pick a stale id.
     let tx_id = prefer_tx_id
@@ -1201,7 +1208,12 @@ where
         .unwrap_or(0);
     for ff in values {
         match ff {
-            FfValue::Storage { address, slot, value, .. } => {
+            FfValue::Storage {
+                address,
+                slot,
+                value,
+                ..
+            } => {
                 if !state.contains_key(address) {
                     let mut acc = Account::new_not_existing(tx_id);
                     acc.info = AccountInfo {
@@ -1220,12 +1232,18 @@ where
                 let _ = acc.mark_warm_with_transaction_id(tx_id);
                 // Unchanged warm slot: original == present == FF value (read-only prefix).
                 if !acc.storage.contains_key(slot) {
-                    acc.storage.insert(*slot, EvmStorageSlot::new(*value, tx_id));
+                    acc.storage
+                        .insert(*slot, EvmStorageSlot::new(*value, tx_id));
                 } else if let Some(s) = acc.storage.get_mut(slot) {
                     let _ = s.mark_warm_with_transaction_id(tx_id);
                 }
             }
-            FfValue::Basic { address, basic, code_hash, .. } => {
+            FfValue::Basic {
+                address,
+                basic,
+                code_hash,
+                ..
+            } => {
                 if state.contains_key(address) {
                     if let Some(acc) = state.get_mut(address) {
                         let _ = acc.mark_warm_with_transaction_id(tx_id);
@@ -1328,13 +1346,17 @@ where
     }
 }
 
-
 fn u256_to_address(v: U256) -> Address {
     Address::from_word(B256::from(v))
 }
 
 /// Opt-in journal RAW stream (FineGrain journal mode). Zero cost when finegrain TLS unset.
-fn maybe_note_journal_effect(interp: &Interpreter<EthInterpreter>, op: u8, opcode_steps: u64, call_depth: u16) {
+fn maybe_note_journal_effect(
+    interp: &Interpreter<EthInterpreter>,
+    op: u8,
+    opcode_steps: u64,
+    call_depth: u16,
+) {
     const OP_BALANCE: u8 = 0x31;
     const OP_CALL: u8 = 0xf1;
     const OP_CALLCODE: u8 = 0xf2;
@@ -1352,7 +1374,9 @@ fn maybe_note_journal_effect(interp: &Interpreter<EthInterpreter>, op: u8, opcod
 
     PLANT.with(|p| {
         let Some(plant) = p.get() else { return };
-        let Some(fg_ptr) = plant.finegrain else { return };
+        let Some(fg_ptr) = plant.finegrain else {
+            return;
+        };
         let fg = unsafe { &*fg_ptr };
         if !fg.journal_enabled() {
             return;
@@ -1366,7 +1390,9 @@ fn maybe_note_journal_effect(interp: &Interpreter<EthInterpreter>, op: u8, opcod
 
         match op {
             OP_SLOAD => {
-                let Ok(key) = interp.stack.peek(0) else { return };
+                let Ok(key) = interp.stack.peek(0) else {
+                    return;
+                };
                 let loc = hash_deterministic(MemoryLocation::Storage(target, key));
                 fg.deep_note_journal_read(
                     plant.tx_idx,
@@ -1382,7 +1408,9 @@ fn maybe_note_journal_effect(interp: &Interpreter<EthInterpreter>, op: u8, opcod
             }
             OP_SSTORE => {
                 // stack: [value, key] — key is peek(1)
-                let Ok(key) = interp.stack.peek(1) else { return };
+                let Ok(key) = interp.stack.peek(1) else {
+                    return;
+                };
                 let loc = hash_deterministic(MemoryLocation::Storage(target, key));
                 fg.deep_note_journal_write(
                     plant.tx_idx,
@@ -1397,7 +1425,9 @@ fn maybe_note_journal_effect(interp: &Interpreter<EthInterpreter>, op: u8, opcod
                 );
             }
             OP_BALANCE => {
-                let Ok(addr_u) = interp.stack.peek(0) else { return };
+                let Ok(addr_u) = interp.stack.peek(0) else {
+                    return;
+                };
                 let addr = u256_to_address(addr_u);
                 let loc = hash_deterministic(MemoryLocation::Basic(addr));
                 let mut acct = [0u8; 20];
@@ -1429,7 +1459,9 @@ fn maybe_note_journal_effect(interp: &Interpreter<EthInterpreter>, op: u8, opcod
                 );
             }
             OP_EXTCODESIZE | OP_EXTCODEHASH | OP_EXTCODECOPY => {
-                let Ok(addr_u) = interp.stack.peek(0) else { return };
+                let Ok(addr_u) = interp.stack.peek(0) else {
+                    return;
+                };
                 let addr = u256_to_address(addr_u);
                 let loc = hash_deterministic(MemoryLocation::CodeHash(addr));
                 let mut acct = [0u8; 20];
@@ -1449,11 +1481,15 @@ fn maybe_note_journal_effect(interp: &Interpreter<EthInterpreter>, op: u8, opcod
             // Live account-write instances (producer_effect_k), not finalize-only.
             OP_CALL | OP_CALLCODE => {
                 // stack: [gas, addr, value, argsOffset, argsLength, retOffset, retLength]
-                let Ok(value) = interp.stack.peek(2) else { return };
+                let Ok(value) = interp.stack.peek(2) else {
+                    return;
+                };
                 if value.is_zero() {
                     return;
                 }
-                let Ok(addr_u) = interp.stack.peek(1) else { return };
+                let Ok(addr_u) = interp.stack.peek(1) else {
+                    return;
+                };
                 let to = u256_to_address(addr_u);
                 let caller = interp.input.caller_address();
                 fg.deep_note_journal_account_write(
@@ -1491,7 +1527,9 @@ fn maybe_note_journal_effect(interp: &Interpreter<EthInterpreter>, op: u8, opcod
                 );
             }
             OP_SELFDESTRUCT => {
-                let Ok(addr_u) = interp.stack.peek(0) else { return };
+                let Ok(addr_u) = interp.stack.peek(0) else {
+                    return;
+                };
                 let beneficiary = u256_to_address(addr_u);
                 fg.deep_note_journal_account_write(
                     plant.tx_idx,
@@ -1600,9 +1638,7 @@ fn tip_sloads_match_pending_ff(snap: &BoundarySnapshot) -> bool {
 /// Iter30 Lean-safe nested abs apply gate (named Iter29→30 cause).
 #[inline]
 fn nested_apply_lean_safe(snap: &BoundarySnapshot, target: Address, call_depth: u16) -> bool {
-    call_depth <= 2
-        && tip_sloads_addr_eq_target(snap, target)
-        && tip_sloads_match_pending_ff(snap)
+    call_depth <= 2 && tip_sloads_addr_eq_target(snap, target) && tip_sloads_match_pending_ff(snap)
 }
 
 /// Credit nested Bind tip steps then clear (hang-free Lean-safe refuse path).
@@ -1618,7 +1654,10 @@ fn credit_nested_bind_tip(snap: &BoundarySnapshot) {
     if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
         eprintln!(
             "JUMP_DIG nested_credit snap_pc={} blen={} tip_sloads={} steps={}",
-            snap.pc, snap.bytecode_len, snap.tip_sloads.len(), snap.opcode_steps
+            snap.pc,
+            snap.bytecode_len,
+            snap.tip_sloads.len(),
+            snap.opcode_steps
         );
     }
     clear_pc_resume();
@@ -1735,7 +1774,10 @@ pub(crate) fn try_apply_pending_pc_resume<CTX>(
             }
         } else {
             if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
-                eprintln!("JUMP_DIG apply_refuse depth snap={} frame={}", snap.call_depth, call_depth);
+                eprintln!(
+                    "JUMP_DIG apply_refuse depth snap={} frame={}",
+                    snap.call_depth, call_depth
+                );
             }
             clear_pc_resume();
             return;
@@ -1756,7 +1798,9 @@ pub(crate) fn try_apply_pending_pc_resume<CTX>(
                     if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
                         eprintln!(
                             "JUMP_DIG nested_stash snap_pc={} blen={} tip_sloads={}",
-                            snap.pc, snap.bytecode_len, snap.tip_sloads.len()
+                            snap.pc,
+                            snap.bytecode_len,
+                            snap.tip_sloads.len()
                         );
                     }
                     NESTED_BIND_STASH.with(|c| *c.borrow_mut() = Some(snap));
@@ -1773,7 +1817,9 @@ pub(crate) fn try_apply_pending_pc_resume<CTX>(
             if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
                 eprintln!(
                     "JUMP_DIG apply_refuse code_hash snap_pc={} blen={} tip_sloads={}",
-                    snap.pc, snap.bytecode_len, snap.tip_sloads.len()
+                    snap.pc,
+                    snap.bytecode_len,
+                    snap.tip_sloads.len()
                 );
             }
             clear_pc_resume();
@@ -1791,8 +1837,7 @@ pub(crate) fn try_apply_pending_pc_resume<CTX>(
     // would apply a tip onto the wrong frame (nested CALL) — refuse.
     // Iter29: nested Bind consume explicitly allows jdepth>1 for one-shot match.
     let jdepth = context.journal().depth();
-    if snap.sstore_index == 0 && !snap.post_sstore && jdepth > 1 && !NESTED_ALLOW_JDEPTH.get()
-    {
+    if snap.sstore_index == 0 && !snap.post_sstore && jdepth > 1 && !NESTED_ALLOW_JDEPTH.get() {
         if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
             eprintln!("JUMP_DIG apply_refuse jdepth={jdepth}");
         }
@@ -1823,19 +1868,13 @@ pub(crate) fn try_apply_pending_pc_resume<CTX>(
             record_journal_blob_ff(n);
         }
     }
-    let seed_basics =
-        PENDING_CALL_TOUCH_BASICS.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    let seed_basics = PENDING_CALL_TOUCH_BASICS.with(|c| std::mem::take(&mut *c.borrow_mut()));
     for (addr, basic, code_hash) in &seed_basics {
         seed_journal_basic_if_missing(context, *addr, basic, *code_hash);
     }
     let call_touches = PENDING_CALL_TOUCHES.with(|c| std::mem::take(&mut *c.borrow_mut()));
     for cached in &call_touches {
-        if try_transfer_in_journal(
-            context,
-            cached.caller,
-            cached.target,
-            cached.value,
-        ) {
+        if try_transfer_in_journal(context, cached.caller, cached.target, cached.value) {
             record_call_outcome_hit();
         } else {
             clear_pc_resume();
@@ -1861,9 +1900,10 @@ pub(crate) fn try_apply_pending_pc_resume<CTX>(
             let target = interp.input.target_address();
             // Iter23: prefer target tx_id; else *min* among loaded (stable), not max —
             // HashMap iteration order made max() flaky under concurrency.
-            state.get(&target).map(|a| a.transaction_id).or_else(|| {
-                state.values().map(|a| a.transaction_id).min()
-            })
+            state
+                .get(&target)
+                .map(|a| a.transaction_id)
+                .or_else(|| state.values().map(|a| a.transaction_id).min())
         };
         apply_ff_read_presents(context, &ff_reads, prefer_tx);
     }
@@ -1898,7 +1938,11 @@ pub(crate) fn try_apply_pending_pc_resume<CTX>(
     PENDING_RESUME.with(|c| *c.borrow_mut() = None);
     OPCODE_STEPS.set(0);
     if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
-        eprintln!("JUMP_DIG apply_ok steps={skipped} pc={} tip_sloads={}", snap.pc, snap.tip_sloads.len());
+        eprintln!(
+            "JUMP_DIG apply_ok steps={skipped} pc={} tip_sloads={}",
+            snap.pc,
+            snap.tip_sloads.len()
+        );
     }
     record_pc_resume(skipped);
 }
@@ -1982,9 +2026,7 @@ pub(crate) fn bind_snap_jump_enabled() -> bool {
             {
                 false
             } else {
-                s == "1"
-                    || s.eq_ignore_ascii_case("true")
-                    || s.eq_ignore_ascii_case("yes")
+                s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
             }
         }
         None => bind_snap_capture_wanted(),
@@ -2104,12 +2146,14 @@ fn sload_bind_snap_eth_slow<H: revm::interpreter::Host + ?Sized>(
         Vec::new()
     };
     // Prefer rem current_k as honest-ish step credit when available.
-    let rem_k = BIND_SNAP.with(|b| {
-        b.get().map(|ctx| {
-            let table = unsafe { &*ctx.partial_retry };
-            table.current_k(ctx.tx_idx) as u64
+    let rem_k = BIND_SNAP
+        .with(|b| {
+            b.get().map(|ctx| {
+                let table = unsafe { &*ctx.partial_retry };
+                table.current_k(ctx.tx_idx) as u64
+            })
         })
-    }).unwrap_or(0);
+        .unwrap_or(0);
     // Iter22: prefer PC as skip-credit proxy — rem_k is effect ordinal (often 2–5)
     // while ERC-20 tip PC is hundreds of opcodes deep; under-crediting is fine for
     // metrics, but rem_k-as-steps confused tip quality gates.
@@ -2134,12 +2178,14 @@ fn sload_bind_snap_eth_slow<H: revm::interpreter::Host + ?Sized>(
     LAST_SNAP.with(|c| *c.borrow_mut() = Some(snap.clone()));
     // Iter26/three-pillar: one attach / resume — keep *best* tip for arm gates
     // (prefer steps≤cap ∧ tip≡FF over deepest steps_over). No per-SLOAD attach tax.
-    let k_now = BIND_SNAP.with(|b| {
-        b.get().map(|ctx| {
-            let table = unsafe { &*ctx.partial_retry };
-            table.current_k(ctx.tx_idx)
+    let k_now = BIND_SNAP
+        .with(|b| {
+            b.get().map(|ctx| {
+                let table = unsafe { &*ctx.partial_retry };
+                table.current_k(ctx.tx_idx)
+            })
         })
-    }).unwrap_or(0);
+        .unwrap_or(0);
     BIND_SNAP_DEFERRED.with(|c| {
         let mut slot = c.borrow_mut();
         let replace = match slot.as_ref() {
@@ -2339,11 +2385,7 @@ where
     CTX: ContextTr,
     CTX::Journal: JournalExt,
 {
-    fn initialize_interp(
-        &mut self,
-        interp: &mut Interpreter<EthInterpreter>,
-        context: &mut CTX,
-    ) {
+    fn initialize_interp(&mut self, interp: &mut Interpreter<EthInterpreter>, context: &mut CTX) {
         try_apply_pending_pc_resume(interp, context, CALL_DEPTH.get());
         // Iter29: Inspector nested frames — consume stash on hash match (no PENDING defer).
         if nested_bind_stash_armed() {
@@ -2359,7 +2401,12 @@ where
         // widened the WW conflict window and hung multi-SSTORE at full width.
         // step_end captures live snaps at EffectBoundary / CALL / SSTORE / LOG.
         let pc = interp.bytecode.pc();
-        let op = interp.bytecode.bytecode_slice().get(pc).copied().unwrap_or(0);
+        let op = interp
+            .bytecode
+            .bytecode_slice()
+            .get(pc)
+            .copied()
+            .unwrap_or(0);
         LAST_OPCODE.set(op);
         // Research journal stream: log every storage/basic world-state opcode
         // (including journal-cached repeats that never re-enter pevm Db).
@@ -2445,11 +2492,7 @@ where
         }
     }
 
-    fn call(
-        &mut self,
-        context: &mut CTX,
-        inputs: &mut CallInputs,
-    ) -> Option<CallOutcome> {
+    fn call(&mut self, context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
         let parent_depth = CALL_DEPTH.get();
         let depth = parent_depth.saturating_add(1);
         CALL_DEPTH.set(depth);
@@ -2506,12 +2549,8 @@ where
                         // Stipend changed across RewindTo — do not reuse cached Gas.
                         return None;
                     }
-                    if try_transfer_in_journal(
-                        context,
-                        inputs.caller,
-                        inputs.target_address,
-                        value,
-                    ) {
+                    if try_transfer_in_journal(context, inputs.caller, inputs.target_address, value)
+                    {
                         RESUME_CALL_IDX.set(RESUME_CALL_IDX.get().saturating_add(1));
                         record_call_outcome_hit();
                         return Some(cached.outcome.clone());
@@ -2522,12 +2561,7 @@ where
         None
     }
 
-    fn call_end(
-        &mut self,
-        _context: &mut CTX,
-        _inputs: &CallInputs,
-        outcome: &mut CallOutcome,
-    ) {
+    fn call_end(&mut self, _context: &mut CTX, _inputs: &CallInputs, outcome: &mut CallOutcome) {
         let meta = PENDING_CALL_STACK.with(|s| s.borrow_mut().pop());
         if let Some(meta) = meta {
             // Cache successful nested calls (depth > 1) for RewindTo short-circuit.
@@ -2562,11 +2596,7 @@ where
         CALL_DEPTH.set(CALL_DEPTH.get().saturating_sub(1));
     }
 
-    fn create(
-        &mut self,
-        _context: &mut CTX,
-        _inputs: &mut CreateInputs,
-    ) -> Option<CreateOutcome> {
+    fn create(&mut self, _context: &mut CTX, _inputs: &mut CreateInputs) -> Option<CreateOutcome> {
         CALL_DEPTH.set(CALL_DEPTH.get().saturating_add(1));
         None
     }
@@ -2581,7 +2611,6 @@ where
     }
 }
 
-
 #[cfg(test)]
 mod m1c_tests {
     use super::*;
@@ -2589,13 +2618,18 @@ mod m1c_tests {
     use revm::interpreter::{Gas, Interpreter};
     use revm::state::Bytecode;
 
-    use crate::specfence::rem::{AccessMode, CheckpointId, FfValue, RegionAccess, ResumeContinuation};
-    use hashbrown::HashMap;
-    use alloy_primitives::Address;
-    use revm::state::AccountInfo;
     use crate::BuildIdentityHasher;
+    use crate::specfence::rem::{
+        AccessMode, CheckpointId, FfValue, RegionAccess, ResumeContinuation,
+    };
+    use alloy_primitives::Address;
+    use hashbrown::HashMap;
+    use revm::state::AccountInfo;
 
-    fn basic_read_effect() -> (Vec<RegionAccess>, hashbrown::HashMap<u64, FfValue, BuildIdentityHasher>) {
+    fn basic_read_effect() -> (
+        Vec<RegionAccess>,
+        hashbrown::HashMap<u64, FfValue, BuildIdentityHasher>,
+    ) {
         let mut values = HashMap::with_hasher(BuildIdentityHasher::default());
         values.insert(
             1u64,
@@ -2754,9 +2788,9 @@ mod m1c_tests {
             jump_snap: Some(BoundarySnapshot {
                 pc: 4,
                 gas_remaining: 1_000,
-            gas_refunded: 0,
-            memory_words: 0,
-            memory_expansion_cost: 0,
+                gas_refunded: 0,
+                memory_words: 0,
+                memory_expansion_cost: 0,
                 call_depth: 2,
                 opcode_steps: 10,
                 stack: vec![U256::from(1)],
@@ -2765,15 +2799,18 @@ mod m1c_tests {
                 bytecode_len: 32,
                 at_call_boundary: false,
 
-            post_sstore: false,
-            sstore_index: 0,
-            write_replays_at_tip: Vec::new(),
-            tip_sloads: Vec::new(),
-        }),
+                post_sstore: false,
+                sstore_index: 0,
+                write_replays_at_tip: Vec::new(),
+                tip_sloads: Vec::new(),
+            }),
             journal_blob: None,
             ..lite.clone()
         };
-        assert!(!jump_is_safe(&nested), "nested without effects/FF must fall back");
+        assert!(
+            !jump_is_safe(&nested),
+            "nested without effects/FF must fall back"
+        );
     }
 
     #[test]
@@ -2797,9 +2834,9 @@ mod m1c_tests {
             jump_snap: Some(BoundarySnapshot {
                 pc: 4,
                 gas_remaining: 50_000,
-            gas_refunded: 0,
-            memory_words: 0,
-            memory_expansion_cost: 0,
+                gas_refunded: 0,
+                memory_words: 0,
+                memory_expansion_cost: 0,
                 call_depth: 1,
                 opcode_steps: 12,
                 stack: vec![U256::from(9)],
@@ -2808,11 +2845,11 @@ mod m1c_tests {
                 bytecode_len: 64,
                 at_call_boundary: false,
 
-            post_sstore: false,
-            sstore_index: 0,
-            write_replays_at_tip: Vec::new(),
-            tip_sloads: Vec::new(),
-        }),
+                post_sstore: false,
+                sstore_index: 0,
+                write_replays_at_tip: Vec::new(),
+                tip_sloads: Vec::new(),
+            }),
             journal_blob: Some(JournalBlob {
                 state,
                 logs: vec![],
@@ -2829,7 +2866,7 @@ mod m1c_tests {
         );
     }
 
-        #[test]
+    #[test]
     fn jump_is_safe_rejects_write_prefix() {
         use crate::specfence::rem::{AccessMode, RegionAccess};
         let cont = ResumeContinuation {
@@ -2864,11 +2901,11 @@ mod m1c_tests {
                 bytecode_len: 64,
                 at_call_boundary: false,
 
-            post_sstore: false,
-            sstore_index: 0,
-            write_replays_at_tip: Vec::new(),
-            tip_sloads: Vec::new(),
-        }),
+                post_sstore: false,
+                sstore_index: 0,
+                write_replays_at_tip: Vec::new(),
+                tip_sloads: Vec::new(),
+            }),
             journal_blob: Some(JournalBlob {
                 state: EvmState::default(),
                 logs: vec![],
@@ -2923,9 +2960,9 @@ mod m1c_tests {
                 at_call_boundary: false,
                 post_sstore: true,
                 sstore_index: 0,
-            write_replays_at_tip: Vec::new(),
-            tip_sloads: Vec::new(),
-        }),
+                write_replays_at_tip: Vec::new(),
+                tip_sloads: Vec::new(),
+            }),
             journal_blob: None,
             call_outcomes: vec![],
             prefix_writes: vec![42],
@@ -2975,11 +3012,11 @@ mod m1c_tests {
                 bytecode_len: 64,
                 at_call_boundary: false,
 
-            post_sstore: false,
-            sstore_index: 0,
-            write_replays_at_tip: Vec::new(),
-            tip_sloads: Vec::new(),
-        }),
+                post_sstore: false,
+                sstore_index: 0,
+                write_replays_at_tip: Vec::new(),
+                tip_sloads: Vec::new(),
+            }),
             journal_blob: None,
             call_outcomes: vec![],
             prefix_writes: vec![],
@@ -2993,7 +3030,10 @@ mod m1c_tests {
         );
     }
 
-    fn storage_read_effect() -> (Vec<RegionAccess>, hashbrown::HashMap<u64, FfValue, BuildIdentityHasher>) {
+    fn storage_read_effect() -> (
+        Vec<RegionAccess>,
+        hashbrown::HashMap<u64, FfValue, BuildIdentityHasher>,
+    ) {
         let mut values = HashMap::with_hasher(BuildIdentityHasher::default());
         values.insert(
             7u64,
@@ -3045,11 +3085,11 @@ mod m1c_tests {
                 bytecode_len: 64,
                 at_call_boundary: false,
 
-            post_sstore: false,
-            sstore_index: 0,
-            write_replays_at_tip: Vec::new(),
-            tip_sloads: Vec::new(),
-        }),
+                post_sstore: false,
+                sstore_index: 0,
+                write_replays_at_tip: Vec::new(),
+                tip_sloads: Vec::new(),
+            }),
             journal_blob: None,
             call_outcomes: vec![],
             prefix_writes: vec![],
@@ -3093,11 +3133,11 @@ mod m1c_tests {
                 bytecode_len: 64,
                 at_call_boundary: true,
 
-            post_sstore: false,
-            sstore_index: 0,
-            write_replays_at_tip: Vec::new(),
-            tip_sloads: Vec::new(),
-        }),
+                post_sstore: false,
+                sstore_index: 0,
+                write_replays_at_tip: Vec::new(),
+                tip_sloads: Vec::new(),
+            }),
             journal_blob: None,
             call_outcomes: vec![],
             prefix_writes: vec![],
@@ -3111,16 +3151,16 @@ mod m1c_tests {
         );
     }
 
-        #[test]
+    #[test]
     fn m1f_arm_applies_absolute_jump_metric() {
         // R0: jump off by default — opt in via dedicated flag (avoid racing inspect env).
         unsafe {
             std::env::set_var("SPECFENCE_ABSOLUTE_JUMP", "1");
         }
+        use crate::BuildIdentityHasher;
         use crate::specfence::metrics::MetricsInner;
         use crate::specfence::rem::{CheckpointId, PartialRetryTable};
         use hashbrown::HashMap;
-        use crate::BuildIdentityHasher;
 
         clear_pc_resume();
         let metrics = MetricsInner::default();
@@ -3193,9 +3233,6 @@ mod m1c_tests {
         clear_pc_resume();
     }
 
-
-
-
     #[test]
     fn jump_is_safe_accepts_multi_sstore_write_prefix() {
         use crate::specfence::rem::{AccessMode, RegionAccess, StorageWriteReplay};
@@ -3240,9 +3277,9 @@ mod m1c_tests {
                 at_call_boundary: false,
                 post_sstore: true,
                 sstore_index: 0,
-            write_replays_at_tip: Vec::new(),
-            tip_sloads: Vec::new(),
-        }),
+                write_replays_at_tip: Vec::new(),
+                tip_sloads: Vec::new(),
+            }),
             journal_blob: Some(JournalBlob {
                 state: EvmState::default(),
                 logs: vec![alloy_primitives::Log {
@@ -3329,9 +3366,9 @@ mod m1c_tests {
                 at_call_boundary: true,
                 post_sstore: true,
                 sstore_index: 0,
-            write_replays_at_tip: Vec::new(),
-            tip_sloads: Vec::new(),
-        }),
+                write_replays_at_tip: Vec::new(),
+                tip_sloads: Vec::new(),
+            }),
             journal_blob: None,
             call_outcomes: vec![CachedCallOutcome {
                 call_seq: 2,
@@ -3393,9 +3430,9 @@ mod m1c_tests {
                 at_call_boundary: true,
                 post_sstore: true,
                 sstore_index: 0,
-            write_replays_at_tip: Vec::new(),
-            tip_sloads: Vec::new(),
-        }),
+                write_replays_at_tip: Vec::new(),
+                tip_sloads: Vec::new(),
+            }),
             journal_blob: None,
             call_outcomes: vec![],
             prefix_writes: vec![],
@@ -3458,9 +3495,9 @@ mod m1c_tests {
                 at_call_boundary: true,
                 post_sstore: true,
                 sstore_index: 0,
-            write_replays_at_tip: Vec::new(),
-            tip_sloads: Vec::new(),
-        }),
+                write_replays_at_tip: Vec::new(),
+                tip_sloads: Vec::new(),
+            }),
             journal_blob: None,
             call_outcomes: vec![CachedCallOutcome {
                 call_seq: 2,
@@ -3508,5 +3545,4 @@ mod m1c_tests {
         // Default (unset) is off unless research inspect — do not assert unset here
         // under parallel cargo test (env races). Logic covered by R0 gating code.
     }
-
 }

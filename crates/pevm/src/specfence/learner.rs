@@ -280,9 +280,15 @@ impl InterBlockPrior {
     }
 
     /// End-of-block: pack morph hat + top-ℓ; raise α on morphology flip.
+    /// Quiet-dominant EMA damps a fan_out hat (no quiet→fan_out Storm flip).
     pub(crate) fn end_block(&self, morph_hat: MorphWeights, top: Vec<TopLocPrior>) -> f64 {
-        let morph_hat = morph_hat.normalize();
+        let mut morph_hat = morph_hat.normalize();
         let mut ema = self.morph_ema.lock().unwrap();
+        if ema.dominant_quiet() && morph_hat.dominant_fan_out() {
+            morph_hat.fan_out = (ema.fan_out + 0.05).min(morph_hat.fan_out);
+            morph_hat.quiet = ema.quiet.max(0.45);
+            morph_hat = morph_hat.normalize();
+        }
         let kl = ema.divergence(morph_hat);
         let flipped = kl > FLIP_KL;
         let alpha = if flipped {
@@ -387,6 +393,12 @@ pub(crate) struct LiveLearner {
     morph_bits: Mutex<MorphWeights>,
     /// Block AdaptiveParams snapshot for EMA rates (set at begin_block).
     params_bits: Mutex<AdaptiveParams>,
+    /// Structural park heat (WaitFor parks this block) — PreferAdmit / steal width.
+    park_heat: AtomicUsize,
+    /// Resolve telemetry: SuffixRepair rewind vs R1 rebind (read by Resolve).
+    rewind_total: AtomicUsize,
+    rebind_total: AtomicUsize,
+    identity_hits: AtomicUsize,
 }
 
 impl LiveLearner {
@@ -429,6 +441,61 @@ impl LiveLearner {
             .store(fp_encode(params.e_idle_prior), Ordering::Relaxed);
         *self.morph_bits.lock().unwrap() = prior_morph.normalize();
         *self.params_bits.lock().unwrap() = params;
+        self.park_heat.store(0, Ordering::Relaxed);
+        self.rewind_total.store(0, Ordering::Relaxed);
+        self.rebind_total.store(0, Ordering::Relaxed);
+        self.identity_hits.store(0, Ordering::Relaxed);
+    }
+
+    /// WaitFor park observed — structural ready-weight, not EV Await.
+    #[inline]
+    pub(crate) fn note_park_heat(&self) {
+        self.park_heat.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn note_resolve_r1(&self) {
+        self.rebind_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn note_resolve_r2(&self) {
+        self.rewind_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn note_identity_hit(&self) {
+        self.identity_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// PreferAdmit / steal width when WaitFor parks starve independents.
+    #[inline]
+    pub(crate) fn prefer_admit_heat(&self) -> bool {
+        self.park_heat.load(Ordering::Relaxed) >= 2 || self.r1_underfire()
+    }
+
+    /// rewind ≫ rebind — R1 is under-firing; Resolve must prefer RebindOnly.
+    #[inline]
+    pub(crate) fn r1_underfire(&self) -> bool {
+        let rw = self.rewind_total.load(Ordering::Relaxed);
+        let rb = self.rebind_total.load(Ordering::Relaxed);
+        rw >= 4 && rw > rb.saturating_mul(2)
+    }
+
+    /// Live Resolve prior: identity/FF abundant or rewind:rebind skewed.
+    #[inline]
+    pub(crate) fn r1_first_bias(&self) -> bool {
+        self.r1_underfire()
+            || self.identity_hits.load(Ordering::Relaxed)
+                > self.rebind_total.load(Ordering::Relaxed)
+    }
+
+    /// Quiet cohort: Fence-off. Do not arm collapse/absorb/Storm-shaped repair.
+    #[inline]
+    pub(crate) fn quiet_fence_off(&self) -> bool {
+        self.morph_weights().dominant_quiet()
+            && self.abort_events.load(Ordering::Relaxed) < 4
+            && self.park_heat.load(Ordering::Relaxed) < 2
     }
 
     /// Observe a location read resolve (policy feature refresh).
@@ -956,10 +1023,13 @@ impl LiveLearner {
     }
 
     /// Empirical morph hat from counters (for inter-block EMA).
+    /// Metric↔L1 calibration: fan_out requires abort/bind evidence, not
+    /// readers-alone (heuristic over-call). Quiet stays quiet without that.
     pub(crate) fn morph_hat(&self) -> MorphWeights {
         let prog = self.program_obs.load(Ordering::Relaxed) as f64;
         let hand = self.handler_obs.load(Ordering::Relaxed) as f64;
         let total = (prog + hand).max(1.0);
+        let aborts = self.abort_events.load(Ordering::Relaxed);
         let mut max_readers = 0usize;
         let mut max_writers = 0usize;
         for e in self.locs.iter() {
@@ -967,17 +1037,23 @@ impl LiveLearner {
             max_writers = max_writers.max(e.writers.load(Ordering::Relaxed));
         }
         let mut w = MorphWeights::default();
-        if max_readers >= 64 {
+        if max_readers >= 64 && aborts >= 8 {
             w.fan_out = 0.55;
             w.mixed = 0.25;
             w.waw_spine = 0.10;
             w.quiet = 0.10;
+        } else if max_readers >= 64 && aborts < 4 {
+            // Wide read set without abort evidence → mixed, not fan_out.
+            w.mixed = 0.45;
+            w.quiet = 0.30;
+            w.fan_out = 0.15;
+            w.waw_spine = 0.10;
         } else if max_writers >= 32 && max_readers < 32 {
             w.waw_spine = 0.50;
             w.mixed = 0.25;
             w.fan_out = 0.10;
             w.quiet = 0.15;
-        } else if total < 8.0 {
+        } else if total < 8.0 || (aborts == 0 && max_readers < 16) {
             w.quiet = 0.70;
             w.mixed = 0.20;
             w.fan_out = 0.05;
@@ -1059,8 +1135,17 @@ mod tests {
     #[test]
     fn flip_raises_alpha() {
         let prior = InterBlockPrior::new();
-        // Start quiet.
-        prior.end_block(MorphWeights::default(), vec![]);
+        // Start mixed (not quiet-dominant) so a real fan_out hat can flip.
+        // quiet→fan_out is damped on purpose (see inter_prior_damps_quiet_to_fan_out).
+        prior.end_block(
+            MorphWeights {
+                fan_out: 0.20,
+                mixed: 0.50,
+                waw_spine: 0.15,
+                quiet: 0.15,
+            },
+            vec![],
+        );
         let hat = MorphWeights {
             fan_out: 0.8,
             mixed: 0.1,
@@ -1226,5 +1311,69 @@ mod tests {
         let r = live.meta_tax_ratio(&params);
         assert!(r > 0.0, "{r}");
         assert!(!live.meta_budget_exceeded(&params) || r > params.meta_budget_rho);
+    }
+
+    #[test]
+    fn structural_park_and_r1_bias_are_readable() {
+        let live = LiveLearner::new();
+        live.begin_block(MorphWeights::default());
+        assert!(!live.prefer_admit_heat());
+        assert!(!live.r1_underfire());
+        live.note_park_heat();
+        live.note_park_heat();
+        assert!(live.prefer_admit_heat());
+        for _ in 0..6 {
+            live.note_resolve_r2();
+        }
+        live.note_resolve_r1();
+        assert!(live.r1_underfire());
+        assert!(live.r1_first_bias());
+        live.note_identity_hit();
+        assert!(live.r1_first_bias());
+    }
+
+    #[test]
+    fn quiet_fence_off_protects_low_abort() {
+        let live = LiveLearner::new();
+        live.begin_block(MorphWeights::default());
+        assert!(live.quiet_fence_off(), "quiet-biased cold start");
+        live.note_abort(1, 1);
+        live.note_abort(1, 1);
+        live.note_abort(1, 1);
+        live.note_abort(1, 1);
+        assert!(!live.quiet_fence_off());
+    }
+
+    #[test]
+    fn morph_hat_does_not_overcall_fan_out_without_aborts() {
+        let live = LiveLearner::new();
+        live.begin_block(MorphWeights::default());
+        for i in 0..80 {
+            live.note_hot_touch(i as u64, true);
+        }
+        let hat = live.morph_hat();
+        assert!(
+            !hat.dominant_fan_out(),
+            "readers-alone must not plant fan_out: {hat:?}"
+        );
+    }
+
+    #[test]
+    fn inter_prior_damps_quiet_to_fan_out() {
+        let prior = InterBlockPrior::new();
+        prior.end_block(MorphWeights::default(), vec![]);
+        assert!(prior.morph_ema().dominant_quiet());
+        let hat = MorphWeights {
+            fan_out: 0.70,
+            mixed: 0.15,
+            waw_spine: 0.05,
+            quiet: 0.10,
+        };
+        prior.end_block(hat, vec![]);
+        let ema = prior.morph_ema();
+        assert!(
+            ema.quiet >= 0.40 || !ema.dominant_fan_out(),
+            "quiet EMA must not snap to fan_out: {ema:?}"
+        );
     }
 }

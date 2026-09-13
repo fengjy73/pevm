@@ -101,53 +101,92 @@ pub(crate) struct EdgeView {
     pub writer_ready: bool,
 }
 
-/// Decide the protocol verb. Bounded Unfenced: known essential → Bind or WaitFor.
-/// `force_prefix` / Avoid with `writer=None` must Fence (serial-lane pred), not Unfenced.
-pub(crate) fn choose_edge_action(v: &EdgeView) -> EdgeAction {
-    let _ = (v.location, v.reader, v.access_k, v.access_depth, v.is_program);
-    // writer_validated is Detect state only — never a Bind door (A3).
-    let _ = v.writer_validated;
+/// Version-visibility state (native CC). Reasons are metrics-only.
+/// Not `must_wait = a∨b∨c∨d` — classify first, then one verb.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum EdgeVisibility {
+    /// Published Data (incl. Executed-not-Validated tip) → Bind.
+    PublishedData {
+        version: TxVersion,
+    },
+    /// Unpublished essential / clique-after-canary with writer `w < reader`.
+    UnpublishedEssential {
+        writer: TxIdx,
+    },
+    /// Essential / Avoid / force_prefix ∧ writer = None ∧ reader > 0.
+    SerialLane {
+        pred: TxIdx,
+    },
+    Independent,
+    Canary,
+    Cold,
+}
 
-    // A3: published Data (incl. unfinished / un-Validated tip) → Bind.
-    if let Some(ver) = v.bind_version.clone() {
-        return EdgeAction::Bind(ver);
+/// Classify EdgeView into version-visibility. Hang-freedom is admit/steal,
+/// never Unfenced. `writer_validated` / Ready / Executing are Detect only.
+pub(crate) fn classify_edge(v: &EdgeView) -> EdgeVisibility {
+    let _ = (
+        v.location,
+        v.reader,
+        v.access_k,
+        v.access_depth,
+        v.is_program,
+    );
+    let _ = v.writer_validated;
+    let _ = (v.writer_executing, v.writer_ready);
+    // H membership is a Region prior, not an OR-door into WaitFor.
+    let _ = v.in_hot_set;
+
+    if let Some(version) = v.bind_version.clone() {
+        return EdgeVisibility::PublishedData { version };
     }
     if v.writer_published {
         if let Some(w) = v.writer {
-            return EdgeAction::Bind(TxVersion {
-                tx_idx: w,
-                tx_incarnation: 0,
-            });
+            return EdgeVisibility::PublishedData {
+                version: TxVersion {
+                    tx_idx: w,
+                    tx_incarnation: 0,
+                },
+            };
         }
     }
 
-    // D6 / A1 / A2 / U1: unpublished essential → WaitFor, never Unfenced+retry.
-    // Hang-freedom is admission (admit lower spine writers), not Unfenced.
-    // U3: runtime WaitFor-parks only Executing; Ready is prefer-admitted (S1).
-    // choose_edge_action still returns WaitFor(w) so the Region stays Fenced.
-    // Inversion (w ≥ reader) is the only known-writer WaitFor reject.
-    // Serial-lane WaitFor(reader-1) is only for known essentials without a
-    // resolved writer (force_prefix / Avoid / essential_antidep).
-    let _ = (v.writer_executing, v.writer_ready);
-    let must_wait = v.essential_antidep || v.avoid_broadcast || v.force_prefix;
-    let must_fence = must_wait
-        || (v.clique_gated && !v.canary_ok)
-        || (v.in_hot_set && !v.canary_ok && !v.independence_certified);
-    if must_fence {
+    let known_essential = v.essential_antidep || v.avoid_broadcast || v.force_prefix;
+    let clique_fence = v.clique_gated && !v.canary_ok;
+    let unpublished_fence = known_essential || clique_fence;
+
+    if unpublished_fence {
         if let Some(w) = v.writer {
             if w < v.reader {
-                return EdgeAction::WaitFor(w);
+                return EdgeVisibility::UnpublishedEssential { writer: w };
             }
             // inversion: later/self writer is not a preset-order anti-dep
-        } else if v.reader > 0 && must_wait {
-            // U1: force_prefix / Avoid / essential with no writer → serial Fence.
-            return EdgeAction::WaitFor(v.reader - 1);
+        } else if v.reader > 0 && known_essential {
+            return EdgeVisibility::SerialLane { pred: v.reader - 1 };
         }
-        // Clique forming, no writer yet: first-wave Unfenced (not serial-all).
+        // Clique forming, no writer yet: first-wave (not serial-all).
     }
 
-    // A2 canary or A4 independence or cold discovery.
-    EdgeAction::Unfenced
+    if v.canary_ok {
+        return EdgeVisibility::Canary;
+    }
+    if v.independence_certified && !known_essential && !clique_fence {
+        return EdgeVisibility::Independent;
+    }
+    EdgeVisibility::Cold
+}
+
+/// Decide the protocol verb from version-visibility. Bounded Unfenced:
+/// known essential → Bind or WaitFor. Ready spine stays WaitFor (admit is hang-freedom).
+pub(crate) fn choose_edge_action(v: &EdgeView) -> EdgeAction {
+    match classify_edge(v) {
+        EdgeVisibility::PublishedData { version } => EdgeAction::Bind(version),
+        EdgeVisibility::UnpublishedEssential { writer } => EdgeAction::WaitFor(writer),
+        EdgeVisibility::SerialLane { pred } => EdgeAction::WaitFor(pred),
+        EdgeVisibility::Independent | EdgeVisibility::Canary | EdgeVisibility::Cold => {
+            EdgeAction::Unfenced
+        }
+    }
 }
 
 /// Multi-touch EdgeTable. Key = `(ℓ, reader, k, depth)`.
@@ -361,7 +400,16 @@ mod tests {
     #[test]
     fn d6_wait_unpublished_essential() {
         let a = choose_edge_action(&view(
-            None, Some(3), false, false, true, false, false, false, true, false,
+            None,
+            Some(3),
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            true,
+            false,
         ));
         assert_eq!(a, EdgeAction::WaitFor(3));
     }
@@ -369,7 +417,16 @@ mod tests {
     #[test]
     fn a2_avoid_broadcast_waits_not_unfenced() {
         let a = choose_edge_action(&view(
-            None, Some(4), false, false, true, true, false, false, false, false,
+            None,
+            Some(4),
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false,
         ));
         assert_eq!(a, EdgeAction::WaitFor(4));
     }
@@ -385,7 +442,16 @@ mod tests {
     #[test]
     fn a2_canary_unfenced_before_avoid() {
         let a = choose_edge_action(&view(
-            None, Some(1), false, false, true, false, true, false, false, true,
+            None,
+            Some(1),
+            false,
+            false,
+            true,
+            false,
+            true,
+            false,
+            false,
+            true,
         ));
         assert_eq!(a, EdgeAction::Unfenced);
     }
@@ -393,7 +459,16 @@ mod tests {
     #[test]
     fn a1_clique_gate_waits_after_canary() {
         let a = choose_edge_action(&view(
-            None, Some(1), false, false, true, false, false, false, false, true,
+            None,
+            Some(1),
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            true,
         ));
         assert_eq!(a, EdgeAction::WaitFor(1));
     }
@@ -414,7 +489,16 @@ mod tests {
     fn clique_gate_not_shorted_by_independence() {
         // Forming clique: canary consumed, independence still stale-true.
         let a = choose_edge_action(&view(
-            None, Some(2), false, false, false, false, false, true, false, true,
+            None,
+            Some(2),
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            true,
         ));
         assert_eq!(
             a,
@@ -426,7 +510,16 @@ mod tests {
     #[test]
     fn never_wait_for_higher_or_self() {
         let mut v = view(
-            None, Some(9), false, false, true, true, false, false, true, true,
+            None,
+            Some(9),
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
+            true,
+            true,
         );
         v.reader = 4;
         v.writer = Some(9);
@@ -443,15 +536,92 @@ mod tests {
     fn wait_for_ready_known_essential() {
         // Ready is not an Unfenced door — admission makes the writer progress.
         let a = choose_edge_action(&view(
-            None, Some(3), false, false, true, true, false, false, true, true,
+            None,
+            Some(3),
+            false,
+            false,
+            true,
+            true,
+            false,
+            false,
+            true,
+            true,
         ));
         assert_eq!(a, EdgeAction::WaitFor(3));
     }
 
     #[test]
+    fn hot_alone_is_cold_unfenced_not_wait() {
+        // H membership is not an OR-door into WaitFor (dissolved salad).
+        let a = choose_edge_action(&view(
+            None, None, false, false, true, false, false, false, false, false,
+        ));
+        assert_eq!(a, EdgeAction::Unfenced);
+        assert!(matches!(
+            classify_edge(&view(
+                None, None, false, false, true, false, false, false, false, false,
+            )),
+            EdgeVisibility::Cold
+        ));
+    }
+
+    #[test]
+    fn visibility_machine_published_then_essential_then_unfenced() {
+        let v = TxVersion {
+            tx_idx: 2,
+            tx_incarnation: 1,
+        };
+        assert!(matches!(
+            classify_edge(&view(
+                Some(v.clone()),
+                Some(2),
+                true,
+                false,
+                true,
+                true,
+                false,
+                false,
+                true,
+                true,
+            )),
+            EdgeVisibility::PublishedData { .. }
+        ));
+        assert!(matches!(
+            classify_edge(&view(
+                None,
+                Some(3),
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                true,
+                false,
+            )),
+            EdgeVisibility::UnpublishedEssential { writer: 3 }
+        ));
+        assert!(matches!(
+            classify_edge(&view(
+                None, None, false, false, false, false, false, true, false, false,
+            )),
+            EdgeVisibility::Independent
+        ));
+    }
+
+    #[test]
     fn never_unfenced_known_essential() {
         let a = choose_edge_action(&view(
-            None, Some(3), false, false, true, false, false, false, true, false,
+            None,
+            Some(3),
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            true,
+            false,
         ));
         assert!(matches!(a, EdgeAction::WaitFor(3)));
         assert!(!matches!(a, EdgeAction::Unfenced));
@@ -479,7 +649,16 @@ mod tests {
     #[test]
     fn force_prefix_with_writer_never_unfenced() {
         let mut v = view(
-            None, Some(2), false, false, true, false, false, true, false, false,
+            None,
+            Some(2),
+            false,
+            false,
+            true,
+            false,
+            false,
+            true,
+            false,
+            false,
         );
         v.force_prefix = true;
         v.writer_ready = true;
@@ -497,7 +676,16 @@ mod tests {
     #[test]
     fn prefer_admit_ready_does_not_unfence_must_wait() {
         let mut v = view(
-            None, Some(3), false, false, true, true, false, true, true, true,
+            None,
+            Some(3),
+            false,
+            false,
+            true,
+            true,
+            false,
+            true,
+            true,
+            true,
         );
         v.writer_ready = true;
         v.writer_executing = false;

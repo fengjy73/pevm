@@ -1,22 +1,22 @@
 //! Shared no-beneficiary Handler for pevm execute paths.
 
 use revm::{
-    Database,
+    Database, Inspector,
     context::{
         ContextTr, JournalTr,
         result::{EVMError, ExecutionResult, HaltReason, InvalidTransaction},
     },
-    handler::{
-        EthFrame, EvmTr, EvmTrError, FrameResult, FrameTr, Handler, ItemOrResult,
-    },
+    handler::{EthFrame, EvmTr, EvmTrError, FrameResult, FrameTr, Handler, ItemOrResult},
     inspector::{InspectorEvmTr, InspectorHandler, JournalExt},
     interpreter::interpreter::EthInterpreter,
     state::EvmState,
-    Inspector,
 };
 
 use crate::chain::{PevmChain, PevmEthereum};
-use crate::specfence::{nested_bind_stash_armed, pending_resume_armed, try_apply_pending_pc_resume, try_consume_nested_bind_resume};
+use crate::specfence::{
+    nested_bind_stash_armed, pending_resume_armed, try_apply_pending_pc_resume,
+    try_consume_nested_bind_resume,
+};
 
 /// MainnetHandler that skips beneficiary reward (pevm applies via MvMemory).
 pub(crate) struct NoBeneficiaryHandler<EVM, ERROR> {
@@ -34,9 +34,9 @@ impl<EVM, ERROR> Default for NoBeneficiaryHandler<EVM, ERROR> {
 impl<EVM, ERROR> Handler for NoBeneficiaryHandler<EVM, ERROR>
 where
     EVM: EvmTr<
-        Context: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt>,
-        Frame = EthFrame<EthInterpreter>,
-    >,
+            Context: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt>,
+            Frame = EthFrame<EthInterpreter>,
+        >,
     ERROR: EvmTrError<EVM>,
 {
     type Evm = EVM;
@@ -117,10 +117,10 @@ where
 impl<EVM, ERROR> InspectorHandler for NoBeneficiaryHandler<EVM, ERROR>
 where
     EVM: InspectorEvmTr<
-        Context: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt>,
-        Frame = EthFrame<EthInterpreter>,
-        Inspector: Inspector<<EVM as EvmTr>::Context, EthInterpreter>,
-    >,
+            Context: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt>,
+            Frame = EthFrame<EthInterpreter>,
+            Inspector: Inspector<<EVM as EvmTr>::Context, EthInterpreter>,
+        >,
     ERROR: EvmTrError<EVM>,
 {
     type IT = EthInterpreter;

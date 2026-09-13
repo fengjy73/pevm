@@ -28,9 +28,10 @@ use flate2::bufread::GzDecoder;
 use hashbrown::HashMap;
 use pevm::{
     BlockHashes, BuildSuffixHasher, Bytecodes, ConcurrencyMode, EvmAccount, FineGrainSnapshot,
-    InMemoryStorage, Pevm, analyze_dag, classify_raw_edges, effect_raw_longest_chain,
-    effect_raw_max_fanout, estimate_ma_md, filter_effect_edges, hot_locations, kind_histogram,
+    InMemoryStorage, Pevm, analyze_dag,
     chain::{PevmChain, PevmEthereum},
+    classify_raw_edges, effect_raw_longest_chain, effect_raw_max_fanout, estimate_ma_md,
+    filter_effect_edges, hot_locations, kind_histogram,
 };
 use serde::Serialize;
 
@@ -186,12 +187,26 @@ fn n_tx(block: &Block<<PevmEthereum as PevmChain>::Transaction>) -> usize {
     }
 }
 
-fn timing_from(mode: &str, cores: usize, n: usize, elapsed_ms: f64, tps: f64, ok: bool, err: Option<String>, pevm: &Pevm, snap: Option<&FineGrainSnapshot>) -> ModeTiming {
+fn timing_from(
+    mode: &str,
+    cores: usize,
+    n: usize,
+    elapsed_ms: f64,
+    tps: f64,
+    ok: bool,
+    err: Option<String>,
+    pevm: &Pevm,
+    snap: Option<&FineGrainSnapshot>,
+) -> ModeTiming {
     let m = pevm.last_specfence_metrics();
     let max_inc = snap
         .map(|s| s.final_incarnations.iter().copied().max().unwrap_or(0))
         .unwrap_or(0);
-    let evm_entries = if mode.starts_with("occ") { m.evm_entries } else { 0 };
+    let evm_entries = if mode.starts_with("occ") {
+        m.evm_entries
+    } else {
+        0
+    };
     ModeTiming {
         mode: mode.into(),
         cores,
@@ -199,7 +214,11 @@ fn timing_from(mode: &str, cores: usize, n: usize, elapsed_ms: f64, tps: f64, ok
         tps,
         ok,
         error: err,
-        occ_aborts: if mode.starts_with("occ") { m.occ_aborts } else { 0 },
+        occ_aborts: if mode.starts_with("occ") {
+            m.occ_aborts
+        } else {
+            0
+        },
         abort_rate: if n == 0 || !mode.starts_with("occ") {
             0.0
         } else {
@@ -280,10 +299,24 @@ fn run_occ_deep(
     let result = pevm.execute(chain, &loaded.storage, &block, cores_nz, false);
     let elapsed = t0.elapsed().as_secs_f64();
     let elapsed_ms = elapsed * 1000.0;
-    let tps = if elapsed > 0.0 { n as f64 / elapsed } else { 0.0 };
+    let tps = if elapsed > 0.0 {
+        n as f64 / elapsed
+    } else {
+        0.0
+    };
     let snap = pevm.take_finegrain_snapshot();
     let timing = match &result {
-        Ok(_) => timing_from("occ_deep", cores, n, elapsed_ms, tps, true, None, &pevm, snap.as_ref()),
+        Ok(_) => timing_from(
+            "occ_deep",
+            cores,
+            n,
+            elapsed_ms,
+            tps,
+            true,
+            None,
+            &pevm,
+            snap.as_ref(),
+        ),
         Err(e) => timing_from(
             "occ_deep",
             cores,
@@ -341,7 +374,8 @@ fn main() {
     let mut deep_dives = Vec::new();
 
     for &bn in &all_blocks {
-        let Some(loaded) = load_block(&data_dir, bn, bytecodes.clone(), block_hashes.clone()) else {
+        let Some(loaded) = load_block(&data_dir, bn, bytecodes.clone(), block_hashes.clone())
+        else {
             continue;
         };
         eprintln!(

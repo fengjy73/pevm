@@ -220,7 +220,11 @@ impl BayesMap {
     }
 
     /// Record a Wait decision's posterior for the mean-waited metric.
-    pub(crate) fn note_wait_decision(&self, location: MemoryLocationHash, address: Option<&Address>) {
+    pub(crate) fn note_wait_decision(
+        &self,
+        location: MemoryLocationHash,
+        address: Option<&Address>,
+    ) {
         self.record_wait_posterior(self.conflict_probability(location, address));
     }
 
@@ -256,11 +260,7 @@ impl BayesMap {
     pub(crate) fn take_mean_wait_posterior(&self) -> f64 {
         let count = self.wait_posterior_count.swap(0, Ordering::Relaxed);
         let sum = f64::from_bits(self.wait_posterior_sum_bits.swap(0, Ordering::Relaxed));
-        if count == 0 {
-            0.0
-        } else {
-            sum / count as f64
-        }
+        if count == 0 { 0.0 } else { sum / count as f64 }
     }
 
     fn record_spec_posterior(&self, p: f64) {
@@ -283,11 +283,7 @@ impl BayesMap {
     pub(crate) fn take_mean_spec_posterior(&self) -> f64 {
         let count = self.spec_posterior_count.swap(0, Ordering::Relaxed);
         let sum = f64::from_bits(self.spec_posterior_sum_bits.swap(0, Ordering::Relaxed));
-        if count == 0 {
-            0.0
-        } else {
-            sum / count as f64
-        }
+        if count == 0 { 0.0 } else { sum / count as f64 }
     }
 
     /// Returns true if this was the first conflict observation for `location` this block.
@@ -424,20 +420,12 @@ impl BayesMap {
             sum += (entry.mean() - prior).max(0.0);
             n += 1;
         }
-        if n == 0 {
-            0.0
-        } else {
-            sum / n as f64
-        }
+        if n == 0 { 0.0 } else { sum / n as f64 }
     }
 
     /// Locations (or accounts if locations empty) with P ≥ `tau` (seed-Wait proxy).
     pub(crate) fn hot_conflict_count(&self, tau: f64) -> usize {
-        let loc_hot = self
-            .locations
-            .iter()
-            .filter(|e| e.mean() >= tau)
-            .count();
+        let loc_hot = self.locations.iter().filter(|e| e.mean() >= tau).count();
         if loc_hot > 0 || !self.locations.is_empty() {
             return loc_hot;
         }
@@ -445,7 +433,6 @@ impl BayesMap {
     }
 
     pub(crate) fn reset(&self) {
-
         self.locations.clear();
         self.accounts.clear();
         self.bind_useful.clear();
@@ -477,11 +464,8 @@ impl BayesMap {
         if extra == 0 {
             return;
         }
-        let mut coldest: Vec<(Address, f64)> = self
-            .accounts
-            .iter()
-            .map(|e| (*e.key(), e.mean()))
-            .collect();
+        let mut coldest: Vec<(Address, f64)> =
+            self.accounts.iter().map(|e| (*e.key(), e.mean())).collect();
         coldest.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         for (addr, _) in coldest.into_iter().take(extra) {
             self.accounts.remove(&addr);

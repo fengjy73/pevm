@@ -98,11 +98,10 @@ fn try_load_block(
     if !pre_path.exists() {
         return Err("missing pre_state.json".into());
     }
-    let block: Block<<PevmEthereum as PevmChain>::Transaction> =
-        serde_json::from_reader(BufReader::new(
-            File::open(&block_path).map_err(|e| format!("open block.json: {e}"))?,
-        ))
-        .map_err(|e| format!("parse block.json: {e}"))?;
+    let block: Block<<PevmEthereum as PevmChain>::Transaction> = serde_json::from_reader(
+        BufReader::new(File::open(&block_path).map_err(|e| format!("open block.json: {e}"))?),
+    )
+    .map_err(|e| format!("parse block.json: {e}"))?;
     let accounts: HashMap<alloy_primitives::Address, EvmAccount, BuildSuffixHasher> =
         serde_json::from_reader(BufReader::new(
             File::open(&pre_path).map_err(|e| format!("open pre_state.json: {e}"))?,
@@ -252,7 +251,10 @@ fn dominant_metric(sf: &serde_json::Value) -> String {
     } else if wait > 50 {
         format!("edge_wait_for={wait}")
     } else {
-        format!("meta/cold bind={bind} unf={}", m["edge_unfenced"].as_u64().unwrap_or(0))
+        format!(
+            "meta/cold bind={bind} unf={}",
+            m["edge_unfenced"].as_u64().unwrap_or(0)
+        )
     }
 }
 
@@ -386,11 +388,9 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(10usize);
-    let block_override: Option<Vec<u64>> = std::env::var("SPECFENCE_ALL_BLOCKS").ok().map(|s| {
-        s.split(',')
-            .filter_map(|x| x.trim().parse().ok())
-            .collect()
-    });
+    let block_override: Option<Vec<u64>> = std::env::var("SPECFENCE_ALL_BLOCKS")
+        .ok()
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect());
 
     let numbers = block_override.unwrap_or_else(|| discover_block_numbers(&blocks_dir));
     eprintln!(
@@ -568,19 +568,13 @@ fn main() {
     }
 
     // Aggregate stats
-    let mut sf_occ_vals: Vec<f64> = pairs
-        .iter()
-        .filter_map(|p| p["sf_occ"].as_f64())
-        .collect();
+    let mut sf_occ_vals: Vec<f64> = pairs.iter().filter_map(|p| p["sf_occ"].as_f64()).collect();
     let mut wall_ratios: Vec<f64> = pairs
         .iter()
         .filter_map(|p| p["wall_ratio"].as_f64())
         .collect();
     let mut sf_tps: Vec<f64> = pairs.iter().filter_map(|p| p["sf_tps"].as_f64()).collect();
-    let mut occ_tps: Vec<f64> = pairs
-        .iter()
-        .filter_map(|p| p["occ_tps"].as_f64())
-        .collect();
+    let mut occ_tps: Vec<f64> = pairs.iter().filter_map(|p| p["occ_tps"].as_f64()).collect();
     let mut sf_walls: Vec<f64> = pairs
         .iter()
         .filter_map(|p| p["sf_wall_ms"].as_f64())
@@ -630,14 +624,16 @@ fn main() {
     let mut morph_counts: HashMap<&'static str, usize> = HashMap::default();
     for p in &pairs {
         let m = p["morph_heuristic"].as_str().unwrap_or("?");
-        *morph_counts.entry(match m {
-            "quiet" => "quiet",
-            "quiet_ish" => "quiet_ish",
-            "fan_out" => "fan_out",
-            "spine" => "spine",
-            "mixed" => "mixed",
-            _ => "other",
-        }).or_default() += 1;
+        *morph_counts
+            .entry(match m {
+                "quiet" => "quiet",
+                "quiet_ish" => "quiet_ish",
+                "fan_out" => "fan_out",
+                "spine" => "spine",
+                "mixed" => "mixed",
+                _ => "other",
+            })
+            .or_default() += 1;
     }
 
     let soft_nonzero: Vec<u64> = pairs

@@ -136,7 +136,8 @@ impl RwPriorMap {
             let c = (entry.co_access * DECAY_NUM) / DECAY_DEN;
             entry.co_access = if entry.co_access > 0 { c.max(0) } else { 0 };
         }
-        self.locations.retain(|_, s| s.writes > 0 || s.co_access > 0);
+        self.locations
+            .retain(|_, s| s.writes > 0 || s.co_access > 0);
         self.refresh_hot_count();
     }
 

@@ -23,9 +23,12 @@ use smallvec::SmallVec;
 use super::{CalculateReceiptRootError, PevmChain};
 use crate::{
     BuildIdentityHasher, MemoryLocation, MemoryLocationHash, PevmTxExecutionResult, TxIdx,
-    hash_deterministic, mv_memory::MvMemory,
-    specfence::{handler_bind_snap_install_wanted, handler_sstore_plant_install_wanted, install_handler_bind_snap_capture, install_handler_sstore_plant_capture, SpecFenceInspector},
-
+    hash_deterministic,
+    mv_memory::MvMemory,
+    specfence::{
+        SpecFenceInspector, handler_bind_snap_install_wanted, handler_sstore_plant_install_wanted,
+        install_handler_bind_snap_capture, install_handler_sstore_plant_capture,
+    },
 };
 
 /// Implementation of [`PevmChain`] for Ethereum
@@ -258,9 +261,6 @@ impl PevmChain for PevmEthereum {
     ) -> Result<ExecutionResult<Self::EvmHaltReason>, EVMError<DB::Error, InvalidTransaction>> {
         crate::tx_runner::run_ethereum_tx(evm, use_inspect)
     }
-
-
-
 
     fn is_eip_1559_enabled(&self, spec_id: SpecId) -> bool {
         spec_id >= SpecId::LONDON

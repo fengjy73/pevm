@@ -223,13 +223,12 @@ mod scheduler;
 pub mod specfence;
 pub use specfence::{
     AbortEvent, AccountGrainObserve, ConcurrencyMode, ConsumerFirstCross, DagStats, EffectClass,
-    EffectLogEntry, FineGrainCollector, FineGrainSnapshot, EffectStreamDiag, HotLocation,
-    L1DagSummary, LocationKind, MaMdProxy, MeasurementMethod, RawEdge, RawEffectEdge,
-    ExecProcessSnapshot, PerTxProcessSnap, SpecFenceMetrics, TxRw, TxWorkTotal, analyze_dag, classify_raw_edges,
-    dependency_edges,
-    effect_raw_longest_chain, effect_raw_max_fanout, estimate_ma_md, filter_effect_edges,
-    hot_locations, kind_histogram, l1_dag_summary, percentile_f64, producer_status_canonical,
-    program_raw_longest_chain,
+    EffectLogEntry, EffectStreamDiag, ExecProcessSnapshot, FineGrainCollector, FineGrainSnapshot,
+    HotLocation, L1DagSummary, LocationKind, MaMdProxy, MeasurementMethod, PerTxProcessSnap,
+    RawEdge, RawEffectEdge, SpecFenceMetrics, TxRw, TxWorkTotal, analyze_dag, classify_raw_edges,
+    dependency_edges, effect_raw_longest_chain, effect_raw_max_fanout, estimate_ma_md,
+    filter_effect_edges, hot_locations, kind_histogram, l1_dag_summary, percentile_f64,
+    producer_status_canonical, program_raw_longest_chain,
 };
 mod storage;
 pub use storage::{

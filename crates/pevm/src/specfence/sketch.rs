@@ -113,7 +113,12 @@ impl HotSketch {
         for top in tops {
             let mut decay = if flipped { 0.45 } else { 1.0 };
             if quiet {
-                decay *= 0.40;
+                decay *= 0.25;
+                // Quiet Fence-off: never plant H from fanout-only (quiet→fan_out leak).
+                if top.abort_rate < 0.40 {
+                    self.decay_events.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
             }
             let conf = if top.abort_rate >= 0.40 {
                 0.25 * decay
@@ -723,6 +728,25 @@ mod tests {
     }
 
     #[test]
+    fn quiet_fanout_only_does_not_seed_h() {
+        let s = HotSketch::new();
+        s.seed_from_prior_morph(
+            &[TopLocPrior {
+                location: 11,
+                fanout_ema: 64.0,
+                abort_rate: 0.05,
+                chain_len_ema: 4.0,
+            }],
+            false,
+            true,
+        );
+        assert!(
+            !s.in_h(11),
+            "quiet + fanout-only must not plant a Fence prior"
+        );
+    }
+
+    #[test]
     fn quiet_revoke_drops_warm_fence_keeps_avoid() {
         let s = HotSketch::new();
         s.seed_from_prior_morph(
@@ -735,7 +759,7 @@ mod tests {
             true,
             true,
         );
-        // quiet × flip decay of 0.85 → 0.85*0.45*0.40 = 0.153 < CONF_LIVE
+        // quiet + low abort_rate never plants H (fanout-only is a quiet→fan_out leak).
         assert!(!s.in_h(4), "U6: quiet+flip must not seed a Fence prior");
         s.seed_from_prior(
             &[TopLocPrior {

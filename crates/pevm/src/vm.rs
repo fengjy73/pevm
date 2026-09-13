@@ -622,21 +622,24 @@ impl<'a, S: Storage> VmDb<'a, S> {
         let canary_taken = self.specfence.sketch.canary_taken(location_hash);
         let must_wait = force_prefix || avoid || essential;
 
-        // S1+S4: this-ℓ unfinished always; cross-ℓ PreferAdmit only before
-        // Unfenced (ready-set ⊆ Avoid spines, not a per-SLOAD full walk).
+        // S1+S4 + v2 park budget: PreferAdmit Ready spines on WaitFor *and*
+        // Unfenced. Park heat skips execution_idx fetch_min so P stays on independents.
         let is_done = |t: TxIdx| self.specfence.scheduler.is_done(t);
         let is_ready = |t: TxIdx| self.specfence.scheduler.is_ready(t);
         let unfinished =
             self.specfence
                 .sketch
                 .unfinished_writers_before(location_hash, self.tx_idx, is_done);
-        let ready_spines = if matches!(action, EdgeAction::Unfenced) {
-            self.specfence
-                .sketch
-                .ready_spine_writers(self.tx_idx, is_ready, is_done)
-        } else {
-            Vec::new()
-        };
+        let park_heat =
+            matches!(action, EdgeAction::WaitFor(_)) || self.specfence.learner.prefer_admit_heat();
+        let ready_spines =
+            if matches!(action, EdgeAction::WaitFor(_) | EdgeAction::Unfenced) || park_heat {
+                self.specfence
+                    .sketch
+                    .ready_spine_writers(self.tx_idx, is_ready, is_done)
+            } else {
+                Vec::new()
+            };
         let mut admit = unfinished.clone();
         for w in &ready_spines {
             if !admit.contains(w) {
@@ -644,9 +647,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
             }
         }
         if !admit.is_empty() {
-            self.specfence
-                .scheduler
-                .admit_spine_writers(&admit, self.specfence.wave);
+            self.specfence.scheduler.admit_spine_writers_heat(
+                &admit,
+                self.specfence.wave,
+                park_heat,
+            );
             if admit.iter().any(|&w| is_ready(w)) {
                 self.specfence.metrics.record_prefer_admit();
             }
@@ -693,6 +698,30 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 must_wait,
             ),
             EdgeAction::Unfenced => {
+                // Incarnation carry: only residual-Bind ℓ that already have a
+                // Region residual or carried writer — not every prior UnfencedCold
+                // (that certified stale FF and broke seq≡par).
+                if self.tx_incarnation > 0
+                    && self
+                        .specfence
+                        .partial_retry
+                        .inc_carry_seen(self.tx_idx, location_hash)
+                    && (self.specfence.sketch.residual_bind(location_hash).is_some()
+                        || self
+                            .specfence
+                            .partial_retry
+                            .force_writer(self.tx_idx, location_hash)
+                            .is_some())
+                {
+                    return self.bind_done_residual(
+                        address,
+                        location_hash,
+                        writer.unwrap_or(self.tx_idx.saturating_sub(1)),
+                        force_prefix,
+                        avoid,
+                        canary_taken,
+                    );
+                }
                 // U5/U1: force_prefix must not Unfence. Do **not** serial-lane
                 // every Avoid/essential (that WaitFor(reader-1) broke seq≡par).
                 if force_prefix {
@@ -819,9 +848,12 @@ impl<'a, S: Storage> VmDb<'a, S> {
         // S4: this-ℓ unfinished only. Other Avoid spines were prefer-admitted
         // in maybe_wait_specfence (do not rescan here).
         if !unfinished_all.is_empty() {
-            self.specfence
-                .scheduler
-                .admit_spine_writers(&unfinished_all, self.specfence.wave);
+            let park_heat = self.specfence.learner.prefer_admit_heat();
+            self.specfence.scheduler.admit_spine_writers_heat(
+                &unfinished_all,
+                self.specfence.wave,
+                park_heat,
+            );
             if unfinished_all.iter().any(|&w| is_ready(w)) {
                 self.specfence.metrics.record_prefer_admit();
             }
@@ -900,6 +932,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
             self.specfence
                 .process
                 .record(location_hash, self.tx_idx, reason, avoid, canary_taken);
+            self.specfence.learner.note_park_heat();
             self.specfence.metrics.record_edge_wait_for();
             self.specfence.metrics.record_wait_hard();
             self.specfence.metrics.record_wait(address);

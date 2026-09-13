@@ -7,8 +7,8 @@
 //! Evolved from Spec v1 SpecDag; `SpecDag` is a type alias for compatibility.
 
 #![allow(dead_code)]
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use dashmap::{DashMap, DashSet};
@@ -49,8 +49,7 @@ pub(crate) struct SoftWaitArm {
 #[derive(Debug, Default)]
 pub(crate) struct FenceGraph {
     /// SoftWait arms: ℓ → [{waiter, k, writer?}]. **Source of truth.**
-    soft_waits:
-        DashMap<MemoryLocationHash, Vec<SoftWaitArm>, BuildIdentityHasher>,
+    soft_waits: DashMap<MemoryLocationHash, Vec<SoftWaitArm>, BuildIdentityHasher>,
     /// Mirror: locations currently under WaitHard (sticky but revokeable).
     wait_locations: DashMap<MemoryLocationHash, (), BuildIdentityHasher>,
     /// Optional hard/soft edge count (metrics).
@@ -136,7 +135,8 @@ impl FenceGraph {
         };
         let mirrored = self.wait_locations.remove(&location).is_some();
         if n > 0 || mirrored {
-            self.soft_revoke_count.fetch_add(n.max(1), Ordering::Relaxed);
+            self.soft_revoke_count
+                .fetch_add(n.max(1), Ordering::Relaxed);
         }
         n
     }
@@ -180,10 +180,7 @@ impl FenceGraph {
         let mut latencies = Vec::new();
         if let Some(mut v) = self.soft_waits.get_mut(&location) {
             for a in v.drain(..) {
-                let match_writer = a
-                    .expected_writer
-                    .map(|w| w == writer_t)
-                    .unwrap_or(true);
+                let match_writer = a.expected_writer.map(|w| w == writer_t).unwrap_or(true);
                 if match_writer && a.waiter > writer_t {
                     if let Some((_, started)) = self.arm_started.remove(&a.arm_id) {
                         let ns = started.elapsed().as_nanos() as u64;
@@ -198,11 +195,7 @@ impl FenceGraph {
             }
             *v = keep;
         }
-        if self
-            .soft_waits
-            .get(&location)
-            .is_none_or(|v| v.is_empty())
-        {
+        if self.soft_waits.get(&location).is_none_or(|v| v.is_empty()) {
             self.soft_waits.remove(&location);
             self.wait_locations.remove(&location);
         }
@@ -228,16 +221,10 @@ impl FenceGraph {
     }
 
     /// SoftWait `armed_at_k` for `(location, waiter)` if armed.
-    pub(crate) fn soft_wait_k(
-        &self,
-        location: MemoryLocationHash,
-        waiter: TxIdx,
-    ) -> Option<u64> {
-        self.soft_waits.get(&location).and_then(|v| {
-            v.iter()
-                .find(|a| a.waiter == waiter)
-                .map(|a| a.armed_at_k)
-        })
+    pub(crate) fn soft_wait_k(&self, location: MemoryLocationHash, waiter: TxIdx) -> Option<u64> {
+        self.soft_waits
+            .get(&location)
+            .and_then(|v| v.iter().find(|a| a.waiter == waiter).map(|a| a.armed_at_k))
     }
 
     /// Like [`wake_on_publish`] but returns full SoftWait arms (includes `armed_at_k`).
@@ -250,10 +237,7 @@ impl FenceGraph {
         let mut keep = Vec::new();
         if let Some(mut v) = self.soft_waits.get_mut(&location) {
             for a in v.drain(..) {
-                let match_writer = a
-                    .expected_writer
-                    .map(|w| w == writer_t)
-                    .unwrap_or(true);
+                let match_writer = a.expected_writer.map(|w| w == writer_t).unwrap_or(true);
                 if match_writer && a.waiter > writer_t {
                     if let Some((_, started)) = self.arm_started.remove(&a.arm_id) {
                         let ns = started.elapsed().as_nanos() as u64;
@@ -268,11 +252,7 @@ impl FenceGraph {
             }
             *v = keep;
         }
-        if self
-            .soft_waits
-            .get(&location)
-            .is_none_or(|v| v.is_empty())
-        {
+        if self.soft_waits.get(&location).is_none_or(|v| v.is_empty()) {
             self.soft_waits.remove(&location);
             self.wait_locations.remove(&location);
         }
@@ -322,12 +302,7 @@ impl FenceGraph {
     }
 
     /// Arm a Blocking WaitFor edge. Does **not** increment SoftWait Soft.
-    pub(crate) fn arm_hard_wait(
-        &self,
-        location: MemoryLocationHash,
-        waiter: TxIdx,
-        writer: TxIdx,
-    ) {
+    pub(crate) fn arm_hard_wait(&self, location: MemoryLocationHash, waiter: TxIdx, writer: TxIdx) {
         self.hard_waits
             .entry(location)
             .or_default()
@@ -336,11 +311,7 @@ impl FenceGraph {
     }
 
     /// Progressive DAG: Data published by `writer` wakes Blocking waiters on ℓ.
-    pub(crate) fn wake_on_data(
-        &self,
-        location: MemoryLocationHash,
-        writer: TxIdx,
-    ) -> Vec<TxIdx> {
+    pub(crate) fn wake_on_data(&self, location: MemoryLocationHash, writer: TxIdx) -> Vec<TxIdx> {
         let mut woken = Vec::new();
         let mut keep = Vec::new();
         if let Some(mut v) = self.hard_waits.get_mut(&location) {
@@ -356,15 +327,12 @@ impl FenceGraph {
             }
             *v = keep;
         }
-        if self
-            .hard_waits
-            .get(&location)
-            .is_none_or(|v| v.is_empty())
-        {
+        if self.hard_waits.get(&location).is_none_or(|v| v.is_empty()) {
             self.hard_waits.remove(&location);
         }
         if !woken.is_empty() {
-            self.hard_wake_count.fetch_add(woken.len(), Ordering::Relaxed);
+            self.hard_wake_count
+                .fetch_add(woken.len(), Ordering::Relaxed);
             self.wake_count.fetch_add(woken.len(), Ordering::Relaxed);
         }
         woken

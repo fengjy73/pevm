@@ -1,6 +1,7 @@
-//! SpecFence **complete CC** — A1–A6 / D1–D7 (not OCC-lite as control plane).
+//! SpecFence **complete CC v2** — Region/Fence state machine + R1-first Resolve.
 //!
-//! Authoritative: `lab/notes/specfence-complete-cc-architecture.md`.
+//! Authoritative: `lab/notes/specfence-complete-architecture-v2.md`.
+//! Landed map: `lab/notes/specfence-architecture-v2-impl.md`.
 //! Family: preset-order hybrid OCC + ahead sketch + ordered admission +
 //! early-visible Bind + first-wave Avoid + piece-restricted resolve.
 //!
@@ -177,7 +178,8 @@ pub(crate) use boundary::{
 };
 pub(crate) use dag::{FenceGraph, SpecDag};
 pub(crate) use edge::{
-    EdgeAction, EdgeKey, EdgeKind, EdgeState, EdgeTable, EdgeView, choose_edge_action,
+    EdgeAction, EdgeKey, EdgeKind, EdgeState, EdgeTable, EdgeView, EdgeVisibility,
+    choose_edge_action, classify_edge,
 };
 pub(crate) use engagement::{AdaptiveEngagement, profile_timing_enabled, research_inspect_enabled};
 pub use finegrain::{
@@ -353,9 +355,8 @@ impl<'a> SpecFenceCtx<'a> {
         false
     }
 
-    /// Retired AEC EV π. Live path is `choose_edge_action` only.
-    /// AdaptiveParams αβγδ / meta_budget / d_wait do **not** choose
-    /// Bind/WaitFor/Unfenced. Kept so lab tests still compile.
+    /// Retired AEC EV π — **not live**. v2 deleted AdaptiveParams / SoftWait /
+    /// Storm Await from access and resolve. Lab tests may still call this.
     #[allow(dead_code)]
     pub(crate) fn choose_resolve(
         &self,

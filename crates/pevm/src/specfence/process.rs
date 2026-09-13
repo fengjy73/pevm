@@ -308,9 +308,12 @@ impl ProcessTrace {
         let seq = self.seq.load(Ordering::Relaxed);
         let e = self.locs.entry(location).or_default();
         if e.first_avoid_seq.load(Ordering::Relaxed) == 0 {
-            let _ = e
-                .first_avoid_seq
-                .compare_exchange(0, seq.max(1), Ordering::Relaxed, Ordering::Relaxed);
+            let _ = e.first_avoid_seq.compare_exchange(
+                0,
+                seq.max(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
         }
     }
 
@@ -370,9 +373,11 @@ impl ProcessTrace {
             let sa = a.bind_after_avoid + a.wait_after_avoid;
             let sb = b.bind_after_avoid + b.wait_after_avoid;
             sb.cmp(&sa).then_with(|| {
-                (b.bind + b.wait_for).cmp(&(a.bind + a.wait_for)).then_with(|| {
-                    (b.unfenced + b.wait_for + b.bind).cmp(&(a.unfenced + a.wait_for + a.bind))
-                })
+                (b.bind + b.wait_for)
+                    .cmp(&(a.bind + a.wait_for))
+                    .then_with(|| {
+                        (b.unfenced + b.wait_for + b.bind).cmp(&(a.unfenced + a.wait_for + a.bind))
+                    })
             })
         });
         let unfenced_after_avoid_total = locs.iter().map(|l| l.unfenced_after_avoid).sum();
@@ -381,8 +386,8 @@ impl ProcessTrace {
             .as_ref()
             .map(|l| l.unfenced_after_avoid)
             .unwrap_or(0);
-        let independent_unfenced_total = self.reasons[ProcessReason::UnfencedIndependence.idx()]
-            .load(Ordering::Relaxed);
+        let independent_unfenced_total =
+            self.reasons[ProcessReason::UnfencedIndependence.idx()].load(Ordering::Relaxed);
         if locs.len() > top_n {
             locs.truncate(top_n);
         }
@@ -424,9 +429,7 @@ impl ProcessTrace {
             hot_fanout_l,
             unfenced_after_fence_on_hot_l,
             independent_unfenced_total,
-            force_prefix_none_unfenced: self
-                .force_prefix_none_unfenced
-                .load(Ordering::Relaxed),
+            force_prefix_none_unfenced: self.force_prefix_none_unfenced.load(Ordering::Relaxed),
             per_tx,
         }
     }

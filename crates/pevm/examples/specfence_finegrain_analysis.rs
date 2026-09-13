@@ -29,8 +29,9 @@ use alloy_rpc_types_eth::Block;
 use flate2::bufread::GzDecoder;
 use pevm::{
     BlockHashes, BuildSuffixHasher, Bytecodes, ConcurrencyMode, EvmAccount, FineGrainSnapshot,
-    InMemoryStorage, Pevm, analyze_dag, hot_locations, kind_histogram,
+    InMemoryStorage, Pevm, analyze_dag,
     chain::{PevmChain, PevmEthereum},
+    hot_locations, kind_histogram,
 };
 use serde::Serialize;
 
@@ -124,7 +125,9 @@ fn repo_root() -> PathBuf {
 }
 
 fn parse_csv_u64(raw: &str) -> Vec<u64> {
-    raw.split(',').filter_map(|s| s.trim().parse().ok()).collect()
+    raw.split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect()
 }
 
 fn load_shared(data_dir: &Path) -> (Arc<Bytecodes>, Arc<BlockHashes>) {
@@ -182,7 +185,15 @@ fn n_tx(block: &Block<<PevmEthereum as PevmChain>::Transaction>) -> usize {
 }
 
 /// v7 SpecFence@8 reference table (from lab/notes/mainnet-sweep-v7-status.md).
-fn v7_refs(block: u64) -> (Option<f64>, Option<usize>, Option<usize>, Option<usize>, Option<usize>) {
+fn v7_refs(
+    block: u64,
+) -> (
+    Option<f64>,
+    Option<usize>,
+    Option<usize>,
+    Option<usize>,
+    Option<usize>,
+) {
     // (sf/occ, wait_hard, inspector_steps, lean_mode_txs, absolute_jump_applied)
     match block {
         19_807_137 => (Some(0.085), Some(7292), Some(1_467_978), Some(0), Some(0)),
@@ -215,14 +226,21 @@ fn timing_from_run(
         let mean_c = if s.abort_events.is_empty() {
             0.0
         } else {
-            s.abort_events.iter().map(|e| e.cascade_validations as f64).sum::<f64>()
+            s.abort_events
+                .iter()
+                .map(|e| e.cascade_validations as f64)
+                .sum::<f64>()
                 / s.abort_events.len() as f64
         };
         (total, max, with_abort, s.abort_events.len(), mean_c)
     } else {
         (0, 0, 0, 0, 0.0)
     };
-    let evm_entries = if mode == "sequential" { 0 } else { m.evm_entries };
+    let evm_entries = if mode == "sequential" {
+        0
+    } else {
+        m.evm_entries
+    };
     ModeTiming {
         mode: mode.to_string(),
         cores,
@@ -230,7 +248,11 @@ fn timing_from_run(
         tps,
         ok,
         error,
-        occ_aborts: if mode == "sequential" { 0 } else { m.occ_aborts },
+        occ_aborts: if mode == "sequential" {
+            0
+        } else {
+            m.occ_aborts
+        },
         abort_rate: if n_tx == 0 || mode == "sequential" {
             0.0
         } else {
@@ -242,7 +264,11 @@ fn timing_from_run(
             m.cascade_validations_scheduled
         },
         evm_entries,
-        full_restart: if mode == "sequential" { 0 } else { m.full_restart },
+        full_restart: if mode == "sequential" {
+            0
+        } else {
+            m.full_restart
+        },
         total_incarnations: total_inc,
         max_incarnation: max_inc,
         txs_with_abort: txs_abort,
@@ -269,7 +295,11 @@ fn run_serial(chain: &PevmEthereum, loaded: &LoadedBlock) -> ModeTiming {
     );
     let elapsed = t0.elapsed().as_secs_f64();
     let elapsed_ms = elapsed * 1000.0;
-    let tps = if elapsed > 0.0 { n as f64 / elapsed } else { 0.0 };
+    let tps = if elapsed > 0.0 {
+        n as f64 / elapsed
+    } else {
+        0.0
+    };
     match result {
         Ok(_) => timing_from_run("sequential", 1, n, elapsed_ms, tps, true, None, &pevm, None),
         Err(e) => timing_from_run(
@@ -298,19 +328,27 @@ fn run_occ(
     let cores_nz = NonZeroUsize::new(cores.max(1)).unwrap();
     // Analysis blocks are >> 4M gas so execute() takes the parallel path.
     let t0 = Instant::now();
-    let result = pevm.execute(
-        chain,
-        &loaded.storage,
-        &loaded.block,
-        cores_nz,
-        false,
-    );
+    let result = pevm.execute(chain, &loaded.storage, &loaded.block, cores_nz, false);
     let elapsed = t0.elapsed().as_secs_f64();
     let elapsed_ms = elapsed * 1000.0;
-    let tps = if elapsed > 0.0 { n as f64 / elapsed } else { 0.0 };
+    let tps = if elapsed > 0.0 {
+        n as f64 / elapsed
+    } else {
+        0.0
+    };
     let snap = pevm.take_finegrain_snapshot();
     let timing = match &result {
-        Ok(_) => timing_from_run("occ", cores, n, elapsed_ms, tps, true, None, &pevm, snap.as_ref()),
+        Ok(_) => timing_from_run(
+            "occ",
+            cores,
+            n,
+            elapsed_ms,
+            tps,
+            true,
+            None,
+            &pevm,
+            snap.as_ref(),
+        ),
         Err(e) => timing_from_run(
             "occ",
             cores,
@@ -495,7 +533,8 @@ fn main() {
     let mut deep_dives = Vec::new();
 
     for &bn in &blocks {
-        let Some(loaded) = load_block(&data_dir, bn, bytecodes.clone(), block_hashes.clone()) else {
+        let Some(loaded) = load_block(&data_dir, bn, bytecodes.clone(), block_hashes.clone())
+        else {
             continue;
         };
         eprintln!(

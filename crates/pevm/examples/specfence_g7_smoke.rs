@@ -404,7 +404,11 @@ fn main() {
                             .unwrap_or(0)
                             .cmp(&a["fail_score"].as_u64().unwrap_or(0))
                     });
-                    let pertx_tag = if tag.is_empty() { "post-u1" } else { tag.as_str() };
+                    let pertx_tag = if tag.is_empty() {
+                        "post-u1"
+                    } else {
+                        tag.as_str()
+                    };
                     let pertx_path = out_dir.join(format!("{pertx_tag}-per-tx-{short}-c8.json"));
                     let head_sha = option_env!("SPECFENCE_BUILD_HEAD").unwrap_or("dbf9f15");
                     std::fs::write(

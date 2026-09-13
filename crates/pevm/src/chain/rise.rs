@@ -316,7 +316,6 @@ impl PevmChain for PevmRise {
         RiseNoBenef::<DB>::default().run(evm)
     }
 
-
     fn is_eip_1559_enabled(&self, _: OpSpecId) -> bool {
         true
     }
