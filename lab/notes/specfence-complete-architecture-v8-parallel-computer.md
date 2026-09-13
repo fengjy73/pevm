@@ -1,4 +1,4 @@
-# SpecFence complete architecture v8 — parallel computer (AUTHORITATIVE SoT)
+# SpecFence complete architecture v8 — PC⊗CC co-equal parallel computer (AUTHORITATIVE SoT)
 
 **Date:** 2026-09-14 (Asia/Shanghai, UTC+8)  
 **Status:** **AUTHORITATIVE design SoT — ready for immediate full-batch implement** (user: 这些都得优化)  
@@ -6,9 +6,9 @@
 **Diagnosis:** `lab/notes/specfence-v6-postland-all-blocks-diagnosis.md`  
 **Switch+Bind audit:** `lab/notes/specfence-v6-switch-and-bind-tax-audit.md`  
 **v7 (absorbed, superseded as SoT):** `lab/notes/specfence-complete-architecture-v7-essence.md`  
-**Earlier PC SoT (primary frame restored):** `lab/notes/specfence-parallel-compute-architecture.md`  
+**Earlier PC SoT (peer frame, not primary):** `lab/notes/specfence-parallel-compute-architecture.md`  
 **Land brief:** `lab/notes/specfence-v8-land-brief.md`  
-**Supersedes as plant SoT:** v6 essence, v7 essence (prescriptions kept), CC-only redesigns.  
+**Supersedes as plant SoT:** v6 essence, v7 essence (prescriptions kept), PC-primary-with-CC-annotation framing, CC-only redesigns.  
 **π fields KEPT:** Spec=Region; Mode(a) verbs; Soft=**0**; exclude set; Spec=Region meaning.  
 **Honesty bar:** nonempty median **> 0.744**; quiet median ≈1.0 with p10 **≥0.85**; named fan_out **14689597 ≥0.85 @8 N≥3**; Soft=0.  
 **Honesty now (tip `3376ac4`):** digest median **0.795**; remasure N=1 median **1.021** (caveat); **14689597 N=3 = 0.336**; R1a=R1b=**0**. **No celebration.**
@@ -17,53 +17,55 @@
 
 ## 0. Essence (ONE paragraph)
 
-**SpecFence v8** is a **preset-order parallel EVM computer**: a task graph of `Execute` / `Validate` / `Repair` stages, a first-class **ready-set**, **work-stealing**, an **execute∥validate pipeline**, and **ProducerStages** that keep writers runnable. Wall obeys  
-`wall = useful_EVM + idle + repair + meta`.  
-Concurrency control (Mode(a) Fence verbs: Spec \| Bind \| WaitFor \| SerialLane \| OrderedAdmit) is a **layer that annotates ReadyEdges and pins access grain** — it does **not** own the schedule loop, the validate walk, or the rem journal. Default Spec ≡ OCC. Empty PE ∧ no ReadyEdge ⇒ **byte-identical OCC path**. Nonempty PE ⇒ Mode(a) at access **and** edge-admit at schedule, with **ProducerStage-safe refuse** (the v6 ready-refuse deadlock is designed out). Bind is **rare** (tip == conflicting producer ∧ EV win); WaitFor/lane are **primary**. Learning is a **closed loop that writes computer structure** (ReadyEdges, PE posteriors, R1 coverage) — not OR-bool gates. Soft=0 forever. Success = median >0.744 **and** 14689597 ≥0.85 @8 N≥3 **and** quiet p10 ≥0.85 **and** Soft=0 — Bind↑ without abort↓ is failure.
+**SpecFence v8** is a **co-equal dual-frame** system: a **parallel computer (PC)** and a **concurrency-control plane (CC)** that **jointly** design the same ready-set and repair stages — **neither demoted**. PC owns Stages (`Execute` / `Validate` / `Repair`), the first-class **ready-set**, **work-stealing**, the **execute∥validate pipeline**, and **ProducerStages** that keep writers runnable; wall obeys `wall = useful_EVM + idle + repair + meta`. CC owns Detect / Avoid / Resolve — **Mode(a)** (Spec \| Bind \| WaitFor \| SerialLane \| OrderedAdmit), **Fence**, **PE**, **certs**, and **R1** — as a **first-class control plane** that **co-owns when stages may enter ready** and **how miss repairs**. Fusion = peers writing the same ReadyEdges, ProducerStage invariants, and Repair plans together. Default Spec ≡ OCC. Empty PE ∧ no ReadyEdge ⇒ **byte-identical OCC path**. Nonempty PE ⇒ Mode(a) at access **and** edge-admit at schedule, with **ProducerStage-safe refuse** (the v6 ready-refuse deadlock is designed out). Bind is **rare** (tip == conflicting producer ∧ EV win); WaitFor/lane are **primary**. Learning is a **closed loop that writes shared computer+control structure** (ReadyEdges, PE posteriors, R1 coverage) — not OR-bool gates. Soft=0 forever. Success = median >0.744 **and** 14689597 ≥0.85 @8 N≥3 **and** quiet p10 ≥0.85 **and** Soft=0 — Bind↑ without abort↓ is failure.
 
 ---
 
-## 0.1 Primary frame vs CC layer (non-negotiable)
+## 0.1 Dual frame — PC ⊗ CC co-equal (non-negotiable)
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│ SpecFenceComputer v8  (THE COMPUTER)                             │
+│ SpecFenceComputer v8  (ONE plant; TWO first-class frames)         │
 │                                                                  │
 │  ready = ProducerStages ∪ PE/edge-satisfied Executes             │
 │        ∪ Validates ∪ Repairs                                     │
 │  steal = independent Stages only (useful_EVM first)              │
 │  pipeline: Execute(t) publish → Validate(t) on another core      │
 │                                                                  │
-│  ┌──────────┐   ┌──────────┐   ┌──────────┐                      │
-│  │ Execute  │──►│ Validate │──►│ Repair   │   Stages             │
-│  └────┬─────┘   └────┬─────┘   └────┬─────┘                      │
-│       │              │              │                            │
-│       ▼              ▼              ▼                            │
-│  ┌─────────────────────────────────────────┐                     │
-│  │ CC LAYER (annotates edges / Mode(a))    │  NOT the computer   │
-│  │  ReadyEdge(t←w) gates ready membership  │                     │
-│  │  Mode(a) at access: Spec|WaitFor|lane|  │                     │
-│  │             Bind(rare)|OrderedAdmit     │                     │
-│  │  cert strips → R1 coverage at fail-a    │                     │
-│  └─────────────────────────────────────────┘                     │
-│       │                                                          │
-│       ▼                                                          │
-│  shared revm + MvMemory                                          │
+│  ┌─────────────────────────┐  ┌──────────────────────────────┐   │
+│  │ PC (parallel computer)  │  │ CC (concurrency control)     │   │
+│  │  Execute / Validate /   │⊗ │  Detect / Avoid / Resolve    │   │
+│  │  Repair Stages          │  │  Mode(a): Spec|WaitFor|lane| │   │
+│  │  ready-set, steal,      │  │         Bind(rare)|Ordered   │   │
+│  │  pipeline               │  │  Fence · PE · certs · R1     │   │
+│  │  ProducerStages         │  │  co-owns ready membership    │   │
+│  │  wall law               │  │  co-owns miss → Repair grain │   │
+│  └───────────┬─────────────┘  └──────────────┬───────────────┘   │
+│              │         FUSION (peers)         │                  │
+│              └───────────────┬────────────────┘                  │
+│                              ▼                                   │
+│              same ReadyEdges · same Repair plans                 │
+│              same ProducerStage invariant                        │
+│                              │                                   │
+│                              ▼                                   │
+│                    shared revm + MvMemory                        │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-| Question | Owner |
-|----------|-------|
-| Which Stage runs on which core now? | **Computer** (ready / steal / pipeline) |
-| May Execute(t) enter ready? | **Computer** + ReadyEdge + ProducerStage invariant |
-| For this access \(a\), Spec or Fence verb? | **CC layer** (Mode(a)) |
-| Miss → B0 or R1 at fail-\(a\)? | **Repair stage** consuming cert coverage |
+| Question | Co-owners |
+|----------|-----------|
+| Which Stage runs on which core now? | **PC** (ready / steal / pipeline) constrained by **CC** ReadyEdge / lane / OrderedAdmit |
+| May Execute(t) enter ready? | **PC ⊗ CC** — ProducerStage invariant (PC) + ReadyEdge / PE admit (CC) |
+| For this access \(a\), Spec or Fence verb? | **CC** Mode(a) — feeds PC schedule (park / refuse / release) |
+| Miss → B0 or R1 at fail-\(a\)? | **CC** cert coverage → **PC** Repair stage plan |
 
-**Ban:** treating SpecFence as “CC-only Mode(a) redesign” while schedule stays Block-STM indices + wave graft. That is v6 fusion theater.
+**Ban:** treating SpecFence as “PC-primary with CC as edge annotation layer.”  
+**Ban:** treating SpecFence as “CC-only Mode(a) redesign” while schedule stays Block-STM indices + wave graft.  
+Both are demotions. Fusion theater of either kind is rejected.
 
 ---
 
-## 0.2 Why v6/v7 still need a PC-primary cut
+## 0.2 Why v6/v7 still need a co-equal cut
 
 ```
 v6 won:   empty-PE OCC retreat; Soft=0; median digest 0.795 > 0.744
@@ -73,14 +75,16 @@ v6 lost:  Bind tax 14689597 (0.336 N=3); ready-refuse abandoned (deadlock);
 
 v7 prescribed: ProducerStage-safe ReadyEdges; WaitFor/lane primary;
                true-k; RS_fence→R1; Soft=0; no template PE; Bind rare
-               — BUT framed as PC⊗CC essence, easy to implement as CC-first
+               — framed PC⊗CC essence, but easy to implement as CC-first
+               or (v8 draft) as PC-primary with CC demoted to annotation
 
-v8:       PRIMARY FRAME = parallel computer (earlier PC SoT restored).
-          ALL v7 prescriptions absorbed as structure of that computer.
+v8:       CO-EQUAL DUAL FRAME = PC ⊗ CC peers.
+          ALL v7 prescriptions absorbed as shared structure of both frames.
+          PC does not own schedule alone; CC does not annotate edges alone.
           Ready for immediate full-batch implement.
 ```
 
-**Regression vs product intent = Fence meta without first-wave Avoid + R1 + ProducerStage-safe schedule.**
+**Regression vs product intent = Fence meta without first-wave Avoid + R1 + ProducerStage-safe schedule — or either frame demoted.**
 
 ---
 
@@ -97,13 +101,14 @@ v8:       PRIMARY FRAME = parallel computer (earlier PC SoT restored).
 | AccessOrdinal HashMap on empty-PE quiet path | **yes** |
 | Tx-global certificate from one Bind covering sibling Spec misses | **yes** |
 | Celebrating median while fan_out≪OCC or Bind↑∧abort↓ | **yes** |
-| P0/P1/P2 staging | **yes** — one coherent computer cut |
+| P0/P1/P2 staging | **yes** — one coherent PC⊗CC cut |
 | **Bind-on-any-published-Data as default Fence** | **yes** |
 | **Ready-edge observe without admit (or refuse without ProducerStage)** | **yes** |
 | **Template PE spray `[1,6,10,20]` on fan_out when ordinal absent** | **yes** |
 | **SpecFence validate always OCC B0 while certs exist** | **yes** |
 | **Gate decide with `dominant_k` alone when live ordinal available** | **yes** |
-| **CC-only redesign that leaves schedule as OCC indices + wave graft** | **NEW v8** |
+| **CC-only redesign that leaves schedule as OCC indices + wave graft** | **yes** |
+| **PC-primary redesign that demotes CC to “annotates edges only”** | **NEW v8** |
 | **Re-enable v6 “defer consumer only” refuse without ProducerStage** | **yes** |
 
 ---
@@ -112,7 +117,7 @@ v8:       PRIMARY FRAME = parallel computer (earlier PC SoT restored).
 
 | Item | v6 live @ tip | **v8** |
 |------|---------------|--------|
-| Primary frame | hybrid OCC↔Mode(a) stitch | **parallel computer** (Stages, ready, steal, pipeline) |
+| Primary frame | hybrid OCC↔Mode(a) stitch | **PC ⊗ CC co-equal** (Stages + control plane peers) |
 | Empty-PE OCC | hybrid `!has_any_predicted` | **kept** — byte-identical OCC |
 | ReadyEdge | observe; refuse off (deadlock) | **ProducerStage + ConsumerEdge**; refuse only if producer runnable/reserved |
 | First wave | abort-then-PE | **seed/HotSet/WŜ → edges before doomed Execute**; else one Spec canary then edge |
@@ -122,10 +127,10 @@ v8:       PRIMARY FRAME = parallel computer (earlier PC SoT restored).
 | Ordinal | `note` dead; templates | **live true-\(k\) when PE-on**; templates **forbidden** on fan_out |
 | Validate | always OCC B0 | **RS_spec OCC bool; RS_fence covers_all → R1a/R1b at fail-a** |
 | HotSet/WŜ | posterior bump | **ReadyEdge insert + PE posterior** (not Wait OR-door) |
-| Learning | PE class + vis | **closed loop → edges, PE, R1 coverage** (computer structure) |
+| Learning | PE class + vis | **closed loop → edges, PE, R1 coverage** (shared PC⊗CC structure) |
 | Repair | B0≡aborts | **R1 on certified fail-a; Spec-only → B0 + train true-k** |
 | Telemetry | Bind invisible to process | **every successful verb records process + decision_fields** |
-| CC role | owns switch / half the story | **annotates edges**; computer owns schedule |
+| Frame roles | switch / half-story / annotation drafts | **peers co-own ready-set + repair**; neither demoted |
 
 ---
 
@@ -133,21 +138,21 @@ v8:       PRIMARY FRAME = parallel computer (earlier PC SoT restored).
 
 ### 1.1 Objects
 
-| Object | Meaning | SoT? |
-|--------|---------|------|
-| **Block** | txs `0..n-1`; commit = preset order | yes |
-| **Access-event \(a\)** | \(a=(t,k,\mathrm{depth},\ell,\mathrm{mode})\) | **yes — primary grain** |
-| **Stage** | Execute(t) \| Validate(t) \| Repair(grain) | **yes — computer** |
-| **ProducerStage** | runnable Stage for writer \(w\) (Execute/Repair) reserved on index | **yes — deadlock ban** |
-| **ReadyEdge** | `(consumer_a \| consumer_t) ← producer_t` on PE/RAW class | **yes — schedule** |
-| **EdgeVisibility \(e_{\mathrm{vis}}\)** | writer?, published_Data?, unfinished_**!done**, executing? | **yes** |
-| **Gate** | PE\((\ell,k_{\mathrm{true}},\mathrm{morph})\) ∨ independence_certified | **yes** |
-| **Mode(a)** | Spec \| Bind \| WaitFor \| SerialLane \| OrderedAdmit | **yes — CC layer verb** |
-| **Certificate strip** | rem/CallEntry/first_k **for Fenced prefix only** | Repair coverage |
-| **SerialLane token** | mutex on PE access-class | Fence progress |
-| **Incarnation** | bookkeeping | not Avoid key |
+| Object | Meaning | SoT? | Frame |
+|--------|---------|------|-------|
+| **Block** | txs `0..n-1`; commit = preset order | yes | shared |
+| **Access-event \(a\)** | \(a=(t,k,\mathrm{depth},\ell,\mathrm{mode})\) | **yes — primary grain** | CC grain / PC consume |
+| **Stage** | Execute(t) \| Validate(t) \| Repair(grain) | **yes — PC** | PC |
+| **ProducerStage** | runnable Stage for writer \(w\) (Execute/Repair) reserved on index | **yes — deadlock ban** | PC (CC edges depend on it) |
+| **ReadyEdge** | `(consumer_a \| consumer_t) ← producer_t` on PE/RAW class | **yes — schedule** | **PC ⊗ CC** |
+| **EdgeVisibility \(e_{\mathrm{vis}}\)** | writer?, published_Data?, unfinished_**!done**, executing? | **yes** | CC → PC ready |
+| **Gate** | PE\((\ell,k_{\mathrm{true}},\mathrm{morph})\) ∨ independence_certified | **yes** | CC |
+| **Mode(a)** | Spec \| Bind \| WaitFor \| SerialLane \| OrderedAdmit | **yes — CC verb** | CC → PC park/release |
+| **Certificate strip** | rem/CallEntry/first_k **for Fenced prefix only** | Repair coverage | CC → PC Repair |
+| **SerialLane token** | mutex on PE access-class | Fence progress | CC → PC ready |
+| **Incarnation** | bookkeeping | not Avoid key | shared |
 
-### 1.2 Makespan law (primary)
+### 1.2 Makespan law (PC; CC shapes idle+repair+meta)
 
 ```
 wall = useful_EVM + idle + repair + meta
@@ -172,7 +177,8 @@ idle_frac ≈ 1 - useful_EVM / (P × wall)
 6. `unfinished` never counts done writers.  
 7. **Bind_count↑ ∧ abort_count↓ falsifier** — if Bind rises and aborts do not fall vs OCC, Bind is tax (14689597).  
 8. **Refuse(consumer) ⇒ ProducerStage(w) is runnable or already Done** — no v6 deadlock.  
-9. Steal never takes PE-blocked Execute “to look busy”; pipeline Validate of Executed is first-class.
+9. Steal never takes PE-blocked Execute “to look busy”; pipeline Validate of Executed is first-class.  
+10. **Neither frame demoted** — ReadyEdge / Repair plans are jointly authored; CC is not an annotation layer; PC is not a schedule shell around Mode(a).
 
 ### 1.3 Success metrics
 
@@ -183,11 +189,11 @@ idle_frac ≈ 1 - useful_EVM / (P × wall)
 - **14689597 ≥0.85 @8 N≥3**  
 - Soft=0; exclude=0  
 
-**Falsifiers:** Soft>0; `note_fence` without verb; prefer_admit without lane progress; unfinished includes done; AccessOrdinal HashMap on empty-PE; B0≡aborts on fan_out with PE+certs present; Bind↑∧abort↓; template PE on fan_out; median claim without JSON; schedule refuse without producer runnable; CC-only land that leaves ready refuse off.
+**Falsifiers:** Soft>0; `note_fence` without verb; prefer_admit without lane progress; unfinished includes done; AccessOrdinal HashMap on empty-PE; B0≡aborts on fan_out with PE+certs present; Bind↑∧abort↓; template PE on fan_out; median claim without JSON; schedule refuse without producer runnable; CC-only land that leaves ready refuse off; **PC-primary land that demotes CC to edge annotation**.
 
 ---
 
-## 2. The computer — Stages, ready-set, steal, pipeline
+## 2. PC frame — Stages, ready-set, steal, pipeline
 
 ### 2.1 Task graph
 
@@ -204,9 +210,9 @@ Execute(t, inc)  ──publish WS/RS──►  Validate(t, inc)
                       └──► selective R1 on fenced; B0 residual on Spec
 ```
 
-Admission edges for later `Execute(t')`: ReadyEdge / SerialLane / OrderedAdmit / Unfenced OCC speculation. **Not** “tx waits” — admission is per access class / edge, then the incarnation is ready or parked on that grain.
+Admission edges for later `Execute(t')`: ReadyEdge / SerialLane / OrderedAdmit / Unfenced OCC speculation — **authored with CC**. **Not** “tx waits” — admission is per access class / edge, then the incarnation is ready or parked on that grain.
 
-### 2.2 Ready set (fixes v6 deadlock)
+### 2.2 Ready set (fixes v6 deadlock; PC⊗CC joint)
 
 ```
 ready =
@@ -248,7 +254,7 @@ Hang-freedom = ProducerStage progress **or** serial-lane **or** Bind race **or**
 
 On producer publish Data for \(\ell\): wake WaitFor; release ReadyEdges; grant next SerialLane waiter **one** at a time. No fleet SoftWait.
 
-### 2.6 First-wave Avoid (schedule-first)
+### 2.6 First-wave Avoid (schedule + Detect/Avoid joint)
 
 ```
 before Execute(t) on fan_out / HotSet star:
@@ -263,7 +269,9 @@ ESTIMATE observe may insert edges **without** marking PE classes that open Bind 
 
 ---
 
-## 3. CC layer — Mode(a) annotates edges (Bind demoted)
+## 3. CC frame — Mode(a) / Fence / PE / certs / R1 (first-class control plane)
+
+CC is **not** an annotation layer. It **co-owns** ready membership (via ReadyEdge / lane / OrderedAdmit) and **co-owns** Repair grain (via cert `covers_all` → R1). Bind remains demoted relative to WaitFor/lane; **the CC frame itself is not demoted**.
 
 ### 3.1 `access_vis` (kept from v6 S2)
 
@@ -319,7 +327,7 @@ else                          → Spec (roi_skip)
 
 ---
 
-## 4. Validate + Repair (certs finally consume)
+## 4. Validate + Repair (certs finally consume; PC⊗CC joint)
 
 ```
 Validate(t):
@@ -352,9 +360,9 @@ When PE becomes nonempty mid-block: enable ordinal+decide **for subsequent PE �
 
 ---
 
-## 6. Learning — closed loop as **computer structure**
+## 6. Learning — closed loop as **shared PC⊗CC structure**
 
-Learning does **not** OR-bool Fire verbs. It writes structures the computer consumes at three ports: **schedule admit**, **decide**, **validate/repair**.
+Learning does **not** OR-bool Fire verbs. It writes structures **both frames** consume at three ports: **schedule admit (PC)**, **decide (CC)**, **validate/repair (PC⊗CC)**.
 
 ### 6.1 Ports (mandatory consume)
 
@@ -388,7 +396,7 @@ epoch observe:
   on Fence verb: strip + process.record (telemetry must see Bind/WaitFor)
 
 epoch consume:
-  schedule: ReadyEdge + ProducerStage          # computer structure
+  schedule: ReadyEdge + ProducerStage          # PC ⊗ CC structure
   decide:   k_true + vis + EV (WaitFor/lane ≫ Bind)
   validate: covers_all → R1 else B0
 
@@ -396,6 +404,7 @@ epoch falsify:
   Bind↑ ∧ abort↓ → disable Bind for that class (roi_skip)
   refuse without ProducerStage → bug
   cert without R1 path → bug
+  PC-primary land demoting CC → bug
 ```
 
 ### 6.4 v6 learned-unused → v8 must consume
@@ -428,7 +437,7 @@ begin_block:
   if empty PE ∧ no edges: quiet_occ_mode=true
   clear cert strips; clear lane tokens; clear ProducerStage table
 
-schedule:                                    # THE COMPUTER
+schedule:                                    # PC, constrained by CC edges
   pop ready Stage (ProducerStage ∪ PE-satisfied Execute ∪ Validate ∪ Repair)
   steal independent only; pipeline Validate of Executed
 
@@ -438,12 +447,12 @@ Execute(t):
     if PE-on ∧ location_predicted(ℓ):
       k := ordinal.note(ℓ)                 # true-k
       vis := access_vis_corrected(ℓ)
-      verb := decide(... tip_is_conflict_producer ...)
+      verb := decide(... tip_is_conflict_producer ...)   # CC
       act(verb); cert only on success; process.record(verb)
     else Spec OCC
   publish; release edges; enqueue Validate(t)   # pipeline
 
-Validate / Repair: as §4
+Validate / Repair: as §4                       # CC certs → PC Repair
 ```
 
 ---
@@ -453,9 +462,9 @@ Validate / Repair: as §4
 ```
 specfence/
   computer.rs       # ready/steal/pipeline with ProducerStage + PE refuse (no deadlock)
-  ready_edge.rs     # edges + producer runnable invariant
+  ready_edge.rs     # edges + producer runnable invariant  (PC⊗CC shared)
   producer_stage.rs # NEW — reserve/progress writers under refuse
-  mode.rs / access_policy.rs  # decide Bind-rare; WaitFor/lane primary
+  mode.rs / access_policy.rs  # decide Bind-rare; WaitFor/lane primary  (CC)
   access_vis.rs     # unfinished=!done; tip_is_conflict_producer
   access_log.rs     # ordinal.note when PE-on only
   certificate.rs    # covers_all for R1
@@ -497,9 +506,10 @@ vm.rs               # access gate Mode(a); empty-PE → occ_read
 ## 11. Implementation posture
 
 - **Status: design SoT ready for immediate full-batch implement.**  
-- No P0/P1/P2 — one coherent computer cut.  
+- No P0/P1/P2 — one coherent **PC⊗CC** cut.  
 - No SoftWait Soft, canary, ForcePrefix π, AEC OR-bool π, mark_pcc resurrection.  
 - Do not re-enable v6 “defer consumer only” refuse without ProducerStage.  
+- Do not land PC-primary with CC demoted to annotation, or CC-only with schedule left as OCC graft.  
 - Land brief: `lab/notes/specfence-v8-land-brief.md`.  
 - This note does **not** change Rust; implementers follow the land brief.
 
@@ -518,10 +528,10 @@ vm.rs               # access gate Mode(a); empty-PE → occ_read
 9. Ready refuse only with ProducerStage runnable; no schedule spin deadlock.  
 10. Empty-PE path: AccessOrdinalLog HashMap ops = 0; no template PE on quiet lone abort.  
 11. Gate \(k\) = live ordinal when PE-on; fan_out templates = 0.  
-12. Computer owns schedule; CC only annotates edges (no CC-only partial land).
+12. **PC ⊗ CC co-equal** — ReadyEdges and Repair plans jointly owned; neither frame demoted to annotation or graft.
 
 ---
 
 ## 13. Essence restated
 
-Fusion = **one parallel EVM computer** (Stages + ready-set + steal + pipeline + ProducerStages) whose wall is `useful_EVM+idle+repair+meta`; Mode(a) is a **CC layer that annotates ReadyEdges** so Fence is **timely at the right place** (schedule-first Avoid / WaitFor pin / rare conflict-tip Bind), not abort-then-Bind-cert museum; learning writes **edges, posteriors, and covers_all** that schedule, decide, and validate all consume; Repair is **fail-a grain**; quiet is **OCC**; Soft forever 0. v6 cleared a median bar and lost fan_out to Bind tax + abandoned refuse; v7 named the prescriptions; **v8 makes the parallel computer the authoritative frame and absorbs every v7 gap for immediate full-batch implement.**
+Fusion = **two first-class peers** designing the same plant: a **parallel EVM computer** (Stages + ready-set + steal + pipeline + ProducerStages; wall = `useful_EVM+idle+repair+meta`) and a **concurrency-control plane** (Detect/Avoid/Resolve; Mode(a) Fence verbs; PE; certs; R1) that **co-owns when stages may run and how miss repairs**. ReadyEdges, ProducerStage invariants, and Repair grains are **shared structure**, not CC annotations on a PC schedule and not PC scaffolding around Mode(a). Fence is **timely at the right place** (schedule-first Avoid / WaitFor pin / rare conflict-tip Bind), not abort-then-Bind-cert museum; learning writes **edges, posteriors, and covers_all** that schedule, decide, and validate all consume; Repair is **fail-a grain**; quiet is **OCC**; Soft forever 0. v6 cleared a median bar and lost fan_out to Bind tax + abandoned refuse; v7 named the prescriptions; **v8 makes PC⊗CC co-equal the authoritative frame and absorbs every v7 gap for immediate full-batch implement.**
