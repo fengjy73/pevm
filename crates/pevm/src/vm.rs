@@ -2903,17 +2903,25 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     self.mv_memory.record(tx_version, read_set, write_set);
                 // M3: learn process WŜ from this incarnation's writes (no residual publish).
                 // R1/R3: feed HotSet writer counts (H_w) from non-lazy writes only.
-                if self.specfence.mode == crate::ConcurrencyMode::SpecFence
-                    && self.specfence.kernel.is_pcc(tx_version.tx_idx)
-                {
-                    let locs: Vec<_> = self.mv_memory.write_locations(tx_version.tx_idx);
-                    self.specfence.rw_prior.observe_write_set(&locs, None);
-                    for loc in hotset_writer_locs {
-                        self.specfence.hotset.note_writer(loc, tx_version.tx_idx);
+                if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+                    if self.specfence.kernel.is_pcc(tx_version.tx_idx) {
+                        let locs: Vec<_> = self.mv_memory.write_locations(tx_version.tx_idx);
+                        self.specfence.rw_prior.observe_write_set(&locs, None);
+                        for loc in hotset_writer_locs {
+                            self.specfence.hotset.note_writer(loc, tx_version.tx_idx);
+                        }
+                        // A2: progressive DAG — Data is visible; wake Blocking waiters
+                        // before is_done (SoftWait Soft stays 0).
+                        self.wake_on_data_publish(tx_version.tx_idx, &locs);
+                    } else {
+                        // OccKernel: observe-only HotSet / WŜ (not rem, not wake).
+                        self.specfence
+                            .rw_prior
+                            .observe_write_set(&hotset_writer_locs, None);
+                        for loc in hotset_writer_locs {
+                            self.specfence.hotset.note_writer(loc, tx_version.tx_idx);
+                        }
                     }
-                    // A2: progressive DAG — Data is visible; wake Blocking waiters
-                    // before is_done (SoftWait Soft stays 0).
-                    self.wake_on_data_publish(tx_version.tx_idx, &locs);
                 }
                 if wrote_new_location {
                     flags |= FinishExecFlags::WroteNewLocation;

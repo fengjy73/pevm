@@ -543,6 +543,7 @@ impl Pevm {
                                         &mv_memory,
                                         &scheduler,
                                         &tx_version,
+                                        Some(&metrics_inner),
                                     )
                                 } else if specfence.mode == ConcurrencyMode::SpecFence
                                     && specfence.kernel.is_occ(tx_version.tx_idx)
@@ -987,7 +988,12 @@ fn try_validate(
 ) -> Option<Task> {
     // OccKernel / OCC never enter this museum — journal-less RebindThis is banned.
     if specfence.mode == ConcurrencyMode::Occ {
-        return crate::specfence::validate_occ_stage(mv_memory, scheduler, tx_version);
+        return crate::specfence::validate_occ_stage(
+            mv_memory,
+            scheduler,
+            tx_version,
+            Some(specfence.metrics),
+        );
     }
     if specfence.mode == ConcurrencyMode::SpecFence && specfence.kernel.is_occ(tx_version.tx_idx) {
         return crate::specfence::validate_occ_kernel(mv_memory, scheduler, tx_version, specfence);

@@ -67,16 +67,21 @@ pub(crate) fn next_occ_task(scheduler: &Scheduler) -> Option<Task> {
     scheduler.next_task()
 }
 
-/// OCC validate stage: bool walk + B0 estimates. No rem, no SF metrics.
+/// OCC validate stage: bool walk + B0 estimates. Abort counters only (no rem).
 pub(crate) fn validate_occ_stage(
     mv_memory: &MvMemory,
     scheduler: &Scheduler,
     tx_version: &TxVersion,
+    metrics: Option<&super::MetricsInner>,
 ) -> Option<Task> {
     let valid = occ_read_set_valid(mv_memory, tx_version.tx_idx);
     let aborted = !valid && scheduler.try_validation_abort(tx_version);
     if aborted {
         mv_memory.convert_writes_to_estimates(tx_version.tx_idx);
+        if let Some(m) = metrics {
+            m.record_occ_abort();
+            m.record_full_restart();
+        }
     }
     scheduler.finish_validation(tx_version, aborted)
 }
@@ -101,6 +106,9 @@ pub(crate) fn validate_occ_kernel(
     mv_memory.convert_writes_to_estimates(tx_version.tx_idx);
     specfence.metrics.record_occ_abort();
     specfence.metrics.record_full_restart();
+    if !invalid.is_empty() {
+        specfence.metrics.record_region_validate_fail(invalid.len());
+    }
     specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
     specfence
         .partial_retry
@@ -125,6 +133,8 @@ pub(crate) fn validate_occ_kernel(
                     .first_k(tx_version.tx_idx, *location)
                     .map(|k| k as u32)
             });
+        // OccKernel has no rem first_k — residual class k=1 so PE can arm.
+        let loc_k = loc_k.or(Some(1));
         specfence
             .learner
             .note_abort_access(*location, cascade_hint, loc_k);
@@ -134,6 +144,19 @@ pub(crate) fn validate_occ_kernel(
     }
 
     let rewind_to = mv_memory.min_higher_reader_of(tx_version.tx_idx, &write_locations);
+    let block_size = scheduler.block_size();
+    let cascade_from = tx_version.tx_idx + 1;
+    let (cascade, skipped) = match rewind_to {
+        Some(to) => {
+            let to = to.min(block_size);
+            (
+                block_size.saturating_sub(to),
+                to.saturating_sub(cascade_from),
+            )
+        }
+        None => (0, block_size.saturating_sub(cascade_from)),
+    };
+    specfence.metrics.record_fence_cascade(cascade, skipped);
     scheduler.finish_validation_fenced(tx_version, true, rewind_to, Some(specfence.wave))
 }
 
