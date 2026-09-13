@@ -101,11 +101,8 @@ pub(crate) fn decide(
             return AccessDecision::WaitFor { writer: w };
         }
     }
-    // Bind only when EV says win: intra abort-PE or cost-aware prior.
-    // Ungated Bind-on-Data after ESTIMATE-PE was stale-Data theater.
-    if vis.published_data && vis.unfinished == 0 && park_ok {
-        return AccessDecision::Bind;
-    }
+    // Bind-on-Data is stale when later writers are not yet in MV (14689597
+    // 550 vs OCC 66). WaitFor(executing) is the only timely Fence.
     AccessDecision::UnfencedOcc {
         predicted: true,
         roi_skip: true,
@@ -210,7 +207,14 @@ mod tests {
     fn prior_pe_plus_data_is_bind() {
         let live = fan_out_learner();
         live.seed_predicted_essential(7, 6);
-        assert_eq!(decide(&live, 7, 6, Some(&data_vis())), AccessDecision::Bind);
+        assert_eq!(
+            decide(&live, 7, 6, Some(&data_vis())),
+            AccessDecision::UnfencedOcc {
+                predicted: true,
+                roi_skip: true
+            },
+            "Bind-on-Data is stale-writer theater; WaitFor(executing) only"
+        );
     }
 
     #[test]
