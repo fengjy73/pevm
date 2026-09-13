@@ -544,6 +544,11 @@ impl LiveLearner {
     /// Park/rewind storms stay Unfenced≡OCC (miss → cheap reincarnation).
     #[inline]
     pub(crate) fn pcc_makespan_win(&self, location: MemoryLocationHash, k: u32) -> bool {
+        // Quiet cohort stays Unfenced≡OCC even after a lone intra mark
+        // (2179522: one abort must not Bind-tax the rest of the block).
+        if self.quiet_fence_off() {
+            return false;
+        }
         if !self.predicted_essential_intra(location, k) {
             return false;
         }
@@ -1613,8 +1618,19 @@ mod tests {
         );
         live.note_abort_access(7, 2, Some(6));
         assert!(
+            !live.pcc_makespan_win(7, 6),
+            "quiet_fence_off: one abort must not Bind-tax quiet"
+        );
+        live.begin_block(MorphWeights {
+            fan_out: 0.70,
+            mixed: 0.15,
+            waw_spine: 0.10,
+            quiet: 0.05,
+        });
+        live.note_abort_access(7, 2, Some(6));
+        assert!(
             live.pcc_makespan_win(7, 6),
-            "intra abort evidence may fire PCC"
+            "intra abort evidence may fire PCC off quiet"
         );
         assert!(
             !live.pcc_makespan_win(7, 12),
