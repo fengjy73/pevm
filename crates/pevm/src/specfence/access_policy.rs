@@ -85,7 +85,9 @@ pub(crate) fn decide(
     // HotSet / WŜ are posterior / ready-edge priors, not SerialLane OR-doors.
     // Multi-writer PE class first — do **not** Bind stale Data (theater).
     let intra = learner.predicted_essential_intra(location, access_k);
-    let park_ok = intra || learner.prior_pe_fire_wins(vis);
+    // 2179522: one abort + Bind livelocked 3s. Quiet cohort stays Spec
+    // until abort/park heat clears `quiet_fence_off`.
+    let park_ok = !learner.quiet_fence_off() && (intra || learner.prior_pe_fire_wins(vis));
     if vis.unfinished > 1 || (vis.in_serial_lane && vis.unfinished > 0) {
         // SerialLane parks only the executing head. Ready-head park
         // serializes satellites before they plant ESTIMATE and inflates
@@ -264,16 +266,25 @@ mod tests {
     }
 
     #[test]
-    fn quiet_intra_pe_may_fence_on_events() {
-        // SoT: quiet_fence_off is not a live Fire ban. Intra PE + e_vis Fences.
+    fn quiet_intra_pe_stays_spec_until_heat() {
+        // 2179522: one abort must not Bind-tax / livelock the quiet cohort.
         let live = LiveLearner::new();
         live.begin_block(MorphWeights::default());
         live.note_abort_access(7, 2, Some(6));
         assert_eq!(
             decide(&live, 7, 6, Some(&exec_vis(1))),
-            AccessDecision::WaitFor { writer: 1 }
+            AccessDecision::UnfencedOcc {
+                predicted: true,
+                roi_skip: true
+            }
         );
-        assert_eq!(decide(&live, 7, 6, Some(&data_vis())), AccessDecision::Bind);
+        assert_eq!(
+            decide(&live, 7, 6, Some(&data_vis())),
+            AccessDecision::UnfencedOcc {
+                predicted: true,
+                roi_skip: true
+            }
+        );
     }
 
     #[test]
