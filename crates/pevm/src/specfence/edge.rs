@@ -1,12 +1,24 @@
-//! Fine-grained Detect (D5) + `choose_edge_action` (A1–A4, D6).
+//! Frozen-grain Detect + `choose_edge_action` (v4.1-frozen π).
 //!
 //! **Spec = Region** (this `EdgeKey`), not speculate. Optimistic access is
-//! [`EdgeAction::Unfenced`]. Fence = Bind / WaitFor / serial-lane admission.
+//! [`EdgeAction::Unfenced`] ≡ OCC-cost for **this** access when
+//! ¬PredictedEssential. Fence = Bind / WaitFor / serial-lane / ordered-admit
+//! on **this** \(a\) only — never sticky Wait-on-tx.
 //!
-//! Conflict identity is **not** a flat `(ℓ, reader)` and not `RegionMode`:
+//! Frozen π:
+//! ```text
+//! a     = (t, k, depth, ℓ, mode)          # inc NOT Avoid key
+//! e_vis = (writer?, published_Data?, kind)
+//! gate  = PredictedEssential(ℓ, k, morph) ∨ independence_certified
+//! ```
+//!
+//! Conflict identity is **not** a flat `(ℓ, reader)` and not `inc` / ForcePrefix:
 //! - `L_record` = location hash
 //! - `L_access` = `(reader, k, depth)` (multi-touch / frames)
 //! - `L_edge` = typed wr/rw/ww with unpublished | published-uncommitted | validated
+//!
+//! Live verbs read **only** π fields. `force_prefix` / canary / H / morph /
+//! `writer_validated` / `inc` are observe-only or excluded — never OR-doors.
 //!
 //! π is this module — not AEC EV Await, not Storm/Quiet morph, not OCC-retry.
 
@@ -62,14 +74,34 @@ pub(crate) struct EdgeRec {
 pub(crate) enum EdgeAction {
     /// Fence: install a published version (A3). Writer need not be Validated.
     Bind(TxVersion),
-    /// Fence: ordered wait-for an unpublished essential / serial-lane pred (D6).
+    /// Fence: WaitFor unpublished PredictedEssential writer (this \(a\) only).
     WaitFor(TxIdx),
-    /// No Region barrier — independence, canary, or cold discovery.
-    /// Not Spec. Spec = Region.
+    /// No Region barrier — ¬PredictedEssential / independence ≡ OCC for this \(a\).
+    /// Not Spec. Spec = Region. Never a canary / ForcePrefix tax class.
     Unfenced,
 }
 
-/// Features for `choose_edge_action`. No AdaptiveParams. No morph mode.
+/// Access-class bucket for PredictedEssential(\(ℓ,k,\mathrm{morph}\)).
+/// Same buckets as the 99-block field table (`k1_3` / `k16p` / …).
+#[inline]
+pub(crate) fn access_k_class(k: u32) -> u8 {
+    match k {
+        0 => 0,
+        1..=3 => 1,
+        4..=7 => 2,
+        8..=15 => 3,
+        _ => 4,
+    }
+}
+
+/// Features for `choose_edge_action`. Live π fields vs observe/exclude.
+///
+/// **Enter π:** \(a=(t,k,\mathrm{depth},ℓ)\), \(e_{\mathrm{vis}}\),
+/// `predicted_essential`, `independence_certified`.
+/// **Observe only:** H, prior_warm, canary, clique, force_prefix, morph,
+/// `writer_validated`, Ready/Executing, avoid-as-ℓ-sticky.
+/// **Exclude as Avoid keys:** `inc`, canary verb, `force_prefix`, H-OR,
+/// morph actuator, `writer_validated` Bind gate, flat `(ℓ,reader)`.
 #[derive(Debug, Clone)]
 pub(crate) struct EdgeView {
     pub location: MemoryLocationHash,
@@ -80,50 +112,59 @@ pub(crate) struct EdgeView {
     pub bind_version: Option<TxVersion>,
     /// True when MV has non-ESTIMATE Data (A3). Not a Bind gate.
     pub writer_published: bool,
-    /// True when writer is Validated — **not** a Bind gate (A3).
+    /// Observe / metric only — **not** a Bind gate (A3).
     pub writer_validated: bool,
     pub is_program: bool,
+    /// Observe / prior only — **banned** as Wait OR-door.
     pub in_hot_set: bool,
-    /// A2: first wr/publish already broadcast Avoid for this ℓ.
+    /// Observe: location-wide first-wave flag. **Not** a live OR-door
+    /// (per-access-class PredictedEssential is the gate).
     pub avoid_broadcast: bool,
-    /// A2: first-wave canary still allowed (no Avoid yet, grant open).
+    /// Exclude: canary as live verb. Always ignored by classify.
     pub canary_ok: bool,
-    /// A4: no predicted essential edge.
+    /// A4: ¬PredictedEssential certificate → Unfenced≡OCC.
     pub independence_certified: bool,
-    /// Known/predicted unpublished essential anti-dep.
+    /// Live gate: PredictedEssential(\(ℓ,k,\mathrm{morph}\)) for **this** \(a\).
+    pub predicted_essential: bool,
+    /// Alias of `predicted_essential` for DecisionFieldAgg (lab).
     pub essential_antidep: bool,
+    /// Exclude: ForcePrefix bool is **not** π (metrics → 0).
     pub force_prefix: bool,
-    /// A1: mass Unfenced on this clique is gated.
+    /// Observe: clique / canary-adjacent. **Not** an Avoid key.
     pub clique_gated: bool,
-    /// U3: writer is actively Executing (WaitFor target).
+    /// Observe: writer Executing (ordered-admit heat, not a verb).
     pub writer_executing: bool,
-    /// S1: writer is ReadyToExecute (prefer-admit, not Unfenced hang-freedom).
+    /// Observe: writer Ready (ordered-admit, not Unfenced hang-freedom).
     pub writer_ready: bool,
 }
 
 /// Version-visibility state (native CC). Reasons are metrics-only.
-/// Not `must_wait = a∨b∨c∨d` — classify first, then one verb.
+/// Not `must_wait = force_prefix∨avoid∨H∨canary∨inc` — classify first, then one verb.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum EdgeVisibility {
     /// Published Data (incl. Executed-not-Validated tip) → Bind.
     PublishedData {
         version: TxVersion,
     },
-    /// Unpublished essential / clique-after-canary with writer `w < reader`.
+    /// PredictedEssential ∧ writer? ∧ ¬published ∧ \(w < reader\).
     UnpublishedEssential {
         writer: TxIdx,
     },
-    /// Essential / Avoid / force_prefix ∧ writer = None ∧ reader > 0.
+    /// PredictedEssential ∧ unpublished ∧ a **real** serial-lane pred
+    /// (writer identity). Never `reader-1` ghost (wait_no_writer smell).
     SerialLane {
         pred: TxIdx,
     },
     Independent,
-    Canary,
     Cold,
 }
 
-/// Classify EdgeView into version-visibility. Hang-freedom is admit/steal,
-/// never Unfenced. `writer_validated` / Ready / Executing are Detect only.
+/// Classify \(a + e_{\mathrm{vis}} + \mathrm{gate}\) into version-visibility.
+///
+/// Exclude-set fields (`force_prefix`, canary, H, clique, `writer_validated`,
+/// location-wide avoid) are recorded then discarded — they never OR into Fence.
+/// Hang-freedom is serial-lane / ordered-admit / steal, never Unfenced-on-essential
+/// and never WaitFor without a writer identity.
 pub(crate) fn classify_edge(v: &EdgeView) -> EdgeVisibility {
     let _ = (
         v.location,
@@ -132,60 +173,61 @@ pub(crate) fn classify_edge(v: &EdgeView) -> EdgeVisibility {
         v.access_depth,
         v.is_program,
     );
+    // Exclude / observe — never live OR-bools.
     let _ = v.writer_validated;
     let _ = (v.writer_executing, v.writer_ready);
-    // H membership is a Region prior, not an OR-door into WaitFor.
     let _ = v.in_hot_set;
+    let _ = v.force_prefix;
+    let _ = v.canary_ok;
+    let _ = v.clique_gated;
+    let _ = v.avoid_broadcast;
 
-    if let Some(version) = v.bind_version.clone() {
-        return EdgeVisibility::PublishedData { version };
-    }
-    if v.writer_published {
-        if let Some(w) = v.writer {
-            return EdgeVisibility::PublishedData {
-                version: TxVersion {
-                    tx_idx: w,
-                    tx_incarnation: 0,
-                },
-            };
+    // gate: PredictedEssential(ℓ, k, morph) for THIS a only.
+    let predicted = v.predicted_essential || v.essential_antidep;
+
+    // e_vis Bind only under PredictedEssential (A3: Data→Bind, no
+    // writer_validated gate). ¬PredictedEssential must stay Unfenced≡OCC
+    // even when MV Data exists — that is the hybrid law (no Bind tax on cold).
+    if predicted {
+        if let Some(version) = v.bind_version.clone() {
+            return EdgeVisibility::PublishedData { version };
         }
-    }
-
-    let known_essential = v.essential_antidep || v.avoid_broadcast || v.force_prefix;
-    let clique_fence = v.clique_gated && !v.canary_ok;
-    let unpublished_fence = known_essential || clique_fence;
-
-    if unpublished_fence {
+        if v.writer_published {
+            if let Some(w) = v.writer {
+                return EdgeVisibility::PublishedData {
+                    version: TxVersion {
+                        tx_idx: w,
+                        tx_incarnation: 0,
+                    },
+                };
+            }
+        }
         if let Some(w) = v.writer {
             if w < v.reader {
                 return EdgeVisibility::UnpublishedEssential { writer: w };
             }
             // inversion: later/self writer is not a preset-order anti-dep
-        } else if v.reader > 0 && known_essential {
-            return EdgeVisibility::SerialLane { pred: v.reader - 1 };
         }
-        // Clique forming, no writer yet: first-wave (not serial-all).
+        // No writer identity → do **not** WaitFor(reader-1). Serial-lane /
+        // ordered-admit happen in the scheduler; classify stays Unfenced≡OCC
+        // rather than invent wait_no_writer.
     }
 
-    if v.canary_ok {
-        return EdgeVisibility::Canary;
-    }
-    if v.independence_certified && !known_essential && !clique_fence {
+    if v.independence_certified || !predicted {
         return EdgeVisibility::Independent;
     }
     EdgeVisibility::Cold
 }
 
-/// Decide the protocol verb from version-visibility. Bounded Unfenced:
-/// known essential → Bind or WaitFor. Ready spine stays WaitFor (admit is hang-freedom).
+/// Decide the protocol verb from frozen π visibility.
+/// PredictedEssential ∧ Data → Bind; PredictedEssential ∧ writer → WaitFor;
+/// else Unfenced≡OCC. Canary / ForcePrefix / SerialLane-without-writer are gone.
 pub(crate) fn choose_edge_action(v: &EdgeView) -> EdgeAction {
     match classify_edge(v) {
         EdgeVisibility::PublishedData { version } => EdgeAction::Bind(version),
         EdgeVisibility::UnpublishedEssential { writer } => EdgeAction::WaitFor(writer),
         EdgeVisibility::SerialLane { pred } => EdgeAction::WaitFor(pred),
-        EdgeVisibility::Independent | EdgeVisibility::Canary | EdgeVisibility::Cold => {
-            EdgeAction::Unfenced
-        }
+        EdgeVisibility::Independent | EdgeVisibility::Cold => EdgeAction::Unfenced,
     }
 }
 
@@ -291,11 +333,24 @@ impl EdgeTable {
     ) -> Option<usize> {
         let mut min_k: Option<u32> = None;
         for &loc in invalid {
-            for (key, _) in self.accesses_of(loc, reader) {
-                min_k = Some(min_k.map_or(key.access_k, |m| m.min(key.access_k)));
+            if let Some(k) = self.min_k_of_location(reader, loc) {
+                min_k = Some(min_k.map_or(k, |m| m.min(k)));
             }
         }
         min_k.map(|k| k as usize)
+    }
+
+    /// Per-ℓ abort grain — do not copy the tx-min \(k\) onto every invalid loc.
+    pub(crate) fn min_k_of_location(
+        &self,
+        reader: TxIdx,
+        location: MemoryLocationHash,
+    ) -> Option<u32> {
+        let mut min_k: Option<u32> = None;
+        for (key, _) in self.accesses_of(location, reader) {
+            min_k = Some(min_k.map_or(key.access_k, |m| m.min(key.access_k)));
+        }
+        min_k
     }
 
     /// Multi-touch: later frames of the same `(ℓ, reader)` after `access_k`.
@@ -346,6 +401,7 @@ mod tests {
             avoid_broadcast: avoid,
             canary_ok: canary,
             independence_certified: indep,
+            predicted_essential: essential,
             essential_antidep: essential,
             force_prefix: false,
             clique_gated: clique,
@@ -382,6 +438,7 @@ mod tests {
             tx_idx: 1,
             tx_incarnation: 0,
         };
+        // A3 still holds — but only on the PredictedEssential path.
         let a = choose_edge_action(&view(
             Some(v.clone()),
             Some(1),
@@ -391,10 +448,35 @@ mod tests {
             false,
             false,
             false,
-            false,
+            true,
             false,
         ));
         assert_eq!(a, EdgeAction::Bind(v));
+    }
+
+    #[test]
+    fn unfenced_when_data_but_not_predicted() {
+        let v = TxVersion {
+            tx_idx: 1,
+            tx_incarnation: 0,
+        };
+        let a = choose_edge_action(&view(
+            Some(v),
+            Some(1),
+            true,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+        ));
+        assert_eq!(
+            a,
+            EdgeAction::Unfenced,
+            "¬PredictedEssential must not Bind-tax published Data"
+        );
     }
 
     #[test]
@@ -415,7 +497,9 @@ mod tests {
     }
 
     #[test]
-    fn a2_avoid_broadcast_waits_not_unfenced() {
+    fn location_avoid_is_not_an_or_door() {
+        // Per-ℓ Avoid broadcast is observe / first-wave fuel — not a live OR.
+        // Without PredictedEssential(ℓ, k) this access stays Unfenced≡OCC.
         let a = choose_edge_action(&view(
             None,
             Some(4),
@@ -424,11 +508,11 @@ mod tests {
             true,
             true,
             false,
-            false,
+            true,
             false,
             false,
         ));
-        assert_eq!(a, EdgeAction::WaitFor(4));
+        assert_eq!(a, EdgeAction::Unfenced);
     }
 
     #[test]
@@ -440,7 +524,8 @@ mod tests {
     }
 
     #[test]
-    fn a2_canary_unfenced_before_avoid() {
+    fn canary_is_not_a_live_verb() {
+        // Exclude: canary never enters classify (was Unfenced discovery tax).
         let a = choose_edge_action(&view(
             None,
             Some(1),
@@ -449,15 +534,31 @@ mod tests {
             true,
             false,
             true,
-            false,
+            true,
             false,
             true,
         ));
         assert_eq!(a, EdgeAction::Unfenced);
+        assert!(matches!(
+            classify_edge(&view(
+                None,
+                Some(1),
+                false,
+                false,
+                true,
+                false,
+                true,
+                true,
+                false,
+                true,
+            )),
+            EdgeVisibility::Independent
+        ));
     }
 
     #[test]
-    fn a1_clique_gate_waits_after_canary() {
+    fn clique_is_not_an_avoid_key() {
+        // Clique / canary-adjacent is observe-only. ¬PredictedEssential → OCC.
         let a = choose_edge_action(&view(
             None,
             Some(1),
@@ -466,11 +567,11 @@ mod tests {
             true,
             false,
             false,
-            false,
+            true,
             false,
             true,
         ));
-        assert_eq!(a, EdgeAction::WaitFor(1));
+        assert_eq!(a, EdgeAction::Unfenced);
     }
 
     #[test]
@@ -481,13 +582,13 @@ mod tests {
         assert_eq!(
             a,
             EdgeAction::Unfenced,
-            "clique ∧ writer=None ∧ !Avoid is first-wave, not serial-all"
+            "clique ∧ writer=None ∧ !PredictedEssential is OCC, not serial-all"
         );
     }
 
     #[test]
-    fn clique_gate_not_shorted_by_independence() {
-        // Forming clique: canary consumed, independence still stale-true.
+    fn independence_wins_without_predicted_essential() {
+        // Clique + writer without PredictedEssential stays Unfenced≡OCC.
         let a = choose_edge_action(&view(
             None,
             Some(2),
@@ -502,8 +603,8 @@ mod tests {
         ));
         assert_eq!(
             a,
-            EdgeAction::WaitFor(2),
-            "clique_gated ∧ !canary must Fence even if independence bit is set"
+            EdgeAction::Unfenced,
+            "¬PredictedEssential must not Fence via clique/canary leftover"
         );
     }
 
@@ -561,7 +662,7 @@ mod tests {
             classify_edge(&view(
                 None, None, false, false, true, false, false, false, false, false,
             )),
-            EdgeVisibility::Cold
+            EdgeVisibility::Independent | EdgeVisibility::Cold
         ));
     }
 
@@ -628,26 +729,23 @@ mod tests {
     }
 
     #[test]
-    fn force_prefix_none_writer_serial_lane_fence() {
+    fn force_prefix_is_not_pi() {
+        // Exclude: ForcePrefix bool must not Fence (sticky tx-grain / inc smell).
         let mut v = view(
-            None, None, false, false, true, false, false, false, false, false,
+            None, None, false, false, true, false, false, true, false, false,
         );
         v.force_prefix = true;
         assert_eq!(
             choose_edge_action(&v),
-            EdgeAction::WaitFor(6),
-            "force_prefix ∧ writer=None must Fence serial pred, not Unfenced"
+            EdgeAction::Unfenced,
+            "force_prefix ∧ writer=None is NOT serial-lane π"
         );
         v.reader = 0;
-        assert_eq!(
-            choose_edge_action(&v),
-            EdgeAction::Unfenced,
-            "tx0 has no serial pred"
-        );
+        assert_eq!(choose_edge_action(&v), EdgeAction::Unfenced);
     }
 
     #[test]
-    fn force_prefix_with_writer_never_unfenced() {
+    fn force_prefix_does_not_override_independence() {
         let mut v = view(
             None,
             Some(2),
@@ -665,12 +763,12 @@ mod tests {
         v.independence_certified = true;
         assert_eq!(
             choose_edge_action(&v),
-            EdgeAction::WaitFor(2),
-            "U1: force_prefix ∧ writer carries WaitFor, not indep Unfenced"
+            EdgeAction::Unfenced,
+            "force_prefix is excluded; ¬PredictedEssential → OCC"
         );
         v.writer_executing = true;
         v.writer_ready = false;
-        assert_eq!(choose_edge_action(&v), EdgeAction::WaitFor(2));
+        assert_eq!(choose_edge_action(&v), EdgeAction::Unfenced);
     }
 
     #[test]
@@ -697,15 +795,121 @@ mod tests {
     }
 
     #[test]
-    fn avoid_none_writer_serial_lane_fence() {
+    fn avoid_none_writer_does_not_ghost_wait() {
+        // wait_no_writer smell: no writer identity → no WaitFor(reader-1).
         let a = choose_edge_action(&view(
-            None, None, false, false, true, true, false, false, false, false,
+            None, None, false, false, true, true, false, false, true, false,
         ));
         assert_eq!(
             a,
-            EdgeAction::WaitFor(6),
-            "avoid ∧ writer=None must WaitFor serial pred, not Unfenced"
+            EdgeAction::Unfenced,
+            "PredictedEssential ∧ writer=None must not invent a serial pred"
         );
+    }
+
+    #[test]
+    fn predicted_essential_waits_this_access_only() {
+        let mut v = view(
+            None,
+            Some(3),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+        );
+        v.access_k = 6;
+        v.access_depth = 2;
+        assert_eq!(choose_edge_action(&v), EdgeAction::WaitFor(3));
+        // Sibling access in the same tx (different k) is ¬PredictedEssential.
+        v.predicted_essential = false;
+        v.essential_antidep = false;
+        v.independence_certified = true;
+        v.access_k = 12;
+        assert_eq!(
+            choose_edge_action(&v),
+            EdgeAction::Unfenced,
+            "mixed verbs inside one tx: later k stays OCC"
+        );
+    }
+
+    #[test]
+    fn inc_is_not_in_avoid_key() {
+        // EdgeKey / EdgeView have no incarnation field. Repair-state must not
+        // re-key Avoid (99-block: inc1+ fence≈74% smell).
+        let k0 = EdgeKey {
+            location: 1,
+            reader: 7,
+            access_k: 6,
+            depth: 1,
+        };
+        let k1 = EdgeKey {
+            location: 1,
+            reader: 7,
+            access_k: 6,
+            depth: 1,
+        };
+        assert_eq!(k0, k1, "same a=(t,k,depth,ℓ) — inc is not part of identity");
+    }
+
+    #[test]
+    fn h_is_not_a_wait_or_door() {
+        let mut v = view(
+            None,
+            Some(2),
+            false,
+            false,
+            true,
+            false,
+            false,
+            true,
+            false,
+            false,
+        );
+        v.in_hot_set = true;
+        assert_eq!(
+            choose_edge_action(&v),
+            EdgeAction::Unfenced,
+            "H membership is observe/prior, not a Wait OR-door"
+        );
+    }
+
+    #[test]
+    fn writer_validated_is_not_a_bind_gate() {
+        let ver = TxVersion {
+            tx_idx: 2,
+            tx_incarnation: 0,
+        };
+        let mut v = view(
+            Some(ver.clone()),
+            Some(2),
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+        );
+        v.writer_validated = false;
+        assert_eq!(
+            choose_edge_action(&v),
+            EdgeAction::Bind(ver),
+            "A3: Data → Bind even if !validated"
+        );
+    }
+
+    #[test]
+    fn access_k_class_buckets_match_field_table() {
+        assert_eq!(access_k_class(0), 0);
+        assert_eq!(access_k_class(2), 1);
+        assert_eq!(access_k_class(6), 2);
+        assert_eq!(access_k_class(10), 3);
+        assert_eq!(access_k_class(20), 4);
     }
 
     #[test]
@@ -732,6 +936,24 @@ mod tests {
         assert!(!t.broadcast_avoid(5));
         assert_eq!(t.avoid_count(), 1);
         assert_eq!(t.min_k_of_invalid(10, &[5]), Some(1));
+        assert_eq!(t.min_k_of_location(10, 5), Some(1));
+        let other = EdgeKey {
+            location: 9,
+            reader: 10,
+            access_k: 12,
+            depth: 0,
+        };
+        t.record(other, Some(2), EdgeKind::Wr, EdgeState::Unpublished);
+        assert_eq!(
+            t.min_k_of_invalid(10, &[5, 9]),
+            Some(1),
+            "tx-min k is still 1"
+        );
+        assert_eq!(
+            t.min_k_of_location(10, 9),
+            Some(12),
+            "sibling ℓ keeps its own k — do not copy tx-min onto it"
+        );
         assert_eq!(t.later_touches(5, 10, 1), 1);
     }
 }

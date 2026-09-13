@@ -9,8 +9,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use dashmap::{DashMap, DashSet};
 
+use rustc_hash::FxBuildHasher;
+
 use crate::{BuildIdentityHasher, MemoryLocationHash, TxIdx, TxIncarnation};
 
+use super::edge::access_k_class;
 use super::learner::TopLocPrior;
 
 /// Done→Data residual Bind install. Region SoT: a Fenced ℓ always has a
@@ -86,6 +89,9 @@ pub(crate) struct HotSketch {
     spines: DashMap<MemoryLocationHash, Mutex<Vec<TxIdx>>, BuildIdentityHasher>,
     locs: DashMap<MemoryLocationHash, LocSketch, BuildIdentityHasher>,
     avoid: DashMap<MemoryLocationHash, (), BuildIdentityHasher>,
+    /// PredictedEssential access-class set: (\(ℓ\), \(k_{\mathrm{class}}\)).
+    /// First-wave / prior template — **not** a per-ℓ sticky Wait for all \(k\).
+    access_class: DashMap<(MemoryLocationHash, u8), (), FxBuildHasher>,
     /// Done→Data residual per ℓ (Bind SoT when writer is Done∅Data).
     residuals: DashMap<MemoryLocationHash, ResidualBind, BuildIdentityHasher>,
     warm_seeded: DashSet<MemoryLocationHash, BuildIdentityHasher>,
@@ -142,7 +148,31 @@ impl HotSketch {
                     confidence: conf,
                 },
             );
+            // Serial-lane access class from abort-derived k_template only.
+            // Live PredictedEssential is seeded on the learner (quiet skips).
+            if top.k_template > 0 {
+                self.mark_access_class(top.location, top.k_template);
+            }
         }
+    }
+
+    /// Mark PredictedEssential access class (\(ℓ, k_{\mathrm{class}}\)).
+    pub(crate) fn mark_access_class(&self, location: MemoryLocationHash, k: u32) {
+        if k == 0 {
+            return;
+        }
+        self.access_class.insert((location, access_k_class(k)), ());
+    }
+
+    /// PredictedEssential(\(ℓ, k\)) for **this** access — not flatten(\(ℓ\)).
+    #[inline]
+    pub(crate) fn access_class_predicted(&self, location: MemoryLocationHash, k: u32) -> bool {
+        self.access_class
+            .contains_key(&(location, access_k_class(k)))
+    }
+
+    pub(crate) fn has_access_class(&self, location: MemoryLocationHash) -> bool {
+        self.access_class.iter().any(|e| e.key().0 == location)
     }
 
     /// Live promote into H (first-wave, not morph mode).
@@ -364,18 +394,16 @@ impl HotSketch {
         }
     }
 
-    /// A4: no H, no Avoid, no live template, no canary taken → Unfenced.
+    /// A4: no PredictedEssential access-class on \(ℓ\) → Unfenced≡OCC.
+    /// H / canary / location-wide Avoid are **not** independence keys.
     pub(crate) fn independence_certified(&self, location: MemoryLocationHash) -> bool {
-        !self.in_serial_lane(location)
+        !self.has_access_class(location)
     }
 
-    /// Hot-record serialization lane (A4 contention-split).
-    /// Canary-taken means a second reader of ℓ is no longer independent.
+    /// Region-access serial lane: PredictedEssential class on \(ℓ\).
+    /// H / canary / flatten-Avoid are observe-only and do not enter this.
     pub(crate) fn in_serial_lane(&self, location: MemoryLocationHash) -> bool {
-        self.in_h(location)
-            || self.avoid_broadcast(location)
-            || self.template_live(location)
-            || self.canary_taken(location)
+        self.has_access_class(location)
     }
 
     /// Closest unfinished lower writer on the spine (Fence target, not reader-1).
@@ -419,12 +447,15 @@ impl HotSketch {
         is_done: impl Fn(TxIdx) -> bool,
     ) -> Vec<TxIdx> {
         let mut out = Vec::new();
-        // Avoid spines only, bounded (per-access full walk was a wall tax).
-        for (i, loc_r) in self.avoid.iter().enumerate() {
-            if i >= 8 {
+        // PredictedEssential access-class spines (not location-wide Avoid).
+        // Bounded (per-access full walk was a wall tax).
+        let mut seen = 0usize;
+        for loc_r in self.access_class.iter() {
+            if seen >= 8 {
                 break;
             }
-            let loc = *loc_r.key();
+            let loc = loc_r.key().0;
+            seen += 1;
             let Some(s) = self.spines.get(&loc) else {
                 continue;
             };
@@ -487,7 +518,10 @@ impl HotSketch {
         n
     }
 
-    /// Essential unpublished anti-dep: H / Avoid / template / known writer.
+    /// Legacy location-level probe — **not** the live Avoid key.
+    /// Observe / serial-lane probe — **not** the live Avoid key.
+    /// Live PE gate is `LiveLearner::predicted_essential`. `force_prefix` is
+    /// ignored (exclude set). H / prior_ws / template are observe-only.
     pub(crate) fn essential_antidep(
         &self,
         location: MemoryLocationHash,
@@ -495,15 +529,8 @@ impl HotSketch {
         prior_ws: bool,
         force_prefix: bool,
     ) -> bool {
-        if force_prefix || self.avoid_broadcast(location) {
-            // Repair prefix / Avoid are essential even before the writer is resolved.
-            // Hang-freedom is serial-lane admission, not Unfenced.
-            return true;
-        }
-        if !writer_known {
-            return false;
-        }
-        self.in_h(location) || prior_ws || self.template_live(location)
+        let _ = (writer_known, prior_ws, force_prefix);
+        self.has_access_class(location)
     }
 
     pub(crate) fn hot_size(&self) -> usize {
@@ -563,12 +590,18 @@ mod tests {
                 fanout_ema: 32.0,
                 abort_rate: 0.1,
                 chain_len_ema: 4.0,
+                k_template: 6,
             }],
             false,
         );
         assert!(s.in_h(9));
+        assert!(s.access_class_predicted(9, 6));
         assert!(!s.independence_certified(9));
         assert!(s.independence_certified(99));
+        assert!(
+            !s.access_class_predicted(9, 12),
+            "k=12 is a different class — mixed verbs"
+        );
     }
 
     #[test]
@@ -578,6 +611,10 @@ mod tests {
         assert!(s.try_canary(1, 3));
         assert_eq!(s.canary_tx(1), Some(3));
         assert!(s.canary_taken(1));
+        // Canary is not a live Avoid key — independence holds until access-class.
+        assert!(!s.in_serial_lane(1));
+        assert!(s.independence_certified(1));
+        s.mark_access_class(1, 6);
         assert!(s.in_serial_lane(1));
         assert!(!s.independence_certified(1));
         assert!(!s.try_canary(1, 4));
@@ -592,10 +629,12 @@ mod tests {
     fn canary_without_h_serializes_second_reader() {
         let s = HotSketch::new();
         assert!(s.try_canary(9, 2));
-        assert!(s.in_h(9), "canary promotes ℓ into H");
+        assert!(s.in_h(9), "canary still records H as observe/prior");
         assert!(s.canary_taken(9));
-        assert!(!s.independence_certified(9));
-        assert!(s.clique_gated(9));
+        assert!(
+            s.independence_certified(9),
+            "canary must not key independence / Avoid"
+        );
         assert!(!s.try_canary(9, 8));
     }
 
@@ -639,6 +678,11 @@ mod tests {
         );
         assert_eq!(s.spine_len(1), 3);
         s.note_hot(1);
+        assert!(
+            !s.in_serial_lane(1),
+            "H membership is observe-only, not a serial-lane key"
+        );
+        s.mark_access_class(1, 6);
         assert!(s.in_serial_lane(1));
         assert!(!s.independence_certified(1));
     }
@@ -652,6 +696,7 @@ mod tests {
                 fanout_ema: 4.0,
                 abort_rate: 0.1,
                 chain_len_ema: 6.0,
+                k_template: 0,
             }],
             false,
         );
@@ -671,6 +716,7 @@ mod tests {
                 fanout_ema: 4.0,
                 abort_rate: 0.5,
                 chain_len_ema: 2.0,
+                k_template: 0,
             }],
             true,
         );
@@ -680,22 +726,26 @@ mod tests {
     }
 
     #[test]
-    fn force_prefix_essential_without_writer() {
+    fn force_prefix_is_not_essential() {
         let s = HotSketch::new();
         assert!(
-            s.essential_antidep(1, false, false, true),
-            "force_prefix ∧ writer=None is still essential (serial-lane Fence)"
+            !s.essential_antidep(1, false, false, true),
+            "force_prefix is excluded from Avoid π"
         );
     }
 
     #[test]
-    fn avoid_essential_without_writer() {
+    fn access_class_not_location_avoid() {
         let s = HotSketch::new();
         assert!(s.broadcast_avoid(2, 0));
         assert!(
-            s.essential_antidep(2, false, false, false),
-            "Avoid ∧ writer=None is still essential"
+            !s.essential_antidep(2, false, false, false),
+            "location-wide Avoid is not PredictedEssential"
         );
+        s.mark_access_class(2, 6);
+        assert!(s.access_class_predicted(2, 6));
+        assert!(!s.access_class_predicted(2, 12));
+        assert!(s.essential_antidep(2, false, false, false));
     }
 
     #[test]
@@ -734,6 +784,7 @@ mod tests {
                 fanout_ema: 64.0,
                 abort_rate: 0.05,
                 chain_len_ema: 4.0,
+                k_template: 6,
             }],
             false,
             true,
@@ -748,11 +799,16 @@ mod tests {
                 fanout_ema: 64.0,
                 abort_rate: 0.90,
                 chain_len_ema: 4.0,
+                k_template: 6,
             }],
             false,
             true,
         );
         assert!(!s.in_h(12), "quiet follow-on must not plant high-abort H");
+        assert!(
+            !s.access_class_predicted(12, 6),
+            "quiet must not seed PredictedEssential"
+        );
     }
 
     #[test]
@@ -764,6 +820,7 @@ mod tests {
                 fanout_ema: 16.0,
                 abort_rate: 0.05,
                 chain_len_ema: 3.0,
+                k_template: 6,
             }],
             true,
             true,
@@ -776,6 +833,7 @@ mod tests {
                 fanout_ema: 16.0,
                 abort_rate: 0.05,
                 chain_len_ema: 3.0,
+                k_template: 6,
             }],
             false,
         );
@@ -787,6 +845,7 @@ mod tests {
                 fanout_ema: 16.0,
                 abort_rate: 0.05,
                 chain_len_ema: 3.0,
+                k_template: 6,
             }],
             false,
         );
@@ -826,8 +885,10 @@ mod tests {
     fn ready_spine_writers_covers_secondary_l() {
         let s = HotSketch::new();
         s.broadcast_avoid(1, 2);
+        s.mark_access_class(1, 6);
         s.push_spine(1, 5);
         s.broadcast_avoid(9, 3);
+        s.mark_access_class(9, 6);
         s.push_spine(9, 7);
         let ready = s.ready_spine_writers(10, |w| w == 5 || w == 7, |w| w == 2 || w == 3);
         assert_eq!(

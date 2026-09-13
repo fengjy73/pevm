@@ -412,6 +412,15 @@ impl PartialRetryState {
         k
     }
 
+    /// Unfenced≡OCC: increment \(k\) + first_k for Detect/abort grain, **no**
+    /// journal / checkpoint (those are Fenced-path PrefixSkip tax).
+    pub(crate) fn note_access_k_only(&mut self, location: MemoryLocationHash) -> usize {
+        self.k += 1;
+        let k = self.k;
+        self.first_k.entry(location).or_insert(k);
+        k
+    }
+
     pub(crate) fn note_certified(&mut self, location: MemoryLocationHash) {
         self.certified.insert(location);
     }
@@ -806,6 +815,21 @@ impl PartialRetryState {
         self.k
     }
 
+    /// True when every grain \(1..=cp_k\) was journaled (Fenced Bind).
+    /// Unfenced `note_access_k_only` leaves holes — PrefixSkip FF would be stale.
+    pub(crate) fn journal_covers_prefix(&self, cp_k: usize) -> bool {
+        if cp_k == 0 || self.journal.len() < cp_k {
+            return false;
+        }
+        let mut seen = vec![false; cp_k];
+        for e in &self.journal {
+            if e.k >= 1 && e.k <= cp_k {
+                seen[e.k - 1] = true;
+            }
+        }
+        seen.iter().all(|&b| b)
+    }
+
     pub(crate) fn incarnation(&self) -> TxIncarnation {
         self.incarnation
     }
@@ -916,6 +940,12 @@ impl PartialRetryTable {
     ) -> usize {
         let mut st = unsafe { self.state_mut(tx_idx) };
         st.note_access(tx_idx, location, mode)
+    }
+
+    /// Unfenced≡OCC grain: \(k\) + first_k only (no journal / checkpoint).
+    pub(crate) fn note_access_k_only(&self, tx_idx: TxIdx, location: MemoryLocationHash) -> usize {
+        let mut st = unsafe { self.state_mut(tx_idx) };
+        st.note_access_k_only(location)
     }
 
     pub(crate) fn note_certified(&self, tx_idx: TxIdx, location: MemoryLocationHash) {
@@ -1352,6 +1382,13 @@ impl PartialRetryTable {
             .unwrap_or(0)
     }
 
+    pub(crate) fn journal_covers_prefix(&self, tx_idx: TxIdx, cp_k: usize) -> bool {
+        if tx_idx >= self.states.len() {
+            return false;
+        }
+        unsafe { self.state_ref(tx_idx).journal_covers_prefix(cp_k) }
+    }
+
     /// G1: cheap effect-progress depth proxy for π (None on first incarnation).
     pub(crate) fn estimate_effect_depth(&self, tx_idx: TxIdx) -> Option<f64> {
         self.states
@@ -1614,17 +1651,16 @@ impl PartialRetryTable {
         LeanAbortRepair::FullRestart { reexec_cost: 2.2 }
     }
 
-    /// SpecFence-native Lean resolve: **R1-first** at validate (`try_validate`);
-    /// this arms **R2 SuffixRepair** only when identity/FF is lost.
+    /// Frozen-grain Resolve: **R1a RebindThis** at validate (`try_validate`);
+    /// this arms **R1b CertifiedPrefixSkip** only when a mid-tx checkpoint
+    /// exists. No checkpoint / grain identity lost → **B0 FullRestart**
+    /// (OCC residual). SuffixRepair / ForcePrefix is **not** the default.
     ///
     /// ```text
     /// if plan_partial_retry + checkpoint with 0 < cp.k < k_fail:
-    ///   arm_rewind_to + journal FF + set_force_bind  → SuffixRepair
-    ///   (same hang-free subset as SoftWait wake / try_arm_park_resume_at_k)
-    /// else if certified prefix (no mid-tx cp):
-    ///   set_force_bind; clear RewindTo → ForceBind (head reexec fallback)
+    ///   arm_rewind_to + journal FF  → CertifiedPrefixSkip (SuffixRepair rust name)
     /// else:
-    ///   clear_force_bind; clear_repair → FullRestart
+    ///   clear_force_bind; clear_repair → B0 FullRestart
     /// ```
     ///
     /// Absolute PC jump is **not** armed here — the execute path may hang-free
@@ -1643,6 +1679,14 @@ impl PartialRetryTable {
         self.apply_suffix_repair_planned(tx_idx, plan)
     }
 
+    /// Certified PrefixSkip cheaper than OCC B0 reincarnation?
+    /// Tiny rewind (1–2 accesses) pays FF/repair tax ≫ saved work (19807137).
+    /// First repair only; substantial prefix (≥8) covering ≥ half the grain.
+    #[inline]
+    pub(crate) fn prefix_skip_beats_b0(cp_k: usize, k_fail: usize, repair_depth: usize) -> bool {
+        repair_depth == 0 && cp_k >= 8 && k_fail > cp_k + 2 && cp_k.saturating_mul(2) >= k_fail
+    }
+
     /// SuffixRepair using a precomputed [`PartialRetryPlan`] (avoids double plan).
     pub(crate) fn apply_suffix_repair_planned(
         &self,
@@ -1652,10 +1696,17 @@ impl PartialRetryTable {
         match plan {
             Some(plan) if !plan.certified.is_empty() => {
                 let k_fail = plan.k_fail;
-                // Hang-free SoftWait-wake criteria: real mid-tx checkpoint before k.
+                // Certified prefix skip **only** when cheaper than OCC B0.
+                // Tiny PrefixSkip / rewind-on-every-fail loses to reincarnation
+                // (19807137 SuffixRepair makespan). Default is B0.
                 if k_fail > 0 {
                     if let Some(cp) = self.last_checkpoint_before(tx_idx, k_fail) {
-                        if cp.k > 0 && cp.k < k_fail {
+                        if Self::prefix_skip_beats_b0(
+                            cp.k,
+                            k_fail,
+                            self.suffix_repair_depth(tx_idx),
+                        ) && self.journal_covers_prefix(tx_idx, cp.k)
+                        {
                             self.arm_rewind_to(
                                 tx_idx,
                                 cp,
@@ -1673,15 +1724,11 @@ impl PartialRetryTable {
                         }
                     }
                 }
-                // Certified prefix but no usable mid-tx checkpoint → head ForceBind.
-                // Still ESTIMATE only failed suffix — never poison certified prefix Data.
-                self.set_force_bind(tx_idx, plan.certified.clone());
+                // No cheap certified skip → B0 residual reincarnation
+                // (OCC-identical). ForceBind / SuffixRepair is not the default.
+                self.clear_force_bind(tx_idx);
                 self.clear_repair(tx_idx);
-                LeanAbortRepair::ForceBind {
-                    certified: plan.certified,
-                    suffix_writes: plan.suffix_writes,
-                    reexec_cost: 1.2,
-                }
+                LeanAbortRepair::FullRestart { reexec_cost: 2.2 }
             }
             _ => {
                 self.clear_force_bind(tx_idx);
@@ -2874,38 +2921,101 @@ mod abort_cheapening_tests {
         assert!(!table.must_force_bind(0, 6));
     }
 
-    /// SuffixRepair: mid-tx checkpoint before fail k → RewindTo + force-bind.
+    /// Tiny certified prefix (1 access) is **not** cheaper than OCC B0.
     #[test]
-    fn apply_suffix_repair_arms_rewind_when_checkpoint_before_k() {
+    fn apply_suffix_repair_tiny_prefix_is_b0_not_rewind() {
         let table = PartialRetryTable::new(1);
         table.reset_incarnation(0, 0);
         let _ = table.push_checkpoint(0, CheckpointKind::CallEntry);
         table.note_access(0, 10, AccessMode::Read);
         table.note_certified(0, 10);
-        // Real mid-tx progress checkpoint (SoftWait hang-free subset requires cp.k > 0).
         let _ = table.push_checkpoint(0, CheckpointKind::EffectBoundary);
         table.note_access(0, 11, AccessMode::Read);
 
         match table.apply_suffix_repair(0, &[10, 11], &[11], &[]) {
+            LeanAbortRepair::FullRestart { reexec_cost } => {
+                assert!((reexec_cost - 2.2).abs() < 1e-9);
+            }
+            other => panic!("expected B0 FullRestart (tiny PrefixSkip tax), got {other:?}"),
+        }
+        assert!(
+            !table.must_force_bind(0, 10),
+            "tiny prefix must not arm ForceBind / SuffixRepair"
+        );
+        assert!(!table.is_rewind_resume(0));
+    }
+
+    /// Substantial certified prefix (≥8, ≥ half grain) → PrefixSkip.
+    #[test]
+    fn apply_suffix_repair_arms_rewind_when_prefix_skip_cheaper() {
+        let table = PartialRetryTable::new(1);
+        table.reset_incarnation(0, 0);
+        let _ = table.push_checkpoint(0, CheckpointKind::CallEntry);
+        let mut reads = Vec::new();
+        for i in 0..8 {
+            let loc = 100 + i;
+            table.note_access(0, loc, AccessMode::Read);
+            table.note_certified(0, loc);
+            reads.push(loc);
+        }
+        let _ = table.push_checkpoint(0, CheckpointKind::EffectBoundary);
+        table.note_access(0, 200, AccessMode::Read);
+        table.note_access(0, 201, AccessMode::Read);
+        table.note_access(0, 202, AccessMode::Read);
+        reads.extend_from_slice(&[200, 201, 202]);
+
+        match table.apply_suffix_repair(0, &reads, &[202], &[]) {
             LeanAbortRepair::SuffixRepair {
                 certified,
                 suffix_writes: _,
                 reexec_cost,
             } => {
-                assert!(certified.contains(&10));
-                assert!(!certified.contains(&11));
+                assert!(certified.contains(&100));
+                assert!(!certified.contains(&202));
                 assert!((reexec_cost - 0.6).abs() < 1e-9);
             }
-            other => panic!("expected SuffixRepair, got {other:?}"),
+            other => panic!("expected PrefixSkip, got {other:?}"),
         }
-        assert!(table.must_force_bind(0, 10));
+        assert!(table.must_force_bind(0, 100));
         assert!(
             table.is_rewind_resume(0),
-            "SuffixRepair must leave RewindTo armed for journal FF"
+            "cheap PrefixSkip must arm RewindTo"
         );
     }
 
-    /// Certified prefix but only k=0 CallEntry → ForceBind head (no RewindTo).
+    #[test]
+    fn prefix_skip_rejects_unfenced_journal_holes() {
+        let table = PartialRetryTable::new(1);
+        table.reset_incarnation(0, 0);
+        let _ = table.push_checkpoint(0, CheckpointKind::CallEntry);
+        let mut reads = Vec::new();
+        for i in 0..8 {
+            let loc = 100 + i;
+            table.note_access_k_only(0, loc); // Unfenced hole
+            reads.push(loc);
+        }
+        let _ = table.push_checkpoint(0, CheckpointKind::EffectBoundary);
+        table.note_access(0, 200, AccessMode::Read);
+        table.note_access(0, 201, AccessMode::Read);
+        table.note_access(0, 202, AccessMode::Read);
+        reads.extend_from_slice(&[200, 201, 202]);
+        assert!(!table.journal_covers_prefix(0, 8));
+        match table.apply_suffix_repair(0, &reads, &[202], &[]) {
+            LeanAbortRepair::FullRestart { .. } => {}
+            other => panic!("Unfenced holes must B0, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prefix_skip_beats_b0_predicate() {
+        assert!(!PartialRetryTable::prefix_skip_beats_b0(1, 2, 0));
+        assert!(!PartialRetryTable::prefix_skip_beats_b0(8, 9, 0));
+        assert!(PartialRetryTable::prefix_skip_beats_b0(8, 11, 0));
+        assert!(!PartialRetryTable::prefix_skip_beats_b0(8, 11, 1));
+        assert!(!PartialRetryTable::prefix_skip_beats_b0(8, 20, 0));
+    }
+
+    /// Certified prefix but only k=0 CallEntry → B0 FullRestart (no ForcePrefix π).
     #[test]
     fn apply_suffix_repair_force_bind_without_mid_tx_checkpoint() {
         let table = PartialRetryTable::new(1);
@@ -2918,27 +3028,15 @@ mod abort_cheapening_tests {
         table.note_access(0, 20, AccessMode::Write);
 
         match table.apply_suffix_repair(0, &[10, 11], &[11], &[10, 20]) {
-            LeanAbortRepair::ForceBind {
-                certified,
-                suffix_writes,
-                reexec_cost,
-            } => {
-                assert!(certified.contains(&10));
-                assert!(!certified.contains(&11));
-                // 10 is certified write (prefix); 20 is failed-suffix write.
-                assert!(
-                    suffix_writes.contains(&20),
-                    "suffix_writes={suffix_writes:?}"
-                );
-                assert!(
-                    !suffix_writes.contains(&10),
-                    "must not ESTIMATE certified prefix write"
-                );
-                assert!((reexec_cost - 1.2).abs() < 1e-9);
+            LeanAbortRepair::FullRestart { reexec_cost } => {
+                assert!((reexec_cost - 2.2).abs() < 1e-9);
             }
-            other => panic!("expected ForceBind fallback, got {other:?}"),
+            other => panic!("expected B0 FullRestart (no ForcePrefix default), got {other:?}"),
         }
-        assert!(table.must_force_bind(0, 10));
+        assert!(
+            !table.must_force_bind(0, 10),
+            "ForceBind / ForcePrefix must not arm without a certified prefix skip"
+        );
         assert!(
             !table.is_rewind_resume(0),
             "k=0-only checkpoint must not arm RewindTo (hang-free SoftWait subset)"
@@ -2970,11 +3068,19 @@ mod abort_cheapening_tests {
         let table = PartialRetryTable::new(1);
         table.reset_incarnation(0, 0);
         let _ = table.push_checkpoint(0, CheckpointKind::CallEntry);
-        table.note_access(0, 10, AccessMode::Read);
-        table.note_certified(0, 10);
+        let mut reads = Vec::new();
+        for i in 0..8 {
+            let loc = 100 + i;
+            table.note_access(0, loc, AccessMode::Read);
+            table.note_certified(0, loc);
+            reads.push(loc);
+        }
         let _ = table.push_checkpoint(0, CheckpointKind::EffectBoundary);
-        table.note_access(0, 11, AccessMode::Read);
-        let _ = table.apply_suffix_repair(0, &[10, 11], &[11], &[]);
+        table.note_access(0, 200, AccessMode::Read);
+        table.note_access(0, 201, AccessMode::Read);
+        table.note_access(0, 202, AccessMode::Read);
+        reads.extend_from_slice(&[200, 201, 202]);
+        let _ = table.apply_suffix_repair(0, &reads, &[202], &[]);
         table.note_suffix_repair(0);
         assert!(table.has_force_bind(0));
         assert_eq!(table.suffix_repair_depth(0), 1);
@@ -3093,33 +3199,41 @@ mod abort_cheapening_tests {
         let table = PartialRetryTable::new(1);
         table.reset_incarnation(0, 0);
         let _ = table.push_checkpoint(0, CheckpointKind::CallEntry);
-        table.note_access(0, 10, AccessMode::Read);
-        table.note_certified(0, 10);
+        let mut reads = Vec::new();
+        for i in 0..8 {
+            let loc = 100 + i;
+            table.note_access(0, loc, AccessMode::Read);
+            table.note_certified(0, loc);
+            reads.push(loc);
+        }
         let _ = table.push_checkpoint(0, CheckpointKind::EffectBoundary);
-        table.note_access(0, 11, AccessMode::Read);
+        table.note_access(0, 200, AccessMode::Read);
+        table.note_access(0, 201, AccessMode::Read);
+        table.note_access(0, 202, AccessMode::Read);
+        reads.extend_from_slice(&[200, 201, 202]);
 
-        match table.research_apply_abort_repair(0, &[10, 11], &[11], &[]) {
+        match table.research_apply_abort_repair(0, &reads, &[202], &[]) {
             ResearchAbortRepair::RewindTo {
                 certified,
                 reexec_cost,
                 ..
             } => {
-                assert!(certified.contains(&10));
+                assert!(certified.contains(&100));
                 assert!((reexec_cost - 0.6).abs() < 1e-9);
             }
             other => panic!("expected research RewindTo, got {other:?}"),
         }
         assert!(table.is_rewind_resume(0));
-        assert!(table.must_force_bind(0, 10));
+        assert!(table.must_force_bind(0, 100));
 
-        // Same inputs on Lean SuffixRepair must keep/re-arm RewindTo.
-        match table.apply_suffix_repair(0, &[10, 11], &[11], &[]) {
+        // Lean PrefixSkip only when ROI says cheaper than B0 (same substantial prefix).
+        match table.apply_suffix_repair(0, &reads, &[202], &[]) {
             LeanAbortRepair::SuffixRepair { .. } => {}
-            other => panic!("expected Lean SuffixRepair, got {other:?}"),
+            other => panic!("expected Lean PrefixSkip, got {other:?}"),
         }
         assert!(
             table.is_rewind_resume(0),
-            "Lean SuffixRepair must arm RewindTo when mid-tx checkpoint exists"
+            "Lean PrefixSkip must arm RewindTo when skip beats B0"
         );
     }
     #[test]
@@ -3127,19 +3241,27 @@ mod abort_cheapening_tests {
         let table = PartialRetryTable::new(1);
         table.reset_incarnation(0, 0);
         let _ = table.push_checkpoint(0, CheckpointKind::CallEntry);
-        let _ = table.note_access(0, 1, AccessMode::Read);
-        table.note_certified(0, 1);
+        let mut reads = Vec::new();
+        for i in 0..8 {
+            let loc = 100 + i;
+            let _ = table.note_access(0, loc, AccessMode::Read);
+            table.note_certified(0, loc);
+            reads.push(loc);
+        }
         let _ = table.push_checkpoint(0, CheckpointKind::EffectBoundary);
-        let _ = table.note_access(0, 2, AccessMode::Read);
-        let repair = table.apply_suffix_repair(0, &[1, 2], &[2], &[]);
+        let _ = table.note_access(0, 200, AccessMode::Read);
+        let _ = table.note_access(0, 201, AccessMode::Read);
+        let _ = table.note_access(0, 202, AccessMode::Read);
+        reads.extend_from_slice(&[200, 201, 202]);
+        let repair = table.apply_suffix_repair(0, &reads, &[202], &[]);
         assert!(
             matches!(repair, LeanAbortRepair::SuffixRepair { .. })
                 || matches!(repair, LeanAbortRepair::ForceBind { .. })
         );
         assert!(table.has_force_bind(0));
-        table.extend_force_bind(0, &[2, 3]);
-        assert!(table.must_force_bind(0, 2));
-        assert!(table.must_force_bind(0, 3));
+        table.extend_force_bind(0, &[202, 203]);
+        assert!(table.must_force_bind(0, 202));
+        assert!(table.must_force_bind(0, 203));
     }
 
     #[test]

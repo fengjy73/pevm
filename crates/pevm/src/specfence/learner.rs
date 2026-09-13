@@ -14,8 +14,11 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use dashmap::DashMap;
+use rustc_hash::FxBuildHasher;
 
 use crate::{BuildIdentityHasher, MemoryLocationHash};
+
+use super::edge::access_k_class;
 
 /// Morphology class weights (Dirichlet/EMA-style, normalized to sum ≈ 1).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -237,6 +240,9 @@ pub(crate) struct TopLocPrior {
     pub abort_rate: f64,
     /// Predicted wr-chain length (A1 spine), not a fanout stub.
     pub chain_len_ema: f64,
+    /// Dominant abort / Detect \(k\) — PredictedEssential access-class template.
+    /// 0 = unknown (do **not** seed PCC on class 0).
+    pub k_template: u32,
 }
 
 const MAX_TOP_L: usize = 64;
@@ -348,6 +354,11 @@ struct LocLive {
     writer_done: AtomicUsize,
     /// Avoid ∧ Done∅Data (u_aa) — serial_lane fuel for secondary ℓs.
     u_aa: AtomicUsize,
+    /// Sum of abort access \(k\) (for inter-block k_template).
+    abort_k_sum: AtomicU64,
+    abort_k_n: AtomicUsize,
+    /// Last Detect \(k\) on this ℓ (observe / pack).
+    last_k: AtomicUsize,
 }
 
 #[inline]
@@ -399,6 +410,13 @@ pub(crate) struct LiveLearner {
     rewind_total: AtomicUsize,
     rebind_total: AtomicUsize,
     identity_hits: AtomicUsize,
+    /// PredictedEssential(\(ℓ, k_{\mathrm{class}}\)) — live Avoid gate (not tx-sticky).
+    predicted: DashMap<(MemoryLocationHash, u8), AtomicUsize, FxBuildHasher>,
+    /// Intra-block marks (abort / first-wave) vs prior seed — quiet must not
+    /// suppress intra evidence.
+    predicted_intra: DashMap<(MemoryLocationHash, u8), AtomicUsize, FxBuildHasher>,
+    /// Cheap emptiness for the Unfenced≡OCC fast path (no DashMap scan).
+    predicted_n: AtomicUsize,
 }
 
 impl LiveLearner {
@@ -445,6 +463,9 @@ impl LiveLearner {
         self.rewind_total.store(0, Ordering::Relaxed);
         self.rebind_total.store(0, Ordering::Relaxed);
         self.identity_hits.store(0, Ordering::Relaxed);
+        self.predicted.clear();
+        self.predicted_intra.clear();
+        self.predicted_n.store(0, Ordering::Relaxed);
     }
 
     /// WaitFor park observed — structural ready-weight, not EV Await.
@@ -498,6 +519,139 @@ impl LiveLearner {
             && self.park_heat.load(Ordering::Relaxed) < 2
     }
 
+    /// Live gate: PredictedEssential(\(ℓ, k, \mathrm{morph}\)) for this access.
+    /// Morph is the block label (quiet seed never plants; intra abort still marks).
+    #[inline]
+    pub(crate) fn predicted_essential(&self, location: MemoryLocationHash, k: u32) -> bool {
+        if !self.has_any_predicted() {
+            return false;
+        }
+        let cls = access_k_class(k);
+        self.predicted
+            .get(&(location, cls))
+            .is_some_and(|e| e.load(Ordering::Relaxed) > 0)
+    }
+
+    /// True when any PredictedEssential mark exists this block (prior or intra).
+    #[inline]
+    pub(crate) fn has_any_predicted(&self) -> bool {
+        self.predicted_n.load(Ordering::Relaxed) > 0
+    }
+
+    /// Strict makespan: enter the Fenced path only if predicted Fence_tax
+    /// < predicted OCC_reexec_waste for this \(a\). Conservative — prior-only
+    /// PE is **not** enough (Bind tax on 19807137). Intra abort evidence is.
+    /// Park/rewind storms stay Unfenced≡OCC (miss → cheap reincarnation).
+    #[inline]
+    pub(crate) fn pcc_makespan_win(&self, location: MemoryLocationHash, k: u32) -> bool {
+        // Quiet cohort stays Unfenced≡OCC even after a lone intra mark
+        // (2179522: one abort must not Bind-tax the rest of the block).
+        if self.quiet_fence_off() {
+            return false;
+        }
+        if !self.predicted_essential_intra(location, k) {
+            return false;
+        }
+        let parks = self.park_heat.load(Ordering::Relaxed);
+        let aborts = self.abort_events.load(Ordering::Relaxed);
+        // WaitFor already losing: park ≫ abort savings.
+        if parks > aborts.saturating_add(aborts / 2).saturating_add(8) {
+            return false;
+        }
+        // PrefixSkip/rewind storm: repair tax > OCC B0.
+        if self.r1_underfire() && parks >= 4 {
+            return false;
+        }
+        true
+    }
+
+    /// WaitFor park only when a **single executing** writer is cheaper than
+    /// OCC reincarnation. Never fleet-park independents (6196166 lesson).
+    #[inline]
+    pub(crate) fn waitfor_makespan_win(&self, unfinished: usize, writer_executing: bool) -> bool {
+        if unfinished > 1 || !writer_executing {
+            return false;
+        }
+        self.park_heat.load(Ordering::Relaxed) < 8
+    }
+
+    /// Intra-block abort / first-wave mark (survives quiet_fence_off).
+    #[inline]
+    pub(crate) fn predicted_essential_intra(&self, location: MemoryLocationHash, k: u32) -> bool {
+        let cls = access_k_class(k);
+        self.predicted_intra
+            .get(&(location, cls))
+            .is_some_and(|e| e.load(Ordering::Relaxed) > 0)
+    }
+
+    /// Mark PredictedEssential for this access class (intra **abort** only).
+    /// Publish / Detect must not call this — `last_k` is observe, not a gate.
+    pub(crate) fn mark_predicted_essential(&self, location: MemoryLocationHash, k: u32) {
+        if k == 0 {
+            return;
+        }
+        let cls = access_k_class(k);
+        self.predicted
+            .entry((location, cls))
+            .or_insert_with(|| AtomicUsize::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+        self.predicted_intra
+            .entry((location, cls))
+            .or_insert_with(|| AtomicUsize::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+        self.predicted_n.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Inter-block prior seed. Quiet callers must not invoke this.
+    pub(crate) fn seed_predicted_essential(&self, location: MemoryLocationHash, k_template: u32) {
+        if k_template == 0 {
+            return;
+        }
+        let cls = access_k_class(k_template);
+        self.predicted
+            .entry((location, cls))
+            .or_insert_with(|| AtomicUsize::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+        self.predicted_n.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Always-on cheap Detect at \(a\). Observe-only features stay here.
+    pub(crate) fn note_detect(
+        &self,
+        location: MemoryLocationHash,
+        k: u32,
+        depth: u8,
+        is_program: bool,
+    ) {
+        let _ = depth; // observe / frame policy feature
+        let entry = self.locs.entry(location).or_default();
+        entry.last_k.store(k as usize, Ordering::Relaxed);
+        entry.readers.fetch_add(1, Ordering::Relaxed);
+        if is_program {
+            entry.program_reads.fetch_add(1, Ordering::Relaxed);
+            self.program_obs.fetch_add(1, Ordering::Relaxed);
+        } else {
+            entry.handler_reads.fetch_add(1, Ordering::Relaxed);
+            self.handler_obs.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Abort-derived \(k\) template for this \(ℓ\). Detect `last_k` is observe
+    /// only — it must **not** become a PredictedEssential / serial-lane key.
+    pub(crate) fn dominant_k(&self, location: MemoryLocationHash) -> u32 {
+        self.locs
+            .get(&location)
+            .map(|e| {
+                let n = e.abort_k_n.load(Ordering::Relaxed);
+                if n > 0 {
+                    (e.abort_k_sum.load(Ordering::Relaxed) / n as u64) as u32
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0)
+    }
+
     /// Observe a location read resolve (policy feature refresh).
     pub(crate) fn note_observe(
         &self,
@@ -535,12 +689,26 @@ impl LiveLearner {
     }
 
     pub(crate) fn note_abort(&self, location: MemoryLocationHash, cascade_hint: usize) {
+        self.note_abort_access(location, cascade_hint, None);
+    }
+
+    /// Abort at access grain — trains PredictedEssential(\(ℓ,k\)) when \(k\) known.
+    pub(crate) fn note_abort_access(
+        &self,
+        location: MemoryLocationHash,
+        cascade_hint: usize,
+        k: Option<u32>,
+    ) {
         let c = cascade_hint.max(1);
         self.abort_events.fetch_add(1, Ordering::Relaxed);
         self.cascade_sum.fetch_add(c as u64, Ordering::Relaxed);
         let entry = self.locs.entry(location).or_default();
         entry.aborts.fetch_add(1, Ordering::Relaxed);
         entry.cascade_sum.fetch_add(c as u64, Ordering::Relaxed);
+        if let Some(k) = k {
+            entry.abort_k_sum.fetch_add(k as u64, Ordering::Relaxed);
+            entry.abort_k_n.fetch_add(1, Ordering::Relaxed);
+        }
         // EMA update E_cascade at ℓ and globally.
         let params = *self.params_bits.lock().unwrap();
         let lr = params.lr_cascade;
@@ -554,6 +722,7 @@ impl LiveLearner {
         entry
             .e_cascade_bits
             .store(fp_encode(next), Ordering::Relaxed);
+        drop(entry);
         let g_prev = fp_decode(self.global_e_cascade_bits.load(Ordering::Relaxed));
         let g_next = (1.0 - lr) * g_prev + lr * (c as f64);
         self.global_e_cascade_bits
@@ -568,6 +737,9 @@ impl LiveLearner {
             m.quiet = (m.quiet - 0.01).max(0.01);
         }
         *m = m.normalize();
+        if let Some(k) = k.filter(|&k| k > 0) {
+            self.mark_predicted_essential(location, k);
+        }
     }
 
     /// Record conflict location after force_bind_reabort (sticky resolve).
@@ -999,12 +1171,20 @@ impl LiveLearner {
                 let obs = readers.max(1.0);
                 let writer_done = e.writer_done.load(Ordering::Relaxed) as f64;
                 let u_aa = e.u_aa.load(Ordering::Relaxed) as f64;
+                let k_n = e.abort_k_n.load(Ordering::Relaxed);
+                // Abort-derived only. Detect last_k must not seed next-block PCC.
+                let k_template = if k_n > 0 {
+                    (e.abort_k_sum.load(Ordering::Relaxed) / k_n as u64) as u32
+                } else {
+                    0
+                };
                 TopLocPrior {
                     location: *e.key(),
                     // Long-tail Done∅Data ℓs rank into H (not only top-16 fanout).
                     fanout_ema: readers + writer_done,
                     abort_rate: (aborts + u_aa) / obs,
                     chain_len_ema: e.writers.load(Ordering::Relaxed) as f64,
+                    k_template,
                 }
             })
             .collect();
@@ -1125,6 +1305,7 @@ mod tests {
                 fanout_ema: 100.0,
                 abort_rate: 0.2,
                 chain_len_ema: 8.0,
+                k_template: 6,
             }],
         );
         assert!(alpha >= ALPHA_NORMAL);
@@ -1187,6 +1368,10 @@ mod tests {
         assert_eq!(tops[0].location, 77);
         assert!(tops[0].fanout_ema >= 2.0);
         assert!(tops[0].abort_rate > 0.0, "u_aa ranks into inter-block H");
+        assert_eq!(
+            tops[0].k_template, 0,
+            "writer_done without abort_k is not a PCC template"
+        );
     }
 
     #[test]
@@ -1374,6 +1559,104 @@ mod tests {
         assert!(
             ema.quiet >= 0.40 || !ema.dominant_fan_out(),
             "quiet EMA must not snap to fan_out: {ema:?}"
+        );
+    }
+
+    #[test]
+    fn predicted_essential_is_per_access_class_not_tx() {
+        let live = LiveLearner::new();
+        live.begin_block(MorphWeights::default());
+        live.note_detect(7, 6, 2, true);
+        assert!(!live.predicted_essential(7, 6));
+        live.note_abort_access(7, 4, Some(6));
+        assert!(live.predicted_essential(7, 6), "k≈6 class must Fence");
+        assert!(
+            live.predicted_essential(7, 5),
+            "same k_class 4–7 shares the template"
+        );
+        assert!(
+            !live.predicted_essential(7, 12),
+            "later k stays ¬PredictedEssential (mixed verbs)"
+        );
+        assert!(
+            !live.predicted_essential(7, 0),
+            "k=0 setup is not the abort class"
+        );
+        live.seed_predicted_essential(9, 6);
+        assert!(live.predicted_essential(9, 6));
+        assert!(!live.predicted_essential_intra(9, 6));
+        live.mark_predicted_essential(9, 6);
+        assert!(live.predicted_essential_intra(9, 6));
+        live.seed_predicted_essential(11, 0);
+        assert!(
+            !live.predicted_essential(11, 0),
+            "k_template=0 must not plant PCC"
+        );
+        // Detect-only last_k is observe — pack_top must not emit a PCC template.
+        live.note_detect(13, 6, 1, true);
+        let detect_only = live
+            .pack_top_locations()
+            .into_iter()
+            .find(|t| t.location == 13)
+            .expect("detect-only loc is packed");
+        assert_eq!(
+            detect_only.k_template, 0,
+            "last_k must not become inter-block PredictedEssential"
+        );
+        assert!(!live.predicted_essential(13, 6));
+    }
+
+    #[test]
+    fn pcc_makespan_win_requires_intra_abort_not_prior_seed() {
+        let live = LiveLearner::new();
+        live.begin_block(MorphWeights::default());
+        live.seed_predicted_essential(7, 6);
+        assert!(live.predicted_essential(7, 6));
+        assert!(
+            !live.pcc_makespan_win(7, 6),
+            "prior-only PE must stay Unfenced≡OCC (Bind tax)"
+        );
+        live.note_abort_access(7, 2, Some(6));
+        assert!(
+            !live.pcc_makespan_win(7, 6),
+            "quiet_fence_off: one abort must not Bind-tax quiet"
+        );
+        live.begin_block(MorphWeights {
+            fan_out: 0.70,
+            mixed: 0.15,
+            waw_spine: 0.10,
+            quiet: 0.05,
+        });
+        live.note_abort_access(7, 2, Some(6));
+        assert!(
+            live.pcc_makespan_win(7, 6),
+            "intra abort evidence may fire PCC off quiet"
+        );
+        assert!(
+            !live.pcc_makespan_win(7, 12),
+            "sibling k-class stays Unfenced"
+        );
+    }
+
+    #[test]
+    fn waitfor_makespan_win_rejects_fleet_and_non_executing() {
+        let live = LiveLearner::new();
+        live.begin_block(MorphWeights::default());
+        assert!(
+            live.waitfor_makespan_win(1, true),
+            "single executing writer is the only cheap WaitFor"
+        );
+        assert!(!live.waitfor_makespan_win(2, true), "fleet park banned");
+        assert!(
+            !live.waitfor_makespan_win(1, false),
+            "Ready/Done must not park independents"
+        );
+        for _ in 0..8 {
+            live.note_park_heat();
+        }
+        assert!(
+            !live.waitfor_makespan_win(1, true),
+            "park storm → Unfenced≡OCC"
         );
     }
 }

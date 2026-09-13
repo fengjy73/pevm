@@ -165,6 +165,19 @@ fn metrics_json(m: &pevm::SpecFenceMetrics, n: usize) -> serde_json::Value {
         "bind_residual": m.bind_residual,
         "canary_reopen": m.canary_reopen,
         "writer_done_learned": m.writer_done_learned,
+        "detect_accesses": m.detect_accesses,
+        "predicted_essential_hits": m.predicted_essential_hits,
+        "pcc_fire_at_a": m.pcc_fire_at_a,
+        "pcc_roi_skip": m.pcc_roi_skip,
+        "unfenced_occ_fast": m.unfenced_occ_fast,
+        "prefix_skip_roi_b0": m.prefix_skip_roi_b0,
+        "force_prefix_as_pi": m.force_prefix_as_pi,
+        "canary_live_verb": m.canary_live_verb,
+        "inc_avoid_hits": m.inc_avoid_hits,
+        "h_or_wait_door": m.h_or_wait_door,
+        "morph_fence_actuator": m.morph_fence_actuator,
+        "writer_validated_bind_gate": m.writer_validated_bind_gate,
+        "flat_edgekey_sot": m.flat_edgekey_sot,
         "writer_identity_preserved": m.writer_identity_preserved,
         "rebind_only": m.rebind_only,
         "full_restart": m.full_restart,
@@ -363,6 +376,7 @@ fn run_mode(
                 "reason_histogram": proc.reason_histogram,
                 "hot_fanout_l": proc.hot_fanout_l,
                 "per_tx_len": proc.per_tx.len(),
+                "mixed_verb_intra_tx": proc.mixed_verb_intra_tx,
             });
         }
     }
