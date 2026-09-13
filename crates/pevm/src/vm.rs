@@ -187,13 +187,18 @@ impl<'a, S: Storage> VmDb<'a, S> {
             fg.deep_begin_consumer(tx_idx, incarnation);
         }
         if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            let repair_armed = self.specfence.partial_retry.is_rewind_resume(tx_idx)
+                || self.specfence.partial_retry.has_ff_head(tx_idx);
+            self.specfence.kernel.begin_execute(tx_idx, repair_armed);
             self.specfence
                 .partial_retry
                 .reset_incarnation(tx_idx, incarnation);
-            // M1b: restore SpecFence journal to checkpoint via FF continuation.
-            let n = self.specfence.partial_retry.replay_ff_if_armed(tx_idx);
-            if n > 0 {
-                self.specfence.metrics.record_journal_ff_entries(n);
+            // FF replay is PccKernel / Repair only — OccKernel never arms rem.
+            if self.specfence.kernel.is_pcc(tx_idx) {
+                let n = self.specfence.partial_retry.replay_ff_if_armed(tx_idx);
+                if n > 0 {
+                    self.specfence.metrics.record_journal_ff_entries(n);
+                }
             }
         }
         if let TxKind::Call(to) = tx.kind {
@@ -518,6 +523,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
         access_k: u32,
         is_program: bool,
     ) -> Result<(), ReadError> {
+        if self.specfence.kernel.is_occ(self.tx_idx) {
+            self.specfence.kernel.mark_pcc(self.tx_idx);
+            self.specfence.metrics.record_pcc_kernel_exec();
+        }
         self.pcc_armed.set(true);
         self.pcc_this_tx
             .set(self.pcc_this_tx.get().saturating_add(1));
@@ -1966,7 +1975,27 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         // prefers `record_resume`, and may narrow-arm hang-free absolute jump.
         let lean = self.specfence.mode == crate::ConcurrencyMode::SpecFence
             && self.specfence.engagement.begin_tx(tx_version.tx_idx);
-        let rewind_resume = self.specfence.mode == crate::ConcurrencyMode::SpecFence
+        let repair_armed = self.specfence.mode == crate::ConcurrencyMode::SpecFence
+            && (self
+                .specfence
+                .partial_retry
+                .is_rewind_resume(tx_version.tx_idx)
+                || self.specfence.partial_retry.has_ff_head(tx_version.tx_idx));
+        let occ_kernel = if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            let k = self
+                .specfence
+                .kernel
+                .begin_execute(tx_version.tx_idx, repair_armed);
+            if k == crate::specfence::IncarnationKernel::Occ {
+                self.specfence.metrics.record_occ_kernel_exec();
+            } else {
+                self.specfence.metrics.record_pcc_kernel_exec();
+            }
+            k == crate::specfence::IncarnationKernel::Occ
+        } else {
+            true
+        };
+        let rewind_resume = !occ_kernel
             && self
                 .specfence
                 .partial_retry
@@ -1974,12 +2003,14 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         if rewind_resume {
             // M1b/M1d: journal FF in set_tx; optional live PC arm inside inspect_run.
             self.specfence.metrics.record_resume();
-        } else if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+        } else if self.specfence.mode == crate::ConcurrencyMode::SpecFence && !occ_kernel {
             self.specfence.metrics.record_evm_entry();
             let _ = self
                 .specfence
                 .partial_retry
                 .push_checkpoint(tx_version.tx_idx, CheckpointKind::CallEntry);
+        } else if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            self.specfence.metrics.record_evm_entry();
         }
 
         // Hang-free SuffixRepair prefix skip + live-snap capture (Iter2):
@@ -2651,7 +2682,9 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         // M1i: capture storage presents for RewindTo residual republish
                         // + absolute-jump journal slot replay (never journal-blob poison).
                         // gas_remaining_after filled from Inspector post-SSTORE captures.
-                        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+                        if self.specfence.mode == crate::ConcurrencyMode::SpecFence
+                            && self.specfence.kernel.is_pcc(tx_version.tx_idx)
+                        {
                             self.specfence.partial_retry.note_write_replay(
                                 tx_version.tx_idx,
                                 loc,
@@ -2772,7 +2805,15 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     FinishExecFlags::empty()
                 };
 
-                if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+                if self.specfence.mode == crate::ConcurrencyMode::SpecFence
+                    && self.specfence.kernel.is_pcc(tx_version.tx_idx)
+                {
+                    if occ_kernel {
+                        let _ = self
+                            .specfence
+                            .partial_retry
+                            .push_checkpoint(tx_version.tx_idx, CheckpointKind::CallEntry);
+                    }
                     for (loc, value) in &write_set {
                         // G2: plant Write ordinal always (HotSet not required).
                         self.specfence.partial_retry.note_access(
@@ -2862,7 +2903,9 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     self.mv_memory.record(tx_version, read_set, write_set);
                 // M3: learn process WŜ from this incarnation's writes (no residual publish).
                 // R1/R3: feed HotSet writer counts (H_w) from non-lazy writes only.
-                if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+                if self.specfence.mode == crate::ConcurrencyMode::SpecFence
+                    && self.specfence.kernel.is_pcc(tx_version.tx_idx)
+                {
                     let locs: Vec<_> = self.mv_memory.write_locations(tx_version.tx_idx);
                     self.specfence.rw_prior.observe_write_set(&locs, None);
                     for loc in hotset_writer_locs {

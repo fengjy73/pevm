@@ -1,12 +1,12 @@
-//! SpecFence **clean-slate plant** — two modes, one EVM/MV store.
+//! SpecFence **parallel computer** — stages + frozen-π CC overlay.
 //!
-//! Plant SoT: `lab/notes/specfence-clean-slate-architecture.md`.
+//! Plant SoT: `lab/notes/specfence-parallel-compute-architecture.md`.
 //! π SoT: `lab/notes/specfence-complete-architecture-v4-frozen-grain.md`.
 //!
-//! `ConcurrencyMode::OCC` is pristine Block-STM (**zero** SpecFence calls).
-//! `ConcurrencyMode::SpecFence` is a first-class executor (`access_policy` +
-//! `executor`); Unfenced accesses call the same OCC read helpers. PCC overlay
-//! is PE-only. Learning is off the Unfenced critical path.
+//! `ConcurrencyMode::OCC` is pristine Block-STM (**zero** SpecFence ticks).
+//! `ConcurrencyMode::SpecFence` owns schedule / execute wrap / validate / rem.
+//! Unfenced incarnations are **OccKernel** (same OCC read + bool validate + B0).
+//! PCC overlay is PE-only. Learning is off the Unfenced critical path.
 //!
 //! Frozen π: \(a=(t,k,\mathrm{depth},ℓ,\mathrm{mode})\) + \(e_{\mathrm{vis}}\) +
 //! gate `PredictedEssential(ℓ,k,morph) ∨ independence_certified`.
@@ -167,6 +167,7 @@ mod executor;
 mod finegrain;
 mod heat;
 mod hotset;
+mod kernel;
 mod learner;
 mod metrics;
 mod prior;
@@ -202,8 +203,9 @@ pub(crate) use edge::{
 };
 pub(crate) use engagement::{AdaptiveEngagement, profile_timing_enabled, research_inspect_enabled};
 pub(crate) use executor::{
-    fence_for_mode, hinted_wait_enabled, occ_read_set_valid, specfence_plant_is_occ,
-    uses_specfence_resolve, wave_for_mode,
+    fence_for_mode, hinted_wait_enabled, next_occ_task, next_sf_task, occ_read_set_valid,
+    specfence_plant_is_occ, uses_specfence_resolve, validate_occ_kernel, validate_occ_stage,
+    wave_for_mode,
 };
 pub use finegrain::{
     AbortEvent, AccountGrainObserve, ConsumerFirstCross, DagStats, EffectClass, EffectLogEntry,
@@ -217,6 +219,7 @@ pub(crate) use heat::HeatMap;
 pub(crate) use hotset::HotSet;
 #[allow(unused_imports)]
 pub(crate) use hotset::{H_A, H_W};
+pub(crate) use kernel::{IncarnationKernel, KernelTable};
 pub(crate) use learner::{AdaptiveParams, InterBlockPrior, LiveLearner};
 pub(crate) use metrics::MetricsInner;
 pub use metrics::SpecFenceMetrics;
@@ -338,6 +341,8 @@ pub(crate) struct SpecFenceCtx<'a> {
     pub sketch: &'a HotSketch,
     /// Process-level Fence/Unfenced reason + per-ℓ timeline (lab / G7).
     pub process: &'a ProcessTrace,
+    /// Per-incarnation OccKernel / PccKernel (SpecFence computer).
+    pub kernel: &'a crate::specfence::KernelTable,
     /// Opt-in lab fine-grain OCC/RW tracer (None = disabled, zero cost).
     pub finegrain: Option<&'a crate::specfence::FineGrainCollector>,
 }

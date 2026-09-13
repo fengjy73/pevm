@@ -247,7 +247,12 @@ impl MvMemory {
     // that re-reading each memory location in the read set still yields the
     // same read origins.
     pub(crate) fn validate_read_locations(&self, tx_idx: TxIdx) -> bool {
-        self.collect_invalid_reads(tx_idx).is_empty()
+        for (location, prior_origins) in &index_mutex!(self.last_locations, tx_idx).read {
+            if !self.origin_still_valid(tx_idx, *location, prior_origins) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Per-location validate API (SpecFence Spec v1): true iff origin still matches.
