@@ -535,7 +535,8 @@ impl LiveLearner {
             .is_some_and(|e| e.load(Ordering::Relaxed) > 0)
     }
 
-    /// Mark PredictedEssential for this access class (intra first-wave / abort).
+    /// Mark PredictedEssential for this access class (intra **abort** only).
+    /// Publish / Detect must not call this — `last_k` is observe, not a gate.
     pub(crate) fn mark_predicted_essential(&self, location: MemoryLocationHash, k: u32) {
         if k == 0 {
             return;
@@ -584,7 +585,8 @@ impl LiveLearner {
         }
     }
 
-    /// Dominant abort / Detect \(k\) for inter-block access-class prior.
+    /// Abort-derived \(k\) template for this \(ℓ\). Detect `last_k` is observe
+    /// only — it must **not** become a PredictedEssential / serial-lane key.
     pub(crate) fn dominant_k(&self, location: MemoryLocationHash) -> u32 {
         self.locs
             .get(&location)
@@ -593,7 +595,7 @@ impl LiveLearner {
                 if n > 0 {
                     (e.abort_k_sum.load(Ordering::Relaxed) / n as u64) as u32
                 } else {
-                    e.last_k.load(Ordering::Relaxed) as u32
+                    0
                 }
             })
             .unwrap_or(0)
@@ -1119,10 +1121,11 @@ impl LiveLearner {
                 let writer_done = e.writer_done.load(Ordering::Relaxed) as f64;
                 let u_aa = e.u_aa.load(Ordering::Relaxed) as f64;
                 let k_n = e.abort_k_n.load(Ordering::Relaxed);
+                // Abort-derived only. Detect last_k must not seed next-block PCC.
                 let k_template = if k_n > 0 {
                     (e.abort_k_sum.load(Ordering::Relaxed) / k_n as u64) as u32
                 } else {
-                    e.last_k.load(Ordering::Relaxed) as u32
+                    0
                 };
                 TopLocPrior {
                     location: *e.key(),
@@ -1314,6 +1317,10 @@ mod tests {
         assert_eq!(tops[0].location, 77);
         assert!(tops[0].fanout_ema >= 2.0);
         assert!(tops[0].abort_rate > 0.0, "u_aa ranks into inter-block H");
+        assert_eq!(
+            tops[0].k_template, 0,
+            "writer_done without abort_k is not a PCC template"
+        );
     }
 
     #[test]
@@ -1534,5 +1541,17 @@ mod tests {
             !live.predicted_essential(11, 0),
             "k_template=0 must not plant PCC"
         );
+        // Detect-only last_k is observe — pack_top must not emit a PCC template.
+        live.note_detect(13, 6, 1, true);
+        let detect_only = live
+            .pack_top_locations()
+            .into_iter()
+            .find(|t| t.location == 13)
+            .expect("detect-only loc is packed");
+        assert_eq!(
+            detect_only.k_template, 0,
+            "last_k must not become inter-block PredictedEssential"
+        );
+        assert!(!live.predicted_essential(13, 6));
     }
 }

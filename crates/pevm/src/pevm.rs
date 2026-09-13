@@ -1550,6 +1550,9 @@ fn try_validate(
                 specfence
                     .learner
                     .note_abort_access(*location, cascade_hint, abort_k);
+                if let Some(k) = abort_k.filter(|&k| k > 0) {
+                    specfence.sketch.mark_access_class(*location, k);
+                }
             }
             // Morph label is decay-only (not an Await / collapse actuator).
             let rewind_to = mv_memory.min_higher_reader_of(tx_version.tx_idx, &fence_locs);
@@ -1777,6 +1780,9 @@ fn try_validate(
                 specfence
                     .learner
                     .note_abort_access(*location, cascade_hint, abort_k);
+                if let Some(k) = abort_k.filter(|&k| k > 0) {
+                    specfence.sketch.mark_access_class(*location, k);
+                }
                 if specfence.rw_prior.predicts_write(*location)
                     || mv_memory
                         .residual_writer_before(*location, tx_version.tx_idx)

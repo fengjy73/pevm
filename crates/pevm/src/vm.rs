@@ -552,15 +552,13 @@ impl<'a, S: Storage> VmDb<'a, S> {
             || self.specfence.edges.avoid_broadcast(location_hash);
 
         // Frozen gate: PredictedEssential(ℓ, k, morph) for THIS a.
-        // Quiet priors never plant; intra abort / first-wave still mark.
+        // Learner PE is abort + inter-block prior only. Sketch access-class is
+        // serial-lane / Detect — never an OR-door into the live verb.
+        // Quiet priors never plant; intra abort still marks.
         let mut predicted = self
             .specfence
             .learner
-            .predicted_essential(location_hash, access_k)
-            || self
-                .specfence
-                .sketch
-                .access_class_predicted(location_hash, access_k);
+            .predicted_essential(location_hash, access_k);
         if self.specfence.learner.quiet_fence_off()
             && !self
                 .specfence
@@ -636,15 +634,19 @@ impl<'a, S: Storage> VmDb<'a, S> {
         }
 
         // Ordered admission on PredictedEssential WaitFor only.
-        // PreferAdmit-as-primary park fix on Unfenced is deleted (serial-lane lands).
+        // PreferAdmit on Unfenced is deleted (serial-lane lands; OCC-width).
         let is_done = |t: TxIdx| self.specfence.scheduler.is_done(t);
         let is_ready = |t: TxIdx| self.specfence.scheduler.is_ready(t);
-        let unfinished =
+        let wait_for = matches!(action, EdgeAction::WaitFor(_));
+        let unfinished = if wait_for {
             self.specfence
                 .sketch
-                .unfinished_writers_before(location_hash, self.tx_idx, is_done);
-        let park_heat = matches!(action, EdgeAction::WaitFor(_));
-        let ready_spines = if matches!(action, EdgeAction::WaitFor(_)) {
+                .unfinished_writers_before(location_hash, self.tx_idx, is_done)
+        } else {
+            Vec::new()
+        };
+        let park_heat = wait_for;
+        let ready_spines = if wait_for {
             self.specfence
                 .sketch
                 .ready_spine_writers(self.tx_idx, is_ready, is_done)
@@ -862,31 +864,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
             (Some(w), ProcessReason::WaitForWriter)
         } else if must_wait {
             // U3: park only Executing. Ready is prefer-admitted; Done∅Data
-            // → Bind residual (not UnfencedWriterDone).
-            if force_prefix && self.tx_idx > 0 && !is_done(self.tx_idx - 1) {
-                (Some(self.tx_idx - 1), ProcessReason::WaitForSerial)
-            } else {
-                (None, ProcessReason::BindPublished)
-            }
-        } else if force_prefix {
-            if let Some(w) = unfinished_all
-                .iter()
-                .copied()
-                .rev()
-                .next()
-                .or(requested_live)
-            {
-                let r = if w + 1 == self.tx_idx {
-                    ProcessReason::WaitForSerial
-                } else {
-                    ProcessReason::WaitForPrefix
-                };
-                (Some(w), r)
-            } else if self.tx_idx > 0 && !is_done(self.tx_idx - 1) {
-                (Some(self.tx_idx - 1), ProcessReason::WaitForSerial)
-            } else {
-                (None, ProcessReason::UnfencedWriterDone)
-            }
+            // → Bind residual. force_prefix must not WaitFor(reader-1)
+            // (exclude-set / wait_no_writer smell).
+            (None, ProcessReason::BindPublished)
         } else if let Some(w) = requested_live {
             let r = if w + 1 == self.tx_idx {
                 ProcessReason::WaitForSerial
@@ -2912,15 +2892,12 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                             self.specfence.edges.broadcast_avoid(*loc);
                             self.specfence.metrics.record_avoid_broadcast();
                         }
-                        // First-wave per access class: if we already know the
-                        // consumer k template, arm PredictedEssential(ℓ, k) —
-                        // not sticky Wait for every later SLOAD in the consumer.
+                        // First-wave serial-lane: abort-derived k template only.
+                        // Publish never plants PredictedEssential from Detect last_k
+                        // (that Bind-taxed quiet / ¬PredictedEssential accesses).
                         let k_tmpl = self.specfence.learner.dominant_k(*loc);
                         if k_tmpl > 0 {
                             self.specfence.sketch.mark_access_class(*loc, k_tmpl);
-                            self.specfence
-                                .learner
-                                .mark_predicted_essential(*loc, k_tmpl);
                         }
                         self.specfence.process.note_avoid(*loc);
                         let kind = match value {

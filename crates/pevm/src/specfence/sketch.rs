@@ -148,7 +148,8 @@ impl HotSketch {
                     confidence: conf,
                 },
             );
-            // Access-class PredictedEssential — not H-OR / not all-k sticky.
+            // Serial-lane access class from abort-derived k_template only.
+            // Live PredictedEssential is seeded on the learner (quiet skips).
             if top.k_template > 0 {
                 self.mark_access_class(top.location, top.k_template);
             }
@@ -518,8 +519,9 @@ impl HotSketch {
     }
 
     /// Legacy location-level probe — **not** the live Avoid key.
-    /// Live gate is [`Self::access_class_predicted`]. `force_prefix` is ignored
-    /// (exclude set). H / prior_ws / template are observe-only.
+    /// Observe / serial-lane probe — **not** the live Avoid key.
+    /// Live PE gate is `LiveLearner::predicted_essential`. `force_prefix` is
+    /// ignored (exclude set). H / prior_ws / template are observe-only.
     pub(crate) fn essential_antidep(
         &self,
         location: MemoryLocationHash,
