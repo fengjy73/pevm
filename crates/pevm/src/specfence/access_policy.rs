@@ -83,27 +83,34 @@ pub(crate) fn decide(
 
     // SoT §3.2 — event-driven + cost-aware prior-PE Fire.
     // HotSet / WŜ are posterior / ready-edge priors, not SerialLane OR-doors.
-    // Multi-writer PE class first — do **not** Bind stale Data (theater).
     let intra = learner.predicted_essential_intra(location, access_k);
-    // Fence only on fan_out (EV win). Spine/quiet intra-Fence is tax
-    // (19807137 0.30; 2179522 Bind livelock). Isolated prior is empty.
     let fan = learner.morph_weights().dominant_fan_out();
-    let park_ok = fan && !learner.quiet_fence_off() && (intra || learner.prior_pe_fire_wins(vis));
-    if vis.unfinished > 1 || (vis.in_serial_lane && vis.unfinished > 0) {
-        // SerialLane parks only the executing head. Ready-head park
-        // serializes satellites before they plant ESTIMATE and inflates
-        // B0 (14689597 abort 229 vs OCC 37).
-        if park_ok && vis.writer_executing && let Some(w) = vis.writer {
-            return AccessDecision::SerialLane { writer: w };
-        }
-    }
-    if vis.unfinished == 1 && vis.writer_executing {
-        if park_ok && let Some(w) = vis.writer {
+    let quiet_off = learner.quiet_fence_off();
+    // WaitFor pins one *executing* producer. Intra evidence is enough —
+    // quiet_fence_off existed to stop Bind-rem livelock (2179522), not
+    // this park. Prior-only WaitFor still needs the T3 fan_out EV brake.
+    if vis.unfinished == 1
+        && vis.writer_executing
+        && let Some(w) = vis.writer
+    {
+        if intra || (fan && !quiet_off && learner.prior_pe_fire_wins(vis)) {
             return AccessDecision::WaitFor { writer: w };
         }
     }
-    // Bind-on-Data is stale when later writers are not yet in MV (14689597
-    // 550 vs OCC 66). WaitFor(executing) is the only timely Fence.
+    // SerialLane / Bind: fan_out + cost gate. Never Bind while unfinished>0
+    // (later writers not yet in MV — stale last_data theater).
+    let park_ok = fan && !quiet_off && (intra || learner.prior_pe_fire_wins(vis));
+    if vis.unfinished > 1 || (vis.in_serial_lane && vis.unfinished > 0) {
+        if park_ok
+            && vis.writer_executing
+            && let Some(w) = vis.writer
+        {
+            return AccessDecision::SerialLane { writer: w };
+        }
+    }
+    if vis.unfinished == 0 && vis.published_data && park_ok {
+        return AccessDecision::Bind;
+    }
     AccessDecision::UnfencedOcc {
         predicted: true,
         roi_skip: true,
@@ -205,16 +212,13 @@ mod tests {
     }
 
     #[test]
-    fn prior_pe_plus_data_is_not_stale_bind() {
+    fn prior_pe_plus_data_and_unfinished0_is_bind() {
         let live = fan_out_learner();
         live.seed_predicted_essential(7, 6);
         assert_eq!(
             decide(&live, 7, 6, Some(&data_vis())),
-            AccessDecision::UnfencedOcc {
-                predicted: true,
-                roi_skip: true
-            },
-            "Bind-on-Data is stale-writer theater; WaitFor(executing) only"
+            AccessDecision::Bind,
+            "SoT: Data ∧ unfinished=0 → Bind (OCC read + cert, no rem overlay)"
         );
     }
 
@@ -271,17 +275,15 @@ mod tests {
     }
 
     #[test]
-    fn quiet_intra_pe_stays_spec_until_heat() {
-        // 2179522: one abort must not Bind-tax / livelock the quiet cohort.
+    fn quiet_intra_pe_waitfor_executing_but_does_not_bind() {
+        // 2179522: one abort must not Bind-tax the quiet cohort.
+        // WaitFor(executing) is park-only — the livelock was rem Bind.
         let live = LiveLearner::new();
         live.begin_block(MorphWeights::default());
         live.note_abort_access(7, 2, Some(6));
         assert_eq!(
             decide(&live, 7, 6, Some(&exec_vis(1))),
-            AccessDecision::UnfencedOcc {
-                predicted: true,
-                roi_skip: true
-            }
+            AccessDecision::WaitFor { writer: 1 }
         );
         assert_eq!(
             decide(&live, 7, 6, Some(&data_vis())),

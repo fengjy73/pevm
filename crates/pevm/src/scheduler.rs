@@ -121,26 +121,30 @@ impl Scheduler {
     }
 
     /// Refuse Execute when PE unpublished-RAW is still live (v6 ready-edge).
+    /// First incarnation always starts so it can plant ESTIMATE writes.
+    /// Reincarnation of a known consumer waits for the producer (S1).
     fn try_execute_ready(
         &self,
         tx_idx: TxIdx,
         wave: Option<&WaveParkTable>,
         ready: Option<&ReadyEdgeTable>,
     ) -> Option<TxVersion> {
-        if let Some(edges) = ready
-            && !edges.may_execute(tx_idx)
-        {
-            edges.defer(tx_idx);
-            if let Some(wave) = wave
-                && let Some(w) = edges.blocking_producer(tx_idx)
-            {
-                self.admit_spine(w, wave);
-            }
-            return None;
-        }
         if tx_idx < self.block_size {
             let mut tx = index_mutex!(self.transactions_status, tx_idx);
             if tx.status == IncarnationStatus::ReadyToExecute {
+                if let Some(edges) = ready
+                    && tx.incarnation > 0
+                    && !edges.may_execute(tx_idx)
+                {
+                    edges.defer(tx_idx);
+                    if let Some(wave) = wave
+                        && let Some(w) = edges.blocking_producer(tx_idx)
+                    {
+                        drop(tx);
+                        self.admit_spine(w, wave);
+                    }
+                    return None;
+                }
                 tx.status = IncarnationStatus::Executing;
                 self.set_done_flag(tx_idx, false);
                 return Some(TxVersion {
@@ -228,6 +232,7 @@ impl Scheduler {
                     // "Steal" execution job while holding the lock
                     if tx.status == IncarnationStatus::ReadyToExecute {
                         if let Some(edges) = ready
+                            && tx.incarnation > 0
                             && !edges.may_execute(tx_idx)
                         {
                             edges.defer(tx_idx);

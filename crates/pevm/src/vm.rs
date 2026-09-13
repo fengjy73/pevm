@@ -508,24 +508,22 @@ impl<'a, S: Storage> VmDb<'a, S> {
             }
             AccessDecision::Bind => {
                 self.specfence.metrics.record_predicted_essential();
-                let Some(v) = self
-                    .mv_memory
-                    .last_data_before(location_hash, self.tx_idx)
-                    .map(|(tx_idx, tx_incarnation)| TxVersion {
-                        tx_idx,
-                        tx_incarnation,
-                    })
-                else {
+                let Some(_) = self.mv_memory.last_data_before(location_hash, self.tx_idx) else {
                     // T2: no cert on Bind-decide then Data miss.
                     self.specfence.metrics.record_pcc_roi_skip();
                     return self.occ_unfenced();
                 };
+                // Bind = OCC read of published Data + cert. Never arm rem
+                // overlay (`pcc_armed`) — that skips later ESTIMATE writers.
                 self.note_fence_success(location_hash);
-                self.pcc_bind_published(address, location_hash, access_k, is_program, v)
+                self.specfence.metrics.record_pcc_fire_at_a();
+                self.specfence.metrics.record_edge_bind();
+                self.specfence.learner.note_bind_success(location_hash);
+                let _ = (address, access_k, is_program);
+                self.occ_unfenced()
             }
             AccessDecision::WaitFor { writer } => {
                 self.specfence.metrics.record_predicted_essential();
-                self.note_fence_success(location_hash);
                 self.pcc_wait_for_writer(address, location_hash, access_k, is_program, writer)
             }
             AccessDecision::SerialLane { writer } => {
@@ -617,10 +615,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.specfence.ready_edges.note_consumer(self.tx_idx, w);
         self.specfence.scheduler.admit_spine(w, self.specfence.wave);
         if self.specfence.scheduler.is_done(w) {
+            self.note_fence_success(location_hash);
             return self.occ_unfenced();
         }
         if self.specfence.scheduler.is_executing(w) {
-            self.note_fence_success(location_hash);
             return self.pcc_wait_for_writer(address, location_hash, access_k, is_program, w);
         }
         // Ready/Aborting: token is admit of the head. Parking the reader
@@ -672,6 +670,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
             || self.specfence.partial_retry.has_ff_head(self.tx_idx)
     }
 
+    #[allow(dead_code)]
     fn pcc_bind_published(
         &self,
         address: Address,
@@ -745,58 +744,52 @@ impl<'a, S: Storage> VmDb<'a, S> {
         is_program: bool,
         w: TxIdx,
     ) -> Result<(), ReadError> {
-        self.pcc_armed.set(true);
-        self.pcc_this_tx
-            .set(self.pcc_this_tx.get().saturating_add(1));
-        self.specfence.metrics.record_pcc_fire_at_a();
+        // Pin one producer. Never `pcc_armed` — rem overlay skips ESTIMATE
+        // and Bind-theaters stale last_data (14689597 abort 503 vs OCC 113).
+        let _ = (address, is_program);
         self.specfence
             .ready_edges
             .note_unpublished(location_hash, w);
         self.specfence.ready_edges.note_consumer(self.tx_idx, w);
-        let access_depth = 0u8;
+        self.specfence.scheduler.admit_spine(w, self.specfence.wave);
+        if self.specfence.scheduler.is_done(w) {
+            // Producer published. OCC reads Data (or ESTIMATE of a later w).
+            self.note_fence_success(location_hash);
+            self.specfence.metrics.record_pcc_fire_at_a();
+            self.specfence.metrics.record_edge_bind();
+            self.specfence.learner.note_bind_success(location_hash);
+            return self.occ_unfenced();
+        }
+        if !self.specfence.scheduler.is_executing(w) {
+            // Ready/Aborting: do not park — ESTIMATE plant / OCC Blocking.
+            return self.occ_unfenced();
+        }
+        self.note_fence_success(location_hash);
+        self.pcc_this_tx
+            .set(self.pcc_this_tx.get().saturating_add(1));
+        self.specfence.metrics.record_pcc_fire_at_a();
+        self.specfence.metrics.record_edge_wait_for();
+        self.specfence.metrics.record_wait_hard();
         let key = EdgeKey {
             location: location_hash,
             reader: self.tx_idx,
             access_k,
-            depth: access_depth,
+            depth: 0,
         };
         self.specfence
             .edges
             .record(key, Some(w), EdgeKind::Wr, EdgeState::Unpublished);
-        self.specfence.process.record_decision(DecisionFeat {
-            verb: DecisionVerb::WaitFor,
-            access_k,
-            depth: access_depth,
-            incarnation: self.tx_incarnation,
-            is_program,
-            writer_published: false,
-            writer_validated: false,
-            writer_executing: true,
-            writer_ready: false,
-            writer_present: true,
-            avoid_broadcast: false,
-            canary_ok: false,
-            independence_certified: false,
-            essential_antidep: true,
-            force_prefix: false,
-            clique_gated: false,
-            in_hot_set: false,
-            prior_warm: false,
-            mode_read: true,
-        });
-        // Hang-freedom: admit the WaitFor target only — never fleet-park.
-        self.specfence.scheduler.admit_spine(w, self.specfence.wave);
-        self.fence_wait_for(
-            address,
+        self.specfence.learner.note_park_heat();
+        self.specfence
+            .dag
+            .arm_hard_wait(location_hash, self.tx_idx, w);
+        self.specfence.wave.set_pending_park(
             location_hash,
-            w,
-            true,
-            false,
-            false,
-            false,
-            false,
-            true,
-        )
+            self.specfence.partial_retry.current_k(self.tx_idx) as u64,
+            crate::specfence::ParkKind::BlockingOther,
+        );
+        self.specfence.process.note_park(self.tx_idx);
+        Err(ReadError::Blocking(w))
     }
 
     /// Fence WaitFor: never convert a known-essential / post-Avoid Region to

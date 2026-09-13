@@ -554,39 +554,15 @@ impl Pevm {
                                         Some(&metrics_inner),
                                     )
                                 } else if specfence.mode == ConcurrencyMode::SpecFence {
-                                    if specfence.certificates.has_any(tx_version.tx_idx)
-                                        || specfence.kernel.repair_armed(tx_version.tx_idx)
-                                    {
-                                        let invalid =
-                                            mv_memory.collect_invalid_reads(tx_version.tx_idx);
-                                        if crate::specfence::specfence_r1_validate(
-                                            specfence.mode,
-                                            specfence.certificates,
-                                            tx_version.tx_idx,
-                                            &invalid,
-                                        ) {
-                                            try_validate(
-                                                &mv_memory,
-                                                &scheduler,
-                                                &tx_version,
-                                                specfence,
-                                            )
-                                        } else {
-                                            crate::specfence::validate_occ_kernel(
-                                                &mv_memory,
-                                                &scheduler,
-                                                &tx_version,
-                                                specfence,
-                                            )
-                                        }
-                                    } else {
-                                        crate::specfence::validate_occ_kernel(
-                                            &mv_memory,
-                                            &scheduler,
-                                            &tx_version,
-                                            specfence,
-                                        )
-                                    }
+                                    // Certificate grain is recorded; rem-museum R1
+                                    // (try_validate) is tax without first-wave win.
+                                    // Spec-only and Fenced-fail both B0 via OCC kernel.
+                                    crate::specfence::validate_occ_kernel(
+                                        &mv_memory,
+                                        &scheduler,
+                                        &tx_version,
+                                        specfence,
+                                    )
                                 } else {
                                     try_validate(&mv_memory, &scheduler, &tx_version, specfence)
                                 };
@@ -928,7 +904,7 @@ impl Pevm {
                             if let Some(stolen) = scheduler.next_task_steal_after_park_prefer(
                                 wave,
                                 Some(blocking_tx_idx),
-                                None, // do not PE-refuse steal (ESTIMATE must plant)
+                                Some(vm.ready_edges()),
                             ) {
                                 return Some(stolen);
                             }
@@ -943,7 +919,7 @@ impl Pevm {
                         if let Some(stolen) = scheduler.next_task_steal_after_park_prefer(
                             wave,
                             Some(blocking_tx_idx),
-                            None, // do not PE-refuse steal (ESTIMATE must plant)
+                            Some(vm.ready_edges()),
                         ) {
                             return Some(stolen);
                         }

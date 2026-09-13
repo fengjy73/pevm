@@ -190,7 +190,14 @@ pub(crate) fn validate_occ_kernel(
         None => (0, block_size.saturating_sub(cascade_from)),
     };
     specfence.metrics.record_fence_cascade(cascade, skipped);
-    scheduler.finish_validation_fenced(tx_version, true, rewind_to, Some(specfence.wave))
+    // OCC-identical suffix cascade + wave ready for park steal.
+    // min_higher_reader skip left later txs Validated against ESTIMATE.
+    scheduler.finish_validation_fenced(
+        tx_version,
+        true,
+        Some(tx_version.tx_idx + 1),
+        Some(specfence.wave),
+    )
 }
 
 #[cfg(test)]

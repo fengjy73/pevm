@@ -3867,10 +3867,7 @@ fn gaps_closed_waitfor_avoid_publish_wake() {
     assert_eq!(par, sequential, "gaps-closed seq≡par: {m:?}");
     assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
     assert!(
-        m.avoid_broadcasts > 0
-            || m.edge_bind > 0
-            || m.edge_wait_for > 0
-            || m.occ_kernel_execs > 0,
+        m.avoid_broadcasts > 0 || m.edge_bind > 0 || m.edge_wait_for > 0 || m.occ_kernel_execs > 0,
         "fan_out Fence or OCC-identical: {m:?}"
     );
     let warm = pevm
