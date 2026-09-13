@@ -15,9 +15,10 @@ pub(crate) fn next_sf_task(
     wave: &WaveParkTable,
     ready: &ReadyEdgeTable,
 ) -> Option<Task> {
-    // Observe ready-edges; do not refuse Execute. Schedule-refuse of
-    // known consumers (even reincarnation-only) deferred ESTIMATE
-    // dependents and inflated 14689597 aborts ~10×.
+    // Wave steal after WaitFor park. Do not PE-refuse Execute here:
+    // schedule-refuse of known consumers deadlocks when the producer is
+    // not on the collaborative index (spin in next_task). Avoid is
+    // WaitFor/Bind/SerialLane at the PE access + ready-edge observe.
     let _ = ready;
     scheduler.next_task_with_wave(Some(wave))
 }

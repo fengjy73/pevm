@@ -779,12 +779,12 @@ impl LiveLearner {
             m.quiet = (m.quiet - 0.01).max(0.01);
         }
         *m = m.normalize();
+        drop(m);
         if let Some(k) = k.filter(|&k| k > 0) {
             self.mark_predicted_essential(location, k);
-        } else {
-            // Quiet first-wave has no AccessOrdinalLog. Still train PE so
-            // reincarnation can Bind/WaitFor (otherwise plant_is_occ sticks
-            // and Fence never opens after B0).
+        } else if !self.quiet_fence_off() || cascade_hint >= 8 {
+            // First-wave has no ordinal. Template only off quiet / on heat
+            // so 2179522 does not open PE after a lone abort.
             for template in [1u32, 6, 10, 20] {
                 self.mark_predicted_essential(location, template);
             }

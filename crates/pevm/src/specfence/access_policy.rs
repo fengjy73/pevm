@@ -86,14 +86,13 @@ pub(crate) fn decide(
     let intra = learner.predicted_essential_intra(location, access_k);
     let fan = learner.morph_weights().dominant_fan_out();
     let quiet_off = learner.quiet_fence_off();
-    // WaitFor pins one *executing* producer. Intra evidence is enough —
-    // quiet_fence_off existed to stop Bind-rem livelock (2179522), not
-    // this park. Prior-only WaitFor still needs the T3 fan_out EV brake.
+    // WaitFor pins one *executing* producer. Quiet-off blocks first-wave
+    // tax (2179522). Prior-only still needs the T3 fan_out EV brake.
     if vis.unfinished == 1
         && vis.writer_executing
         && let Some(w) = vis.writer
     {
-        if intra || (fan && !quiet_off && learner.prior_pe_fire_wins(vis)) {
+        if !quiet_off && (intra || (fan && learner.prior_pe_fire_wins(vis))) {
             return AccessDecision::WaitFor { writer: w };
         }
     }
@@ -277,13 +276,16 @@ mod tests {
     #[test]
     fn quiet_intra_pe_waitfor_executing_but_does_not_bind() {
         // 2179522: one abort must not Bind-tax the quiet cohort.
-        // WaitFor(executing) is park-only — the livelock was rem Bind.
+        // quiet_fence_off also holds WaitFor until heat lifts.
         let live = LiveLearner::new();
         live.begin_block(MorphWeights::default());
         live.note_abort_access(7, 2, Some(6));
         assert_eq!(
             decide(&live, 7, 6, Some(&exec_vis(1))),
-            AccessDecision::WaitFor { writer: 1 }
+            AccessDecision::UnfencedOcc {
+                predicted: true,
+                roi_skip: true
+            }
         );
         assert_eq!(
             decide(&live, 7, 6, Some(&data_vis())),

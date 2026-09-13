@@ -413,11 +413,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
         is_program: bool,
     ) -> Result<(), ReadError> {
         match self.specfence.mode {
-            crate::ConcurrencyMode::Occ | crate::ConcurrencyMode::SpecFence => {
-                let _ = (address, location_hash, is_program);
-                Ok(())
-            }
+            crate::ConcurrencyMode::Occ => Ok(()),
             crate::ConcurrencyMode::Pcc => self.maybe_wait_pcc(address, location_hash),
+            crate::ConcurrencyMode::SpecFence => {
+                self.specfence_access_gate(address, location_hash, is_program)
+            }
         }
     }
 
@@ -453,8 +453,8 @@ impl<'a, S: Storage> VmDb<'a, S> {
 
     /// SpecFence access gate. Mode(a) from \(a + e_{\mathrm{vis}} + \mathrm{PE}\).
     /// Quiet + empty PE ⇒ byte-identical OCC (`Ok(())`, no detect / ordinal).
-    /// Fence certs only after a successful verb.
-    #[allow(dead_code)]
+    /// First incarnation always OCC (ESTIMATE must plant). Fence certs only
+    /// after a successful verb. Never `pcc_armed` rem overlay.
     fn specfence_access_gate(
         &self,
         address: Address,
@@ -465,13 +465,51 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if address == self.specfence.beneficiary || self.is_lazy {
             return Ok(());
         }
+        if self.tx_incarnation == 0
+            || crate::specfence::specfence_access_is_occ(
+                crate::ConcurrencyMode::SpecFence,
+                self.specfence.learner,
+                location_hash,
+            )
+        {
+            return Ok(());
+        }
 
-        // Live execute is OCC-identical. Measured Fence cuts (wave schedule,
-        // mid-read WaitFor, Bind-cert, reincarnation WaitFor) each lost
-        // 14689597 wall vs OCC despite architecture modules staying compiled.
-        // `decide` / ready-edge / cert / lane remain unit-tested.
-        let _ = (location_hash, is_program);
-        Ok(())
+        let vis = self.access_vis(location_hash);
+        let access_k = self.specfence.learner.dominant_k(location_hash).max(1);
+        match crate::specfence::decide_access(
+            self.specfence.learner,
+            location_hash,
+            access_k,
+            Some(&vis),
+        ) {
+            AccessDecision::UnfencedOcc { .. } => Ok(()),
+            AccessDecision::Bind => {
+                if self
+                    .mv_memory
+                    .last_data_before(location_hash, self.tx_idx)
+                    .is_none()
+                {
+                    self.specfence.metrics.record_pcc_roi_skip();
+                    return Ok(());
+                }
+                self.note_fence_success(location_hash);
+                self.specfence.metrics.record_predicted_essential();
+                self.specfence.metrics.record_pcc_fire_at_a();
+                self.specfence.metrics.record_edge_bind();
+                self.specfence.learner.note_bind_success(location_hash);
+                let _ = (address, is_program);
+                Ok(())
+            }
+            AccessDecision::WaitFor { writer } => {
+                self.specfence.metrics.record_predicted_essential();
+                self.pcc_wait_for_writer(address, location_hash, access_k, is_program, writer)
+            }
+            AccessDecision::SerialLane { writer } => {
+                self.specfence.metrics.record_predicted_essential();
+                self.pcc_serial_lane(address, location_hash, access_k, is_program, writer)
+            }
+        }
     }
 
     /// \(e_{\mathrm{vis}}\) + learning features. Gathered only on a PE hit.
@@ -526,7 +564,6 @@ impl<'a, S: Storage> VmDb<'a, S> {
     }
 
     /// Successful Fence verb — strip + rem-legal mirror. Never call on Data miss.
-    #[allow(dead_code)]
     fn note_fence_success(&self, location: MemoryLocationHash) {
         let first = !self.specfence.certificates.has_any(self.tx_idx);
         self.specfence
@@ -539,7 +576,6 @@ impl<'a, S: Storage> VmDb<'a, S> {
     }
 
     /// SerialLane = exclusive progress token. Never prefer_admit + Spec continue.
-    #[allow(dead_code)]
     fn pcc_serial_lane(
         &self,
         address: Address,
@@ -679,7 +715,6 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.bind_on_data_lite(address, location_hash, v, false)
     }
 
-    #[allow(dead_code)]
     fn pcc_wait_for_writer(
         &self,
         address: Address,
@@ -698,12 +733,16 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.specfence.scheduler.admit_spine(w, self.specfence.wave);
         if self.specfence.scheduler.is_done(w) {
             // Producer published. OCC reads Data (or ESTIMATE of a later w).
+            self.note_fence_success(location_hash);
+            self.specfence.metrics.record_edge_bind();
+            self.specfence.learner.note_bind_success(location_hash);
             return self.occ_unfenced();
         }
         if !self.specfence.scheduler.is_executing(w) {
             // Ready/Aborting: do not park — ESTIMATE plant / OCC Blocking.
             return self.occ_unfenced();
         }
+        self.note_fence_success(location_hash);
         self.pcc_this_tx
             .set(self.pcc_this_tx.get().saturating_add(1));
         self.specfence.metrics.record_pcc_fire_at_a();

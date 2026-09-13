@@ -519,15 +519,11 @@ impl Pevm {
                         chain, spec_id, &block_env, &txs, storage, &mv_memory, specfence,
                     );
                     let profile = crate::specfence::profile_timing_enabled();
-                    // SpecFence live computer ≡ OCC (execute / schedule /
-                    // validate). Wave + mid-read Fence each inflated 14689597
-                    // aborts ~10× vs OCC; Default Spec ≡ OCC helpers.
-                    let occ_ticks = matches!(
-                        self.concurrency_mode,
-                        ConcurrencyMode::Occ | ConcurrencyMode::SpecFence
-                    );
+                    // Empty PE ⇒ OCC computer (T6). After abort trains PE,
+                    // ready-edge + wave steal (incarnation>0 refuse).
+                    let occ_mode = self.concurrency_mode == ConcurrencyMode::Occ;
                     let mut sched_t0 = profile.then(Instant::now);
-                    let mut task = if occ_ticks {
+                    let mut task = if occ_mode || !specfence.learner.has_any_predicted() {
                         crate::specfence::next_occ_task(&scheduler)
                     } else if let Some(w) = wave_ref {
                         crate::specfence::next_sf_task(&scheduler, w, specfence.ready_edges)
@@ -540,7 +536,8 @@ impl Pevm {
                     while task.is_some() {
                         task = match task.unwrap() {
                             Task::Execution(tx_version) => {
-                                if occ_ticks {
+                                let pe = specfence.learner.has_any_predicted();
+                                if occ_mode || !pe {
                                     self.try_execute(&mut vm, &scheduler, tx_version, None, None)
                                 } else {
                                     let fence_ref = crate::specfence::fence_for_mode(
@@ -554,7 +551,7 @@ impl Pevm {
                             }
                             Task::Validation(tx_version) => {
                                 let v0 = profile.then(Instant::now);
-                                let next = if self.concurrency_mode == ConcurrencyMode::Occ {
+                                let next = if occ_mode {
                                     crate::specfence::validate_occ_stage(
                                         &mv_memory,
                                         &scheduler,
@@ -562,11 +559,11 @@ impl Pevm {
                                         Some(&metrics_inner),
                                     )
                                 } else if specfence.mode == ConcurrencyMode::SpecFence {
-                                    crate::specfence::validate_occ_stage(
+                                    crate::specfence::validate_occ_kernel(
                                         &mv_memory,
                                         &scheduler,
                                         &tx_version,
-                                        Some(&metrics_inner),
+                                        specfence,
                                     )
                                 } else {
                                     try_validate(&mv_memory, &scheduler, &tx_version, specfence)
@@ -591,7 +588,7 @@ impl Pevm {
 
                         if task.is_none() {
                             sched_t0 = profile.then(Instant::now);
-                            task = if occ_ticks {
+                            task = if occ_mode || !specfence.learner.has_any_predicted() {
                                 crate::specfence::next_occ_task(&scheduler)
                             } else if let Some(w) = wave_ref {
                                 crate::specfence::next_sf_task(&scheduler, w, specfence.ready_edges)
