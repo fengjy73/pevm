@@ -91,4 +91,4 @@ N=3 focus+worst10+quiet (17 blocks) at `c821784` before quiet/in-flight tighten:
 - **14689597** R1=0 / R2=149 (prior R2=66) — H-alone Unfenced while writer Executing
 - **19807137** SF/OCC 0.095 vs 0.090 (SF wall 172 vs 131 — not a win)
 
-Post-N3 tighten kept: quiet follow-on **never** plants H (high-abort leftovers included). In-flight-H WaitFor and abort&lt;4 quiet lift were tried; first broke seq≡par, second made the specfence suite schedule-flaky — reverted. Isolated 2179522 N=3 regression remains (no inter-prior). Same-sample median is **not** a full-set 0.356 replay.
+Post-N3 tighten kept: quiet follow-on **never** plants H (high-abort leftovers included). In-flight-H WaitFor and abort<4 quiet lift were tried; first broke seq≡par, second made the specfence suite schedule-flaky — reverted. Isolated 2179522 N=3 regression remains (no inter-prior). Same-sample median is **not** a full-set 0.356 replay.
