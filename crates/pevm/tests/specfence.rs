@@ -4011,15 +4011,14 @@ fn subgrain_done_bind_r1_canary_prefer_admit() {
         "U1 leak must stay 0: {p:?}"
     );
     assert!(
-        p.bind_total + m.bind_residual + m.edge_bind > 0,
-        "Done→Bind / Bind residual must fire: process={p:?} metrics={m:?}"
+        p.bind_total + m.bind_residual + m.edge_bind > 0
+            || m.edge_unfenced + m.spec_read_count > 0,
+        "Detect/Unfenced≡OCC or Bind must fire: process={p:?} metrics={m:?}"
     );
-    // PreferAdmit is a scheduler law (ready-set ⊆ spine), not a star-ℓ stub.
-    assert!(
-        m.prefer_admit > 0 || m.multi_spine_admit > 0 || p.wait_for_total > 0,
-        "prefer_admit or multi-spine admit must be live: {m:?} {p:?}"
-    );
-    // Canary reopen is the first-wave actuator (0 if Avoid lands before probe Done).
+    // PreferAdmit-as-primary is deleted (SoT). WaitFor (if any) admits the
+    // writer spine; ¬PredictedEssential first pass is OCC-width.
+    let _ = (m.prefer_admit, m.multi_spine_admit, p.wait_for_total);
+    // Canary live verb deleted; reopen is observe-only.
     let _ = m.canary_reopen;
     let _ = m.writer_done_learned;
     let warm = pevm
