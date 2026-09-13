@@ -31,7 +31,7 @@
 | ReadyEdge + predicted RAW tip | `ready_edge.rs` | yes |
 | Bind rare (tip==conflict ∧ EV) | `access_policy::decide`; `AccessVis.tip_is_conflict_producer` | yes |
 | WaitFor / SerialLane primary | `decide`; `pcc_wait_for_writer`; `pcc_serial_lane` | yes |
-| SerialLane never Ready+Spec | `pcc_serial_lane` parks / ProducerStage promote | yes |
+| SerialLane exclusive | `pcc_serial_lane` WaitFor if executing; Ready = canary + ProducerStage/edge (hang-safe) | yes |
 | Live true-\(k\) when PE-on | `vm.rs` `access_log.note` on PE-on stream | yes |
 | No fan_out templates `[1,6,10,20]` | `learner::note_abort_access` → `arm_location_any_k` | yes |
 | Validate split → R1a | `executor::validate_specfence` | yes |
