@@ -608,13 +608,13 @@ impl LiveLearner {
 
     /// Bind↑ without abort relief — disable Bind for the rest of the block.
     ///
-    /// `aborts >= binds` never fired on 14689597 (577 Bind / 176 abort).
-    /// Flood + residual abort **is** the tax (Bind↑ ∧ abort not↓ vs OCC).
+    /// `binds>=16 ∧ abort>0` (v8 try) **lost** 14689597: 0.424→0.199 and
+    /// aborts 176→965. Keep the strict `aborts >= binds` trip only.
     #[inline]
     pub(crate) fn bind_tax_losing(&self) -> bool {
         let binds = self.bind_success_total.load(Ordering::Relaxed);
         let aborts = self.abort_events.load(Ordering::Relaxed);
-        binds >= 16 && aborts > 0
+        binds >= 16 && aborts >= binds
     }
 
     /// Unknown-\(k\) abort: arm \(\ell\) any-k. Never spray `[1,6,10,20]`.

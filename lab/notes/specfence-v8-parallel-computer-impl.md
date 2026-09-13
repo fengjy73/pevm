@@ -77,6 +77,6 @@ PE nonempty:
 - All-blocks N=1 @8 (tip before Bind-flood trip, 98 nonempty): median **0.706** (< 0.744); quiet p10 **0.510** (< 0.85)
 - **14689597** N=3 @8: SF/OCC **0.424** (v6 N=3 = 0.336); Bind=577 Wait=77 R1=0 aborts 176 vs OCC 31
 - **14689597** N=1 @8: **0.311**; Bind=514 Wait=44
-- Bind-flood trip (`binds>=16 ∧ abort>0`) added after that JSON — re-sweep before celebrating
+- Bind-flood trip `binds≥16 ∧ abort>0` **reverted**: 14689597 N=3 fell 0.424→0.199 (aborts 176→965). Strict `aborts≥binds` kept.
 
 JSON: `lab/results/v8-all-blocks-n1.json`, `lab/results/v8-named-sf-occ-n3.json` (gitignored).

@@ -358,25 +358,28 @@ mod tests {
 
     #[test]
     #[test]
-    fn bind_flood_with_residual_abort_is_tax() {
+    fn bind_tax_trips_only_when_aborts_match_binds() {
         let live = fan_out_learner();
         live.seed_predicted_essential(7, 6);
-        assert_eq!(
-            decide(&live, 7, 6, Some(&data_vis())),
-            AccessDecision::Bind,
-            "first Bind still allowed"
-        );
         for _ in 0..16 {
             live.note_bind_success(7);
         }
         live.note_abort_access(7, 2, Some(6));
         assert_eq!(
             decide(&live, 7, 6, Some(&data_vis())),
+            AccessDecision::Bind,
+            "loose abort>0 trip lost 14689597 (965 aborts); residual abort alone is not enough"
+        );
+        for _ in 0..16 {
+            live.note_abort_access(7, 2, Some(6));
+        }
+        assert_eq!(
+            decide(&live, 7, 6, Some(&data_vis())),
             AccessDecision::UnfencedOcc {
                 predicted: true,
                 roi_skip: true
             },
-            "14689597: Bind flood + residual abort → Spec, not more Bind"
+            "aborts >= binds still trips Bind"
         );
     }
 
