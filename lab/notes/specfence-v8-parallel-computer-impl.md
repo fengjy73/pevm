@@ -34,7 +34,8 @@
 | SerialLane exclusive | `pcc_serial_lane` WaitFor if executing; Ready = canary + ProducerStage/edge (Ready-park/refuse yield-spins) | yes |
 | Live true-\(k\) when PE-on | `vm.rs` `access_log.note` on PE-on stream | yes |
 | No fan_out templates `[1,6,10,20]` | `learner::note_abort_access` → `arm_location_any_k` | yes |
-| Validate split → R1a | `executor::validate_specfence` | yes |
+| Validate split → R1a | `executor::validate_specfence` (covers_all + selective fenced rebind) | yes |
+| Cert strips survive WaitFor resume | `certificate::begin_execute` keeps locs on inc>0 | yes |
 | Spec-only → B0 | `validate_occ_kernel` when no strip | yes |
 | HotSet/WŜ → edges + posterior | `access_vis` insert ReadyEdge; `note_hot_ws_posterior` | yes |
 | process.record every Fence verb | Bind / WaitFor / SerialLane in `vm.rs` | yes |

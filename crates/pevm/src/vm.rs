@@ -190,9 +190,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
             let repair_armed = self.specfence.partial_retry.is_rewind_resume(tx_idx)
                 || self.specfence.partial_retry.has_ff_head(tx_idx);
             self.specfence.kernel.begin_execute(tx_idx, repair_armed);
-            self.specfence
-                .certificates
-                .begin_execute(tx_idx, repair_armed);
+            self.specfence.certificates.begin_execute(
+                tx_idx,
+                repair_armed,
+                incarnation,
+            );
             self.specfence.access_log.begin_incarnation(tx_idx);
             self.specfence
                 .partial_retry

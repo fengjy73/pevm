@@ -37,14 +37,14 @@ mod tests {
     #[test]
     fn spec_only_fail_is_b0() {
         let c = CertificateTable::new(1);
-        c.begin_execute(0, false);
+        c.begin_execute(0, false, 0);
         assert_eq!(repair_grain(&c, 0, &[7]), RepairGrain::B0);
     }
 
     #[test]
     fn fenced_fail_is_r1() {
         let c = CertificateTable::new(1);
-        c.begin_execute(0, false);
+        c.begin_execute(0, false, 0);
         c.note_success(0, 7);
         assert_eq!(repair_grain(&c, 0, &[7]), RepairGrain::R1);
         assert_eq!(

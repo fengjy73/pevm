@@ -222,40 +222,59 @@ pub(crate) fn validate_specfence(
     }
 
     let invalid = mv_memory.collect_invalid_reads(tx_version.tx_idx);
-    if !invalid.is_empty()
-        && specfence
+    if !invalid.is_empty() {
+        let covers = specfence
             .certificates
-            .covers_all(tx_version.tx_idx, &invalid)
-    {
-        // Caller must prove same-output before value-stable rebind
-        // (`try_rebind_*_value_stable` only relaxes multi-origin, it does
-        // not check values — patching without this proof is seq≠par).
-        let estimate_cleared = invalid.iter().all(|&loc| {
-            mv_memory
-                .current_data_value(tx_version.tx_idx, loc)
-                .is_some()
-        });
-        let value_stable = estimate_cleared
-            && invalid
+            .covers_all(tx_version.tx_idx, &invalid);
+        let selective: Vec<_> = if covers {
+            Vec::new()
+        } else {
+            // SoT §4 mixed: R1 on fenced fail; Spec residual stays B0 unless
+            // the rebind makes the whole RS valid.
+            invalid
                 .iter()
-                .all(|&loc| mv_memory.prior_read_value_stable(tx_version.tx_idx, loc));
-        if value_stable
-            && mv_memory.try_rebind_invalid_reads_value_stable(tx_version.tx_idx, &invalid)
-        {
-            specfence.learner.note_resolve_r1();
-            specfence.metrics.record_rebind_only();
-            specfence.metrics.record_partial_retry();
-            specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
-            specfence
-                .partial_retry
-                .clear_force_writers(tx_version.tx_idx);
-            specfence.partial_retry.clear_repair(tx_version.tx_idx);
-            specfence.partial_retry.clear_ff_head(tx_version.tx_idx);
-            specfence
-                .partial_retry
-                .clear_suffix_repair_depth(tx_version.tx_idx);
-            specfence.learner.note_reexec_cost(0.1);
-            return scheduler.finish_validation(tx_version, false);
+                .copied()
+                .filter(|&loc| specfence.certificates.covers(tx_version.tx_idx, loc))
+                .collect()
+        };
+        let fenced: &[MemoryLocationHash] = if covers {
+            &invalid
+        } else {
+            &selective
+        };
+        if !fenced.is_empty() {
+            // Caller must prove same-output before value-stable rebind
+            // (`try_rebind_*_value_stable` only relaxes multi-origin, it does
+            // not check values — patching without this proof is seq≠par).
+            let estimate_cleared = fenced.iter().all(|&loc| {
+                mv_memory
+                    .current_data_value(tx_version.tx_idx, loc)
+                    .is_some()
+            });
+            let value_stable = estimate_cleared
+                && fenced
+                    .iter()
+                    .all(|&loc| mv_memory.prior_read_value_stable(tx_version.tx_idx, loc));
+            if value_stable
+                && mv_memory.try_rebind_invalid_reads_value_stable(tx_version.tx_idx, &fenced)
+                && (fenced.len() == invalid.len()
+                    || occ_read_set_valid(mv_memory, tx_version.tx_idx))
+            {
+                specfence.learner.note_resolve_r1();
+                specfence.metrics.record_rebind_only();
+                specfence.metrics.record_partial_retry();
+                specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
+                specfence
+                    .partial_retry
+                    .clear_force_writers(tx_version.tx_idx);
+                specfence.partial_retry.clear_repair(tx_version.tx_idx);
+                specfence.partial_retry.clear_ff_head(tx_version.tx_idx);
+                specfence
+                    .partial_retry
+                    .clear_suffix_repair_depth(tx_version.tx_idx);
+                specfence.learner.note_reexec_cost(0.1);
+                return scheduler.finish_validation(tx_version, false);
+            }
         }
     }
 
@@ -279,7 +298,7 @@ mod tests {
         k.note_fence(0);
         assert!(uses_specfence_resolve(ConcurrencyMode::SpecFence, &k, 0));
         let cert = CertificateTable::new(1);
-        cert.begin_execute(0, false);
+        cert.begin_execute(0, false, 0);
         assert!(!specfence_r1_validate(
             ConcurrencyMode::SpecFence,
             &cert,
