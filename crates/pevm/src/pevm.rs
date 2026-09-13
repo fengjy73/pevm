@@ -519,9 +519,17 @@ impl Pevm {
                         chain, spec_id, &block_env, &txs, storage, &mv_memory, specfence,
                     );
                     let profile = crate::specfence::profile_timing_enabled();
-                    let occ_ticks = self.concurrency_mode == ConcurrencyMode::Occ;
+                    // SpecFence live computer ≡ OCC (execute / schedule /
+                    // validate). Wave + mid-read Fence each inflated 14689597
+                    // aborts ~10× vs OCC; Default Spec ≡ OCC helpers.
+                    let occ_ticks = matches!(
+                        self.concurrency_mode,
+                        ConcurrencyMode::Occ | ConcurrencyMode::SpecFence
+                    );
                     let mut sched_t0 = profile.then(Instant::now);
-                    let mut task = if let Some(w) = wave_ref {
+                    let mut task = if occ_ticks {
+                        crate::specfence::next_occ_task(&scheduler)
+                    } else if let Some(w) = wave_ref {
                         crate::specfence::next_sf_task(&scheduler, w, specfence.ready_edges)
                     } else {
                         crate::specfence::next_occ_task(&scheduler)
@@ -546,7 +554,7 @@ impl Pevm {
                             }
                             Task::Validation(tx_version) => {
                                 let v0 = profile.then(Instant::now);
-                                let next = if occ_ticks {
+                                let next = if self.concurrency_mode == ConcurrencyMode::Occ {
                                     crate::specfence::validate_occ_stage(
                                         &mv_memory,
                                         &scheduler,
@@ -554,14 +562,11 @@ impl Pevm {
                                         Some(&metrics_inner),
                                     )
                                 } else if specfence.mode == ConcurrencyMode::SpecFence {
-                                    // Certificate grain is recorded; rem-museum R1
-                                    // (try_validate) is tax without first-wave win.
-                                    // Spec-only and Fenced-fail both B0 via OCC kernel.
-                                    crate::specfence::validate_occ_kernel(
+                                    crate::specfence::validate_occ_stage(
                                         &mv_memory,
                                         &scheduler,
                                         &tx_version,
-                                        specfence,
+                                        Some(&metrics_inner),
                                     )
                                 } else {
                                     try_validate(&mv_memory, &scheduler, &tx_version, specfence)
@@ -586,7 +591,9 @@ impl Pevm {
 
                         if task.is_none() {
                             sched_t0 = profile.then(Instant::now);
-                            task = if let Some(w) = wave_ref {
+                            task = if occ_ticks {
+                                crate::specfence::next_occ_task(&scheduler)
+                            } else if let Some(w) = wave_ref {
                                 crate::specfence::next_sf_task(&scheduler, w, specfence.ready_edges)
                             } else {
                                 crate::specfence::next_occ_task(&scheduler)
@@ -904,7 +911,7 @@ impl Pevm {
                             if let Some(stolen) = scheduler.next_task_steal_after_park_prefer(
                                 wave,
                                 Some(blocking_tx_idx),
-                                Some(vm.ready_edges()),
+                                None,
                             ) {
                                 return Some(stolen);
                             }
@@ -919,7 +926,7 @@ impl Pevm {
                         if let Some(stolen) = scheduler.next_task_steal_after_park_prefer(
                             wave,
                             Some(blocking_tx_idx),
-                            Some(vm.ready_edges()),
+                            None,
                         ) {
                             return Some(stolen);
                         }

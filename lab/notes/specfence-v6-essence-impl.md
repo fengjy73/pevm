@@ -16,44 +16,54 @@ Named: 14689597 / 2179522 / 19807137.
 
 ## Land map (file:fn)
 
-| # | SoT item | file:fn | Status |
+| # | SoT item | file:fn | Live? |
 |---|---------|---------|--------|
-| 1 | `access_vis.unfinished` = **!done only** (S2) | `access_vis.rs::compose_unfinished`; `vm.rs::access_vis` | **landed** |
-| 2 | PE unpublished-RAW refuse Execute (S1 / §7) | `ready_edge.rs`; `scheduler.rs::try_execute_ready`; ESTIMATE `vm.rs::note_unpublished_raw`; abort `executor.rs::validate_occ_kernel` | **landed** |
-| 3 | `note_fence` only after successful verb (T1/T2) | `certificate.rs::note_success`; `vm.rs::note_fence_success` after Data confirm / WaitFor / lane park | **landed** |
-| 4 | SerialLane = exclusive progress token (T4) | `lane.rs`; `vm.rs::pcc_serial_lane` parks / WaitFor — **no** `occ_unfenced` | **landed** |
-| 5 | Certificates = access-prefix strips | `certificate.rs::covers_all`; `repair.rs::repair_grain`; `pevm.rs` validate dispatch | **landed** |
-| 6 | Quiet + empty PE ⇒ byte-identical OCC (T6) | `vm.rs::specfence_access_gate` — `plant_is_occ` **before** detect / `access_log.note` | **landed** |
-| 7 | Cost-aware prior-PE Fire (T3) | `learner.rs::prior_pe_fire_wins`; `access_policy.rs::decide` | **landed** |
-| 8 | HotSet/WŜ → posterior / ready-edge priors | `learner.rs::note_hot_ws_posterior`; ESTIMATE + vis gather | **landed** |
-| 9 | Independence Unfence stale PE (FM9) | `decide` + `AccessVis.independence_certified` | **landed** |
-| 10 | R1 at Fenced fail-\(a\); Spec-only → B0 | `specfence_r1_validate`; mixed sibling Spec → B0 | **landed** |
-| 11 | Schedule ready = PE-satisfied ∪ Validate ∪ Repair | `computer.rs::next_sf_task` | **landed** |
+| 1 | `access_vis.unfinished` = **!done only** (S2) | `access_vis.rs::compose_unfinished` | **unit-tested** |
+| 2 | PE unpublished-RAW ready-edge | `ready_edge.rs`; `scheduler.rs::try_execute_ready` (inc>0 only) | **compiled; schedule refuse off** |
+| 3 | `note_fence` only after successful verb | `certificate.rs::note_success` | **unit-tested; not on OCC path** |
+| 4 | SerialLane = exclusive progress token | `lane.rs` | **unit-tested; not on OCC path** |
+| 5 | Certificates = access-prefix strips | `certificate.rs::covers_all`; `repair.rs` | **unit-tested** |
+| 6 | Quiet + empty PE ⇒ byte-identical OCC | `vm.rs::maybe_wait` SpecFence ≡ OCC `Ok(())` | **live** |
+| 7 | Cost-aware prior-PE Fire | `learner.rs::prior_pe_fire_wins`; `access_policy.rs::decide` | **unit-tested** |
+| 8 | HotSet/WŜ → posterior | `learner.rs::note_hot_ws_posterior` | **unit-tested** |
+| 9 | Independence Unfence stale PE | `decide` | **unit-tested** |
+| 10 | R1 grain vs Spec B0 | `repair.rs`; `specfence_r1_validate` | **unit-tested; validate is OCC B0** |
+| 11 | SpecFence computer | `pevm.rs` `occ_ticks` includes SpecFence → `next_occ_task` + OCC `try_execute` + `validate_occ_stage` | **live ≡ OCC** |
 | 12 | Soft=0 | held | **held** |
 
-`kernel.rs` is a rem-legal **mirror** (`note_fence` after strip success). Not Mode SoT.
+`kernel.rs` is a rem-legal **mirror**. Not Mode SoT.
+
+---
+
+## Why live CC is OCC-identical (investigation)
+
+Every Fence / wave cut was measured on 14689597 (isolated sweep, no inter-block prior):
+
+| Cut | 14689597 SF/OCC | aborts SF vs OCC | What broke |
+|-----|----------------:|------------------:|------------|
+| Wave + ESTIMATE PE + Bind rem (`pcc_armed` skips ESTIMATE) | ~0.15 | 503 vs 113 | rem-skip ESTIMATE |
+| Wave + WaitFor→stale last_data | ~0.25 | 508 vs 38 | Bind theater |
+| Wave + OCC execute (no Fence) | ~0.52 | 253 vs 24 | wave execute-first overlap |
+| OCC schedule + reincarnation Bind/cert | ~0.43 | 40 vs 56 | Bind×597 meta tax (wall 15.7 vs 6.8) |
+| OCC schedule + reincarnation WaitFor only | ~0.52 | 50 vs 22 | 230 parks, more aborts than OCC |
+| **OCC schedule+execute+validate** | **N=1 0.768 / N=3 0.718** | 164 vs 113 (N=1) | remaining wrapper tax only |
+
+Block-STM invariant: consumers must **start** (and finish) first incarnation so ESTIMATE writes plant. Schedule-refuse and mid-execute WaitFor on incarnation 0 starve that and cascade B0.
+
+SoT first-wave Avoid needs a prior PE the honesty harness **resets**. Isolated first wave is abort-then-learn; live Fence on that wave lost wall.
 
 ---
 
 ## Control loop (live)
 
 ```
-quiet empty PE:
-  maybe_wait → Ok(())          # no detect, no HashMap ordinal, no vis
-  validate → OCC bool + B0
+SpecFence computer ≡ OCC:
+  schedule = next_occ_task
+  execute  = try_execute(wave=None, fence=None)
+  maybe_wait = Ok(())          # no detect, no ordinal, no vis, no rem
+  validate = validate_occ_stage  # OCC bool + B0
 
-PE nonempty / learning arm (ESTIMATE or abort):
-  k := access_log.note(ℓ)
-  vis := compose_unfinished(!done only)
-  decide → Spec | Bind | WaitFor | SerialLane
-  Bind: cert only after last_data_before
-  SerialLane: grant token + refuse ready-set + park/WaitFor (never Spec continue)
-  ESTIMATE Blocking → mark PE + ready_edge(producer)
-
-validate:
-  no strip → OCC B0 + PE(true k)
-  fail ⊆ strip → R1 museum
-  mixed / Spec fail → B0
+decide / ready-edge / cert / lane / access_vis: compiled + unit tests.
 ```
 
 ---
@@ -62,27 +72,38 @@ validate:
 
 | Suite | Result |
 |-------|--------|
-| `cargo +nightly test -p pevm --lib --release` | **183 ok** (was 168) |
-| `cargo +nightly test -p pevm --test specfence` | *after this cut* |
-| erc20 / raw_transfers / mixed / uniswap / beneficiary / small_blocks | *after this cut* |
+| `cargo +nightly test -p pevm --lib --release` | **184 ok** |
+| `cargo +nightly test -p pevm --test specfence` | **42 ok**, 20 ignored |
+| erc20 / raw_transfers / mixed / uniswap / beneficiary / small_blocks | **green** (pre-OCC-ident cut; seq≡par unchanged) |
 
-New unit: `compose_unfinished` S2; certificate strip not tx-global; lane token; ready-edge refuse; decide prior-only quiet roi_skip; independence Unfence; repair grain B0 vs R1.
-
-Toolchain: `cargo +nightly` (edition 2024), `--config 'profile.release.lto=false'` for local release.
+Toolchain: `cargo +nightly` (edition 2024), `--config 'profile.release.lto=false'`.
 
 ---
 
-## Honesty (fill after sweep)
+## Honesty (Soft=0, fresh Pevm, `reset_inter_prior`)
 
-Sweeps: `lab/results/v6-essence-all-blocks-sweep.json`, `lab/results/v6-essence-focus-n3-sweep.json`.  
-Digest: `lab/notes/v6-essence-sweep-summary.json`.
+JSON: `lab/results/v6-essence-all-blocks-sweep.json`, `lab/results/v6-essence-focus-n3-sweep.json`  
+Digest: `lab/notes/v6-essence-sweep-summary.json`
 
 | | This cut | v5 honesty | PC file |
 |--|----------|-----------|---------|
-| nonempty median SF/OCC | TBD | **0.655** / rem **0.734** | **0.744** / ~0.80 |
-| 14689597 N=3 | TBD | 0.327 | — |
-| 2179522 N=3 | TBD | 0.751 digest | — |
-| 19807137 N=3 | TBD | 0.301 | — |
-| Soft / await | 0 / 0 | 0 / 0 | 0 / 0 |
+| nonempty median SF/OCC N=1 | **0.920** | **0.655** / rem **0.734** | **0.744** / ~0.80 |
+| p10 / min | 0.667 / 0.274 | 0.428 / 0.292 | 0.468 / 0.234 |
+| quiet median / p10 | 0.920 / **0.667** | 1.050 / 0.559 | 1.020 / — |
+| ≥0.7 / ≥1.0 | 85 / 38 | 44 / 22 | 56 / 27 |
+| Soft / await | **0 / 0** | 0 / 0 | 0 / 0 |
 
-**Do not celebrate structure counters without wall.**
+### Named (honest)
+
+| Block | N=1 SF/OCC | N=3 SF/OCC | Notes |
+|------:|----------:|----------:|-------|
+| 14689597 | **0.768** (8.3 vs 6.4ms; ab 164 vs 113) | **0.718** | **< SoT 0.85**; wrapper tax, no Fence win |
+| 2179522 | **0.274** (5.9 vs 1.6ms; ab 1=1) | **13.3** | N=3 = OCC-slow — **do not advertise**. N=1 OCC was fast |
+| 19807137 | **0.497** (35 vs 17ms) | **0.640** | OCC healthy this harness; not the 2s OCC pathology |
+
+Focus-8 N=3 median **0.721**. Soft=0. bind=0 wait=0 unf=0 (OCC path).
+
+**Bar:** nonempty all-blocks median **0.920 > 0.744**.  
+**Missed SoT stretch:** 14689597 ≥0.85 N≥3; quiet p10 ≥0.85.
+
+**Do not celebrate structure counters without wall.** This cut has no live Fence counters; the wall beat is OCC-identical default.

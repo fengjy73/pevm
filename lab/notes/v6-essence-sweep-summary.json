@@ -1,0 +1,176 @@
+{
+  "plant": "specfence-v6-essence",
+  "honesty": "fresh Pevm + reset_inter_prior; Soft=0; drop n_tx==0",
+  "all_blocks_n1": {
+    "path": "/workspace/lab/results/v6-essence-all-blocks-sweep.json",
+    "head": "f74f875",
+    "iters": 1,
+    "nonempty": 98,
+    "median": 0.9199019918092532,
+    "p10": 0.6674380389487857,
+    "min": 0.27397512699951465,
+    "mean": 2.368979279932877,
+    "ge_0_7": 85,
+    "ge_1_0": 38,
+    "quiet_n": 88,
+    "quiet_median": 0.9199019918092532,
+    "quiet_p10": 0.6674380389487857,
+    "quiet_ge1": "34/88",
+    "soft": 0,
+    "named": {
+      "19807137": {
+        "sf_occ": 0.49713284861134954,
+        "sf_ms": 35.196258,
+        "occ_ms": 17.497215999999998,
+        "ab_sf": 957,
+        "ab_occ": 1124
+      },
+      "2179522": {
+        "sf_occ": 0.27397512699951465,
+        "sf_ms": 5.8663609999999995,
+        "occ_ms": 1.607237,
+        "ab_sf": 1,
+        "ab_occ": 1
+      },
+      "19606598": {
+        "sf_occ": 0.9150232545375423,
+        "sf_ms": 1.5304540000000002,
+        "occ_ms": 1.400401,
+        "ab_sf": 6,
+        "ab_occ": 4
+      },
+      "6196166": {
+        "sf_occ": 0.8357348571799047,
+        "sf_ms": 1.9743019999999998,
+        "occ_ms": 1.649993,
+        "ab_sf": 89,
+        "ab_occ": 108
+      },
+      "19606599": {
+        "sf_occ": 0.8749557622162447,
+        "sf_ms": 14.622681,
+        "occ_ms": 12.794198999999999,
+        "ab_sf": 73,
+        "ab_occ": 111
+      },
+      "19469097": {
+        "sf_occ": 0.964407681464469,
+        "sf_ms": 7.557361,
+        "occ_ms": 7.2883770000000005,
+        "ab_sf": 112,
+        "ab_occ": 148
+      },
+      "6137495": {
+        "sf_occ": 0.7885019816194266,
+        "sf_ms": 1.210626,
+        "occ_ms": 0.954581,
+        "ab_sf": 43,
+        "ab_occ": 33
+      },
+      "14689597": {
+        "sf_occ": 0.7677834275158842,
+        "sf_ms": 8.322313,
+        "occ_ms": 6.389734,
+        "ab_sf": 164,
+        "ab_occ": 113
+      }
+    },
+    "totals": {
+      "bind": 0,
+      "wait": 0,
+      "unf": 0,
+      "full": 3776,
+      "ab_sf": 3776,
+      "ab_occ": 3992
+    }
+  },
+  "focus_n3": {
+    "path": "/workspace/lab/results/v6-essence-focus-n3-sweep.json",
+    "head": "f74f875",
+    "iters": 3,
+    "nonempty": 8,
+    "median": 0.7205701851814394,
+    "p10": 0.6690676798465607,
+    "min": 0.6397124804493362,
+    "mean": 2.2997400492257936,
+    "ge_0_7": 5,
+    "ge_1_0": 1,
+    "quiet_n": 6,
+    "quiet_median": 0.7317113277499936,
+    "quiet_p10": 0.6397124804493362,
+    "quiet_ge1": "1/6",
+    "soft": 0,
+    "named": {
+      "19807137": {
+        "sf_occ": 0.6397124804493362,
+        "sf_ms": 31.101885,
+        "occ_ms": 19.896264,
+        "ab_sf": 926,
+        "ab_occ": 1052
+      },
+      "2179522": {
+        "sf_occ": 13.305479710623224,
+        "sf_ms": 1.684724,
+        "occ_ms": 22.416061000000003,
+        "ab_sf": 1,
+        "ab_occ": 0
+      },
+      "19606598": {
+        "sf_occ": 0.8790974970243627,
+        "sf_ms": 1.511441,
+        "occ_ms": 1.328704,
+        "ab_sf": 7,
+        "ab_occ": 6
+      },
+      "6196166": {
+        "sf_occ": 0.7233865786079942,
+        "sf_ms": 2.1882379999999997,
+        "occ_ms": 1.5829419999999998,
+        "ab_sf": 93,
+        "ab_occ": 99
+      },
+      "19606599": {
+        "sf_occ": 0.7754484573472108,
+        "sf_ms": 14.82025,
+        "occ_ms": 11.49234,
+        "ab_sf": 91,
+        "ab_occ": 85
+      },
+      "19469097": {
+        "sf_occ": 0.6690676798465607,
+        "sf_ms": 8.041744,
+        "occ_ms": 5.380471,
+        "ab_sf": 67,
+        "ab_occ": 58
+      },
+      "6137495": {
+        "sf_occ": 0.6879741981527765,
+        "sf_ms": 1.3899780000000002,
+        "occ_ms": 0.956269,
+        "ab_sf": 31,
+        "ab_occ": 27
+      },
+      "14689597": {
+        "sf_occ": 0.7177537917548847,
+        "sf_ms": 9.751883,
+        "occ_ms": 6.9994510000000005,
+        "ab_sf": 135,
+        "ab_occ": 77
+      }
+    },
+    "totals": {
+      "bind": 0,
+      "wait": 0,
+      "unf": 0,
+      "full": 1351,
+      "ab_sf": 1351,
+      "ab_occ": 1404
+    }
+  },
+  "bar": {
+    "nonempty_median_gt": 0.744,
+    "pc_file": 0.744,
+    "soft": 0
+  },
+  "note": "Live computer is OCC-identical (OCC schedule+execute+validate). Wave/WaitFor/Bind cuts lost 14689597 wall. Architecture modules compiled+unit-tested. Do not advertise OCC-slow N=1 as a win."
+}

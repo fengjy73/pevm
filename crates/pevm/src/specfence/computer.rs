@@ -15,7 +15,9 @@ pub(crate) fn next_sf_task(
     wave: &WaveParkTable,
     ready: &ReadyEdgeTable,
 ) -> Option<Task> {
-    // Reincarnation of a known PE consumer is refused until the producer
-    // is Done. First incarnation always starts (ESTIMATE must plant).
-    scheduler.next_task_with_wave_ready(Some(wave), Some(ready))
+    // Observe ready-edges; do not refuse Execute. Schedule-refuse of
+    // known consumers (even reincarnation-only) deferred ESTIMATE
+    // dependents and inflated 14689597 aborts ~10×.
+    let _ = ready;
+    scheduler.next_task_with_wave(Some(wave))
 }

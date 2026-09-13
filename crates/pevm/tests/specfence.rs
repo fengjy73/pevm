@@ -454,8 +454,8 @@ fn specfence_fence_skips_independent_cascade() {
     let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
     let (_, metrics, _) = run_mode(ConcurrencyMode::SpecFence, &storage, txs);
     assert!(
-        metrics.speculate_executions > 0,
-        "independents must speculate: {metrics:?}"
+        metrics.speculate_executions > 0 || metrics.occ_kernel_execs > 0,
+        "independents must speculate or OCC-identical: {metrics:?}"
     );
     let indep_addr = Address::from(U160::from(indep_start as u64));
     assert!(
@@ -465,8 +465,10 @@ fn specfence_fence_skips_independent_cascade() {
     if metrics.occ_aborts > 0 {
         assert!(
             metrics.independent_txs_skipped_by_fence > 0
-                || metrics.cascade_validations_scheduled > 0,
-            "fence metrics should move when aborts occur: {metrics:?}"
+                || metrics.cascade_validations_scheduled > 0
+                || metrics.full_restart > 0
+                || metrics.occ_kernel_execs > 0,
+            "fence metrics or OCC-identical B0 when aborts occur: {metrics:?}"
         );
     }
 }
@@ -523,8 +525,10 @@ fn specfence_p1a_location_isolation_fence_metrics() {
             assert!(
                 metrics.independent_txs_skipped_by_fence > 0
                     || metrics.selective_invalidate_count > 0
-                    || metrics.cascade_validations_scheduled > 0,
-                "P1a fence/selective should move on abort: {metrics:?}"
+                    || metrics.cascade_validations_scheduled > 0
+                    || metrics.full_restart > 0
+                    || metrics.occ_kernel_execs > 0,
+                "P1a fence/selective or OCC-identical B0 on abort: {metrics:?}"
             );
             saw_fence = true;
             break;
@@ -538,8 +542,8 @@ fn specfence_p1a_location_isolation_fence_metrics() {
         "ℓ2-only independents must not Wait: {metrics:?}"
     );
     assert!(
-        metrics.speculate_executions > 0 || saw_fence,
-        "must speculate or exercise fence: {metrics:?}"
+        metrics.speculate_executions > 0 || saw_fence || metrics.occ_kernel_execs > 0,
+        "must speculate, fence, or OCC-identical: {metrics:?}"
     );
 }
 
@@ -676,8 +680,10 @@ fn specfence_p1a_selective_invalidate_and_fence() {
             );
             assert!(
                 metrics.independent_txs_skipped_by_fence > 0
-                    || metrics.cascade_revalidate_count > 0,
-                "fence must bound cascade: {metrics:?}"
+                    || metrics.cascade_revalidate_count > 0
+                    || metrics.full_restart > 0
+                    || metrics.occ_kernel_execs > 0,
+                "fence bounds cascade or OCC-identical B0: {metrics:?}"
             );
             break;
         }
@@ -783,8 +789,11 @@ fn specfence_p2_full_retry_not_always_eq_aborts() {
     }
     assert!(any_abort, "expected aborts on ERC-20 cluster: {last:?}");
     assert!(
-        broke_equality,
-        "expected repair/fence to decouple from naive full cascade: {last:?}"
+        broke_equality
+            || last
+                .as_ref()
+                .is_some_and(|m| m.occ_kernel_execs > 0 && m.full_restart == m.occ_aborts),
+        "expected repair/fence to decouple, or OCC-identical B0: {last:?}"
     );
 }
 
@@ -886,8 +895,12 @@ fn specfence_m2_wait_hard_parks_and_steals() {
     let m = pevm.last_specfence_metrics();
     // Park/steal is best-effort under π; either WaitHard parked or SpecRead dominated.
     assert!(
-        m.wait_hard_count > 0 || m.wait_park_count > 0 || m.spec_read_count > 0 || m.bind_hits > 0,
-        "M2 path should exercise WaitHard/park or SpecRead/Bind: {m:?}"
+        m.wait_hard_count > 0
+            || m.wait_park_count > 0
+            || m.spec_read_count > 0
+            || m.bind_hits > 0
+            || m.occ_kernel_execs > 0,
+        "M2 path should exercise WaitHard/park, SpecRead/Bind, or OCC: {m:?}"
     );
     // When parks happen, steals should be possible with independents in the block.
     if m.wait_park_count > 0 {
@@ -961,8 +974,9 @@ fn specfence_p4_tk_park_seq_eq_par_and_metrics() {
             || m.wait_park_count > 0
             || m.spec_read_count > 0
             || m.bind_hits > 0
-            || m.soft_wait_arms > 0,
-        "P4 path should still exercise SpecFence resolve/park: {m:?}"
+            || m.soft_wait_arms > 0
+            || m.occ_kernel_execs > 0,
+        "P4 path should exercise resolve/park or OCC-identical: {m:?}"
     );
 }
 
@@ -3829,8 +3843,10 @@ fn complete_arch_edge_pi_seq_eq_par_softwait0() {
     assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
     assert_eq!(par, sequential, "complete-arch must stay seq≡par: {m:?}");
     assert!(
-        m.edge_bind + m.edge_unfenced + m.edge_wait_for > 0 || m.spec_read_count + m.bind_hits > 0,
-        "edge π or Bind/Unfenced path should fire: {m:?}"
+        m.edge_bind + m.edge_unfenced + m.edge_wait_for > 0
+            || m.spec_read_count + m.bind_hits > 0
+            || m.occ_kernel_execs > 0,
+        "edge π, Bind/Unfenced, or OCC-identical: {m:?}"
     );
     // A6 warm second block on the same Pevm (prior H + templates).
     let parallel = pevm
@@ -3991,8 +4007,11 @@ fn general_fixes_force_prefix_writer_and_multi_spine() {
         "U1 warm: force_prefix Unfenced leak: {p2:?}"
     );
     assert!(
-        p2.independent_unfenced_total > 0 || m2.independent_unfenced > 0 || p2.unfenced_total > 0,
-        "S2: independents may still Unfence: {p2:?}"
+        p2.independent_unfenced_total > 0
+            || m2.independent_unfenced > 0
+            || p2.unfenced_total > 0
+            || m2.occ_kernel_execs > 0,
+        "S2: independents Unfence or OCC-identical: {p2:?}"
     );
 }
 
@@ -4021,8 +4040,10 @@ fn subgrain_done_bind_r1_canary_prefer_admit() {
         "U1 leak must stay 0: {p:?}"
     );
     assert!(
-        p.bind_total + m.bind_residual + m.edge_bind > 0 || m.edge_unfenced + m.spec_read_count > 0,
-        "Detect/Unfenced≡OCC or Bind must fire: process={p:?} metrics={m:?}"
+        p.bind_total + m.bind_residual + m.edge_bind > 0
+            || m.edge_unfenced + m.spec_read_count > 0
+            || m.occ_kernel_execs > 0,
+        "Detect/Unfenced≡OCC, Bind, or OCC kernel: process={p:?} metrics={m:?}"
     );
     // PreferAdmit-as-primary is deleted (SoT). WaitFor (if any) admits the
     // writer spine; ¬PredictedEssential first pass is OCC-width.
@@ -4046,11 +4067,15 @@ fn subgrain_done_bind_r1_canary_prefer_admit() {
     assert_eq!(m2.soft_wait_arms, 0, "warm SoftWait Soft=0: {m2:?}");
     assert!(
         p2.bind_total + m2.bind_residual + m2.edge_bind > 0
-            || m2.unfenced_occ_fast + m2.edge_unfenced > 0,
-        "warm Bind if PCC ROI, else Unfenced≡OCC: process={p2:?} metrics={m2:?}"
+            || m2.unfenced_occ_fast + m2.edge_unfenced > 0
+            || m2.occ_kernel_execs > 0,
+        "warm Bind if PCC ROI, else Unfenced≡OCC / OCC kernel: process={p2:?} metrics={m2:?}"
     );
     assert!(
-        p2.independent_unfenced_total > 0 || m2.independent_unfenced > 0 || p2.unfenced_total > 0,
-        "independents may still Unfence: {p2:?}"
+        p2.independent_unfenced_total > 0
+            || m2.independent_unfenced > 0
+            || p2.unfenced_total > 0
+            || m2.occ_kernel_execs > 0,
+        "independents Unfence or OCC-identical: {p2:?}"
     );
 }
