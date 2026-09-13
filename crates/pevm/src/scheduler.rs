@@ -11,7 +11,7 @@ use smallvec::SmallVec;
 
 use crate::{
     FinishExecFlags, IncarnationStatus, Task, TxIdx, TxStatus, TxVersion,
-    specfence::{FenceGraph, WaveParkTable},
+    specfence::{FenceGraph, ReadyEdgeTable, WaveParkTable},
 };
 
 // The Pevm collaborative scheduler coordinates execution & validation
@@ -117,9 +117,34 @@ impl Scheduler {
     }
 
     fn try_execute(&self, tx_idx: TxIdx) -> Option<TxVersion> {
+        self.try_execute_ready(tx_idx, None, None)
+    }
+
+    /// Refuse Execute when PE unpublished-RAW is still live (v6 ready-edge).
+    /// First incarnation always starts so it can plant ESTIMATE writes.
+    /// Reincarnation of a known consumer waits for the producer (S1).
+    fn try_execute_ready(
+        &self,
+        tx_idx: TxIdx,
+        wave: Option<&WaveParkTable>,
+        ready: Option<&ReadyEdgeTable>,
+    ) -> Option<TxVersion> {
         if tx_idx < self.block_size {
             let mut tx = index_mutex!(self.transactions_status, tx_idx);
             if tx.status == IncarnationStatus::ReadyToExecute {
+                if let Some(edges) = ready
+                    && tx.incarnation > 0
+                    && !edges.may_execute(tx_idx)
+                {
+                    edges.defer(tx_idx);
+                    if let Some(wave) = wave
+                        && let Some(w) = edges.blocking_producer(tx_idx)
+                    {
+                        drop(tx);
+                        self.admit_spine(w, wave);
+                    }
+                    return None;
+                }
                 tx.status = IncarnationStatus::Executing;
                 self.set_done_flag(tx_idx, false);
                 return Some(TxVersion {
@@ -137,16 +162,25 @@ impl Scheduler {
     }
 
     pub(crate) fn next_task_with_wave(&self, wave: Option<&WaveParkTable>) -> Option<Task> {
+        self.next_task_with_wave_ready(wave, None)
+    }
+
+    /// SpecFence ready-set: PE unpublished-RAW refuses Execute(t) (v6 §2.1).
+    pub(crate) fn next_task_with_wave_ready(
+        &self,
+        wave: Option<&WaveParkTable>,
+        ready: Option<&ReadyEdgeTable>,
+    ) -> Option<Task> {
         if let Some(wave) = wave {
             // After park: prefer wave ready + one cautious execution steal so the core
             // does not idle when Ready work exists (avoid validation-first stampede).
             if wave.steal_after_park_pending() {
-                if let Some(task) = self.next_task_steal_after_park(wave) {
+                if let Some(task) = self.next_task_steal_after_park_ready(wave, ready) {
                     return Some(task);
                 }
             }
             while let Some(tx_idx) = wave.pop_ready() {
-                if let Some(tx_version) = self.try_execute(tx_idx) {
+                if let Some(tx_version) = self.try_execute_ready(tx_idx, Some(wave), ready) {
                     wave.note_ready_steal_if_after_park();
                     return Some(Task::Execution(tx_version));
                 }
@@ -164,7 +198,8 @@ impl Scheduler {
                 // Re-check wave ready before yield — a producer may have just pushed.
                 if let Some(wave) = wave {
                     while let Some(tx_idx) = wave.pop_ready() {
-                        if let Some(tx_version) = self.try_execute(tx_idx) {
+                        if let Some(tx_version) = self.try_execute_ready(tx_idx, Some(wave), ready)
+                        {
                             wave.note_ready_steal_if_after_park();
                             return Some(Task::Execution(tx_version));
                         }
@@ -179,7 +214,7 @@ impl Scheduler {
             // Do **not** fetch_add on a miss — that burned the collaborative
             // index past Aborting/Executing holes. OCC (wave None) unchanged.
             if wave.is_some() && execution_idx < self.block_size {
-                if let Some(tx_version) = self.try_execute(execution_idx) {
+                if let Some(tx_version) = self.try_execute_ready(execution_idx, wave, ready) {
                     self.execution_idx
                         .fetch_max(execution_idx + 1, Ordering::Relaxed);
                     if let Some(wave) = wave {
@@ -196,6 +231,19 @@ impl Scheduler {
                     let mut tx = index_mutex!(self.transactions_status, tx_idx);
                     // "Steal" execution job while holding the lock
                     if tx.status == IncarnationStatus::ReadyToExecute {
+                        if let Some(edges) = ready
+                            && tx.incarnation > 0
+                            && !edges.may_execute(tx_idx)
+                        {
+                            edges.defer(tx_idx);
+                            if let Some(wave) = wave
+                                && let Some(w) = edges.blocking_producer(tx_idx)
+                            {
+                                drop(tx);
+                                self.admit_spine(w, wave);
+                            }
+                            continue;
+                        }
                         tx.status = IncarnationStatus::Executing;
                         self.set_done_flag(tx_idx, false);
                         if let Some(wave) = wave {
@@ -229,9 +277,11 @@ impl Scheduler {
             }
 
             // Prioritize execution task
-            if let Some(tx_version) =
-                self.try_execute(self.execution_idx.fetch_add(1, Ordering::Relaxed))
-            {
+            if let Some(tx_version) = self.try_execute_ready(
+                self.execution_idx.fetch_add(1, Ordering::Relaxed),
+                wave,
+                ready,
+            ) {
                 if let Some(wave) = wave {
                     wave.note_ready_steal_if_after_park();
                 }
@@ -247,28 +297,37 @@ impl Scheduler {
     /// Park→steal: wave ready first, then one cautious `execution_idx` fetch_add.
     /// Counts `ready_steal_on_wait` only for Execution steals (not validation).
     pub(crate) fn next_task_steal_after_park(&self, wave: &WaveParkTable) -> Option<Task> {
-        self.next_task_steal_after_park_prefer(wave, None)
+        self.next_task_steal_after_park_ready(wave, None)
+    }
+
+    fn next_task_steal_after_park_ready(
+        &self,
+        wave: &WaveParkTable,
+        ready: Option<&ReadyEdgeTable>,
+    ) -> Option<Task> {
+        self.next_task_steal_after_park_prefer(wave, None, ready)
     }
 
     pub(crate) fn next_task_steal_after_park_prefer(
         &self,
         wave: &WaveParkTable,
         prefer: Option<TxIdx>,
+        ready: Option<&ReadyEdgeTable>,
     ) -> Option<Task> {
         if let Some(idx) = prefer
-            && let Some(tx_version) = self.try_execute(idx)
+            && let Some(tx_version) = self.try_execute_ready(idx, Some(wave), ready)
         {
             wave.note_ready_steal_if_after_park();
             return Some(Task::Execution(tx_version));
         }
         while let Some(tx_idx) = wave.pop_ready() {
-            if let Some(tx_version) = self.try_execute(tx_idx) {
+            if let Some(tx_version) = self.try_execute_ready(tx_idx, Some(wave), ready) {
                 wave.note_ready_steal_if_after_park();
                 return Some(Task::Execution(tx_version));
             }
         }
         let idx = self.execution_idx.fetch_add(1, Ordering::Relaxed);
-        if let Some(tx_version) = self.try_execute(idx) {
+        if let Some(tx_version) = self.try_execute_ready(idx, Some(wave), ready) {
             wave.note_ready_steal_if_after_park();
             return Some(Task::Execution(tx_version));
         }

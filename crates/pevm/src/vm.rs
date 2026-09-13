@@ -190,6 +190,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
             let repair_armed = self.specfence.partial_retry.is_rewind_resume(tx_idx)
                 || self.specfence.partial_retry.has_ff_head(tx_idx);
             self.specfence.kernel.begin_execute(tx_idx, repair_armed);
+            self.specfence
+                .certificates
+                .begin_execute(tx_idx, repair_armed);
             self.specfence.access_log.begin_incarnation(tx_idx);
             self.specfence
                 .partial_retry
@@ -449,7 +452,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
     }
 
     /// SpecFence access gate. Mode(a) from \(a + e_{\mathrm{vis}} + \mathrm{PE}\).
-    /// Spec ⇒ OCC proceed (`pcc_armed=false`). Fence verbs certificate rem/R1.
+    /// Quiet + empty PE ⇒ byte-identical OCC (`Ok(())`, no detect / ordinal).
+    /// First incarnation always OCC (ESTIMATE must plant). Fence certs only
+    /// after a successful verb. Never `pcc_armed` rem overlay.
     fn specfence_access_gate(
         &self,
         address: Address,
@@ -458,69 +463,46 @@ impl<'a, S: Storage> VmDb<'a, S> {
     ) -> Result<(), ReadError> {
         self.pcc_armed.set(false);
         if address == self.specfence.beneficiary || self.is_lazy {
-            return self.occ_unfenced();
+            return Ok(());
         }
-
-        // Detect coverage only (one Relaxed atomic). DashMap `note_detect` is
-        // off this path — learner updates on abort / end_block / PCC.
-        self.specfence.metrics.record_detect_access();
-
-        // AccessOrdinalLog: true k even on empty PE / Spec (no rem DashMap).
-        let access_k = self.specfence.access_log.note(self.tx_idx, location_hash);
-
-        if crate::specfence::specfence_plant_is_occ(
-            crate::ConcurrencyMode::SpecFence,
-            self.specfence.learner,
-        ) {
-            return self.occ_unfenced();
-        }
-
-        if !self
-            .specfence
-            .learner
-            .predicted_essential(location_hash, access_k)
+        if self.tx_incarnation == 0
+            || crate::specfence::specfence_access_is_occ(
+                crate::ConcurrencyMode::SpecFence,
+                self.specfence.learner,
+                location_hash,
+            )
         {
-            return self.occ_unfenced();
+            return Ok(());
         }
 
         let vis = self.access_vis(location_hash);
+        let access_k = self.specfence.learner.dominant_k(location_hash).max(1);
         match crate::specfence::decide_access(
             self.specfence.learner,
             location_hash,
             access_k,
             Some(&vis),
         ) {
-            AccessDecision::UnfencedOcc {
-                predicted,
-                roi_skip,
-            } => {
-                if predicted {
-                    self.specfence.metrics.record_predicted_essential();
-                }
-                if roi_skip {
-                    self.specfence.metrics.record_pcc_roi_skip();
-                }
-                self.occ_unfenced()
-            }
+            AccessDecision::UnfencedOcc { .. } => Ok(()),
             AccessDecision::Bind => {
-                self.specfence.metrics.record_predicted_essential();
-                self.note_fence_certificate();
-                let Some(v) = self
+                if self
                     .mv_memory
                     .last_data_before(location_hash, self.tx_idx)
-                    .map(|(tx_idx, tx_incarnation)| TxVersion {
-                        tx_idx,
-                        tx_incarnation,
-                    })
-                else {
+                    .is_none()
+                {
                     self.specfence.metrics.record_pcc_roi_skip();
-                    return self.occ_unfenced();
-                };
-                self.pcc_bind_published(address, location_hash, access_k, is_program, v)
+                    return Ok(());
+                }
+                self.note_fence_success(location_hash);
+                self.specfence.metrics.record_predicted_essential();
+                self.specfence.metrics.record_pcc_fire_at_a();
+                self.specfence.metrics.record_edge_bind();
+                self.specfence.learner.note_bind_success(location_hash);
+                let _ = (address, is_program);
+                Ok(())
             }
             AccessDecision::WaitFor { writer } => {
                 self.specfence.metrics.record_predicted_essential();
-                self.note_fence_certificate();
                 self.pcc_wait_for_writer(address, location_hash, access_k, is_program, writer)
             }
             AccessDecision::SerialLane { writer } => {
@@ -531,63 +513,69 @@ impl<'a, S: Storage> VmDb<'a, S> {
     }
 
     /// \(e_{\mathrm{vis}}\) + learning features. Gathered only on a PE hit.
+    /// `unfinished` is **!done only** (v6 S2).
     fn access_vis(&self, location_hash: MemoryLocationHash) -> AccessVis {
         let published_data = self
             .mv_memory
             .last_data_before(location_hash, self.tx_idx)
             .is_some();
         let is_done = |t: TxIdx| self.specfence.scheduler.is_done(t);
-        let mut unfinished =
+        let sketch =
             self.specfence
                 .sketch
                 .unfinished_writers_before(location_hash, self.tx_idx, is_done);
-        let writer = self
-            .mv_memory
-            .last_writer_before(location_hash, self.tx_idx)
-            .or_else(|| {
-                self.mv_memory
-                    .residual_writer_before(location_hash, self.tx_idx)
-            })
-            .or_else(|| {
-                self.specfence
-                    .partial_retry
-                    .force_writer(self.tx_idx, location_hash)
-            })
-            .filter(|&w| w < self.tx_idx)
-            .or_else(|| unfinished.iter().copied().min());
-        if unfinished.is_empty() {
-            if let Some(w) = writer {
-                unfinished.push(w);
-            }
-        }
+        let (writer, unfinished) = crate::specfence::compose_unfinished(
+            sketch,
+            self.mv_memory
+                .last_writer_before(location_hash, self.tx_idx),
+            self.mv_memory
+                .residual_writer_before(location_hash, self.tx_idx),
+            self.specfence
+                .partial_retry
+                .force_writer(self.tx_idx, location_hash),
+            self.tx_idx,
+            is_done,
+        );
         let writer_executing = writer.is_some_and(|w| self.specfence.scheduler.is_executing(w));
+        let hot = self.specfence.hotset.contains(location_hash)
+            || self.specfence.hotset.writer_count(location_hash) >= 2
+            || self.specfence.learner.writer_count_live(location_hash) >= 2
+            || ((self.specfence.rw_prior.predicts_write(location_hash)
+                || self.specfence.rw_prior.write_confidence(location_hash) > 0.25)
+                && unfinished > 0);
+        let ws_hat = self.specfence.rw_prior.predicts_write(location_hash)
+            || self.specfence.rw_prior.write_confidence(location_hash) > 0.25;
+        if hot || ws_hat {
+            self.specfence
+                .learner
+                .note_hot_ws_posterior(location_hash, true);
+        }
         AccessVis {
             published_data,
             writer,
             writer_executing,
-            unfinished: unfinished.len(),
+            unfinished,
             in_serial_lane: self.specfence.sketch.in_serial_lane(location_hash),
-            hot: self.specfence.hotset.contains(location_hash)
-                || self.specfence.hotset.writer_count(location_hash) >= 2
-                || self.specfence.learner.writer_count_live(location_hash) >= 2
-                || ((self.specfence.rw_prior.predicts_write(location_hash)
-                    || self.specfence.rw_prior.write_confidence(location_hash) > 0.25)
-                    && !unfinished.is_empty()),
-            ws_hat: self.specfence.rw_prior.predicts_write(location_hash)
-                || self.specfence.rw_prior.write_confidence(location_hash) > 0.25,
+            hot,
+            ws_hat,
+            independence_certified: self.specfence.sketch.independence_certified(location_hash)
+                && unfinished == 0,
         }
     }
 
-    /// First Fence event this incarnation — certificate, not a kernel fork.
-    fn note_fence_certificate(&self) {
-        let first = !self.specfence.kernel.had_fence(self.tx_idx);
+    /// Successful Fence verb — strip + rem-legal mirror. Never call on Data miss.
+    fn note_fence_success(&self, location: MemoryLocationHash) {
+        let first = !self.specfence.certificates.has_any(self.tx_idx);
+        self.specfence
+            .certificates
+            .note_success(self.tx_idx, location);
         self.specfence.kernel.note_fence(self.tx_idx);
         if first {
             self.specfence.metrics.record_pcc_kernel_exec();
         }
     }
 
-    /// Serial-lane: admit earliest unfinished writer; park only if executing.
+    /// SerialLane = exclusive progress token. Never prefer_admit + Spec continue.
     fn pcc_serial_lane(
         &self,
         address: Address,
@@ -599,14 +587,43 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.specfence
             .sketch
             .mark_access_class(location_hash, access_k);
+        self.specfence.lanes.grant(location_hash, access_k, w);
+        self.specfence
+            .ready_edges
+            .note_unpublished(location_hash, w);
+        self.specfence.ready_edges.note_consumer(self.tx_idx, w);
         self.specfence.scheduler.admit_spine(w, self.specfence.wave);
-        self.specfence.metrics.record_prefer_admit();
+        if self.specfence.scheduler.is_done(w) {
+            self.note_fence_success(location_hash);
+            return self.occ_unfenced();
+        }
         if self.specfence.scheduler.is_executing(w) {
-            self.note_fence_certificate();
             return self.pcc_wait_for_writer(address, location_hash, access_k, is_program, w);
         }
-        // Lane head Ready: ordered-admit without fleet park.
+        // Ready/Aborting: token is admit of the head. Parking the reader
+        // before ESTIMATE writes cascades B0 on later dependents.
         self.occ_unfenced()
+    }
+
+    /// ESTIMATE observe only. Must **not** mark PE — that opens decide/ordinal
+    /// for the rest of the first wave and Bind-theaters stale Data
+    /// (14689597: 581 SF aborts vs OCC 24). Abort still trains true-k PE.
+    fn note_unpublished_raw(&self, location: MemoryLocationHash, writer: TxIdx) {
+        if self.specfence.mode != crate::ConcurrencyMode::SpecFence {
+            return;
+        }
+        self.specfence.sketch.push_spine(location, writer);
+        self.specfence
+            .ready_edges
+            .note_unpublished(location, writer);
+        self.specfence
+            .ready_edges
+            .note_consumer(self.tx_idx, writer);
+        let hot_or_ws = self.specfence.hotset.contains(location)
+            || self.specfence.rw_prior.predicts_write(location);
+        self.specfence
+            .learner
+            .note_hot_ws_posterior(location, hot_or_ws);
     }
 
     /// Shared OCC proceed: no rem journal / first_k / Edge / process / Detect DashMap.
@@ -632,6 +649,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
             || self.specfence.partial_retry.has_ff_head(self.tx_idx)
     }
 
+    #[allow(dead_code)]
     fn pcc_bind_published(
         &self,
         address: Address,
@@ -705,54 +723,51 @@ impl<'a, S: Storage> VmDb<'a, S> {
         is_program: bool,
         w: TxIdx,
     ) -> Result<(), ReadError> {
-        self.pcc_armed.set(true);
+        // Pin one producer. Never `pcc_armed` — rem overlay skips ESTIMATE
+        // and Bind-theaters stale last_data (14689597 abort 503 vs OCC 113).
+        let _ = (address, is_program);
+        self.specfence
+            .ready_edges
+            .note_unpublished(location_hash, w);
+        self.specfence.ready_edges.note_consumer(self.tx_idx, w);
+        self.specfence.scheduler.admit_spine(w, self.specfence.wave);
+        if self.specfence.scheduler.is_done(w) {
+            // Producer published. OCC reads Data (or ESTIMATE of a later w).
+            self.note_fence_success(location_hash);
+            self.specfence.metrics.record_edge_bind();
+            self.specfence.learner.note_bind_success(location_hash);
+            return self.occ_unfenced();
+        }
+        if !self.specfence.scheduler.is_executing(w) {
+            // Ready/Aborting: do not park — ESTIMATE plant / OCC Blocking.
+            return self.occ_unfenced();
+        }
+        self.note_fence_success(location_hash);
         self.pcc_this_tx
             .set(self.pcc_this_tx.get().saturating_add(1));
         self.specfence.metrics.record_pcc_fire_at_a();
-        let access_depth = 0u8;
+        self.specfence.metrics.record_edge_wait_for();
+        self.specfence.metrics.record_wait_hard();
         let key = EdgeKey {
             location: location_hash,
             reader: self.tx_idx,
             access_k,
-            depth: access_depth,
+            depth: 0,
         };
         self.specfence
             .edges
             .record(key, Some(w), EdgeKind::Wr, EdgeState::Unpublished);
-        self.specfence.process.record_decision(DecisionFeat {
-            verb: DecisionVerb::WaitFor,
-            access_k,
-            depth: access_depth,
-            incarnation: self.tx_incarnation,
-            is_program,
-            writer_published: false,
-            writer_validated: false,
-            writer_executing: true,
-            writer_ready: false,
-            writer_present: true,
-            avoid_broadcast: false,
-            canary_ok: false,
-            independence_certified: false,
-            essential_antidep: true,
-            force_prefix: false,
-            clique_gated: false,
-            in_hot_set: false,
-            prior_warm: false,
-            mode_read: true,
-        });
-        // Hang-freedom: admit the WaitFor target only — never fleet-park.
-        self.specfence.scheduler.admit_spine(w, self.specfence.wave);
-        self.fence_wait_for(
-            address,
+        self.specfence.learner.note_park_heat();
+        self.specfence
+            .dag
+            .arm_hard_wait(location_hash, self.tx_idx, w);
+        self.specfence.wave.set_pending_park(
             location_hash,
-            w,
-            true,
-            false,
-            false,
-            false,
-            false,
-            true,
-        )
+            self.specfence.partial_retry.current_k(self.tx_idx) as u64,
+            crate::specfence::ParkKind::BlockingOther,
+        );
+        self.specfence.process.note_park(self.tx_idx);
+        Err(ReadError::Blocking(w))
     }
 
     /// Fence WaitFor: never convert a known-essential / post-Avoid Region to
@@ -1347,6 +1362,8 @@ impl<S: Storage> Database for VmDb<'_, S> {
                         if resolve {
                             self.promote_on_conflict(address, location_hash);
                             self.specfence.wave.set_pending_park_location(location_hash);
+                        } else {
+                            self.note_unpublished_raw(location_hash, *blocking_idx);
                         }
                         return Err(ReadError::Blocking(*blocking_idx));
                     }
@@ -1738,6 +1755,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
                         self.specfence.metrics.record_spec_read();
                     } else {
                         self.promote_on_conflict(address, location_hash);
+                        self.note_unpublished_raw(location_hash, *closest_idx);
                         return Err(ReadError::Blocking(*closest_idx));
                     }
                 }
@@ -1800,6 +1818,9 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
     fn wake_on_data_publish(&self, writer: crate::TxIdx, locs: &[crate::MemoryLocationHash]) {
         for &loc in locs {
             self.specfence.sketch.push_spine(loc, writer);
+            self.specfence.ready_edges.note_published(loc, writer);
+            let k = self.specfence.learner.dominant_k(loc);
+            self.specfence.lanes.release(loc, k.max(1), writer);
             let _ = self.specfence.wave.wake_location(loc);
             let _ = self.specfence.dag.wake_on_data(loc, writer);
             self.specfence.metrics.record_data_publish_wake();
@@ -1926,6 +1947,18 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
     }
 
     /// G4/AEC: credit LiveLearner wait_useful + arm→wake latency for SoftWait wakes.
+    pub(crate) fn ready_edges(&self) -> &crate::specfence::ReadyEdgeTable {
+        self.specfence.ready_edges
+    }
+
+    pub(crate) fn release_ready_edges(
+        &self,
+        writer: TxIdx,
+        wave: &crate::specfence::WaveParkTable,
+    ) {
+        self.specfence.ready_edges.note_producer_done(writer, wave);
+    }
+
     pub(crate) fn credit_softwait_wakes(&self, fence: &crate::specfence::FenceGraph) {
         for loc in fence.drain_wake_useful_locs() {
             self.specfence.learner.note_wait_useful(loc);

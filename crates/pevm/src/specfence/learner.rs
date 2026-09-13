@@ -417,6 +417,8 @@ pub(crate) struct LiveLearner {
     predicted_intra: DashMap<(MemoryLocationHash, u8), AtomicUsize, FxBuildHasher>,
     /// Cheap emptiness for the Unfenced≡OCC fast path (no DashMap scan).
     predicted_n: AtomicUsize,
+    /// Locations with any PE class — T6: non-PE ℓ stays byte-identical OCC.
+    predicted_locs: DashMap<MemoryLocationHash, (), BuildIdentityHasher>,
 }
 
 impl LiveLearner {
@@ -465,6 +467,7 @@ impl LiveLearner {
         self.identity_hits.store(0, Ordering::Relaxed);
         self.predicted.clear();
         self.predicted_intra.clear();
+        self.predicted_locs.clear();
         self.predicted_n.store(0, Ordering::Relaxed);
     }
 
@@ -582,6 +585,30 @@ impl LiveLearner {
         self.park_heat.load(Ordering::Relaxed) >= 8
     }
 
+    /// Cost-aware prior-PE Fire (v6 T3). Intra abort still event-drives verbs.
+    /// Observe makespan — not Soft, not `mark_pcc`. HotSet/WŜ are not Wait OR.
+    #[inline]
+    pub(crate) fn prior_pe_fire_wins(&self, vis: &super::access_policy::AccessVis) -> bool {
+        if self.quiet_fence_off() || self.park_storm() {
+            return false;
+        }
+        let m = self.morph_weights();
+        if m.dominant_quiet() {
+            return false;
+        }
+        m.dominant_fan_out() && (vis.published_data || vis.writer_executing)
+    }
+
+    /// HotSet / WŜ → PE posterior (not a SerialLane / Wait OR-door).
+    #[inline]
+    pub(crate) fn note_hot_ws_posterior(&self, location: MemoryLocationHash, hot_or_ws: bool) {
+        if !hot_or_ws {
+            return;
+        }
+        let entry = self.locs.entry(location).or_default();
+        entry.readers.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Intra-block abort / first-wave mark (survives quiet_fence_off).
     #[inline]
     pub(crate) fn predicted_essential_intra(&self, location: MemoryLocationHash, k: u32) -> bool {
@@ -607,6 +634,13 @@ impl LiveLearner {
             .or_insert_with(|| AtomicUsize::new(0))
             .fetch_add(1, Ordering::Relaxed);
         self.predicted_n.fetch_add(1, Ordering::Relaxed);
+        self.predicted_locs.insert(location, ());
+    }
+
+    /// True when any PE class exists for \(\ell\) (T6: other ℓ stay OCC).
+    #[inline]
+    pub(crate) fn location_predicted(&self, location: MemoryLocationHash) -> bool {
+        self.predicted_locs.contains_key(&location)
     }
 
     /// Inter-block prior seed. Quiet callers must not invoke this.
@@ -620,6 +654,7 @@ impl LiveLearner {
             .or_insert_with(|| AtomicUsize::new(0))
             .fetch_add(1, Ordering::Relaxed);
         self.predicted_n.fetch_add(1, Ordering::Relaxed);
+        self.predicted_locs.insert(location, ());
     }
 
     /// Always-on cheap Detect at \(a\). Observe-only features stay here.
@@ -744,8 +779,15 @@ impl LiveLearner {
             m.quiet = (m.quiet - 0.01).max(0.01);
         }
         *m = m.normalize();
+        drop(m);
         if let Some(k) = k.filter(|&k| k > 0) {
             self.mark_predicted_essential(location, k);
+        } else if !self.quiet_fence_off() || cascade_hint >= 8 {
+            // First-wave has no ordinal. Template only off quiet / on heat
+            // so 2179522 does not open PE after a lone abort.
+            for template in [1u32, 6, 10, 20] {
+                self.mark_predicted_essential(location, template);
+            }
         }
     }
 

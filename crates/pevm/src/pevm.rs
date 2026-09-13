@@ -445,6 +445,9 @@ impl Pevm {
         let wave = WaveParkTable::new();
         let kernel = KernelTable::new(block_size);
         let access_log = crate::specfence::AccessOrdinalLog::new(block_size);
+        let certificates = crate::specfence::CertificateTable::new(block_size);
+        let ready_edges = crate::specfence::ReadyEdgeTable::new();
+        let lanes = crate::specfence::LaneTable::new();
         let edges = EdgeTable::new();
         let sketch = HotSketch::new();
         let process = ProcessTrace::new();
@@ -502,6 +505,9 @@ impl Pevm {
             process: &process,
             kernel: &kernel,
             access_log: &access_log,
+            certificates: &certificates,
+            ready_edges: &ready_edges,
+            lanes: &lanes,
             finegrain: finegrain_ref,
         };
 
@@ -513,10 +519,14 @@ impl Pevm {
                         chain, spec_id, &block_env, &txs, storage, &mv_memory, specfence,
                     );
                     let profile = crate::specfence::profile_timing_enabled();
-                    let occ_ticks = self.concurrency_mode == ConcurrencyMode::Occ;
+                    // Empty PE ⇒ OCC computer (T6). After abort trains PE,
+                    // ready-edge + wave steal (incarnation>0 refuse).
+                    let occ_mode = self.concurrency_mode == ConcurrencyMode::Occ;
                     let mut sched_t0 = profile.then(Instant::now);
-                    let mut task = if let Some(w) = wave_ref {
-                        crate::specfence::next_sf_task(&scheduler, w)
+                    let mut task = if occ_mode || !specfence.learner.has_any_predicted() {
+                        crate::specfence::next_occ_task(&scheduler)
+                    } else if let Some(w) = wave_ref {
+                        crate::specfence::next_sf_task(&scheduler, w, specfence.ready_edges)
                     } else {
                         crate::specfence::next_occ_task(&scheduler)
                     };
@@ -526,7 +536,8 @@ impl Pevm {
                     while task.is_some() {
                         task = match task.unwrap() {
                             Task::Execution(tx_version) => {
-                                if occ_ticks {
+                                let pe = specfence.learner.has_any_predicted();
+                                if occ_mode || !pe {
                                     self.try_execute(&mut vm, &scheduler, tx_version, None, None)
                                 } else {
                                     let fence_ref = crate::specfence::fence_for_mode(
@@ -540,16 +551,14 @@ impl Pevm {
                             }
                             Task::Validation(tx_version) => {
                                 let v0 = profile.then(Instant::now);
-                                let next = if occ_ticks {
+                                let next = if occ_mode {
                                     crate::specfence::validate_occ_stage(
                                         &mv_memory,
                                         &scheduler,
                                         &tx_version,
                                         Some(&metrics_inner),
                                     )
-                                } else if specfence.mode == ConcurrencyMode::SpecFence
-                                    && !specfence.kernel.may_resolve(tx_version.tx_idx)
-                                {
+                                } else if specfence.mode == ConcurrencyMode::SpecFence {
                                     crate::specfence::validate_occ_kernel(
                                         &mv_memory,
                                         &scheduler,
@@ -579,8 +588,10 @@ impl Pevm {
 
                         if task.is_none() {
                             sched_t0 = profile.then(Instant::now);
-                            task = if let Some(w) = wave_ref {
-                                crate::specfence::next_sf_task(&scheduler, w)
+                            task = if occ_mode || !specfence.learner.has_any_predicted() {
+                                crate::specfence::next_occ_task(&scheduler)
+                            } else if let Some(w) = wave_ref {
+                                crate::specfence::next_sf_task(&scheduler, w, specfence.ready_edges)
                             } else {
                                 crate::specfence::next_occ_task(&scheduler)
                             };
@@ -849,8 +860,12 @@ impl Pevm {
             return match vm.execute(&tx_version, result_slot) {
                 Ok(flags) => {
                     // PublishWrite ≈ incarnation finished: wake location waiters + ready.
+                    let done_idx = tx_version.tx_idx;
                     let task =
                         scheduler.finish_execution_with_wave_fence(tx_version, flags, wave, fence);
+                    if let Some(wave) = wave {
+                        vm.release_ready_edges(done_idx, wave);
+                    }
                     // G4: SoftWait wake → wait_useful learner credit.
                     if let Some(fence) = fence {
                         vm.credit_softwait_wakes(fence);
@@ -890,9 +905,11 @@ impl Pevm {
                     if let Some(wave) = wave {
                         if park_kind == crate::specfence::ParkKind::BlockingOther {
                             wave.arm_steal_convert_without_park();
-                            if let Some(stolen) = scheduler
-                                .next_task_steal_after_park_prefer(wave, Some(blocking_tx_idx))
-                            {
+                            if let Some(stolen) = scheduler.next_task_steal_after_park_prefer(
+                                wave,
+                                Some(blocking_tx_idx),
+                                None,
+                            ) {
                                 return Some(stolen);
                             }
                         }
@@ -903,9 +920,11 @@ impl Pevm {
                             park_k,
                             park_kind,
                         );
-                        if let Some(stolen) =
-                            scheduler.next_task_steal_after_park_prefer(wave, Some(blocking_tx_idx))
-                        {
+                        if let Some(stolen) = scheduler.next_task_steal_after_park_prefer(
+                            wave,
+                            Some(blocking_tx_idx),
+                            None,
+                        ) {
                             return Some(stolen);
                         }
                     }
