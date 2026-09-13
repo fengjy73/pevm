@@ -72,12 +72,12 @@ PE nonempty:
 
 ## Tests / honesty
 
-- lib `specfence`: **185 passed**
-- `--test specfence`: **42 passed**, 20 ignored (research jump); iter20/iter24 hang-free after Ready-refuse revert
-- Soft=0 on named + all-blocks N=1
-- All-blocks N=1 @8 (tip before Bind-flood trip, 98 nonempty): median **0.706** (< 0.744); quiet p10 **0.510** (< 0.85)
-- **14689597** N=3 @8: SF/OCC **0.424** (v6 N=3 = 0.336); Bind=577 Wait=77 R1=0 aborts 176 vs OCC 31
-- **14689597** N=1 @8: **0.311**; Bind=514 Wait=44
-- Bind-flood trip `binds≥16 ∧ abort>0` **reverted**: 14689597 N=3 fell 0.424→0.199 (aborts 176→965). Strict `aborts≥binds` kept.
+- lib `specfence`: **188 passed**
+- `--test specfence`: **42 passed**, 20 ignored; seq≡par held
+- Soft=0 on named + all-blocks
+- All-blocks N=1 @8 (98 nonempty, tip `a8426c2` quiet-OCC): median **0.744** (bar is **>** 0.744 — not claimed); quiet median **0.963**, p10 **0.518**
+- **14689597** N=3 @8: **0.554** (v6 0.336); Bind **7** / Wait **67**; R1=0; aborts 98 vs OCC 71
+- **14689597** N=1 @8: **0.440**; Bind **11** / Wait **48**; aborts 61 vs OCC 64
+- Bind-flood trip `abort>0` **reverted** (0.199 / 965 aborts)
 
-JSON: `lab/results/v8-all-blocks-n1.json`, `lab/results/v8-named-sf-occ-n3.json` (gitignored).
+JSON gitignored under `lab/results/v8-*-quietocc.json`.
