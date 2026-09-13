@@ -373,6 +373,7 @@ fn run_mode(
                 "reason_histogram": proc.reason_histogram,
                 "hot_fanout_l": proc.hot_fanout_l,
                 "per_tx_len": proc.per_tx.len(),
+                "mixed_verb_intra_tx": proc.mixed_verb_intra_tx,
             });
         }
     }
