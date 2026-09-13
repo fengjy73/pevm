@@ -99,17 +99,49 @@ resolve_tick:
 
 Sweep JSON (gitignored):  
 `lab/results/occ-cost-all-blocks-sweep.json`,  
-`lab/results/occ-cost-focus-n3-sweep.json`.
+`lab/results/occ-cost-focus-n3-sweep.json`.  
+Tip `5ef6791` + test-assert follow-up.
 
 ---
 
 ## Honesty vs 0.351 median
 
-Filled after sweeps. Do **not** claim ≥0.7. Interim target: median SF/OCC **rises above 0.351 toward ≥0.5**; worst 19807137 / 6196166 / 14689597 wall toward OCC; Soft=0; quiet SF wall ≈ OCC wall.
+Do **not** claim ≥0.7 or SoT “then → ≥1.0”. Mean is inflated by N=1 OCC pathology (e.g. 19434587). Empty snapshot 19910734 (`n_tx=0`) is dropped from the nonempty median.
 
-Falsifiers:
+### All-blocks N=1 @8 (98 nonempty / 99 loaded)
 
-- quiet / ¬PE: `unfenced_occ_fast` ≈ `detect_accesses`; `pcc_fire_at_a` ≈ 0; SF/OCC → 1.0
-- fan_out Unfenced-only accesses: no Edge tax (`unfenced_occ_fast` dominates)
-- Soft=0, await=0, exclude-set=0
-- `prefix_skip_roi_b0` on tiny-prefix fails; `pcc_roi_skip` on prior-only PE
+| | This cut | Grain tip to beat |
+|--|----------|-------------------|
+| median SF/OCC | **0.436** | **0.351** |
+| p10 / min (nonempty) | 0.256 / **0.149** (6196166) | 0.215 / **0.057** (19807137) |
+| mean | 1.33 | 0.98 |
+| quiet heuristic (33 nonempty) median | **0.989** (16/33 ≥1) | 1.07 (18/34 ≥1) |
+| fan_out (53) median | **0.423** | 0.315 |
+
+Median **rose 0.351 → 0.436** toward ≥0.5. Soft=0, await=0. Exclude-set counters = 0 on all 99 SF rows. Detect 324 100; `unfenced_occ_fast` 244 266 (= `edge_unfenced`); `pcc_fire_at_a` 15 093; `pcc_roi_skip` 1 524; `prefix_skip_roi_b0` 13 259; rewind≈0 on worst (19807137 rewind=0, B0=2853).
+
+| Block | Role | SF/OCC (N=1) | grain N=1 | notes |
+|------:|------|-------------:|----------:|-------|
+| 19807137 | worst | **0.252** | 0.057 | wall 76 vs 19 ms; WaitFor=0; PrefixSkip default gone |
+| 6196166 | park | **0.149** | ~0.10 focus | still Bind-residual / abort-heavy; min of set |
+| 14689597 | focus | **0.227** | 0.345 | more B0; mixed_verb=260 |
+| 2179522 | quiet | 3.56 (OCC N=1 pathology) | 0.40 | N=3 quiet **1.05**; pcc_fire=0 |
+
+### Focus+worst+quiet N=3 (8-block set)
+
+Printed median **0.424** / mean **0.401** / min **0.097**. Soft=0. Prior grain N=3 median **0.307** / min **0.085**.
+
+| Block | Role | SF/OCC | grain N=3 | notes |
+|------:|------|-------:|----------:|-------|
+| 14689597 | focus | 0.209 | 0.345 | B0-heavy |
+| 19606599 | focus | 0.517 | 0.307 | up |
+| 19469097 | focus | 0.424 | 0.293 | up |
+| 19807137 | worst | **0.200** | **0.085** | 2.4×; rewind=0 |
+| 6196166 | park | 0.097 | 0.097 | still park/abort class |
+| 6137495 | worst-ish | 0.240 | 0.210 | |
+| 2179522 | quiet | **1.05** | 1.57 | SF wall 2.8 ≈ OCC 2.9 |
+| 19606598 | quiet neighbor | 0.472 | 0.347 | up |
+
+Falsifiers held: Soft=0; exclude-set=0; quiet Unfenced≡OCC (`pcc_fire=0` on 2179522); fan_out Unfenced path is `unfenced_occ_fast` (no Edge tax); mixed_verb 14689597=260, 19807137=305.
+
+Remaining performance (not leftover π): 6196166 / some fan_out still pay Bind-residual on reincarnation and extra B0 vs OCC. Cost class is the land; median moved 0.351 → 0.436.

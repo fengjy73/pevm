@@ -4038,8 +4038,9 @@ fn subgrain_done_bind_r1_canary_prefer_admit() {
     assert_eq!(warm, sequential, "subgrain warm seq≡par: {m2:?}");
     assert_eq!(m2.soft_wait_arms, 0, "warm SoftWait Soft=0: {m2:?}");
     assert!(
-        p2.bind_total + m2.bind_residual + m2.edge_bind > 0,
-        "warm Done→Bind: process={p2:?} metrics={m2:?}"
+        p2.bind_total + m2.bind_residual + m2.edge_bind > 0
+            || m2.unfenced_occ_fast + m2.edge_unfenced > 0,
+        "warm Bind if PCC ROI, else Unfenced≡OCC: process={p2:?} metrics={m2:?}"
     );
     assert!(
         p2.independent_unfenced_total > 0 || m2.independent_unfenced > 0 || p2.unfenced_total > 0,
