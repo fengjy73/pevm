@@ -71,4 +71,12 @@ PE nonempty:
 
 ## Tests / honesty
 
-See PR body after sweeps. Unit/lib tests must stay green. Stretch bars reported honestly.
+- lib `specfence`: **185 passed**
+- `--test specfence`: **42 passed**, 20 ignored (research jump); iter20/iter24 hang-free after Ready-refuse revert
+- Soft=0 on named + all-blocks N=1
+- All-blocks N=1 @8 (tip before Bind-flood trip, 98 nonempty): median **0.706** (< 0.744); quiet p10 **0.510** (< 0.85)
+- **14689597** N=3 @8: SF/OCC **0.424** (v6 N=3 = 0.336); Bind=577 Wait=77 R1=0 aborts 176 vs OCC 31
+- **14689597** N=1 @8: **0.311**; Bind=514 Wait=44
+- Bind-flood trip (`binds>=16 ∧ abort>0`) added after that JSON — re-sweep before celebrating
+
+JSON: `lab/results/v8-all-blocks-n1.json`, `lab/results/v8-named-sf-occ-n3.json` (gitignored).
