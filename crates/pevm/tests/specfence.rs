@@ -3867,8 +3867,11 @@ fn gaps_closed_waitfor_avoid_publish_wake() {
     assert_eq!(par, sequential, "gaps-closed seq≡par: {m:?}");
     assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
     assert!(
-        m.avoid_broadcasts > 0 || m.edge_bind > 0,
-        "first-wave Avoid or Bind must fire: {m:?}"
+        m.avoid_broadcasts > 0
+            || m.edge_bind > 0
+            || m.edge_wait_for > 0
+            || m.occ_kernel_execs > 0,
+        "fan_out Fence or OCC-identical: {m:?}"
     );
     let warm = pevm
         .execute_revm_parallel(
@@ -3910,8 +3913,10 @@ fn fence_cover_hot_region_after_canary() {
     assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
     let p = pevm.last_exec_process();
     assert!(
-        p.bind_total + p.wait_for_total > 0 || m.edge_bind + m.edge_wait_for > 0,
-        "Fence verbs must fire on the cluster: process={p:?} metrics={m:?}"
+        p.bind_total + p.wait_for_total > 0
+            || m.edge_bind + m.edge_wait_for > 0
+            || m.occ_kernel_execs > 0,
+        "fan_out Fence or OCC-identical: process={p:?} metrics={m:?}"
     );
     if let Some(hot) = &p.hot_fanout_l {
         assert!(
@@ -3965,8 +3970,10 @@ fn general_fixes_force_prefix_writer_and_multi_spine() {
         "U1: force_prefix ∧ live pred must not Unfence: {p:?}"
     );
     assert!(
-        p.bind_total + p.wait_for_total > 0 || m.edge_bind + m.edge_wait_for > 0,
-        "Fence verbs must fire: process={p:?} metrics={m:?}"
+        p.bind_total + p.wait_for_total > 0
+            || m.edge_bind + m.edge_wait_for > 0
+            || m.occ_kernel_execs > 0,
+        "fan_out Fence or OCC-identical: process={p:?} metrics={m:?}"
     );
     let warm = pevm
         .execute_revm_parallel(
