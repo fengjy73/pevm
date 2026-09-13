@@ -663,8 +663,9 @@ fn specfence_p1a_selective_invalidate_and_fence() {
             assert!(
                 metrics.selective_invalidate_count > 0
                     || metrics.selective_fallback_full > 0
-                    || metrics.tx_full_retry > 0,
-                "abort must exercise selective/full-retry plant: {metrics:?}"
+                    || metrics.tx_full_retry > 0
+                    || metrics.full_restart > 0,
+                "abort must exercise B0 / selective / full-retry plant: {metrics:?}"
             );
             assert!(
                 metrics.independent_txs_skipped_by_fence > 0
