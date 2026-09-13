@@ -76,37 +76,42 @@ pub(crate) fn decide(
         };
     };
 
-    // A3: PE ∧ published Data → Bind. Prior PE may take this path.
-    // writer_validated is not a Bind gate. WŜ is a feature, not an OR-door.
-    if vis.published_data {
-        return AccessDecision::Bind;
-    }
-
-    // Quiet: Bind-on-Data only (2179522). No WaitFor / lane.
+    // Quiet: Bind-on-Data only when no unfinished lower writer (2179522).
+    // No WaitFor / lane on quiet.
     if learner.quiet_fence_off() {
+        if vis.published_data && vis.unfinished == 0 {
+            return AccessDecision::Bind;
+        }
         return AccessDecision::UnfencedOcc {
             predicted: true,
             roi_skip: true,
         };
     }
     if learner.park_storm() {
+        if vis.published_data && vis.unfinished == 0 {
+            return AccessDecision::Bind;
+        }
         return AccessDecision::UnfencedOcc {
             predicted: true,
             roi_skip: true,
         };
     }
 
+    // Multi-writer PE class first — do **not** Bind stale Data (theater).
+    if vis.unfinished > 1 || ((vis.in_serial_lane || vis.hot) && vis.unfinished > 0) {
+        if let Some(w) = vis.writer {
+            return AccessDecision::SerialLane { writer: w };
+        }
+    }
     if vis.unfinished == 1 && vis.writer_executing {
         if let Some(w) = vis.writer {
             return AccessDecision::WaitFor { writer: w };
         }
     }
-    // Multi-writer PE class / HotSet / already-laned ℓ → serial-lane, not
-    // Bind-only theater and not fleet WaitFor.
-    if vis.unfinished > 1 || vis.in_serial_lane || vis.hot {
-        if let Some(w) = vis.writer {
-            return AccessDecision::SerialLane { writer: w };
-        }
+    // A3: PE ∧ published Data ∧ no unfinished lower writer → Bind.
+    // Prior PE may take this path. writer_validated is not a Bind gate.
+    if vis.published_data && vis.unfinished == 0 {
+        return AccessDecision::Bind;
     }
     AccessDecision::UnfencedOcc {
         predicted: true,
@@ -138,6 +143,18 @@ mod tests {
             unfinished: 0,
             in_serial_lane: false,
             hot: false,
+            ws_hat: true,
+        }
+    }
+
+    fn data_plus_multi() -> AccessVis {
+        AccessVis {
+            published_data: true,
+            writer: Some(0),
+            writer_executing: true,
+            unfinished: 3,
+            in_serial_lane: false,
+            hot: true,
             ws_hat: true,
         }
     }
@@ -216,6 +233,11 @@ mod tests {
         assert_eq!(
             decide(&live, 7, 6, Some(&multi_vis(0))),
             AccessDecision::SerialLane { writer: 0 }
+        );
+        assert_eq!(
+            decide(&live, 7, 6, Some(&data_plus_multi())),
+            AccessDecision::SerialLane { writer: 0 },
+            "published Data must not Bind-theater a multi-writer PE class"
         );
     }
 
