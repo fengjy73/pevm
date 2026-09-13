@@ -7,7 +7,7 @@
 **π SoT:** `lab/notes/specfence-complete-architecture-v4-frozen-grain.md` (unchanged)  
 **Honesty baseline:** parallel-compute nonempty N=1 median **SF/OCC = 0.744**; quiet **1.020**
 
-**Verdict:** rebased onto the pushed SoT, then closed remaining plant gaps vs that document (AccessOrdinalLog module, deleted `quiet_fence_off`/`park_storm` decide gates, execute-first steal, Spec PE-publish wake). Incarnation Occ\|Pcc fork removed as SoT. Pre-rebase nonempty median **0.743** (flat vs 0.744). **Re-sweep after this cut** — numbers below are the pre-rebase honesty until the new all-blocks JSON lands. Soft=0. **Do not claim ≥0.7 as a finished product bar.**
+**Verdict:** rebased onto the pushed SoT (`987b196` + catalog), then landed the remaining plant vs that document. Incarnation Occ\|Pcc fork is not SoT. Nonempty median **0.655** (↓ vs 0.744). Quiet heuristic median **1.050** (19/36 ≥1). Soft=0. 14689597 N=1 **0.558** (↑ vs our pre-rebase 0.365 / PC 0.535). 2179522 N=3 **0.751** (was 0.112). **Do not claim ≥0.7 as a finished product bar** — 0.655 is this run’s median, not a guarantee.
 
 ---
 
@@ -37,21 +37,21 @@
 ```
 OCC:     next_task(); occ_read; validate_read_locations; B0
 SpecFence access a:
-  detect; k := note_access_k_only(ℓ)
+  detect; k := access_log.note(ℓ)          # not rem DashMap
   empty PE → Spec (OCC)
   ¬PE(ℓ,k) → Spec
-  vis := e_vis + HotSet + WŜ
+  vis := e_vis (+ HotSet/WŜ observe only)
   decide → Spec | Bind | WaitFor | SerialLane
   first real Fence → certificate (rem / R1), not a tx kernel
   SerialLane: mark class + admit_spine; park only if lane head executing
 SpecFence validate:
-  ¬certificate → OCC bool + B0 + PE(true k)
+  ¬certificate → OCC bool + B0 + PE(true k from access_log)
   certificate → R1a / R1b / B0
-schedule: next_task_with_wave only
-  (do not steal on cumulative wait_park_count — that starved validate)
+schedule: wave ready; Execute if next idx Ready; else validate
+  (do not fetch_add execution_idx on a miss; do not steal on wait_park_count)
 ```
 
-`decide` order (after Bind-theater fix): empty/¬PE → Spec; quiet/park_storm → Bind only if Data ∧ unfinished=0; unfinished>1 or ((lane∨HotSet) ∧ unfinished>0) → SerialLane; unfinished==1 ∧ executing → WaitFor; Data ∧ unfinished=0 → Bind; else Spec.
+`decide` (SoT §3.2): empty/¬PE → Spec; unfinished>1 or (lane ∧ unfinished>0) → SerialLane; unfinished==1 ∧ executing → WaitFor; Data ∧ unfinished=0 → Bind; else Spec. **Deleted live gates:** `quiet_fence_off`, `park_storm`, HotSet-as-SerialLane.
 
 ---
 
@@ -72,9 +72,11 @@ Toolchain: `cargo +nightly` (edition 2024), `--config 'profile.release.lto=false
 ## Honesty vs 0.744
 
 Sweeps (gitignored JSON):  
-`lab/results/v5-fusion-all-blocks-sweep.json`,  
-`lab/results/v5-fusion-focus-n3-sweep.json`.  
+`lab/results/v5-sot-all-blocks-sweep.json`,  
+`lab/results/v5-sot-focus-n3-sweep.json`.  
 Committed digest: `lab/notes/v5-fusion-sweep-summary.json`.
+
+A broken execute-first `fetch_add` on miss (median **0.643**, 14689597 **0.159**) was discarded; numbers below are the **fixed** steal.
 
 ### All-blocks N=1 @8 (98 nonempty / 99 loaded)
 
@@ -82,15 +84,14 @@ Empty snapshot **19910734** (`n_tx=0`) dropped — same rule as parallel-compute
 
 | | This cut | Parallel-compute to match |
 |--|----------|---------------------------|
-| median SF/OCC | **0.743** | **0.744** |
-| p10 / min (nonempty) | 0.484 / **0.233** | 0.468 / **0.234** |
+| median SF/OCC | **0.655** | **0.744** |
+| p10 / min (nonempty) | 0.428 / **0.292** | 0.468 / **0.234** |
 | mean | 1.75 | 1.74 |
-| quiet heuristic (44 nonempty) median | **1.035** (25/44 ≥1) | 1.020 (24/46 ≥1) |
-| quiet+ish (60) median | **0.932** | 0.922 (63) |
-| fan_out heuristic (2) median | **0.274** | 0.468 (3) |
-| ≥0.7 / ≥1.0 | **51 / 28** | 56 / 27 |
+| quiet heuristic (36 nonempty) median | **1.050** (19/36 ≥1) | 1.020 (24/46 ≥1) |
+| quiet p10 | **0.559** | — |
+| ≥0.7 / ≥1.0 | **44 / 22** | 56 / 27 |
 
-Soft=0, await=0, exclude-set=0 (`force_prefix_*` / canary / Soft = 0). Detect 272 615; `unfenced_occ_fast` 294 783; `pcc_fire_at_a` 3 931; `pcc_roi_skip` 1 085; `occ_kernel_execs` 52 228; `pcc_kernel_execs` 3 656; `occ_kernel_validates` 112 517; `prefer_admit` 14 693; `edge_wait_for` 71; `edge_bind` 3 860.
+Soft=0, await=0, exclude-set=0. Detect 305 281; `unfenced_occ_fast` 326 876; `pcc_fire_at_a` 4 571; `pcc_roi_skip` 479; `occ_kernel_execs` 61 871; `pcc_kernel_execs` 4 136; `occ_kernel_validates` 96 978; `prefer_admit` 16 407; `edge_wait_for` 132; `edge_bind` 4 439.
 
 **OCC mode:** detect / pcc_fire / unfenced / occ_kernel_* = **0**.
 
@@ -98,44 +99,44 @@ Soft=0, await=0, exclude-set=0 (`force_prefix_*` / canary / Soft = 0). Detect 27
 
 | Block | Role | SF/OCC (N=1) | parallel-compute N=1 |
 |------:|------|-------------:|---------------------:|
-| 14689597 | fan_out/spine | **0.365** | 0.535 |
-| 2179522 | quiet | **1.567** | 0.234 |
-| 19807137 | spine | 0.399 | 0.465 |
-| 6196166 | fan_out | 0.315 | 0.597 |
-| 6137495 | spine | 0.590 | — |
-| 19606599 | spine | 0.579 | — |
-| 19469097 | spine | 0.673 | — |
-| 19606598 | quiet | 1.063 | — |
+| 14689597 | fan_out/spine | **0.558** | 0.535 |
+| 2179522 | quiet | **1.526** | 0.234 |
+| 19807137 | fan_out | 0.383 | 0.465 |
+| 6196166 | fan_out | 0.460 | 0.597 |
+| 6137495 | spine | 0.452 | — |
+| 19606599 | spine | 0.625 | — |
+| 19469097 | spine | 0.580 | — |
+| 19606598 | quiet | 0.677 | — |
 
-14689597 N=1: bind=111, wait=1, prefer_admit=1077, park_idle≈2.90. Still Bind/B0 vs OCC reincarnation.
+14689597 N=1 **0.558** (bind=87, wait=1, aborts=177). Better than this branch’s pre-SoT-gap 0.365; ≈ PC 0.535. Still Bind/B0 vs OCC reincarnation.
 
-2179522 N=1: bind=0, pcc_fire=0, SF 1.9 vs OCC 3.0 ms. **Do not advertise 1.567 as a quiet win** — OCC was slow this sample.
+2179522 N=1: bind=0, SF 1.9 vs OCC 2.8 ms. **Do not advertise 1.526 as a quiet win** — OCC was slow this sample.
 
-Mean inflated by 19434587 OCC N=1 pathology (sf_occ ≈90).
+Mean inflated by 19434587 OCC N=1 pathology.
 
 ### Focus+worst+quiet N=3 (8-block set)
 
-Printed median **0.523** / mean **0.509** / min **0.112**. Soft=0. Prior parallel-compute N=3 median **0.606** / min **0.268**.
+Printed median **0.541** / mean **0.532** / min **0.368**. Soft=0. Prior parallel-compute N=3 median **0.606** / min **0.268**.
 
 | Block | Role | SF/OCC | parallel-compute N=3 |
 |------:|------|-------:|---------------------:|
-| 14689597 | focus | **0.523** | 0.268 |
-| 19606599 | focus | 0.672 | 0.606 |
-| 19469097 | focus | 0.740 | 0.678 |
-| 19807137 | worst | 0.410 | 0.563 |
-| 6196166 | park | 0.412 | 0.591 |
-| 6137495 | worst-ish | 0.499 | 0.646 |
-| 2179522 | quiet | **0.112** | **3.565** |
-| 19606598 | quiet neighbor | 0.703 | 0.571 |
+| 14689597 | focus | **0.454** | 0.268 |
+| 19606599 | focus | 0.541 | 0.606 |
+| 19469097 | focus | 0.557 | 0.678 |
+| 19807137 | worst | 0.428 | 0.563 |
+| 6196166 | park | 0.368 | 0.591 |
+| 6137495 | worst-ish | 0.483 | 0.646 |
+| 2179522 | quiet | **0.751** | **3.565** |
+| 19606598 | quiet neighbor | 0.677 | 0.571 |
 
-2179522 N=3 is the honest quiet tail: SF 16.5 vs OCC 1.8 ms, bind=0, unfenced=3346, dominant `meta/cold`. Parallel-compute N=3 **3.565** was OCC pathology (OCC 17.8 vs SF 5.0) — do not invert the story. Report **N=3 0.112** + all-blocks quiet **median 1.035**.
+2179522 N=3 is the honest quiet tail: SF 2.2 vs OCC 1.6 ms, bind=0, ratio **0.751** (was 0.112 on the recreation plant). Parallel-compute N=3 **3.565** was OCC pathology — do not invert the story. Report **N=3 0.751** + all-blocks quiet **median 1.050**.
 
 ---
 
 ## Remaining (honest)
 
-1. Quiet tail 2179522 N=3 **0.112** — still meta/schedule vs a fast OCC sample (`note_access_k_only` + detect on empty-PE path).  
-2. Named 14689597 N=1 **0.365** (was 0.535) — serial-lane/Bind still loses to OCC reincarnation; N=3 recovered to 0.523.  
-3. Fan_out cohort median **0.274** (2 blocks) vs PC 0.468 (3) — Bind theater is gone, but unfinished>1 now parks a lane.  
-4. Per-worker steal deques not built; schedule is Block-STM indices + wave ready.  
-5. Median is **flat** (0.744→0.743). Architecture SoT is the landing; wall is not a product win.
+1. Nonempty median **0.655** vs 0.744 — architecture SoT landed; wall is a **regression**, not a product win. More Bind/WaitFor (4.4k / 132) and execute-first changed the mix.  
+2. 14689597 N=1 **0.558** / N=3 **0.454** — better than the recreation’s 0.365, still ≪ SoT bar 0.85.  
+3. Quiet p10 **0.559** ≪ SoT 0.85. 2179522 N=3 **0.751** is the named quiet tail (do not advertise N=1 1.526).  
+4. Per-worker steal deques not built; schedule is Block-STM indices + wave ready + execute-if-Ready.  
+5. AccessOrdinalLog still writes a per-tx first_k map on Spec (±k-log vs OCC).
