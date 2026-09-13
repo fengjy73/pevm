@@ -1,0 +1,359 @@
+{
+  "method": {
+    "features": [
+      "n_tx",
+      "program_frac",
+      "handler_frac",
+      "fanout_max",
+      "raw_path",
+      "waw_path",
+      "gw_p10",
+      "gw_p50",
+      "gw_p90",
+      "abort_at_8",
+      "reexec_frac",
+      "indep_frac"
+    ],
+    "distance": "L2 on raw feature vector (unstandardized)",
+    "global_prior": "mean feature vector within segment",
+    "test": "err(t-1 \u2192 t) < err(global \u2192 t)"
+  },
+  "features_by_block": {
+    "14689595": {
+      "block": 14689595,
+      "source": "contiguous-segments-finegrain.json",
+      "n_tx": 23.0,
+      "program_frac": 1.0,
+      "handler_frac": 0.0,
+      "fanout_max": 4.0,
+      "raw_path": 5.0,
+      "waw_path": 12.0,
+      "gw_p10": 0.0,
+      "gw_p50": 0.0,
+      "gw_p90": 0.0,
+      "abort_at_8": 0.34782608695652173,
+      "reexec_frac": 0.3611111111111111,
+      "indep_frac": 0.5652173913043478
+    },
+    "14689596": {
+      "block": 14689596,
+      "source": "contiguous-segments-finegrain.json",
+      "n_tx": 31.0,
+      "program_frac": 1.0,
+      "handler_frac": 0.0,
+      "fanout_max": 10.0,
+      "raw_path": 10.0,
+      "waw_path": 40.0,
+      "gw_p10": 0.0,
+      "gw_p50": 0.0,
+      "gw_p90": 0.0,
+      "abort_at_8": 0.5161290322580645,
+      "reexec_frac": 0.5694444444444444,
+      "indep_frac": 0.45161290322580644
+    },
+    "14689597": {
+      "block": 14689597,
+      "source": "effect-raw-deeper-b14689597.json",
+      "n_tx": 564.0,
+      "program_frac": 0.9350850077279753,
+      "handler_frac": 0.06491499227202473,
+      "fanout_max": 448.0,
+      "raw_path": 27.0,
+      "waw_path": 144.0,
+      "gw_p10": 0.9412633723892002,
+      "gw_p50": 0.942722305017387,
+      "gw_p90": 0.9427564293516036,
+      "abort_at_8": 0.11170212765957446,
+      "reexec_frac": 0.7405703771849126,
+      "indep_frac": 0.0
+    },
+    "14689598": {
+      "block": 14689598,
+      "source": "contiguous-segments-finegrain.json",
+      "n_tx": 111.0,
+      "program_frac": 0.8571428571428571,
+      "handler_frac": 0.14285714285714285,
+      "fanout_max": 7.0,
+      "raw_path": 8.0,
+      "waw_path": 31.0,
+      "gw_p10": 0.0,
+      "gw_p50": 0.0,
+      "gw_p90": 0.0,
+      "abort_at_8": 0.06306306306306306,
+      "reexec_frac": 0.14615384615384616,
+      "indep_frac": 0.5945945945945946
+    },
+    "14689599": {
+      "block": 14689599,
+      "source": "effect-raw-journal-stream-b14689599.json",
+      "n_tx": 43.0,
+      "program_frac": 0.0,
+      "handler_frac": 1.0,
+      "fanout_max": 0.0,
+      "raw_path": 1.0,
+      "waw_path": 0.0,
+      "gw_p10": 0.0,
+      "gw_p50": 0.0,
+      "gw_p90": 0.0,
+      "abort_at_8": 0.0,
+      "reexec_frac": 0.044444444444444446,
+      "indep_frac": 0.0
+    },
+    "19606597": {
+      "block": 19606597,
+      "source": "contiguous-segments-finegrain.json",
+      "n_tx": 124.0,
+      "program_frac": 0.09090909090909091,
+      "handler_frac": 0.9090909090909091,
+      "fanout_max": 31.0,
+      "raw_path": 32.0,
+      "waw_path": 72.0,
+      "gw_p10": 0.0,
+      "gw_p50": 0.0,
+      "gw_p90": 0.0,
+      "abort_at_8": 0.3548387096774194,
+      "reexec_frac": 0.6487252124645893,
+      "indep_frac": 0.5806451612903226
+    },
+    "19606598": {
+      "block": 19606598,
+      "source": "effect-raw-deeper-b19606598.json",
+      "n_tx": 91.0,
+      "program_frac": 0.7272727272727273,
+      "handler_frac": 0.2727272727272727,
+      "fanout_max": 6.0,
+      "raw_path": 3.0,
+      "waw_path": 13.0,
+      "gw_p10": 0.3520736743832777,
+      "gw_p50": 0.5387800566627116,
+      "gw_p90": 0.9282249915796564,
+      "abort_at_8": 0.13186813186813187,
+      "reexec_frac": 0.7573333333333333,
+      "indep_frac": 0.0
+    },
+    "19606599": {
+      "block": 19606599,
+      "source": "effect-raw-deeper-b19606599.json",
+      "n_tx": 367.0,
+      "program_frac": 0.7517123287671232,
+      "handler_frac": 0.2482876712328767,
+      "fanout_max": 14.0,
+      "raw_path": 26.0,
+      "waw_path": 177.0,
+      "gw_p10": 0.13844618246741988,
+      "gw_p50": 0.3812670101504596,
+      "gw_p90": 0.7604224648540641,
+      "abort_at_8": 0.24250681198910082,
+      "reexec_frac": 0.4657933042212518,
+      "indep_frac": 0.0
+    },
+    "19606600": {
+      "block": 19606600,
+      "source": "contiguous-segments-finegrain.json",
+      "n_tx": 237.0,
+      "program_frac": 0.3076923076923077,
+      "handler_frac": 0.6923076923076923,
+      "fanout_max": 45.0,
+      "raw_path": 47.0,
+      "waw_path": 148.0,
+      "gw_p10": 0.0,
+      "gw_p50": 0.0,
+      "gw_p90": 0.0,
+      "abort_at_8": 0.24472573839662448,
+      "reexec_frac": 0.9668716801789209,
+      "indep_frac": 0.5864978902953587
+    },
+    "19469096": {
+      "block": 19469096,
+      "source": "effect-raw-deeper-b19469096.json",
+      "n_tx": 250.0,
+      "program_frac": 0.9181034482758621,
+      "handler_frac": 0.08189655172413793,
+      "fanout_max": 12.0,
+      "raw_path": 132.0,
+      "waw_path": 172.0,
+      "gw_p10": 0.6105792879034394,
+      "gw_p50": 0.9252877431513764,
+      "gw_p90": 0.9252877431513764,
+      "abort_at_8": 0.472,
+      "reexec_frac": 0.6744791666666666,
+      "indep_frac": 0.0
+    },
+    "19469097": {
+      "block": 19469097,
+      "source": "effect-raw-deeper-b19469097.json",
+      "n_tx": 336.0,
+      "program_frac": 0.8317073170731707,
+      "handler_frac": 0.16829268292682928,
+      "fanout_max": 6.0,
+      "raw_path": 47.0,
+      "waw_path": 181.0,
+      "gw_p10": 0.18574466363027659,
+      "gw_p50": 0.6106971290237168,
+      "gw_p90": 0.9252877431513764,
+      "abort_at_8": 0.25595238095238093,
+      "reexec_frac": 0.5561426684280053,
+      "indep_frac": 0.0
+    },
+    "19469098": {
+      "block": 19469098,
+      "source": "contiguous-segments-finegrain.json",
+      "n_tx": 268.0,
+      "program_frac": 0.4,
+      "handler_frac": 0.6,
+      "fanout_max": 26.0,
+      "raw_path": 26.0,
+      "waw_path": 83.0,
+      "gw_p10": 0.0,
+      "gw_p50": 0.0,
+      "gw_p90": 0.0,
+      "abort_at_8": 0.2537313432835821,
+      "reexec_frac": 0.3810623556581986,
+      "indep_frac": 0.6902985074626866
+    },
+    "19469099": {
+      "block": 19469099,
+      "source": "contiguous-segments-finegrain.json",
+      "n_tx": 257.0,
+      "program_frac": 0.42857142857142855,
+      "handler_frac": 0.5714285714285714,
+      "fanout_max": 25.0,
+      "raw_path": 29.0,
+      "waw_path": 111.0,
+      "gw_p10": 0.0,
+      "gw_p50": 0.0,
+      "gw_p90": 0.0,
+      "abort_at_8": 0.23346303501945526,
+      "reexec_frac": 0.38072289156626504,
+      "indep_frac": 0.6381322957198443
+    }
+  },
+  "segments": [
+    {
+      "segment": "A",
+      "blocks_present": [
+        14689595,
+        14689596,
+        14689597,
+        14689598,
+        14689599
+      ],
+      "blocks_missing": [],
+      "n_adjacent_pairs": 4,
+      "mean_err_tm1": 361.4863754570573,
+      "mean_err_global": 237.72296071531977,
+      "tm1_better_frac": 0.5,
+      "tm1_predicts_better": false,
+      "pairs": [
+        {
+          "t_minus_1": 14689595,
+          "t": 14689596,
+          "err_prior_tm1": 30.151030407581207,
+          "err_global_prior": 149.26343796123507,
+          "tm1_better": true
+        },
+        {
+          "t_minus_1": 14689596,
+          "t": 14689597,
+          "err_prior_tm1": 697.8832772886154,
+          "err_global_prior": 550.6686986922471,
+          "tm1_better": false
+        },
+        {
+          "t_minus_1": 14689597,
+          "t": 14689598,
+          "err_prior_tm1": 642.5133343995486,
+          "err_global_prior": 98.13395064637454,
+          "tm1_better": false
+        },
+        {
+          "t_minus_1": 14689598,
+          "t": 14689599,
+          "err_prior_tm1": 75.39785973248406,
+          "err_global_prior": 152.82575556142245,
+          "tm1_better": true
+        }
+      ]
+    },
+    {
+      "segment": "B",
+      "blocks_present": [
+        19606597,
+        19606598,
+        19606599
+      ],
+      "blocks_missing": [],
+      "n_adjacent_pairs": 2,
+      "mean_err_tm1": 199.83924362104688,
+      "mean_err_global": 161.81689486380486,
+      "tm1_better_frac": 0.5,
+      "tm1_predicts_better": false,
+      "pairs": [
+        {
+          "t_minus_1": 19606597,
+          "t": 19606598,
+          "err_prior_tm1": 77.70768571523561,
+          "err_global_prior": 128.67114136551845,
+          "tm1_better": true
+        },
+        {
+          "t_minus_1": 19606598,
+          "t": 19606599,
+          "err_prior_tm1": 321.9708015268581,
+          "err_global_prior": 194.96264836209127,
+          "tm1_better": false
+        }
+      ]
+    },
+    {
+      "segment": "C",
+      "blocks_present": [
+        19469096,
+        19469097,
+        19469098,
+        19469099
+      ],
+      "blocks_missing": [],
+      "n_adjacent_pairs": 3,
+      "mean_err_tm1": 91.47175285256766,
+      "mean_err_global": 61.3553390375931,
+      "tm1_better_frac": 0.3333333333333333,
+      "tm1_predicts_better": false,
+      "pairs": [
+        {
+          "t_minus_1": 19469096,
+          "t": 19469097,
+          "err_prior_tm1": 121.40162709122133,
+          "err_global_prior": 74.90253056160545,
+          "tm1_better": false
+        },
+        {
+          "t_minus_1": 19469097,
+          "t": 19469098,
+          "err_prior_tm1": 122.76458578093543,
+          "err_global_prior": 64.16854980493271,
+          "tm1_better": false
+        },
+        {
+          "t_minus_1": 19469098,
+          "t": 19469099,
+          "err_prior_tm1": 30.249045685546257,
+          "err_global_prior": 44.99493674624113,
+          "tm1_better": true
+        }
+      ]
+    }
+  ],
+  "overall": {
+    "n_pairs": 9,
+    "mean_err_tm1": 235.55991640311402,
+    "mean_err_global": 162.0657388557409,
+    "tm1_better_frac": 0.4444444444444444,
+    "prior_useful": false,
+    "conclusion": "NO \u2014 t-1 is not reliably better than global prior; prefer intra-block EV over sticky cross-block priors."
+  },
+  "gaps": {
+    "B_missing_19606600": false,
+    "note": "Segment B historically incomplete (19606600 not on disk); L4 uses 597\u2013599 only."
+  }
+}

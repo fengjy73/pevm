@@ -1,0 +1,64 @@
+{
+  "block": 14689597,
+  "cores": 8,
+  "base_tip": "ade501d",
+  "iters": 7,
+  "authority": [
+    "lab/notes/specfence-resolve-profile-strip-status.md",
+    "lab/results/resolve-profile-597.json",
+    "lab/notes/specfence-native-resolve-protocol.md"
+  ],
+  "wall_ms": {
+    "ade501d_profile_median": 30.620336,
+    "park_steal_unprofiled_median": 29.958735,
+    "park_steal_unprofiled_min": 26.597091,
+    "park_steal_profiled_median": 26.98979,
+    "park_steal_profiled_min": 23.279307,
+    "occ_median_unprofiled": 3.3820989999999997
+  },
+  "park_subtype_split_last_iter_unprofiled_ms": {
+    "softwait_park_idle_total": 187.02414,
+    "softwait_soft": 38.165129,
+    "early_abort": 0.0,
+    "blocking_other": 148.859011,
+    "park_count_softwait": 52,
+    "park_count_early_abort": 0,
+    "park_count_blocking_other": 293,
+    "wait_park_count": 345,
+    "ready_steal_on_wait": 196
+  },
+  "bucket_table_sf_cpu_ms_sum_profiled_last_iter": {
+    "handler_total_incl_maybe_wait": 115.58369,
+    "maybe_wait_pi_meta": 91.763693,
+    "pure_evm_handler_minus_maybe_wait": 23.819997,
+    "validate_suffix_repair": 46.970123,
+    "scheduler_next_task": 1.634013,
+    "softwait_park_idle": 396.974244,
+    "park_ns_softwait": 35.400106,
+    "park_ns_early_abort": 1.581853,
+    "park_ns_blocking_other": 359.992285
+  },
+  "baseline_bucket_ade501d_profile": {
+    "handler_total_incl_maybe_wait": 156.588012,
+    "maybe_wait_pi_meta": 124.833212,
+    "pure_evm_handler_minus_maybe_wait": 31.7548,
+    "validate_suffix_repair": 72.762513,
+    "scheduler_next_task": 1.115704,
+    "softwait_park_idle": 391.305715
+  },
+  "counters": {
+    "soft_wait_arms_median_unprofiled": 52.0,
+    "occ_aborts_median_unprofiled": 254.0,
+    "ready_steal_on_wait_last": 196,
+    "wait_park_count_last": 345,
+    "steal_vs_park_ratio": 0.5681159420289855,
+    "baseline_ready_steal_on_wait": 120
+  },
+  "diagnosis": {
+    "park_idle_owner": "BlockingOther (cold/ESTIMATE Blocking) dominates SoftWait Soft; EarlyAbort ~0",
+    "park_idle_delta_vs_ade501d": "unprofiled last-iter park_ms 187 vs baseline 391 (~52% down); profiled median wall 27.0 vs 30.6",
+    "steal": "ready_steal_on_wait rises (196\u2013240) vs parks; post-park prefers wave ready + one execution fetch_add; status set before wake",
+    "softwait_arms": "scarce (~51\u201352) \u226a428",
+    "stretch_lt_15": "not met; next lever BlockingOther wake/ESTIMATE path + maybe_wait meta (already ~92ms vs 125)"
+  }
+}

@@ -1,0 +1,132 @@
+{
+  "block": 14689597,
+  "cores": 8,
+  "base_tip": "169eece",
+  "iters_profile": 7,
+  "compare_to": "ade501d/resolve-profile-597 (dfa34ed capture)",
+  "wall_ms": {
+    "sf_median_profile_taxed": 35.325088,
+    "sf_min_profile_taxed": 25.758346,
+    "occ_median": 3.415749,
+    "gap_ms_profile_taxed": 31.909339000000003,
+    "note": "SPECFENCE_PROFILE=1 Instant tax biases SF wall up; non-profile cascade best median ~24.9 vs OCC ~3.4 (~21ms gap)"
+  },
+  "bucket_table_sf_cpu_ms_sum_across_workers": {
+    "handler_total_incl_maybe_wait": 124.186695,
+    "maybe_wait_pi_meta": 102.211521,
+    "pure_evm_handler_minus_maybe_wait": 21.975173999999996,
+    "validate_suffix_repair": 38.906059,
+    "scheduler_next_task": 1.318582,
+    "softwait_park_idle_total": 407.296942,
+    "park_idle_softwait_soft": 44.086889,
+    "park_idle_early_abort": 0.0,
+    "park_idle_blocking_other": 363.210053
+  },
+  "bucket_table_occ_cpu_ms_sum_across_workers": {
+    "handler_total": 24.523669,
+    "maybe_wait": 0.0,
+    "validate": 3.223643,
+    "park_idle": 0.0
+  },
+  "compare_ade501d_profile": {
+    "handler": {
+      "then": 156.588,
+      "now": 124.187
+    },
+    "maybe_wait": {
+      "then": 124.833,
+      "now": 102.212
+    },
+    "validate": {
+      "then": 72.763,
+      "now": 38.906
+    },
+    "park_idle_total": {
+      "then": 391.306,
+      "now": 407.297
+    },
+    "parks": {
+      "then": 1144,
+      "now": 238
+    },
+    "ready_steal": {
+      "then": 120,
+      "now": 294
+    },
+    "soft_wait_arms_median": {
+      "then": 42.0,
+      "now": 57.0
+    }
+  },
+  "diagnosis": {
+    "root_bucket": "park_idle_blocking_other (residual BO) + maybe_wait_meta second",
+    "evidence": [
+      "BO idle 363ms / 185 parks \u2248 89% of park idle; SoftWait Soft only 44ms / 53 parks (scarce)",
+      "Cascade cut already dropped BO parks 1519\u2192~185, but residual BO idle still serializes critical path (~21ms non-profile gap)",
+      "maybe_wait 102ms \u2248 82% of SF handler; validate already halved 73\u219239 vs ade501d",
+      "ready_steal 294 vs parks 238 \u2014 steal works when Ready; residual idle = writer Executing after ESTIMATE",
+      "EarlyAbort park idle = 0"
+    ],
+    "not_root": [
+      "SoftWait arm count (57 \u226a 428)",
+      "pure EVM (22ms vs OCC handler ~15\u201324)",
+      "validate (improved, secondary)",
+      "scheduler next_task (~1ms)"
+    ],
+    "phase2_lever": "OrderedDirtyRead past ESTIMATE/aborted Data (SpecFence-native SpecRead) to avoid BlockingOther park while writer re-executes; keep SoftWait scarce; no SpecRead-through-live-writer / Wait storms / finish-under-lock"
+  },
+  "counters_sf_last_iter": {
+    "soft_wait_arms": 58,
+    "soft_wait_arms_median": 57.0,
+    "occ_aborts_median": 336.0,
+    "occ_fast_first": 2357,
+    "cold_spec_fast": 5125,
+    "ready_steal_on_wait": 294,
+    "park_count_softwait": 53,
+    "park_count_blocking_other": 185,
+    "wait_park_count": 238,
+    "evm_entries": 934
+  },
+  "source": "lab/results/resolve-reprofile-sf-occ.json",
+  "phase2": {
+    "cut": "OrderedDirtyRead past leading ESTIMATE/aborted + maybe_wait ESTIMATE SpecRead short-circuit + last_data_before skip ESTIMATE",
+    "wall_ms": {
+      "169eece_best_median": 24.853,
+      "after_n7_median": 22.1,
+      "after_n11_median": 22.6,
+      "after_n11_p90": 24.7,
+      "after_n11_min": 21.3,
+      "occ_median": 3.6
+    },
+    "park_after_last_iter_n11": {
+      "bo_ms": 0.4,
+      "sw_ms": 22.3,
+      "parks": 107,
+      "soft_wait_arms_median": 124
+    },
+    "bucket_after_profile_taxed_last_iter": {
+      "handler_ms": 114.781519,
+      "maybe_wait_ms": 90.945725,
+      "validate_ms": 32.302823,
+      "park_total_ms": 19.531643,
+      "park_sw_ms": 18.80704,
+      "park_bo_ms": 0.724603,
+      "park_count_bo": 7,
+      "park_count_sw": 98,
+      "soft_wait_arms_median": 139.0,
+      "wall_median_profile_taxed": 24.614555
+    },
+    "cuts": [
+      "OrderedDirtyRead past leading ESTIMATE/aborted (basic/storage)",
+      "last_data_before continues past ESTIMATE",
+      "maybe_wait ESTIMATE \u2192 SpecRead (no SoftWait/BO)",
+      "maybe_wait unfinished live writer + sticky/prior/hot \u2192 WaitHard without note_observe/try_revoke/choose_action"
+    ],
+    "counters_final_n11": {
+      "soft_wait_arms_median": 125,
+      "occ_aborts_median": 157,
+      "bo_ms_last": 2.4,
+      "sw_ms_last": 117.2
+    }
+  }
+}

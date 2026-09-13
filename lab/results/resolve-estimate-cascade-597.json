@@ -1,0 +1,48 @@
+{
+  "block": 14689597,
+  "cores": 8,
+  "base_tip": "a5cf67e",
+  "iters": 7,
+  "authority": [
+    "lab/notes/specfence-native-resolve-protocol.md",
+    "lab/notes/specfence-resolve-blocking-other-status.md",
+    "lab/notes/specfence-resolve-park-steal-status.md"
+  ],
+  "cascade_map": {
+    "ForceBind_was": "invalidate_selective \u2192 ESTIMATE+abort-stamp poisons certified prefix \u2192 BlockingOther",
+    "ForceBind_now": "invalidate_partial_suffix(suffix_writes) only",
+    "FullRestart_sticky": "protect prior_force_bind write locations from ESTIMATE",
+    "BlockingOther_convert": "steal Ready writer without park_with_kind when possible"
+  },
+  "wall_ms": {
+    "a5cf67e_median": 25.980966,
+    "this_best_median": 24.853204,
+    "this_noisy_medians": [
+      28.83552,
+      30.3
+    ],
+    "occ_median": 3.4
+  },
+  "park_subtype_last_iter": {
+    "a5cf67e_bo_parks": 1519,
+    "a5cf67e_bo_ms": 435.4,
+    "this_bo_parks_best_run_row": 181,
+    "this_bo_ms_range": [
+      212,
+      387
+    ]
+  },
+  "counters": {
+    "soft_wait_arms_median_best": 48.0,
+    "soft_wait_arms_median_noisy": 87.0,
+    "occ_aborts_median_best": 117.0
+  },
+  "success": {
+    "bo_idle_down": true,
+    "wall_best_down": true,
+    "softwait_scarce": true,
+    "aborts_not_exploding": true,
+    "tests_green": true,
+    "no_hang": true
+  }
+}

@@ -1,0 +1,28 @@
+G7 dig tag="resolve-blocking-other" softwait_disabled=false
+=== G7 flip smoke 19606598 → 19606599 ===
+  block=19606598 ok=true tps=19626 soft_wait_arms=3 wait_hard=3 aborts=5 flip_count=0
+  block=19606599 ok=true tps=11658 soft_wait_arms=27 wait_hard=27 aborts=76 flip_count=1
+wrote "/workspace/specfence/crates/pevm/../../lab/results/resolve-blocking-other-flip.json"
+=== G7 SF vs OCC@8 cores iters=7 ===
+  block=14689597 mode=occ        iter=7/7 ok=true tps=179289 wall_ms=3.1 soft=0 wait_hard=0 abort_rate=0.053 lean=0 evm=1072 reexec=508 fb_reabort=0 rebind=0 cold=0 occ_fast=0 steal=0 park_k=0 mw_ms=0.0 h_ms=0.0 v_ms=0.0 park_ms=0.0 sw_ms=0.0 ea_ms=0.0 bo_ms=0.0 parks=0
+  block=14689597 mode=occ        SUMMARY n=7 wall_ms median=3.4 p90=3.5 min=3.1 mean=3.6 soft_med=0 abort_med=48
+  block=14689597 mode=specfence  iter=7/7 ok=true tps=15786 wall_ms=35.7 soft=50 wait_hard=50 abort_rate=0.631 lean=2489 evm=2085 reexec=1521 fb_reabort=177 rebind=0 cold=5206 occ_fast=2405 steal=257 park_k=38 mw_ms=0.0 h_ms=0.0 v_ms=0.0 park_ms=459.9 sw_ms=24.4 ea_ms=0.0 bo_ms=435.4 parks=1569
+  block=14689597 mode=specfence  SUMMARY n=7 wall_ms median=26.0 p90=34.0 min=21.1 mean=27.1 soft_med=47 abort_med=194
+  block=19606599 mode=occ        iter=7/7 ok=true tps=36440 wall_ms=10.1 soft=0 wait_hard=0 abort_rate=0.213 lean=0 evm=726 reexec=359 fb_reabort=0 rebind=0 cold=0 occ_fast=0 steal=0 park_k=0 mw_ms=0.0 h_ms=0.0 v_ms=0.0 park_ms=0.0 sw_ms=0.0 ea_ms=0.0 bo_ms=0.0 parks=0
+  block=19606599 mode=occ        SUMMARY n=7 wall_ms median=9.1 p90=10.1 min=8.4 mean=9.4 soft_med=0 abort_med=86
+  block=19606599 mode=specfence  iter=7/7 ok=true tps=11150 wall_ms=32.9 soft=29 wait_hard=29 abort_rate=0.207 lean=629 evm=511 reexec=144 fb_reabort=14 rebind=0 cold=5087 occ_fast=3098 steal=141 park_k=22 mw_ms=0.0 h_ms=0.0 v_ms=0.0 park_ms=426.9 sw_ms=26.6 ea_ms=0.0 bo_ms=400.3 parks=186
+  block=19606599 mode=specfence  SUMMARY n=7 wall_ms median=32.1 p90=32.9 min=28.7 mean=32.9 soft_med=28 abort_med=75
+  block=19469097 mode=occ        iter=7/7 ok=true tps=63210 wall_ms=5.3 soft=0 wait_hard=0 abort_rate=0.283 lean=0 evm=637 reexec=301 fb_reabort=0 rebind=0 cold=0 occ_fast=0 steal=0 park_k=0 mw_ms=0.0 h_ms=0.0 v_ms=0.0 park_ms=0.0 sw_ms=0.0 ea_ms=0.0 bo_ms=0.0 parks=0
+  block=19469097 mode=occ        SUMMARY n=7 wall_ms median=5.3 p90=6.4 min=4.9 mean=5.7 soft_med=0 abort_med=92
+  block=19469097 mode=specfence  iter=7/7 ok=true tps=19440 wall_ms=17.3 soft=81 wait_hard=81 abort_rate=0.247 lean=580 evm=421 reexec=85 fb_reabort=18 rebind=0 cold=3056 occ_fast=2112 steal=134 park_k=64 mw_ms=0.0 h_ms=0.0 v_ms=0.0 park_ms=47.4 sw_ms=19.1 ea_ms=0.0 bo_ms=28.3 parks=161
+  block=19469097 mode=specfence  SUMMARY n=7 wall_ms median=17.3 p90=17.7 min=15.6 mean=17.2 soft_med=84 abort_med=83
+  block=19606598 mode=occ        iter=7/7 ok=true tps=75806 wall_ms=1.2 soft=0 wait_hard=0 abort_rate=0.099 lean=0 evm=116 reexec=25 fb_reabort=0 rebind=0 cold=0 occ_fast=0 steal=0 park_k=0 mw_ms=0.0 h_ms=0.0 v_ms=0.0 park_ms=0.0 sw_ms=0.0 ea_ms=0.0 bo_ms=0.0 parks=0
+  block=19606598 mode=occ        SUMMARY n=7 wall_ms median=1.2 p90=1.3 min=1.1 mean=1.2 soft_med=0 abort_med=8
+  block=19606598 mode=specfence  iter=7/7 ok=true tps=27076 wall_ms=3.4 soft=2 wait_hard=2 abort_rate=0.077 lean=118 evm=111 reexec=20 fb_reabort=0 rebind=0 cold=647 occ_fast=533 steal=14 park_k=0 mw_ms=0.0 h_ms=0.0 v_ms=0.0 park_ms=1.7 sw_ms=0.3 ea_ms=0.0 bo_ms=1.4 parks=20
+  block=19606598 mode=specfence  SUMMARY n=7 wall_ms median=3.4 p90=3.6 min=3.1 mean=3.4 soft_med=3 abort_med=4
+  SF/OCC@8 block=14689597: 0.088
+  SF/OCC@8 block=19606599: 0.306
+  SF/OCC@8 block=19469097: 0.308
+  SF/OCC@8 block=19606598: 0.357
+  mean SF/OCC@8 = 0.265 (v8 baseline ~0.325 on different block set)
+wrote "/workspace/specfence/crates/pevm/../../lab/results/resolve-blocking-other-sf-occ.json"

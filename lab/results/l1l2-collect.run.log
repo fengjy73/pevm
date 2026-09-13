@@ -1,0 +1,21 @@
+=== L1/L2 block 14689597 n_tx=564 ===
+  L1/OCC@1: 88ms ok=true edges=647 log=3600 morph=Some("fan_out")
+  L2/OCC@8: 55ms ok=true edges=1987 aborts=90
+  wrote /workspace/specfence/crates/pevm/../../lab/results/l1l2-b14689597.json
+=== L1/L2 block 19606599 n_tx=367 ===
+  L1/OCC@1: 359ms ok=true edges=951 log=7955 morph=Some("long_chain")
+  L2/OCC@8: 192ms ok=true edges=1550 aborts=100
+  wrote /workspace/specfence/crates/pevm/../../lab/results/l1l2-b19606599.json
+=== L1/L2 block 19469097 n_tx=336 ===
+  L1/OCC@1: 245ms ok=true edges=745 log=4805 morph=Some("long_chain")
+  L2/OCC@8: 178ms ok=true edges=1187 aborts=109
+  wrote /workspace/specfence/crates/pevm/../../lab/results/l1l2-b19469097.json
+=== L1/L2 block 19606598 n_tx=91 ===
+  L1/OCC@1: 19ms ok=true edges=44 log=1167 morph=Some("quiet")
+  L2/OCC@8: 11ms ok=true edges=52 aborts=11
+  wrote /workspace/specfence/crates/pevm/../../lab/results/l1l2-b19606598.json
+=== L1/L2 block 19469096 n_tx=250 ===
+  L1/OCC@1: 47ms ok=true edges=234 log=2128 morph=Some("long_chain")
+  L2/OCC@8: 27ms ok=true edges=586 aborts=113
+  wrote /workspace/specfence/crates/pevm/../../lab/results/l1l2-b19469096.json
+wrote /workspace/specfence/crates/pevm/../../lab/results/l1l2-summary.json

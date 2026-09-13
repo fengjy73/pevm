@@ -1,0 +1,571 @@
+{
+  "method": {
+    "location": "MemoryLocation",
+    "warm_policy": "emit_warm_true",
+    "primary_depth": "gross_work",
+    "primary_depth_formula": "gas_used_so_far/tx_gas_used",
+    "raw_instance": true,
+    "excluded_from_effective_gstar": [
+      "coinbase_beneficiary",
+      "basic_lazy"
+    ],
+    "producer_status_sampled_at": "discovering_incarnation",
+    "account_grain": "diagnostic_only",
+    "schema_version": "l1l2-v1",
+    "l3_assumptions": [
+      "Consumer-work units; not wall-clock calibrated",
+      "Depths from gross-work first-cross (sampled or synthetic from p10/p50/p90)",
+      "Wait-if-program-fanout uses morphology + fanout + d>=0.5",
+      "Bind-if-ready uses OCC@8 edge_ready_done_frac",
+      "M-A = always SpecRead / full redo on conflict consumers"
+    ]
+  },
+  "per_block": [
+    {
+      "block": 14689597,
+      "morphology": "fan_out",
+      "source": "effect-raw-deeper",
+      "n_tx": 564,
+      "n_raw": 647,
+      "n_program": 605,
+      "max_fanout": 448,
+      "program_path": 27,
+      "gw_p50": 0.942722305017387,
+      "edge_ready_done_frac": 0.710411198600175,
+      "edge_ready_waitish_frac": 0.289588801399825,
+      "abort_rate_occ8": 0.11170212765957446,
+      "M-A": {
+        "policy": "M-A",
+        "redo": 475.0,
+        "wait": 0.0,
+        "waste": 475.0,
+        "makespan": 129.875
+      },
+      "policies": {
+        "M-D": {
+          "policy": "M-D",
+          "redo": 48.29393359002095,
+          "wait": 107.67996453900707,
+          "waste": 155.97389812902802,
+          "makespan": 89.9967372661285,
+          "redo_saved_vs_MA": 426.70606640997903,
+          "wait_added_vs_MA": 107.67996453900707,
+          "makespan_delta_vs_MA": -39.878262733871495,
+          "waste_delta_vs_MA": -319.02610187097196,
+          "win_vs_MA": true
+        },
+        "Wait-if-program-fanout": {
+          "policy": "Wait-if-program-fanout",
+          "redo": 7.244090038503122,
+          "wait": 85.64960629921184,
+          "waste": 92.89369633771496,
+          "makespan": 82.11171204221436,
+          "n_consumers": 475,
+          "redo_saved_vs_MA": 467.75590996149685,
+          "wait_added_vs_MA": 85.64960629921184,
+          "makespan_delta_vs_MA": -47.763287957785636,
+          "waste_delta_vs_MA": -382.10630366228503,
+          "win_vs_MA": true
+        },
+        "Bind-if-ready": {
+          "policy": "Bind-if-ready",
+          "redo": 20.734288729918735,
+          "wait": 41.13757655293073,
+          "waste": 61.87186528284947,
+          "makespan": 78.23398316035619,
+          "redo_saved_vs_MA": 454.2657112700813,
+          "wait_added_vs_MA": 41.13757655293073,
+          "makespan_delta_vs_MA": -51.64101683964381,
+          "waste_delta_vs_MA": -413.12813471715054,
+          "win_vs_MA": true
+        }
+      }
+    },
+    {
+      "block": 14689599,
+      "morphology": "quiet",
+      "source": "effect-raw-journal-stream",
+      "n_tx": 43,
+      "n_raw": 1,
+      "n_program": 0,
+      "max_fanout": 0,
+      "program_path": 1,
+      "gw_p50": 0.0,
+      "edge_ready_done_frac": 1.0,
+      "edge_ready_waitish_frac": 0.0,
+      "abort_rate_occ8": 0.0,
+      "M-A": {
+        "policy": "M-A",
+        "redo": 1.0,
+        "wait": 0.0,
+        "waste": 1.0,
+        "makespan": 5.5
+      },
+      "policies": {
+        "M-D": {
+          "policy": "M-D",
+          "redo": 1.0,
+          "wait": 0.0,
+          "waste": 1.0,
+          "makespan": 5.5,
+          "redo_saved_vs_MA": 0.0,
+          "wait_added_vs_MA": 0.0,
+          "makespan_delta_vs_MA": 0.0,
+          "waste_delta_vs_MA": 0.0,
+          "win_vs_MA": false
+        },
+        "Wait-if-program-fanout": {
+          "policy": "Wait-if-program-fanout",
+          "redo": 1.0,
+          "wait": 0.0,
+          "waste": 1.0,
+          "makespan": 5.5,
+          "n_consumers": 1,
+          "redo_saved_vs_MA": 0.0,
+          "wait_added_vs_MA": 0.0,
+          "makespan_delta_vs_MA": 0.0,
+          "waste_delta_vs_MA": 0.0,
+          "win_vs_MA": false
+        },
+        "Bind-if-ready": {
+          "policy": "Bind-if-ready",
+          "redo": 0.02,
+          "wait": 0.02,
+          "waste": 0.04,
+          "makespan": 5.38,
+          "redo_saved_vs_MA": 0.98,
+          "wait_added_vs_MA": 0.02,
+          "makespan_delta_vs_MA": -0.1200000000000001,
+          "waste_delta_vs_MA": -0.96,
+          "win_vs_MA": true
+        }
+      }
+    },
+    {
+      "block": 19469096,
+      "morphology": "waw_spine",
+      "source": "effect-raw-deeper",
+      "n_tx": 250,
+      "n_raw": 232,
+      "n_program": 213,
+      "max_fanout": 12,
+      "program_path": 132,
+      "gw_p50": 0.9252877431513764,
+      "edge_ready_done_frac": 0.8502202643171806,
+      "edge_ready_waitish_frac": 0.14977973568281938,
+      "abort_rate_occ8": 0.472,
+      "M-A": {
+        "policy": "M-A",
+        "redo": 155.0,
+        "wait": 0.0,
+        "waste": 155.0,
+        "makespan": 151.399
+      },
+      "policies": {
+        "M-D": {
+          "policy": "M-D",
+          "redo": 21.09094016841499,
+          "wait": 4.375999999999999,
+          "waste": 25.466940168414986,
+          "makespan": 135.20736752105188,
+          "redo_saved_vs_MA": 133.909059831585,
+          "wait_added_vs_MA": 4.375999999999999,
+          "makespan_delta_vs_MA": -16.191632478948122,
+          "waste_delta_vs_MA": -129.533059831585,
+          "win_vs_MA": true
+        },
+        "Wait-if-program-fanout": {
+          "policy": "Wait-if-program-fanout",
+          "redo": 155.0,
+          "wait": 0.0,
+          "waste": 155.0,
+          "makespan": 151.399,
+          "n_consumers": 155,
+          "redo_saved_vs_MA": 0.0,
+          "wait_added_vs_MA": 0.0,
+          "makespan_delta_vs_MA": 0.0,
+          "waste_delta_vs_MA": 0.0,
+          "win_vs_MA": false
+        },
+        "Bind-if-ready": {
+          "policy": "Bind-if-ready",
+          "redo": 5.794678263110611,
+          "wait": 8.439647577092495,
+          "waste": 14.234325840203105,
+          "makespan": 133.8032907300254,
+          "redo_saved_vs_MA": 149.2053217368894,
+          "wait_added_vs_MA": 8.439647577092495,
+          "makespan_delta_vs_MA": -17.595709269974606,
+          "waste_delta_vs_MA": -140.7656741597969,
+          "win_vs_MA": true
+        }
+      }
+    },
+    {
+      "block": 19469097,
+      "morphology": "long_chain",
+      "source": "effect-raw-deeper",
+      "n_tx": 336,
+      "n_raw": 410,
+      "n_program": 341,
+      "max_fanout": 6,
+      "program_path": 47,
+      "gw_p50": 0.6106971290237168,
+      "edge_ready_done_frac": 0.9088397790055248,
+      "edge_ready_waitish_frac": 0.09116022099447514,
+      "abort_rate_occ8": 0.25595238095238093,
+      "M-A": {
+        "policy": "M-A",
+        "redo": 140.0,
+        "wait": 0.0,
+        "waste": 140.0,
+        "makespan": 64.512
+      },
+      "policies": {
+        "M-D": {
+          "policy": "M-D",
+          "redo": 52.31568311327309,
+          "wait": 5.694940476190472,
+          "waste": 58.01062358946356,
+          "makespan": 54.26332794868294,
+          "redo_saved_vs_MA": 87.68431688672692,
+          "wait_added_vs_MA": 5.694940476190472,
+          "makespan_delta_vs_MA": -10.248672051317058,
+          "waste_delta_vs_MA": -81.98937641053644,
+          "win_vs_MA": true
+        },
+        "Wait-if-program-fanout": {
+          "policy": "Wait-if-program-fanout",
+          "redo": 42.644192195975364,
+          "wait": 9.193232044198904,
+          "waste": 51.83742424017427,
+          "makespan": 53.49167803002179,
+          "n_consumers": 140,
+          "redo_saved_vs_MA": 97.35580780402464,
+          "wait_added_vs_MA": 9.193232044198904,
+          "makespan_delta_vs_MA": -11.020321969978212,
+          "waste_delta_vs_MA": -88.16257575982573,
+          "win_vs_MA": true
+        },
+        "Bind-if-ready": {
+          "policy": "Bind-if-ready",
+          "redo": 7.313860615298379,
+          "wait": 5.735359116022102,
+          "waste": 13.04921973132048,
+          "makespan": 48.64315246641506,
+          "redo_saved_vs_MA": 132.68613938470162,
+          "wait_added_vs_MA": 5.735359116022102,
+          "makespan_delta_vs_MA": -15.86884753358494,
+          "waste_delta_vs_MA": -126.95078026867952,
+          "win_vs_MA": true
+        }
+      }
+    },
+    {
+      "block": 19606598,
+      "morphology": "quiet",
+      "source": "effect-raw-deeper",
+      "n_tx": 91,
+      "n_raw": 44,
+      "n_program": 32,
+      "max_fanout": 6,
+      "program_path": 3,
+      "gw_p50": 0.5387800566627116,
+      "edge_ready_done_frac": 1.0,
+      "edge_ready_waitish_frac": 0.0,
+      "abort_rate_occ8": 0.13186813186813187,
+      "M-A": {
+        "policy": "M-A",
+        "redo": 12.0,
+        "wait": 0.0,
+        "waste": 12.0,
+        "makespan": 12.875
+      },
+      "policies": {
+        "M-D": {
+          "policy": "M-D",
+          "redo": 5.144839343428991,
+          "wait": 1.3681318681318684,
+          "waste": 6.51297121156086,
+          "makespan": 12.189121401445107,
+          "redo_saved_vs_MA": 6.855160656571009,
+          "wait_added_vs_MA": 1.3681318681318684,
+          "makespan_delta_vs_MA": -0.6858785985548934,
+          "waste_delta_vs_MA": -5.48702878843914,
+          "win_vs_MA": true
+        },
+        "Wait-if-program-fanout": {
+          "policy": "Wait-if-program-fanout",
+          "redo": 12.0,
+          "wait": 0.0,
+          "waste": 12.0,
+          "makespan": 12.875,
+          "n_consumers": 12,
+          "redo_saved_vs_MA": 0.0,
+          "wait_added_vs_MA": 0.0,
+          "makespan_delta_vs_MA": 0.0,
+          "waste_delta_vs_MA": 0.0,
+          "win_vs_MA": false
+        },
+        "Bind-if-ready": {
+          "policy": "Bind-if-ready",
+          "redo": 0.23999999999999996,
+          "wait": 0.23999999999999996,
+          "waste": 0.4799999999999999,
+          "makespan": 11.435,
+          "redo_saved_vs_MA": 11.76,
+          "wait_added_vs_MA": 0.23999999999999996,
+          "makespan_delta_vs_MA": -1.4399999999999995,
+          "waste_delta_vs_MA": -11.52,
+          "win_vs_MA": true
+        }
+      }
+    },
+    {
+      "block": 19606599,
+      "morphology": "mixed",
+      "source": "effect-raw-deeper",
+      "n_tx": 367,
+      "n_raw": 584,
+      "n_program": 439,
+      "max_fanout": 14,
+      "program_path": 26,
+      "gw_p50": 0.3812670101504596,
+      "edge_ready_done_frac": 0.8737233054781801,
+      "edge_ready_waitish_frac": 0.12627669452181986,
+      "abort_rate_occ8": 0.24250681198910082,
+      "M-A": {
+        "policy": "M-A",
+        "redo": 93.0,
+        "wait": 0.0,
+        "waste": 93.0,
+        "makespan": 57.5
+      },
+      "policies": {
+        "M-D": {
+          "policy": "M-D",
+          "redo": 54.619846556299414,
+          "wait": 7.213896457765666,
+          "waste": 61.83374301406508,
+          "makespan": 53.604217876758135,
+          "redo_saved_vs_MA": 38.380153443700586,
+          "wait_added_vs_MA": 7.213896457765666,
+          "makespan_delta_vs_MA": -3.8957821232418652,
+          "waste_delta_vs_MA": -31.166256985934922,
+          "win_vs_MA": true
+        },
+        "Wait-if-program-fanout": {
+          "policy": "Wait-if-program-fanout",
+          "redo": 93.0,
+          "wait": 0.0,
+          "waste": 93.0,
+          "makespan": 57.5,
+          "n_consumers": 93,
+          "redo_saved_vs_MA": 0.0,
+          "wait_added_vs_MA": 0.0,
+          "makespan_delta_vs_MA": 0.0,
+          "waste_delta_vs_MA": 0.0,
+          "win_vs_MA": false
+        },
+        "Bind-if-ready": {
+          "policy": "Bind-if-ready",
+          "redo": 8.522339026607913,
+          "wait": 4.56105849582172,
+          "waste": 13.083397522429632,
+          "makespan": 47.5104246903037,
+          "redo_saved_vs_MA": 84.47766097339209,
+          "wait_added_vs_MA": 4.56105849582172,
+          "makespan_delta_vs_MA": -9.9895753096963,
+          "waste_delta_vs_MA": -79.91660247757036,
+          "win_vs_MA": true
+        }
+      }
+    }
+  ],
+  "by_morphology": {
+    "fan_out": {
+      "M-D": {
+        "n_blocks": 1,
+        "mean_waste_delta_vs_MA": -319.02610187097196,
+        "mean_redo_saved_vs_MA": 426.70606640997903,
+        "mean_wait_added_vs_MA": 107.67996453900707,
+        "mean_makespan_delta_vs_MA": -39.878262733871495,
+        "win_frac": 1.0,
+        "all_win": true
+      },
+      "Wait-if-program-fanout": {
+        "n_blocks": 1,
+        "mean_waste_delta_vs_MA": -382.10630366228503,
+        "mean_redo_saved_vs_MA": 467.75590996149685,
+        "mean_wait_added_vs_MA": 85.64960629921184,
+        "mean_makespan_delta_vs_MA": -47.763287957785636,
+        "win_frac": 1.0,
+        "all_win": true
+      },
+      "Bind-if-ready": {
+        "n_blocks": 1,
+        "mean_waste_delta_vs_MA": -413.12813471715054,
+        "mean_redo_saved_vs_MA": 454.2657112700813,
+        "mean_wait_added_vs_MA": 41.13757655293073,
+        "mean_makespan_delta_vs_MA": -51.64101683964381,
+        "win_frac": 1.0,
+        "all_win": true
+      }
+    },
+    "long_chain": {
+      "M-D": {
+        "n_blocks": 1,
+        "mean_waste_delta_vs_MA": -81.98937641053644,
+        "mean_redo_saved_vs_MA": 87.68431688672692,
+        "mean_wait_added_vs_MA": 5.694940476190472,
+        "mean_makespan_delta_vs_MA": -10.248672051317058,
+        "win_frac": 1.0,
+        "all_win": true
+      },
+      "Wait-if-program-fanout": {
+        "n_blocks": 1,
+        "mean_waste_delta_vs_MA": -88.16257575982573,
+        "mean_redo_saved_vs_MA": 97.35580780402464,
+        "mean_wait_added_vs_MA": 9.193232044198904,
+        "mean_makespan_delta_vs_MA": -11.020321969978212,
+        "win_frac": 1.0,
+        "all_win": true
+      },
+      "Bind-if-ready": {
+        "n_blocks": 1,
+        "mean_waste_delta_vs_MA": -126.95078026867952,
+        "mean_redo_saved_vs_MA": 132.68613938470162,
+        "mean_wait_added_vs_MA": 5.735359116022102,
+        "mean_makespan_delta_vs_MA": -15.86884753358494,
+        "win_frac": 1.0,
+        "all_win": true
+      }
+    },
+    "mixed": {
+      "M-D": {
+        "n_blocks": 1,
+        "mean_waste_delta_vs_MA": -31.166256985934922,
+        "mean_redo_saved_vs_MA": 38.380153443700586,
+        "mean_wait_added_vs_MA": 7.213896457765666,
+        "mean_makespan_delta_vs_MA": -3.8957821232418652,
+        "win_frac": 1.0,
+        "all_win": true
+      },
+      "Wait-if-program-fanout": {
+        "n_blocks": 1,
+        "mean_waste_delta_vs_MA": 0.0,
+        "mean_redo_saved_vs_MA": 0.0,
+        "mean_wait_added_vs_MA": 0.0,
+        "mean_makespan_delta_vs_MA": 0.0,
+        "win_frac": 0.0,
+        "all_win": false
+      },
+      "Bind-if-ready": {
+        "n_blocks": 1,
+        "mean_waste_delta_vs_MA": -79.91660247757036,
+        "mean_redo_saved_vs_MA": 84.47766097339209,
+        "mean_wait_added_vs_MA": 4.56105849582172,
+        "mean_makespan_delta_vs_MA": -9.9895753096963,
+        "win_frac": 1.0,
+        "all_win": true
+      }
+    },
+    "quiet": {
+      "M-D": {
+        "n_blocks": 2,
+        "mean_waste_delta_vs_MA": -2.74351439421957,
+        "mean_redo_saved_vs_MA": 3.4275803282855044,
+        "mean_wait_added_vs_MA": 0.6840659340659342,
+        "mean_makespan_delta_vs_MA": -0.3429392992774467,
+        "win_frac": 0.5,
+        "all_win": false
+      },
+      "Wait-if-program-fanout": {
+        "n_blocks": 2,
+        "mean_waste_delta_vs_MA": 0.0,
+        "mean_redo_saved_vs_MA": 0.0,
+        "mean_wait_added_vs_MA": 0.0,
+        "mean_makespan_delta_vs_MA": 0.0,
+        "win_frac": 0.0,
+        "all_win": false
+      },
+      "Bind-if-ready": {
+        "n_blocks": 2,
+        "mean_waste_delta_vs_MA": -6.24,
+        "mean_redo_saved_vs_MA": 6.37,
+        "mean_wait_added_vs_MA": 0.12999999999999998,
+        "mean_makespan_delta_vs_MA": -0.7799999999999998,
+        "win_frac": 1.0,
+        "all_win": true
+      }
+    },
+    "waw_spine": {
+      "M-D": {
+        "n_blocks": 1,
+        "mean_waste_delta_vs_MA": -129.533059831585,
+        "mean_redo_saved_vs_MA": 133.909059831585,
+        "mean_wait_added_vs_MA": 4.375999999999999,
+        "mean_makespan_delta_vs_MA": -16.191632478948122,
+        "win_frac": 1.0,
+        "all_win": true
+      },
+      "Wait-if-program-fanout": {
+        "n_blocks": 1,
+        "mean_waste_delta_vs_MA": 0.0,
+        "mean_redo_saved_vs_MA": 0.0,
+        "mean_wait_added_vs_MA": 0.0,
+        "mean_makespan_delta_vs_MA": 0.0,
+        "win_frac": 0.0,
+        "all_win": false
+      },
+      "Bind-if-ready": {
+        "n_blocks": 1,
+        "mean_waste_delta_vs_MA": -140.7656741597969,
+        "mean_redo_saved_vs_MA": 149.2053217368894,
+        "mean_wait_added_vs_MA": 8.439647577092495,
+        "mean_makespan_delta_vs_MA": -17.595709269974606,
+        "win_frac": 1.0,
+        "all_win": true
+      }
+    }
+  },
+  "gate": {
+    "hot_morphologies_tested": [
+      "fan_out",
+      "long_chain",
+      "mixed",
+      "waw_spine"
+    ],
+    "quiet_morphologies_tested": [
+      "quiet"
+    ],
+    "per_policy": {
+      "M-D": {
+        "hot_ev_win_any": true,
+        "hot_ev_win_all": true,
+        "quiet_not_degraded": true,
+        "implement_choose_action_candidate": true
+      },
+      "Wait-if-program-fanout": {
+        "hot_ev_win_any": true,
+        "hot_ev_win_all": false,
+        "quiet_not_degraded": true,
+        "implement_choose_action_candidate": true
+      },
+      "Bind-if-ready": {
+        "hot_ev_win_any": true,
+        "hot_ev_win_all": true,
+        "quiet_not_degraded": true,
+        "implement_choose_action_candidate": true
+      }
+    }
+  },
+  "decision": {
+    "implement_choose_action": true,
+    "winning_policies": [
+      "Wait-if-program-fanout",
+      "Bind-if-ready"
+    ],
+    "reason": "L3 offline: candidates=['Wait-if-program-fanout', 'Bind-if-ready']. Hot morphology EV win without quiet degradation \u2192 authorize choose_action v3."
+  }
+}

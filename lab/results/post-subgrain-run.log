@@ -1,0 +1,79 @@
+G7 dig tag="post-subgrain" softwait_disabled=false
+=== G7 flip smoke 19606598 → 19606599 ===
+  block=19606598 ok=true tps=17035 soft_wait_arms=0 wait_hard=2 aborts=9 flip_count=1
+  block=19606599 ok=true tps=10060 soft_wait_arms=0 wait_hard=56 aborts=172 flip_count=2
+wrote "/workspace/specfence/crates/pevm/../../lab/results/post-subgrain-flip.json"
+=== G7 SF vs OCC@8 cores iters=3 ===
+  block=14689597 mode=occ        iter=3/3 ok=true tps=140350 wall_ms=4.0 soft=0 wait_hard=0 abort_rate=0.098 lean=0 evm=1608 reexec=1044 fb_reabort=0 fra=0 sra=0 sb_res=0 sb_def=0 hsstore=0 bsnap=0 bcredit=0 sb_clique=0 jdef=0 aj=0 rebind=0 ffc=0 fvd=0 fab=0 cold=0 occ_fast=0 steal=0 park_k=0 await_a=0 await_ok=0 eng_sw=0 mw_ms=0.0 h_ms=0.0 v_ms=0.0 park_ms=0.0 sw_ms=0.0 ea_ms=0.0 bo_ms=0.0 parks=0
+  block=14689597 mode=occ        SUMMARY n=3 wall_ms median=4.0 p90=4.1 min=3.8 mean=4.0 soft_med=0 abort_med=55
+  process-14689597 unfenced=3280 wait=53 bind=1432 unfenced_after_avoid=0 force_prefix_none_unfenced=0 hot_l_unfenced_after_fence=0 indep=627 per_tx=558 reasons={"bind_published": 1432, "unfenced_after_avoid": 0, "unfenced_canary": 543, "unfenced_cold": 2110, "unfenced_independence": 627, "unfenced_inversion": 0, "unfenced_plant_tls": 0, "unfenced_writer_done": 0, "wait_for_canary": 0, "wait_for_prefix": 0, "wait_for_serial": 32, "wait_for_writer": 21} hot_l=Some((85335018835337005, 6, 0, 539, 0, 5))
+wrote "/workspace/specfence/crates/pevm/../../lab/results/exec-process-14689597-post-subgrain.json"
+per-tx lean -> "/workspace/specfence/crates/pevm/../../lab/results/post-subgrain-per-tx-597-c8.json"
+  block=14689597 mode=specfence  iter=3/3 ok=true tps=22944 wall_ms=24.6 soft=0 wait_hard=53 abort_rate=0.105 lean=716 evm=613 reexec=49 fb_reabort=23 fra=4 sra=1 sb_res=2 sb_def=0 hsstore=0 bsnap=54 bcredit=8 sb_clique=2 jdef=0 aj=10 rebind=0 ffc=1 fvd=0 fab=1 cold=627 occ_fast=600 steal=82 park_k=42 await_a=0 await_ok=0 eng_sw=1 mw_ms=0.0 h_ms=0.0 v_ms=0.0 park_ms=102.9 sw_ms=0.0 ea_ms=0.0 bo_ms=102.9 parks=56
+  block=14689597 mode=specfence  SUMMARY n=3 wall_ms median=17.7 p90=24.6 min=17.6 mean=20.0 soft_med=0 abort_med=58
+  block=19606599 mode=occ        iter=3/3 ok=true tps=37964 wall_ms=9.7 soft=0 wait_hard=0 abort_rate=0.248 lean=0 evm=662 reexec=295 fb_reabort=0 fra=0 sra=0 sb_res=0 sb_def=0 hsstore=0 bsnap=0 bcredit=0 sb_clique=0 jdef=0 aj=0 rebind=0 ffc=0 fvd=0 fab=0 cold=0 occ_fast=0 steal=0 park_k=0 await_a=0 await_ok=0 eng_sw=0 mw_ms=0.0 h_ms=0.0 v_ms=0.0 park_ms=0.0 sw_ms=0.0 ea_ms=0.0 bo_ms=0.0 parks=0
+  block=19606599 mode=occ        SUMMARY n=3 wall_ms median=9.7 p90=10.8 min=9.7 mean=10.0 soft_med=0 abort_med=91
+  process-19606599 unfenced=5091 wait=55 bind=3948 unfenced_after_avoid=0 force_prefix_none_unfenced=0 hot_l_unfenced_after_fence=0 indep=1120 per_tx=345 reasons={"bind_published": 3948, "unfenced_after_avoid": 0, "unfenced_canary": 2527, "unfenced_cold": 1444, "unfenced_independence": 1120, "unfenced_inversion": 0, "unfenced_plant_tls": 0, "unfenced_writer_done": 0, "wait_for_canary": 0, "wait_for_prefix": 0, "wait_for_serial": 34, "wait_for_writer": 21} hot_l=Some((13758554269703882113, 7, 0, 233, 0, 0))
+wrote "/workspace/specfence/crates/pevm/../../lab/results/exec-process-19606599-post-subgrain.json"
+per-tx lean -> "/workspace/specfence/crates/pevm/../../lab/results/post-subgrain-per-tx-599-c8.json"
+  block=19606599 mode=specfence  iter=3/3 ok=true tps=10378 wall_ms=35.4 soft=0 wait_hard=55 abort_rate=0.466 lean=617 evm=431 reexec=64 fb_reabort=64 fra=35 sra=2 sb_res=15 sb_def=0 hsstore=0 bsnap=121 bcredit=8 sb_clique=12 jdef=0 aj=13 rebind=2 ffc=4 fvd=0 fab=0 cold=1120 occ_fast=1040 steal=64 park_k=36 await_a=0 await_ok=0 eng_sw=1 mw_ms=0.0 h_ms=0.0 v_ms=0.0 park_ms=39.6 sw_ms=0.0 ea_ms=0.0 bo_ms=39.6 parks=48
+  block=19606599 mode=specfence  SUMMARY n=3 wall_ms median=35.2 p90=35.4 min=34.5 mean=35.0 soft_med=0 abort_med=171
+  block=19469097 mode=occ        iter=3/3 ok=true tps=47272 wall_ms=7.1 soft=0 wait_hard=0 abort_rate=0.354 lean=0 evm=658 reexec=322 fb_reabort=0 fra=0 sra=0 sb_res=0 sb_def=0 hsstore=0 bsnap=0 bcredit=0 sb_clique=0 jdef=0 aj=0 rebind=0 ffc=0 fvd=0 fab=0 cold=0 occ_fast=0 steal=0 park_k=0 await_a=0 await_ok=0 eng_sw=0 mw_ms=0.0 h_ms=0.0 v_ms=0.0 park_ms=0.0 sw_ms=0.0 ea_ms=0.0 bo_ms=0.0 parks=0
+  block=19469097 mode=occ        SUMMARY n=3 wall_ms median=7.1 p90=7.1 min=6.4 mean=6.9 soft_med=0 abort_med=92
+  process-19469097 unfenced=2910 wait=42 bind=2116 unfenced_after_avoid=0 force_prefix_none_unfenced=0 hot_l_unfenced_after_fence=0 indep=686 per_tx=296 reasons={"bind_published": 2116, "unfenced_after_avoid": 0, "unfenced_canary": 1541, "unfenced_cold": 683, "unfenced_independence": 686, "unfenced_inversion": 0, "unfenced_plant_tls": 0, "unfenced_writer_done": 0, "wait_for_canary": 0, "wait_for_prefix": 0, "wait_for_serial": 34, "wait_for_writer": 8} hot_l=Some((5756944208085735096, 1, 0, 127, 0, 0))
+wrote "/workspace/specfence/crates/pevm/../../lab/results/exec-process-19469097-post-subgrain.json"
+per-tx lean -> "/workspace/specfence/crates/pevm/../../lab/results/post-subgrain-per-tx-097-c8.json"
+  block=19469097 mode=specfence  iter=3/3 ok=true tps=16699 wall_ms=20.1 soft=0 wait_hard=42 abort_rate=0.545 lean=583 evm=382 reexec=46 fb_reabort=44 fra=48 sra=2 sb_res=14 sb_def=0 hsstore=0 bsnap=125 bcredit=3 sb_clique=12 jdef=0 aj=2 rebind=3 ffc=1 fvd=0 fab=1 cold=686 occ_fast=639 steal=48 park_k=35 await_a=0 await_ok=0 eng_sw=1 mw_ms=0.0 h_ms=0.0 v_ms=0.0 park_ms=12.5 sw_ms=0.0 ea_ms=0.0 bo_ms=12.5 parks=46
+  block=19469097 mode=specfence  SUMMARY n=3 wall_ms median=19.0 p90=20.1 min=18.5 mean=19.2 soft_med=0 abort_med=183
+  block=19606598 mode=occ        iter=3/3 ok=true tps=81860 wall_ms=1.1 soft=0 wait_hard=0 abort_rate=0.110 lean=0 evm=115 reexec=24 fb_reabort=0 fra=0 sra=0 sb_res=0 sb_def=0 hsstore=0 bsnap=0 bcredit=0 sb_clique=0 jdef=0 aj=0 rebind=0 ffc=0 fvd=0 fab=0 cold=0 occ_fast=0 steal=0 park_k=0 await_a=0 await_ok=0 eng_sw=0 mw_ms=0.0 h_ms=0.0 v_ms=0.0 park_ms=0.0 sw_ms=0.0 ea_ms=0.0 bo_ms=0.0 parks=0
+  block=19606598 mode=occ        SUMMARY n=3 wall_ms median=1.4 p90=2.3 min=1.1 mean=1.6 soft_med=0 abort_med=9
+  block=19606598 mode=specfence  iter=3/3 ok=true tps=21643 wall_ms=4.2 soft=0 wait_hard=4 abort_rate=0.121 lean=126 evm=116 reexec=25 fb_reabort=4 fra=1 sra=1 sb_res=1 sb_def=0 hsstore=0 bsnap=7 bcredit=1 sb_clique=1 jdef=0 aj=0 rebind=0 ffc=0 fvd=0 fab=0 cold=258 occ_fast=226 steal=15 park_k=1 await_a=0 await_ok=0 eng_sw=1 mw_ms=0.0 h_ms=0.0 v_ms=0.0 park_ms=0.2 sw_ms=0.0 ea_ms=0.0 bo_ms=0.2 parks=6
+  block=19606598 mode=specfence  SUMMARY n=3 wall_ms median=3.8 p90=4.2 min=3.7 mean=3.9 soft_med=0 abort_med=9
+  SF/OCC@8 block=14689597: 0.163
+  SF/OCC@8 block=19606599: 0.273
+  SF/OCC@8 block=19469097: 0.353
+  SF/OCC@8 block=19606598: 0.264
+  mean SF/OCC@8 = 0.264 (v8 baseline ~0.325 on different block set)
+=== complete-arch xblock contiguous families ===
+  fam=597 block=14689595 mode=sf-warm ok=true tps=19447 wall_ms=1.2 soft=0 wait_hard=0 aborts=0 edge_bind=0 edge_wait=0 edge_unfenced=0 avoid=0 canary=0 indep=0 spine=0 hot=0
+  fam=597 block=14689596 mode=sf-warm ok=true tps=6725 wall_ms=4.6 soft=0 wait_hard=11 aborts=14 edge_bind=500 edge_wait=11 edge_unfenced=582 avoid=229 canary=289 indep=95 spine=10 hot=310
+  fam=597 block=14689597 mode=sf-warm ok=true tps=30170 wall_ms=18.7 soft=0 wait_hard=39 aborts=36 edge_bind=1329 edge_wait=39 edge_unfenced=3109 avoid=910 canary=543 indep=594 spine=34 hot=1054
+  process-597-warm unfenced=3109 wait=39 bind=1329 unfenced_after_avoid=0 hot_after_fence=0 wrote "/workspace/specfence/crates/pevm/../../lab/results/exec-process-597-fence-post-subgrain-warm.json"
+  fam=597 block=14689598 mode=sf-warm ok=true tps=20415 wall_ms=5.4 soft=0 wait_hard=0 aborts=9 edge_bind=244 edge_wait=0 edge_unfenced=696 avoid=221 canary=259 indep=115 spine=0 hot=373
+  fam=597 block=14689599 mode=sf-warm ok=true tps=231300 wall_ms=0.2 soft=0 wait_hard=0 aborts=9 edge_bind=244 edge_wait=0 edge_unfenced=696 avoid=221 canary=259 indep=115 spine=0 hot=373
+  fam=597 block=14689595 mode=sf-cold ok=true tps=21791 wall_ms=1.1 soft=0 wait_hard=0 aborts=0
+  fam=597 block=14689595 mode=occ ok=true tps=20002 wall_ms=1.1 soft=0 wait_hard=0 aborts=0
+  fam=597 block=14689596 mode=sf-cold ok=true tps=5640 wall_ms=5.5 soft=0 wait_hard=8 aborts=14
+  fam=597 block=14689596 mode=occ ok=true tps=30100 wall_ms=1.0 soft=0 wait_hard=0 aborts=11
+  fam=597 block=14689597 mode=sf-cold ok=true tps=30286 wall_ms=18.6 soft=0 wait_hard=41 aborts=41
+  fam=597 block=14689597 mode=occ ok=true tps=109480 wall_ms=5.2 soft=0 wait_hard=0 aborts=97
+  fam=597 block=14689598 mode=sf-cold ok=true tps=23872 wall_ms=4.6 soft=0 wait_hard=3 aborts=11
+  fam=597 block=14689598 mode=occ ok=true tps=52754 wall_ms=2.1 soft=0 wait_hard=0 aborts=7
+  fam=597 block=14689599 mode=sf-cold ok=true tps=229849 wall_ms=0.2 soft=0 wait_hard=0 aborts=0
+  fam=597 block=14689599 mode=occ ok=true tps=296634 wall_ms=0.1 soft=0 wait_hard=0 aborts=0
+  fam=599 block=19606597 mode=sf-warm ok=true tps=5172 wall_ms=24.0 soft=0 wait_hard=30 aborts=117 edge_bind=3101 edge_wait=30 edge_unfenced=2486 avoid=561 canary=1235 indep=407 spine=28 hot=1353
+  fam=599 block=19606598 mode=sf-warm ok=true tps=20493 wall_ms=4.4 soft=0 wait_hard=1 aborts=8 edge_bind=206 edge_wait=1 edge_unfenced=628 avoid=300 canary=344 indep=234 spine=1 hot=539
+  fam=599 block=19606599 mode=sf-warm ok=true tps=10440 wall_ms=35.2 soft=0 wait_hard=44 aborts=153 edge_bind=3785 edge_wait=44 edge_unfenced=4905 avoid=1280 canary=2632 indep=1057 spine=41 hot=2931
+  fam=599 block=19606600 mode=sf-warm ok=true tps=7755 wall_ms=30.6 soft=0 wait_hard=46 aborts=116 edge_bind=3183 edge_wait=46 edge_unfenced=3593 avoid=929 canary=1984 indep=707 spine=41 hot=2174
+  fam=599 block=19606597 mode=sf-cold ok=true tps=6442 wall_ms=19.2 soft=0 wait_hard=32 aborts=86
+  fam=599 block=19606597 mode=occ ok=true tps=19934 wall_ms=6.2 soft=0 wait_hard=0 aborts=46
+  fam=599 block=19606598 mode=sf-cold ok=true tps=22794 wall_ms=4.0 soft=0 wait_hard=4 aborts=7
+  fam=599 block=19606598 mode=occ ok=true tps=54319 wall_ms=1.7 soft=0 wait_hard=0 aborts=7
+  fam=599 block=19606599 mode=sf-cold ok=true tps=9725 wall_ms=37.7 soft=0 wait_hard=58 aborts=206
+  fam=599 block=19606599 mode=occ ok=true tps=37231 wall_ms=9.9 soft=0 wait_hard=0 aborts=80
+  fam=599 block=19606600 mode=sf-cold ok=true tps=8051 wall_ms=29.4 soft=0 wait_hard=53 aborts=131
+  fam=599 block=19606600 mode=occ ok=true tps=21207 wall_ms=11.2 soft=0 wait_hard=0 aborts=80
+  fam=097 block=19469096 mode=sf-warm ok=true tps=15272 wall_ms=16.4 soft=0 wait_hard=110 aborts=356 edge_bind=1757 edge_wait=110 edge_unfenced=1418 avoid=657 canary=696 indep=470 spine=110 hot=964
+  fam=097 block=19469097 mode=sf-warm ok=true tps=16858 wall_ms=19.9 soft=0 wait_hard=33 aborts=147 edge_bind=1869 edge_wait=33 edge_unfenced=2868 avoid=1071 canary=1579 indep=668 spine=32 hot=1920
+  fam=097 block=19469098 mode=sf-warm ok=true tps=21786 wall_ms=12.3 soft=0 wait_hard=36 aborts=61 edge_bind=753 edge_wait=36 edge_unfenced=1440 avoid=693 canary=801 indep=362 spine=35 hot=1135
+  fam=097 block=19469099 mode=sf-warm ok=true tps=11908 wall_ms=21.6 soft=0 wait_hard=29 aborts=102 edge_bind=1379 edge_wait=29 edge_unfenced=2614 avoid=1171 canary=1644 indep=442 spine=28 hot=1957
+  fam=097 block=19469096 mode=sf-cold ok=true tps=15997 wall_ms=15.6 soft=0 wait_hard=140 aborts=355
+  fam=097 block=19469096 mode=occ ok=true tps=70932 wall_ms=3.5 soft=0 wait_hard=0 aborts=119
+  fam=097 block=19469097 mode=sf-cold ok=true tps=16478 wall_ms=20.4 soft=0 wait_hard=31 aborts=199
+  fam=097 block=19469097 mode=occ ok=true tps=63574 wall_ms=5.3 soft=0 wait_hard=0 aborts=100
+  fam=097 block=19469098 mode=sf-cold ok=true tps=26210 wall_ms=10.2 soft=0 wait_hard=46 aborts=89
+  fam=097 block=19469098 mode=occ ok=true tps=69472 wall_ms=3.9 soft=0 wait_hard=0 aborts=58
+  fam=097 block=19469099 mode=sf-cold ok=true tps=16051 wall_ms=16.0 soft=0 wait_hard=26 aborts=108
+  fam=097 block=19469099 mode=occ ok=true tps=52446 wall_ms=4.9 soft=0 wait_hard=0 aborts=66
+wrote "/workspace/specfence/crates/pevm/../../lab/results/post-subgrain-xblock.json"
+wrote "/workspace/specfence/crates/pevm/../../lab/results/post-subgrain-sf-occ.json"
