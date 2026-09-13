@@ -27,11 +27,11 @@
 |----------|---------|------|
 | PC ⊗ CC peer frame | SoT v8 §0.1; `mod.rs` | yes |
 | Empty-PE OCC (T6) | `specfence_plant_is_occ` / gate early return | **kept** |
-| ProducerStage-safe refuse | `producer_stage.rs`; `scheduler::try_execute_ready` (Ready/Executing/Validated); `computer::next_sf_task` drops Aborting reservations | yes |
+| ProducerStage-safe refuse | `producer_stage.rs`; `try_execute_ready` refuse iff producer Executing; `next_sf_task` drops Aborting reservations | yes |
 | ReadyEdge + predicted RAW tip | `ready_edge.rs` | yes |
 | Bind rare (tip==conflict ∧ EV) | `access_policy::decide`; `AccessVis.tip_is_conflict_producer` | yes |
 | WaitFor / SerialLane primary | `decide`; `pcc_wait_for_writer`; `pcc_serial_lane` | yes |
-| SerialLane exclusive | `pcc_serial_lane` WaitFor if executing; Ready/Validated = BlockingOther steal (never `occ_unfenced`) | yes |
+| SerialLane exclusive | `pcc_serial_lane` WaitFor if executing; Ready = canary + ProducerStage/edge (Ready-park/refuse yield-spins) | yes |
 | Live true-\(k\) when PE-on | `vm.rs` `access_log.note` on PE-on stream | yes |
 | No fan_out templates `[1,6,10,20]` | `learner::note_abort_access` → `arm_location_any_k` | yes |
 | Validate split → R1a | `executor::validate_specfence` | yes |
@@ -59,7 +59,7 @@ PE nonempty:
          if location_predicted: vis + decide
            WaitFor(executing) → park + cert + process.record
            SerialLane(executing) → grant + WaitFor
-           SerialLane(Ready) → reserve ProducerStage + Blocking (never occ_unfenced)
+           SerialLane(Ready) → reserve ProducerStage + canary (Ready-park yield-spins)
            Bind(tip==RAW producer ∧ EV) → OCC read + cert + process.record
            else Spec ≡ OCC
   validate = validate_specfence

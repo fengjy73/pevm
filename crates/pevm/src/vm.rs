@@ -664,14 +664,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if self.specfence.scheduler.is_executing(w) {
             return self.pcc_wait_for_writer(address, location_hash, access_k, is_program, w);
         }
+        // Ready/Validated/Aborting: one Spec canary + ProducerStage/edge so
+        // the next incarnation is refused while w is Executing. Parking or
+        // ready-refuse of a Ready head yield-spins (iter20 / v6 hang class).
+        // Not prefer_admit-without-progress: w is reserved and admitted.
         if self.specfence.scheduler.is_ready(w) || self.specfence.scheduler.is_validated(w) {
-            // Exclusive: never occ_unfenced while the unfinished head is live.
-            // BlockingOther steal-converts to the Ready producer (no WaitHard
-            // park) — hang-safe vs v6 Ready-park, SoT vs prefer_admit+Spec.
-            self.note_fence_success(location_hash);
-            self.pcc_this_tx
-                .set(self.pcc_this_tx.get().saturating_add(1));
-            self.specfence.metrics.record_pcc_fire_at_a();
             self.specfence.process.record(
                 location_hash,
                 self.tx_idx,
@@ -679,36 +676,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 true,
                 false,
             );
-            self.specfence.process.record_decision(DecisionFeat {
-                verb: DecisionVerb::WaitFor,
-                access_k,
-                depth: 0,
-                incarnation: self.tx_incarnation,
-                is_program,
-                writer_published: false,
-                writer_validated: self.specfence.scheduler.is_validated(w),
-                writer_executing: false,
-                writer_ready: self.specfence.scheduler.is_ready(w),
-                writer_present: true,
-                avoid_broadcast: false,
-                canary_ok: false,
-                independence_certified: false,
-                essential_antidep: true,
-                force_prefix: false,
-                clique_gated: false,
-                in_hot_set: false,
-                prior_warm: false,
-                mode_read: true,
-            });
-            self.specfence.wave.set_pending_park(
-                location_hash,
-                self.specfence.partial_retry.current_k(self.tx_idx) as u64,
-                crate::specfence::ParkKind::BlockingOther,
-            );
-            self.specfence.process.note_park(self.tx_idx);
-            return Err(ReadError::Blocking(w));
         }
-        // Aborting: no Stage — hang-safe canary; ProducerStage already reserved.
         self.occ_unfenced()
     }
 

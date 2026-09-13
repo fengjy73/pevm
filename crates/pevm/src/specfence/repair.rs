@@ -1,6 +1,6 @@
 //! Repair grain — R1 at first failed Fenced \(a\); Spec-only fail → B0.
 //!
-//! Plant SoT: `lab/notes/specfence-complete-architecture-v6-essence.md` §5.
+//! Plant SoT: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md` §4.
 
 use crate::MemoryLocationHash;
 use crate::TxIdx;
