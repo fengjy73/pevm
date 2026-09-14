@@ -21,7 +21,7 @@ PinHold park (no rem checkpoint, armed_at_k=0)
 
 | # | Duty | Where | Done when |
 |---|------|-------|-----------|
-| 1 | **PinWithoutThrow resumes** | Unfenced PE-on reads `maybe_note_value`. `arm_pinhold_checkpoint` journals **snapped** prefix only (wait loc not certified). First-access / empty snap → FullRetry (synthetic k=1 livelocked 19807137). Wake ResumeAtK without force-bind; `repair_armed` only with FF values | mid-tx snapped `park_resume_at_k`; Soft=0 |
+| 1 | **PinWithoutThrow resumes** | Unfenced PE-on reads `maybe_note_value`. `arm_pinhold_checkpoint` journals **snapped** prefix only (wait loc not certified). First-access / empty / **k<8** → FullRetry (tiny ResumeAtK was 0.17/0.09 tax; synthetic k=1 hung 19807137). Wake ResumeAtK without force-bind only when prefix skip is real; `repair_armed` only with FF values | mid-tx k≥8 `park_resume_at_k`; Soft=0 |
 | 2 | **R1 wins when strips cover** | R1a value-stable; R1b `try_arm_r1b_covered` strips-only, **one** RewindTo (`suffix_repair_depth==0`). No `r1_attempt` unless R1b arms. Second strip-cover → honest OCC B0 (never-B0 ForceBind hung 19807137) | R1 path not theater; no RewindTo train |
 | 3 | **Schedule-first Avoid** | `scheduler.rs:try_execute_ready` refuses known consumers while `w` **Ready or Executing**; `admit_spine(w)` so ProducerStage progresses (no v6 yield-spin) | refuse on Ready; 19807137 refuse ≫ 0 |
 | 4 | **Kill known-edge ReadyCanary** | `fence_act::act_wait_for`: Ready → PinHold; DoneUnfenced **cert=false** (no R1-bait strip) | canary only Aborting/unknown |
