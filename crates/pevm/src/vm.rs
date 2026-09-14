@@ -475,7 +475,16 @@ impl<'a, S: Storage> VmDb<'a, S> {
         // PE-on: true stream \(k\). Empty-PE never reaches HashMap note.
         let access_k = self.specfence.access_log.note(self.tx_idx, location_hash);
         if !self.specfence.learner.location_predicted(location_hash) {
-            return Ok(());
+            // Storage RAW of a hinted star account: plant PE at this stream k
+            // (admit only seeded Basic(addr)@k≈6 — hot RAW is often storage).
+            let basic = hash_deterministic(MemoryLocation::Basic(address));
+            if self.specfence.learner.location_predicted(basic) {
+                self.specfence
+                    .learner
+                    .seed_predicted_essential(location_hash, access_k);
+            } else {
+                return Ok(());
+            }
         }
 
         let vis = self.access_vis(location_hash);
@@ -751,7 +760,25 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 .predicted_producer(location_hash)
                 .is_some();
         let kind = crate::specfence::fence_act::estimate_park_kind(pe_known);
-        let armed_at_k = self.specfence.partial_retry.current_k(self.tx_idx) as u64;
+        let access_k = self
+            .specfence
+            .access_log
+            .first_k(self.tx_idx, location_hash)
+            .unwrap_or_else(|| self.specfence.partial_retry.current_k(self.tx_idx) as u32);
+        let armed_at_k = if kind == crate::specfence::ParkKind::PinHold {
+            let prefix = self
+                .specfence
+                .access_log
+                .prefix_before(self.tx_idx, access_k);
+            self.specfence.partial_retry.arm_pinhold_checkpoint(
+                self.tx_idx,
+                location_hash,
+                access_k.max(1),
+                &prefix,
+            )
+        } else {
+            self.specfence.partial_retry.current_k(self.tx_idx) as u64
+        };
         self.specfence
             .wave
             .set_pending_park(location_hash, armed_at_k, kind);
@@ -866,7 +893,8 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.specfence.scheduler.admit_spine(w, self.specfence.wave);
         match crate::specfence::fence_act::act_wait_for(self.specfence.scheduler, w) {
             crate::specfence::fence_act::FenceAct::DoneUnfenced { cert } => {
-                // Bind-after-Done is tax — cert for R1, do not count Bind.
+                // Bind-after-Done is tax. DoneUnfenced cert is R1 bait
+                // (sibling Spec stays uncertified → attempt then B0).
                 if cert {
                     self.note_fence_success(location_hash);
                     self.specfence.metrics.record_bind_after_done();
@@ -878,6 +906,16 @@ impl<'a, S: Storage> VmDb<'a, S> {
             }
             crate::specfence::fence_act::FenceAct::PinHold { writer: _ } => {}
         }
+        let prefix = self
+            .specfence
+            .access_log
+            .prefix_before(self.tx_idx, access_k);
+        let armed_at_k = self.specfence.partial_retry.arm_pinhold_checkpoint(
+            self.tx_idx,
+            location_hash,
+            access_k,
+            &prefix,
+        );
         self.note_fence_success(location_hash);
         self.pcc_this_tx
             .set(self.pcc_this_tx.get().saturating_add(1));
@@ -927,7 +965,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
             .arm_hard_wait(location_hash, self.tx_idx, w);
         self.specfence.wave.set_pending_park(
             location_hash,
-            self.specfence.partial_retry.current_k(self.tx_idx) as u64,
+            armed_at_k,
             crate::specfence::ParkKind::PinHold,
         );
         self.specfence.process.note_park(self.tx_idx);

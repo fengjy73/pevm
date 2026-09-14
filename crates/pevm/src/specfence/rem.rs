@@ -1225,6 +1225,117 @@ impl PartialRetryTable {
         ParkResumeKind::ResumeAtK { checkpoint_k: cp.k }
     }
 
+    /// PinWithoutThrow: plant rem checkpoint + certified prefix **before** park
+    /// so wake [`Self::try_arm_park_resume_at_k`] returns ResumeAtK (not FullRetry).
+    ///
+    /// Product WaitFor does not journal rem (Unfenced grain). Without this,
+    /// `current_k==0` → park k=0 → wake FullRetry (OCC-class head reexec + idle
+    /// tax OCC never pays). SoftWait Soft is **not** armed (Soft=0).
+    ///
+    /// `prefix` is access_log first-touches with `k < access_k`. Returns
+    /// `armed_at_k` for the wave park (`> checkpoint k`).
+    pub(crate) fn arm_pinhold_checkpoint(
+        &self,
+        tx_idx: TxIdx,
+        wait_loc: MemoryLocationHash,
+        access_k: u32,
+        prefix: &[(MemoryLocationHash, u32)],
+    ) -> u64 {
+        if tx_idx >= self.states.len() {
+            return access_k.max(2) as u64;
+        }
+        // SAFETY: single-executor invariant (waiter still owns this incarnation).
+        let st = unsafe { self.state_mut(tx_idx) };
+        for &(loc, k) in prefix {
+            if k == 0 {
+                continue;
+            }
+            let kk = k as usize;
+            if st.first_k.get(&loc).is_none() {
+                st.journal.push(RegionAccess {
+                    tx_idx,
+                    k: kk,
+                    location: loc,
+                    mode: AccessMode::Read,
+                });
+                st.first_k.insert(loc, kk);
+                st.certified.insert(loc);
+            }
+            if kk > st.k {
+                st.k = kk;
+            }
+        }
+        let prefix_end = (access_k as usize).saturating_sub(1).max(1);
+        if st.k < prefix_end {
+            if st.first_k.get(&wait_loc).is_none() {
+                st.journal.push(RegionAccess {
+                    tx_idx,
+                    k: prefix_end,
+                    location: wait_loc,
+                    mode: AccessMode::Read,
+                });
+                st.first_k.insert(wait_loc, prefix_end);
+            }
+            st.k = prefix_end;
+        }
+        st.certified.insert(wait_loc);
+        let has_mid_cp = st.checkpoints.iter().any(|c| c.id.k > 0 && c.id.k <= st.k);
+        if !has_mid_cp {
+            let _ = st.push_checkpoint(tx_idx, CheckpointKind::EffectBoundary);
+        }
+        let armed = st.k.saturating_add(1).max(access_k as usize).max(2);
+        if st.first_k.get(&wait_loc).is_none() {
+            st.journal.push(RegionAccess {
+                tx_idx,
+                k: armed,
+                location: wait_loc,
+                mode: AccessMode::Read,
+            });
+            st.first_k.insert(wait_loc, armed);
+        }
+        armed as u64
+    }
+
+    /// R1b timely Resolve: arm RewindTo when a mid-tx checkpoint exists.
+    ///
+    /// Unlike [`Self::apply_suffix_repair`], this does **not** require
+    /// `prefix_skip_beats_b0` (cp_k≥8) — that gate made cert-covered R1 theater
+    /// (attempt then OCC B0). SoftWait Soft stays 0.
+    pub(crate) fn try_arm_r1b_covered(
+        &self,
+        tx_idx: TxIdx,
+        read_locations: &[MemoryLocationHash],
+        invalid: &[MemoryLocationHash],
+        write_locations: &[MemoryLocationHash],
+    ) -> Option<LeanAbortRepair> {
+        let plan = self.plan_partial_retry(tx_idx, read_locations, invalid, write_locations)?;
+        if plan.certified.is_empty() {
+            return None;
+        }
+        let k_fail = plan.k_fail;
+        if k_fail == 0 {
+            return None;
+        }
+        let cp = self.last_checkpoint_before(tx_idx, k_fail)?;
+        if cp.k == 0 || cp.k >= k_fail {
+            return None;
+        }
+        self.arm_rewind_to(
+            tx_idx,
+            cp,
+            k_fail,
+            plan.certified.clone(),
+            plan.suffix_writes.clone(),
+            plan.prefix_writes.clone(),
+        );
+        self.set_force_bind(tx_idx, plan.certified.clone());
+        Some(LeanAbortRepair::SuffixRepair {
+            certified: plan.certified,
+            suffix_writes: plan.suffix_writes,
+            reexec_cost: 0.6,
+        })
+    }
+
     /// After `reset_incarnation`, replay FF continuation into the fresh journal.
     /// Returns effects replayed (0 if none).
     pub(crate) fn replay_ff_if_armed(&self, tx_idx: TxIdx) -> usize {
@@ -2250,6 +2361,58 @@ mod p4_tk_park_tests {
         assert!(table.is_rewind_resume(2));
         assert!(table.must_force_bind(2, 1));
         assert!(table.must_force_bind(2, 2));
+    }
+
+    #[test]
+    fn arm_pinhold_checkpoint_makes_product_park_resume() {
+        let table = PartialRetryTable::new(2);
+        table.reset_incarnation(0, 0);
+        // Unfenced product path: rem empty, access_log prefix at k=1,2 wait at k=3.
+        let armed = table.arm_pinhold_checkpoint(0, 99, 3, &[(10, 1), (11, 2)]);
+        assert!(armed > 2, "armed_at_k must exceed prefix checkpoint");
+        match table.try_arm_park_resume_at_k(0, armed) {
+            ParkResumeKind::ResumeAtK { checkpoint_k } => {
+                assert!(checkpoint_k > 0 && checkpoint_k < armed as usize);
+            }
+            other => panic!("PinHold must ResumeAtK, got {other:?}"),
+        }
+        assert!(table.is_rewind_resume(0));
+    }
+
+    #[test]
+    fn arm_pinhold_first_access_still_resumes() {
+        let table = PartialRetryTable::new(2);
+        table.reset_incarnation(0, 0);
+        let armed = table.arm_pinhold_checkpoint(0, 7, 1, &[]);
+        assert!(armed >= 2);
+        assert!(
+            matches!(
+                table.try_arm_park_resume_at_k(0, armed),
+                ParkResumeKind::ResumeAtK { .. }
+            ),
+            "first-access PinHold must not FullRetry"
+        );
+    }
+
+    #[test]
+    fn try_arm_r1b_covered_without_cp_k8_gate() {
+        let table = PartialRetryTable::new(1);
+        table.reset_incarnation(0, 0);
+        table.note_access(0, 10, AccessMode::Read);
+        table.note_certified(0, 10);
+        table.note_access(0, 11, AccessMode::Read);
+        table.note_certified(0, 11);
+        let _ = table.push_checkpoint(0, CheckpointKind::EffectBoundary);
+        table.note_access(0, 20, AccessMode::Read);
+        match table.apply_suffix_repair(0, &[10, 11, 20], &[20], &[]) {
+            LeanAbortRepair::FullRestart { .. } => {}
+            other => panic!("cp_k<8 must stay B0 on apply_suffix_repair, got {other:?}"),
+        }
+        match table.try_arm_r1b_covered(0, &[10, 11, 20], &[20], &[]) {
+            Some(LeanAbortRepair::SuffixRepair { .. }) => {}
+            other => panic!("R1b covered must RewindTo without cp_k≥8, got {other:?}"),
+        }
+        assert!(table.is_rewind_resume(0));
     }
 }
 

@@ -305,27 +305,26 @@ pub(crate) fn validate_specfence(
                 specfence.learner.note_reexec_cost(0.1);
                 return scheduler.finish_validation(tx_version, false);
             }
-            specfence.metrics.record_r1_attempt();
-            // R1b: certified prefix skip when EV[rewind] > EV[B0] (strips cover).
-            // Ban silent always-B0 while strips exist.
-            let ev_r1b = bayes_q.is_some_and(|q| {
-                q.known_star || q.depth_frac >= 0.50 || q.ev_pin_beats_abort || covers
-            });
+            // R1b: cert-covered fail → RewindTo when a mid-tx checkpoint exists.
+            // Do **not** count an attempt that always falls through to OCC B0
+            // (`apply_suffix_repair` cp_k≥8 theater). Soft=0.
+            let ev_r1b = covers
+                || bayes_q
+                    .is_some_and(|q| q.known_star || q.depth_frac >= 0.50 || q.ev_pin_beats_abort);
             if ev_r1b && matches!(grain, RepairGrain::R1 | RepairGrain::R1Selective) {
                 let read_locations = mv_memory.read_locations(tx_version.tx_idx);
                 let write_locations = mv_memory.write_locations(tx_version.tx_idx);
-                let repair = specfence.partial_retry.apply_suffix_repair(
+                if let Some(LeanAbortRepair::SuffixRepair {
+                    suffix_writes,
+                    reexec_cost,
+                    ..
+                }) = specfence.partial_retry.try_arm_r1b_covered(
                     tx_version.tx_idx,
                     &read_locations,
                     &invalid,
                     &write_locations,
-                );
-                if let LeanAbortRepair::SuffixRepair {
-                    suffix_writes,
-                    reexec_cost,
-                    ..
-                } = repair
-                {
+                ) {
+                    specfence.metrics.record_r1_attempt();
                     if scheduler.try_validation_abort(tx_version) {
                         let estimated =
                             mv_memory.invalidate_partial_suffix(tx_version.tx_idx, &suffix_writes);
@@ -351,6 +350,8 @@ pub(crate) fn validate_specfence(
                     }
                 }
             }
+            // Covers-all but neither R1a nor R1b can convert: do not increment
+            // r1_attempt (that was the theater). Residual B0 below.
         }
     }
 

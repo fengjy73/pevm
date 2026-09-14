@@ -347,8 +347,15 @@ impl AccountHints {
 
     #[cfg(test)]
     pub(crate) fn from_account_txs(addr: Address, txs: Vec<TxIdx>) -> Self {
+        Self::from_many(vec![(addr, txs)])
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_many(pairs: Vec<(Address, Vec<TxIdx>)>) -> Self {
         let mut by_account = HashMap::with_hasher(BuildSuffixHasher::default());
-        by_account.insert(addr, txs);
+        for (addr, txs) in pairs {
+            by_account.insert(addr, txs);
+        }
         Self { by_account }
     }
 
