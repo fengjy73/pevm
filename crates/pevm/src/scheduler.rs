@@ -391,7 +391,9 @@ impl Scheduler {
                 continue;
             }
             if let Some(tx_version) = self.try_execute_ready(cand, Some(wave), ready) {
-                self.execution_idx.fetch_max(cand + 1, Ordering::Relaxed);
+                // Steal only — do not fetch_max(cand+1). Jumping the
+                // collaborative index past refused consumers dropped them
+                // off ready (iter11 lazy-eval unreachable / SIGSEGV).
                 wave.note_ready_steal_if_after_park();
                 return Some(Task::Execution(tx_version));
             }
