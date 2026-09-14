@@ -12,8 +12,8 @@ use super::certificate::CertificateTable;
 use super::dag::FenceGraph;
 use super::kernel::KernelTable;
 use super::learner::LiveLearner;
-use super::rem::WaveParkTable;
 use super::repair::{RepairGrain, repair_grain};
+use super::wave::WaveParkTable;
 use crate::mv_memory::MvMemory;
 use crate::scheduler::Scheduler;
 use crate::{MemoryLocationHash, Task, TxIdx, TxVersion};
@@ -65,24 +65,29 @@ pub(crate) fn specfence_r1_validate(
         && repair_grain(cert, tx_idx, invalid) == RepairGrain::R1
 }
 
-/// Empty PE **or** quiet-fence-off: byte-identical OCC computer
-/// (schedule / execute / access). A lone quiet abort must not flip the
-/// ready-set to wave+refuse (13287210 / 2179522 tax).
+/// **Deprecated name.** v9.3: this is **not** a computer switch.
+/// Cold Spec cost-class (empty PE). Quiet-off alone must **not** retreat
+/// the scheduler to `next_occ_task`.
 #[inline]
 pub(crate) fn specfence_plant_is_occ(mode: ConcurrencyMode, learner: &LiveLearner) -> bool {
-    mode != ConcurrencyMode::SpecFence
-        || !learner.has_any_predicted()
-        || learner.quiet_fence_off()
+    specfence_cost_class_spec(mode, learner)
 }
 
-/// Per-access OCC fast path: empty PE **or** this \(\ell\) has no PE class.
+/// SpecFence cold = Mode(a)=Spec on the **same** spine (zero Fence meta).
+/// Not a flip to the Occ computer.
+#[inline]
+pub(crate) fn specfence_cost_class_spec(mode: ConcurrencyMode, learner: &LiveLearner) -> bool {
+    mode != ConcurrencyMode::SpecFence || !learner.has_any_predicted()
+}
+
+/// Per-access Spec cost class: empty PE **or** this \(\ell\) has no PE class.
 #[inline]
 pub(crate) fn specfence_access_is_occ(
     mode: ConcurrencyMode,
     learner: &LiveLearner,
     location: crate::MemoryLocationHash,
 ) -> bool {
-    specfence_plant_is_occ(mode, learner) || !learner.location_predicted(location)
+    specfence_cost_class_spec(mode, learner) || !learner.location_predicted(location)
 }
 
 /// OCC schedule — zero SpecFence symbols.
@@ -145,7 +150,6 @@ pub(crate) fn validate_occ_kernel(
 
     let cascade_hint = invalid.len().max(1);
     for location in &invalid {
-        specfence.bayes.observe_conflict_location_always(*location);
         specfence.metrics.record_bayes_conflict();
         specfence.hotset.note_abort(*location);
         // True k from AccessOrdinalLog / rem first_k / EdgeKey — never residual 1.
@@ -164,9 +168,13 @@ pub(crate) fn validate_occ_kernel(
                     .min_k_of_location(tx_version.tx_idx, *location)
             })
             .filter(|&k| k > 0);
-        specfence
-            .learner
-            .note_abort_access(*location, cascade_hint, loc_k);
+        crate::specfence::feeder::observe_abort(
+            specfence.learner,
+            specfence.bayes,
+            *location,
+            cascade_hint,
+            loc_k,
+        );
         if let Some(k) = loc_k {
             specfence.sketch.mark_access_class(*location, k);
         }
@@ -174,9 +182,13 @@ pub(crate) fn validate_occ_kernel(
             && w < tx_version.tx_idx
             && !scheduler.is_done(w)
         {
-            specfence.ready_edges.note_raw_producer(*location, w);
-            specfence.ready_edges.note_consumer(tx_version.tx_idx, w);
-            specfence.producer_stages.reserve(w);
+            crate::specfence::admit::admit_seed_on_abort(
+                specfence.ready_edges,
+                specfence.producer_stages,
+                tx_version.tx_idx,
+                w,
+                *location,
+            );
             specfence.sketch.push_spine(*location, w);
         }
     }
@@ -215,6 +227,7 @@ pub(crate) fn validate_specfence(
     specfence: SpecFenceCtx<'_>,
 ) -> Option<Task> {
     let has_cert = specfence.certificates.has_any(tx_version.tx_idx)
+        || specfence.certificates.may_resolve(tx_version.tx_idx)
         || specfence.kernel.may_resolve(tx_version.tx_idx);
     if !has_cert {
         return validate_occ_kernel(mv_memory, scheduler, tx_version, specfence);
@@ -233,39 +246,45 @@ pub(crate) fn validate_specfence(
         let selective: Vec<_> = if covers {
             Vec::new()
         } else {
-            // SoT §4 mixed: R1 on fenced fail; Spec residual stays B0 unless
-            // the rebind makes the whole RS valid.
             invalid
                 .iter()
                 .copied()
                 .filter(|&loc| specfence.certificates.covers(tx_version.tx_idx, loc))
                 .collect()
         };
-        let fenced: &[MemoryLocationHash] = if covers {
-            &invalid
-        } else {
-            &selective
-        };
+        let fenced: &[MemoryLocationHash] = if covers { &invalid } else { &selective };
         if !fenced.is_empty() {
-            // Caller must prove same-output before value-stable rebind
-            // (`try_rebind_*_value_stable` only relaxes multi-origin, it does
-            // not check values — patching without this proof is seq≠par).
             let estimate_cleared = fenced.iter().all(|&loc| {
                 mv_memory
                     .current_data_value(tx_version.tx_idx, loc)
                     .is_some()
             });
+            // M3: snap / FF identity **or** incarnation-strict same-output.
+            // Never rebind on identity_held alone (seq≠par).
+            let identity_held = specfence
+                .partial_retry
+                .identity_held(tx_version.tx_idx, fenced);
             let value_stable = estimate_cleared
-                && fenced
-                    .iter()
-                    .all(|&loc| mv_memory.prior_read_value_stable(tx_version.tx_idx, loc));
+                && fenced.iter().all(|&loc| {
+                    let Some(cur) = mv_memory.current_data_value(tx_version.tx_idx, loc) else {
+                        return false;
+                    };
+                    specfence
+                        .partial_retry
+                        .identity_stable_match(tx_version.tx_idx, loc, &cur)
+                        || mv_memory.prior_read_value_stable(tx_version.tx_idx, loc)
+                });
+            if identity_held {
+                specfence.learner.note_identity_hit();
+            }
             if value_stable
-                && mv_memory.try_rebind_invalid_reads_value_stable(tx_version.tx_idx, &fenced)
+                && mv_memory.try_rebind_invalid_reads_value_stable(tx_version.tx_idx, fenced)
                 && (fenced.len() == invalid.len()
                     || occ_read_set_valid(mv_memory, tx_version.tx_idx))
             {
                 specfence.learner.note_resolve_r1();
                 specfence.metrics.record_rebind_only();
+                specfence.metrics.record_r1_win();
                 specfence.metrics.record_partial_retry();
                 specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
                 specfence
@@ -279,6 +298,7 @@ pub(crate) fn validate_specfence(
                 specfence.learner.note_reexec_cost(0.1);
                 return scheduler.finish_validation(tx_version, false);
             }
+            specfence.metrics.record_r1_attempt();
         }
     }
 
@@ -325,17 +345,18 @@ mod tests {
     }
 
     #[test]
-    fn quiet_lone_pe_keeps_occ_computer() {
+    fn quiet_lone_pe_stays_on_specfence_spine() {
         let live = LiveLearner::new();
         live.begin_block(crate::specfence::learner::MorphWeights::default());
         live.note_abort_access(7, 2, Some(6));
+        assert!(live.has_any_predicted(), "intra abort may arm PE");
         assert!(
-            live.has_any_predicted(),
-            "intra abort may arm PE"
+            !specfence_cost_class_spec(ConcurrencyMode::SpecFence, &live),
+            "v9.3: PE-on must not retreat to an OCC computer"
         );
         assert!(
-            specfence_plant_is_occ(ConcurrencyMode::SpecFence, &live),
-            "quiet_fence_off must not flip the PC ready-set"
+            live.quiet_fence_off(),
+            "quiet morph still holds Fence verbs (2179522)"
         );
     }
 }

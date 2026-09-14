@@ -12,7 +12,7 @@ use dashmap::DashMap;
 
 use crate::{BuildIdentityHasher, MemoryLocationHash, TxIdx};
 
-use super::rem::WaveParkTable;
+use super::wave::WaveParkTable;
 
 const NONE: usize = usize::MAX;
 

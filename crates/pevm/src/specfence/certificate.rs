@@ -57,28 +57,50 @@ impl CertificateTable {
         }
     }
 
-    /// New incarnation. Repair-armed keeps a prefix certificate (no locs).
-    /// Incarnation 0 clears strips. Later incarnations **keep location
-    /// strips** so WaitFor/Bind certs survive Blocking resume (CC → R1).
-    /// They still do **not** cover sibling Spec misses (`covers_all`).
+    /// New incarnation. Repair-armed keeps a prefix certificate.
+    /// **M5:** location strips survive PinHold / same-incarnation resume
+    /// (`incarnation == 0` must **not** wipe). Only [`Self::begin_block`]
+    /// clears. Kept strips still do **not** cover sibling Spec (`covers_all`).
     #[inline]
-    pub(crate) fn begin_execute(
-        &self,
-        tx_idx: TxIdx,
-        repair_armed: bool,
-        incarnation: usize,
-    ) {
+    pub(crate) fn begin_execute(&self, tx_idx: TxIdx, repair_armed: bool, incarnation: usize) {
+        let _ = incarnation;
         if let Some(slot) = self.slots.get(tx_idx) {
             // SAFETY: one executor owns `tx_idx` at a time.
             let st = unsafe { &mut *slot.get() };
             if repair_armed {
-                st.clear(true);
-            } else if incarnation == 0 {
-                st.clear(false);
+                st.repair = true;
             } else {
                 st.repair = false;
             }
         }
+    }
+
+    /// Block start — the only legal strip wipe.
+    #[inline]
+    pub(crate) fn begin_block(&self) {
+        for slot in &self.slots {
+            // SAFETY: begin_block is single-threaded before workers spawn.
+            unsafe { &mut *slot.get() }.clear(false);
+        }
+    }
+
+    /// rem journal / R1 legal iff any strip or repair prefix (merged kernel).
+    #[inline]
+    pub(crate) fn rem_legal(&self, tx_idx: TxIdx) -> bool {
+        self.has_any(tx_idx)
+    }
+
+    #[inline]
+    pub(crate) fn may_resolve(&self, tx_idx: TxIdx) -> bool {
+        self.has_any(tx_idx)
+    }
+
+    #[inline]
+    pub(crate) fn repair_armed(&self, tx_idx: TxIdx) -> bool {
+        let Some(slot) = self.slots.get(tx_idx) else {
+            return false;
+        };
+        unsafe { &*slot.get() }.repair
     }
 
     /// Successful Fence verb on \(\ell\) — the only legal `note_fence` equivalent.
@@ -163,11 +185,16 @@ mod tests {
     }
 
     #[test]
-    fn next_execute_clears_unless_repair() {
+    fn next_execute_keeps_strips_until_begin_block() {
         let t = CertificateTable::new(1);
         t.begin_execute(0, false, 0);
         t.note_success(0, 3);
         t.begin_execute(0, false, 0);
+        assert!(
+            t.has_any(0),
+            "M5: same-incarnation resume must not wipe strips"
+        );
+        t.begin_block();
         assert!(!t.has_any(0));
     }
 

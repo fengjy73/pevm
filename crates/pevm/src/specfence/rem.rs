@@ -2193,6 +2193,8 @@ pub(crate) enum ParkKind {
     /// account-hint WaitHard was converted to SpecRead (BlockingOther cut).
     #[default]
     BlockingOther = 2,
+    /// v9.1 PinWithoutThrow — park the waiter; do **not** steal-convert.
+    PinHold = 3,
 }
 
 /// One WaitHard park entry. Carries SoftWait `(t,k)` for P4 wake resume intent.
@@ -2355,7 +2357,7 @@ impl WaveParkTable {
             ParkKind::EarlyAbort => {
                 self.park_count_early_abort.fetch_add(1, Ordering::Relaxed);
             }
-            ParkKind::BlockingOther => {
+            ParkKind::BlockingOther | ParkKind::PinHold => {
                 self.park_count_blocking_other
                     .fetch_add(1, Ordering::Relaxed);
             }
@@ -2549,7 +2551,7 @@ impl WaveParkTable {
                 ParkKind::EarlyAbort => {
                     self.park_ns_early_abort.fetch_add(ns, Ordering::Relaxed);
                 }
-                ParkKind::BlockingOther => {
+                ParkKind::BlockingOther | ParkKind::PinHold => {
                     self.park_ns_blocking_other.fetch_add(ns, Ordering::Relaxed);
                 }
             }

@@ -8,7 +8,7 @@
 
 use super::producer_stage::ProducerStageTable;
 use super::ready_edge::ReadyEdgeTable;
-use super::rem::WaveParkTable;
+use super::wave::WaveParkTable;
 use crate::Task;
 use crate::scheduler::Scheduler;
 

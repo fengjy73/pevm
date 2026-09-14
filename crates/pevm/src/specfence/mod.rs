@@ -1,12 +1,13 @@
-//! SpecFence **PC ⊗ CC parallel computer** — first-class peers.
+//! SpecFence — pevm's fused PC⊗CC⊗Bayes plant on **one** parallel spine.
 //!
-//! Plant SoT: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md`.
-//! π SoT: `lab/notes/specfence-complete-architecture-v4-frozen-grain.md`.
-//! PC owns Stages / ready-set / steal / ProducerStage / wall.
-//! CC owns Detect / Avoid / Resolve / Mode(a) / Fence / PE / certs / R1.
-//! They **co-design** the same ready-set and Repair plans. Neither is
-//! demoted — CC is not an edge-annotation layer; PC is not a schedule
-//! shell around Mode(a).
+//! SoT: `lab/notes/specfence-complete-architecture-v9.4-file-srp.md` (file SRP);
+//! `v9.3-pevm-unified.md` (one spine; ban dual OCC/SF computers);
+//! `v9.1-cc-pc-bayes.md` (Bayes→admit→decide→Fence→Validate; Soft=0).
+//! Triple = analysis lens, **not** folder kingdoms.
+//!
+//! Call order: Bayes.seed → admit_seed → Execute(if admitted) →
+//! decide←Bayes → Fence(PinWithoutThrow|Refuse; Bind rare) → Validate/R1.
+//! Quiet/cold = Spec cost class on the same spine (not `plant_is_occ` retreat).
 //!
 //! `ConcurrencyMode::OCC` is pristine Block-STM (**zero** SpecFence ticks).
 //! `ConcurrencyMode::SpecFence` owns schedule / execute wrap / validate / rem.
@@ -164,6 +165,7 @@ use hashbrown::HashMap;
 mod access_log;
 mod access_policy;
 mod access_vis;
+pub(crate) mod admit;
 mod bayes;
 mod boundary;
 mod certificate;
@@ -173,6 +175,8 @@ mod decision_field;
 mod edge;
 mod engagement;
 mod executor;
+pub(crate) mod feeder;
+pub(crate) mod fence_act;
 #[allow(missing_docs)]
 mod finegrain;
 mod heat;
@@ -181,7 +185,6 @@ mod kernel;
 mod lane;
 mod learner;
 mod metrics;
-mod mode;
 mod prior;
 mod process;
 mod producer_stage;
@@ -191,10 +194,14 @@ mod rem;
 mod repair;
 mod resolve;
 mod sketch;
+mod wave;
 
 pub(crate) use access_log::AccessOrdinalLog;
-pub(crate) use access_policy::{AccessDecision, AccessVis, decide as decide_access};
+pub(crate) use access_policy::{
+    AccessDecision, AccessVis, decide as decide_access, decide_queried as decide_access_queried,
+};
 pub(crate) use access_vis::compose_unfinished;
+pub(crate) use bayes::BayesAccessQuery;
 pub(crate) use bayes::{BayesMap, DEFAULT_TAU};
 pub use boundary::SpecFenceInspector;
 #[allow(unused_imports)]
@@ -218,13 +225,14 @@ pub(crate) use decision_field::{DecisionFeat, DecisionVerb};
 pub use decision_field::{DecisionFieldSnap, QualityProxies, VerbHist};
 pub(crate) use edge::{
     EdgeAction, EdgeKey, EdgeKind, EdgeState, EdgeTable, EdgeView, EdgeVisibility, access_k_class,
-    choose_edge_action, classify_edge,
+    classify_edge,
 };
 pub(crate) use engagement::{AdaptiveEngagement, profile_timing_enabled, research_inspect_enabled};
 pub(crate) use executor::{
     fence_for_mode, hinted_wait_enabled, next_occ_task, occ_read_set_valid,
-    specfence_access_is_occ, specfence_plant_is_occ, specfence_r1_validate, uses_specfence_resolve,
-    validate_occ_kernel, validate_occ_stage, validate_specfence, wave_for_mode,
+    specfence_access_is_occ, specfence_cost_class_spec, specfence_plant_is_occ,
+    specfence_r1_validate, uses_specfence_resolve, validate_occ_kernel, validate_occ_stage,
+    validate_specfence, wave_for_mode,
 };
 pub use finegrain::{
     AbortEvent, AccountGrainObserve, ConsumerFirstCross, DagStats, EffectClass, EffectLogEntry,
@@ -252,7 +260,6 @@ pub use region::RegionMode;
 pub(crate) use region::RegionTable;
 pub(crate) use rem::PartialRetryTable;
 pub(crate) use rem::RemCounters;
-pub(crate) use rem::WaveParkTable;
 #[allow(unused_imports)]
 pub(crate) use rem::{
     AccessMode, Checkpoint, CheckpointId, CheckpointKind, EffectOrdinal, FfValue, LeanAbortRepair,
@@ -262,13 +269,15 @@ pub(crate) use rem::{
 };
 #[allow(unused_imports)]
 pub(crate) use repair::{RepairGrain, repair_grain};
+use resolve::choose_action;
 #[allow(unused_imports)]
 pub(crate) use resolve::{
     BindTarget, C_RETRY, COST_MARGIN, D_EARLY, D_WAIT, EvScores, SelectiveOutcome, TAU_REVOKE,
     TAU_S, TAU_VERY_HIGH, TAU_W, compute_ev, cost_prefers_wait, early_val_probability,
 };
-pub(crate) use resolve::{PolicyCtx, ResolveAction, choose_action};
+pub(crate) use resolve::{PolicyCtx, ResolveAction};
 pub(crate) use sketch::{HotSketch, ResidualBind};
+pub(crate) use wave::WaveParkTable;
 
 /// Selectable concurrency control for parallel block execution.
 ///
@@ -322,6 +331,14 @@ impl AccountHints {
 
     pub(crate) fn writer_count(&self, address: &Address) -> usize {
         self.by_account.get(address).map(Vec::len).unwrap_or(0)
+    }
+
+    /// Consensus-order hinted txs for an account (admit_seed OrderedAdmit).
+    pub(crate) fn txs(&self, address: &Address) -> &[TxIdx] {
+        self.by_account
+            .get(address)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// Last transaction before `tx_idx` that hinted this account.

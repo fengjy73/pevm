@@ -16,6 +16,18 @@ use super::resolve::{TAU_REVOKE, cost_prefers_wait};
 #[cfg(test)]
 use super::resolve::{TAU_S, TAU_VERY_HIGH, TAU_W};
 
+/// Bayes query port consumed by Mode(a) decide (not a second π).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BayesAccessQuery {
+    pub p_raw: f64,
+    pub p_bind: f64,
+    pub quiet_cold: bool,
+    pub depth_frac: f64,
+    pub ev_pin_beats_abort: bool,
+    pub ev_bind_beats_b0: bool,
+    pub known_star: bool,
+}
+
 /// Prior: mild low-conflict (`α=1`, `β=9` → P≈0.1).
 const PRIOR_ALPHA: f64 = 1.0;
 const PRIOR_BETA: f64 = 9.0;
@@ -169,7 +181,44 @@ impl BayesMap {
         }
     }
 
-    /// Decide Wait vs Speculate for a location (uses τ_w for seed / sticky path).
+    /// Cold cost-class: no location posterior above prior+ε (Spec ≡ OCC meta).
+    #[inline]
+    pub(crate) fn is_cold(&self) -> bool {
+        self.locations.iter().all(|e| e.mean() < DEFAULT_TAU)
+    }
+
+    /// Query port at admit / decide / validate (v9.1). Not a Boolean π.
+    pub(crate) fn query_access(
+        &self,
+        location: MemoryLocationHash,
+        writer_executing: bool,
+        unfinished: usize,
+        published_data: bool,
+    ) -> BayesAccessQuery {
+        let p_raw = self.prior_wait_probability(location);
+        let p_bind = self.bind_useful_probability(location);
+        let depth_frac = if unfinished <= 1 && writer_executing {
+            0.85
+        } else if unfinished > 1 {
+            0.35
+        } else {
+            0.15
+        };
+        let ev_pin = p_raw * depth_frac;
+        let ev_abort = (1.0 - depth_frac) * p_raw;
+        let ev_bind = if published_data { p_bind } else { 0.0 };
+        BayesAccessQuery {
+            p_raw,
+            p_bind,
+            quiet_cold: self.is_cold() && p_raw < DEFAULT_TAU,
+            depth_frac,
+            ev_pin_beats_abort: ev_pin >= ev_abort && writer_executing,
+            ev_bind_beats_b0: ev_bind >= 0.20 && published_data,
+            known_star: p_raw >= DEFAULT_TAU,
+        }
+    }
+
+    /// Boolean π museums — **not** SpecFence decide. Tests / PCC only.
     #[allow(dead_code)]
     pub(crate) fn decide(
         &self,
