@@ -15,6 +15,12 @@
 > crate computer. Seam text that leaves pevm as a thin hybrid switch (`next_occ` vs `next_sf`) is **void**.  
 > Bars + call-flow remain v9.1; spine unity is v9.3.
 
+> **Structure law (v9.4):** folder-layer SoC (`pc/`/`cc/`/`bayes/` as product requirement) is **DEMOTED**.  
+> Authoritative structure correction: `lab/notes/specfence-complete-architecture-v9.4-file-srp.md` — **file single responsibility**;  
+> PC/CC/Bayes = analysis lenses only, not folder-split goal; tree below = **optional packaging** only.  
+> Bars + call-flow remain v9.1; pevm spine unity remains v9.3. **No land now.**
+
+
 **Supersedes only:** v9.1 §§5–6 (delete/merge list + flat module map) and any land-map that keeps a flat 31-file `specfence/` as the plant shape.  
 **Does not supersede:** v9.1 product bars (§1), call-flow spine (§2), WaitFor/Resolve redesign (§4), morph recipes, falsifiers.
 

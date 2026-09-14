@@ -19,6 +19,11 @@
 
 **Does not supersede:** v9.1 product bars (§1), call order Bayes→admit→decide→Fence→Validate/Repair, Soft=0, WaitFor/Resolve redesign (M1–M5), morph recipes, falsifiers. Module **names** still v9.2; they are **owned by the pevm spine**, not a parallel crate computer.
 
+> **Structure law (v9.4):** SoC = **file SRP**, not PC/CC/Bayes ownership dirs.  
+> See `lab/notes/specfence-complete-architecture-v9.4-file-srp.md`. v9.2 folder tree optional.  
+> This note remains AUTHORITATIVE for **one pevm spine** / dual-computer ban. Triple stays fused mechanisms + analysis lens. **No land now.**
+
+
 ```
 v9.1 owns:  BARS + WHAT (Bayes→admit→decide→Fence→Validate) + Soft=0
 v9.2 owns:  LAYER NAMES (pc/ cc/ bayes/ fuse/ research/) + DELETE/MERGE inventory

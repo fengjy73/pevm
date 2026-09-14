@@ -18,6 +18,10 @@
 > morphs, falsifiers — still AUTHORITATIVE here.**  
 > Structure audit: `lab/notes/specfence-v9.1-code-structure-audit.md`.
 
+> **Structure law (v9.4):** file-SRP supersedes v9.2 folder-layer SoC — `lab/notes/specfence-complete-architecture-v9.4-file-srp.md`.  
+> Bars + call-flow here **kept**; spine unity v9.3 **kept**. Triple = lens, not folder goal. **No land now.**
+
+
 
 **π fields KEPT:** Spec=Region; Mode(a) verbs; Soft=**0**; exclude set; Spec=Region meaning.  
 **Honesty now (tip):** nonempty median **0.728**; **14689597 N=3 ≈0.362**; WaitFor↑∧abort≈OCC; R1≈0; star Bind-after-Done dominant. **No celebration.**
