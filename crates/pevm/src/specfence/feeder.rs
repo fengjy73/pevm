@@ -36,7 +36,7 @@ pub(crate) fn seed_known_stars(
     n
 }
 
-/// True when feeder has no PE and Bayes is cold (Spec cost class, same spine).
+/// True when feeder has no PE and Bayes is cold (optimistic_read cost class, same spine).
 #[inline]
 pub(crate) fn feeder_is_cold(learner: &LiveLearner, bayes: &BayesMap) -> bool {
     !learner.has_any_predicted() && bayes.is_cold()

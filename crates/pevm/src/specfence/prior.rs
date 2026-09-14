@@ -1,6 +1,6 @@
-//! Plant v2 M3 — online WŜ / RŜ learning for Bind-before-touch.
+//! Plant v2 M3 — online WŜ / RŜ learning for OrderedAdmit-before-touch.
 //!
-//! Learning ∉ TCB: wrong priors only change π (more SpecRead / Wait / validate
+//! Learning ∉ TCB: wrong priors only change π (more OptimisticRead / Wait / validate
 //! fail / repair). Sequential equivalence still holds via validate.
 //!
 //! Structures:
@@ -17,7 +17,7 @@ use dashmap::DashMap;
 
 use crate::{BuildIdentityHasher, BuildSuffixHasher, MemoryLocationHash};
 
-/// Minimum write observations before a location is treated as a prior Bind hint.
+/// Minimum write observations before a location is treated as a prior OrderedAdmit hint.
 const WRITE_HIT_FLOOR: u32 = 1;
 /// Soft cap so decay stays meaningful.
 const MAX_ENTRIES: usize = 8192;
@@ -52,7 +52,7 @@ impl RwPriorMap {
         }
     }
 
-    /// True when process prior believes ℓ is frequently written (Bind/Wait hint).
+    /// True when process prior believes ℓ is frequently written (OrderedAdmit/Wait hint).
     pub(crate) fn predicts_write(&self, location: MemoryLocationHash) -> bool {
         self.locations
             .get(&location)
@@ -130,7 +130,7 @@ impl RwPriorMap {
     /// Soft decay after each block (Spec v1 process-local prior).
     pub(crate) fn decay_block(&self) {
         for mut entry in self.locations.iter_mut() {
-            // Keep a floor of 1 write once learned so next block still Bind-hints.
+            // Keep a floor of 1 write once learned so next block still OrderedAdmit-hints.
             let w = (entry.writes * DECAY_NUM) / DECAY_DEN;
             entry.writes = if entry.writes > 0 { w.max(1) } else { 0 };
             let c = (entry.co_access * DECAY_NUM) / DECAY_DEN;
@@ -199,7 +199,7 @@ mod tests {
         for _ in 0..80 {
             p.decay_block();
         }
-        // Floor keeps a Bind hint across blocks (confidence may shrink via mass).
+        // Floor keeps a OrderedAdmit hint across blocks (confidence may shrink via mass).
         assert!(p.predicts_write(loc));
     }
 }

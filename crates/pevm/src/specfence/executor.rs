@@ -1,8 +1,8 @@
 //! SpecFence parallel computer — Spec validate / OCC helpers.
 //!
 //! Owns SpecFence **validate** (CC Resolve). Ready/steal lives in `computer.rs` (PC).
-//! Spec-only incarnations use the shared OCC validate kernel (bool walk + B0).
-//! R1 Resolve runs only when a certificate **strip** covers fail locations.
+//! Spec-only incarnations use the shared OCC validate kernel (bool walk + full_abort_reexecute).
+//! partial_abort Resolve runs only when a certificate **strip** covers fail locations.
 //!
 //! Plant SoT: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md`.
 
@@ -52,9 +52,9 @@ pub(crate) fn uses_specfence_resolve(
     mode == ConcurrencyMode::SpecFence && cert.may_resolve(tx_idx)
 }
 
-/// R1 museum only when the strip covers **every** invalid read (v6 §5).
+/// partial_abort museum only when the strip covers **every** invalid read (v6 §5).
 #[inline]
-pub(crate) fn specfence_r1_validate(
+pub(crate) fn specfence_partial_abort_validate(
     mode: ConcurrencyMode,
     cert: &CertificateTable,
     tx_idx: TxIdx,
@@ -62,7 +62,7 @@ pub(crate) fn specfence_r1_validate(
 ) -> bool {
     mode == ConcurrencyMode::SpecFence
         && !invalid.is_empty()
-        && repair_grain(cert, tx_idx, invalid) == RepairGrain::R1
+        && repair_grain(cert, tx_idx, invalid) == RepairGrain::PartialAbort
 }
 
 /// **Deprecated name.** v9.3: this is **not** a computer switch.
@@ -80,7 +80,7 @@ pub(crate) fn specfence_cost_class_spec(mode: ConcurrencyMode, learner: &LiveLea
     mode != ConcurrencyMode::SpecFence || !learner.has_any_predicted()
 }
 
-/// Per-access Spec cost class: empty PE **or** this \(\ell\) has no PE class.
+/// Per-access optimistic_read cost class: empty PE **or** this \(\ell\) has no PE class.
 #[inline]
 pub(crate) fn specfence_access_is_occ(
     mode: ConcurrencyMode,
@@ -96,7 +96,7 @@ pub(crate) fn next_occ_task(scheduler: &Scheduler) -> Option<Task> {
     scheduler.next_task()
 }
 
-/// OCC validate stage: bool walk + B0 estimates. Abort counters only (no rem).
+/// OCC validate stage: bool walk + full_abort_reexecute estimates. Abort counters only (no rem).
 pub(crate) fn validate_occ_stage(
     mv_memory: &MvMemory,
     scheduler: &Scheduler,
@@ -109,13 +109,13 @@ pub(crate) fn validate_occ_stage(
         mv_memory.convert_writes_to_estimates(tx_version.tx_idx);
         if let Some(m) = metrics {
             m.record_occ_abort();
-            m.record_full_restart();
+            m.record_full_abort_reexecute();
         }
     }
     scheduler.finish_validation(tx_version, aborted)
 }
 
-/// Spec-only validate: same OCC kernel. Fail ⇒ B0 + learn PE at **true \(k\)**.
+/// Spec-only validate: same OCC kernel. Fail ⇒ full_abort_reexecute + learn PE at **true \(k\)**.
 /// Never RebindThis / PrefixSkip — journal-less repair is a protocol bug.
 pub(crate) fn validate_occ_kernel(
     mv_memory: &MvMemory,
@@ -134,11 +134,13 @@ pub(crate) fn validate_occ_kernel(
     let write_locations = mv_memory.write_locations(tx_version.tx_idx);
     mv_memory.convert_writes_to_estimates(tx_version.tx_idx);
     specfence.metrics.record_occ_abort();
-    specfence.metrics.record_full_restart();
+    specfence.metrics.record_full_abort_reexecute();
     if !invalid.is_empty() {
         specfence.metrics.record_region_validate_fail(invalid.len());
     }
-    specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
+    specfence
+        .partial_retry
+        .clear_force_ordered_admit(tx_version.tx_idx);
     specfence
         .partial_retry
         .clear_force_writers(tx_version.tx_idx);
@@ -217,9 +219,9 @@ pub(crate) fn validate_occ_kernel(
     )
 }
 
-/// CC Resolve: split RS_spec / RS_fence. Never always-B0 while certs exist.
+/// CC Resolve: split RS_spec / RS_fence. Never always-full_abort_reexecute while certs exist.
 ///
-/// No strip → OCC B0 + PE(true k). `covers_all` → R1a rebind; else B0.
+/// No strip → OCC full_abort_reexecute + PE(true k). `covers_all` → PartialAbortRebind rebind; else full_abort_reexecute.
 pub(crate) fn validate_specfence(
     mv_memory: &MvMemory,
     scheduler: &Scheduler,
@@ -241,7 +243,7 @@ pub(crate) fn validate_specfence(
     let invalid = mv_memory.collect_invalid_reads(tx_version.tx_idx);
     if !invalid.is_empty() {
         let grain = repair_grain(specfence.certificates, tx_version.tx_idx, &invalid);
-        let covers = grain == RepairGrain::R1;
+        let covers = grain == RepairGrain::PartialAbort;
         let selective: Vec<_> = if covers {
             Vec::new()
         } else {
@@ -284,16 +286,18 @@ pub(crate) fn validate_specfence(
             if identity_held {
                 specfence.learner.note_identity_hit();
             }
-            let r1a = value_stable
+            let partial_abort_rebind = value_stable
                 && mv_memory.try_rebind_invalid_reads_value_stable(tx_version.tx_idx, fenced)
                 && (fenced.len() == invalid.len()
                     || occ_read_set_valid(mv_memory, tx_version.tx_idx));
-            if r1a {
-                specfence.learner.note_resolve_r1();
+            if partial_abort_rebind {
+                specfence.learner.note_resolve_partial_abort();
                 specfence.metrics.record_rebind_only();
-                specfence.metrics.record_r1_win();
+                specfence.metrics.record_partial_abort_win();
                 specfence.metrics.record_partial_retry();
-                specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
+                specfence
+                    .partial_retry
+                    .clear_force_ordered_admit(tx_version.tx_idx);
                 specfence
                     .partial_retry
                     .clear_force_writers(tx_version.tx_idx);
@@ -305,8 +309,8 @@ pub(crate) fn validate_specfence(
                 specfence.learner.note_reexec_cost(0.1);
                 return scheduler.finish_validation(tx_version, false);
             }
-            // R1b: **strip**-covered fail → RewindTo. repair_armed covers_all
-            // must not skip sibling Spec (Iter26 seq≠par). Soft=0.
+            // PartialAbortRewind: **strip**-covered fail → RewindTo. repair_armed covers_all
+            // must not skip sibling optimistic_read (Iter26 seq≠par). Soft=0.
             let strip_covers = specfence
                 .certificates
                 .covers_strips_all(tx_version.tx_idx, &invalid);
@@ -317,13 +321,13 @@ pub(crate) fn validate_specfence(
                     suffix_writes,
                     reexec_cost,
                     ..
-                }) = specfence.partial_retry.try_arm_r1b_covered(
+                }) = specfence.partial_retry.try_arm_partial_abort_rewind(
                     tx_version.tx_idx,
                     &read_locations,
                     &invalid,
                     &write_locations,
                 ) {
-                    specfence.metrics.record_r1_attempt();
+                    specfence.metrics.record_partial_abort_attempt();
                     if scheduler.try_validation_abort(tx_version) {
                         let estimated =
                             mv_memory.invalidate_partial_suffix(tx_version.tx_idx, &suffix_writes);
@@ -332,8 +336,8 @@ pub(crate) fn validate_specfence(
                                 .metrics
                                 .record_selective_invalidate(estimated.len());
                         }
-                        specfence.learner.note_resolve_r1();
-                        specfence.metrics.record_r1_win();
+                        specfence.learner.note_resolve_partial_abort();
+                        specfence.metrics.record_partial_abort_win();
                         specfence.metrics.record_rewind_to_cp();
                         specfence.metrics.record_partial_retry();
                         specfence.learner.note_reexec_cost(reexec_cost);
@@ -348,9 +352,9 @@ pub(crate) fn validate_specfence(
                         );
                     }
                 }
-                // Strips cover but R1b cannot arm (empty prefix / already
-                // rewound once): honest OCC B0. Never-B0 ForceBind livelocked
-                // 19807137. Do not increment r1_attempt (that was the theater).
+                // Strips cover but PartialAbortRewind cannot arm (empty prefix / already
+                // rewound once): honest OCC full_abort_reexecute. Never-full_abort_reexecute ForceOrderedAdmit livelocked
+                // 19807137. Do not increment partial_abort_attempt (that was the theater).
             }
         }
     }
@@ -376,20 +380,20 @@ mod tests {
         assert!(uses_specfence_resolve(ConcurrencyMode::SpecFence, &k, 0));
         let cert = CertificateTable::new(1);
         cert.begin_execute(0, false, 0);
-        assert!(!specfence_r1_validate(
+        assert!(!specfence_partial_abort_validate(
             ConcurrencyMode::SpecFence,
             &cert,
             0,
             &[7]
         ));
         cert.note_success(0, 7);
-        assert!(specfence_r1_validate(
+        assert!(specfence_partial_abort_validate(
             ConcurrencyMode::SpecFence,
             &cert,
             0,
             &[7]
         ));
-        assert!(!specfence_r1_validate(
+        assert!(!specfence_partial_abort_validate(
             ConcurrencyMode::SpecFence,
             &cert,
             0,
@@ -408,7 +412,7 @@ mod tests {
             "v9.3: PE-on must not retreat to an OCC computer"
         );
         assert!(
-            live.quiet_fence_off(),
+            live.quiet_pessimistic_off(),
             "quiet morph still holds Fence verbs (2179522)"
         );
     }

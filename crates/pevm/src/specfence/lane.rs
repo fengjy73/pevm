@@ -4,7 +4,7 @@
 //!
 //! Token is held by the earliest unfinished producer (or admitted head).
 //! Consumers are blocked in the ready-set or park via WaitFor — they must
-//! **not** `occ_unfenced` while the holder is live. CC lane tokens co-own
+//! **not** `occ_optimistic_read` while the holder is live. CC lane tokens co-own
 //! PC ready membership.
 
 use std::sync::atomic::{AtomicUsize, Ordering};

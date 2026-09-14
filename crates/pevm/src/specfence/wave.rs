@@ -29,13 +29,13 @@ thread_local! {
 ///
 /// Hang-free subset (P4): never live-park the Interpreter. Either arm existing
 /// RewindTo/FF when a real checkpoint exists before armed `k`, or fall back to
-/// tx-grain FullRetry (head reexec) — same as M2.
+/// tx-grain FullAbortReexecute (head reexec) — same as M2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ParkResumeKind {
     /// Checkpoint `checkpoint_k` with `0 < checkpoint_k < armed_at_k` — arm RewindTo+FF.
     ResumeAtK { checkpoint_k: usize },
     /// No safe mid-tx continuation — reexec from tx head.
-    FullRetry,
+    FullAbortReexecute,
 }
 
 /// Intent restored on SoftWait wake: resume waiter at SoftWait `armed_at_k` if safe.
@@ -50,16 +50,16 @@ pub(crate) struct ParkResumeIntent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub(crate) enum ParkKind {
-    /// FenceGraph SoftWait Soft arm (π WaitHard / Bind→Await).
+    /// FenceGraph SoftWait Soft arm (π WaitHard / OrderedAdmit→Await).
     SoftWaitSoft = 0,
     /// P3 EarlyAbort Blocking (no SoftWait arm).
     EarlyAbort = 1,
     /// ESTIMATE / aborted-incarnation / nonce Blocking (no SoftWait arm). Cold
-    /// account-hint WaitHard was converted to SpecRead (BlockingOther cut).
+    /// account-hint WaitHard was converted to OptimisticRead (BlockingOther cut).
     #[default]
     BlockingOther = 2,
-    /// v9.1 PinWithoutThrow — park the waiter; do **not** steal-convert.
-    PinHold = 3,
+    /// v9.1 wait_for_dependency — park the waiter; do **not** steal-convert.
+    WaitForDependency = 3,
 }
 
 /// One WaitHard park entry. Carries SoftWait `(t,k)` for P4 wake resume intent.
@@ -87,9 +87,9 @@ pub(crate) struct PendingPark {
 /// M2/P4 wave ready-queue + WaitHard park table.
 ///
 /// **Grain (honest):** PEVM tasks are still whole-tx. `ParkKind::BlockingOther`
-/// is Block-STM `Aborting` + `add_dependency` (incarnation++). `ParkKind::PinHold`
-/// is PinWithoutThrow: `add_pin_hold` keeps `Executing` and wakes Ready at the
-/// **same** incarnation (no FullRetry throw). P4 stores SoftWait `armed_at_k`
+/// is Block-STM `Aborting` + `add_dependency` (incarnation++). `ParkKind::WaitForDependency`
+/// is wait_for_dependency: `add_wait_for_dependency` keeps `Executing` and wakes Ready at the
+/// **same** incarnation (no FullAbortReexecute throw). P4 stores SoftWait `armed_at_k`
 /// for RewindTo/FF when a checkpoint exists. Mid-effect live Interpreter park
 /// is **not** implemented (M1k/M1l hang lessons).
 #[derive(Debug, Default)]
@@ -120,8 +120,8 @@ pub(crate) struct WaveParkTable {
     wave_width_samples: AtomicUsize,
     /// P4: wakes that armed RewindTo at checkpoint before SoftWait `k`.
     park_resume_at_k: AtomicUsize,
-    /// P4: wakes that fell back to tx-grain FullRetry.
-    park_resume_full_retry: AtomicUsize,
+    /// P4: wakes that fell back to tx-grain FullAbortReexecute.
+    park_resume_full_abort_reexecute: AtomicUsize,
 }
 
 impl WaveParkTable {
@@ -150,7 +150,7 @@ impl WaveParkTable {
         self.set_pending_park(location, armed_at_k, ParkKind::SoftWaitSoft);
     }
 
-    /// Backward-compatible: pending park with `k=0` (tx-grain FullRetry on wake).
+    /// Backward-compatible: pending park with `k=0` (tx-grain FullAbortReexecute on wake).
     pub(crate) fn set_pending_park_location(&self, location: MemoryLocationHash) {
         self.set_pending_park(location, 0, ParkKind::BlockingOther);
     }
@@ -222,7 +222,7 @@ impl WaveParkTable {
             ParkKind::EarlyAbort => {
                 self.park_count_early_abort.fetch_add(1, Ordering::Relaxed);
             }
-            ParkKind::BlockingOther | ParkKind::PinHold => {
+            ParkKind::BlockingOther | ParkKind::WaitForDependency => {
                 self.park_count_blocking_other
                     .fetch_add(1, Ordering::Relaxed);
             }
@@ -270,16 +270,18 @@ impl WaveParkTable {
         self.park_resume_at_k.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn note_park_resume_full_retry(&self) {
-        self.park_resume_full_retry.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn note_park_resume_full_abort_reexecute(&self) {
+        self.park_resume_full_abort_reexecute
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn park_resume_at_k(&self) -> usize {
         self.park_resume_at_k.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn park_resume_full_retry(&self) -> usize {
-        self.park_resume_full_retry.load(Ordering::Relaxed)
+    pub(crate) fn park_resume_full_abort_reexecute(&self) -> usize {
+        self.park_resume_full_abort_reexecute
+            .load(Ordering::Relaxed)
     }
 
     /// Push a ready continuation; priority = lower TxIdx first.
@@ -416,7 +418,7 @@ impl WaveParkTable {
                 ParkKind::EarlyAbort => {
                     self.park_ns_early_abort.fetch_add(ns, Ordering::Relaxed);
                 }
-                ParkKind::BlockingOther | ParkKind::PinHold => {
+                ParkKind::BlockingOther | ParkKind::WaitForDependency => {
                     self.park_ns_blocking_other.fetch_add(ns, Ordering::Relaxed);
                 }
             }
@@ -522,9 +524,9 @@ mod tests {
     }
 
     #[test]
-    fn pinhold_does_not_use_softwait_counter() {
+    fn wait_for_dependency_does_not_use_softwait_counter() {
         let wave = WaveParkTable::new();
-        wave.park_with_kind(4, 1, 7, 0, ParkKind::PinHold);
+        wave.park_with_kind(4, 1, 7, 0, ParkKind::WaitForDependency);
         assert_eq!(wave.park_count_softwait(), 0);
         assert_eq!(wave.park_count_blocking_other(), 1);
     }

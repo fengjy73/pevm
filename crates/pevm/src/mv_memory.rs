@@ -47,7 +47,7 @@ pub struct MvMemory {
     readers: DashMap<MemoryLocationHash, BTreeSet<TxIdx>, BuildIdentityHasher>,
     /// Aborted incarnation numbers: reading Data with this (tx,inc) is invalid.
     aborted_incarnations: DashMap<TxIdx, TxIncarnation, BuildIdentityHasher>,
-    /// Prior incarnation write-set (Bohm-lite residual) for Bind/WaitHard placeholders.
+    /// Prior incarnation write-set (Bohm-lite residual) for OrderedAdmit/WaitHard placeholders.
     residual_write_sets: DashMap<TxIdx, Vec<MemoryLocationHash>, BuildIdentityHasher>,
 }
 

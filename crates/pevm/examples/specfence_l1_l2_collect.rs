@@ -59,7 +59,7 @@ struct L2EdgeExport {
     warm: bool,
     call_depth: Option<u16>,
     producer_status: Option<String>,
-    ready_for_bind: Option<bool>,
+    ready_for_ordered_admit: Option<bool>,
     producer_ready: Option<String>,
     producer_mv: Option<String>,
 }
@@ -100,7 +100,7 @@ struct L2Export {
     n_program: usize,
     n_handler: usize,
     producer_status_hist: StdHashMap<String, usize>,
-    ready_for_bind_frac: f64,
+    ready_for_ordered_admit_frac: f64,
     warm_frac: f64,
     edges_sample: Vec<L2EdgeExport>,
     abort_events_sample: Vec<pevm::AbortEvent>,
@@ -210,7 +210,7 @@ fn export_l2(timing: ModeRun, snap: &FineGrainSnapshot) -> L2Export {
     let n_program = edges.iter().filter(|e| e.class == "program").count();
     let n_handler = n_raw.saturating_sub(n_program);
     let mut hist: StdHashMap<String, usize> = StdHashMap::new();
-    let mut n_bind = 0usize;
+    let mut n_ordered_admit = 0usize;
     let mut n_warm = 0usize;
     for e in &edges {
         if let Some(s) = &e.producer_status {
@@ -219,8 +219,8 @@ fn export_l2(timing: ModeRun, snap: &FineGrainSnapshot) -> L2Export {
             let s = pevm::producer_status_canonical(r, m).to_string();
             *hist.entry(s).or_default() += 1;
         }
-        if e.ready_for_bind.unwrap_or(false) {
-            n_bind += 1;
+        if e.ready_for_ordered_admit.unwrap_or(false) {
+            n_ordered_admit += 1;
         }
         if e.warm {
             n_warm += 1;
@@ -241,7 +241,7 @@ fn export_l2(timing: ModeRun, snap: &FineGrainSnapshot) -> L2Export {
             warm: e.warm,
             call_depth: e.call_depth,
             producer_status: e.producer_status.clone(),
-            ready_for_bind: e.ready_for_bind,
+            ready_for_ordered_admit: e.ready_for_ordered_admit,
             producer_ready: e.producer_ready.clone(),
             producer_mv: e.producer_mv.clone(),
         })
@@ -252,10 +252,10 @@ fn export_l2(timing: ModeRun, snap: &FineGrainSnapshot) -> L2Export {
         n_program,
         n_handler,
         producer_status_hist: hist,
-        ready_for_bind_frac: if n_raw == 0 {
+        ready_for_ordered_admit_frac: if n_raw == 0 {
             0.0
         } else {
-            n_bind as f64 / n_raw as f64
+            n_ordered_admit as f64 / n_raw as f64
         },
         warm_frac: if n_raw == 0 {
             0.0
@@ -368,7 +368,7 @@ fn main() {
             "l1_log": export.l1.as_ref().map(|l| l.effect_log_len),
             "l2_occ1_raw": export.l2_occ1.as_ref().map(|l| l.n_raw),
             "l2_occ8_raw": export.l2_occ8.as_ref().map(|l| l.n_raw),
-            "l2_occ8_bind_frac": export.l2_occ8.as_ref().map(|l| l.ready_for_bind_frac),
+            "l2_occ8_ordered_admit_frac": export.l2_occ8.as_ref().map(|l| l.ready_for_ordered_admit_frac),
             "method": MeasurementMethod::frozen(),
         }));
     }

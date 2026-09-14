@@ -18,6 +18,7 @@ specfence/
     results/              JSON/CSV from a sweep (generated)
     figures/              TPS scalability + abort-rate plots (generated)
     notes/                run logs
+    notes/specfence-cc-glossary.md   AUTHORITATIVE CC vocabulary (live plant language)
 ```
 
 ## Run a mainnet sweep

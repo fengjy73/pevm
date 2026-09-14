@@ -84,7 +84,7 @@ impl AccessOrdinalLog {
         unsafe { &*slot.get() }.first.get(&location).copied()
     }
 
-    /// First-touches with \(k < before_k\) — PinHold rem prefix (completed reads).
+    /// First-touches with \(k < before_k\) — WaitForDependency rem prefix (completed reads).
     #[inline]
     pub(crate) fn prefix_before(
         &self,
@@ -94,7 +94,7 @@ impl AccessOrdinalLog {
         let Some(slot) = self.slots.get(tx_idx) else {
             return Vec::new();
         };
-        // SAFETY: waiter still owns this incarnation (PinHold, not yet reset).
+        // SAFETY: waiter still owns this incarnation (WaitForDependency, not yet reset).
         let st = unsafe { &*slot.get() };
         st.first
             .iter()

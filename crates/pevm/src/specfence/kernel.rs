@@ -7,11 +7,11 @@
 //!
 //! `Mode(a)` is computed by [`crate::specfence::decide_access`]. This table
 //! only records **Repair / rem certificates**:
-//! - Fence event (Bind / WaitFor / serial-lane) this incarnation
+//! - Fence event (OrderedAdmit / WaitFor / serial-lane) this incarnation
 //! - Repair-armed (rewind / FF-head prefix)
 //!
-//! Rem journal and R1 Resolve are legal iff a certificate exists.
-//! Spec-only incarnations stay OCC-cost (bool validate + B0).
+//! Rem journal and partial_abort Resolve are legal iff a certificate exists.
+//! Spec-only incarnations stay OCC-cost (bool validate + full_abort_reexecute).
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -50,7 +50,7 @@ impl KernelTable {
         }
     }
 
-    /// Certificate: this incarnation Fenced **this** access (Bind / WaitFor / lane).
+    /// Certificate: this incarnation Fenced **this** access (OrderedAdmit / WaitFor / lane).
     /// Not a tx-kernel upgrade.
     #[inline]
     pub(crate) fn note_fence(&self, tx_idx: TxIdx) {
@@ -79,7 +79,7 @@ impl KernelTable {
         self.had_fence(tx_idx) || self.repair_armed(tx_idx)
     }
 
-    /// R1a/R1b legal. Spec-only miss must not enter Resolve.
+    /// PartialAbortRebind/PartialAbortRewind legal. Spec-only miss must not enter Resolve.
     #[inline]
     pub(crate) fn may_resolve(&self, tx_idx: TxIdx) -> bool {
         self.rem_legal(tx_idx)

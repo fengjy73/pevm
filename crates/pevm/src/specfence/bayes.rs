@@ -2,7 +2,7 @@
 //!
 //! Control unit is a memory location (`MemoryLocationHash`), with optional
 //! address-level posteriors for cold-start when the slot is unknown pre-exec.
-//! Spec v1: P_conflict + P_bind_useful; revoke sticky Wait when P < τ_revoke.
+//! Spec v1: P_conflict + P_ordered_admit_useful; revoke sticky Wait when P < τ_revoke.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -23,11 +23,11 @@ use super::resolve::{TAU_S, TAU_VERY_HIGH, TAU_W};
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BayesAccessQuery {
     pub p_raw: f64,
-    pub p_bind: f64,
+    pub p_ordered_admit: f64,
     pub quiet_cold: bool,
     pub depth_frac: f64,
-    pub ev_pin_beats_abort: bool,
-    pub ev_bind_beats_b0: bool,
+    pub ev_wait_for_dependency_beats_abort: bool,
+    pub ev_ordered_admit_beats_full_abort: bool,
     pub known_star: bool,
 }
 
@@ -87,13 +87,13 @@ impl BetaPosterior {
 pub(crate) struct BayesMap {
     locations: DashMap<MemoryLocationHash, BetaPosterior, BuildIdentityHasher>,
     accounts: DashMap<Address, BetaPosterior, BuildSuffixHasher>,
-    /// Bind usefulness posterior per location (residual write-set hit rate).
-    bind_useful: DashMap<MemoryLocationHash, BetaPosterior, BuildIdentityHasher>,
+    /// OrderedAdmit usefulness posterior per location (residual write-set hit rate).
+    ordered_admit_useful: DashMap<MemoryLocationHash, BetaPosterior, BuildIdentityHasher>,
     wave_id: AtomicUsize,
     /// Sum of conflict posteriors at Wait decisions (for mean metric).
     wait_posterior_sum_bits: AtomicU64,
     wait_posterior_count: AtomicUsize,
-    /// Sum of conflict posteriors at SpecRead cost decisions.
+    /// Sum of conflict posteriors at OptimisticRead cost decisions.
     spec_posterior_sum_bits: AtomicU64,
     spec_posterior_count: AtomicUsize,
     success_seen: DashSet<MemoryLocationHash, BuildIdentityHasher>,
@@ -105,7 +105,7 @@ impl BayesMap {
         Self {
             locations: DashMap::default(),
             accounts: DashMap::default(),
-            bind_useful: DashMap::default(),
+            ordered_admit_useful: DashMap::default(),
             wave_id: AtomicUsize::new(0),
             wait_posterior_sum_bits: AtomicU64::new(0),
             wait_posterior_count: AtomicUsize::new(0),
@@ -147,8 +147,8 @@ impl BayesMap {
             .unwrap_or_else(BetaPosterior::prior)
     }
 
-    fn bind_posterior(&self, location: MemoryLocationHash) -> BetaPosterior {
-        self.bind_useful
+    fn ordered_admit_posterior(&self, location: MemoryLocationHash) -> BetaPosterior {
+        self.ordered_admit_useful
             .get(&location)
             .map(|e| *e)
             .unwrap_or_else(BetaPosterior::prior)
@@ -164,9 +164,9 @@ impl BayesMap {
         self.account_posterior(address).mean()
     }
 
-    /// P(bind useful) for residual write-set / Bohm-lite.
-    pub(crate) fn bind_useful_probability(&self, location: MemoryLocationHash) -> f64 {
-        self.bind_posterior(location).mean()
+    /// P(ordered_admit useful) for residual write-set / Bohm-lite.
+    pub(crate) fn ordered_admit_useful_probability(&self, location: MemoryLocationHash) -> f64 {
+        self.ordered_admit_posterior(location).mean()
     }
 
     /// Conflict posterior with address cold-start fallback.
@@ -199,7 +199,7 @@ impl BayesMap {
         published_data: bool,
     ) -> BayesAccessQuery {
         let p_raw = self.prior_wait_probability(location);
-        let p_bind = self.bind_useful_probability(location);
+        let p_ordered_admit = self.ordered_admit_useful_probability(location);
         let depth_frac = if unfinished <= 1 && writer_executing {
             0.85
         } else if unfinished > 1 {
@@ -207,16 +207,17 @@ impl BayesMap {
         } else {
             0.15
         };
-        let ev_pin = p_raw * depth_frac;
+        let ev_wait_for_dependency = p_raw * depth_frac;
         let ev_abort = (1.0 - depth_frac) * p_raw;
-        let ev_bind = if published_data { p_bind } else { 0.0 };
+        let ev_ordered_admit = if published_data { p_ordered_admit } else { 0.0 };
         BayesAccessQuery {
             p_raw,
-            p_bind,
+            p_ordered_admit,
             quiet_cold: self.is_cold() && p_raw < DEFAULT_TAU,
             depth_frac,
-            ev_pin_beats_abort: ev_pin >= ev_abort && writer_executing,
-            ev_bind_beats_b0: ev_bind >= 0.20 && published_data,
+            ev_wait_for_dependency_beats_abort: ev_wait_for_dependency >= ev_abort
+                && writer_executing,
+            ev_ordered_admit_beats_full_abort: ev_ordered_admit >= 0.20 && published_data,
             known_star: p_raw >= DEFAULT_TAU,
         }
     }
@@ -231,7 +232,7 @@ impl BayesMap {
     ) -> BayesAccessQuery {
         let mut q = self.query_access(location, writer_executing, if covers { 0 } else { 2 }, true);
         if covers {
-            q.ev_bind_beats_b0 = true;
+            q.ev_ordered_admit_beats_full_abort = true;
             q.depth_frac = q.depth_frac.max(0.55);
         }
         q
@@ -301,7 +302,7 @@ impl BayesMap {
         if chose_wait {
             self.record_wait_posterior(p);
         } else {
-            self.record_spec_posterior(p);
+            self.record_optimistic_posterior(p);
         }
     }
 
@@ -328,7 +329,7 @@ impl BayesMap {
         if count == 0 { 0.0 } else { sum / count as f64 }
     }
 
-    fn record_spec_posterior(&self, p: f64) {
+    fn record_optimistic_posterior(&self, p: f64) {
         let mut cur = self.spec_posterior_sum_bits.load(Ordering::Relaxed);
         loop {
             let next = (f64::from_bits(cur) + p).to_bits();
@@ -403,8 +404,8 @@ impl BayesMap {
         self.evict_locations_if_needed();
     }
 
-    pub(crate) fn observe_bind_hit(&self, location: MemoryLocationHash) {
-        self.bind_useful
+    pub(crate) fn observe_ordered_admit_hit(&self, location: MemoryLocationHash) {
+        self.ordered_admit_useful
             .entry(location)
             .and_modify(|p| p.observe_ok())
             .or_insert_with(|| {
@@ -414,8 +415,8 @@ impl BayesMap {
             });
     }
 
-    pub(crate) fn observe_bind_miss(&self, location: MemoryLocationHash) {
-        self.bind_useful
+    pub(crate) fn observe_ordered_admit_miss(&self, location: MemoryLocationHash) {
+        self.ordered_admit_useful
             .entry(location)
             .and_modify(|p| p.observe_conflict())
             .or_insert_with(|| {
@@ -468,7 +469,7 @@ impl BayesMap {
         for mut entry in self.accounts.iter_mut() {
             entry.decay();
         }
-        for mut entry in self.bind_useful.iter_mut() {
+        for mut entry in self.ordered_admit_useful.iter_mut() {
             entry.decay();
         }
         self.success_seen.clear();
@@ -500,7 +501,7 @@ impl BayesMap {
     pub(crate) fn reset(&self) {
         self.locations.clear();
         self.accounts.clear();
-        self.bind_useful.clear();
+        self.ordered_admit_useful.clear();
         self.success_seen.clear();
         self.conflict_seen.clear();
         self.wave_id.store(0, Ordering::Relaxed);
@@ -551,12 +552,12 @@ mod tests {
         for _ in 0..5 {
             bayes.observe_conflict_location_always(loc);
         }
-        // α=6, β=9 → P=6/15=0.40: moderate — SpecRead if writer not done;
+        // α=6, β=9 → P=6/15=0.40: moderate — OptimisticRead if writer not done;
         // WaitHard if writer done (cost_wait=0).
         assert!(!bayes.should_revoke(loc, None));
         assert!(
             !bayes.should_wait_hard(loc, None, true, false),
-            "moderate P + writer running → SpecRead; p={}",
+            "moderate P + writer running → OptimisticRead; p={}",
             bayes.prior_wait_probability(loc)
         );
         assert!(

@@ -1,9 +1,9 @@
-//! SpecFence Mode(a) — CC Avoid decide (WaitFor/lane primary; Bind rare).
+//! SpecFence Mode(a) — CC Avoid decide (WaitFor/lane primary; OrderedAdmit rare).
 //!
 //! Authoritative plant: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md`.
 //! π: `lab/notes/specfence-complete-architecture-v4-frozen-grain.md`.
 //!
-//! Unfenced ⇒ caller **must** invoke the shared OCC read helper. This module
+//! OptimisticRead ⇒ caller **must** invoke the shared OCC read helper. This module
 //! never touches rem journal / FF. CC is a first-class control plane — not
 //! an edge-annotation layer.
 
@@ -22,9 +22,9 @@ pub(crate) struct AccessVis {
     pub in_serial_lane: bool,
     pub hot: bool,
     pub ws_hat: bool,
-    /// Stale PE may Unfence when independence is certified (FM9 consume).
+    /// Stale PE may optimistic_read when independence is certified (FM9 consume).
     pub independence_certified: bool,
-    /// Bind-rare: MV tip identity == predicted RAW producer for this \(\ell\).
+    /// OrderedAdmit-rare: MV tip identity == predicted RAW producer for this \(\ell\).
     pub tip_is_conflict_producer: bool,
 }
 
@@ -32,12 +32,12 @@ pub(crate) struct AccessVis {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AccessDecision {
     /// Compile to OCC `storage`/`basic` (no SpecFence body).
-    UnfencedOcc { predicted: bool, roi_skip: bool },
-    /// Fence: Bind published Data for this \(a\).
-    Bind,
-    /// Fence: WaitFor a **single** executing writer.
+    OptimisticReadOcc { predicted: bool, roi_skip: bool },
+    /// Pessimistic admit: OrderedAdmit published Data for this \(a\).
+    OrderedAdmit,
+    /// Pessimistic admit: WaitFor a **single** executing writer.
     WaitFor { writer: TxIdx },
-    /// Fence: serial-lane / ordered-admit on multi-writer PE class.
+    /// Pessimistic admit: serial-lane / ordered admit on multi-writer PE class.
     SerialLane { writer: TxIdx },
 }
 
@@ -66,94 +66,98 @@ pub(crate) fn decide_queried(
     bayes: Option<BayesAccessQuery>,
 ) -> AccessDecision {
     if !learner.has_any_predicted() {
-        return AccessDecision::UnfencedOcc {
+        return AccessDecision::OptimisticReadOcc {
             predicted: false,
             roi_skip: false,
         };
     }
     let predicted = learner.predicted_essential(location, access_k);
     if !predicted {
-        return AccessDecision::UnfencedOcc {
+        return AccessDecision::OptimisticReadOcc {
             predicted: false,
             roi_skip: false,
         };
     }
     let Some(vis) = vis else {
-        // Prior PE with empty visibility stays Spec (quiet Bind-tax protection).
-        return AccessDecision::UnfencedOcc {
+        // Prior PE with empty visibility stays Spec (quiet OrderedAdmit-tax protection).
+        return AccessDecision::OptimisticReadOcc {
             predicted: true,
             roi_skip: true,
         };
     };
 
-    // FM9: independence Unfences a stale prior PE (not a Wait OR-door).
+    // FM9: independence takes optimistic_read on a stale prior PE (not a Wait OR-door).
     if vis.independence_certified
         && vis.unfinished == 0
         && !learner.predicted_essential_intra(location, access_k)
     {
-        return AccessDecision::UnfencedOcc {
+        return AccessDecision::OptimisticReadOcc {
             predicted: true,
             roi_skip: true,
         };
     }
 
-    // SoT §3.2 — WaitFor/lane primary; Bind only conflict-tip ∧ EV.
+    // SoT §3.2 — WaitFor/lane primary; OrderedAdmit only conflict-tip ∧ EV.
     // HotSet / WŜ are posterior / ready-edge priors, not SerialLane OR-doors.
     let intra = learner.predicted_essential_intra(location, access_k);
     let fan = learner.morph_weights().dominant_fan_out();
-    let quiet_off = learner.quiet_fence_off();
+    let quiet_off = learner.quiet_pessimistic_off();
     // Known-star Bayes posterior opens WaitFor even on quiet morph (M4).
-    // Lone intra abort on quiet stays Unfenced (2179522).
+    // Lone intra abort on quiet stays OptimisticRead (2179522).
     let known_star = bayes.is_some_and(|q| q.known_star && !q.quiet_cold);
     // OR-bool adapter only when no Bayes query (tests / empty ports).
-    // Live π is ev_pin_beats_abort / depth_frac — not ev_win as decide spine.
+    // Live π is ev_wait_for_dependency_beats_abort / depth_frac — not ev_win as decide spine.
     let ev_adapter = !quiet_off && (intra || (fan && learner.prior_pe_fire_wins(vis)));
-    let ev_pin = if let Some(q) = bayes {
+    let ev_wait_for_dependency = if let Some(q) = bayes {
         if quiet_off && !known_star {
             false
         } else {
-            q.ev_pin_beats_abort || q.depth_frac >= 0.50 || known_star
+            q.ev_wait_for_dependency_beats_abort || q.depth_frac >= 0.50 || known_star
         }
     } else {
         known_star || ev_adapter
     };
-    // Bind rare: tip==conflict ∧ Bind EV only. `known_star` opens WaitFor,
-    // never Bind (fan 14689597 Bind 472 vs Wait 47 was this OR).
-    let bind_ev = if let Some(q) = bayes {
-        crate::specfence::fence_act::bind_ev_from_query(q.ev_bind_beats_b0, quiet_off, known_star)
+    // OrderedAdmit rare: tip==conflict ∧ OrderedAdmit EV only. `known_star` opens WaitFor,
+    // never OrderedAdmit (fan 14689597 OrderedAdmit 472 vs Wait 47 was this OR).
+    let ordered_admit_ev = if let Some(q) = bayes {
+        crate::specfence::fence_act::ordered_admit_ev_from_query(
+            q.ev_ordered_admit_beats_full_abort,
+            quiet_off,
+            known_star,
+        )
     } else {
         ev_adapter
     };
     // WaitFor pins one *executing* producer. AbortingThrow last: low
-    // depth_frac ∧ ¬ev_pin_beats_abort (already folded into ev_pin).
+    // depth_frac ∧ ¬ev_wait_for_dependency_beats_abort (already folded into ev_wait_for_dependency).
     if vis.unfinished == 1
         && vis.writer_executing
         && let Some(w) = vis.writer
-        && ev_pin
+        && ev_wait_for_dependency
     {
         return AccessDecision::WaitFor { writer: w };
     }
-    // SerialLane: multi-writer PE class. Never Bind while unfinished>0
+    // SerialLane: multi-writer PE class. Never OrderedAdmit while unfinished>0
     // (later writers not yet in MV — stale last_data theater).
     if vis.unfinished > 1 || (vis.in_serial_lane && vis.unfinished > 0) {
-        if ev_pin
+        if ev_wait_for_dependency
             && vis.writer_executing
             && let Some(w) = vis.writer
         {
             return AccessDecision::SerialLane { writer: w };
         }
     }
-    // Bind RARE: published tip must be the predicted RAW producer, EV win,
-    // and Bind must not be a tax (Bind↑ ∧ abort not↓).
+    // OrderedAdmit RARE: published tip must be the predicted RAW producer, EV win,
+    // and OrderedAdmit must not be a tax (OrderedAdmit↑ ∧ abort not↓).
     if vis.unfinished == 0
         && vis.published_data
         && vis.tip_is_conflict_producer
-        && bind_ev
-        && !learner.bind_tax_losing()
+        && ordered_admit_ev
+        && !learner.ordered_admit_tax_losing()
     {
-        return AccessDecision::Bind;
+        return AccessDecision::OrderedAdmit;
     }
-    AccessDecision::UnfencedOcc {
+    AccessDecision::OptimisticReadOcc {
         predicted: true,
         roi_skip: true,
     }
@@ -232,12 +236,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_pe_is_unfenced_occ() {
+    fn empty_pe_is_optimistic_read_occ() {
         let live = LiveLearner::new();
         live.begin_block(MorphWeights::default());
         assert_eq!(
             decide(&live, 7, 6, None),
-            AccessDecision::UnfencedOcc {
+            AccessDecision::OptimisticReadOcc {
                 predicted: false,
                 roi_skip: false
             }
@@ -250,7 +254,7 @@ mod tests {
         live.seed_predicted_essential(7, 6);
         assert_eq!(
             decide(&live, 7, 6, None),
-            AccessDecision::UnfencedOcc {
+            AccessDecision::OptimisticReadOcc {
                 predicted: true,
                 roi_skip: true
             }
@@ -258,23 +262,23 @@ mod tests {
     }
 
     #[test]
-    fn prior_pe_plus_data_and_unfinished0_is_bind() {
+    fn prior_pe_plus_data_and_unfinished0_is_ordered_admit() {
         let live = fan_out_learner();
         live.seed_predicted_essential(7, 6);
         assert_eq!(
             decide(&live, 7, 6, Some(&data_vis())),
-            AccessDecision::Bind,
-            "v8: Data ∧ unfinished=0 ∧ tip==conflict producer ∧ EV → Bind"
+            AccessDecision::OrderedAdmit,
+            "v8: Data ∧ unfinished=0 ∧ tip==conflict producer ∧ EV → OrderedAdmit"
         );
         let mut mere_data = data_vis();
         mere_data.tip_is_conflict_producer = false;
         assert_eq!(
             decide(&live, 7, 6, Some(&mere_data)),
-            AccessDecision::UnfencedOcc {
+            AccessDecision::OptimisticReadOcc {
                 predicted: true,
                 roi_skip: true
             },
-            "v8: Bind-on-any-Data is tax — tip must be the RAW producer"
+            "v8: OrderedAdmit-on-any-Data is tax — tip must be the RAW producer"
         );
     }
 
@@ -299,13 +303,13 @@ mod tests {
         assert_eq!(
             decide(&live, 7, 6, Some(&data_plus_multi())),
             AccessDecision::SerialLane { writer: 0 },
-            "published Data must not Bind-theater a multi-writer PE class"
+            "published Data must not OrderedAdmit-theater a multi-writer PE class"
         );
         let mut ready_multi = data_plus_multi();
         ready_multi.writer_executing = false;
         assert_eq!(
             decide(&live, 7, 6, Some(&ready_multi)),
-            AccessDecision::UnfencedOcc {
+            AccessDecision::OptimisticReadOcc {
                 predicted: true,
                 roi_skip: true
             },
@@ -323,7 +327,7 @@ mod tests {
         );
         assert_eq!(
             decide(&live, 7, 12, None),
-            AccessDecision::UnfencedOcc {
+            AccessDecision::OptimisticReadOcc {
                 predicted: false,
                 roi_skip: false
             }
@@ -331,22 +335,22 @@ mod tests {
     }
 
     #[test]
-    fn quiet_intra_pe_waitfor_executing_but_does_not_bind() {
-        // 2179522: one abort must not Bind-tax the quiet cohort.
-        // quiet_fence_off also holds WaitFor until heat lifts.
+    fn quiet_intra_pe_waitfor_executing_but_does_not_ordered_admit() {
+        // 2179522: one abort must not OrderedAdmit-tax the quiet cohort.
+        // quiet_pessimistic_off also holds WaitFor until heat lifts.
         let live = LiveLearner::new();
         live.begin_block(MorphWeights::default());
         live.note_abort_access(7, 2, Some(6));
         assert_eq!(
             decide(&live, 7, 6, Some(&exec_vis(1))),
-            AccessDecision::UnfencedOcc {
+            AccessDecision::OptimisticReadOcc {
                 predicted: true,
                 roi_skip: true
             }
         );
         assert_eq!(
             decide(&live, 7, 6, Some(&data_vis())),
-            AccessDecision::UnfencedOcc {
+            AccessDecision::OptimisticReadOcc {
                 predicted: true,
                 roi_skip: true
             }
@@ -374,7 +378,7 @@ mod tests {
         live.seed_predicted_essential(7, 6);
         assert_eq!(
             decide(&live, 7, 6, Some(&exec_vis(2))),
-            AccessDecision::UnfencedOcc {
+            AccessDecision::OptimisticReadOcc {
                 predicted: true,
                 roi_skip: true
             },
@@ -382,25 +386,25 @@ mod tests {
         );
         assert_eq!(
             decide(&live, 7, 6, Some(&data_vis())),
-            AccessDecision::UnfencedOcc {
+            AccessDecision::OptimisticReadOcc {
                 predicted: true,
                 roi_skip: true
             },
-            "T3: quiet prior-PE Bind-on-Data is Fence tax"
+            "T3: quiet prior-PE OrderedAdmit-on-Data is Fence tax"
         );
     }
 
     #[test]
-    fn bind_tax_trips_only_when_aborts_match_binds() {
+    fn ordered_admit_tax_trips_only_when_aborts_match_binds() {
         let live = fan_out_learner();
         live.seed_predicted_essential(7, 6);
         for _ in 0..16 {
-            live.note_bind_success(7);
+            live.note_ordered_admit_success(7);
         }
         live.note_abort_access(7, 2, Some(6));
         assert_eq!(
             decide(&live, 7, 6, Some(&data_vis())),
-            AccessDecision::Bind,
+            AccessDecision::OrderedAdmit,
             "loose abort>0 trip lost 14689597 (965 aborts); residual abort alone is not enough"
         );
         for _ in 0..16 {
@@ -408,11 +412,11 @@ mod tests {
         }
         assert_eq!(
             decide(&live, 7, 6, Some(&data_vis())),
-            AccessDecision::UnfencedOcc {
+            AccessDecision::OptimisticReadOcc {
                 predicted: true,
                 roi_skip: true
             },
-            "aborts >= binds still trips Bind"
+            "aborts >= binds still trips OrderedAdmit"
         );
     }
 
@@ -422,84 +426,84 @@ mod tests {
         live.seed_predicted_essential(7, 6);
         let q = crate::specfence::BayesAccessQuery {
             p_raw: 0.4,
-            p_bind: 0.1,
+            p_ordered_admit: 0.1,
             quiet_cold: false,
             depth_frac: 0.15,
-            ev_pin_beats_abort: false,
-            ev_bind_beats_b0: false,
+            ev_wait_for_dependency_beats_abort: false,
+            ev_ordered_admit_beats_full_abort: false,
             known_star: false,
         };
         assert_eq!(
             decide_queried(&live, 7, 6, Some(&exec_vis(2)), Some(q)),
-            AccessDecision::UnfencedOcc {
+            AccessDecision::OptimisticReadOcc {
                 predicted: true,
                 roi_skip: true
             },
-            "decide←Bayes: low depth_frac ∧ ¬ev_pin_beats_abort → AbortingThrow last"
+            "decide←Bayes: low depth_frac ∧ ¬ev_wait_for_dependency_beats_abort → AbortingThrow last"
         );
     }
 
     #[test]
-    fn bayes_pin_ev_opens_waitfor() {
+    fn bayes_wait_for_dependency_ev_opens_waitfor() {
         let live = fan_out_learner();
         live.seed_predicted_essential(7, 6);
         let q = crate::specfence::BayesAccessQuery {
             p_raw: 0.5,
-            p_bind: 0.1,
+            p_ordered_admit: 0.1,
             quiet_cold: false,
             depth_frac: 0.85,
-            ev_pin_beats_abort: true,
-            ev_bind_beats_b0: false,
+            ev_wait_for_dependency_beats_abort: true,
+            ev_ordered_admit_beats_full_abort: false,
             known_star: false,
         };
         assert_eq!(
             decide_queried(&live, 7, 6, Some(&exec_vis(2)), Some(q)),
             AccessDecision::WaitFor { writer: 2 },
-            "decide←Bayes: ev_pin_beats_abort shapes WaitFor"
+            "decide←Bayes: ev_wait_for_dependency_beats_abort shapes WaitFor"
         );
     }
 
     #[test]
-    fn known_star_is_not_bind_ev() {
-        // Star + Bind EV off + published conflict tip → Unfenced, never Bind.
+    fn known_star_is_not_ordered_admit_ev() {
+        // Star + OrderedAdmit EV off + published conflict tip → OptimisticRead, never OrderedAdmit.
         let live = fan_out_learner();
         live.seed_predicted_essential(7, 6);
         let q = crate::specfence::BayesAccessQuery {
             p_raw: 0.5,
-            p_bind: 0.1,
+            p_ordered_admit: 0.1,
             quiet_cold: false,
             depth_frac: 0.10,
-            ev_pin_beats_abort: false,
-            ev_bind_beats_b0: false,
+            ev_wait_for_dependency_beats_abort: false,
+            ev_ordered_admit_beats_full_abort: false,
             known_star: true,
         };
         assert_eq!(
             decide_queried(&live, 7, 6, Some(&data_vis()), Some(q)),
-            AccessDecision::UnfencedOcc {
+            AccessDecision::OptimisticReadOcc {
                 predicted: true,
                 roi_skip: true
             },
-            "Bind rare: known_star is WaitFor/pin, not Bind EV"
+            "OrderedAdmit rare: known_star is WaitFor/wait_for_dependency, not OrderedAdmit EV"
         );
     }
 
     #[test]
-    fn bind_ev_opens_bind_on_conflict_tip() {
+    fn ordered_admit_ev_opens_ordered_admit_on_conflict_tip() {
         let live = fan_out_learner();
         live.seed_predicted_essential(7, 6);
         let q = crate::specfence::BayesAccessQuery {
             p_raw: 0.4,
-            p_bind: 0.4,
+            p_ordered_admit: 0.4,
             quiet_cold: false,
             depth_frac: 0.15,
-            ev_pin_beats_abort: false,
-            ev_bind_beats_b0: true,
+            ev_wait_for_dependency_beats_abort: false,
+            ev_ordered_admit_beats_full_abort: true,
             known_star: false,
         };
         assert_eq!(
             decide_queried(&live, 7, 6, Some(&data_vis()), Some(q)),
-            AccessDecision::Bind,
-            "Bind rare: tip==conflict ∧ ev_bind_beats_b0"
+            AccessDecision::OrderedAdmit,
+            "OrderedAdmit rare: tip==conflict ∧ ev_ordered_admit_beats_full_abort"
         );
     }
 
@@ -510,11 +514,11 @@ mod tests {
         live.seed_predicted_essential(7, 6);
         let q = crate::specfence::BayesAccessQuery {
             p_raw: 0.4,
-            p_bind: 0.2,
+            p_ordered_admit: 0.2,
             quiet_cold: false,
             depth_frac: 0.85,
-            ev_pin_beats_abort: true,
-            ev_bind_beats_b0: true,
+            ev_wait_for_dependency_beats_abort: true,
+            ev_ordered_admit_beats_full_abort: true,
             known_star: true,
         };
         assert_eq!(
@@ -534,7 +538,7 @@ mod tests {
         vis.ws_hat = false;
         assert_eq!(
             decide(&live, 7, 6, Some(&vis)),
-            AccessDecision::UnfencedOcc {
+            AccessDecision::OptimisticReadOcc {
                 predicted: true,
                 roi_skip: true
             }

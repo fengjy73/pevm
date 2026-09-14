@@ -1,9 +1,9 @@
 //! Hollow PCC/legacy `RegionMode` bits — **not** SpecFence π.
 //!
-//! Spec = Region = `EdgeKey` (ℓ + k + depth + typed edge).
+//! Region = `EdgeKey` (ℓ + k + depth + typed edge).
 //! `RegionMode::Speculate|Wait` is a PCC mirror only. Avoid-path π is
-//! `choose_edge_action` (Bind / WaitFor / Unfenced). Do not treat these bits
-//! as Spec=speculate.
+//! `choose_edge_action` (OrderedAdmit / WaitFor / OptimisticRead). Do not treat these bits
+//! as Mode Spec.
 
 use alloy_primitives::Address;
 use dashmap::DashMap;
@@ -13,9 +13,9 @@ use crate::{BuildIdentityHasher, BuildSuffixHasher, MemoryLocationHash};
 /// Hollow PCC/legacy bit. Not the SpecFence Avoid protocol face.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegionMode {
-    /// PCC/legacy “no Wait bit”. Not Spec. Spec = Region.
+    /// PCC/legacy “no Wait bit”. Not Mode Spec. Region is the control unit.
     Speculate,
-    /// PCC sticky Wait mirror. Avoid-path Fence is WaitFor/Bind, not this bit.
+    /// PCC sticky Wait mirror. Avoid-path pessimistic admit is WaitFor/OrderedAdmit, not this bit.
     Wait,
 }
 

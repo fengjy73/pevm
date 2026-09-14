@@ -1,17 +1,19 @@
-//! Fine-grain serial + OCC runtime analysis for SpecFence lab blocks.
+//! Scoring harness: ALL nonempty ethereum blocks — DAG upper bound + OCC@1/@8 Soft=0.
 //!
-//! Produces:
-//! - `lab/results/mainnet-serial-occ-finegrain.json` (all blocks summary + deep dives)
-//! - `lab/results/mainnet-serial-occ-finegrain.csv` (summary rows)
-//! - per-block deep JSON for 19807137, 15199017, 19434587
+//! Forces the parallel OCC path for gas_used < 4M by bumping header.gas_used (measurement only;
+//! no plant protocol change). Writes:
+//!   lab/results/all-blocks-parallel-upper-bound-finegrain.json
+//!   lab/results/all-blocks-parallel-upper-bound-finegrain.csv
 //!
 //! Usage:
 //! ```
-//! cargo run -p pevm --release --config 'profile.release.lto=false' --example specfence_finegrain_analysis -- \
-//!   --out lab/results/mainnet-serial-occ-finegrain.json
+//! cargo run -p pevm --release --config 'profile.release.lto=false' --example specfence_all_blocks_upper_bound -- \
+//!   --out lab/results/all-blocks-parallel-upper-bound-finegrain.json
 //! ```
+//!
+//! Optional: `--blocks 14689597,2179522` to subset.
 
-#![allow(missing_docs)]
+#![allow(missing_docs, dead_code)]
 
 use std::{
     fs::{self, File},
@@ -326,9 +328,14 @@ fn run_occ(
     pevm.reset_heat();
     pevm.set_finegrain_trace(true);
     let cores_nz = NonZeroUsize::new(cores.max(1)).unwrap();
-    // Analysis blocks are >> 4M gas so execute() takes the parallel path.
+    // Scoring: bump header.gas_used past the 4M sequential fallback so finegrain OCC runs
+    // on low-gas quiet blocks too (measurement-only; plant unchanged).
+    let mut block = loaded.block.clone();
+    if block.header.gas_used < 4_000_000 {
+        block.header.gas_used = 4_000_000;
+    }
     let t0 = Instant::now();
-    let result = pevm.execute(chain, &loaded.storage, &loaded.block, cores_nz, false);
+    let result = pevm.execute(chain, &loaded.storage, &block, cores_nz, false);
     let elapsed = t0.elapsed().as_secs_f64();
     let elapsed_ms = elapsed * 1000.0;
     let tps = if elapsed > 0.0 {
@@ -502,9 +509,34 @@ fn write_csv(path: &Path, rows: &[BlockSummary]) {
     }
 }
 
+fn discover_nonempty_blocks(data_dir: &Path) -> Vec<u64> {
+    let blocks_dir = data_dir.join("blocks");
+    let mut out = Vec::new();
+    let Ok(rd) = fs::read_dir(&blocks_dir) else {
+        return out;
+    };
+    for ent in rd.flatten() {
+        let name = ent.file_name();
+        let Some(s) = name.to_str() else { continue };
+        let Ok(bn) = s.parse::<u64>() else { continue };
+        let block_path = ent.path().join("block.json");
+        let Ok(f) = File::open(&block_path) else { continue };
+        let Ok(block) = serde_json::from_reader::<_, Block<<PevmEthereum as PevmChain>::Transaction>>(
+            BufReader::new(f),
+        ) else {
+            continue;
+        };
+        if n_tx(&block) > 0 {
+            out.push(bn);
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
 fn main() {
-    let mut out = repo_root().join("lab/results/mainnet-serial-occ-finegrain.json");
-    let mut blocks: Vec<u64> = DEFAULT_BLOCKS.to_vec();
+    let mut out = repo_root().join("lab/results/all-blocks-parallel-upper-bound-finegrain.json");
+    let mut blocks: Option<Vec<u64>> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -518,7 +550,7 @@ fn main() {
             }
             "--blocks" => {
                 if let Some(raw) = args.next() {
-                    blocks = parse_csv_u64(&raw);
+                    blocks = Some(parse_csv_u64(&raw));
                 }
             }
             other => eprintln!("unknown arg {other}"),
@@ -529,17 +561,24 @@ fn main() {
     let chain = PevmEthereum::mainnet();
     let (bytecodes, block_hashes) = load_shared(&data_dir);
 
+    let blocks = blocks.unwrap_or_else(|| discover_nonempty_blocks(&data_dir));
+    eprintln!("all-blocks upper-bound harness: {} nonempty candidates", blocks.len());
+
     let mut summaries = Vec::new();
-    let mut deep_dives = Vec::new();
 
     for &bn in &blocks {
         let Some(loaded) = load_block(&data_dir, bn, bytecodes.clone(), block_hashes.clone())
         else {
             continue;
         };
+        let n = n_tx(&loaded.block);
+        if n == 0 {
+            eprintln!("=== block {bn} EMPTY skip ===");
+            continue;
+        }
         eprintln!(
             "=== block {bn} n_tx={} gas={} ===",
-            n_tx(&loaded.block),
+            n,
             loaded.block.header.gas_used
         );
 
@@ -554,13 +593,11 @@ fn main() {
         for &cores in OCC_CORES {
             let (timing, snap) = run_occ(&chain, &loaded, cores);
             eprintln!(
-                "  occ@{cores}: {:.2}ms TPS={:.0} aborts={} abort_rate={:.3} evm_entries={} reexec_frac={:.3} max_inc={} ok={}",
+                "  occ@{cores}: {:.2}ms TPS={:.0} aborts={} abort_rate={:.3} max_inc={} ok={}",
                 timing.elapsed_ms,
                 timing.tps,
                 timing.occ_aborts,
                 timing.abort_rate,
-                timing.evm_entries,
-                timing.reexec_entry_frac,
                 timing.max_incarnation,
                 timing.ok
             );
@@ -571,70 +608,51 @@ fn main() {
         }
 
         let Some(snap) = best_snap else {
-            eprintln!("  WARN: no finegrain snapshot (sequential fallback?)");
+            eprintln!("  WARN: no finegrain snapshot even after gas bump");
             continue;
         };
 
         let summary = summarize_from_snap(&loaded, serial, occ_timings, &snap);
         eprintln!(
-            "  DAG(effective): longest={} indep_frac={:.3} max_wave={} multi_w={} max_comp={} | raw_lazy_longest={} kinds={:?}",
+            "  DAG(effective): L={} W={} RAW={} WAW={} indep_frac={:.3} multi_w={}",
             summary.dag.longest_chain,
-            summary.dag.independent_frac,
             summary.dag.max_wave_width,
+            summary.dag.n_raw,
+            summary.dag.n_waw,
+            summary.dag.independent_frac,
             summary.dag.multi_writer_locs,
-            summary.dag.max_conflict_component,
-            summary.dag_with_lazy.longest_chain,
-            summary.kind_hist
         );
-
-        if DEEP_BLOCKS.contains(&bn) {
-            let per_tx: Vec<PerTxRow> = snap
-                .txs
-                .iter()
-                .map(|t| PerTxRow {
-                    tx_idx: t.tx_idx,
-                    incarnation: t.incarnation,
-                    n_reads: t.n_reads,
-                    n_writes: t.n_writes,
-                })
-                .collect();
-            let abort_sample: Vec<_> = snap.abort_events.iter().take(200).cloned().collect();
-            let chains = multi_writer_chains(&snap, 20);
-            let deep = DeepDive {
-                block: bn,
-                summary: summary.clone(),
-                per_tx,
-                abort_events_sample: abort_sample,
-                multi_writer_chains_top20: chains,
-            };
-            let deep_path = out.with_file_name(format!("mainnet-serial-occ-finegrain-b{bn}.json"));
-            fs::create_dir_all(deep_path.parent().unwrap()).ok();
-            let mut f = File::create(&deep_path).expect("deep json");
-            serde_json::to_writer_pretty(&mut f, &deep).unwrap();
-            eprintln!("  wrote {}", deep_path.display());
-            deep_dives.push(bn);
-        }
-
         summaries.push(summary);
     }
 
     #[derive(Serialize)]
     struct OutFile {
         generated: String,
+        tip: String,
+        soft: u64,
+        n_requested: usize,
+        n_measured: usize,
         blocks: Vec<BlockSummary>,
-        deep_dive_blocks: Vec<u64>,
         notes: String,
     }
     let out_obj = OutFile {
-        generated: "2026-09-06 Asia/Shanghai".into(),
+        generated: "2026-09-15 Asia/Shanghai".into(),
+        tip: "2cbd339".into(),
+        soft: 0,
+        n_requested: blocks.len(),
+        n_measured: summaries.len(),
         blocks: summaries.clone(),
-        deep_dive_blocks: deep_dives,
-        notes: "Final OCC RW sets ≈ true G* (beneficiary excluded from DAG). v7_* fields cite mainnet-sweep-v7-status.md.".into(),
+        notes: "Final OCC RW sets ≈ true G* (beneficiary/basic_lazy excluded). Soft=0 OCC; gas bump for <4M parallel path only.".into(),
     };
     fs::create_dir_all(out.parent().unwrap()).ok();
     let mut f = File::create(&out).expect("out json");
     serde_json::to_writer_pretty(&mut f, &out_obj).unwrap();
     let csv = out.with_extension("csv");
     write_csv(&csv, &summaries);
-    eprintln!("wrote {} and {}", out.display(), csv.display());
+    eprintln!(
+        "wrote {} ({} blocks) and {}",
+        out.display(),
+        summaries.len(),
+        csv.display()
+    );
 }

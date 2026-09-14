@@ -1,6 +1,8 @@
-//! Repair grain — R1 at first failed Fenced \(a\); Spec-only fail → B0.
+//! Repair grain — partial_abort at first failed pessimistic-admit \(a\);
+//! optimistic-read-only fail → full_abort_reexecute.
 //!
 //! Plant SoT: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md` §4.
+//! Vocabulary: `lab/notes/specfence-cc-glossary.md`.
 
 use crate::MemoryLocationHash;
 use crate::TxIdx;
@@ -10,15 +12,15 @@ use super::certificate::CertificateTable;
 /// Validate fail grain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RepairGrain {
-    /// All fail locations are on the Fenced-prefix strip → R1a/R1b.
-    R1,
-    /// Fenced RAW subset may R1; Spec residual stays B0 unless rebind heals RS.
-    R1Selective,
-    /// Spec-only fail → OCC B0 + PE(true k).
-    B0,
+    /// All fail locations are on the admitted-prefix strip → PartialAbortRebind/PartialAbortRewind.
+    PartialAbort,
+    /// Admitted RAW subset may partial_abort; optimistic residual stays full abort unless rebind heals RS.
+    PartialAbortSelective,
+    /// Optimistic-read-only fail → OCC full_abort_reexecute + PE(true k).
+    FullAbortReexecute,
 }
 
-/// Selective grain: R1 if strip covers every invalid; R1Selective if any fenced.
+/// Selective grain: PartialAbort if strip covers every invalid; PartialAbortSelective if any admitted.
 #[inline]
 pub(crate) fn repair_grain(
     cert: &CertificateTable,
@@ -26,11 +28,11 @@ pub(crate) fn repair_grain(
     invalid: &[MemoryLocationHash],
 ) -> RepairGrain {
     if invalid.is_empty() || cert.covers_all(tx_idx, invalid) {
-        RepairGrain::R1
+        RepairGrain::PartialAbort
     } else if invalid.iter().any(|&l| cert.covers(tx_idx, l)) {
-        RepairGrain::R1Selective
+        RepairGrain::PartialAbortSelective
     } else {
-        RepairGrain::B0
+        RepairGrain::FullAbortReexecute
     }
 }
 
@@ -39,22 +41,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn spec_only_fail_is_b0() {
+    fn optimistic_only_fail_is_full_abort_reexecute() {
         let c = CertificateTable::new(1);
         c.begin_execute(0, false, 0);
-        assert_eq!(repair_grain(&c, 0, &[7]), RepairGrain::B0);
+        assert_eq!(repair_grain(&c, 0, &[7]), RepairGrain::FullAbortReexecute);
     }
 
     #[test]
-    fn fenced_fail_is_r1() {
+    fn admitted_fail_is_partial_abort() {
         let c = CertificateTable::new(1);
         c.begin_execute(0, false, 0);
         c.note_success(0, 7);
-        assert_eq!(repair_grain(&c, 0, &[7]), RepairGrain::R1);
+        assert_eq!(repair_grain(&c, 0, &[7]), RepairGrain::PartialAbort);
         assert_eq!(
             repair_grain(&c, 0, &[7, 8]),
-            RepairGrain::R1Selective,
-            "mixed: fenced RAW prefix is R1-selective, not sticky-all"
+            RepairGrain::PartialAbortSelective,
+            "mixed: admitted RAW prefix is partial-abort-selective, not sticky-all"
         );
     }
 }

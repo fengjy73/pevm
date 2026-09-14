@@ -1,6 +1,6 @@
 //! Deeper effect-RAW instrumentation pass (lab opt-in).
 //!
-//! Extends journal stream with: account-grain structured observes + Wait/Bind EV
+//! Extends journal stream with: account-grain structured observes + Wait/OrderedAdmit EV
 //! proxies, producer readiness at discovery, OCC@8 vs OCC@1 discovery timing,
 //! WAW-only multi-writer spurious HotLocal Wait proxy. Does **not** implement
 //! choose_action / HotSet replacement. Writes:
@@ -111,7 +111,7 @@ struct EffectRawStats {
     account_grain_balance: usize,
     account_grain_ext: usize,
     account_grain_would_wait: usize,
-    account_grain_would_bind: usize,
+    account_grain_would_ordered_admit: usize,
     slot_and_account_both: usize,
     account_grain_would_wait_frac: f64,
     /// Producer readiness histogram on location RAW edges (validated/executed/data/estimate/running/...).
@@ -545,7 +545,7 @@ fn effect_stats(snap: &FineGrainSnapshot) -> EffectRawStats {
         account_grain_balance: d.account_grain_balance,
         account_grain_ext: d.account_grain_ext,
         account_grain_would_wait: d.account_grain_would_wait,
-        account_grain_would_bind: d.account_grain_would_bind,
+        account_grain_would_ordered_admit: d.account_grain_would_ordered_admit,
         slot_and_account_both: d.slot_and_account_both,
         account_grain_would_wait_frac,
         producer_ready_hist,
@@ -626,7 +626,7 @@ fn run_occ_deep(
 
 fn gap_note(bn: u64, stats: &EffectRawStats) -> String {
     format!(
-        "block {bn}: location_RAW={} (prog={} hand={}); acct_grain={} (sload={} bal={} ext={}) would_wait={} ({:.3}) would_bind={}; producer_ready_done_frac={:.3} waitish_frac={:.3}; gw_p50={:.4}; waw_only_mw={} / multi_writer={} spurious_hotlocal={:.3}; aborts={} abort_w_disc={}. Plant-observed only; v3 control law frozen (design).",
+        "block {bn}: location_RAW={} (prog={} hand={}); acct_grain={} (sload={} bal={} ext={}) would_wait={} ({:.3}) would_ordered_admit={}; producer_ready_done_frac={:.3} waitish_frac={:.3}; gw_p50={:.4}; waw_only_mw={} / multi_writer={} spurious_hotlocal={:.3}; aborts={} abort_w_disc={}. Plant-observed only; v3 control law frozen (design).",
         stats.n_raw_effect_total,
         stats.n_raw_effect_program,
         stats.n_raw_effect_handler,
@@ -636,7 +636,7 @@ fn gap_note(bn: u64, stats: &EffectRawStats) -> String {
         stats.account_grain_ext,
         stats.account_grain_would_wait,
         stats.account_grain_would_wait_frac,
-        stats.account_grain_would_bind,
+        stats.account_grain_would_ordered_admit,
         stats.first_cross_ready_data_or_done_frac,
         stats.first_cross_ready_running_or_estimate_frac,
         stats.gross_work_depth_p50,
@@ -699,12 +699,12 @@ fn main() {
         let effect = effect_stats(&snap);
         let effect_occ8 = snap8.as_ref().map(effect_stats);
         eprintln!(
-            "  RAW={} acct_grain={} would_wait={}/{:.2} would_bind={} edge_ready_done={:.2} waitish={:.2} gw_p50={:.3} waw_pairs={}/{} (no_raw_frac={:.2}) mw_no_readers={} aborts={}",
+            "  RAW={} acct_grain={} would_wait={}/{:.2} would_ordered_admit={} edge_ready_done={:.2} waitish={:.2} gw_p50={:.3} waw_pairs={}/{} (no_raw_frac={:.2}) mw_no_readers={} aborts={}",
             effect.n_raw_effect_total,
             effect.sload_account_grain_cross,
             effect.account_grain_would_wait,
             effect.account_grain_would_wait_frac,
-            effect.account_grain_would_bind,
+            effect.account_grain_would_ordered_admit,
             effect.edge_ready_done_frac,
             effect.edge_ready_waitish_frac,
             effect.gross_work_depth_p50,
@@ -800,7 +800,7 @@ fn main() {
     let payload = Out {
         generated: chrono_lite_now(),
         method_notes: vec![
-            "Deeper pass: account-grain structured observes + Wait/Bind EV proxies; producer readiness at discovery; OCC@8 vs OCC@1 timing; WAW-only HotLocal proxy.".into(),
+            "Deeper pass: account-grain structured observes + Wait/OrderedAdmit EV proxies; producer readiness at discovery; OCC@8 vs OCC@1 timing; WAW-only HotLocal proxy.".into(),
             "OCC@1 preferred for clean G* effect stream; OCC@8 for abort×discovery timing.".into(),
             "Primary RAW remains location last-writer; account-grain is diag only (not a control-law target).".into(),
             "producer_ready ∈ {validated,executed,data,estimate,running,aborting,unknown} sampled live via MvMemory+Scheduler attach.".into(),
@@ -822,7 +822,7 @@ fn main() {
     let mut csv = File::create(&csv_path).expect("csv");
     writeln!(
         csv,
-        "seg,block,n_tx,occ1_tps,occ8_tps,occ8_abort,n_raw_effect,n_prog,n_hand,n_final_rw,unique_pcl,mean_eff_per_pcl,gw_p50,opcode_p50,acct_grain,acct_sload,acct_would_wait,acct_would_bind,acct_wait_frac,ready_done_frac,waitish_frac,waw_only_mw,multi_writer,spurious_hl_frac,occ8_gw_p50,occ8_ready_done,occ8_waitish,occ8_aborts,occ8_abort_w_disc,occ8_mean_gw_abort,fanout"
+        "seg,block,n_tx,occ1_tps,occ8_tps,occ8_abort,n_raw_effect,n_prog,n_hand,n_final_rw,unique_pcl,mean_eff_per_pcl,gw_p50,opcode_p50,acct_grain,acct_sload,acct_would_wait,acct_would_ordered_admit,acct_wait_frac,ready_done_frac,waitish_frac,waw_only_mw,multi_writer,spurious_hl_frac,occ8_gw_p50,occ8_ready_done,occ8_waitish,occ8_aborts,occ8_abort_w_disc,occ8_mean_gw_abort,fanout"
     )
     .unwrap();
     for s in &summaries {
@@ -848,7 +848,7 @@ fn main() {
             e.sload_account_grain_cross,
             e.account_grain_sload,
             e.account_grain_would_wait,
-            e.account_grain_would_bind,
+            e.account_grain_would_ordered_admit,
             e.account_grain_would_wait_frac,
             e.first_cross_ready_data_or_done_frac,
             e.first_cross_ready_running_or_estimate_frac,

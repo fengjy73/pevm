@@ -3,7 +3,7 @@
 //! Plant SoT: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md` §3.1.
 //!
 //! FORBIDDEN: pushing `last_writer_before` into `unfinished` when `is_done`.
-//! `Data ∧ unfinished=0 → Bind` is reachable only with this filter.
+//! `Data ∧ unfinished=0 → OrderedAdmit` is reachable only with this filter.
 
 use crate::TxIdx;
 
@@ -43,7 +43,7 @@ mod tests {
     fn done_mv_tip_is_not_unfinished() {
         let (writer, n) = compose_unfinished(Vec::new(), Some(1), None, None, 4, |w| w == 1);
         assert_eq!(writer, Some(1));
-        assert_eq!(n, 0, "S2: done last_writer must not starve Bind");
+        assert_eq!(n, 0, "S2: done last_writer must not starve OrderedAdmit");
     }
 
     #[test]

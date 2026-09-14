@@ -1,18 +1,18 @@
-//! Adaptive EV Controller (AEC) π: Bind / WaitHard / SpecRead / EarlyAbort.
+//! Adaptive EV Controller (AEC) π: OrderedAdmit / WaitHard / OptimisticRead / EarlyAbort.
 //!
 //! Sole decision = argmin EV over FenceGraph actions (makespan-relevant):
 //! ```text
-//! EV_Bind  = 0 if Data ready (published version) else +∞
+//! EV_OrderedAdmit  = 0 if Data ready (published version) else +∞
 //! EV_Wait  = E_wait_time(ℓ)*(1+α*fanout) + δ*max(0,E_idle−prior)/(1+fanout)
 //! EV_Spec  = P_abort(ℓ,x) * (W_remain(d) + β * E_cascade + γ * E_reexec)
 //! EV_Early = W_prefix(d) + E_reexec   # only if d known & heavy features
 //! pick argmin; ties → Await(WaitHard) if producer Running/unfinished,
-//! else SpecRead (discovery — not SpecFence identity)
+//! else OptimisticRead (discovery — not SpecFence identity)
 //! ```
 //! V5-P2 θ: measured wake latency → E_wait_time; cascade → E_cascade;
-//! idle-steal → E_idle_steal; lean ForceBind/FullRestart → E_reexec.
+//! idle-steal → E_idle_steal; lean ForceOrderedAdmit/FullAbortReexecute → E_reexec.
 //! Meta tax: ρ hard Spec + tiny-gap Spec bias (no SoftWait storm).
-//! Bind is aggressive when Data is published / WŜ predicts a ready version —
+//! OrderedAdmit is aggressive when Data is published / WŜ predicts a ready version —
 //! still EV (not Boolean Wait ladders).
 //!
 //! Features (never Boolean Wait gates): HotSet, H_w/H_a, morph, live fanout, d,
@@ -33,11 +33,11 @@ pub(crate) enum ResolveAction {
     /// Block until last writer `< t` has non-ESTIMATE Data (or aborted).
     WaitHard,
     /// Read exact version `v=(t_w,inc)` once published; `t_w < t`.
-    Bind(TxVersion),
+    OrderedAdmit(TxVersion),
     /// OrderedDirtyRead: last Data `< t` skipping ESTIMATE (else Wait).
-    SpecRead,
+    OptimisticRead,
     /// EarlyAbort: cut incarnation at early bad program cross (known d + heavy).
-    /// VM arms rem RewindTo/FullRetry + Blocking on unresolved producer (hang-free).
+    /// VM arms rem RewindTo/FullAbortReexecute + Blocking on unresolved producer (hang-free).
     /// Does **not** SoftWait-arm (alternate fence to WaitHard).
     EarlyAbort,
 }
@@ -51,9 +51,9 @@ pub(crate) struct PolicyCtx {
     /// True when last writer is Executed/Validated (wait is cheap / Bindable).
     pub writer_done: bool,
     pub posterior_conflict: f64,
-    pub posterior_bind_success: f64,
+    pub posterior_ordered_admit_success: f64,
     pub placeholder_ready: bool,
-    pub bind_version: Option<TxVersion>,
+    pub ordered_admit_version: Option<TxVersion>,
     /// M3: residual / process WŜ predicts a lower writer on this location.
     pub prior_ws_predicts: bool,
     /// Program (storage/code/selfdestruct) vs handler (basic/lazy).
@@ -72,7 +72,7 @@ pub(crate) struct PolicyCtx {
     pub e_idle_steal: f64,
     /// Continuous meta_ops/useful (0 before warmup) — tiny-gap Spec bias.
     pub meta_tax: f64,
-    /// Meta budget exceeded → force SpecRead (storm brake, not OCC identity).
+    /// Meta budget exceeded → force OptimisticRead (storm brake, not OCC identity).
     pub meta_budget_exceeded: bool,
     /// Known depth only: gross-work / effect-progress proxy.
     /// Morph late prior feeds **W_remain feature only** — not EarlyAbort, not Wait gate.
@@ -83,7 +83,7 @@ pub(crate) struct PolicyCtx {
     pub waw_spine_hint: bool,
     /// Gas band / prior says heavy tx (EarlyAbort niche feature).
     pub tx_heavy_hint: bool,
-    /// Sticky resolve after force_bind_reabort on this ℓ — Bind/Await EV bias.
+    /// Sticky resolve after force_ordered_admit_reabort on this ℓ — OrderedAdmit/Await EV bias.
     pub sticky_resolve: bool,
     /// Learning rates / priors (not decision cuts).
     pub params: AdaptiveParams,
@@ -94,11 +94,11 @@ pub(crate) const TAU_W: f64 = 0.35;
 pub(crate) const TAU_S: f64 = 0.50;
 pub(crate) const TAU_REVOKE: f64 = 0.20;
 
-/// Partial-retry reexec factor (legacy SpecRead cost helper / docs).
+/// Partial-retry reexec factor (legacy OptimisticRead cost helper / docs).
 pub(crate) const C_RETRY: f64 = 3.0;
 /// DEPRECATED — not a Wait gate in AEC.
 pub(crate) const COST_MARGIN: f64 = 0.40;
-/// Bind escalation with published Data (not a Wait gate).
+/// OrderedAdmit escalation with published Data (not a Wait gate).
 pub(crate) const TAU_VERY_HIGH: f64 = 0.75;
 /// DEPRECATED — not a Wait gate in AEC (feature demotion only).
 pub(crate) const D_WAIT: f64 = 0.50;
@@ -111,7 +111,7 @@ pub(crate) fn cost_wait(writer_done: bool) -> f64 {
     if writer_done { 0.0 } else { 1.0 }
 }
 
-/// Expected SpecRead cost: base progress + conflict-weighted retry (legacy helper).
+/// Expected OptimisticRead cost: base progress + conflict-weighted retry (legacy helper).
 #[inline]
 pub(crate) fn cost_spec(p_conflict: f64) -> f64 {
     cost_spec_params(p_conflict, C_RETRY)
@@ -162,7 +162,7 @@ pub(crate) fn early_abort_candidate(ctx: &PolicyCtx) -> bool {
         && d.map(|x| x <= ctx.params.d_early).unwrap_or(false)
 }
 
-/// Remaining work if SpecRead aborts (continuous). Measured d preferred;
+/// Remaining work if OptimisticRead aborts (continuous). Measured d preferred;
 /// morph late prior is a **feature** for W_remain only (never Boolean Wait).
 #[inline]
 fn w_remain(ctx: &PolicyCtx) -> f64 {
@@ -193,7 +193,7 @@ pub(crate) struct EvScores {
     pub ev_early: f64,
 }
 
-/// AEC EV estimates (finite actions only; Bind handled separately).
+/// AEC EV estimates (finite actions only; OrderedAdmit handled separately).
 ///
 /// V5-P2: θ-driven continuous costs only — no Boolean Wait gates.
 pub(crate) fn compute_ev(ctx: &PolicyCtx) -> EvScores {
@@ -217,7 +217,7 @@ pub(crate) fn compute_ev(ctx: &PolicyCtx) -> EvScores {
 
     let p_abort = ctx.posterior_conflict.clamp(0.0, 1.0);
     let e_cascade = ctx.e_cascade.max(0.0);
-    // Measured abort→reexec (V5-P1 ForceBind≈1.2 / FullRestart≈2.2) via γ.
+    // Measured abort→reexec (V5-P1 ForceOrderedAdmit≈1.2 / FullAbortReexecute≈2.2) via γ.
     let e_reexec = ctx.e_reexec.max(params.e_reexec * 0.25).max(0.0);
     let ev_spec = p_abort
         * (w_remain(ctx) + params.beta_cascade * e_cascade + params.gamma_reexec * e_reexec);
@@ -230,7 +230,7 @@ pub(crate) fn compute_ev(ctx: &PolicyCtx) -> EvScores {
     };
 
     // Sticky resolve: raise EV_Spec / dampen EV_Wait (not Boolean Wait storm).
-    // Sticky resolve uses force_bind extension (Bind-if-Data), not EV Wait dampening —
+    // Sticky resolve uses force_ordered_admit extension (OrderedAdmit-if-Data), not EV Wait dampening —
     // EV Wait dampening SoftWait/park-stormed 597 (wait_park 497→2662).
     let _ = ctx.sticky_resolve;
 
@@ -241,7 +241,7 @@ pub(crate) fn compute_ev(ctx: &PolicyCtx) -> EvScores {
     }
 }
 
-/// Tiny-gap meta bias: Wait barely beats Spec under meta pressure → SpecRead.
+/// Tiny-gap meta bias: Wait barely beats Spec under meta pressure → OptimisticRead.
 #[inline]
 fn meta_tax_prefers_spec(
     ev_wait: f64,
@@ -264,26 +264,26 @@ fn meta_tax_prefers_spec(
     gap < thresh
 }
 
-/// AEC π: Bind if Data ready; else argmin EV.
+/// AEC π: OrderedAdmit if Data ready; else argmin EV.
 ///
 /// **Museum.** Live Mode(a) is [`crate::specfence::decide_access_queried`].
 /// Tie law (SpecFence-native): when writer is known Running/unfinished and
-/// `EV_Wait ≈ EV_Spec`, prefer **Await (WaitHard)** over SpecRead. SpecRead
+/// `EV_Wait ≈ EV_Spec`, prefer **Await (WaitHard)** over OptimisticRead. OptimisticRead
 /// remains for writer absent/unknown discovery — not the protocol brand.
 /// Meta tax may still bias away from Wait storms; no Boolean fanout→Wait ladders.
 #[cfg(test)]
 pub(crate) fn choose_action(ctx: PolicyCtx) -> ResolveAction {
     let params = ctx.params;
-    // 1. Published Data → Bind (install origin / certify). Bind match arm does **not**
-    // SoftWait; waiting is WaitHard-only. Prefer Bind over SpecRead whenever MV Data
-    // exists to cut origin churn and enable RebindOnly / force_bind prefixes.
-    if let Some(v) = ctx.bind_version.clone() {
-        return ResolveAction::Bind(v);
+    // 1. Published Data → OrderedAdmit (install origin / certify). OrderedAdmit match arm does **not**
+    // SoftWait; waiting is WaitHard-only. Prefer OrderedAdmit over OptimisticRead whenever MV Data
+    // exists to cut origin churn and enable RebindOnly / force_ordered_admit prefixes.
+    if let Some(v) = ctx.ordered_admit_version.clone() {
+        return ResolveAction::OrderedAdmit(v);
     }
 
-    // Meta budget → SpecRead fallback (storm brake), not OCC identity.
+    // Meta budget → OptimisticRead fallback (storm brake), not OCC identity.
     if ctx.meta_budget_exceeded {
-        return ResolveAction::SpecRead;
+        return ResolveAction::OptimisticRead;
     }
 
     let mut ev = compute_ev(&ctx);
@@ -292,13 +292,13 @@ pub(crate) fn choose_action(ctx: PolicyCtx) -> ResolveAction {
 
     // When WŜ predicts a writer but Data not yet published, raise Spec abort cost.
     if ctx.prior_ws_predicts || ctx.placeholder_ready {
-        ev.ev_spec *= 1.0 + ctx.posterior_bind_success.clamp(0.0, 1.0);
+        ev.ev_spec *= 1.0 + ctx.posterior_ordered_admit_success.clamp(0.0, 1.0);
     }
 
-    // Argmin; ties → Await if producer Running, else SpecRead (discovery).
+    // Argmin; ties → Await if producer Running, else OptimisticRead (discovery).
     // Meta tax still biases Spec on tiny Wait wins (no SoftWait storm).
     const EPS: f64 = 1e-9;
-    let mut best = ResolveAction::SpecRead;
+    let mut best = ResolveAction::OptimisticRead;
     let mut best_ev = ev.ev_spec;
 
     let wait_ok = if prefer_await_tie {
@@ -331,7 +331,7 @@ pub(crate) enum SelectiveOutcome {
     FallbackFull,
 }
 
-/// Describe a Bind target for Bohm-lite residual write-set.
+/// Describe a OrderedAdmit target for Bohm-lite residual write-set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BindTarget {
     pub writer: TxIdx,
@@ -346,7 +346,7 @@ mod tests {
         p: f64,
         writer_known: bool,
         writer_done: bool,
-        bind: Option<TxVersion>,
+        ordered_admit: Option<TxVersion>,
         placeholder_ready: bool,
         is_program: bool,
         fanout_hint: bool,
@@ -360,9 +360,9 @@ mod tests {
             writer: if writer_known { Some(0) } else { None },
             writer_done,
             posterior_conflict: p,
-            posterior_bind_success: 0.1,
+            posterior_ordered_admit_success: 0.1,
             placeholder_ready,
-            bind_version: bind,
+            ordered_admit_version: ordered_admit,
             prior_ws_predicts: false,
             is_program,
             fanout_hint,
@@ -383,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn aec_bind_when_data_ready() {
+    fn aec_ordered_admit_when_data_ready() {
         let v = TxVersion {
             tx_idx: 0,
             tx_incarnation: 0,
@@ -399,12 +399,12 @@ mod tests {
             16.0,
             Some(0.9),
         ));
-        assert_eq!(a, ResolveAction::Bind(v));
+        assert_eq!(a, ResolveAction::OrderedAdmit(v));
     }
 
     #[test]
     fn aec_high_fanout_prefers_spec_over_wait_when_e_wait_high() {
-        // Smoking gun 597: high fanout must raise EV_Wait → SpecRead.
+        // Smoking gun 597: high fanout must raise EV_Wait → OptimisticRead.
         let mut c = ctx_aec(0.35, true, false, None, false, true, true, 16.0, Some(0.9));
         c.e_wait_time = 1.0;
         let ev = compute_ev(&c);
@@ -414,7 +414,7 @@ mod tests {
             ev.ev_wait,
             ev.ev_spec
         );
-        assert_eq!(choose_action(c), ResolveAction::SpecRead);
+        assert_eq!(choose_action(c), ResolveAction::OptimisticRead);
     }
 
     #[test]
@@ -423,11 +423,11 @@ mod tests {
         // High E_wait + hint without live fanout → Spec (EV), never Boolean Wait.
         let mut c = ctx_aec(0.25, true, false, None, false, true, true, 0.0, None);
         c.e_wait_time = 2.0;
-        assert_eq!(choose_action(c), ResolveAction::SpecRead);
+        assert_eq!(choose_action(c), ResolveAction::OptimisticRead);
         // Hint + moderate P + high fanout → Spec because fanout raises EV_Wait.
         let mut c2 = ctx_aec(0.40, true, false, None, false, true, true, 16.0, None);
         c2.e_wait_time = 1.0;
-        assert_eq!(choose_action(c2), ResolveAction::SpecRead);
+        assert_eq!(choose_action(c2), ResolveAction::OptimisticRead);
     }
 
     #[test]
@@ -444,7 +444,7 @@ mod tests {
             2.0,
             Some(0.94),
         ));
-        assert_eq!(a, ResolveAction::SpecRead);
+        assert_eq!(a, ResolveAction::OptimisticRead);
     }
 
     #[test]
@@ -468,14 +468,14 @@ mod tests {
         let a = choose_action(ctx_aec(
             0.9, true, false, None, false, false, true, 32.0, None,
         ));
-        assert_eq!(a, ResolveAction::SpecRead);
+        assert_eq!(a, ResolveAction::OptimisticRead);
     }
 
     #[test]
     fn aec_tie_prefers_await_when_producer_running() {
         let mut c = ctx_aec(0.5, true, false, None, false, true, false, 0.0, None);
         // EV_Spec = 0.5 * (1 + β*1 + γ*1.5) = 1.375 with γ=0.5; set EV_Wait equal →
-        // tie + writer known unfinished → Await (WaitHard), not OCC SpecRead.
+        // tie + writer known unfinished → Await (WaitHard), not OCC OptimisticRead.
         c.e_idle_steal = 0.0;
         c.e_wait_time = 1.375;
         c.posterior_conflict = 0.5;
@@ -487,13 +487,13 @@ mod tests {
     #[test]
     fn aec_tie_specread_when_writer_unknown() {
         let mut c = ctx_aec(0.5, false, false, None, false, true, false, 0.0, None);
-        // writer_known=false → EV_Wait = ∞; SpecRead for discovery.
+        // writer_known=false → EV_Wait = ∞; OptimisticRead for discovery.
         c.e_idle_steal = 0.0;
         c.e_wait_time = 1.375;
         c.posterior_conflict = 0.5;
         c.e_cascade = 1.0;
         c.e_reexec = 1.5;
-        assert_eq!(choose_action(c), ResolveAction::SpecRead);
+        assert_eq!(choose_action(c), ResolveAction::OptimisticRead);
     }
 
     #[test]
@@ -512,7 +512,7 @@ mod tests {
         assert!(
             matches!(
                 a,
-                ResolveAction::EarlyAbort | ResolveAction::SpecRead | ResolveAction::WaitHard
+                ResolveAction::EarlyAbort | ResolveAction::OptimisticRead | ResolveAction::WaitHard
             ),
             "{a:?}"
         );
@@ -533,7 +533,7 @@ mod tests {
             quiet: 0.10,
         };
         // Morph late prior shrinks W_remain → Spec cheaper; must NOT Wait-force.
-        assert_eq!(choose_action(c), ResolveAction::SpecRead);
+        assert_eq!(choose_action(c), ResolveAction::OptimisticRead);
     }
 
     #[test]
@@ -541,7 +541,7 @@ mod tests {
         let mut c = ctx_aec(0.95, true, false, None, false, true, false, 1.0, Some(0.2));
         c.e_wait_time = 0.1;
         c.meta_budget_exceeded = true;
-        assert_eq!(choose_action(c), ResolveAction::SpecRead);
+        assert_eq!(choose_action(c), ResolveAction::OptimisticRead);
     }
 
     #[test]
@@ -549,11 +549,11 @@ mod tests {
         let mut c = ctx_aec(0.9, true, false, None, false, true, true, 2.0, Some(0.2));
         c.waw_spine_hint = true;
         c.e_wait_time = 0.1;
-        assert_eq!(choose_action(c), ResolveAction::SpecRead);
+        assert_eq!(choose_action(c), ResolveAction::OptimisticRead);
     }
 
     #[test]
-    fn aec_bind_prior_ws_or_high_p() {
+    fn aec_ordered_admit_prior_ws_or_high_p() {
         let v = TxVersion {
             tx_idx: 0,
             tx_incarnation: 0,
@@ -570,7 +570,7 @@ mod tests {
             None,
         );
         c.prior_ws_predicts = true;
-        assert_eq!(choose_action(c), ResolveAction::Bind(v.clone()));
+        assert_eq!(choose_action(c), ResolveAction::OrderedAdmit(v.clone()));
         let c2 = ctx_aec(
             0.80,
             true,
@@ -582,16 +582,16 @@ mod tests {
             8.0,
             None,
         );
-        assert_eq!(choose_action(c2), ResolveAction::Bind(v));
+        assert_eq!(choose_action(c2), ResolveAction::OrderedAdmit(v));
     }
 
     #[test]
-    fn aec_bind_when_data_and_writer_done_or_quality() {
+    fn aec_ordered_admit_when_data_and_writer_done_or_quality() {
         let v = TxVersion {
             tx_idx: 1,
             tx_incarnation: 0,
         };
-        // writer_done → Bind (EV_Bind=0, hang-free).
+        // writer_done → OrderedAdmit (EV_OrderedAdmit=0, hang-free).
         let c = ctx_aec(
             0.05,
             true,
@@ -603,8 +603,8 @@ mod tests {
             32.0,
             None,
         );
-        assert_eq!(choose_action(c), ResolveAction::Bind(v.clone()));
-        // High bind posterior + Data → Bind (quality signal).
+        assert_eq!(choose_action(c), ResolveAction::OrderedAdmit(v.clone()));
+        // High ordered_admit posterior + Data → OrderedAdmit (quality signal).
         let mut c2 = ctx_aec(
             0.05,
             true,
@@ -616,9 +616,9 @@ mod tests {
             2.0,
             None,
         );
-        c2.posterior_bind_success = 0.80;
-        assert_eq!(choose_action(c2), ResolveAction::Bind(v.clone()));
-        // Data alone → Bind (Bind does not SoftWait; origin install is hang-free).
+        c2.posterior_ordered_admit_success = 0.80;
+        assert_eq!(choose_action(c2), ResolveAction::OrderedAdmit(v.clone()));
+        // Data alone → OrderedAdmit (OrderedAdmit does not SoftWait; origin install is hang-free).
         let mut c3 = ctx_aec(
             0.05,
             true,
@@ -632,7 +632,7 @@ mod tests {
         );
         c3.e_wait_time = 2.0;
         c3.e_reexec = 0.5;
-        assert_eq!(choose_action(c3), ResolveAction::Bind(v));
+        assert_eq!(choose_action(c3), ResolveAction::OrderedAdmit(v));
     }
 
     #[test]
@@ -641,7 +641,7 @@ mod tests {
         let mut c = ctx_aec(0.85, true, false, None, false, true, false, 1.0, Some(0.3));
         c.e_wait_time = 0.4;
         c.e_cascade = 0.5;
-        c.e_reexec = 2.5; // measured FullRestart-ish abort cost
+        c.e_reexec = 2.5; // measured FullAbortReexecute-ish abort cost
         let ev = compute_ev(&c);
         assert!(
             ev.ev_wait < ev.ev_spec,
@@ -659,10 +659,10 @@ mod tests {
         c.e_cascade = 1.0;
         c.e_reexec = 1.5;
         c.prior_ws_predicts = true;
-        c.posterior_bind_success = 0.8;
+        c.posterior_ordered_admit_success = 0.8;
         // High fanout keeps Wait expensive; Spec still wins (no Boolean Wait), but cost raised.
         let a = choose_action(c);
-        assert_eq!(a, ResolveAction::SpecRead);
+        assert_eq!(a, ResolveAction::OptimisticRead);
     }
 
     #[test]
@@ -704,7 +704,7 @@ mod tests {
         let a = choose_action(ctx_aec(
             0.90, true, false, None, false, false, true, 8.0, None,
         ));
-        assert_eq!(a, ResolveAction::SpecRead);
+        assert_eq!(a, ResolveAction::OptimisticRead);
     }
 
     #[test]
@@ -741,9 +741,9 @@ mod tests {
     fn v5_p2_ev_spec_uses_measured_reexec_gamma() {
         let mut c = ctx_aec(0.8, true, false, None, false, true, false, 1.0, Some(0.3));
         c.e_cascade = 0.5;
-        c.e_reexec = 1.2; // Lean ForceBind
+        c.e_reexec = 1.2; // Lean ForceOrderedAdmit
         let cheap = compute_ev(&c);
-        c.e_reexec = 2.2; // FullRestart
+        c.e_reexec = 2.2; // FullAbortReexecute
         let dear = compute_ev(&c);
         assert!(
             dear.ev_spec > cheap.ev_spec,
@@ -767,7 +767,7 @@ mod tests {
         assert!(ev.ev_wait + 1e-9 < ev.ev_spec, "{:?}", ev);
         assert_eq!(choose_action(c.clone()), ResolveAction::WaitHard);
 
-        // Tiny Wait win + measured meta_tax → SpecRead (no SoftWait storm).
+        // Tiny Wait win + measured meta_tax → OptimisticRead (no SoftWait storm).
         let mut c2 = c.clone();
         let gap_target = c2.params.meta_gap_eps * 0.5;
         let fanout = 1.0;
@@ -783,7 +783,7 @@ mod tests {
         c2.meta_tax = 0.5; // thresh = 0.06*(1.5)=0.09 > gap_target
         assert_eq!(
             choose_action(c2),
-            ResolveAction::SpecRead,
+            ResolveAction::OptimisticRead,
             "measured meta tax + tiny Wait win → Spec"
         );
     }
@@ -801,7 +801,7 @@ mod tests {
         c.meta_tax = 0.0;
         assert_eq!(choose_action(c.clone()), ResolveAction::WaitHard);
         c.meta_tax = 2.0; // thresh = 0.06*(1+2)=0.18 > gap
-        assert_eq!(choose_action(c), ResolveAction::SpecRead);
+        assert_eq!(choose_action(c), ResolveAction::OptimisticRead);
     }
 
     #[test]
@@ -810,7 +810,7 @@ mod tests {
             tx_idx: 0,
             tx_incarnation: 0,
         };
-        // Sticky flag is informational for π; Bind still requires hang-free gates.
+        // Sticky flag is informational for π; OrderedAdmit still requires hang-free gates.
         let mut c = ctx_aec(
             0.2,
             true,
@@ -823,9 +823,9 @@ mod tests {
             None,
         );
         c.sticky_resolve = true;
-        assert_eq!(choose_action(c), ResolveAction::Bind(v));
+        assert_eq!(choose_action(c), ResolveAction::OrderedAdmit(v));
 
-        // Sticky alone must not Boolean-Wait: EV unchanged vs plain (force_bind extend
+        // Sticky alone must not Boolean-Wait: EV unchanged vs plain (force_ordered_admit extend
         // owns sticky resolve — not EV Wait dampening).
         let mut c2 = ctx_aec(0.45, true, false, None, false, true, false, 2.0, Some(0.4));
         c2.e_wait_time = 0.15;
@@ -836,7 +836,7 @@ mod tests {
         let plain_ev = compute_ev(&plain);
         assert!(
             (sticky_ev.ev_spec - plain_ev.ev_spec).abs() < 1e-12,
-            "sticky must not alter EV_Spec (force_bind extend is the sticky verb)"
+            "sticky must not alter EV_Spec (force_ordered_admit extend is the sticky verb)"
         );
         assert!(
             (sticky_ev.ev_wait - plain_ev.ev_wait).abs() < 1e-12

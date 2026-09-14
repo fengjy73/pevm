@@ -52,31 +52,31 @@ struct RunRow {
     bayes_success_updates: usize,
     wave_promotions: usize,
     mean_wait_posterior: f64,
-    bind_hits: usize,
+    ordered_admit_hits: usize,
     wait_hard_count: usize,
-    spec_read_count: usize,
+    optimistic_read_count: usize,
     selective_invalidate_count: usize,
-    tx_full_retry: usize,
+    tx_full_abort_reexecute: usize,
     region_validate_fail: usize,
     soft_edge_revokes: usize,
     selective_fallback_full: usize,
     partial_retry_count: usize,
     partial_retry_fallback_full: usize,
     cost_chose_wait: usize,
-    cost_chose_spec: usize,
-    cost_chose_bind: usize,
+    cost_chose_optimistic_read: usize,
+    cost_chose_ordered_admit: usize,
     mean_p_at_wait: f64,
-    mean_p_at_spec: f64,
+    mean_p_at_optimistic_read: f64,
     evm_entries: usize,
     resume_count: usize,
     rebind_only: usize,
     rewind_to_cp: usize,
-    full_restart: usize,
+    full_abort_reexecute: usize,
     tx_head_reexec: usize,
     absolute_jump_applied: usize,
     absolute_jump_fallback: usize,
-    prior_bind_hits: usize,
-    prior_bind_miss: usize,
+    prior_ordered_admit_hits: usize,
+    prior_ordered_admit_miss: usize,
     journal_ff_entries: usize,
     journal_ff_hits: usize,
     prefix_opcodes_skipped: usize,
@@ -202,31 +202,31 @@ fn zeros_row(
         bayes_success_updates: 0,
         wave_promotions: 0,
         mean_wait_posterior: 0.0,
-        bind_hits: 0,
+        ordered_admit_hits: 0,
         wait_hard_count: 0,
-        spec_read_count: 0,
+        optimistic_read_count: 0,
         selective_invalidate_count: 0,
-        tx_full_retry: 0,
+        tx_full_abort_reexecute: 0,
         region_validate_fail: 0,
         soft_edge_revokes: 0,
         selective_fallback_full: 0,
         partial_retry_count: 0,
         partial_retry_fallback_full: 0,
         cost_chose_wait: 0,
-        cost_chose_spec: 0,
-        cost_chose_bind: 0,
+        cost_chose_optimistic_read: 0,
+        cost_chose_ordered_admit: 0,
         mean_p_at_wait: 0.0,
-        mean_p_at_spec: 0.0,
+        mean_p_at_optimistic_read: 0.0,
         evm_entries: 0,
         resume_count: 0,
         rebind_only: 0,
         rewind_to_cp: 0,
-        full_restart: 0,
+        full_abort_reexecute: 0,
         tx_head_reexec: 0,
         absolute_jump_applied: 0,
         absolute_jump_fallback: 0,
-        prior_bind_hits: 0,
-        prior_bind_miss: 0,
+        prior_ordered_admit_hits: 0,
+        prior_ordered_admit_miss: 0,
         journal_ff_entries: 0,
         journal_ff_hits: 0,
         prefix_opcodes_skipped: 0,
@@ -332,15 +332,23 @@ fn measure(
                 } else {
                     m.mean_wait_posterior
                 },
-                bind_hits: if sequential { 0 } else { m.bind_hits },
+                ordered_admit_hits: if sequential { 0 } else { m.ordered_admit_hits },
                 wait_hard_count: if sequential { 0 } else { m.wait_hard_count },
-                spec_read_count: if sequential { 0 } else { m.spec_read_count },
+                optimistic_read_count: if sequential {
+                    0
+                } else {
+                    m.optimistic_read_count
+                },
                 selective_invalidate_count: if sequential {
                     0
                 } else {
                     m.selective_invalidate_count
                 },
-                tx_full_retry: if sequential { 0 } else { m.tx_full_retry },
+                tx_full_abort_reexecute: if sequential {
+                    0
+                } else {
+                    m.tx_full_abort_reexecute
+                },
                 region_validate_fail: if sequential {
                     0
                 } else {
@@ -359,15 +367,31 @@ fn measure(
                     m.partial_retry_fallback_full
                 },
                 cost_chose_wait: if sequential { 0 } else { m.cost_chose_wait },
-                cost_chose_spec: if sequential { 0 } else { m.cost_chose_spec },
-                cost_chose_bind: if sequential { 0 } else { m.cost_chose_bind },
+                cost_chose_optimistic_read: if sequential {
+                    0
+                } else {
+                    m.cost_chose_optimistic_read
+                },
+                cost_chose_ordered_admit: if sequential {
+                    0
+                } else {
+                    m.cost_chose_ordered_admit
+                },
                 mean_p_at_wait: if sequential { 0.0 } else { m.mean_p_at_wait },
-                mean_p_at_spec: if sequential { 0.0 } else { m.mean_p_at_spec },
+                mean_p_at_optimistic_read: if sequential {
+                    0.0
+                } else {
+                    m.mean_p_at_optimistic_read
+                },
                 evm_entries: if sequential { 0 } else { m.evm_entries },
                 resume_count: if sequential { 0 } else { m.resume_count },
                 rebind_only: if sequential { 0 } else { m.rebind_only },
                 rewind_to_cp: if sequential { 0 } else { m.rewind_to_cp },
-                full_restart: if sequential { 0 } else { m.full_restart },
+                full_abort_reexecute: if sequential {
+                    0
+                } else {
+                    m.full_abort_reexecute
+                },
                 tx_head_reexec: if sequential { 0 } else { m.tx_head_reexec },
                 absolute_jump_applied: if sequential {
                     0
@@ -379,8 +403,16 @@ fn measure(
                 } else {
                     m.absolute_jump_fallback
                 },
-                prior_bind_hits: if sequential { 0 } else { m.prior_bind_hits },
-                prior_bind_miss: if sequential { 0 } else { m.prior_bind_miss },
+                prior_ordered_admit_hits: if sequential {
+                    0
+                } else {
+                    m.prior_ordered_admit_hits
+                },
+                prior_ordered_admit_miss: if sequential {
+                    0
+                } else {
+                    m.prior_ordered_admit_miss
+                },
                 journal_ff_entries: if sequential { 0 } else { m.journal_ff_entries },
                 journal_ff_hits: if sequential { 0 } else { m.journal_ff_hits },
                 prefix_opcodes_skipped: if sequential {
@@ -448,31 +480,31 @@ fn write_outputs(out: &Path, rows: &[RunRow]) {
                 "bayes_success_updates": r.bayes_success_updates,
                 "wave_promotions": r.wave_promotions,
                 "mean_wait_posterior": r.mean_wait_posterior,
-                "bind_hits": r.bind_hits,
+                "ordered_admit_hits": r.ordered_admit_hits,
                 "wait_hard_count": r.wait_hard_count,
-                "spec_read_count": r.spec_read_count,
+                "optimistic_read_count": r.optimistic_read_count,
                 "selective_invalidate_count": r.selective_invalidate_count,
-                "tx_full_retry": r.tx_full_retry,
+                "tx_full_abort_reexecute": r.tx_full_abort_reexecute,
                 "region_validate_fail": r.region_validate_fail,
                 "soft_edge_revokes": r.soft_edge_revokes,
                 "selective_fallback_full": r.selective_fallback_full,
                 "partial_retry_count": r.partial_retry_count,
                 "partial_retry_fallback_full": r.partial_retry_fallback_full,
                 "cost_chose_wait": r.cost_chose_wait,
-                "cost_chose_spec": r.cost_chose_spec,
-                "cost_chose_bind": r.cost_chose_bind,
+                "cost_chose_optimistic_read": r.cost_chose_optimistic_read,
+                "cost_chose_ordered_admit": r.cost_chose_ordered_admit,
                 "mean_p_at_wait": r.mean_p_at_wait,
-                "mean_p_at_spec": r.mean_p_at_spec,
+                "mean_p_at_optimistic_read": r.mean_p_at_optimistic_read,
                 "evm_entries": r.evm_entries,
                 "resume_count": r.resume_count,
                 "rebind_only": r.rebind_only,
                 "rewind_to_cp": r.rewind_to_cp,
-                "full_restart": r.full_restart,
+                "full_abort_reexecute": r.full_abort_reexecute,
                 "tx_head_reexec": r.tx_head_reexec,
                 "absolute_jump_applied": r.absolute_jump_applied,
                 "absolute_jump_fallback": r.absolute_jump_fallback,
-                "prior_bind_hits": r.prior_bind_hits,
-                "prior_bind_miss": r.prior_bind_miss,
+                "prior_ordered_admit_hits": r.prior_ordered_admit_hits,
+                "prior_ordered_admit_miss": r.prior_ordered_admit_miss,
                 "journal_ff_entries": r.journal_ff_entries,
                 "journal_ff_hits": r.journal_ff_hits,
                 "prefix_opcodes_skipped": r.prefix_opcodes_skipped,
@@ -497,7 +529,7 @@ fn write_outputs(out: &Path, rows: &[RunRow]) {
     let mut csv = File::create(&csv_path).expect("write csv");
     writeln!(
         csv,
-        "block,n_tx,gas_used,mode,cores,repeat,elapsed_ms,tps,occ_aborts,abort_rate,wait_admissions,speculate_executions,region_promotions,cascade_validations_scheduled,independent_txs_skipped_by_fence,bayes_wait_decisions,bayes_speculate_decisions,bayes_conflict_updates,bayes_success_updates,wave_promotions,mean_wait_posterior,bind_hits,wait_hard_count,spec_read_count,selective_invalidate_count,tx_full_retry,region_validate_fail,soft_edge_revokes,selective_fallback_full,partial_retry_count,partial_retry_fallback_full,cost_chose_wait,cost_chose_spec,cost_chose_bind,mean_p_at_wait,mean_p_at_spec,evm_entries,resume_count,rebind_only,rewind_to_cp,full_restart,tx_head_reexec,absolute_jump_applied,absolute_jump_fallback,prior_bind_hits,prior_bind_miss,journal_ff_entries,journal_ff_hits,prefix_opcodes_skipped,ready_steal_on_wait,lean_mode_txs,full_mode_txs,engagement_switches,hot_local_reads,hotset_size,inspector_steps,inspector_steps_resume,ok,error"
+        "block,n_tx,gas_used,mode,cores,repeat,elapsed_ms,tps,occ_aborts,abort_rate,wait_admissions,speculate_executions,region_promotions,cascade_validations_scheduled,independent_txs_skipped_by_fence,bayes_wait_decisions,bayes_speculate_decisions,bayes_conflict_updates,bayes_success_updates,wave_promotions,mean_wait_posterior,ordered_admit_hits,wait_hard_count,optimistic_read_count,selective_invalidate_count,tx_full_abort_reexecute,region_validate_fail,soft_edge_revokes,selective_fallback_full,partial_retry_count,partial_retry_fallback_full,cost_chose_wait,cost_chose_optimistic_read,cost_chose_ordered_admit,mean_p_at_wait,mean_p_at_optimistic_read,evm_entries,resume_count,rebind_only,rewind_to_cp,full_abort_reexecute,tx_head_reexec,absolute_jump_applied,absolute_jump_fallback,prior_ordered_admit_hits,prior_ordered_admit_miss,journal_ff_entries,journal_ff_hits,prefix_opcodes_skipped,ready_steal_on_wait,lean_mode_txs,full_mode_txs,engagement_switches,hot_local_reads,hotset_size,inspector_steps,inspector_steps_resume,ok,error"
     )
     .unwrap();
     for r in rows {
@@ -526,31 +558,31 @@ fn write_outputs(out: &Path, rows: &[RunRow]) {
             r.bayes_success_updates,
             r.wave_promotions,
             r.mean_wait_posterior,
-            r.bind_hits,
+            r.ordered_admit_hits,
             r.wait_hard_count,
-            r.spec_read_count,
+            r.optimistic_read_count,
             r.selective_invalidate_count,
-            r.tx_full_retry,
+            r.tx_full_abort_reexecute,
             r.region_validate_fail,
             r.soft_edge_revokes,
             r.selective_fallback_full,
             r.partial_retry_count,
             r.partial_retry_fallback_full,
             r.cost_chose_wait,
-            r.cost_chose_spec,
-            r.cost_chose_bind,
+            r.cost_chose_optimistic_read,
+            r.cost_chose_ordered_admit,
             r.mean_p_at_wait,
-            r.mean_p_at_spec,
+            r.mean_p_at_optimistic_read,
             r.evm_entries,
             r.resume_count,
             r.rebind_only,
             r.rewind_to_cp,
-            r.full_restart,
+            r.full_abort_reexecute,
             r.tx_head_reexec,
             r.absolute_jump_applied,
             r.absolute_jump_fallback,
-            r.prior_bind_hits,
-            r.prior_bind_miss,
+            r.prior_ordered_admit_hits,
+            r.prior_ordered_admit_miss,
             r.journal_ff_entries,
             r.journal_ff_hits,
             r.prefix_opcodes_skipped,
@@ -644,23 +676,23 @@ fn main() {
                 for repeat in 0..repeats {
                     let row = measure(&chain, &loaded, mode, c, repeat);
                     eprintln!(
-                        "  {mode:10} cores={c} r{repeat} tps={:.0} abort={:.3} wait={} full_retry={} partial={} pr_fb={} bind={} wait_hard={} spec_read={} cost_w/s/b={}/{}/{} sel_inv={} sel_fb={} jump={} prior_bind={} lean={} resume={} ok={}",
+                        "  {mode:10} cores={c} r{repeat} tps={:.0} abort={:.3} wait={} full_retry={} partial={} pr_fb={} ordered_admit={} wait_hard={} optimistic_read={} cost_w/s/b={}/{}/{} sel_inv={} sel_fb={} jump={} prior_ordered_admit={} lean={} resume={} ok={}",
                         row.tps,
                         row.abort_rate,
                         row.wait_admissions,
-                        row.tx_full_retry,
+                        row.tx_full_abort_reexecute,
                         row.partial_retry_count,
                         row.partial_retry_fallback_full,
-                        row.bind_hits,
+                        row.ordered_admit_hits,
                         row.wait_hard_count,
-                        row.spec_read_count,
+                        row.optimistic_read_count,
                         row.cost_chose_wait,
-                        row.cost_chose_spec,
-                        row.cost_chose_bind,
+                        row.cost_chose_optimistic_read,
+                        row.cost_chose_ordered_admit,
                         row.selective_invalidate_count,
                         row.selective_fallback_full,
                         row.absolute_jump_applied,
-                        row.prior_bind_hits,
+                        row.prior_ordered_admit_hits,
                         row.lean_mode_txs,
                         row.resume_count,
                         row.ok

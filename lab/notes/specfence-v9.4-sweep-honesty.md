@@ -25,17 +25,17 @@
 | ≥0.7 / ≥0.95 / ≥1.0 | 50 / 29 / 23 |
 | quiet n / median / p10 / ≥1 | 36 / 1.0732 / 0.4329 / 19/36 |
 | morph | {'spine': 53, 'quiet': 36, 'quiet_ish': 9} |
-| Soft / Bind / WaitFor | **0** / **0** / 4875 |
-| WaitFor pin / aborting | **5158** / **177** |
-| Bind-after-Done | 214 (Bind verb = 0; cert-without-Bind) |
-| R1 win / attempt (rate) | 3 / 2439 (0.0012) |
-| schedule_refuse | **1540** |
+| Soft / OrderedAdmit / WaitFor | **0** / **0** / 4875 |
+| WaitFor wait_for_dependency / aborting | **5158** / **177** |
+| OrderedAdmit-after-Done | 214 (OrderedAdmit verb = 0; cert-without-OrderedAdmit) |
+| partial_abort win / attempt (rate) | 3 / 2439 (0.0012) |
+| refuse_admit | **1540** |
 
-Bind rare landed in volume (2208 → 0). PinWithoutThrow landed (`waitfor_aborting` 3280 → 177). Schedule-first refuse fires (0 → 1540). R1 still token.
+OrderedAdmit rare landed in volume (2208 → 0). wait_for_dependency landed (`wait_for_full_abort` 3280 → 177). Schedule-first refuse fires (0 → 1540). R1 still token.
 
 ### Named Soft=0 N=3 @8
 
-| bn | N=1 sf_occ | N=3 sf_occ | N=3 Bind | N=3 Wait | N=3 pin | N=3 aborting | N=3 R1 w/a | N=3 refuse |
+| bn | N=1 sf_occ | N=3 sf_occ | N=3 OrderedAdmit | N=3 Wait | N=3 wait_for_dependency | N=3 aborting | N=3 R1 w/a | N=3 refuse |
 |---:|----------:|----------:|---------:|---------:|--------:|-------------:|-----------:|-----------:|
 | 14689597 | 0.3981 | **0.4485** | 0 | 246 | 274 | 4 | 0/74 | 160 |
 | 19807137 | 0.3088 | **0.2308** | 0 | 891 | 971 | 0 | 0/537 | 0 |
@@ -46,8 +46,8 @@ Bind rare landed in volume (2208 → 0). PinWithoutThrow landed (`waitfor_aborti
 Notes:
 
 - **2179522** N=1/N=3 ratios are OCC-slow noise (OCC wall hundreds–tens of thousands of ms). Do **not** advertise them.
-- Fan **14689597** N=3 **0.4485** beats the 0.348 wall; Bind=0; refuse=160; still misses ≥0.90.
-- **19807137** remains worst (N=3 **0.2308**); WaitFor/pin dominate park idle; refuse=0 on that block.
+- Fan **14689597** N=3 **0.4485** beats the 0.348 wall; OrderedAdmit=0; refuse=160; still misses ≥0.90.
+- **19807137** remains worst (N=3 **0.2308**); WaitFor/wait_for_dependency dominate park idle; refuse=0 on that block.
 
 ### Product bars (this JSON)
 
@@ -59,7 +59,7 @@ Notes:
 | nonempty median ≥0.95 | **miss** (0.7033) |
 | 14689597 ≥0.90 @8 N≥3 | **miss** (0.4485) |
 | quiet p10 ≥0.90 | **miss** (0.4329) |
-| R1 win ≥50% attempts | **miss** (0.0012) |
+| partial_abort win ≥50% attempts | **miss** (0.0012) |
 
 ---
 
@@ -96,15 +96,15 @@ Notes:
 | ≥0.7 / ≥0.95 / ≥1.0 | 46 / 25 / 22 |
 | quiet n / median / p10 / ≥1 | 33 / 1.0634 / 0.5124 / 21/33 |
 | morph | {'spine': 53, 'quiet': 33, 'quiet_ish': 12} |
-| Soft / Bind / WaitFor | 0 / 2208 / 2151 |
-| WaitFor pin / aborting | 2061 / 3280 |
-| Bind-after-Done | 205 (share of Bind 0.0928) |
-| R1 win / attempt (rate) | 6 / 1636 (0.0037) |
-| schedule_refuse | 0 |
+| Soft / OrderedAdmit / WaitFor | 0 / 2208 / 2151 |
+| WaitFor wait_for_dependency / aborting | 2061 / 3280 |
+| OrderedAdmit-after-Done | 205 (share of OrderedAdmit 0.0928) |
+| partial_abort win / attempt (rate) | 6 / 1636 (0.0037) |
+| refuse_admit | 0 |
 
 ## Named Soft=0 N=3 @8
 
-| bn | N=1 sf_occ | N=3 sf_occ | N=3 Bind | N=3 Wait | N=3 pin | N=3 R1 w/a | N=3 bind_after_done |
+| bn | N=1 sf_occ | N=3 sf_occ | N=3 OrderedAdmit | N=3 Wait | N=3 wait_for_dependency | N=3 R1 w/a | N=3 ordered_admit_after_done |
 |---:|----------:|----------:|---------:|---------:|--------:|-----------:|--------------------:|
 | 14689597 | 0.3375 | **0.3482** | 472 | 47 | 45 | 0/42 | 1 |
 | 19807137 | 0.1953 | **0.2265** | 202 | 442 | 420 | 4/491 | 90 |
@@ -115,8 +115,8 @@ Notes:
 Notes:
 
 - **2179522** N=1 (1.6857) is OCC-slow noise; advertise **N=3 0.6382**.
-- Fan **14689597** still Bind-heavy; R1 almost never wins certs on that block.
-- **19807137** remains worst (N=3 **0.2265**); WaitFor/pin/aborting dominate park idle.
+- Fan **14689597** still OrderedAdmit-heavy; R1 almost never wins certs on that block.
+- **19807137** remains worst (N=3 **0.2265**); WaitFor/wait_for_dependency/aborting dominate park idle.
 
 ## Product bars (this JSON)
 
@@ -126,7 +126,7 @@ Notes:
 | nonempty median ≥0.95 | **miss** (0.6853) |
 | 14689597 ≥0.90 @8 N≥3 | **miss** (0.3482) |
 | quiet p10 ≥0.90 | **miss** (0.5124) |
-| R1 win ≥50% attempts | **miss** (0.0037) |
-| Bind-after-Done theater | path fixed; share still **0.0928** of Bind |
+| partial_abort win ≥50% attempts | **miss** (0.0037) |
+| OrderedAdmit-after-Done theater | path fixed; share still **0.0928** of OrderedAdmit |
 
-Soft=0 held on all SF rows. Nonempty median 0.685 vs base 0.728 (delta -0.0427); 14689597 N=3 0.3482 vs base 0.362 (delta -0.0138). Quiet median ~1.06 but quiet p10 0.51 misses ≥0.90. R1 path live (attempt>0) but win rate near-zero. 2179522 N=1 can look OCC-slow; use N=3 (0.638). Do not claim product bars.
+Soft=0 held on all SF rows. Nonempty median 0.685 vs base 0.728 (delta -0.0427); 14689597 N=3 0.3482 vs base 0.362 (delta -0.0138). Quiet median ~1.06 but quiet p10 0.51 misses ≥0.90. partial_abort path live (attempt>0) but win rate near-zero. 2179522 N=1 can look OCC-slow; use N=3 (0.638). Do not claim product bars.

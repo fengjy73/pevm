@@ -127,7 +127,7 @@ pub(crate) struct BoundarySnapshot {
     /// Iter9: exact storage presents at this Handler tip (ordered plant notes).
     /// Empty for Inspector snaps. Armed jump applies these instead of full cont wr.
     pub write_replays_at_tip: Vec<StorageWriteReplay>,
-    /// Iter23: cumulative Bind SLOAD (address, slot, value) log for stack↔FF
+    /// Iter23: cumulative OrderedAdmit SLOAD (address, slot, value) log for stack↔FF
     /// reconcile on abs-jump apply. Empty for Inspector/SSTORE/lite snaps.
     pub tip_sloads: Vec<(Address, U256, U256)>,
 }
@@ -205,7 +205,7 @@ impl BoundarySnapshot {
 /// M1i safety gate: when true, production may absolute-jump PC on RewindTo resume.
 ///
 /// Live capture, in-range PC, non-empty prefix with ≥1 Basic and/or Storage FF.
-/// Storage correctness stays via SpecFence FF + force-bind / MV origins —
+/// Storage correctness stays via SpecFence FF + force-ordered_admit / MV origins —
 /// **never** journal-blob `present_values` dump (poisons pevm Db / shadows MvMemory).
 /// Write-prefix allowed when post-SSTORE snap (gas already charged) + `write_replays`
 /// cover storage presents for controlled journal slot replay (not blob dump).
@@ -258,7 +258,7 @@ pub(crate) fn jump_is_safe(cont: &ResumeContinuation) -> bool {
         .values
         .values()
         .any(|v| matches!(v, crate::specfence::rem::FfValue::Basic { .. }));
-    // Iter27: Bind tip with ≥1 tip_sload overlapping FF Storage counts as
+    // Iter27: OrderedAdmit tip with ≥1 tip_sload overlapping FF Storage counts as
     // storage-FF for large-bytecode gate (same Validated-fresh identity).
     let tip_sload_ff = snap.tip_sloads.iter().any(|(addr, slot, snap_val)| {
         cont.values.values().any(|v| match v {
@@ -292,7 +292,7 @@ pub(crate) fn jump_is_safe(cont: &ResumeContinuation) -> bool {
     // M1j: multi-SSTORE+LOG prefixes can exceed 128 steps; allow up to 512 when
     // write_replays and/or call_outcomes certify a controlled jump.
     // Iter2: Storage/write_replay prefixes on 597 often need >512 prefix steps.
-    // Three-pillar resolve: tip≡FF Bind tips on 597 often sit at PC 2–6k;
+    // Three-pillar resolve: tip≡FF OrderedAdmit tips on 597 often sit at PC 2–6k;
     // 2048 refused armable tips → steps_over / aj=0. Cap 8192 for storage/FF tips.
     let max_steps = if !cont.write_replays.is_empty()
         || !cont.call_outcomes.is_empty()
@@ -428,7 +428,7 @@ pub(crate) fn jump_is_safe(cont: &ResumeContinuation) -> bool {
     true
 }
 
-/// Iter20 dig: why [`jump_is_safe`] refused (Bind-snap consume diagnosis).
+/// Iter20 dig: why [`jump_is_safe`] refused (OrderedAdmit-snap consume diagnosis).
 pub(crate) fn jump_refuse_reason(cont: &ResumeContinuation) -> &'static str {
     let Some(snap) = cont.jump_snap.as_ref() else {
         return "no_snap";
@@ -488,7 +488,7 @@ pub(crate) fn jump_refuse_reason(cont: &ResumeContinuation) -> &'static str {
     if cont.cp.k == 0 && cont.effects.is_empty() && snap.opcode_steps == 0 {
         return "empty_cp0";
     }
-    // Three-pillar resolve: tip≡FF Bind tips on 597 often sit at PC 2–6k;
+    // Three-pillar resolve: tip≡FF OrderedAdmit tips on 597 often sit at PC 2–6k;
     // 2048 refused armable tips → steps_over / aj=0. Cap 8192 for storage/FF tips.
     let max_steps = if !cont.write_replays.is_empty()
         || !cont.call_outcomes.is_empty()
@@ -643,21 +643,21 @@ thread_local! {
     static PENDING_EFFECT_CP: Cell<bool> = const { Cell::new(false) };
     /// Iter4: SSTORE count on Handler::run plant path (hang-free, no Inspector).
     static HANDLER_SSTORE_STEPS: Cell<u64> = const { Cell::new(0) };
-    /// Iter19: hang-free Bind/EffectBoundary snap context (no IN_INSPECT / WaitHard demote).
+    /// Iter19: hang-free OrderedAdmit/EffectBoundary snap context (no IN_INSPECT / WaitHard demote).
     /// Distinct from PLANT so stock SSTORE + SoftWait Soft~0 stay unchanged.
     static BIND_SNAP: Cell<Option<PlantTls>> = const { Cell::new(None) };
-    /// Set by Bind-on-Data; consumed after stock SLOAD returns in Handler wrap.
+    /// Set by OrderedAdmit-on-Data; consumed after stock SLOAD returns in Handler wrap.
     static PENDING_BIND_SNAP: Cell<bool> = const { Cell::new(false) };
-    /// Bind-snap ordinal this incarnation (opcode_steps proxy for jump credit).
+    /// OrderedAdmit-snap ordinal this incarnation (opcode_steps proxy for jump credit).
     static BIND_SNAP_STEPS: Cell<u64> = const { Cell::new(0) };
-    /// Iter23: cumulative Bind SLOAD (addr, slot, value) within with_bind_snap_tls.
+    /// Iter23: cumulative OrderedAdmit SLOAD (addr, slot, value) within with_ordered_admit_snap_tls.
     static BIND_SLOAD_LOG: RefCell<Vec<(Address, U256, U256)>> =
         const { RefCell::new(Vec::new()) };
     /// Iter26: deepest tip≡FF snap deferred to TLS exit (one attach / resume).
     static BIND_SNAP_DEFERRED: RefCell<Option<(usize, BoundarySnapshot)>> =
         const { RefCell::new(None) };
     static PENDING_RESUME: RefCell<Option<BoundarySnapshot>> = const { RefCell::new(None) };
-    /// Iter29: hang-free nested Bind consume — stash on frame0 code_hash mismatch
+    /// Iter29: hang-free nested OrderedAdmit consume — stash on frame0 code_hash mismatch
     /// WITHOUT keeping PENDING_RESUME (Iter28e frame_init-defer hung). Natural
     /// nested frame_init in run_exec_loop re-arms + applies once on hash match.
     static NESTED_BIND_STASH: RefCell<Option<BoundarySnapshot>> = const { RefCell::new(None) };
@@ -667,7 +667,7 @@ thread_local! {
     /// Iter21: FF read-origin seeds applied only after successful PC restore.
     static PENDING_FF_ORIGIN_SEEDS: RefCell<Vec<(crate::MemoryLocationHash, crate::ReadOrigin)>> = const { RefCell::new(Vec::new()) };
     /// Iter22: certified-prefix FF Storage/Basic presents to warm in revm journal on
-    /// Bind abs jump (EIP-2929). Without this, jumped-past SLOADs leave slots cold →
+    /// OrderedAdmit abs jump (EIP-2929). Without this, jumped-past SLOADs leave slots cold →
     /// later SLOAD/SSTORE gas ≠ sequential → seq≠par on ERC-20.
     static PENDING_FF_READ_PRESENTS: RefCell<Vec<crate::specfence::rem::FfValue>> = const { RefCell::new(Vec::new()) };
     static PENDING_JOURNAL_BLOB: RefCell<Option<JournalBlob>> = const { RefCell::new(None) };
@@ -844,7 +844,7 @@ pub(crate) fn clear_pc_resume() {
     PENDING_LOG_REPLAYS.with(|c| c.borrow_mut().clear());
     PENDING_CALL_TOUCHES.with(|c| c.borrow_mut().clear());
     PENDING_CALL_TOUCH_BASICS.with(|c| c.borrow_mut().clear());
-    // Iter29: drop nested Bind stash with the rest of the arm.
+    // Iter29: drop nested OrderedAdmit stash with the rest of the arm.
     NESTED_BIND_STASH.with(|c| *c.borrow_mut() = None);
     NESTED_BIND_ATTEMPTS.set(0);
     NESTED_ALLOW_JDEPTH.set(false);
@@ -925,13 +925,13 @@ pub(crate) fn try_arm_safe_absolute_jump_gated(
         .jump_snap
         .clone()
         .expect("jump_is_safe implies jump_snap");
-    // Iter23: when Bind tip_sloads is present, require FF match on overlapping
+    // Iter23: when OrderedAdmit tip_sloads is present, require FF match on overlapping
     // slots — stale SLOAD values already consumed into require/SUB (ERC-20
     // revert dgas=+661); patching tops is insufficient → refuse.
-    // Iter27: cumulative Bind SLOAD log includes slots absent from certified
+    // Iter27: cumulative OrderedAdmit SLOAD log includes slots absent from certified
     // FF values — missing FF entry is OK; conflict (FF≠tip) still refuses;
     // require ≥1 overlapping match so tip still has Validated-fresh identity.
-    // Empty tip_sloads: allow legacy M1f/Inspector snaps (no Bind identity).
+    // Empty tip_sloads: allow legacy M1f/Inspector snaps (no OrderedAdmit identity).
     if snap.sstore_index == 0 && !snap.post_sstore && !snap.tip_sloads.is_empty() {
         let mut any_match = false;
         for (addr, slot, snap_val) in &snap.tip_sloads {
@@ -981,7 +981,7 @@ pub(crate) fn try_arm_safe_absolute_jump_gated(
     PENDING_WRITE_REPLAYS.with(|c| {
         *c.borrow_mut() = tip_writes;
     });
-    // Iter22: read-prefix Bind jump — warm FF presents so skipped SLOADs stay EIP-2929 warm.
+    // Iter22: read-prefix OrderedAdmit jump — warm FF presents so skipped SLOADs stay EIP-2929 warm.
     if snap.sstore_index == 0 && !snap.post_sstore && cont.write_replays.is_empty() {
         let presents: Vec<_> = cont.values.values().cloned().collect();
         if !presents.is_empty() {
@@ -1028,7 +1028,7 @@ pub(crate) fn try_arm_safe_absolute_jump_gated(
 /// When SpecFenceInspector is driving `inspect_run`, set `PENDING_EFFECT_CP` so
 /// `step_end` attaches a live PC/stack snap + journal blob to this k (M1e).
 
-/// Attach the latest Inspector snap at the current effect ordinal (SpecRead path).
+/// Attach the latest Inspector snap at the current effect ordinal (OptimisticRead path).
 /// Does not push an EffectBoundary checkpoint (those livelocked ERC-20 schedules).
 pub(crate) fn attach_current_live_snap(tx_idx: TxIdx, partial_retry: &PartialRetryTable) {
     let Some(snap) = last_boundary_snap() else {
@@ -1041,7 +1041,7 @@ pub(crate) fn attach_current_live_snap(tx_idx: TxIdx, partial_retry: &PartialRet
 }
 
 /// Arm Inspector step_end live-snap capture without rem checkpoint plant.
-/// Used by Bind-on-Data lite after `note_certified_with_effect_boundary`.
+/// Used by OrderedAdmit-on-Data lite after `note_certified_with_effect_boundary`.
 pub(crate) fn arm_pending_effect_cp_only() {
     PENDING_EFFECT_CP.set(true);
 }
@@ -1104,7 +1104,7 @@ fn push_cp(kind: CheckpointKind, snap: Option<BoundarySnapshot>) {
 
 fn record_pc_resume(skipped: u64) {
     LAST_SKIPPED.set(skipped);
-    // Iter21: Bind-snap Lean jumps apply via Handler run_exec_loop without PLANT
+    // Iter21: OrderedAdmit-snap Lean jumps apply via Handler run_exec_loop without PLANT
     // TLS — still record aj/pc_resume via BIND_SNAP metrics so digs aren't blind
     // (aj=0 while jump applied → silent seq≠par).
     let mut recorded = false;
@@ -1188,7 +1188,7 @@ where
 }
 
 /// Iter22: warm certified-prefix FF reads into revm journal without Db re-entry.
-/// Read-prefix Bind jump skips SLOADs; without warm slots, later SLOAD/SSTORE pay
+/// Read-prefix OrderedAdmit jump skips SLOADs; without warm slots, later SLOAD/SSTORE pay
 /// cold gas and receipts diverge (ERC-20 aj>0 ∧ seq≠par).
 fn apply_ff_read_presents<CTX>(
     context: &mut CTX,
@@ -1568,14 +1568,14 @@ pub(crate) fn pending_resume_armed() -> bool {
     PENDING_RESUME.with(|c| c.borrow().is_some())
 }
 
-/// Iter30: Lean-safe nested Bind consume **default-on**.
+/// Iter30: Lean-safe nested OrderedAdmit consume **default-on**.
 /// Differs from Iter28e frame_init-defer: PENDING cleared on mismatch; stash is
 /// consulted after natural nested frame_init hash match.
 /// Iter29 default-on hung Lean seq≠par — Iter30 narrows apply with:
 ///   tip_sloads addr ≡ target_address ∧ call_depth≤2 ∧ tip≡FF
 /// so silent default stays Lean seq≡par. Opt-out: `SPECFENCE_NESTED_BIND=0`.
 /// Dig override `=1` same as default (gates still apply).
-pub(crate) fn nested_bind_consume_enabled() -> bool {
+pub(crate) fn nested_ordered_admit_consume_enabled() -> bool {
     match std::env::var_os("SPECFENCE_NESTED_BIND") {
         None => true, // Iter30: Lean-safe default-on
         Some(v) => {
@@ -1641,13 +1641,13 @@ fn nested_apply_lean_safe(snap: &BoundarySnapshot, target: Address, call_depth: 
     call_depth <= 2 && tip_sloads_addr_eq_target(snap, target) && tip_sloads_match_pending_ff(snap)
 }
 
-/// Credit nested Bind tip steps then clear (hang-free Lean-safe refuse path).
-fn credit_nested_bind_tip(snap: &BoundarySnapshot) {
+/// Credit nested OrderedAdmit tip steps then clear (hang-free Lean-safe refuse path).
+fn credit_nested_ordered_admit_tip(snap: &BoundarySnapshot) {
     if snap.opcode_steps > 0 {
         BIND_SNAP.with(|b| {
             if let Some(ctx) = b.get() {
                 let metrics = unsafe { &*ctx.metrics };
-                metrics.record_bind_snap_credit(snap.opcode_steps);
+                metrics.record_ordered_admit_snap_credit(snap.opcode_steps);
             }
         });
     }
@@ -1663,16 +1663,16 @@ fn credit_nested_bind_tip(snap: &BoundarySnapshot) {
     clear_pc_resume();
 }
 
-/// True when a nested Bind tip is stashed awaiting natural CALL match.
+/// True when a nested OrderedAdmit tip is stashed awaiting natural CALL match.
 #[inline]
-pub(crate) fn nested_bind_stash_armed() -> bool {
+pub(crate) fn nested_ordered_admit_stash_armed() -> bool {
     NESTED_BIND_STASH.with(|c| c.borrow().is_some())
 }
 
-/// Iter29/30: after natural nested `frame_init`, apply stashed Bind tip iff
+/// Iter29/30: after natural nested `frame_init`, apply stashed OrderedAdmit tip iff
 /// code_hash matches **and** Lean-safe gates pass (Iter30). Hard attempt budget —
 /// never spins / never keeps PENDING across frames.
-pub(crate) fn try_consume_nested_bind_resume<CTX>(
+pub(crate) fn try_consume_nested_ordered_admit_resume<CTX>(
     interp: &mut Interpreter<EthInterpreter>,
     context: &mut CTX,
     call_depth: u16,
@@ -1680,7 +1680,7 @@ pub(crate) fn try_consume_nested_bind_resume<CTX>(
     CTX: ContextTr,
     CTX::Journal: JournalExt,
 {
-    if RESUME_APPLIED.get() || !nested_bind_consume_enabled() {
+    if RESUME_APPLIED.get() || !nested_ordered_admit_consume_enabled() {
         return;
     }
     let Some(snap) = NESTED_BIND_STASH.with(|c| c.borrow().clone()) else {
@@ -1720,7 +1720,7 @@ pub(crate) fn try_consume_nested_bind_resume<CTX>(
             );
         }
         NESTED_BIND_STASH.with(|c| *c.borrow_mut() = None);
-        credit_nested_bind_tip(&snap);
+        credit_nested_ordered_admit_tip(&snap);
         return;
     }
     if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
@@ -1762,7 +1762,7 @@ pub(crate) fn try_apply_pending_pc_resume<CTX>(
         return;
     };
     if snap.call_depth != call_depth && !(snap.call_depth <= 1 && call_depth <= 1) {
-        // Iter29/30: Lean CALL_DEPTH stays 0 on Bind tips; nested consume applies
+        // Iter29/30: Lean CALL_DEPTH stays 0 on OrderedAdmit tips; nested consume applies
         // onto frame.depth≥2 after natural CALL — allow under NESTED_ALLOW_JDEPTH.
         // Iter30: depth≤2 only (≤8 was Lean seq≠par under concurrency).
         if NESTED_ALLOW_JDEPTH.get() && snap.call_depth <= 1 && call_depth <= 2 {
@@ -1787,11 +1787,11 @@ pub(crate) fn try_apply_pending_pc_resume<CTX>(
         let actual = interp.bytecode.get_or_calculate_hash();
         if actual != expected {
             // Iter28: defer-until-match keeping PENDING across frame_init hung.
-            // Iter29 hang-free nested Bind consume: stash Bind tip, clear
+            // Iter29 hang-free nested OrderedAdmit consume: stash OrderedAdmit tip, clear
             // PENDING_RESUME so unrelated frames do not re-enter try_apply;
             // natural nested frame_init re-arms once on code_hash match.
             if snap.sstore_index == 0 && !snap.post_sstore && !snap.tip_sloads.is_empty() {
-                if nested_bind_consume_enabled() && tip_sloads_homogeneous(&snap) {
+                if nested_ordered_admit_consume_enabled() && tip_sloads_homogeneous(&snap) {
                     // Iter30: stash only homogeneous tip_sloads (single callee).
                     // Multi-addr cumulative logs credit (no stash tax). Consume
                     // still filters addr≡target ∧ depth≤2 ∧ tip≡FF.
@@ -1809,9 +1809,9 @@ pub(crate) fn try_apply_pending_pc_resume<CTX>(
                     // Keep FF presents / write_replays / log / call touches for later apply.
                     return;
                 }
-                // Hang-free nested Bind *credit* — multi-addr tip_sloads or apply off.
+                // Hang-free nested OrderedAdmit *credit* — multi-addr tip_sloads or apply off.
                 // Abs apply on frame0 would refuse; credit steps (no PENDING defer).
-                credit_nested_bind_tip(&snap);
+                credit_nested_ordered_admit_tip(&snap);
                 return;
             }
             if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
@@ -1833,9 +1833,9 @@ pub(crate) fn try_apply_pending_pc_resume<CTX>(
         clear_pc_resume();
         return;
     }
-    // Iter22: Bind read-prefix tips are top-level only. journal.depth()>1 means we
+    // Iter22: OrderedAdmit read-prefix tips are top-level only. journal.depth()>1 means we
     // would apply a tip onto the wrong frame (nested CALL) — refuse.
-    // Iter29: nested Bind consume explicitly allows jdepth>1 for one-shot match.
+    // Iter29: nested OrderedAdmit consume explicitly allows jdepth>1 for one-shot match.
     let jdepth = context.journal().depth();
     if snap.sstore_index == 0 && !snap.post_sstore && jdepth > 1 && !NESTED_ALLOW_JDEPTH.get() {
         if std::env::var_os("SPECFENCE_JUMP_DIG").is_some() {
@@ -1892,7 +1892,7 @@ pub(crate) fn try_apply_pending_pc_resume<CTX>(
     if !writes.is_empty() {
         apply_write_replays(context, &writes);
     }
-    // Iter22: warm FF read presents before PC restore (Bind jump read-prefix).
+    // Iter22: warm FF read presents before PC restore (OrderedAdmit jump read-prefix).
     let ff_reads = PENDING_FF_READ_PRESENTS.with(|c| std::mem::take(&mut *c.borrow_mut()));
     if !ff_reads.is_empty() {
         let prefer_tx = {
@@ -1909,7 +1909,7 @@ pub(crate) fn try_apply_pending_pc_resume<CTX>(
     }
     let skipped = snap.opcode_steps;
     snap.apply_to_interp(interp);
-    // Iter23: stack↔FF reconcile for cumulative Bind SLOADs (stale earlier
+    // Iter23: stack↔FF reconcile for cumulative OrderedAdmit SLOADs (stale earlier
     // balances on stack → ERC-20 require revert under jump).
     if !snap.tip_sloads.is_empty() {
         use crate::specfence::rem::FfValue;
@@ -1947,37 +1947,37 @@ pub(crate) fn try_apply_pending_pc_resume<CTX>(
     record_pc_resume(skipped);
 }
 
-/// Iter19: true while `with_bind_snap_tls` is active (Hang-free Bind snap, no plant).
-pub(crate) fn bind_snap_tls_active() -> bool {
+/// Iter19: true while `with_ordered_admit_snap_tls` is active (Hang-free OrderedAdmit snap, no plant).
+pub(crate) fn ordered_admit_snap_tls_active() -> bool {
     BIND_SNAP.with(|c| c.get().is_some())
 }
 
-/// Arm Bind-snap capture after Bind-on-Data / EffectBoundary certify (SLOAD wrap consumes).
-pub(crate) fn note_pending_bind_snap() {
-    if bind_snap_tls_active() {
+/// Arm OrderedAdmit-snap capture after OrderedAdmit-on-Data / EffectBoundary certify (SLOAD wrap consumes).
+pub(crate) fn note_pending_ordered_admit_snap() {
+    if ordered_admit_snap_tls_active() {
         PENDING_BIND_SNAP.set(true);
     }
 }
 
-/// Iter24/25 Bind-snap capture mode.
+/// Iter24/25 OrderedAdmit-snap capture mode.
 /// - `Off`: no Handler wrap / no TLS (SPECFENCE_BIND_SNAP=0).
 /// - `ResumePath` (silent default / `=resume`): capture only on SuffixRepair resume /
-///   force_bind / needs_live_capture — **no mass-path SNAP tax**.
+///   force_ordered_admit / needs_live_capture — **no mass-path SNAP tax**.
 /// - `Mass`: every Lean SpecFence execute (`SPECFENCE_BIND_SNAP=1` dig).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BindSnapMode {
+pub(crate) enum OrderedAdmitSnapMode {
     Off,
     ResumePath,
     Mass,
 }
 
-/// Resolve Bind-snap mode from `SPECFENCE_BIND_SNAP`.
+/// Resolve OrderedAdmit-snap mode from `SPECFENCE_BIND_SNAP`.
 /// Iter25: default **ResumePath** (silent production) — hang-free with
 /// refuse-if-stale + tip_sloads-gated jump (Mass JUMP was the Lean hang).
 /// Force Off: `=0`; Mass dig: `=1`. No every-Handler tax on ResumePath.
-pub(crate) fn bind_snap_mode() -> BindSnapMode {
+pub(crate) fn ordered_admit_snap_mode() -> OrderedAdmitSnapMode {
     match std::env::var_os("SPECFENCE_BIND_SNAP") {
-        None => BindSnapMode::ResumePath,
+        None => OrderedAdmitSnapMode::ResumePath,
         Some(v) => {
             let s = v.to_string_lossy();
             if s == "0"
@@ -1985,37 +1985,37 @@ pub(crate) fn bind_snap_mode() -> BindSnapMode {
                 || s.eq_ignore_ascii_case("off")
                 || s.eq_ignore_ascii_case("no")
             {
-                BindSnapMode::Off
+                OrderedAdmitSnapMode::Off
             } else if s == "1"
                 || s.eq_ignore_ascii_case("true")
                 || s.eq_ignore_ascii_case("yes")
                 || s.eq_ignore_ascii_case("mass")
             {
-                BindSnapMode::Mass
+                OrderedAdmitSnapMode::Mass
             } else if s.eq_ignore_ascii_case("resume") {
-                BindSnapMode::ResumePath
+                OrderedAdmitSnapMode::ResumePath
             } else {
                 // Unknown → ResumePath (same as unset), not Off — keep silent default.
-                BindSnapMode::ResumePath
+                OrderedAdmitSnapMode::ResumePath
             }
         }
     }
 }
 
 /// Env gate (compat): true only for **Mass** dig (`SPECFENCE_BIND_SNAP=1`).
-pub(crate) fn bind_snap_env_enabled() -> bool {
-    bind_snap_mode() == BindSnapMode::Mass
+pub(crate) fn ordered_admit_snap_env_enabled() -> bool {
+    ordered_admit_snap_mode() == OrderedAdmitSnapMode::Mass
 }
 
-/// True when any Bind-snap capture path may run (ResumePath or Mass).
-pub(crate) fn bind_snap_capture_wanted() -> bool {
-    !matches!(bind_snap_mode(), BindSnapMode::Off)
+/// True when any OrderedAdmit-snap capture path may run (ResumePath or Mass).
+pub(crate) fn ordered_admit_snap_capture_wanted() -> bool {
+    !matches!(ordered_admit_snap_mode(), OrderedAdmitSnapMode::Off)
 }
 
-/// Iter24: absolute Bind jump enabled when capture mode is on, unless
+/// Iter24: absolute OrderedAdmit jump enabled when capture mode is on, unless
 /// `SPECFENCE_BIND_SNAP_JUMP=0`. Explicit `=1` forces on (dig). Refuse-if-stale
 /// still gates arming. SoftWait Soft stays ~0.
-pub(crate) fn bind_snap_jump_enabled() -> bool {
+pub(crate) fn ordered_admit_snap_jump_enabled() -> bool {
     match std::env::var_os("SPECFENCE_BIND_SNAP_JUMP") {
         Some(v) => {
             let s = v.to_string_lossy();
@@ -2029,21 +2029,21 @@ pub(crate) fn bind_snap_jump_enabled() -> bool {
                 s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
             }
         }
-        None => bind_snap_capture_wanted(),
+        None => ordered_admit_snap_capture_wanted(),
     }
 }
 
-/// Install SLOAD Bind-snap wrap when ResumePath/Mass/inspect may capture.
-pub(crate) fn handler_bind_snap_install_wanted() -> bool {
+/// Install SLOAD OrderedAdmit-snap wrap when ResumePath/Mass/inspect may capture.
+pub(crate) fn handler_ordered_admit_snap_install_wanted() -> bool {
     if crate::specfence::research_inspect_enabled() {
         return true;
     }
-    bind_snap_capture_wanted()
+    ordered_admit_snap_capture_wanted()
 }
 
-/// Scoped Bind-snap TLS for Lean SpecFence execute (no IN_INSPECT / no WaitHard demote).
+/// Scoped OrderedAdmit-snap TLS for Lean SpecFence execute (no IN_INSPECT / no WaitHard demote).
 /// Caller selects when to invoke (Mass = every Lean run; ResumePath = repair only).
-pub(crate) fn with_bind_snap_tls<R>(
+pub(crate) fn with_ordered_admit_snap_tls<R>(
     tx_idx: TxIdx,
     partial_retry: &PartialRetryTable,
     metrics: &MetricsInner,
@@ -2078,7 +2078,7 @@ pub(crate) fn with_bind_snap_tls<R>(
                 let table = unsafe { &*ctx.partial_retry };
                 table.attach_live_boundary_at(ctx.tx_idx, k, snap, JournalBlob::default());
                 let metrics = unsafe { &*ctx.metrics };
-                metrics.record_handler_bind_snap_capture();
+                metrics.record_handler_ordered_admit_snap_capture();
             }
         }
     });
@@ -2090,21 +2090,21 @@ pub(crate) fn with_bind_snap_tls<R>(
     out
 }
 
-/// EthInterpreter SLOAD wrap: stock SLOAD; after Bind-on-Data, capture live tip at
+/// EthInterpreter SLOAD wrap: stock SLOAD; after OrderedAdmit-on-Data, capture live tip at
 /// certified-prefix end (k < k_fail on RAW-read fails). Hang-free — no inspect_run.
 #[inline(always)]
-pub(crate) fn sload_bind_snap_eth<H: revm::interpreter::Host + ?Sized>(
+pub(crate) fn sload_ordered_admit_snap_eth<H: revm::interpreter::Host + ?Sized>(
     context: revm::interpreter::InstructionContext<'_, H, EthInterpreter>,
 ) {
-    if !bind_snap_tls_active() {
+    if !ordered_admit_snap_tls_active() {
         revm::interpreter::instructions::host::sload(context);
         return;
     }
-    sload_bind_snap_eth_slow(context);
+    sload_ordered_admit_snap_eth_slow(context);
 }
 
 #[cold]
-fn sload_bind_snap_eth_slow<H: revm::interpreter::Host + ?Sized>(
+fn sload_ordered_admit_snap_eth_slow<H: revm::interpreter::Host + ?Sized>(
     context: revm::interpreter::InstructionContext<'_, H, EthInterpreter>,
 ) {
     let interp_ptr = context.interpreter as *mut Interpreter<EthInterpreter>;
@@ -2130,7 +2130,7 @@ fn sload_bind_snap_eth_slow<H: revm::interpreter::Host + ?Sized>(
     let code_hash = Some(interp.bytecode.get_or_calculate_hash());
     let mem_gas = *interp.gas.memory();
     let stack: Vec<_> = interp.stack.data().to_vec();
-    // Iter23: accumulate ALL Bind SLOADs this incarnation — earlier stale
+    // Iter23: accumulate ALL OrderedAdmit SLOADs this incarnation — earlier stale
     // balances left on stack caused ERC-20 revert (status false, dgas=+661).
     let mut tip_sloads = BIND_SLOAD_LOG.with(|c| c.borrow().clone());
     if let (Some(slot), Some(val)) = (tip_slot, stack.last().copied()) {
@@ -2190,7 +2190,7 @@ fn sload_bind_snap_eth_slow<H: revm::interpreter::Host + ?Sized>(
         let mut slot = c.borrow_mut();
         let replace = match slot.as_ref() {
             None => true,
-            Some((_, old)) => deferred_bind_tip_better(&snap, old),
+            Some((_, old)) => deferred_ordered_admit_tip_better(&snap, old),
         };
         if replace {
             *slot = Some((k_now, snap));
@@ -2201,7 +2201,7 @@ fn sload_bind_snap_eth_slow<H: revm::interpreter::Host + ?Sized>(
 /// Capture-time tip rank for single deferred attach (no mass SNAP).
 /// Prefer in-cap tips; among equals prefer tip≡FF; among over-cap prefer fewer steps.
 #[inline]
-fn deferred_bind_tip_better(new: &BoundarySnapshot, old: &BoundarySnapshot) -> bool {
+fn deferred_ordered_admit_tip_better(new: &BoundarySnapshot, old: &BoundarySnapshot) -> bool {
     const CAP: u64 = 8192;
     let new_ok = new.opcode_steps > 0 && new.opcode_steps <= CAP;
     let old_ok = old.opcode_steps > 0 && old.opcode_steps <= CAP;
@@ -2224,14 +2224,14 @@ fn deferred_bind_tip_better(new: &BoundarySnapshot, old: &BoundarySnapshot) -> b
     new.opcode_steps < old.opcode_steps
 }
 
-/// Install SLOAD Bind-snap capture on Mainnet instruction table (Iter19).
-pub(crate) fn install_handler_bind_snap_capture<H: revm::interpreter::Host>(
+/// Install SLOAD OrderedAdmit-snap capture on Mainnet instruction table (Iter19).
+pub(crate) fn install_handler_ordered_admit_snap_capture<H: revm::interpreter::Host>(
     instructions: &mut revm::handler::instructions::EthInstructions<EthInterpreter, H>,
 ) {
     const OP_SLOAD: u8 = 0x54;
     instructions.insert_instruction(
         OP_SLOAD,
-        revm::interpreter::Instruction::new(sload_bind_snap_eth::<H>, 0),
+        revm::interpreter::Instruction::new(sload_ordered_admit_snap_eth::<H>, 0),
     );
 }
 
@@ -2388,8 +2388,8 @@ where
     fn initialize_interp(&mut self, interp: &mut Interpreter<EthInterpreter>, context: &mut CTX) {
         try_apply_pending_pc_resume(interp, context, CALL_DEPTH.get());
         // Iter29: Inspector nested frames — consume stash on hash match (no PENDING defer).
-        if nested_bind_stash_armed() {
-            try_consume_nested_bind_resume(interp, context, CALL_DEPTH.get());
+        if nested_ordered_admit_stash_armed() {
+            try_consume_nested_ordered_admit_resume(interp, context, CALL_DEPTH.get());
         }
     }
 
