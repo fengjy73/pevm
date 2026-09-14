@@ -14,6 +14,10 @@ use crate::{
     specfence::{FenceGraph, ReadyEdgeTable, WaveParkTable},
 };
 
+/// After refuse_admit, probe this many later txs for an independent Execute.
+/// Wide enough for RAW_fan_out holes; small enough to stay work-conserving.
+const WAVE_FILL_WINDOW: usize = 32;
+
 // The Pevm collaborative scheduler coordinates execution & validation
 // tasks among work threads.
 //
@@ -248,6 +252,14 @@ impl Scheduler {
                     }
                     return Some(Task::Execution(tx_version));
                 }
+                // Wave fill: refused known consumer — steal the next independent
+                // without fighting admit_spine(w) fetch_min. Do not idle on the head.
+                if let Some(wave) = wave
+                    && let Some(task) =
+                        self.try_fill_independent_after_refuse(execution_idx, wave, ready)
+                {
+                    return Some(task);
+                }
             }
 
             // Prioritize a validation task to minimize re-execution
@@ -355,6 +367,36 @@ impl Scheduler {
         if let Some(tx_version) = self.try_execute_ready(idx, Some(wave), ready) {
             wave.note_ready_steal_if_after_park();
             return Some(Task::Execution(tx_version));
+        }
+        self.try_fill_independent_after_refuse(idx, wave, ready)
+    }
+
+    /// After `refuse_admit` of `from`, run the next independent in a short window.
+    /// Does **not** `fetch_max(from+1)` (that fights `admit_spine` fetch_min).
+    fn try_fill_independent_after_refuse(
+        &self,
+        from: TxIdx,
+        wave: &WaveParkTable,
+        ready: Option<&ReadyEdgeTable>,
+    ) -> Option<Task> {
+        let Some(edges) = ready else {
+            return None;
+        };
+        if edges.may_execute(from) {
+            return None;
+        }
+        let end = from.saturating_add(WAVE_FILL_WINDOW).min(self.block_size);
+        for cand in (from + 1)..end {
+            if !edges.may_execute(cand) {
+                continue;
+            }
+            if let Some(tx_version) = self.try_execute_ready(cand, Some(wave), ready) {
+                // Steal only — do not fetch_max(cand+1). Jumping the
+                // collaborative index past refused consumers dropped them
+                // off ready (iter11 lazy-eval unreachable / SIGSEGV).
+                wave.note_ready_steal_if_after_park();
+                return Some(Task::Execution(tx_version));
+            }
         }
         None
     }
@@ -944,6 +986,38 @@ mod tests {
             "first-wave (inc==0) must refuse while ProducerStage(w) Executing"
         );
         assert!(ready.refuse_count() >= 1);
+    }
+
+    #[test]
+    fn refuse_wave_fill_runs_independent() {
+        let s = Scheduler::new(6);
+        let ready = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        ready.note_consumer(1, 0);
+        let first = s
+            .next_task_with_wave_ready(Some(&wave), Some(&ready))
+            .expect("producer");
+        let Task::Execution(v0) = first else {
+            panic!("expected Execution");
+        };
+        assert_eq!(v0.tx_idx, 0);
+        let second = s
+            .next_task_with_wave_ready(Some(&wave), Some(&ready))
+            .expect("wave fill must not idle on refused consumer 1");
+        let Task::Execution(v) = second else {
+            panic!("expected Execution, got {second:?}");
+        };
+        assert_eq!(
+            v.tx_idx, 2,
+            "refuse 1 while 0 Executing must steal independent 2"
+        );
+        assert_eq!(ready.refuse_count(), 1, "defer is idempotent");
+        assert!(s.try_execute_ready(1, Some(&wave), Some(&ready)).is_none());
+        assert_eq!(
+            ready.refuse_count(),
+            1,
+            "second refuse of the same consumer must not spin-count"
+        );
     }
 
     #[test]

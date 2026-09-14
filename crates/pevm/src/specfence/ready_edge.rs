@@ -142,10 +142,16 @@ impl ReadyEdgeTable {
             .filter(|&w| w < tx_idx && !self.finished.contains_key(&w))
     }
 
+    /// Defer a known consumer. Count once until the producer finishes —
+    /// re-probing the same head must not spin `refuse_admit` (19606599 31k).
     #[inline]
     pub(crate) fn defer(&self, tx_idx: TxIdx) {
+        let mut d = self.deferred.lock().unwrap();
+        if d.iter().any(|&t| t == tx_idx) {
+            return;
+        }
         self.refuse.fetch_add(1, Ordering::Relaxed);
-        self.deferred.lock().unwrap().push(tx_idx);
+        d.push(tx_idx);
     }
 
     #[inline]
@@ -183,6 +189,12 @@ mod tests {
         t.note_unpublished(9, 0);
         t.note_consumer(4, 0);
         t.defer(4);
+        t.defer(4);
+        assert_eq!(
+            t.refuse_count(),
+            1,
+            "defer is idempotent until producer_done"
+        );
         t.note_producer_done(0, &wave);
         assert!(t.may_execute(4));
         assert_eq!(wave.pop_ready(), Some(4));

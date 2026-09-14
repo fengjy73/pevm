@@ -520,7 +520,9 @@ fn discover_nonempty_blocks(data_dir: &Path) -> Vec<u64> {
         let Some(s) = name.to_str() else { continue };
         let Ok(bn) = s.parse::<u64>() else { continue };
         let block_path = ent.path().join("block.json");
-        let Ok(f) = File::open(&block_path) else { continue };
+        let Ok(f) = File::open(&block_path) else {
+            continue;
+        };
         let Ok(block) = serde_json::from_reader::<_, Block<<PevmEthereum as PevmChain>::Transaction>>(
             BufReader::new(f),
         ) else {
@@ -562,7 +564,10 @@ fn main() {
     let (bytecodes, block_hashes) = load_shared(&data_dir);
 
     let blocks = blocks.unwrap_or_else(|| discover_nonempty_blocks(&data_dir));
-    eprintln!("all-blocks upper-bound harness: {} nonempty candidates", blocks.len());
+    eprintln!(
+        "all-blocks upper-bound harness: {} nonempty candidates",
+        blocks.len()
+    );
 
     let mut summaries = Vec::new();
 
@@ -578,8 +583,7 @@ fn main() {
         }
         eprintln!(
             "=== block {bn} n_tx={} gas={} ===",
-            n,
-            loaded.block.header.gas_used
+            n, loaded.block.header.gas_used
         );
 
         let serial = run_serial(&chain, &loaded);

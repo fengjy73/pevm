@@ -190,7 +190,25 @@ impl BayesMap {
         self.locations.iter().all(|e| e.mean() < DEFAULT_TAU)
     }
 
+    /// begin_block admit port: high \(P_{\mathrm{RAW}}\) must seed PE / ReadyEdges.
+    #[inline]
+    pub(crate) fn query_admit(&self, location: MemoryLocationHash) -> bool {
+        self.prior_wait_probability(location) >= DEFAULT_TAU
+    }
+
+    /// Visit locations whose posterior clears the admit seed threshold.
+    pub(crate) fn for_each_admit_hit(&self, mut f: impl FnMut(MemoryLocationHash)) {
+        for e in self.locations.iter() {
+            if e.mean() >= DEFAULT_TAU {
+                f(*e.key());
+            }
+        }
+    }
+
     /// Query port at admit / decide / validate (v9.1). Not a Boolean π.
+    ///
+    /// Single unfinished producer (Ready **or** Executing) is high `depth_frac` —
+    /// ReadyCanary of a known RAW writer is the fan_out abort class.
     pub(crate) fn query_access(
         &self,
         location: MemoryLocationHash,
@@ -200,7 +218,8 @@ impl BayesMap {
     ) -> BayesAccessQuery {
         let p_raw = self.prior_wait_probability(location);
         let p_ordered_admit = self.ordered_admit_useful_probability(location);
-        let depth_frac = if unfinished <= 1 && writer_executing {
+        let single_unfinished = unfinished == 1;
+        let depth_frac = if single_unfinished {
             0.85
         } else if unfinished > 1 {
             0.35
@@ -216,7 +235,7 @@ impl BayesMap {
             quiet_cold: self.is_cold() && p_raw < DEFAULT_TAU,
             depth_frac,
             ev_wait_for_dependency_beats_abort: ev_wait_for_dependency >= ev_abort
-                && writer_executing,
+                && (writer_executing || single_unfinished),
             ev_ordered_admit_beats_full_abort: ev_ordered_admit >= 0.20 && published_data,
             known_star: p_raw >= DEFAULT_TAU,
         }
@@ -542,6 +561,22 @@ impl BayesMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_admit_and_single_unfinished_wait_ev() {
+        let bayes = BayesMap::new();
+        let loc = 7u64;
+        assert!(!bayes.query_admit(loc), "prior must not seed admit");
+        assert!(bayes.observe_conflict_location(loc));
+        assert!(bayes.query_admit(loc));
+        let q = bayes.query_access(loc, false, 1, false);
+        assert!(
+            q.ev_wait_for_dependency_beats_abort,
+            "Ready single unfinished writer must open wait EV"
+        );
+        assert!(q.depth_frac >= 0.50);
+        assert!(q.known_star);
+    }
 
     #[test]
     fn revoke_clears_when_posterior_low() {

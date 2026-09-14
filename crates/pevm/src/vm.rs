@@ -481,16 +481,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
         // PE-on: true stream \(k\). Empty-PE never reaches HashMap note.
         let access_k = self.specfence.access_log.note(self.tx_idx, location_hash);
         if !self.specfence.learner.location_predicted(location_hash) {
-            // Storage RAW of a hinted star account: plant PE at this stream k
-            // (admit only seeded Basic(addr)@k≈6 — hot RAW is often storage).
-            let basic = hash_deterministic(MemoryLocation::Basic(address));
-            if self.specfence.learner.location_predicted(basic) {
-                self.specfence
-                    .learner
-                    .seed_predicted_essential(location_hash, access_k);
-            } else {
-                return Ok(());
-            }
+            // Do **not** clone Basic(addr) PE onto every Storage(addr,slot).
+            // That opened WaitFor/ESTIMATE on the first SLOAD of a hint-fan
+            // account (14689597: 263 wait→full_abort vs OCC 29). Storage RAW
+            // becomes PE-on at abort true-k / InterPrior / Bayes admit only.
+            return Ok(());
         }
 
         let vis = self.access_vis(location_hash);
@@ -767,7 +762,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 .ready_edges
                 .predicted_producer(location_hash)
                 .is_some();
-        let kind = crate::specfence::fence_act::estimate_park_kind(pe_known);
+        let mut kind = crate::specfence::fence_act::estimate_park_kind(pe_known);
         let access_k = self
             .specfence
             .access_log
@@ -778,14 +773,23 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 .specfence
                 .access_log
                 .prefix_before(self.tx_idx, access_k);
-            self.specfence
+            let armed = self
+                .specfence
                 .partial_retry
                 .arm_wait_for_dependency_checkpoint(
                     self.tx_idx,
                     location_hash,
                     access_k.max(1),
                     &prefix,
-                )
+                );
+            if crate::specfence::fence_act::wait_for_resume_armed(armed) {
+                armed
+            } else {
+                // No honest prefix — WaitForDependency park wakes FullAbortReexecute
+                // (14689597: 263 wait + 243 abort vs OCC 29). Stay OCC BlockingOther.
+                kind = crate::specfence::ParkKind::BlockingOther;
+                self.specfence.partial_retry.current_k(self.tx_idx) as u64
+            }
         } else {
             self.specfence.partial_retry.current_k(self.tx_idx) as u64
         };
@@ -926,6 +930,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
             .specfence
             .partial_retry
             .arm_wait_for_dependency_checkpoint(self.tx_idx, location_hash, access_k, &prefix);
+        // Edges already reserved. Park only when rem can ResumeAtK.
+        // Park-then-full_abort_reexecute is idle + OCC abort (14689597).
+        if !crate::specfence::fence_act::wait_for_resume_armed(armed_at_k) {
+            return self.occ_optimistic_read();
+        }
         self.note_fence_success(location_hash);
         self.pcc_this_tx
             .set(self.pcc_this_tx.get().saturating_add(1));

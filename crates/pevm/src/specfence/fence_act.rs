@@ -73,6 +73,14 @@ pub(crate) fn estimate_park_kind(pe_known: bool) -> ParkKind {
     }
 }
 
+/// WaitForDependency may park only when rem can ResumeAtK (`armed_at_k>0`).
+/// Empty / tiny prefix → do **not** park (OCC-equal `optimistic_read`).
+/// Park-then-`full_abort_reexecute` is the 14689597 honesty tax.
+#[inline]
+pub(crate) fn wait_for_resume_armed(armed_at_k: u64) -> bool {
+    armed_at_k > 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,6 +126,13 @@ mod tests {
             ),
             "DoneOptimisticRead must not write partial_abort bait cert"
         );
+    }
+
+    #[test]
+    #[test]
+    fn wait_for_parks_only_when_resume_armed() {
+        assert!(!wait_for_resume_armed(0), "empty prefix must not park");
+        assert!(wait_for_resume_armed(9));
     }
 
     #[test]

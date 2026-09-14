@@ -1,10 +1,11 @@
-//! SpecFenceComputer — PC ⊗ CC jointly author the ready-set.
+//! SpecFenceComputer — fused ready-set on one pevm spine (v10).
 //!
-//! Plant SoT: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md`.
-//! PC: Stages / steal / pipeline / ProducerStage / wall.
+//! Plant SoT: `lab/notes/specfence-complete-architecture-v10-raw-mixed.md`.
+//! PC: Stages / steal / pipeline / ProducerStage / wave-fill / wall.
 //! CC: ReadyEdge / lane / OrderedAdmit / PE refuse — first-class, not annotation.
 //! Steal only Stages in ready. Never steal a PE-blocked Execute "to look busy".
 //! Refuse consumer only when ProducerStage(w) is runnable (v6 deadlock designed out).
+//! After refuse: scheduler wave-fills the next independent (`optimistic_read`).
 
 use super::metrics::MetricsInner;
 use super::producer_stage::ProducerStageTable;
