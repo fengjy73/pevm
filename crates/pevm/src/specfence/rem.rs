@@ -1201,7 +1201,7 @@ impl PartialRetryTable {
                 certified.push(access.location);
             }
         }
-        if certified.is_empty() {
+        if certified.is_empty() && force_bind {
             drop(st);
             self.repair.insert(tx_idx, RepairPlan::FullRestart);
             return ParkResumeKind::FullRetry;
@@ -1247,14 +1247,15 @@ impl PartialRetryTable {
         self.try_arm_park_resume_at_k_inner(tx_idx, armed_at_k, false)
     }
 
-    /// PinWithoutThrow: plant rem checkpoint from **snapped** prefix reads
-    /// so wake [`Self::try_arm_pinhold_resume_at_k`] can ResumeAtK.
+    /// PinWithoutThrow: plant rem checkpoint so wake ResumeAtK (not FullRetry).
     ///
-    /// Inventing a k=1 wait-loc grain (no `value_snap`) caused Iter26 seq≠par
-    /// (stale FF + repair_armed covers_all → R1b skip). First-access Wait
-    /// stays FullRetry. SoftWait Soft is **not** armed (Soft=0).
+    /// Journals access_log prefix (real reads). Wait loc is **not** a prefix
+    /// grain (first_k stays fail-k). First-access plants k=1 checkpoint with
+    /// empty prefix certified — PinHold resume allows empty certified
+    /// (no force-bind; empty FF → re-read; repair_armed stays false).
+    /// SoftWait Soft is **not** armed (Soft=0).
     ///
-    /// Returns `armed_at_k` (`> checkpoint k`), or 0 if no honest prefix.
+    /// Returns `armed_at_k` (`> checkpoint k`).
     pub(crate) fn arm_pinhold_checkpoint(
         &self,
         tx_idx: TxIdx,
@@ -1263,15 +1264,12 @@ impl PartialRetryTable {
         prefix: &[(MemoryLocationHash, u32)],
     ) -> u64 {
         if tx_idx >= self.states.len() {
-            return 0;
+            return access_k.max(2) as u64;
         }
         // SAFETY: single-executor invariant (waiter still owns this incarnation).
         let st = unsafe { self.state_mut(tx_idx) };
         for &(loc, k) in prefix {
             if k == 0 || loc == wait_loc {
-                continue;
-            }
-            if !st.value_snap.contains_key(&loc) && !st.inc_carry_snap.contains_key(&loc) {
                 continue;
             }
             let kk = k as usize;
@@ -1283,21 +1281,25 @@ impl PartialRetryTable {
                     mode: AccessMode::Read,
                 });
                 st.first_k.insert(loc, kk);
-                st.certified.insert(loc);
+                if st.value_snap.contains_key(&loc) || st.inc_carry_snap.contains_key(&loc) {
+                    st.certified.insert(loc);
+                }
             }
             if kk > st.k {
                 st.k = kk;
             }
         }
         if st.k == 0 {
-            return 0;
+            st.k = 1;
         }
-        st.certified.insert(wait_loc);
         let has_mid_cp = st.checkpoints.iter().any(|c| c.id.k > 0 && c.id.k <= st.k);
         if !has_mid_cp {
             let _ = st.push_checkpoint(tx_idx, CheckpointKind::EffectBoundary);
         }
-        st.k.saturating_add(1).max(access_k as usize) as u64
+        // Wait loc is the fail grain — not prefix-certified (covers_strips is
+        // CertificateTable note_fence_success, not rem first_k ≤ cp.k).
+        let _ = wait_loc;
+        st.k.saturating_add(1).max(access_k as usize).max(2) as u64
     }
 
     /// R1b timely Resolve: arm RewindTo when a mid-tx checkpoint exists.
@@ -2399,14 +2401,20 @@ mod p4_tk_park_tests {
     }
 
     #[test]
-    fn arm_pinhold_first_access_is_full_retry() {
+    fn arm_pinhold_first_access_resumes_without_force_bind() {
         let table = PartialRetryTable::new(2);
         table.reset_incarnation(0, 0);
         let armed = table.arm_pinhold_checkpoint(0, 7, 1, &[]);
-        assert_eq!(armed, 0, "no snapped prefix → no synthetic checkpoint");
-        assert_eq!(
-            table.try_arm_pinhold_resume_at_k(0, armed),
-            ParkResumeKind::FullRetry
+        assert!(armed >= 2, "first-access still arms checkpoint k=1");
+        match table.try_arm_pinhold_resume_at_k(0, armed) {
+            ParkResumeKind::ResumeAtK { checkpoint_k } => {
+                assert!(checkpoint_k > 0 && checkpoint_k < armed as usize);
+            }
+            other => panic!("PinHold must not FullRetry, got {other:?}"),
+        }
+        assert!(
+            !table.must_force_bind(0, 7),
+            "empty-prefix PinHold must not force-bind"
         );
     }
 

@@ -187,8 +187,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
             fg.deep_begin_consumer(tx_idx, incarnation);
         }
         if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
-            let repair_armed = self.specfence.partial_retry.is_rewind_resume(tx_idx)
-                || self.specfence.partial_retry.has_ff_head(tx_idx);
+            // repair_armed covers_all only with real FF values. PinHold ResumeAtK
+            // with empty FF must not pretend sibling Spec is certified (Iter26).
+            let repair_armed = (self.specfence.partial_retry.is_rewind_resume(tx_idx)
+                || self.specfence.partial_retry.has_ff_head(tx_idx))
+                && self.specfence.partial_retry.has_ff_resume_values(tx_idx);
             self.specfence
                 .certificates
                 .begin_execute(tx_idx, repair_armed, incarnation);
@@ -1764,26 +1767,28 @@ impl<S: Storage> Database for VmDb<'_, S> {
             // M1b: cache basics for FF (single-origin origin) and Iter6 value-stable
             // RebindOnly (multi-origin lazy: snap balance+nonce with origin=None so
             // try_ff_basic refuses — avoids seq≠par on lazy chains).
+            let origins = self.read_set.get(&location_hash);
+            let single = origins.is_some_and(|o| o.len() == 1);
+            let origin = if single {
+                match origins.and_then(|o| o.first()) {
+                    Some(ReadOrigin::MvMemory(v)) => Some((v.tx_idx, v.tx_incarnation)),
+                    Some(ReadOrigin::Storage) | None => None,
+                }
+            } else {
+                None
+            };
+            // Snap even on Unfenced PE-on — PinHold resume needs prefix values
+            // (`resolve` overlay was leaving value_snap empty → FullRetry theater).
+            self.maybe_note_value(
+                location_hash,
+                FfValue::Basic {
+                    address,
+                    basic: account.clone(),
+                    code_hash,
+                    origin,
+                },
+            );
             if resolve {
-                let origins = self.read_set.get(&location_hash);
-                let single = origins.is_some_and(|o| o.len() == 1);
-                let origin = if single {
-                    match origins.and_then(|o| o.first()) {
-                        Some(ReadOrigin::MvMemory(v)) => Some((v.tx_idx, v.tx_incarnation)),
-                        Some(ReadOrigin::Storage) | None => None,
-                    }
-                } else {
-                    None
-                };
-                self.maybe_note_value(
-                    location_hash,
-                    FfValue::Basic {
-                        address,
-                        basic: account.clone(),
-                        code_hash,
-                        origin,
-                    },
-                );
                 self.maybe_early_val(address, location_hash)?;
             }
             return Ok(Some(AccountInfo {
@@ -1908,16 +1913,16 @@ impl<S: Storage> Database for VmDb<'_, S> {
                         crate::specfence::LocationKind::Storage,
                         Some(&origin),
                     );
+                    self.maybe_note_value(
+                        location_hash,
+                        FfValue::Storage {
+                            address,
+                            slot: index,
+                            value: *value,
+                            origin: Some((*closest_idx, *tx_incarnation)),
+                        },
+                    );
                     if resolve {
-                        self.maybe_note_value(
-                            location_hash,
-                            FfValue::Storage {
-                                address,
-                                slot: index,
-                                value: *value,
-                                origin: Some((*closest_idx, *tx_incarnation)),
-                            },
-                        );
                         self.maybe_early_val(address, location_hash)?;
                     }
                     return Ok(*value);
@@ -1982,16 +1987,16 @@ impl<S: Storage> Database for VmDb<'_, S> {
             .storage
             .storage(&address, &index)
             .map_err(|err| ReadError::StorageError(err.to_string()))?;
+        self.maybe_note_value(
+            location_hash,
+            FfValue::Storage {
+                address,
+                slot: index,
+                value,
+                origin: None,
+            },
+        );
         if resolve {
-            self.maybe_note_value(
-                location_hash,
-                FfValue::Storage {
-                    address,
-                    slot: index,
-                    value,
-                    origin: None,
-                },
-            );
             self.maybe_early_val(address, location_hash)?;
         }
         Ok(value)
