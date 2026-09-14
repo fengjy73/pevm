@@ -1,4 +1,69 @@
-# SpecFence v9.4 full-land Soft=0 honesty sweep
+# SpecFence v9.4 Soft=0 honesty sweep
+
+## This package (`c42f96a`, PR #11) — remaining PARTIAL close
+
+**When:** 2026-09-14  
+**Binary:** `specfence_all_blocks_sweep` release, LTO off, Soft=0 plant  
+**Artifacts:** `lab/results/v9.4-sot-partial-all-blocks-n1-sweep.json`, `lab/results/v9.4-sot-partial-focus-n3-sweep.json`, `lab/notes/v9.4-sot-partial-sweep-summary.json`  
+**Protocol:** same as below (fresh `Pevm` + `reset_heat` + `reset_inter_prior`; drop `n_tx==0`; SF vs OCC @8).
+
+### Headline vs wall (`3687da6` Soft=0)
+
+| Metric | Wall `3687da6` | This tip | Δ |
+|--------|---------------:|---------:|--:|
+| nonempty median SF/OCC | **0.6853** | **0.7033** | +0.0180 |
+| 14689597 N=3 SF/OCC | **0.3482** | **0.4485** | +0.1003 |
+| Soft | 0 | **0** | held |
+
+**Wall beaten.** Product bars (median ≥0.95, fan ≥0.90, quiet p10 ≥0.90, R1 ≥50%) still **miss**. Do not claim crush of 0.95 / 0.90.
+
+### All-blocks N=1 @8 (n=98 nonempty)
+
+| | |
+|--|--:|
+| median / p10 / p90 / min / mean | 0.7033 / 0.4136 / 1.2143 / 0.2729 / 148.2002 |
+| ≥0.7 / ≥0.95 / ≥1.0 | 50 / 29 / 23 |
+| quiet n / median / p10 / ≥1 | 36 / 1.0732 / 0.4329 / 19/36 |
+| morph | {'spine': 53, 'quiet': 36, 'quiet_ish': 9} |
+| Soft / Bind / WaitFor | **0** / **0** / 4875 |
+| WaitFor pin / aborting | **5158** / **177** |
+| Bind-after-Done | 214 (Bind verb = 0; cert-without-Bind) |
+| R1 win / attempt (rate) | 3 / 2439 (0.0012) |
+| schedule_refuse | **1540** |
+
+Bind rare landed in volume (2208 → 0). PinWithoutThrow landed (`waitfor_aborting` 3280 → 177). Schedule-first refuse fires (0 → 1540). R1 still token.
+
+### Named Soft=0 N=3 @8
+
+| bn | N=1 sf_occ | N=3 sf_occ | N=3 Bind | N=3 Wait | N=3 pin | N=3 aborting | N=3 R1 w/a | N=3 refuse |
+|---:|----------:|----------:|---------:|---------:|--------:|-------------:|-----------:|-----------:|
+| 14689597 | 0.3981 | **0.4485** | 0 | 246 | 274 | 4 | 0/74 | 160 |
+| 19807137 | 0.3088 | **0.2308** | 0 | 891 | 971 | 0 | 0/537 | 0 |
+| 2179522 | (OCC-slow) | (OCC-slow) | 0 | 0 | 0 | 0 | 0/0 | 0 |
+| 19606599 | 0.6116 | **0.8312** | 0 | 147 | 153 | 6 | 0/56 | 0 |
+| 19469097 | 0.4506 | **0.5075** | 0 | 160 | 161 | 3 | 0/49 | 0 |
+
+Notes:
+
+- **2179522** N=1/N=3 ratios are OCC-slow noise (OCC wall hundreds–tens of thousands of ms). Do **not** advertise them.
+- Fan **14689597** N=3 **0.4485** beats the 0.348 wall; Bind=0; refuse=160; still misses ≥0.90.
+- **19807137** remains worst (N=3 **0.2308**); WaitFor/pin dominate park idle; refuse=0 on that block.
+
+### Product bars (this JSON)
+
+| Bar | Result |
+|-----|--------|
+| Soft=0 | **held** |
+| beat median 0.685 | **yes** (0.7033) |
+| beat 14689597 0.348 @8 N≥3 | **yes** (0.4485) |
+| nonempty median ≥0.95 | **miss** (0.7033) |
+| 14689597 ≥0.90 @8 N≥3 | **miss** (0.4485) |
+| quiet p10 ≥0.90 | **miss** (0.4329) |
+| R1 win ≥50% attempts | **miss** (0.0012) |
+
+---
+
+## Pre-close wall (`3687da6`, PR #10)
 
 **When:** 2026-09-14 15:36 CST  
 **Tip:** `3687da6` (PR #10)  

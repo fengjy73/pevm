@@ -105,4 +105,4 @@ Named blocks match: **19807137** Wait/pin/aborting dominate (N=3 wait 442 / abor
 
 ## 4. Essence
 
-v9.4 PR #10 landed **scaffolding**. The first successor (`ab62eb7`) landed refuse / PinHold / decide←Bayes / R1 / admit edges. **This package** closes the remaining PARTIAL rows: Bind rare (`known_star` is not Bind EV), true-k (admit k≈6 + no any-k smear), file-SRP leftovers (Bind EV in `fence_act`; `fence_wait_for` museum). Soft=0. Product TPS / R1 rate / Bind vs WaitFor **need a new Soft=0 sweep** — beat of median 0.685 / fan 0.348 is a JSON claim, not a unit-test claim.
+v9.4 PR #10 landed **scaffolding**. The first successor (`ab62eb7`) landed refuse / PinHold / decide←Bayes / R1 / admit edges. **This package** closes the remaining PARTIAL rows: Bind rare (`known_star` is not Bind EV), true-k (admit k≈6 + no any-k smear), file-SRP leftovers (Bind EV in `fence_act`; `fence_wait_for` museum). Soft=0 all-blocks JSON: nonempty median **0.7033** (beats 0.6853); fan **14689597** N=3 **0.4485** (beats 0.3482); Bind **0**; pin **5158** / aborting **177**; refuse **1540**. Product bars (0.95 / 0.90 / R1 ≥50%) still **miss**.
