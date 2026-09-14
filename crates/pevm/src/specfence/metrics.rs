@@ -290,6 +290,18 @@ pub struct SpecFenceMetrics {
     pub writer_validated_bind_gate: usize,
     /// Falsifier: flat EdgeKey(\(ℓ\),reader) control SoT (target 0).
     pub flat_edgekey_sot: usize,
+    /// v9.1: WaitFor PinWithoutThrow parks.
+    pub waitfor_pin: usize,
+    /// v9.1: WaitFor that still took AbortingThrow (should stay rare).
+    pub waitfor_aborting: usize,
+    /// v9.1: schedule refuse (known consumer not admitted).
+    pub schedule_refuse: usize,
+    /// v9.1: WaitFor/lane hit a Done producer (Bind-after-Done share).
+    pub bind_after_done: usize,
+    /// v9.1: R1a/R1b wins.
+    pub r1_win: usize,
+    /// v9.1: R1 attempts that fell through to B0.
+    pub r1_attempt: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -422,6 +434,12 @@ pub(crate) struct MetricsInner {
     morph_fence_actuator: AtomicUsize,
     writer_validated_bind_gate: AtomicUsize,
     flat_edgekey_sot: AtomicUsize,
+    waitfor_pin: AtomicUsize,
+    waitfor_aborting: AtomicUsize,
+    schedule_refuse: AtomicUsize,
+    bind_after_done: AtomicUsize,
+    r1_win: AtomicUsize,
+    r1_attempt: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -793,6 +811,30 @@ impl MetricsInner {
         self.edge_wait_for.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_waitfor_pin(&self) {
+        self.waitfor_pin.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_waitfor_aborting(&self) {
+        self.waitfor_aborting.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_schedule_refuse(&self) {
+        self.schedule_refuse.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_bind_after_done(&self) {
+        self.bind_after_done.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_r1_win(&self) {
+        self.r1_win.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_r1_attempt(&self) {
+        self.r1_attempt.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_edge_unfenced(&self) {
         self.edge_unfenced.fetch_add(1, Ordering::Relaxed);
     }
@@ -1162,6 +1204,12 @@ impl MetricsInner {
             morph_fence_actuator: self.morph_fence_actuator.load(Ordering::Relaxed),
             writer_validated_bind_gate: self.writer_validated_bind_gate.load(Ordering::Relaxed),
             flat_edgekey_sot: self.flat_edgekey_sot.load(Ordering::Relaxed),
+            waitfor_pin: self.waitfor_pin.load(Ordering::Relaxed),
+            waitfor_aborting: self.waitfor_aborting.load(Ordering::Relaxed),
+            schedule_refuse: self.schedule_refuse.load(Ordering::Relaxed),
+            bind_after_done: self.bind_after_done.load(Ordering::Relaxed),
+            r1_win: self.r1_win.load(Ordering::Relaxed),
+            r1_attempt: self.r1_attempt.load(Ordering::Relaxed),
         }
     }
 }

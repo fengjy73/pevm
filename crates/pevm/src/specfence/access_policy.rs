@@ -9,6 +9,7 @@
 
 use crate::{MemoryLocationHash, TxIdx};
 
+use super::bayes::BayesAccessQuery;
 use super::learner::LiveLearner;
 
 /// Visibility + learning features gathered **only** on a PE hit.
@@ -52,6 +53,18 @@ pub(crate) fn decide(
     access_k: u32,
     vis: Option<&AccessVis>,
 ) -> AccessDecision {
+    decide_queried(learner, location, access_k, vis, None)
+}
+
+/// Live decide ← Bayes query ports (v9.1). Tests use [`decide`] (no query).
+#[inline]
+pub(crate) fn decide_queried(
+    learner: &LiveLearner,
+    location: MemoryLocationHash,
+    access_k: u32,
+    vis: Option<&AccessVis>,
+    bayes: Option<BayesAccessQuery>,
+) -> AccessDecision {
     if !learner.has_any_predicted() {
         return AccessDecision::UnfencedOcc {
             predicted: false,
@@ -89,7 +102,11 @@ pub(crate) fn decide(
     let intra = learner.predicted_essential_intra(location, access_k);
     let fan = learner.morph_weights().dominant_fan_out();
     let quiet_off = learner.quiet_fence_off();
-    let ev_win = !quiet_off && (intra || (fan && learner.prior_pe_fire_wins(vis)));
+    // Known-star Bayes posterior opens WaitFor even on quiet morph (M4).
+    // Lone intra abort on quiet stays Unfenced (2179522).
+    let known_star = bayes.is_some_and(|q| q.known_star && !q.quiet_cold);
+    let ev_win = known_star || (!quiet_off && (intra || (fan && learner.prior_pe_fire_wins(vis))));
+    let bind_ev = bayes.is_none_or(|q| q.ev_bind_beats_b0 || q.known_star);
     // WaitFor pins one *executing* producer. Quiet-off blocks first-wave
     // tax (2179522). Prior-only still needs the T3 fan_out EV brake.
     if vis.unfinished == 1
@@ -115,6 +132,7 @@ pub(crate) fn decide(
         && vis.published_data
         && vis.tip_is_conflict_producer
         && ev_win
+        && bind_ev
         && !learner.bind_tax_losing()
     {
         return AccessDecision::Bind;
@@ -379,6 +397,27 @@ mod tests {
                 roi_skip: true
             },
             "aborts >= binds still trips Bind"
+        );
+    }
+
+    #[test]
+    fn known_star_bayes_opens_waitfor_on_quiet() {
+        let live = LiveLearner::new();
+        live.begin_block(MorphWeights::default());
+        live.seed_predicted_essential(7, 6);
+        let q = crate::specfence::BayesAccessQuery {
+            p_raw: 0.4,
+            p_bind: 0.2,
+            quiet_cold: false,
+            depth_frac: 0.85,
+            ev_pin_beats_abort: true,
+            ev_bind_beats_b0: true,
+            known_star: true,
+        };
+        assert_eq!(
+            decide_queried(&live, 7, 6, Some(&exec_vis(2)), Some(q)),
+            AccessDecision::WaitFor { writer: 2 },
+            "M4: known-star posterior opens WaitFor despite quiet morph"
         );
     }
 

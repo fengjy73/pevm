@@ -189,18 +189,15 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
             let repair_armed = self.specfence.partial_retry.is_rewind_resume(tx_idx)
                 || self.specfence.partial_retry.has_ff_head(tx_idx);
-            self.specfence.kernel.begin_execute(tx_idx, repair_armed);
-            self.specfence.certificates.begin_execute(
-                tx_idx,
-                repair_armed,
-                incarnation,
-            );
+            self.specfence
+                .certificates
+                .begin_execute(tx_idx, repair_armed, incarnation);
             self.specfence.access_log.begin_incarnation(tx_idx);
             self.specfence
                 .partial_retry
                 .reset_incarnation(tx_idx, incarnation);
             // FF replay is a prefix certificate — Spec-only incarnations never arm rem.
-            if self.specfence.kernel.repair_armed(tx_idx) {
+            if self.specfence.certificates.repair_armed(tx_idx) {
                 let n = self.specfence.partial_retry.replay_ff_if_armed(tx_idx);
                 if n > 0 {
                     self.specfence.metrics.record_journal_ff_entries(n);
@@ -467,7 +464,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if address == self.specfence.beneficiary || self.is_lazy {
             return Ok(());
         }
-        if crate::specfence::specfence_plant_is_occ(
+        // Same-spine Spec cost class: empty PE → Mode(a)=Spec, no Fence meta.
+        // Not a plant_is_occ computer retreat (v9.3).
+        if crate::specfence::specfence_cost_class_spec(
             crate::ConcurrencyMode::SpecFence,
             self.specfence.learner,
         ) {
@@ -480,11 +479,18 @@ impl<'a, S: Storage> VmDb<'a, S> {
         }
 
         let vis = self.access_vis(location_hash);
-        match crate::specfence::decide_access(
+        let bayes_q = self.specfence.bayes.query_access(
+            location_hash,
+            vis.writer_executing,
+            vis.unfinished,
+            vis.published_data,
+        );
+        match crate::specfence::decide_access_queried(
             self.specfence.learner,
             location_hash,
             access_k,
             Some(&vis),
+            Some(bayes_q),
         ) {
             AccessDecision::UnfencedOcc { .. } => Ok(()),
             AccessDecision::Bind => {
@@ -560,8 +566,13 @@ impl<'a, S: Storage> VmDb<'a, S> {
             self.specfence
                 .learner
                 .note_hot_ws_posterior(location_hash, true);
-            // Consume HotSet/WŜ as ReadyEdges + ProducerStage (not a Wait OR-door).
-            if let Some(w) = writer
+            // Refresh only — first ReadyEdge insert is admit_seed (begin_block / abort).
+            if self
+                .specfence
+                .ready_edges
+                .predicted_producer(location_hash)
+                .is_some()
+                && let Some(w) = writer
                 && unfinished > 0
                 && w < self.tx_idx
             {
@@ -634,7 +645,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.specfence
             .certificates
             .note_success(self.tx_idx, location);
-        self.specfence.kernel.note_fence(self.tx_idx);
+        // Certificate strip is the rem-legal SoT (kernel merged).
         if first {
             self.specfence.metrics.record_pcc_kernel_exec();
         }
@@ -659,12 +670,24 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.specfence.ready_edges.note_consumer(self.tx_idx, w);
         self.specfence.producer_stages.reserve(w);
         self.specfence.scheduler.admit_spine(w, self.specfence.wave);
-        if self.specfence.scheduler.is_done(w) {
-            self.note_fence_success(location_hash);
-            return self.occ_unfenced();
-        }
-        if self.specfence.scheduler.is_executing(w) {
-            return self.pcc_wait_for_writer(address, location_hash, access_k, is_program, w);
+        match crate::specfence::fence_act::act_serial_lane(self.specfence.scheduler, w) {
+            crate::specfence::fence_act::FenceAct::DoneUnfenced { cert } => {
+                if cert {
+                    self.note_fence_success(location_hash);
+                    self.specfence.metrics.record_bind_after_done();
+                }
+                return self.occ_unfenced();
+            }
+            crate::specfence::fence_act::FenceAct::PinHold { writer } => {
+                return self.pcc_wait_for_writer(
+                    address,
+                    location_hash,
+                    access_k,
+                    is_program,
+                    writer,
+                );
+            }
+            crate::specfence::fence_act::FenceAct::ReadyCanary => {}
         }
         // Ready/Validated/Aborting: one Spec canary + ProducerStage/edge so
         // the next incarnation is refused while w is Executing. Parking or
@@ -810,17 +833,19 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.specfence.ready_edges.note_consumer(self.tx_idx, w);
         self.specfence.producer_stages.reserve(w);
         self.specfence.scheduler.admit_spine(w, self.specfence.wave);
-        if self.specfence.scheduler.is_done(w) {
-            // Producer published. OCC reads Data (or ESTIMATE of a later w).
-            self.note_fence_success(location_hash);
-            self.specfence.metrics.record_edge_bind();
-            self.specfence.learner.note_bind_success(location_hash);
-            return self.occ_unfenced();
-        }
-        if !self.specfence.scheduler.is_executing(w) {
-            // Ready/Aborting: do not park (ESTIMATE cascade / hang).
-            // ProducerStage + ReadyEdge refuse the *next* incarnation.
-            return self.occ_unfenced();
+        match crate::specfence::fence_act::act_wait_for(self.specfence.scheduler, w) {
+            crate::specfence::fence_act::FenceAct::DoneUnfenced { cert } => {
+                // Bind-after-Done is tax — cert for R1, do not count Bind.
+                if cert {
+                    self.note_fence_success(location_hash);
+                    self.specfence.metrics.record_bind_after_done();
+                }
+                return self.occ_unfenced();
+            }
+            crate::specfence::fence_act::FenceAct::ReadyCanary => {
+                return self.occ_unfenced();
+            }
+            crate::specfence::fence_act::FenceAct::PinHold { writer: _ } => {}
         }
         self.note_fence_success(location_hash);
         self.pcc_this_tx
@@ -872,7 +897,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.specfence.wave.set_pending_park(
             location_hash,
             self.specfence.partial_retry.current_k(self.tx_idx) as u64,
-            crate::specfence::ParkKind::BlockingOther,
+            crate::specfence::ParkKind::PinHold,
         );
         self.specfence.process.note_park(self.tx_idx);
         Err(ReadError::Blocking(w))
@@ -2059,6 +2084,14 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         self.specfence.ready_edges
     }
 
+    pub(crate) fn record_waitfor_pin(&self) {
+        self.specfence.metrics.record_waitfor_pin();
+    }
+
+    pub(crate) fn record_waitfor_aborting(&self) {
+        self.specfence.metrics.record_waitfor_aborting();
+    }
+
     pub(crate) fn release_ready_edges(
         &self,
         writer: TxIdx,
@@ -2888,7 +2921,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         // + absolute-jump journal slot replay (never journal-blob poison).
                         // gas_remaining_after filled from Inspector post-SSTORE captures.
                         if self.specfence.mode == crate::ConcurrencyMode::SpecFence
-                            && self.specfence.kernel.rem_legal(tx_version.tx_idx)
+                            && self.specfence.certificates.rem_legal(tx_version.tx_idx)
                         {
                             self.specfence.partial_retry.note_write_replay(
                                 tx_version.tx_idx,
@@ -3011,7 +3044,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 };
 
                 if self.specfence.mode == crate::ConcurrencyMode::SpecFence
-                    && self.specfence.kernel.rem_legal(tx_version.tx_idx)
+                    && self.specfence.certificates.rem_legal(tx_version.tx_idx)
                 {
                     for (loc, value) in &write_set {
                         // G2: plant Write ordinal always (HotSet not required).
@@ -3104,7 +3137,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 // R1/R3: feed HotSet writer counts (H_w) from non-lazy writes only.
                 if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
                     // Learning is consumed by decide() — always observe HotSet / WŜ.
-                    if self.specfence.kernel.rem_legal(tx_version.tx_idx) {
+                    if self.specfence.certificates.rem_legal(tx_version.tx_idx) {
                         let locs: Vec<_> = self.mv_memory.write_locations(tx_version.tx_idx);
                         self.specfence.rw_prior.observe_write_set(&locs, None);
                         for loc in &hotset_writer_locs {

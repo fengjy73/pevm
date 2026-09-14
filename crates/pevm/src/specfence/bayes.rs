@@ -11,10 +11,25 @@ use dashmap::{DashMap, DashSet};
 
 use crate::{BuildIdentityHasher, BuildSuffixHasher, MemoryLocationHash};
 
+#[cfg(test)]
 use super::RegionMode;
-use super::resolve::{TAU_REVOKE, cost_prefers_wait};
+use super::resolve::TAU_REVOKE;
+#[cfg(test)]
+use super::resolve::cost_prefers_wait;
 #[cfg(test)]
 use super::resolve::{TAU_S, TAU_VERY_HIGH, TAU_W};
+
+/// Bayes query port consumed by Mode(a) decide (not a second π).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BayesAccessQuery {
+    pub p_raw: f64,
+    pub p_bind: f64,
+    pub quiet_cold: bool,
+    pub depth_frac: f64,
+    pub ev_pin_beats_abort: bool,
+    pub ev_bind_beats_b0: bool,
+    pub known_star: bool,
+}
 
 /// Prior: mild low-conflict (`α=1`, `β=9` → P≈0.1).
 const PRIOR_ALPHA: f64 = 1.0;
@@ -169,8 +184,45 @@ impl BayesMap {
         }
     }
 
-    /// Decide Wait vs Speculate for a location (uses τ_w for seed / sticky path).
-    #[allow(dead_code)]
+    /// Cold cost-class: no location posterior above prior+ε (Spec ≡ OCC meta).
+    #[inline]
+    pub(crate) fn is_cold(&self) -> bool {
+        self.locations.iter().all(|e| e.mean() < DEFAULT_TAU)
+    }
+
+    /// Query port at admit / decide / validate (v9.1). Not a Boolean π.
+    pub(crate) fn query_access(
+        &self,
+        location: MemoryLocationHash,
+        writer_executing: bool,
+        unfinished: usize,
+        published_data: bool,
+    ) -> BayesAccessQuery {
+        let p_raw = self.prior_wait_probability(location);
+        let p_bind = self.bind_useful_probability(location);
+        let depth_frac = if unfinished <= 1 && writer_executing {
+            0.85
+        } else if unfinished > 1 {
+            0.35
+        } else {
+            0.15
+        };
+        let ev_pin = p_raw * depth_frac;
+        let ev_abort = (1.0 - depth_frac) * p_raw;
+        let ev_bind = if published_data { p_bind } else { 0.0 };
+        BayesAccessQuery {
+            p_raw,
+            p_bind,
+            quiet_cold: self.is_cold() && p_raw < DEFAULT_TAU,
+            depth_frac,
+            ev_pin_beats_abort: ev_pin >= ev_abort && writer_executing,
+            ev_bind_beats_b0: ev_bind >= 0.20 && published_data,
+            known_star: p_raw >= DEFAULT_TAU,
+        }
+    }
+
+    /// Boolean π museums — **not** SpecFence decide.
+    #[cfg(test)]
     pub(crate) fn decide(
         &self,
         location: MemoryLocationHash,
@@ -185,6 +237,7 @@ impl BayesMap {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn decide_account(&self, address: &Address, tau: f64) -> RegionMode {
         if self.account_wait_probability(address) >= tau {
             RegionMode::Wait
@@ -202,12 +255,8 @@ impl BayesMap {
         self.conflict_probability(location, address) < TAU_REVOKE
     }
 
-    /// Legacy Boolean Wait probe (cost_prefers_wait).
-    ///
-    /// **Not SpecFence π.** V5-P0: SpecFence Wait is decided only by AEC
-    /// `choose_action`. Keep this for unit tests / PCC-era callers; Beta
-    /// posteriors feed PolicyCtx as continuous features instead.
-    /// `writer_done`: producer Executed/Validated (wait cheap); unknown → false.
+    /// Legacy Boolean Wait probe. **Not SpecFence π.**
+    #[cfg(test)]
     pub(crate) fn should_wait_hard(
         &self,
         location: MemoryLocationHash,

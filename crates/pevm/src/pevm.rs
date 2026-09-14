@@ -31,10 +31,10 @@ use crate::{
     specfence::{
         AccountHints, AdaptiveEngagement, AdaptiveParams, BayesMap, ConcurrencyMode, DEFAULT_TAU,
         EdgeTable, ExecProcessSnapshot, FineGrainCollector, FineGrainSnapshot, HeatMap, HotSet,
-        HotSketch, InterBlockPrior, KernelTable, LeanAbortRepair, LiveLearner, MetricsInner,
-        PartialRetryTable, ProcessTrace, RemCounters, ResearchAbortRepair, RwPriorMap, SpecDag,
-        SpecFenceCtx, SpecFenceMetrics, WaveParkTable, seed_wait_regions, update_bayes,
-        update_heat, update_rw_prior,
+        HotSketch, InterBlockPrior, LeanAbortRepair, LiveLearner, MetricsInner, PartialRetryTable,
+        ProcessTrace, RemCounters, ResearchAbortRepair, RwPriorMap, SpecDag, SpecFenceCtx,
+        SpecFenceMetrics, WaveParkTable, seed_wait_regions, update_bayes, update_heat,
+        update_rw_prior,
     },
     storage::StorageWrapper,
     vm::{
@@ -443,7 +443,6 @@ impl Pevm {
         let rem = RemCounters::default();
         let partial_retry = PartialRetryTable::new(block_size);
         let wave = WaveParkTable::new();
-        let kernel = KernelTable::new(block_size);
         let access_log = crate::specfence::AccessOrdinalLog::new(block_size);
         let certificates = crate::specfence::CertificateTable::new(block_size);
         let ready_edges = crate::specfence::ReadyEdgeTable::new();
@@ -456,14 +455,18 @@ impl Pevm {
             let flipped = self.inter_prior.take_last_flipped();
             let quiet = abc_prior_morph.is_some_and(|m| m.dominant_quiet());
             sketch.seed_from_prior_morph(&self.inter_prior.top_locations(), flipped, quiet);
-            if !quiet {
-                for top in self.inter_prior.top_locations() {
-                    if top.k_template > 0 {
-                        learner.seed_predicted_essential(top.location, top.k_template);
-                    }
-                }
-            }
-            if quiet {
+            // Bayes → admit_seed before any Execute (v9.1). Known stars keep
+            // PE even on quiet morph (M4). Truly cold seeds nothing.
+            let _ = crate::specfence::admit::admit_seed_begin_block(
+                &ready_edges,
+                &producer_stages,
+                &learner,
+                &self.bayes,
+                &self.inter_prior,
+                &hints,
+                block_env.beneficiary,
+            );
+            if quiet && !learner.has_any_predicted() {
                 let n = sketch.revoke_prior_fences_if_quiet(true);
                 metrics_inner.record_quiet_fence_revoke(n);
             }
@@ -504,7 +507,6 @@ impl Pevm {
             edges: &edges,
             sketch: &sketch,
             process: &process,
-            kernel: &kernel,
             access_log: &access_log,
             certificates: &certificates,
             ready_edges: &ready_edges,
@@ -521,23 +523,24 @@ impl Pevm {
                         chain, spec_id, &block_env, &txs, storage, &mv_memory, specfence,
                     );
                     let profile = crate::specfence::profile_timing_enabled();
-                    // Empty PE ∨ quiet_fence_off ⇒ OCC computer (T6 / quiet).
-                    // After abort heat lifts quiet-off, PC⊗CC ready-set + refuse.
+                    // v9.3: one spine. SpecFence always uses unified next_sf
+                    // (empty extras ≡ OCC walk). Occ mode is a separate computer.
+                    // Ban: plant_is_occ → next_occ_task retreat.
                     let occ_mode = self.concurrency_mode == ConcurrencyMode::Occ;
                     let mut sched_t0 = profile.then(Instant::now);
-                    let mut task = if occ_mode
-                        || crate::specfence::specfence_plant_is_occ(
-                            self.concurrency_mode,
-                            specfence.learner,
-                        ) {
+                    let mut task = if occ_mode {
                         crate::specfence::next_occ_task(&scheduler)
-                    } else if let Some(w) = wave_ref {
-                        crate::specfence::next_sf_task(
-                            &scheduler,
-                            w,
-                            specfence.ready_edges,
-                            specfence.producer_stages,
-                        )
+                    } else if self.concurrency_mode == ConcurrencyMode::SpecFence {
+                        if let Some(w) = wave_ref {
+                            crate::specfence::next_sf_task(
+                                &scheduler,
+                                w,
+                                specfence.ready_edges,
+                                specfence.producer_stages,
+                            )
+                        } else {
+                            crate::specfence::next_occ_task(&scheduler)
+                        }
                     } else {
                         crate::specfence::next_occ_task(&scheduler)
                     };
@@ -547,11 +550,7 @@ impl Pevm {
                     while task.is_some() {
                         task = match task.unwrap() {
                             Task::Execution(tx_version) => {
-                                let occ_exec = occ_mode
-                                    || crate::specfence::specfence_plant_is_occ(
-                                        self.concurrency_mode,
-                                        specfence.learner,
-                                    );
+                                let occ_exec = occ_mode;
                                 if occ_exec {
                                     self.try_execute(&mut vm, &scheduler, tx_version, None, None)
                                 } else {
@@ -603,19 +602,19 @@ impl Pevm {
 
                         if task.is_none() {
                             sched_t0 = profile.then(Instant::now);
-                            task = if occ_mode
-                                || crate::specfence::specfence_plant_is_occ(
-                                    self.concurrency_mode,
-                                    specfence.learner,
-                                ) {
+                            task = if occ_mode {
                                 crate::specfence::next_occ_task(&scheduler)
-                            } else if let Some(w) = wave_ref {
-                                crate::specfence::next_sf_task(
-                                    &scheduler,
-                                    w,
-                                    specfence.ready_edges,
-                                    specfence.producer_stages,
-                                )
+                            } else if self.concurrency_mode == ConcurrencyMode::SpecFence {
+                                if let Some(w) = wave_ref {
+                                    crate::specfence::next_sf_task(
+                                        &scheduler,
+                                        w,
+                                        specfence.ready_edges,
+                                        specfence.producer_stages,
+                                    )
+                                } else {
+                                    crate::specfence::next_occ_task(&scheduler)
+                                }
                             } else {
                                 crate::specfence::next_occ_task(&scheduler)
                             };
@@ -928,6 +927,7 @@ impl Pevm {
                     }
                     if let Some(wave) = wave {
                         let ready = Some(vm.ready_edges());
+                        // PinHold: park first, never steal-convert (v9.1 M1).
                         if park_kind == crate::specfence::ParkKind::BlockingOther {
                             wave.arm_steal_convert_without_park();
                             if let Some(stolen) = scheduler.next_task_steal_after_park_prefer(
@@ -937,6 +937,11 @@ impl Pevm {
                             ) {
                                 return Some(stolen);
                             }
+                        }
+                        if park_kind == crate::specfence::ParkKind::PinHold {
+                            vm.record_waitfor_pin();
+                        } else if park_kind == crate::specfence::ParkKind::BlockingOther {
+                            vm.record_waitfor_aborting();
                         }
                         wave.park_with_kind(
                             tx_version.tx_idx,
@@ -1064,8 +1069,11 @@ fn try_validate(
     let mut cached_plan: Option<Option<crate::specfence::PartialRetryPlan>> = None;
     // Iter15: true_suffix flag for fan-out FR collapse / RebindOnly widen on abort path.
     let mut true_suffix_flag = false;
-    if crate::specfence::uses_specfence_resolve(specfence.mode, specfence.kernel, tx_version.tx_idx)
-        && !invalid.is_empty()
+    if crate::specfence::uses_specfence_resolve(
+        specfence.mode,
+        specfence.certificates,
+        tx_version.tx_idx,
+    ) && !invalid.is_empty()
     {
         specfence.metrics.record_region_validate_fail(invalid.len());
         // RebindOnly-first (native resolve): patch origins when invalid reads now
