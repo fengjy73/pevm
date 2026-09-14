@@ -1632,7 +1632,7 @@ impl PartialRetryTable {
                 .all(|&loc| self.force_writer(tx_idx, loc).is_some())
     }
 
-    /// Value-stable via snap **or** certified-prefix FF (thin identity → R1).
+    /// Value-stable via snap **or** certified-prefix FF (thin identity → partial_abort).
     pub(crate) fn identity_stable_match(
         &self,
         tx_idx: TxIdx,
@@ -2569,7 +2569,7 @@ mod p3_early_abort_tests {
         let cur = crate::MemoryValue::Storage(U256::from(9));
         assert!(
             table.value_stable_match(0, 77, &cur),
-            "carried snap must match for R1"
+            "carried snap must match for partial_abort"
         );
     }
 
@@ -2684,7 +2684,7 @@ mod abort_cheapening_tests {
 
     /// Tiny certified prefix (1 access) is **not** cheaper than OCC full_abort_reexecute.
     #[test]
-    fn apply_suffix_repair_tiny_prefix_is_b0_not_rewind() {
+    fn apply_suffix_repair_tiny_prefix_is_full_abort_not_rewind() {
         let table = PartialRetryTable::new(1);
         table.reset_incarnation(0, 0);
         let _ = table.push_checkpoint(0, CheckpointKind::CallEntry);

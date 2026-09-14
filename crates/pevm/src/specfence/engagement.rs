@@ -5,7 +5,7 @@
 //! - Execute path: always LeanOCC for `Handler::run` unless research inspect.
 //! - Block engagement mode (C): **decay-only label** (Quiet vs Storm hat).
 //!   v2: mode does **not** actuate Await / collapse / absorb. Live π is the
-//!   Edge visibility machine + R1-first Resolve. SoftWait Soft stays 0.
+//!   Edge visibility machine + partial_abort-first Resolve. SoftWait Soft stays 0.
 //! - `note_abort` is **metrics-only** — does not escalate HotSet or flip π.
 //! - `SPECFENCE_ENABLE_INSPECT=1` re-enables inspect_run / jump (research only).
 //!

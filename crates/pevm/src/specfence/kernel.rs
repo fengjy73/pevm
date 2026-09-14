@@ -10,7 +10,7 @@
 //! - Fence event (OrderedAdmit / WaitFor / serial-lane) this incarnation
 //! - Repair-armed (rewind / FF-head prefix)
 //!
-//! Rem journal and R1 Resolve are legal iff a certificate exists.
+//! Rem journal and partial_abort Resolve are legal iff a certificate exists.
 //! Spec-only incarnations stay OCC-cost (bool validate + full_abort_reexecute).
 
 use std::sync::atomic::{AtomicU8, Ordering};

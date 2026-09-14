@@ -406,7 +406,7 @@ pub(crate) struct LiveLearner {
     params_bits: Mutex<AdaptiveParams>,
     /// Structural park heat (WaitFor parks this block) — PreferAdmit / steal width.
     park_heat: AtomicUsize,
-    /// Resolve telemetry: SuffixRepair rewind vs R1 rebind (read by Resolve).
+    /// Resolve telemetry: SuffixRepair rewind vs partial_abort rebind (read by Resolve).
     rewind_total: AtomicUsize,
     rebind_total: AtomicUsize,
     identity_hits: AtomicUsize,

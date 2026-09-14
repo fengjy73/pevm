@@ -1965,7 +1965,7 @@ pub(crate) fn note_pending_ordered_admit_snap() {
 ///   force_ordered_admit / needs_live_capture — **no mass-path SNAP tax**.
 /// - `Mass`: every Lean SpecFence execute (`SPECFENCE_BIND_SNAP=1` dig).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BindSnapMode {
+pub(crate) enum OrderedAdmitSnapMode {
     Off,
     ResumePath,
     Mass,
@@ -1975,9 +1975,9 @@ pub(crate) enum BindSnapMode {
 /// Iter25: default **ResumePath** (silent production) — hang-free with
 /// refuse-if-stale + tip_sloads-gated jump (Mass JUMP was the Lean hang).
 /// Force Off: `=0`; Mass dig: `=1`. No every-Handler tax on ResumePath.
-pub(crate) fn ordered_admit_snap_mode() -> BindSnapMode {
+pub(crate) fn ordered_admit_snap_mode() -> OrderedAdmitSnapMode {
     match std::env::var_os("SPECFENCE_BIND_SNAP") {
-        None => BindSnapMode::ResumePath,
+        None => OrderedAdmitSnapMode::ResumePath,
         Some(v) => {
             let s = v.to_string_lossy();
             if s == "0"
@@ -1985,18 +1985,18 @@ pub(crate) fn ordered_admit_snap_mode() -> BindSnapMode {
                 || s.eq_ignore_ascii_case("off")
                 || s.eq_ignore_ascii_case("no")
             {
-                BindSnapMode::Off
+                OrderedAdmitSnapMode::Off
             } else if s == "1"
                 || s.eq_ignore_ascii_case("true")
                 || s.eq_ignore_ascii_case("yes")
                 || s.eq_ignore_ascii_case("mass")
             {
-                BindSnapMode::Mass
+                OrderedAdmitSnapMode::Mass
             } else if s.eq_ignore_ascii_case("resume") {
-                BindSnapMode::ResumePath
+                OrderedAdmitSnapMode::ResumePath
             } else {
                 // Unknown → ResumePath (same as unset), not Off — keep silent default.
-                BindSnapMode::ResumePath
+                OrderedAdmitSnapMode::ResumePath
             }
         }
     }
@@ -2004,12 +2004,12 @@ pub(crate) fn ordered_admit_snap_mode() -> BindSnapMode {
 
 /// Env gate (compat): true only for **Mass** dig (`SPECFENCE_BIND_SNAP=1`).
 pub(crate) fn ordered_admit_snap_env_enabled() -> bool {
-    ordered_admit_snap_mode() == BindSnapMode::Mass
+    ordered_admit_snap_mode() == OrderedAdmitSnapMode::Mass
 }
 
 /// True when any OrderedAdmit-snap capture path may run (ResumePath or Mass).
 pub(crate) fn ordered_admit_snap_capture_wanted() -> bool {
-    !matches!(ordered_admit_snap_mode(), BindSnapMode::Off)
+    !matches!(ordered_admit_snap_mode(), OrderedAdmitSnapMode::Off)
 }
 
 /// Iter24: absolute OrderedAdmit jump enabled when capture mode is on, unless

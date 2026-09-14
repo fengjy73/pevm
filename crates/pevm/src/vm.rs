@@ -23,8 +23,8 @@ use crate::{
     hash_deterministic,
     mv_memory::MvMemory,
     specfence::{
-        AccessDecision, AccessMode, AccessVis, BindSnapMode, CheckpointKind, DecisionFeat,
-        DecisionVerb, EdgeKey, EdgeKind, EdgeState, FfValue, ProcessReason, SpecFenceCtx,
+        AccessDecision, AccessMode, AccessVis, CheckpointKind, DecisionFeat, DecisionVerb, EdgeKey,
+        EdgeKind, EdgeState, FfValue, OrderedAdmitSnapMode, ProcessReason, SpecFenceCtx,
         StorageWriteReplay, absolute_jump_eligible, arm_call_outcome_cache, arm_ff_origin_seeds,
         attach_current_live_snap, early_val_probability, jump_is_safe, jump_refuse_reason,
         note_pending_effect_boundary, note_pending_ordered_admit_snap,
@@ -1242,7 +1242,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     requested.min(self.tx_idx.saturating_sub(1)),
                 )
             }) {
-            crate::specfence::ResidualBind::Data {
+            crate::specfence::ResidualOrderedAdmit::Data {
                 tx_idx,
                 tx_incarnation,
             } => self.ordered_admit_residual_data(
@@ -1256,7 +1256,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 avoid,
                 canary_taken,
             ),
-            crate::specfence::ResidualBind::Storage { .. } => {
+            crate::specfence::ResidualOrderedAdmit::Storage { .. } => {
                 self.specfence.metrics.record_edge_ordered_admit();
                 self.specfence.metrics.record_ordered_admit_residual();
                 self.specfence
@@ -2431,7 +2431,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         // seed (refuse jump if any certified origin is Estimate/unstable); credit
         // fallback when jump not armed. Production JUMP/SNAP stay OFF (no default tax).
         // SoftWait Soft=0. Stock SSTORE. No mega-fan yield.
-        // Iter24: JUMP follows BindSnapMode (ResumePath/Mass default-on) unless
+        // Iter24: JUMP follows OrderedAdmitSnapMode (ResumePath/Mass default-on) unless
         // SPECFENCE_BIND_SNAP_JUMP=0. Mass SNAP still opt-in (`SPECFENCE_BIND_SNAP=1`).
         // Refuse-if-stale + Validated-prefix gates remain. SoftWait Soft=0.
         let ordered_admit_snap_jump_env = ordered_admit_snap_jump_enabled();
@@ -2675,9 +2675,9 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         let use_ordered_admit_snap = self.specfence.mode == crate::ConcurrencyMode::SpecFence
             && lean
             && match snap_mode {
-                BindSnapMode::Off => false,
-                BindSnapMode::Mass => true,
-                BindSnapMode::ResumePath => repair_capture,
+                OrderedAdmitSnapMode::Off => false,
+                OrderedAdmitSnapMode::Mass => true,
+                OrderedAdmitSnapMode::ResumePath => repair_capture,
             };
         let run_result = if plant_handler {
             let partial_retry = self.specfence.partial_retry;

@@ -19,7 +19,7 @@ use super::learner::TopLocPrior;
 /// Done→Data residual OrderedAdmit install. Region SoT: a Fenced ℓ always has a
 /// residual version (last committed Data, or Storage after writer Done∅Data).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ResidualBind {
+pub(crate) enum ResidualOrderedAdmit {
     /// Last committed MV Data (may predate the Done writer).
     Data {
         tx_idx: TxIdx,
@@ -93,7 +93,7 @@ pub(crate) struct HotSketch {
     /// First-wave / prior template — **not** a per-ℓ sticky Wait for all \(k\).
     access_class: DashMap<(MemoryLocationHash, u8), (), FxBuildHasher>,
     /// Done→Data residual per ℓ (OrderedAdmit SoT when writer is Done∅Data).
-    residuals: DashMap<MemoryLocationHash, ResidualBind, BuildIdentityHasher>,
+    residuals: DashMap<MemoryLocationHash, ResidualOrderedAdmit, BuildIdentityHasher>,
     warm_seeded: DashSet<MemoryLocationHash, BuildIdentityHasher>,
     hot_size: AtomicUsize,
     avoid_broadcasts: AtomicUsize,
@@ -213,7 +213,7 @@ impl HotSketch {
     ) {
         self.residuals.insert(
             location,
-            ResidualBind::Data {
+            ResidualOrderedAdmit::Data {
                 tx_idx,
                 tx_incarnation,
             },
@@ -225,11 +225,11 @@ impl HotSketch {
         &self,
         location: MemoryLocationHash,
         writer: TxIdx,
-    ) -> ResidualBind {
+    ) -> ResidualOrderedAdmit {
         if let Some(e) = self.residuals.get(&location) {
             return *e;
         }
-        let r = ResidualBind::Storage { writer };
+        let r = ResidualOrderedAdmit::Storage { writer };
         self.residuals.insert(location, r);
         r
     }
@@ -238,7 +238,7 @@ impl HotSketch {
     pub(crate) fn residual_ordered_admit(
         &self,
         location: MemoryLocationHash,
-    ) -> Option<ResidualBind> {
+    ) -> Option<ResidualOrderedAdmit> {
         self.residuals.get(&location).map(|e| *e)
     }
 
@@ -864,15 +864,15 @@ mod tests {
     fn done_without_data_installs_storage_residual() {
         let s = HotSketch::new();
         let r = s.install_done_residual(3, 4);
-        assert_eq!(r, ResidualBind::Storage { writer: 4 });
+        assert_eq!(r, ResidualOrderedAdmit::Storage { writer: 4 });
         assert_eq!(
             s.residual_ordered_admit(3),
-            Some(ResidualBind::Storage { writer: 4 })
+            Some(ResidualOrderedAdmit::Storage { writer: 4 })
         );
         s.install_data_residual(3, 2, 1);
         assert!(matches!(
             s.residual_ordered_admit(3),
-            Some(ResidualBind::Data {
+            Some(ResidualOrderedAdmit::Data {
                 tx_idx: 2,
                 tx_incarnation: 1
             })
@@ -880,7 +880,7 @@ mod tests {
         // Done after Data keeps the Data residual.
         assert!(matches!(
             s.install_done_residual(3, 9),
-            ResidualBind::Data { tx_idx: 2, .. }
+            ResidualOrderedAdmit::Data { tx_idx: 2, .. }
         ));
     }
 

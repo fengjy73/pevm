@@ -1157,7 +1157,7 @@ fn try_validate(
             });
         // U4 identity wall: same writer + current Data + certified/FF match
         // already covered above. If identity holds and Estimate cleared,
-        // also accept prior_read / snap after a brief yield (R1 over R2).
+        // also accept prior_read / snap after a brief yield (partial_abort over rewind).
         if !value_stable && identity_held && estimate_cleared && !invalid.is_empty() {
             value_stable = invalid.iter().all(|&loc| {
                 let cur = match mv_memory.current_data_value(tx_version.tx_idx, loc) {
@@ -1170,8 +1170,8 @@ fn try_validate(
                     || mv_memory.prior_read_value_stable(tx_version.tx_idx, loc)
             });
         }
-        // R1-first: RebindOnly when values are stable (snap / carry / FF /
-        // prior-origin). Identity-held without a value match is not R1 —
+        // partial_abort-first: RebindOnly when values are stable (snap / carry / FF /
+        // prior-origin). Identity-held without a value match is not partial_abort —
         // that accepted stale suffix writes (seq≠par). true_suffix no longer
         // blocks a real value-stable match (the old SuffixRepair-as-default).
         if identity_held {

@@ -50,6 +50,8 @@ Live access verbs after PredictedEssential / visibility:
 
 `PartialRetry` (the rem table) is the implementation surface for these outcomes. It is not a user-facing verb.
 
+`RepairGrain::{PartialAbort, PartialAbortSelective, FullAbortReexecute}` classifies a validate fail before those outcomes fire.
+
 ## Metrics (hot-path names)
 
 | Field | Counts |

@@ -2,7 +2,7 @@
 //!
 //! Owns SpecFence **validate** (CC Resolve). Ready/steal lives in `computer.rs` (PC).
 //! Spec-only incarnations use the shared OCC validate kernel (bool walk + full_abort_reexecute).
-//! R1 Resolve runs only when a certificate **strip** covers fail locations.
+//! partial_abort Resolve runs only when a certificate **strip** covers fail locations.
 //!
 //! Plant SoT: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md`.
 
@@ -52,7 +52,7 @@ pub(crate) fn uses_specfence_resolve(
     mode == ConcurrencyMode::SpecFence && cert.may_resolve(tx_idx)
 }
 
-/// R1 museum only when the strip covers **every** invalid read (v6 §5).
+/// partial_abort museum only when the strip covers **every** invalid read (v6 §5).
 #[inline]
 pub(crate) fn specfence_partial_abort_validate(
     mode: ConcurrencyMode,
@@ -62,7 +62,7 @@ pub(crate) fn specfence_partial_abort_validate(
 ) -> bool {
     mode == ConcurrencyMode::SpecFence
         && !invalid.is_empty()
-        && repair_grain(cert, tx_idx, invalid) == RepairGrain::R1
+        && repair_grain(cert, tx_idx, invalid) == RepairGrain::PartialAbort
 }
 
 /// **Deprecated name.** v9.3: this is **not** a computer switch.
@@ -243,7 +243,7 @@ pub(crate) fn validate_specfence(
     let invalid = mv_memory.collect_invalid_reads(tx_version.tx_idx);
     if !invalid.is_empty() {
         let grain = repair_grain(specfence.certificates, tx_version.tx_idx, &invalid);
-        let covers = grain == RepairGrain::R1;
+        let covers = grain == RepairGrain::PartialAbort;
         let selective: Vec<_> = if covers {
             Vec::new()
         } else {

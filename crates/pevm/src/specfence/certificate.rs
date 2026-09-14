@@ -84,7 +84,7 @@ impl CertificateTable {
         }
     }
 
-    /// rem journal / R1 legal iff any strip or repair prefix (merged kernel).
+    /// rem journal / partial_abort legal iff any strip or repair prefix (merged kernel).
     #[inline]
     pub(crate) fn rem_legal(&self, tx_idx: TxIdx) -> bool {
         self.has_any(tx_idx)
@@ -124,7 +124,7 @@ impl CertificateTable {
         st.repair || !st.locs.is_empty()
     }
 
-    /// R1 legal iff every fail location is on the Fenced-prefix strip (or repair).
+    /// partial_abort legal iff every fail location is on the admitted-prefix strip (or repair).
     #[inline]
     pub(crate) fn covers_all(&self, tx_idx: TxIdx, invalid: &[MemoryLocationHash]) -> bool {
         if invalid.is_empty() {
@@ -154,7 +154,7 @@ impl CertificateTable {
         !st.locs.is_empty() && invalid.iter().all(|l| st.locs.contains(l))
     }
 
-    /// Single-location cover (selective R1 on the fenced subset).
+    /// Single-location cover (selective partial_abort on the admitted subset).
     #[inline]
     pub(crate) fn covers(&self, tx_idx: TxIdx, location: MemoryLocationHash) -> bool {
         let Some(slot) = self.slots.get(tx_idx) else {

@@ -209,7 +209,7 @@ pub(crate) use bayes::{BayesMap, DEFAULT_TAU};
 pub use boundary::SpecFenceInspector;
 #[allow(unused_imports)]
 pub(crate) use boundary::{
-    BindSnapMode, BoundarySnapshot, CachedCallOutcome, JournalBlob, absolute_jump_eligible,
+    BoundarySnapshot, CachedCallOutcome, JournalBlob, OrderedAdmitSnapMode, absolute_jump_eligible,
     absolute_jump_env_enabled, arm_call_outcome_cache, arm_ff_origin_seeds, arm_pc_resume,
     arm_pending_effect_cp_only, attach_current_live_snap, clear_pc_resume,
     handler_ordered_admit_snap_install_wanted, handler_sstore_plant_install_wanted, in_inspect_run,
@@ -283,7 +283,7 @@ pub(crate) use resolve::{
 };
 #[cfg(test)]
 pub(crate) use resolve::{PolicyCtx, ResolveAction};
-pub(crate) use sketch::{HotSketch, ResidualBind};
+pub(crate) use sketch::{HotSketch, ResidualOrderedAdmit};
 pub(crate) use wave::{
     ParkKind, ParkResumeIntent, ParkResumeKind, ParkedWait, PendingPark, WaveParkTable,
 };
@@ -299,7 +299,7 @@ pub enum ConcurrencyMode {
     Occ,
     /// Conservative PCC: hinted `from`/`to` accounts start in Wait.
     Pcc,
-    /// SpecFence complete CC: sketch + edge π + early-visible OrderedAdmit + R1–R4 resolve.
+    /// SpecFence complete CC: sketch + edge π + early-visible OrderedAdmit + partial_abort resolve.
     SpecFence,
 }
 
