@@ -1292,6 +1292,12 @@ impl PartialRetryTable {
         if st.k == 0 {
             return 0;
         }
+        // Tiny prefix ResumeAtK pays rem tax ≫ OCC FullRetry (14689597
+        // 0.17 / 19807137 0.09 with 300–1200 resume_k). Cash only when
+        // prefix skip is real (same bar as `prefix_skip_beats_b0`).
+        if st.k < 8 {
+            return 0;
+        }
         let has_mid_cp = st.checkpoints.iter().any(|c| c.id.k > 0 && c.id.k <= st.k);
         if !has_mid_cp {
             let _ = st.push_checkpoint(tx_idx, CheckpointKind::EffectBoundary);
@@ -2378,8 +2384,10 @@ mod p4_tk_park_tests {
     fn arm_pinhold_checkpoint_makes_product_park_resume() {
         let table = PartialRetryTable::new(2);
         table.reset_incarnation(0, 0);
-        // Snapped prefix (maybe_note_value) — honest rem grain.
-        for (loc, i) in [(10u64, 1u32), (11, 2)] {
+        // Snapped prefix (maybe_note_value) — honest rem grain. k≥8 so
+        // ResumeAtK is cheaper than FullRetry.
+        let prefix: Vec<(u64, u32)> = (1..=8).map(|i| (10 + i as u64, i)).collect();
+        for &(loc, i) in &prefix {
             unsafe { &mut *table.states[0].get() }.note_value(
                 loc,
                 FfValue::Storage {
@@ -2390,8 +2398,8 @@ mod p4_tk_park_tests {
                 },
             );
         }
-        let armed = table.arm_pinhold_checkpoint(0, 99, 3, &[(10, 1), (11, 2)]);
-        assert!(armed > 2, "armed_at_k must exceed prefix checkpoint");
+        let armed = table.arm_pinhold_checkpoint(0, 99, 9, &prefix);
+        assert!(armed > 8, "armed_at_k must exceed prefix checkpoint");
         match table.try_arm_pinhold_resume_at_k(0, armed) {
             ParkResumeKind::ResumeAtK { checkpoint_k } => {
                 assert!(checkpoint_k > 0 && checkpoint_k < armed as usize);
@@ -2403,6 +2411,23 @@ mod p4_tk_park_tests {
             !table.must_force_bind(0, 10),
             "PinHold resume must not force-bind"
         );
+    }
+
+    #[test]
+    fn arm_pinhold_tiny_snapped_prefix_is_full_retry() {
+        let table = PartialRetryTable::new(2);
+        table.reset_incarnation(0, 0);
+        unsafe { &mut *table.states[0].get() }.note_value(
+            10,
+            FfValue::Storage {
+                address: Address::ZERO,
+                slot: U256::from(1),
+                value: U256::from(1),
+                origin: None,
+            },
+        );
+        let armed = table.arm_pinhold_checkpoint(0, 99, 2, &[(10, 1)]);
+        assert_eq!(armed, 0, "tiny prefix must not ResumeAtK");
     }
 
     #[test]
