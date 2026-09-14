@@ -345,6 +345,13 @@ impl AccountHints {
             .unwrap_or(&[])
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_account_txs(addr: Address, txs: Vec<TxIdx>) -> Self {
+        let mut by_account = HashMap::with_hasher(BuildSuffixHasher::default());
+        by_account.insert(addr, txs);
+        Self { by_account }
+    }
+
     /// Last transaction before `tx_idx` that hinted this account.
     pub(crate) fn prev(&self, address: &Address, tx_idx: TxIdx) -> Option<TxIdx> {
         let list = self.by_account.get(address)?;

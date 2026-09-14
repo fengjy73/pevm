@@ -57,6 +57,8 @@ pub(crate) struct Scheduler {
     // The list of dependent transactions to resume when the
     // key transaction is re-executed.
     transactions_dependents: Vec<Mutex<SmallVec<[TxIdx; 1]>>>,
+    /// PinWithoutThrow waiters: park without `Aborting`; wake keeps incarnation.
+    pin_dependents: Vec<Mutex<SmallVec<[TxIdx; 1]>>>,
     // The next transaction to try and execute.
     execution_idx: AtomicUsize,
     // The next transaction to try and validate.
@@ -89,6 +91,7 @@ impl Scheduler {
             done_flags: (0..block_size).map(|_| AtomicBool::new(false)).collect(),
             validated_flags: (0..block_size).map(|_| AtomicBool::new(false)).collect(),
             transactions_dependents: (0..block_size).map(|_| Mutex::default()).collect(),
+            pin_dependents: (0..block_size).map(|_| Mutex::default()).collect(),
             // We won't validate until we find the first non-lazy transaction that
             // needs to read explicit values. We also skip the first transaction.
             validation_idx: AtomicUsize::new(block_size),
@@ -136,8 +139,8 @@ impl Scheduler {
     }
 
     /// Refuse Execute when CC ReadyEdge is live **and** PC ProducerStage(w)
-    /// is runnable. Known consumers (any incarnation) wait. If the producer
-    /// has no Stage, do **not** refuse (v6 collaborative-index deadlock).
+    /// is runnable. Known consumers (**any** incarnation, including first wave)
+    /// wait. If the producer has no Stage, do **not** refuse (v6 deadlock).
     fn try_execute_ready(
         &self,
         tx_idx: TxIdx,
@@ -148,7 +151,6 @@ impl Scheduler {
             let mut tx = index_mutex!(self.transactions_status, tx_idx);
             if tx.status == IncarnationStatus::ReadyToExecute {
                 if let Some(edges) = ready
-                    && tx.incarnation > 0
                     && !edges.may_execute(tx_idx)
                     && let Some(w) = edges.blocking_producer(tx_idx)
                 {
@@ -156,6 +158,7 @@ impl Scheduler {
                     // visible). Ready/Validated refuse reintroduced the v6
                     // yield-spin (iter20): consumers deferred, producer off
                     // execution_idx, next_sf_task cannot make progress.
+                    // First wave (inc==0) must refuse too — SoT schedule-first Avoid.
                     if self.is_executing(w) {
                         edges.defer(tx_idx);
                         if let Some(wave) = wave {
@@ -256,7 +259,6 @@ impl Scheduler {
                     // "Steal" execution job while holding the lock
                     if tx.status == IncarnationStatus::ReadyToExecute {
                         if let Some(edges) = ready
-                            && tx.incarnation > 0
                             && !edges.may_execute(tx_idx)
                             && let Some(w) = edges.blocking_producer(tx_idx)
                             && self.is_executing(w)
@@ -382,6 +384,40 @@ impl Scheduler {
         blocking_dependents.push(tx_idx);
 
         true
+    }
+
+    /// PinWithoutThrow: park `tx_idx` behind `blocking_tx_idx` **without**
+    /// `Aborting` or incarnation++. Status stays `Executing` (worker has left)
+    /// until the writer finishes and [`Self::set_pin_ready`] restores Ready
+    /// at the same incarnation.
+    ///
+    /// Returns `false` if the writer is already Executed|Validated (race).
+    pub(crate) fn add_pin_hold(&self, tx_idx: TxIdx, blocking_tx_idx: TxIdx) -> bool {
+        let blocking_tx = index_mutex!(self.transactions_status, blocking_tx_idx);
+        if matches!(
+            blocking_tx.status,
+            IncarnationStatus::Executed | IncarnationStatus::Validated
+        ) {
+            return false;
+        }
+
+        let tx = index_mutex!(self.transactions_status, tx_idx);
+        debug_assert_eq!(tx.status, IncarnationStatus::Executing);
+        drop(tx);
+
+        let mut pin_dependents = index_mutex!(self.pin_dependents, blocking_tx_idx);
+        pin_dependents.push(tx_idx);
+        true
+    }
+
+    /// Wake a PinHold waiter: Ready at the **same** incarnation (no FullRetry throw).
+    fn set_pin_ready(&self, tx_idx: TxIdx) {
+        let mut tx = index_mutex!(self.transactions_status, tx_idx);
+        if tx.status != IncarnationStatus::Executing {
+            return;
+        }
+        tx.status = IncarnationStatus::ReadyToExecute;
+        self.set_done_flag(tx_idx, false);
     }
 
     /// Iter3 serial-barrier resolve: after validation abort the tx is already
@@ -596,9 +632,14 @@ impl Scheduler {
         // Drain dependents first; set Executed/Validated *before* waking so SoftWait
         // `is_done` is true as soon as the writer lock is released / waiters proceed.
         let mut drained: SmallVec<[TxIdx; 4]> = SmallVec::new();
+        let mut pin_drained: SmallVec<[TxIdx; 4]> = SmallVec::new();
         {
             let mut dependents = index_mutex!(self.transactions_dependents, tx_version.tx_idx);
             drained.extend(dependents.drain(..));
+        }
+        {
+            let mut pins = index_mutex!(self.pin_dependents, tx_version.tx_idx);
+            pin_drained.extend(pins.drain(..));
         }
 
         // TODO: Simplify or better document this logic.
@@ -682,6 +723,14 @@ impl Scheduler {
                 if let Some(wave) = wave {
                     wave.push_ready(tx_idx);
                 }
+            }
+        }
+        // PinHold: same-incarnation Ready (no Aborting / no incarnation++).
+        for tx_idx in pin_drained {
+            self.set_pin_ready(tx_idx);
+            self.execution_idx.fetch_min(tx_idx, Ordering::Relaxed);
+            if let Some(wave) = wave {
+                wave.push_ready(tx_idx);
             }
         }
         // Location-keyed WaitHard parks: wake → ready deque + park_ns.
@@ -874,5 +923,65 @@ impl Scheduler {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::specfence::ReadyEdgeTable;
+
+    #[test]
+    fn refuse_known_consumer_on_incarnation_zero() {
+        let s = Scheduler::new(4);
+        let ready = ReadyEdgeTable::new();
+        ready.note_consumer(2, 0);
+        let v0 = s.try_execute(0).expect("producer");
+        assert_eq!(v0.tx_idx, 0);
+        assert!(s.is_executing(0));
+        assert!(
+            s.try_execute_ready(2, None, Some(&ready)).is_none(),
+            "first-wave (inc==0) must refuse while ProducerStage(w) Executing"
+        );
+        assert!(ready.refuse_count() >= 1);
+    }
+
+    #[test]
+    fn pin_hold_does_not_abort_or_bump_incarnation() {
+        let s = Scheduler::new(3);
+        let p = s.try_execute(0).unwrap();
+        let c = s.try_execute(1).unwrap();
+        assert_eq!(c.tx_incarnation, 0);
+        assert!(s.add_pin_hold(1, 0));
+        assert!(s.is_executing(1), "PinHold must not mark Aborting");
+        assert!(!s.is_aborting(1));
+        let _ = s.finish_execution(
+            TxVersion {
+                tx_idx: p.tx_idx,
+                tx_incarnation: p.tx_incarnation,
+            },
+            FinishExecFlags::empty(),
+        );
+        assert!(s.is_ready(1));
+        let again = s.try_execute(1).expect("same-incarnation resume");
+        assert_eq!(again.tx_incarnation, 0, "PinWithoutThrow keeps incarnation");
+    }
+
+    #[test]
+    fn pin_hold_loses_race_when_writer_done() {
+        let s = Scheduler::new(2);
+        let p = s.try_execute(0).unwrap();
+        let _ = s.finish_execution(
+            TxVersion {
+                tx_idx: p.tx_idx,
+                tx_incarnation: p.tx_incarnation,
+            },
+            FinishExecFlags::empty(),
+        );
+        let _ = s.try_execute(1).unwrap();
+        assert!(
+            !s.add_pin_hold(1, 0),
+            "writer already Done must not pin forever"
+        );
     }
 }

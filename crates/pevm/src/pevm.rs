@@ -537,6 +537,7 @@ impl Pevm {
                                 w,
                                 specfence.ready_edges,
                                 specfence.producer_stages,
+                                Some(&metrics_inner),
                             )
                         } else {
                             crate::specfence::next_occ_task(&scheduler)
@@ -611,6 +612,7 @@ impl Pevm {
                                         w,
                                         specfence.ready_edges,
                                         specfence.producer_stages,
+                                        Some(&metrics_inner),
                                     )
                                 } else {
                                     crate::specfence::next_occ_task(&scheduler)
@@ -909,25 +911,26 @@ impl Pevm {
                 }
                 Err(VmExecutionError::Blocking(blocking_tx_idx)) => {
                     // M2/P4: WaitHard registered park+(location,k) in Vm (SpecFence).
-                    // add_dependency marks Aborting; worker must steal ready work.
                     let pending = vm.take_pending_park();
                     let park_loc = pending.map(|p| p.location).unwrap_or(0);
                     let park_k = pending.map(|p| p.armed_at_k).unwrap_or(0);
                     let park_kind = pending
                         .map(|p| p.kind)
                         .unwrap_or(crate::specfence::ParkKind::BlockingOther);
-                    // Dependency first (Block-STM). SoftWait/EarlyAbort still need wave
-                    // park for (t,k) resume; BlockingOther ESTIMATE may convert to
-                    // steal-without-long-park when the writer is Ready.
-                    if !scheduler.add_dependency(tx_version.tx_idx, blocking_tx_idx)
-                        && self.abort_reason.get().is_none()
-                    {
+                    // PinWithoutThrow: park Stage without add_dependency→Aborting.
+                    // BlockingOther ESTIMATE may still Aborting+steal-convert.
+                    let pinned = park_kind == crate::specfence::ParkKind::PinHold;
+                    let parked = if pinned {
+                        scheduler.add_pin_hold(tx_version.tx_idx, blocking_tx_idx)
+                    } else {
+                        scheduler.add_dependency(tx_version.tx_idx, blocking_tx_idx)
+                    };
+                    if !parked && self.abort_reason.get().is_none() {
                         // Writer already done — retry without parking.
                         continue;
                     }
                     if let Some(wave) = wave {
                         let ready = Some(vm.ready_edges());
-                        // PinHold: park first, never steal-convert (v9.1 M1).
                         if park_kind == crate::specfence::ParkKind::BlockingOther {
                             wave.arm_steal_convert_without_park();
                             if let Some(stolen) = scheduler.next_task_steal_after_park_prefer(
@@ -938,7 +941,7 @@ impl Pevm {
                                 return Some(stolen);
                             }
                         }
-                        if park_kind == crate::specfence::ParkKind::PinHold {
+                        if pinned {
                             vm.record_waitfor_pin();
                         } else if park_kind == crate::specfence::ParkKind::BlockingOther {
                             vm.record_waitfor_aborting();

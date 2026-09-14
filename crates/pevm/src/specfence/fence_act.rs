@@ -6,6 +6,7 @@
 //!
 //! Plant SoT: `lab/notes/specfence-complete-architecture-v9.1-cc-pc-bayes.md` §2.4.
 
+use super::wave::ParkKind;
 use crate::TxIdx;
 use crate::scheduler::Scheduler;
 
@@ -44,6 +45,17 @@ pub(crate) fn act_bind_has_data(has_data: bool) -> bool {
     has_data
 }
 
+/// ESTIMATE Avoid: PE-known RAW is PinHold (not BlockingOther Aborting default).
+/// Unknown ESTIMATE stays BlockingOther (true OCC).
+#[inline]
+pub(crate) fn estimate_park_kind(pe_known: bool) -> ParkKind {
+    if pe_known {
+        ParkKind::PinHold
+    } else {
+        ParkKind::BlockingOther
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -52,5 +64,11 @@ mod tests {
     fn bind_requires_data() {
         assert!(act_bind_has_data(true));
         assert!(!act_bind_has_data(false));
+    }
+
+    #[test]
+    fn estimate_pe_known_is_pinhold() {
+        assert_eq!(estimate_park_kind(true), ParkKind::PinHold);
+        assert_eq!(estimate_park_kind(false), ParkKind::BlockingOther);
     }
 }

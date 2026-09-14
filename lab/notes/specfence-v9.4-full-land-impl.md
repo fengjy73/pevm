@@ -60,7 +60,7 @@
 
 | Suite | Result |
 |-------|--------|
-| `cargo test -p pevm --lib` | **194 passed** |
+| `cargo test -p pevm --lib` | **202 passed** (incl. refuse inc==0, PinHold, decide EV, admit ≥16) |
 | `--test specfence` | **42 passed**, 20 ignored |
 | `--test raw_transfers` / `small_blocks` / `mixed` / `beneficiary` / `erc20` | **all passed** (re-run after wave extract + kernel merge + dual-π gate) |
 | `--test uniswap` | **passed** (re-run after SRP close) |
@@ -120,13 +120,13 @@ No `specfence/pc/`, `specfence/cc/`, `specfence/bayes/` directories.
 - Dual π **bodies** remain as `#[cfg(test)]` museums (`edge`/`resolve`/`bayes` Boolean). Hot-path compile + export removed.
 - `learner.rs` is still a megaclass (PE + morph + tax). Feeder is split; decide does **not** live there.
 - SoftWait Soft arms still compile inside `rem` (product Soft=0; not default Avoid).
-- OrderedAdmit (≥16 hinted txs) only when fan/star — first-block 14689597 with empty InterPrior still learns after first abort.
+- OrderedAdmit (≥16 hinted txs) now seeds even on quiet-biased empty InterPrior; floor=2 when fan/prior/stars. Sweep must confirm 14689597 edges before satellite Execute.
 
 ---
 
 ## 5. Essence
 
-One pevm spine, file-SRP (wave extract, kernel merge, dual-π test-gated, Fence out of vm), Bayes→admit→decide→PinHold→R1, Soft=0, seq≡par tests green. Product TPS bars need a sweep — this PR does not invent 0.95.
+One pevm spine, file-SRP, Bayes→admit→decide→PinHold→R1 **duties landed** (refuse fires, PinHold ≠ Aborting, decide consumes EV, R1b wired, admit seeds stars without prior gate). Soft=0, seq≡par tests green. Product TPS bars need a **new** Soft=0 sweep — this PR does not invent 0.95 or claim a crush of 0.685.
 
 ---
 
@@ -145,3 +145,24 @@ One pevm spine, file-SRP (wave extract, kernel merge, dual-π test-gated, Fence 
 | Bind-after-Done | — | 205 |
 
 Product bars still **not** met. Do not claim crush from call-order land alone.
+
+---
+
+## 6. SoT-gap close (successor of `b9903f2`)
+
+**Date:** 2026-09-14  
+**Posture:** finish named MISSING/PARTIAL duties — **no redesign**, no P0/P1/P2, Soft=0.
+
+| Duty | Land |
+|------|------|
+| schedule-first Avoid | `try_execute_ready` refuses known consumers on **inc==0**; `record_schedule_refuse_n` from `next_sf_task` |
+| ProducerStage refuse | first wave respects ReadyEdge while `w` Executing; Ready/Validated still canary |
+| PinWithoutThrow | `add_pin_hold` (status stays Executing); wake `set_pin_ready` same incarnation; pevm PinHold arm does **not** `add_dependency` |
+| BlockingOther not default | `fence_act::estimate_park_kind`; PE-known ESTIMATE / `fence_wait_for` → PinHold |
+| decide←Bayes | `ev_pin_beats_abort` / `depth_frac` are the WaitFor spine; OR-bool is no-query adapter only |
+| R1 live | `query_validate` + `repair_grain`; R1a value-stable; R1b `apply_suffix_repair` when EV/covers |
+| admit_seed | ≥16-tx hints seed on quiet-biased empty InterPrior; floor=2 when fan/prior/stars |
+| mid-tx bleed | `note_unpublished_raw` refresh-only unless predicted producer |
+| file-SRP | ESTIMATE park-kind extracted to `fence_act`; no `pc/cc/bayes` dirs |
+
+**Honesty:** tip sweep median **0.6853** / fan **0.3482** / R1 **6/1636** / refuse **0** is the *pre-close* wall. This land does **not** attach a new all-blocks JSON. Product bars (median ≥0.95, fan ≥0.90, R1 ≥50%) remain **unclaimed**. Soft=0 held in tests.

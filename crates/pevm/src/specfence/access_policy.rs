@@ -105,21 +105,36 @@ pub(crate) fn decide_queried(
     // Known-star Bayes posterior opens WaitFor even on quiet morph (M4).
     // Lone intra abort on quiet stays Unfenced (2179522).
     let known_star = bayes.is_some_and(|q| q.known_star && !q.quiet_cold);
-    let ev_win = known_star || (!quiet_off && (intra || (fan && learner.prior_pe_fire_wins(vis))));
-    let bind_ev = bayes.is_none_or(|q| q.ev_bind_beats_b0 || q.known_star);
-    // WaitFor pins one *executing* producer. Quiet-off blocks first-wave
-    // tax (2179522). Prior-only still needs the T3 fan_out EV brake.
+    // OR-bool adapter only when no Bayes query (tests / empty ports).
+    // Live π is ev_pin_beats_abort / depth_frac — not ev_win as decide spine.
+    let ev_adapter = !quiet_off && (intra || (fan && learner.prior_pe_fire_wins(vis)));
+    let ev_pin = if let Some(q) = bayes {
+        if quiet_off && !known_star {
+            false
+        } else {
+            q.ev_pin_beats_abort || q.depth_frac >= 0.50 || known_star
+        }
+    } else {
+        known_star || ev_adapter
+    };
+    let bind_ev = if let Some(q) = bayes {
+        (q.ev_bind_beats_b0 || q.known_star) && (!quiet_off || known_star)
+    } else {
+        ev_adapter
+    };
+    // WaitFor pins one *executing* producer. AbortingThrow last: low
+    // depth_frac ∧ ¬ev_pin_beats_abort (already folded into ev_pin).
     if vis.unfinished == 1
         && vis.writer_executing
         && let Some(w) = vis.writer
-        && ev_win
+        && ev_pin
     {
         return AccessDecision::WaitFor { writer: w };
     }
     // SerialLane: multi-writer PE class. Never Bind while unfinished>0
     // (later writers not yet in MV — stale last_data theater).
     if vis.unfinished > 1 || (vis.in_serial_lane && vis.unfinished > 0) {
-        if ev_win
+        if ev_pin
             && vis.writer_executing
             && let Some(w) = vis.writer
         {
@@ -131,7 +146,6 @@ pub(crate) fn decide_queried(
     if vis.unfinished == 0
         && vis.published_data
         && vis.tip_is_conflict_producer
-        && ev_win
         && bind_ev
         && !learner.bind_tax_losing()
     {
@@ -397,6 +411,49 @@ mod tests {
                 roi_skip: true
             },
             "aborts >= binds still trips Bind"
+        );
+    }
+
+    #[test]
+    fn bayes_low_depth_does_not_waitfor() {
+        let live = fan_out_learner();
+        live.seed_predicted_essential(7, 6);
+        let q = crate::specfence::BayesAccessQuery {
+            p_raw: 0.4,
+            p_bind: 0.1,
+            quiet_cold: false,
+            depth_frac: 0.15,
+            ev_pin_beats_abort: false,
+            ev_bind_beats_b0: false,
+            known_star: false,
+        };
+        assert_eq!(
+            decide_queried(&live, 7, 6, Some(&exec_vis(2)), Some(q)),
+            AccessDecision::UnfencedOcc {
+                predicted: true,
+                roi_skip: true
+            },
+            "decide←Bayes: low depth_frac ∧ ¬ev_pin_beats_abort → AbortingThrow last"
+        );
+    }
+
+    #[test]
+    fn bayes_pin_ev_opens_waitfor() {
+        let live = fan_out_learner();
+        live.seed_predicted_essential(7, 6);
+        let q = crate::specfence::BayesAccessQuery {
+            p_raw: 0.5,
+            p_bind: 0.1,
+            quiet_cold: false,
+            depth_frac: 0.85,
+            ev_pin_beats_abort: true,
+            ev_bind_beats_b0: false,
+            known_star: false,
+        };
+        assert_eq!(
+            decide_queried(&live, 7, 6, Some(&exec_vis(2)), Some(q)),
+            AccessDecision::WaitFor { writer: 2 },
+            "decide←Bayes: ev_pin_beats_abort shapes WaitFor"
         );
     }
 

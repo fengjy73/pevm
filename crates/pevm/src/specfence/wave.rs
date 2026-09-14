@@ -86,12 +86,12 @@ pub(crate) struct PendingPark {
 
 /// M2/P4 wave ready-queue + WaitHard park table.
 ///
-/// **Grain (honest):** PEVM tasks are still whole-tx. Park = Block-STM
-/// `Aborting` + dependency (`add_dependency`); wake = `ReadyToExecute` +
-/// incarnation++. P4 stores SoftWait `armed_at_k` on the park entry and restores
-/// a [`ParkResumeIntent`] so the next incarnation can arm RewindTo/FF when a
-/// checkpoint exists; otherwise FullRetry from tx head (M2 behaviour).
-/// Mid-effect live Interpreter park is **not** implemented (M1k/M1l hang lessons).
+/// **Grain (honest):** PEVM tasks are still whole-tx. `ParkKind::BlockingOther`
+/// is Block-STM `Aborting` + `add_dependency` (incarnation++). `ParkKind::PinHold`
+/// is PinWithoutThrow: `add_pin_hold` keeps `Executing` and wakes Ready at the
+/// **same** incarnation (no FullRetry throw). P4 stores SoftWait `armed_at_k`
+/// for RewindTo/FF when a checkpoint exists. Mid-effect live Interpreter park
+/// is **not** implemented (M1k/M1l hang lessons).
 #[derive(Debug, Default)]
 pub(crate) struct WaveParkTable {
     /// Min-heap: lower `TxIdx` first (frozen choice §8.3).

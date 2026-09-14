@@ -708,6 +708,8 @@ impl<'a, S: Storage> VmDb<'a, S> {
     /// ESTIMATE observe only. Must **not** mark PE — that opens decide/ordinal
     /// for the rest of the first wave and Bind-theaters stale Data
     /// (14689597: 581 SF aborts vs OCC 24). Abort still trains true-k PE.
+    /// First ReadyEdge insert is admit_seed; refresh only when the producer
+    /// was already predicted.
     fn note_unpublished_raw(&self, location: MemoryLocationHash, writer: TxIdx) {
         if self.specfence.mode != crate::ConcurrencyMode::SpecFence {
             return;
@@ -716,15 +718,44 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.specfence
             .ready_edges
             .note_unpublished(location, writer);
-        self.specfence
+        if self
+            .specfence
             .ready_edges
-            .note_consumer(self.tx_idx, writer);
-        self.specfence.producer_stages.reserve(writer);
+            .predicted_producer(location)
+            .is_some()
+            && writer < self.tx_idx
+        {
+            self.specfence
+                .ready_edges
+                .note_consumer(self.tx_idx, writer);
+            self.specfence.producer_stages.reserve(writer);
+        }
         let hot_or_ws = self.specfence.hotset.contains(location)
             || self.specfence.rw_prior.predicts_write(location);
         self.specfence
             .learner
             .note_hot_ws_posterior(location, hot_or_ws);
+    }
+
+    /// ESTIMATE / aborted-incarnation Blocking: PE-known RAW → PinHold;
+    /// unknown ESTIMATE stays BlockingOther (true OCC).
+    fn park_estimate_blocking(
+        &self,
+        location_hash: MemoryLocationHash,
+        writer: TxIdx,
+    ) -> ReadError {
+        let pe_known = self.specfence.learner.location_predicted(location_hash)
+            || self
+                .specfence
+                .ready_edges
+                .predicted_producer(location_hash)
+                .is_some();
+        let kind = crate::specfence::fence_act::estimate_park_kind(pe_known);
+        let armed_at_k = self.specfence.partial_retry.current_k(self.tx_idx) as u64;
+        self.specfence
+            .wave
+            .set_pending_park(location_hash, armed_at_k, kind);
+        ReadError::Blocking(writer)
     }
 
     /// Shared OCC proceed: no rem journal / first_k / Edge / process / Detect DashMap.
@@ -1026,10 +1057,16 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 .arm_hard_wait(location_hash, self.tx_idx, t);
             self.specfence.scheduler.admit_spine(t, self.specfence.wave);
             let armed_at_k = self.specfence.partial_retry.current_k(self.tx_idx) as u64;
+            let pe_known = self.specfence.learner.location_predicted(location_hash)
+                || self
+                    .specfence
+                    .ready_edges
+                    .predicted_producer(location_hash)
+                    .is_some();
             self.specfence.wave.set_pending_park(
                 location_hash,
                 armed_at_k,
-                crate::specfence::ParkKind::BlockingOther,
+                crate::specfence::fence_act::estimate_park_kind(pe_known),
             );
             self.specfence.process.note_park(self.tx_idx);
             return Err(ReadError::Blocking(t));
@@ -1494,11 +1531,10 @@ impl<S: Storage> Database for VmDb<'_, S> {
                         }
                         if resolve {
                             self.promote_on_conflict(address, location_hash);
-                            self.specfence.wave.set_pending_park_location(location_hash);
                         } else {
                             self.note_unpublished_raw(location_hash, *blocking_idx);
                         }
-                        return Err(ReadError::Blocking(*blocking_idx));
+                        return Err(self.park_estimate_blocking(location_hash, *blocking_idx));
                     }
                     Some((closest_idx, MemoryEntry::Data(tx_incarnation, value))) => {
                         if self
@@ -1515,9 +1551,8 @@ impl<S: Storage> Database for VmDb<'_, S> {
                             }
                             if resolve {
                                 self.promote_on_conflict(address, location_hash);
-                                self.specfence.wave.set_pending_park_location(location_hash);
                             }
-                            return Err(ReadError::Blocking(*closest_idx));
+                            return Err(self.park_estimate_blocking(location_hash, *closest_idx));
                         }
                         self.specfence.metrics.record_db_heavy_op();
                         // About to push a new origin
@@ -1818,10 +1853,9 @@ impl<S: Storage> Database for VmDb<'_, S> {
                                     return Ok(*v2);
                                 }
                             }
-                            self.specfence.wave.set_pending_park_location(location_hash);
                             self.promote_on_conflict(address, location_hash);
                         }
-                        return Err(ReadError::Blocking(*closest_idx));
+                        return Err(self.park_estimate_blocking(location_hash, *closest_idx));
                     }
                     self.specfence.metrics.record_db_heavy_op();
                     let origin = ReadOrigin::MvMemory(TxVersion {
@@ -1889,7 +1923,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
                     } else {
                         self.promote_on_conflict(address, location_hash);
                         self.note_unpublished_raw(location_hash, *closest_idx);
-                        return Err(ReadError::Blocking(*closest_idx));
+                        return Err(self.park_estimate_blocking(location_hash, *closest_idx));
                     }
                 }
                 _ => return Err(ReadError::InvalidMemoryValueType),
