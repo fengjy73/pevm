@@ -266,10 +266,12 @@ fn meta_tax_prefers_spec(
 
 /// AEC π: Bind if Data ready; else argmin EV.
 ///
+/// **Museum.** Live Mode(a) is [`crate::specfence::decide_access_queried`].
 /// Tie law (SpecFence-native): when writer is known Running/unfinished and
 /// `EV_Wait ≈ EV_Spec`, prefer **Await (WaitHard)** over SpecRead. SpecRead
 /// remains for writer absent/unknown discovery — not the protocol brand.
 /// Meta tax may still bias away from Wait storms; no Boolean fanout→Wait ladders.
+#[cfg(test)]
 pub(crate) fn choose_action(ctx: PolicyCtx) -> ResolveAction {
     let params = ctx.params;
     // 1. Published Data → Bind (install origin / certify). Bind match arm does **not**

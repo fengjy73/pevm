@@ -199,6 +199,20 @@ mod tests {
     }
 
     #[test]
+    fn rem_legal_is_certificate_not_second_table() {
+        let t = CertificateTable::new(2);
+        assert!(!t.rem_legal(0));
+        assert!(!t.may_resolve(0));
+        t.note_success(0, 1);
+        assert!(t.rem_legal(0));
+        assert!(t.may_resolve(0));
+        assert!(!t.rem_legal(1));
+        t.begin_execute(1, true, 0);
+        assert!(t.repair_armed(1));
+        assert!(t.rem_legal(1));
+    }
+
+    #[test]
     fn wait_resume_keeps_location_strips() {
         let t = CertificateTable::new(1);
         t.begin_execute(0, false, 0);

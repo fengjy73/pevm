@@ -31,10 +31,10 @@ use crate::{
     specfence::{
         AccountHints, AdaptiveEngagement, AdaptiveParams, BayesMap, ConcurrencyMode, DEFAULT_TAU,
         EdgeTable, ExecProcessSnapshot, FineGrainCollector, FineGrainSnapshot, HeatMap, HotSet,
-        HotSketch, InterBlockPrior, KernelTable, LeanAbortRepair, LiveLearner, MetricsInner,
-        PartialRetryTable, ProcessTrace, RemCounters, ResearchAbortRepair, RwPriorMap, SpecDag,
-        SpecFenceCtx, SpecFenceMetrics, WaveParkTable, seed_wait_regions, update_bayes,
-        update_heat, update_rw_prior,
+        HotSketch, InterBlockPrior, LeanAbortRepair, LiveLearner, MetricsInner, PartialRetryTable,
+        ProcessTrace, RemCounters, ResearchAbortRepair, RwPriorMap, SpecDag, SpecFenceCtx,
+        SpecFenceMetrics, WaveParkTable, seed_wait_regions, update_bayes, update_heat,
+        update_rw_prior,
     },
     storage::StorageWrapper,
     vm::{
@@ -443,7 +443,6 @@ impl Pevm {
         let rem = RemCounters::default();
         let partial_retry = PartialRetryTable::new(block_size);
         let wave = WaveParkTable::new();
-        let kernel = KernelTable::new(block_size);
         let access_log = crate::specfence::AccessOrdinalLog::new(block_size);
         let certificates = crate::specfence::CertificateTable::new(block_size);
         let ready_edges = crate::specfence::ReadyEdgeTable::new();
@@ -508,7 +507,6 @@ impl Pevm {
             edges: &edges,
             sketch: &sketch,
             process: &process,
-            kernel: &kernel,
             access_log: &access_log,
             certificates: &certificates,
             ready_edges: &ready_edges,
@@ -1071,8 +1069,11 @@ fn try_validate(
     let mut cached_plan: Option<Option<crate::specfence::PartialRetryPlan>> = None;
     // Iter15: true_suffix flag for fan-out FR collapse / RebindOnly widen on abort path.
     let mut true_suffix_flag = false;
-    if crate::specfence::uses_specfence_resolve(specfence.mode, specfence.kernel, tx_version.tx_idx)
-        && !invalid.is_empty()
+    if crate::specfence::uses_specfence_resolve(
+        specfence.mode,
+        specfence.certificates,
+        tx_version.tx_idx,
+    ) && !invalid.is_empty()
     {
         specfence.metrics.record_region_validate_fail(invalid.len());
         // RebindOnly-first (native resolve): patch origins when invalid reads now

@@ -11,8 +11,11 @@ use dashmap::{DashMap, DashSet};
 
 use crate::{BuildIdentityHasher, BuildSuffixHasher, MemoryLocationHash};
 
+#[cfg(test)]
 use super::RegionMode;
-use super::resolve::{TAU_REVOKE, cost_prefers_wait};
+use super::resolve::TAU_REVOKE;
+#[cfg(test)]
+use super::resolve::cost_prefers_wait;
 #[cfg(test)]
 use super::resolve::{TAU_S, TAU_VERY_HIGH, TAU_W};
 
@@ -218,8 +221,8 @@ impl BayesMap {
         }
     }
 
-    /// Boolean π museums — **not** SpecFence decide. Tests / PCC only.
-    #[allow(dead_code)]
+    /// Boolean π museums — **not** SpecFence decide.
+    #[cfg(test)]
     pub(crate) fn decide(
         &self,
         location: MemoryLocationHash,
@@ -234,6 +237,7 @@ impl BayesMap {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn decide_account(&self, address: &Address, tau: f64) -> RegionMode {
         if self.account_wait_probability(address) >= tau {
             RegionMode::Wait
@@ -251,12 +255,8 @@ impl BayesMap {
         self.conflict_probability(location, address) < TAU_REVOKE
     }
 
-    /// Legacy Boolean Wait probe (cost_prefers_wait).
-    ///
-    /// **Not SpecFence π.** V5-P0: SpecFence Wait is decided only by AEC
-    /// `choose_action`. Keep this for unit tests / PCC-era callers; Beta
-    /// posteriors feed PolicyCtx as continuous features instead.
-    /// `writer_done`: producer Executed/Validated (wait cheap); unknown → false.
+    /// Legacy Boolean Wait probe. **Not SpecFence π.**
+    #[cfg(test)]
     pub(crate) fn should_wait_hard(
         &self,
         location: MemoryLocationHash,

@@ -222,6 +222,9 @@ pub(crate) fn classify_edge(v: &EdgeView) -> EdgeVisibility {
 /// Decide the protocol verb from frozen π visibility.
 /// PredictedEssential ∧ Data → Bind; PredictedEssential ∧ writer → WaitFor;
 /// else Unfenced≡OCC. Canary / ForcePrefix / SerialLane-without-writer are gone.
+///
+/// **Museum.** Live Mode(a) is [`crate::specfence::decide_access_queried`].
+#[cfg(test)]
 pub(crate) fn choose_edge_action(v: &EdgeView) -> EdgeAction {
     match classify_edge(v) {
         EdgeVisibility::PublishedData { version } => EdgeAction::Bind(version),

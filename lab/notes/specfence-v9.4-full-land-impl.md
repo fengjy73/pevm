@@ -26,15 +26,15 @@
 | Action | File |
 |--------|------|
 | **SPLIT** Fence policy out of `vm` | `specfence/fence_act.rs` (`FenceAct::{PinHold,DoneUnfenced,ReadyCanary}`) |
-| **SPLIT** wave product surface | `specfence/wave.rs` (re-exports `WaveParkTable`; SoftWait stays in `rem`, Soft=0) |
+| **SPLIT** wave product surface | `specfence/wave.rs` **owns** `WaveParkTable` + `ParkKind`/`PinHold` (~530 LOC). SoftWait Soft + SuffixRepair remain in `rem.rs` (quarantined; Soft=0) |
 | **SPLIT** feeder ≠ decide | `specfence/feeder.rs` (PE seed / abort observe → Bayes) |
 | **NEW** admit_seed | `specfence/admit.rs` (begin_block + abort strengthen) |
 | **DELETE** | `specfence/mode.rs` (3-LOC reexport) |
-| **DELETE hot export** | `choose_edge_action`, `choose_action` no longer `mod.rs` production π |
-| **MERGE** kernel SoT | `CertificateTable::{rem_legal,may_resolve,repair_armed,begin_block}`; strips survive resume |
-| **QUARANTINE** | `boundary` / `finegrain` / `edge`/`resolve`/`bayes` Boolean π remain compiled for tests/museum; not live decide |
+| **DELETE hot export** | `choose_edge_action`, `choose_action`, `bayes::{decide,should_wait_hard}` are `#[cfg(test)]` museums |
+| **MERGE** kernel SoT | `CertificateTable::{rem_legal,may_resolve,repair_armed,begin_block}`; strips survive resume. `kernel.rs` is **`#[cfg(test)]` only** — not on Ctx, not allocated |
+| **QUARANTINE** | `boundary` / `finegrain` remain compiled for inspect/lab opt-in; dual π bodies do **not** compile on the product path |
 
-**Not done (honest):** physical extract of 1k+ WavePark lines out of `rem.rs`; `pc/`/`cc/`/`bayes/` folders (banned as success). `kernel.rs` still allocated (Ctx field) as rem-legal mirror.
+**Not a success criterion:** `pc/`/`cc/`/`bayes/` folders (banned). None created.
 
 ### Mechanism cuts (v9.1 on unified spine)
 
@@ -60,10 +60,10 @@
 
 | Suite | Result |
 |-------|--------|
-| `cargo test -p pevm --lib` | **191 passed** |
+| `cargo test -p pevm --lib` | **194 passed** |
 | `--test specfence` | **42 passed**, 20 ignored |
-| `--test raw_transfers` / `small_blocks` / `mixed` / `beneficiary` / `erc20` | **all passed** |
-| `--test uniswap` | **passed** |
+| `--test raw_transfers` / `small_blocks` / `mixed` / `beneficiary` / `erc20` | **all passed** (re-run after wave extract + kernel merge + dual-π gate) |
+| `--test uniswap` | **passed** (re-run after SRP close) |
 | SoftWait Soft | **0** (asserted in specfence tests) |
 | seq≡par | **held** on mocked clusters (one R1-overbind seq≠par caught and fixed: identity-without-value-proof) |
 
@@ -94,32 +94,36 @@ Tip honesty at base (`bb67ff7`): median **0.728** / fan **0.362**. This land is 
 crates/pevm/src/pevm.rs          # unified next/execute/validate; admit_seed; PinHold park
 crates/pevm/src/vm.rs            # thin gate → decide_queried + fence_act; PinHold park kind
 crates/pevm/src/specfence/
-  fence_act.rs                   # NEW — Fence verb policy
-  admit.rs                       # NEW — begin_block / abort seed
-  feeder.rs                      # NEW — PE/Bayes observe
-  wave.rs                        # NEW — product WavePark surface
-  access_policy.rs               # decide_queried ← Bayes
-  bayes.rs                       # query_access / is_cold ports
-  certificate.rs                 # strip survival + kernel merge APIs
+  fence_act.rs                   # Fence verb policy (out of vm)
+  admit.rs                       # begin_block / abort seed
+  feeder.rs                      # PE/Bayes observe (learner feeder ≠ decide)
+  wave.rs                        # WaveParkTable + PinHold (physical extract from rem)
+  access_policy.rs               # ONE live decide ← Bayes
+  bayes.rs                       # query_access / is_cold ports; Boolean π cfg(test)
+  certificate.rs                 # strip survival + merged rem-legal SoT
+  kernel.rs                      # cfg(test) museum only
   repair.rs                      # R1Selective grain
   executor.rs                    # cost_class_spec; R1 snap; no OCC retreat
   computer.rs                    # next_sf only (SpecFence spine)
-  rem.rs                         # ParkKind::PinHold
+  rem.rs                         # SuffixRepair + SoftWait Soft quarantine
+  edge.rs / resolve.rs           # Detect/EV museums; choose_* cfg(test)
   mode.rs                        # DELETED
 ```
+
+No `specfence/pc/`, `specfence/cc/`, `specfence/bayes/` directories.
 
 ---
 
 ## 4. Falsifiers still open (post-land)
 
 - Mainnet all-blocks Soft=0 JSON not attached — **cannot** claim B1/B5.
-- `rem.rs` still a god (wave code physically inside; `wave.rs` is the product name).
-- `kernel.rs` still wired on Ctx (certificate is SoT for resolve).
-- Dual π **bodies** still compile (`edge`/`resolve` tests). Hot-path export removed.
+- Dual π **bodies** remain as `#[cfg(test)]` museums (`edge`/`resolve`/`bayes` Boolean). Hot-path compile + export removed.
+- `learner.rs` is still a megaclass (PE + morph + tax). Feeder is split; decide does **not** live there.
+- SoftWait Soft arms still compile inside `rem` (product Soft=0; not default Avoid).
 - OrderedAdmit (≥16 hinted txs) only when fan/star — first-block 14689597 with empty InterPrior still learns after first abort.
 
 ---
 
 ## 5. Essence
 
-One pevm spine, file-SRP splits (not three folders), Bayes→admit→decide→PinHold→R1, Soft=0, seq≡par tests green. Product TPS bars need a sweep — this PR does not invent 0.95.
+One pevm spine, file-SRP (wave extract, kernel merge, dual-π test-gated, Fence out of vm), Bayes→admit→decide→PinHold→R1, Soft=0, seq≡par tests green. Product TPS bars need a sweep — this PR does not invent 0.95.

@@ -10,7 +10,6 @@ use super::ConcurrencyMode;
 use super::SpecFenceCtx;
 use super::certificate::CertificateTable;
 use super::dag::FenceGraph;
-use super::kernel::KernelTable;
 use super::learner::LiveLearner;
 use super::repair::{RepairGrain, repair_grain};
 use super::wave::WaveParkTable;
@@ -46,10 +45,10 @@ pub(crate) fn hinted_wait_enabled(mode: ConcurrencyMode) -> bool {
 #[inline]
 pub(crate) fn uses_specfence_resolve(
     mode: ConcurrencyMode,
-    kernel: &KernelTable,
+    cert: &CertificateTable,
     tx_idx: TxIdx,
 ) -> bool {
-    mode == ConcurrencyMode::SpecFence && kernel.may_resolve(tx_idx)
+    mode == ConcurrencyMode::SpecFence && cert.may_resolve(tx_idx)
 }
 
 /// R1 museum only when the strip covers **every** invalid read (v6 §5).
@@ -228,7 +227,7 @@ pub(crate) fn validate_specfence(
 ) -> Option<Task> {
     let has_cert = specfence.certificates.has_any(tx_version.tx_idx)
         || specfence.certificates.may_resolve(tx_version.tx_idx)
-        || specfence.kernel.may_resolve(tx_version.tx_idx);
+        || specfence.certificates.may_resolve(tx_version.tx_idx);
     if !has_cert {
         return validate_occ_kernel(mv_memory, scheduler, tx_version, specfence);
     }
@@ -316,10 +315,10 @@ mod tests {
         assert!(!hinted_wait_enabled(ConcurrencyMode::Occ));
         assert!(!hinted_wait_enabled(ConcurrencyMode::SpecFence));
         assert!(hinted_wait_enabled(ConcurrencyMode::Pcc));
-        let k = KernelTable::new(2);
+        let k = CertificateTable::new(2);
         assert!(!uses_specfence_resolve(ConcurrencyMode::Occ, &k, 0));
         assert!(!uses_specfence_resolve(ConcurrencyMode::SpecFence, &k, 0));
-        k.note_fence(0);
+        k.note_success(0, 1);
         assert!(uses_specfence_resolve(ConcurrencyMode::SpecFence, &k, 0));
         let cert = CertificateTable::new(1);
         cert.begin_execute(0, false, 0);

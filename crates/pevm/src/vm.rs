@@ -189,7 +189,6 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
             let repair_armed = self.specfence.partial_retry.is_rewind_resume(tx_idx)
                 || self.specfence.partial_retry.has_ff_head(tx_idx);
-            self.specfence.kernel.begin_execute(tx_idx, repair_armed);
             self.specfence
                 .certificates
                 .begin_execute(tx_idx, repair_armed, incarnation);
@@ -198,7 +197,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 .partial_retry
                 .reset_incarnation(tx_idx, incarnation);
             // FF replay is a prefix certificate — Spec-only incarnations never arm rem.
-            if self.specfence.kernel.repair_armed(tx_idx) {
+            if self.specfence.certificates.repair_armed(tx_idx) {
                 let n = self.specfence.partial_retry.replay_ff_if_armed(tx_idx);
                 if n > 0 {
                     self.specfence.metrics.record_journal_ff_entries(n);
@@ -646,7 +645,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.specfence
             .certificates
             .note_success(self.tx_idx, location);
-        self.specfence.kernel.note_fence(self.tx_idx);
+        // Certificate strip is the rem-legal SoT (kernel merged).
         if first {
             self.specfence.metrics.record_pcc_kernel_exec();
         }
@@ -2922,7 +2921,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         // + absolute-jump journal slot replay (never journal-blob poison).
                         // gas_remaining_after filled from Inspector post-SSTORE captures.
                         if self.specfence.mode == crate::ConcurrencyMode::SpecFence
-                            && self.specfence.kernel.rem_legal(tx_version.tx_idx)
+                            && self.specfence.certificates.rem_legal(tx_version.tx_idx)
                         {
                             self.specfence.partial_retry.note_write_replay(
                                 tx_version.tx_idx,
@@ -3045,7 +3044,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 };
 
                 if self.specfence.mode == crate::ConcurrencyMode::SpecFence
-                    && self.specfence.kernel.rem_legal(tx_version.tx_idx)
+                    && self.specfence.certificates.rem_legal(tx_version.tx_idx)
                 {
                     for (loc, value) in &write_set {
                         // G2: plant Write ordinal always (HotSet not required).
@@ -3138,7 +3137,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 // R1/R3: feed HotSet writer counts (H_w) from non-lazy writes only.
                 if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
                     // Learning is consumed by decide() — always observe HotSet / WŜ.
-                    if self.specfence.kernel.rem_legal(tx_version.tx_idx) {
+                    if self.specfence.certificates.rem_legal(tx_version.tx_idx) {
                         let locs: Vec<_> = self.mv_memory.write_locations(tx_version.tx_idx);
                         self.specfence.rw_prior.observe_write_set(&locs, None);
                         for loc in &hotset_writer_locs {

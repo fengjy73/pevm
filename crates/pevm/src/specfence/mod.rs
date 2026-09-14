@@ -181,6 +181,7 @@ pub(crate) mod fence_act;
 mod finegrain;
 mod heat;
 mod hotset;
+#[cfg(test)]
 mod kernel;
 mod lane;
 mod learner;
@@ -246,7 +247,7 @@ pub(crate) use heat::HeatMap;
 pub(crate) use hotset::HotSet;
 #[allow(unused_imports)]
 pub(crate) use hotset::{H_A, H_W};
-pub(crate) use kernel::KernelTable;
+// kernel.rs museum — tests only; rem-legal SoT is CertificateTable.
 pub(crate) use lane::LaneTable;
 pub(crate) use learner::{AdaptiveParams, InterBlockPrior, LiveLearner};
 pub(crate) use metrics::MetricsInner;
@@ -263,21 +264,24 @@ pub(crate) use rem::RemCounters;
 #[allow(unused_imports)]
 pub(crate) use rem::{
     AccessMode, Checkpoint, CheckpointId, CheckpointKind, EffectOrdinal, FfValue, LeanAbortRepair,
-    ParkKind, ParkResumeIntent, ParkResumeKind, ParkedWait, PartialRetryPlan, PartialRetryState,
-    PendingPark, RegionAccess, RemTask, RepairPlan, ResearchAbortRepair, ResumeContinuation,
-    StorageWriteReplay,
+    PartialRetryPlan, PartialRetryState, RegionAccess, RemTask, RepairPlan, ResearchAbortRepair,
+    ResumeContinuation, StorageWriteReplay,
 };
 #[allow(unused_imports)]
 pub(crate) use repair::{RepairGrain, repair_grain};
+#[cfg(test)]
 use resolve::choose_action;
 #[allow(unused_imports)]
 pub(crate) use resolve::{
     BindTarget, C_RETRY, COST_MARGIN, D_EARLY, D_WAIT, EvScores, SelectiveOutcome, TAU_REVOKE,
     TAU_S, TAU_VERY_HIGH, TAU_W, compute_ev, cost_prefers_wait, early_val_probability,
 };
+#[cfg(test)]
 pub(crate) use resolve::{PolicyCtx, ResolveAction};
 pub(crate) use sketch::{HotSketch, ResidualBind};
-pub(crate) use wave::WaveParkTable;
+pub(crate) use wave::{
+    ParkKind, ParkResumeIntent, ParkResumeKind, ParkedWait, PendingPark, WaveParkTable,
+};
 
 /// Selectable concurrency control for parallel block execution.
 ///
@@ -382,8 +386,6 @@ pub(crate) struct SpecFenceCtx<'a> {
     pub sketch: &'a HotSketch,
     /// Process-level Fence/Unfenced reason + per-ℓ timeline (lab / G7).
     pub process: &'a ProcessTrace,
-    /// Mode(a) Fence / prefix certificates (not an Occ\|Pcc incarnation fork).
-    pub kernel: &'a crate::specfence::KernelTable,
     /// Spec-safe AccessOrdinalLog — true \(k\) without rem DashMap.
     pub access_log: &'a crate::specfence::AccessOrdinalLog,
     /// Per-prefix Fence certificates (not a tx-global bit).
@@ -434,9 +436,8 @@ impl<'a> SpecFenceCtx<'a> {
         false
     }
 
-    /// Retired AEC EV π — **not live**. v2 deleted AdaptiveParams / SoftWait /
-    /// Storm Await from access and resolve. Lab tests may still call this.
-    #[allow(dead_code)]
+    /// Retired AEC EV π — **not live**. Museum for resolve tests only.
+    #[cfg(test)]
     pub(crate) fn choose_resolve(
         &self,
         location: crate::MemoryLocationHash,
