@@ -1,7 +1,8 @@
 //! SpecFence — pevm's fused PC⊗CC⊗Bayes plant on **one** parallel spine.
 //!
-//! SoT: `lab/notes/specfence-complete-architecture-v9.4-file-srp.md` (file SRP);
-//! `v9.3-pevm-unified.md` (one spine; ban dual OCC/SF computers);
+//! SoT: `lab/notes/specfence-complete-architecture-v10-raw-mixed.md`
+//! (RAW_fan_out + mixed_RAW_WAW; wave-fill refuse; wait_for resumes or does not park);
+//! `v9.4-file-srp.md` (file SRP); `v9.3-pevm-unified.md` (one spine);
 //! `v9.1-cc-pc-bayes.md` (Bayes→admit→decide→pessimistic admit→Validate; Soft=0).
 //! Live vocabulary: `lab/notes/specfence-cc-glossary.md`.
 //! Triple = analysis lens, **not** folder kingdoms.

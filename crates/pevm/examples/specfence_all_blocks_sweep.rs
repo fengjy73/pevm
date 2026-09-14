@@ -88,9 +88,8 @@ fn default_collection_block_ids_path() -> PathBuf {
 }
 
 fn read_block_ids_file(path: &Path) -> Vec<u64> {
-    let raw = fs::read_to_string(path).unwrap_or_else(|e| {
-        panic!("failed to read block-ids file {}: {e}", path.display())
-    });
+    let raw = fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("failed to read block-ids file {}: {e}", path.display()));
     let mut nums: Vec<u64> = raw
         .lines()
         .map(str::trim)

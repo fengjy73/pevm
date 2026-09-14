@@ -128,10 +128,10 @@ pub(crate) fn decide_queried(
     } else {
         ev_adapter
     };
-    // WaitFor pins one *executing* producer. AbortingThrow last: low
-    // depth_frac ∧ ¬ev_wait_for_dependency_beats_abort (already folded into ev_wait_for_dependency).
+    // WaitFor pins one unfinished producer (Ready or Executing).
+    // Requiring writer_executing leaked ReadyCanary optimistic_read → abort.
+    // AbortingThrow last: low depth_frac ∧ ¬ev_wait (already folded in).
     if vis.unfinished == 1
-        && vis.writer_executing
         && let Some(w) = vis.writer
         && ev_wait_for_dependency
     {
@@ -440,6 +440,28 @@ mod tests {
                 roi_skip: true
             },
             "decide←Bayes: low depth_frac ∧ ¬ev_wait_for_dependency_beats_abort → AbortingThrow last"
+        );
+    }
+
+    #[test]
+    fn bayes_ready_single_writer_is_waitfor_not_canary() {
+        let live = fan_out_learner();
+        live.seed_predicted_essential(7, 6);
+        let mut ready = exec_vis(2);
+        ready.writer_executing = false;
+        let q = crate::specfence::BayesAccessQuery {
+            p_raw: 0.5,
+            p_ordered_admit: 0.1,
+            quiet_cold: false,
+            depth_frac: 0.85,
+            ev_wait_for_dependency_beats_abort: true,
+            ev_ordered_admit_beats_full_abort: false,
+            known_star: true,
+        };
+        assert_eq!(
+            decide_queried(&live, 7, 6, Some(&ready), Some(q)),
+            AccessDecision::WaitFor { writer: 2 },
+            "Ready single unfinished writer must WaitFor, not optimistic_read canary"
         );
     }
 

@@ -926,6 +926,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
             .specfence
             .partial_retry
             .arm_wait_for_dependency_checkpoint(self.tx_idx, location_hash, access_k, &prefix);
+        // Edges already reserved. Park only when rem can ResumeAtK.
+        // Park-then-full_abort_reexecute is idle + OCC abort (14689597).
+        if !crate::specfence::fence_act::wait_for_resume_armed(armed_at_k) {
+            return self.occ_optimistic_read();
+        }
         self.note_fence_success(location_hash);
         self.pcc_this_tx
             .set(self.pcc_this_tx.get().saturating_add(1));

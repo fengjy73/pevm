@@ -314,7 +314,10 @@ pub(crate) fn validate_specfence(
             let strip_covers = specfence
                 .certificates
                 .covers_strips_all(tx_version.tx_idx, &invalid);
-            if strip_covers {
+            // Validate port: PartialAbortRewind only when Bayes EV says cover beats full abort.
+            let rewind_ev =
+                bayes_q.is_none_or(|q| q.depth_frac >= 0.50 || q.ev_ordered_admit_beats_full_abort);
+            if strip_covers && rewind_ev {
                 let read_locations = mv_memory.read_locations(tx_version.tx_idx);
                 let write_locations = mv_memory.write_locations(tx_version.tx_idx);
                 if let Some(LeanAbortRepair::SuffixRepair {

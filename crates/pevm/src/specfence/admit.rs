@@ -3,7 +3,8 @@
 //! Call order (v9.1): Bayes → admit_seed → Execute(only if admitted).
 //! Mid-tx `access_vis` may refresh edges; it must not be the first insert.
 //!
-//! Plant SoT: `lab/notes/specfence-complete-architecture-v9.1-cc-pc-bayes.md`.
+//! Plant SoT: `lab/notes/specfence-complete-architecture-v10-raw-mixed.md`.
+//! Bayes `query_admit` + star `note_raw_producer` so storage RAW refuse-covers.
 
 use alloy_primitives::Address;
 
@@ -47,12 +48,18 @@ pub(crate) fn admit_seed_begin_block(
         .accounts()
         .any(|a| a != beneficiary && hints.txs(&a).len() >= HINT_FANOUT_FLOOR);
     let star_edges = fan || prior_star || stars > 0 || hint_fan;
-    // Storage RAW stars from InterPrior (not only Basic(addr) below).
+    // Storage RAW stars from InterPrior **or** Bayes admit port (not only Basic).
     for top in prior.top_locations() {
-        if top.k_template > 0 && (hint_fan || top_is_known_star(&top)) {
+        if top.k_template > 0
+            && (hint_fan || top_is_known_star(&top) || bayes.query_admit(top.location))
+        {
             learner.seed_predicted_essential(top.location, top.k_template);
         }
     }
+    // Cross-block Bayes carry: hot ℓ without a top-k InterPrior row.
+    bayes.for_each_admit_hit(|loc| {
+        learner.seed_predicted_essential(loc, FAN_STAR_K);
+    });
     let floor = if star_edges {
         HINT_STAR_FLOOR
     } else {
@@ -71,8 +78,11 @@ pub(crate) fn admit_seed_begin_block(
         stages.reserve(producer);
         // True-k before Execute: Basic(addr) at k≈6 so the access gate is
         // PE-on for the star and abort notes a class, not any-k.
-        learner
-            .seed_predicted_essential(hash_deterministic(MemoryLocation::Basic(addr)), FAN_STAR_K);
+        // `note_raw_producer` makes later storage RAW of this account a
+        // known edge (refuse / vis refresh), not a first-wave canary.
+        let basic = hash_deterministic(MemoryLocation::Basic(addr));
+        learner.seed_predicted_essential(basic, FAN_STAR_K);
+        ready.note_raw_producer(basic, producer);
         for &t in &txs[1..] {
             ready.note_consumer(t, producer);
             edges += 1;
@@ -181,6 +191,56 @@ mod tests {
         assert!(
             learner.predicted_essential(storage_loc, 6),
             "true-k: hint-fan plants storage RAW PE from InterPrior, not only Basic(addr)"
+        );
+        let basic = hash_deterministic(MemoryLocation::Basic(star));
+        assert_eq!(
+            ready.predicted_producer(basic),
+            Some(0),
+            "star Basic tip must be known so storage RAW refuse-covers the account"
+        );
+    }
+
+    #[test]
+    #[test]
+    fn bayes_admit_seeds_storage_without_hint_fan() {
+        let ready = ReadyEdgeTable::new();
+        let stages = ProducerStageTable::new();
+        let learner = LiveLearner::new();
+        learner.begin_block(MorphWeights::default());
+        let bayes = BayesMap::new();
+        let storage_loc = 0xdef_u64;
+        assert!(
+            bayes.observe_conflict_location(storage_loc),
+            "first conflict observation"
+        );
+        assert!(
+            bayes.query_admit(storage_loc),
+            "triple-conflict seed must clear admit τ"
+        );
+        let prior = InterBlockPrior::new();
+        prior.end_block(
+            MorphWeights::default(),
+            vec![TopLocPrior {
+                location: storage_loc,
+                fanout_ema: 1.0,
+                abort_rate: 0.0,
+                chain_len_ema: 1.0,
+                k_template: 6,
+            }],
+        );
+        let n = admit_seed_begin_block(
+            &ready,
+            &stages,
+            &learner,
+            &bayes,
+            &prior,
+            &AccountHints::default(),
+            Address::ZERO,
+        );
+        assert_eq!(n, 0, "no hint accounts → no ReadyEdges");
+        assert!(
+            learner.predicted_essential(storage_loc, 6),
+            "Bayes query_admit must plant storage PE on a cold hint set"
         );
     }
 
