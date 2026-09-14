@@ -198,9 +198,9 @@ pub struct RawEffectEdge {
     /// Canonical L2: Data|Estimate|Running|Absent (sampled at discovering incarnation).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub producer_status: Option<String>,
-    /// True when producer_status == Data (Bind candidate).
+    /// True when producer_status == Data (OrderedAdmit candidate).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ready_for_bind: Option<bool>,
+    pub ready_for_ordered_admit: Option<bool>,
     /// Warm journal re-read (emit_warm_true policy).
     #[serde(default)]
     pub warm: bool,
@@ -329,8 +329,8 @@ pub struct AccountGrainObserve {
     pub account_producer_mv: String,
     /// True if Wait EV would fire under account-keyed policy.
     pub would_wait: bool,
-    /// True if Bind EV would fire under account-keyed policy.
-    pub would_bind: bool,
+    /// True if OrderedAdmit EV would fire under account-keyed policy.
+    pub would_ordered_admit: bool,
 }
 
 /// Instrumentation for RAW count / depth definitional gaps (research).
@@ -363,8 +363,8 @@ pub struct EffectStreamDiag {
     pub account_grain_ext: usize,
     /// Of account-grain observes: account producer running/estimate → Wait EV would fire if account-keyed.
     pub account_grain_would_wait: usize,
-    /// Account producer already Data/Executed/Validated → Bind EV if account-keyed.
-    pub account_grain_would_bind: usize,
+    /// Account producer already Data/Executed/Validated → OrderedAdmit EV if account-keyed.
+    pub account_grain_would_ordered_admit: usize,
     /// Slot-grain RAW edges that also had account prior (informational).
     pub slot_and_account_both: usize,
     /// WAW-only multi-writer locs with no location RAW (HotLocal writer-count spurious Wait proxy).
@@ -680,7 +680,7 @@ impl FineGrainCollector {
             c.first_program_producer_mv = Some(mv_kind.clone());
         }
         let status = producer_status_canonical(&ready, &mv_kind).to_string();
-        let ready_for_bind = status == "Data";
+        let ready_for_ordered_admit = status == "Data";
         let edge = RawEffectEdge {
             producer_tx,
             producer_effect_k: producer_k,
@@ -697,7 +697,7 @@ impl FineGrainCollector {
             producer_ready: Some(ready),
             producer_mv: Some(mv_kind),
             producer_status: Some(status),
-            ready_for_bind: Some(ready_for_bind),
+            ready_for_ordered_admit: Some(ready_for_ordered_admit),
             warm: false,
             call_depth: None,
         };
@@ -946,12 +946,12 @@ impl FineGrainCollector {
             };
             let ready = classify_producer_ready(&status, &mv_kind).to_string();
             let would_wait = matches!(ready.as_str(), "running" | "estimate" | "aborting");
-            let would_bind = matches!(ready.as_str(), "validated" | "executed" | "data");
+            let would_ordered_admit = matches!(ready.as_str(), "validated" | "executed" | "data");
             if would_wait {
                 st.diag.account_grain_would_wait += 1;
             }
-            if would_bind {
-                st.diag.account_grain_would_bind += 1;
+            if would_ordered_admit {
+                st.diag.account_grain_would_ordered_admit += 1;
             }
             st.account_grain_edges.push(AccountGrainObserve {
                 consumer_tx,
@@ -967,7 +967,7 @@ impl FineGrainCollector {
                 account_producer_ready: ready,
                 account_producer_mv: mv_kind,
                 would_wait,
-                would_bind,
+                would_ordered_admit,
             });
         }
 
@@ -1005,7 +1005,7 @@ impl FineGrainCollector {
             }
         }
         let status = producer_status_canonical(&ready, &mv_kind).to_string();
-        let ready_for_bind = status == "Data";
+        let ready_for_ordered_admit = status == "Data";
         let edge = RawEffectEdge {
             producer_tx,
             producer_effect_k: producer_k,
@@ -1022,7 +1022,7 @@ impl FineGrainCollector {
             producer_ready: Some(ready),
             producer_mv: Some(mv_kind),
             producer_status: Some(status),
-            ready_for_bind: Some(ready_for_bind),
+            ready_for_ordered_admit: Some(ready_for_ordered_admit),
             warm,
             call_depth,
         };
@@ -1741,7 +1741,7 @@ pub fn percentile_f64(sorted: &[f64], p: f64) -> f64 {
 #[derive(Debug, Clone, Serialize)]
 pub struct MaMdProxy {
     pub n_consumers_with_program_cross: usize,
-    /// M-A: always SpecRead → conflict pays full remaining = 1.0 per such consumer.
+    /// M-A: always OptimisticRead → conflict pays full remaining = 1.0 per such consumer.
     pub ma_redo_cost: f64,
     /// M-D: redo ∝ (1 − d) using depth_frac_effects at first program cross.
     pub md_redo_cost: f64,

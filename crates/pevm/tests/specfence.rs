@@ -362,12 +362,12 @@ fn specfence_mixed_hot_and_independent() {
         .unwrap();
     assert_eq!(sequential, parallel);
     let metrics = pevm.last_specfence_metrics();
-    // R1/R2: HotSet carries heat; WaitHard only on HotSet (may be 0 if EV prefers SpecRead).
+    // R1/R2: HotSet carries heat; WaitHard only on HotSet (may be 0 if EV prefers OptimisticRead).
     assert!(
         metrics.hotset_size > 0
             || metrics.hot_local_reads > 0
             || metrics.wait_hard_count > 0
-            || metrics.bind_hits > 0
+            || metrics.ordered_admit_hits > 0
             || metrics.wait_admissions > 0,
         "hot cluster must engage HotLocal/HotSet: {metrics:?}"
     );
@@ -466,9 +466,9 @@ fn specfence_fence_skips_independent_cascade() {
         assert!(
             metrics.independent_txs_skipped_by_fence > 0
                 || metrics.cascade_validations_scheduled > 0
-                || metrics.full_restart > 0
+                || metrics.full_abort_reexecute > 0
                 || metrics.occ_kernel_execs > 0,
-            "fence metrics or OCC-identical B0 when aborts occur: {metrics:?}"
+            "fence metrics or OCC-identical full_abort_reexecute when aborts occur: {metrics:?}"
         );
     }
 }
@@ -526,9 +526,9 @@ fn specfence_p1a_location_isolation_fence_metrics() {
                 metrics.independent_txs_skipped_by_fence > 0
                     || metrics.selective_invalidate_count > 0
                     || metrics.cascade_validations_scheduled > 0
-                    || metrics.full_restart > 0
+                    || metrics.full_abort_reexecute > 0
                     || metrics.occ_kernel_execs > 0,
-                "P1a fence/selective or OCC-identical B0 on abort: {metrics:?}"
+                "P1a fence/selective or OCC-identical full_abort_reexecute on abort: {metrics:?}"
             );
             saw_fence = true;
             break;
@@ -547,10 +547,10 @@ fn specfence_p1a_location_isolation_fence_metrics() {
     );
 }
 
-/// P1a §9.3: after a contended first block, residual WS / Bayes WaitHard/Bind
+/// P1a §9.3: after a contended first block, residual WS / Bayes WaitHard/OrderedAdmit
 /// on the hotspot should reduce (or avoid growing) aborts on the second wave.
 #[test]
-fn specfence_p1a_bind_wait_reduces_abort_on_hotspot() {
+fn specfence_p1a_ordered_admit_wait_reduces_abort_on_hotspot() {
     let chain = PevmEthereum::mainnet();
     let hot = Address::from(U160::from(1));
     let storage = storage_for(200);
@@ -577,7 +577,7 @@ fn specfence_p1a_bind_wait_reduces_abort_on_hotspot() {
         "hotspot posterior must rise"
     );
 
-    // Next block: same-sender pressure — Wait/Bind/HotLocal should dominate.
+    // Next block: same-sender pressure — Wait/OrderedAdmit/HotLocal should dominate.
     let mut txs2 = Vec::new();
     for i in 0..24 {
         txs2.push(self_transfer(hot, 1 + i as u64));
@@ -608,22 +608,22 @@ fn specfence_p1a_bind_wait_reduces_abort_on_hotspot() {
     assert!(
         m.wait_hard_count > 0
             || m.wait_admissions > 0
-            || m.bind_hits > 0
+            || m.ordered_admit_hits > 0
             || m.bayes_wait_decisions > 0
             || m.hot_local_reads > 0
             || m.hotset_size > 0,
-        "second wave should WaitHard/Bind/HotLocal on hotspot: {m:?}"
+        "second wave should WaitHard/OrderedAdmit/HotLocal on hotspot: {m:?}"
     );
     // Aborts on the heated recipient wave should not explode vs block1 learning.
     assert!(
         m.occ_aborts <= aborts_b1.saturating_add(8),
-        "Bind/Wait should bound aborts: b1={aborts_b1} b2={}",
+        "OrderedAdmit/Wait should bound aborts: b1={aborts_b1} b2={}",
         m.occ_aborts
     );
 }
 
 /// P1a §9.4: revoke sticky Wait when posterior < τ_revoke (unit-level coverage
-/// lives in bayes; this checks metrics/API after a cold SpecRead-heavy block).
+/// lives in bayes; this checks metrics/API after a cold OptimisticRead-heavy block).
 #[test]
 fn specfence_p1a_revoke_api_on_low_posterior() {
     // Independent transfers: posteriors stay near prior → sticky Wait revoked / unused.
@@ -642,9 +642,9 @@ fn specfence_p1a_revoke_api_on_low_posterior() {
         pevm.bayes_account_conflict_prob(&cold)
     );
     assert!(
-        metrics.spec_read_count > 0
+        metrics.optimistic_read_count > 0
             || metrics.bayes_speculate_decisions > 0
-            || metrics.unfenced_occ_fast > 0
+            || metrics.optimistic_read_occ_fast > 0
             || metrics.occ_kernel_execs > 0,
         "quiet independent block is Spec ≡ OCC (T6, no AccessOrdinalLog): {metrics:?}"
     );
@@ -674,16 +674,16 @@ fn specfence_p1a_selective_invalidate_and_fence() {
             assert!(
                 metrics.selective_invalidate_count > 0
                     || metrics.selective_fallback_full > 0
-                    || metrics.tx_full_retry > 0
-                    || metrics.full_restart > 0,
-                "abort must exercise B0 / selective / full-retry plant: {metrics:?}"
+                    || metrics.tx_full_abort_reexecute > 0
+                    || metrics.full_abort_reexecute > 0,
+                "abort must exercise full_abort_reexecute / selective / full-retry plant: {metrics:?}"
             );
             assert!(
                 metrics.independent_txs_skipped_by_fence > 0
                     || metrics.cascade_revalidate_count > 0
-                    || metrics.full_restart > 0
+                    || metrics.full_abort_reexecute > 0
                     || metrics.occ_kernel_execs > 0,
-                "fence bounds cascade or OCC-identical B0: {metrics:?}"
+                "fence bounds cascade or OCC-identical full_abort_reexecute: {metrics:?}"
             );
             break;
         }
@@ -722,18 +722,18 @@ fn specfence_p2_partial_retry_on_localized_conflict() {
     for _ in 0..10 {
         let (_, metrics, _) = run_mode(ConcurrencyMode::SpecFence, &storage, txs.clone());
         last_metrics = Some(metrics.clone());
-        // R0: LeanOCC uses selective invalidate + full_restart; PartialRetry/RewindTo
+        // R0: LeanOCC uses selective invalidate + full_abort_reexecute; PartialRetry/RewindTo
         // remain research-inspect. HotSet/HotLocal should still engage.
         if metrics.partial_retry_count >= 1
             || metrics.rewind_to_cp >= 1
             || metrics.selective_invalidate_count >= 1
-            || metrics.full_restart >= 1
+            || metrics.full_abort_reexecute >= 1
         {
             saw_repair = true;
             assert!(metrics.occ_aborts > 0, "repair implies abort: {metrics:?}");
             assert!(
                 metrics.hotset_size > 0 || metrics.hot_local_reads > 0 || metrics.lean_mode_txs > 0,
-                "R1 metrics: {metrics:?}"
+                "partial_abort metrics: {metrics:?}"
             );
             break;
         }
@@ -746,9 +746,9 @@ fn specfence_p2_partial_retry_on_localized_conflict() {
 }
 
 /// P2: sequential ≡ SpecFence on ERC-20 + independents; when PartialRetry
-/// fires, tx_full_retry < occ_aborts (breaks P1b 1:1).
+/// fires, tx_full_abort_reexecute < occ_aborts (breaks P1b 1:1).
 #[test]
-fn specfence_p2_full_retry_not_always_eq_aborts() {
+fn specfence_p2_full_abort_reexecute_not_always_eq_aborts() {
     let (mut state, bytecodes, mut txs) = erc20::generate_cluster(3, 8, 4);
     state.insert(Address::ZERO, EvmAccount::default());
     for i in 0..32 {
@@ -768,13 +768,13 @@ fn specfence_p2_full_retry_not_always_eq_aborts() {
             any_abort = true;
             assert!(
                 m.partial_retry_count > 0
-                    || m.tx_full_retry > 0
-                    || m.full_restart > 0
+                    || m.tx_full_abort_reexecute > 0
+                    || m.full_abort_reexecute > 0
                     || m.selective_invalidate_count > 0,
                 "abort must be Partial/Full/selective (R0): {m:?}"
             );
-            // R0 LeanOCC: full_restart tracks aborts; selective may decouple cascade.
-            if m.partial_retry_count > 0 && m.tx_full_retry < m.occ_aborts {
+            // R0 LeanOCC: full_abort_reexecute tracks aborts; selective may decouple cascade.
+            if m.partial_retry_count > 0 && m.tx_full_abort_reexecute < m.occ_aborts {
                 broke_equality = true;
                 break;
             }
@@ -792,8 +792,8 @@ fn specfence_p2_full_retry_not_always_eq_aborts() {
         broke_equality
             || last
                 .as_ref()
-                .is_some_and(|m| m.occ_kernel_execs > 0 && m.full_restart == m.occ_aborts),
-        "expected repair/fence to decouple, or OCC-identical B0: {last:?}"
+                .is_some_and(|m| m.occ_kernel_execs > 0 && m.full_abort_reexecute == m.occ_aborts),
+        "expected repair/fence to decouple, or OCC-identical full_abort_reexecute: {last:?}"
     );
 }
 
@@ -826,7 +826,7 @@ fn specfence_m1_rewind_to_skips_evm_entries() {
                 );
             }
             // L1 accounting: resumes are not counted as fresh tx-head entries.
-            // evm_entries ≈ n_tx + full_restarts (+ Blocking retries still enter).
+            // evm_entries ≈ n_tx + full_abort_reexecutes (+ Blocking retries still enter).
             assert!(
                 m.evm_entries >= txs.len(),
                 "evm_entries should cover at least one entry per tx: {m:?}"
@@ -893,14 +893,14 @@ fn specfence_m2_wait_hard_parks_and_steals() {
     );
 
     let m = pevm.last_specfence_metrics();
-    // Park/steal is best-effort under π; either WaitHard parked or SpecRead dominated.
+    // Park/steal is best-effort under π; either WaitHard parked or OptimisticRead dominated.
     assert!(
         m.wait_hard_count > 0
             || m.wait_park_count > 0
-            || m.spec_read_count > 0
-            || m.bind_hits > 0
+            || m.optimistic_read_count > 0
+            || m.ordered_admit_hits > 0
             || m.occ_kernel_execs > 0,
-        "M2 path should exercise WaitHard/park, SpecRead/Bind, or OCC: {m:?}"
+        "M2 path should exercise WaitHard/park, OptimisticRead/OrderedAdmit, or OCC: {m:?}"
     );
     // When parks happen, steals should be possible with independents in the block.
     if m.wait_park_count > 0 {
@@ -912,7 +912,7 @@ fn specfence_m2_wait_hard_parks_and_steals() {
 }
 
 /// P4: SoftWait `(t,k)` park data plane — seq≡par; park/resume counters defined.
-/// ResumeAtK only when a mid-tx checkpoint exists; otherwise tx-grain FullRetry.
+/// ResumeAtK only when a mid-tx checkpoint exists; otherwise tx-grain FullAbortReexecute.
 #[test]
 fn specfence_p4_tk_park_seq_eq_par_and_metrics() {
     let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 12, 6);
@@ -963,17 +963,17 @@ fn specfence_p4_tk_park_seq_eq_par_and_metrics() {
     );
 
     let m = pevm.last_specfence_metrics();
-    // Counters always defined; ResumeAtK is rare on default lean path (often FullRetry).
+    // Counters always defined; ResumeAtK is rare on default lean path (often FullAbortReexecute).
     let _ = (
         m.park_resume_at_k,
-        m.park_resume_full_retry,
+        m.park_resume_full_abort_reexecute,
         m.soft_wait_arms,
     );
     assert!(
         m.wait_hard_count > 0
             || m.wait_park_count > 0
-            || m.spec_read_count > 0
-            || m.bind_hits > 0
+            || m.optimistic_read_count > 0
+            || m.ordered_admit_hits > 0
             || m.soft_wait_arms > 0
             || m.occ_kernel_execs > 0,
         "P4 path should exercise resolve/park or OCC-identical: {m:?}"
@@ -1632,10 +1632,10 @@ fn specfence_iter11_handler_multi_sstore_jump_seq_eq_par() {
     let _ = last;
 }
 
-/// Iter20: production Bind-snap consume stays opt-in (SNAP/JUMP OFF).
+/// Iter20: production OrderedAdmit-snap consume stays opt-in (SNAP/JUMP OFF).
 /// SLOAD reader/writer RAW conflicts; seq≡par; SoftWait Soft=0; aj=0; bsnap=0.
 #[test]
-fn specfence_iter20_bind_snap_consume_production_off() {
+fn specfence_iter20_ordered_admit_snap_consume_production_off() {
     unsafe {
         std::env::set_var("SPECFENCE_BIND_SNAP", "0");
         std::env::set_var("SPECFENCE_BIND_SNAP_JUMP", "0");
@@ -1712,15 +1712,18 @@ fn specfence_iter20_bind_snap_consume_production_off() {
     for _ in 0..8 {
         let (_, m, _) = run_mode_conc(ConcurrencyMode::SpecFence, &storage, txs.clone(), width);
         assert_eq!(m.absolute_jump_applied, 0, "production jump OFF: {m:?}");
-        assert_eq!(m.bind_snap_capture, 0, "production SNAP OFF: {m:?}");
+        assert_eq!(
+            m.ordered_admit_snap_capture, 0,
+            "production SNAP OFF: {m:?}"
+        );
         assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
         assert_eq!(m.handler_sstore_capture, 0, "stock SSTORE: {m:?}");
     }
 }
 
-/// Iter21: production Bind jump stays hard-off (SNAP/JUMP unset). SoftWait Soft=0.
+/// Iter21: production OrderedAdmit jump stays hard-off (SNAP/JUMP unset). SoftWait Soft=0.
 #[test]
-fn specfence_iter21_bind_jump_production_off() {
+fn specfence_iter21_ordered_admit_jump_production_off() {
     unsafe {
         std::env::set_var("SPECFENCE_BIND_SNAP", "0");
         std::env::set_var("SPECFENCE_BIND_SNAP_JUMP", "0");
@@ -1794,19 +1797,22 @@ fn specfence_iter21_bind_jump_production_off() {
     for _ in 0..8 {
         let (_, m, _) = run_mode_conc(ConcurrencyMode::SpecFence, &storage, txs.clone(), width);
         assert_eq!(m.absolute_jump_applied, 0, "production jump OFF: {m:?}");
-        assert_eq!(m.bind_snap_capture, 0, "production SNAP OFF: {m:?}");
+        assert_eq!(
+            m.ordered_admit_snap_capture, 0,
+            "production SNAP OFF: {m:?}"
+        );
         assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
         assert_eq!(m.handler_sstore_capture, 0, "stock SSTORE: {m:?}");
     }
 }
 
-/// Iter21: Storage-FF Bind-snap jump dig — width=1 first (seq≡par + hang-free).
+/// Iter21: Storage-FF OrderedAdmit-snap jump dig — width=1 first (seq≡par + hang-free).
 /// Opt-in SNAP+JUMP; ignored by default (env leaks under parallel cargo test).
-/// Run: `cargo test -p pevm --test specfence iter21_bind_jump_width1 -- --ignored --test-threads=1`
+/// Run: `cargo test -p pevm --test specfence iter21_ordered_admit_jump_width1 -- --ignored --test-threads=1`
 /// Tiny SLOAD×N reader vs SSTORE writers; bytecode ≤256 so jump_is_safe OK.
 #[ignore = "Iter21 dig: SNAP+JUMP env; run solo --ignored --test-threads=1"]
 #[test]
-fn specfence_iter21_bind_jump_width1_seq_eq_par() {
+fn specfence_iter21_ordered_admit_jump_width1_seq_eq_par() {
     unsafe {
         std::env::set_var("SPECFENCE_BIND_SNAP", "1");
         std::env::set_var("SPECFENCE_BIND_SNAP_JUMP", "1");
@@ -1895,7 +1901,7 @@ fn specfence_iter21_bind_jump_width1_seq_eq_par() {
         if m.absolute_jump_applied > 0 {
             saw_aj = true;
             assert!(
-                m.bind_snap_capture > 0 || m.prefix_opcodes_skipped > 0,
+                m.ordered_admit_snap_capture > 0 || m.prefix_opcodes_skipped > 0,
                 "{m:?}"
             );
             break;
@@ -1909,7 +1915,11 @@ fn specfence_iter21_bind_jump_width1_seq_eq_par() {
     let m = last.expect("expected at least one run");
     eprintln!(
         "iter21 width1 dig: resume={} aj={} bsnap={} bcredit={} soft={} last={m:?}",
-        saw_resume, saw_aj, m.bind_snap_capture, m.bind_snap_credit, m.soft_wait_arms
+        saw_resume,
+        saw_aj,
+        m.ordered_admit_snap_capture,
+        m.ordered_admit_snap_credit,
+        m.soft_wait_arms
     );
     assert!(saw_resume || m.resume_count == 0, "unexpected: {m:?}");
     // Prefer aj>0; if Validated gate refuses all tips, credit path still hang-free.
@@ -1920,11 +1930,11 @@ fn specfence_iter21_bind_jump_width1_seq_eq_par() {
     }
 }
 
-/// Iter21: Storage-FF Bind jump under concurrency — hang repro / hang-free check.
+/// Iter21: Storage-FF OrderedAdmit jump under concurrency — hang repro / hang-free check.
 /// Ignored by default (hang risk). Run with `--ignored` + SNAP+JUMP to dig.
-#[ignore = "Iter21 dig: Bind abs jump under concurrency; hang risk until width≥2 proven"]
+#[ignore = "Iter21 dig: OrderedAdmit abs jump under concurrency; hang risk until width≥2 proven"]
 #[test]
-fn specfence_iter21_bind_jump_width2_hang_repro() {
+fn specfence_iter21_ordered_admit_jump_width2_hang_repro() {
     unsafe {
         std::env::set_var("SPECFENCE_BIND_SNAP", "1");
         std::env::set_var("SPECFENCE_BIND_SNAP_JUMP", "1");
@@ -1969,7 +1979,7 @@ fn specfence_iter21_bind_jump_width2_hang_repro() {
     let mut bytecodes = Bytecodes::default();
     bytecodes.insert(code_hash, bytecode.into());
     let mut txs: Vec<TxEnv> = Vec::new();
-    // Writers first (lower idx) — concurrent readers Bind against unfinished /
+    // Writers first (lower idx) — concurrent readers OrderedAdmit against unfinished /
     // published Data (bsnap path). pevm commit order: earlier write + later read.
     for i in 0..24 {
         txs.push(TxEnv {
@@ -2026,16 +2036,16 @@ fn specfence_iter21_bind_jump_width2_hang_repro() {
                 "iter21 width2 dig: aj_saw={} aj={} bsnap={} bcredit={} resume={} rewind={} soft={} fb_re={} abort={} vfail={} full_retry={} fr={} lean={}",
                 saw_aj,
                 m.absolute_jump_applied,
-                m.bind_snap_capture,
-                m.bind_snap_credit,
+                m.ordered_admit_snap_capture,
+                m.ordered_admit_snap_credit,
                 m.resume_count,
                 m.rewind_to_cp,
                 m.soft_wait_arms,
-                m.force_bind_reabort,
+                m.force_ordered_admit_reabort,
                 m.occ_aborts,
                 m.region_validate_fail,
-                m.tx_full_retry,
-                m.full_restart,
+                m.tx_full_abort_reexecute,
+                m.full_abort_reexecute,
                 m.lean_mode_txs,
             );
             // Hang-free under concurrency — keep JUMP OFF in production until aj>0
@@ -2047,14 +2057,16 @@ fn specfence_iter21_bind_jump_width2_hang_repro() {
                 std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP");
                 std::env::remove_var("SPECFENCE_BIND_SNAP");
             }
-            panic!("Iter21 Bind jump hung under concurrency (width≥2, 20s) — keep JUMP OFF");
+            panic!(
+                "Iter21 OrderedAdmit jump hung under concurrency (width≥2, 20s) — keep JUMP OFF"
+            );
         }
     }
 }
 
 /// Iter22: forced SNAP/JUMP OFF — SoftWait Soft=0; aj=0; bsnap=0; seq≡par.
 #[test]
-fn specfence_iter22_bind_jump_production_off() {
+fn specfence_iter22_ordered_admit_jump_production_off() {
     unsafe {
         std::env::set_var("SPECFENCE_BIND_SNAP", "0");
         std::env::set_var("SPECFENCE_BIND_SNAP_JUMP", "0");
@@ -2069,7 +2081,7 @@ fn specfence_iter22_bind_jump_production_off() {
     let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
     let width = NonZeroUsize::new(concurrency().get().min(4).max(2)).unwrap();
     for _ in 0..4 {
-        // Re-pin Off each iter — parallel tests may clear SPECFENCE_BIND_SNAP.
+        // Re-wait_for_dependency Off each iter — parallel tests may clear SPECFENCE_BIND_SNAP.
         unsafe {
             std::env::set_var("SPECFENCE_BIND_SNAP", "0");
             std::env::set_var("SPECFENCE_BIND_SNAP_JUMP", "0");
@@ -2077,7 +2089,10 @@ fn specfence_iter22_bind_jump_production_off() {
         let (_, m, _) = run_mode_conc(ConcurrencyMode::SpecFence, &storage, txs.clone(), width);
         assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
         assert_eq!(m.absolute_jump_applied, 0, "production JUMP OFF: {m:?}");
-        assert_eq!(m.bind_snap_capture, 0, "production SNAP OFF: {m:?}");
+        assert_eq!(
+            m.ordered_admit_snap_capture, 0,
+            "production SNAP OFF: {m:?}"
+        );
         assert_eq!(m.handler_sstore_capture, 0, "stock SSTORE: {m:?}");
     }
     unsafe {
@@ -2088,9 +2103,9 @@ fn specfence_iter22_bind_jump_production_off() {
 
 /// Iter22 dig: ERC-20 SNAP+JUMP after restore plumbing — seek aj>0∧seq≡par stability.
 /// Ignored. Production JUMP stays OFF until this dig is stably green + 597 no-hang.
-#[ignore = "Iter22 dig: ERC-20 Bind jump aj>0∧seq≡par stability; run solo --ignored --test-threads=1"]
+#[ignore = "Iter22 dig: ERC-20 OrderedAdmit jump aj>0∧seq≡par stability; run solo --ignored --test-threads=1"]
 #[test]
-fn specfence_iter22_erc20_bind_jump_seq_eq_par_dig() {
+fn specfence_iter22_erc20_ordered_admit_jump_seq_eq_par_dig() {
     unsafe {
         std::env::set_var("SPECFENCE_BIND_SNAP", "1");
         std::env::set_var("SPECFENCE_BIND_SNAP_JUMP", "1");
@@ -2149,7 +2164,7 @@ fn specfence_iter22_erc20_bind_jump_seq_eq_par_dig() {
     // Document: require success>0∧fail==0 for enable. Today restore still flaky.
     assert!(
         aj_runs > 0,
-        "expected some Bind jump apply under SNAP+JUMP: success={success} fail={fail}"
+        "expected some OrderedAdmit jump apply under SNAP+JUMP: success={success} fail={fail}"
     );
     if fail > 0 {
         eprintln!("iter22 erc20 dig: STILL FLAKY seq≠par (fail={fail}) — keep JUMP OFF");
@@ -2160,7 +2175,7 @@ fn specfence_iter22_erc20_bind_jump_seq_eq_par_dig() {
 
 /// Iter23: forced SNAP/JUMP OFF — SoftWait Soft=0; aj=0; bsnap=0; seq≡par.
 #[test]
-fn specfence_iter23_bind_jump_production_off() {
+fn specfence_iter23_ordered_admit_jump_production_off() {
     unsafe {
         std::env::set_var("SPECFENCE_BIND_SNAP", "0");
         std::env::set_var("SPECFENCE_BIND_SNAP_JUMP", "0");
@@ -2182,7 +2197,10 @@ fn specfence_iter23_bind_jump_production_off() {
         let (_, m, _) = run_mode_conc(ConcurrencyMode::SpecFence, &storage, txs.clone(), width);
         assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
         assert_eq!(m.absolute_jump_applied, 0, "production JUMP OFF: {m:?}");
-        assert_eq!(m.bind_snap_capture, 0, "production SNAP OFF: {m:?}");
+        assert_eq!(
+            m.ordered_admit_snap_capture, 0,
+            "production SNAP OFF: {m:?}"
+        );
         assert_eq!(m.handler_sstore_capture, 0, "stock SSTORE: {m:?}");
     }
 }
@@ -2190,9 +2208,9 @@ fn specfence_iter23_bind_jump_production_off() {
 /// Iter23 diff-first dig: on aj>0∧seq≠par report first differing tx gas/logs/storage
 /// vs sequential; also contrast SNAP-only (cold SuffixRepair) seq≡par.
 /// Ignored. Production JUMP stays OFF until fail=0 over ≥16 aj runs + 597 no-hang.
-#[ignore = "Iter23 dig: diff-first Bind jump vs cold SuffixRepair; run solo --ignored --test-threads=1"]
+#[ignore = "Iter23 dig: diff-first OrderedAdmit jump vs cold SuffixRepair; run solo --ignored --test-threads=1"]
 #[test]
-fn specfence_iter23_erc20_diff_first_bind_jump_dig() {
+fn specfence_iter23_erc20_diff_first_ordered_admit_jump_dig() {
     unsafe {
         std::env::set_var("SPECFENCE_BIND_SNAP", "1");
         std::env::set_var("SPECFENCE_BIND_SNAP_JUMP", "1");
@@ -2293,7 +2311,7 @@ fn specfence_iter23_erc20_diff_first_bind_jump_dig() {
                             "iter23 diff-first run={run} tx={i} status_seq={ss:?} status_par={ps:?} gas_seq={sg} gas_par={pg} dgas={} logs_seq={sl} logs_par={pl} stor={stor:?} bal={bal:?} aj={} bsnap={} resume={}",
                             pg as i64 - sg as i64,
                             m.absolute_jump_applied,
-                            m.bind_snap_capture,
+                            m.ordered_admit_snap_capture,
                             m.resume_count,
                         );
                         classified = true;
@@ -2376,13 +2394,13 @@ fn specfence_iter23_erc20_diff_first_bind_jump_dig() {
     }
 }
 
-/// Iter21: ERC-20 + SNAP+JUMP dig — documents Bind jump seq≠par (or hang).
+/// Iter21: ERC-20 + SNAP+JUMP dig — documents OrderedAdmit jump seq≠par (or hang).
 /// Ignored. Run solo: `--ignored --test-threads=1`.
 /// Expected falsification: aj>0 ⇒ committed state ≠ sequential (restore wrong
 /// under pevm MV). Keep production JUMP OFF.
-#[ignore = "Iter21 dig: ERC-20 Bind jump seq≠par/hang falsification; run solo"]
+#[ignore = "Iter21 dig: ERC-20 OrderedAdmit jump seq≠par/hang falsification; run solo"]
 #[test]
-fn specfence_iter21_erc20_bind_jump_hang_repro() {
+fn specfence_iter21_erc20_ordered_admit_jump_hang_repro() {
     unsafe {
         std::env::set_var("SPECFENCE_BIND_SNAP", "1");
         std::env::set_var("SPECFENCE_BIND_SNAP_JUMP", "1");
@@ -2431,7 +2449,7 @@ fn specfence_iter21_erc20_bind_jump_hang_repro() {
                     // Rare: aj>0 ∧ seq≡par — success path for a future iter.
                     eprintln!(
                         "iter21 erc20 dig SUCCESS aj>0∧seq≡par: aj={} bsnap={} resume={}",
-                        m.absolute_jump_applied, m.bind_snap_capture, m.resume_count
+                        m.absolute_jump_applied, m.ordered_admit_snap_capture, m.resume_count
                     );
                     unsafe {
                         std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP");
@@ -2446,7 +2464,7 @@ fn specfence_iter21_erc20_bind_jump_hang_repro() {
                 eprintln!(
                     "iter21 erc20 dig FALSIFIED seq≠par: aj={} bsnap={} skipped={} resume={}",
                     m.absolute_jump_applied,
-                    m.bind_snap_capture,
+                    m.ordered_admit_snap_capture,
                     m.prefix_opcodes_skipped,
                     m.resume_count,
                 );
@@ -2462,19 +2480,19 @@ fn specfence_iter21_erc20_bind_jump_hang_repro() {
     let m = last_m.expect("expected at least one run");
     assert!(
         saw_seq_ne || saw_aj,
-        "expected Bind jump seq≠par falsification or aj>0: {m:?}"
+        "expected OrderedAdmit jump seq≠par falsification or aj>0: {m:?}"
     );
     // Documented: keep JUMP OFF until aj>0∧seq≡par.
     assert!(
         saw_seq_ne,
-        "Bind jump applied without seq≠par — recheck before enable: {m:?}"
+        "OrderedAdmit jump applied without seq≠par — recheck before enable: {m:?}"
     );
 }
 
 /// Iter21: ERC-20 + SNAP=1 JUMP=0 — isolate capture seq≡par (no abs jump).
 #[ignore = "Iter21 dig: SNAP-only seq≡par isolate; run solo --ignored --test-threads=1"]
 #[test]
-fn specfence_iter21_erc20_bind_snap_only_seq_eq_par() {
+fn specfence_iter21_erc20_ordered_admit_snap_only_seq_eq_par() {
     unsafe {
         std::env::set_var("SPECFENCE_BIND_SNAP", "1");
         std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP");
@@ -2501,8 +2519,8 @@ fn specfence_iter21_erc20_bind_snap_only_seq_eq_par() {
     let m = last.expect("metrics");
     eprintln!(
         "iter21 erc20 snap-only: bsnap={} bcredit={} resume={} rewind={} abort={} aj={}",
-        m.bind_snap_capture,
-        m.bind_snap_credit,
+        m.ordered_admit_snap_capture,
+        m.ordered_admit_snap_credit,
         m.resume_count,
         m.rewind_to_cp,
         m.occ_aborts,
@@ -3086,11 +3104,11 @@ fn specfence_m1l_valued_call_boundary_absolute_jump() {
 /// Transfer schedules + shared-slot valued+write all green under mainnet shapes.
 /// Plant now covers full-width multi-SSTORE+LOG, warm valued SC, valued CALL jump.
 
-/// Plant v2 M3: process/residual WŜ prior drives Bind-before-touch on a
+/// Plant v2 M3: process/residual WŜ prior drives OrderedAdmit-before-touch on a
 /// contended same-sender schedule (must *read* the hot Basic location).
-/// Second block shows `prior_bind_hits > 0` and bounded `region_validate_fail`.
+/// Second block shows `prior_ordered_admit_hits > 0` and bounded `region_validate_fail`.
 #[test]
-fn specfence_m3_prior_is_observe_not_bind_or() {
+fn specfence_m3_prior_is_observe_not_ordered_admit_or() {
     let chain = PevmEthereum::mainnet();
     let hot = Address::from(U160::from(1));
     let storage = storage_for(200);
@@ -3119,14 +3137,14 @@ fn specfence_m3_prior_is_observe_not_bind_or() {
     assert_eq!(seq1, par1);
     let m1 = pevm.last_specfence_metrics().clone();
     assert!(
-        pevm.rw_prior_hot_writes() > 0 || m1.bind_hits > 0 || m1.occ_aborts > 0,
-        "block1 must learn WŜ or exercise bind/abort: prior_hot={} m1={m1:?}",
+        pevm.rw_prior_hot_writes() > 0 || m1.ordered_admit_hits > 0 || m1.occ_aborts > 0,
+        "block1 must learn WŜ or exercise ordered_admit/abort: prior_hot={} m1={m1:?}",
         pevm.rw_prior_hot_writes()
     );
     let fail1 = m1.region_validate_fail;
 
     // Block 2 — fresh-storage nonces, same hot Basic location. Process prior +
-    // residual WŜ from earlier txs in the block should Bind before SpecRead.
+    // residual WŜ from earlier txs in the block should OrderedAdmit before OptimisticRead.
     let txs2: Vec<TxEnv> = (1..=32).map(|i| self_transfer(hot, i as u64)).collect();
     let seq2 = execute_revm_sequential(
         &chain,
@@ -3155,7 +3173,7 @@ fn specfence_m3_prior_is_observe_not_bind_or() {
         last = Some(pevm.last_specfence_metrics().clone());
     }
     let m2 = last.expect("ran block 2");
-    // prior_ws is observe-only — not a Bind OR-door. Lean OCC-fast on this
+    // prior_ws is observe-only — not a OrderedAdmit OR-door. Lean OCC-fast on this
     // same-sender cluster is the hybrid miss/quiet path.
     assert_eq!(m2.soft_wait_arms, 0, "SoftWait Soft=0: {m2:?}");
     assert_eq!(m2.await_at_a_arms, 0, "no EV Await: {m2:?}");
@@ -3248,7 +3266,11 @@ fn specfence_m4_high_conflict_uses_full_plant() {
         assert_eq!(seq, par, "HotLocal must preserve seq≡par");
         let m = pevm.last_specfence_metrics().clone();
         last = Some(m.clone());
-        if m.hotset_size > 0 || m.hot_local_reads > 0 || m.bind_hits > 0 || m.wait_hard_count > 0 {
+        if m.hotset_size > 0
+            || m.hot_local_reads > 0
+            || m.ordered_admit_hits > 0
+            || m.wait_hard_count > 0
+        {
             saw_hot = true;
             break;
         }
@@ -3336,7 +3358,7 @@ fn specfence_r1_hot_multiwriter_hotset() {
 /// Iter24/25: production ResumePath SNAP + JUMP — SoftWait Soft=0; seq≡par.
 /// Iter25: silent default is ResumePath (unset env); mass path still OFF.
 #[test]
-fn specfence_iter24_bind_jump_resume_path_production() {
+fn specfence_iter24_ordered_admit_jump_resume_path_production() {
     unsafe {
         std::env::remove_var("SPECFENCE_BIND_SNAP"); // Iter25 silent ResumePath
         std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP"); // JUMP follows mode
@@ -3383,7 +3405,7 @@ fn specfence_iter24_bind_jump_resume_path_production() {
 
 /// Iter24: SPECFENCE_BIND_SNAP=0 forces capture+jump off.
 #[test]
-fn specfence_iter24_bind_snap_force_off() {
+fn specfence_iter24_ordered_admit_snap_force_off() {
     unsafe {
         std::env::set_var("SPECFENCE_BIND_SNAP", "0");
         std::env::set_var("SPECFENCE_BIND_SNAP_JUMP", "0");
@@ -3400,7 +3422,7 @@ fn specfence_iter24_bind_snap_force_off() {
     let (_, m, _) = run_mode_conc(ConcurrencyMode::SpecFence, &storage, txs, width);
     assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
     assert_eq!(m.absolute_jump_applied, 0, "force-off JUMP: {m:?}");
-    assert_eq!(m.bind_snap_capture, 0, "force-off SNAP: {m:?}");
+    assert_eq!(m.ordered_admit_snap_capture, 0, "force-off SNAP: {m:?}");
     unsafe {
         std::env::remove_var("SPECFENCE_BIND_SNAP");
         std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP");
@@ -3458,8 +3480,8 @@ fn specfence_iter26_validated_fresh_ff_tip_jump() {
         );
         let _ = (
             m.absolute_jump_applied,
-            m.bind_snap_capture,
-            m.bind_snap_credit,
+            m.ordered_admit_snap_capture,
+            m.ordered_admit_snap_credit,
         );
     }
 }
@@ -3516,8 +3538,8 @@ fn specfence_iter27_tip_ff_overlap_steps_cap() {
         );
         let _ = (
             m.absolute_jump_applied,
-            m.bind_snap_capture,
-            m.bind_snap_credit,
+            m.ordered_admit_snap_capture,
+            m.ordered_admit_snap_credit,
         );
     }
 }
@@ -3574,20 +3596,20 @@ fn specfence_iter28_first_frame_tip_identity() {
         );
         let _ = (
             m.absolute_jump_applied,
-            m.bind_snap_capture,
-            m.bind_snap_credit,
+            m.ordered_admit_snap_capture,
+            m.ordered_admit_snap_credit,
         );
     }
 }
 
-/// Iter29: hang-free nested Bind credit path — SoftWait Soft=0; seq≡par.
+/// Iter29: hang-free nested OrderedAdmit credit path — SoftWait Soft=0; seq≡par.
 #[test]
-fn specfence_iter29_nested_bind_consume() {
+fn specfence_iter29_nested_ordered_admit_consume() {
     unsafe {
         std::env::remove_var("SPECFENCE_BIND_SNAP");
         std::env::remove_var("SPECFENCE_BIND_SNAP_JUMP");
         std::env::remove_var("SPECFENCE_JUMP_DIG");
-        // Iter30 default-on is Lean-safe; force OFF here to pin Iter29 credit posture.
+        // Iter30 default-on is Lean-safe; force OFF here to wait_for_dependency Iter29 credit posture.
         std::env::set_var("SPECFENCE_NESTED_BIND", "0");
     }
     let (mut state, bytecodes, mut txs) = erc20::generate_cluster(4, 12, 6);
@@ -3630,12 +3652,12 @@ fn specfence_iter29_nested_bind_consume() {
         assert_eq!(m.handler_sstore_capture, 0, "stock SSTORE: {m:?}");
         assert_eq!(
             parallel, sequential,
-            "Iter29 nested Bind consume must stay seq≡par: {m:?}"
+            "Iter29 nested OrderedAdmit consume must stay seq≡par: {m:?}"
         );
         let _ = (
             m.absolute_jump_applied,
-            m.bind_snap_capture,
-            m.bind_snap_credit,
+            m.ordered_admit_snap_capture,
+            m.ordered_admit_snap_credit,
         );
     }
     unsafe {
@@ -3697,8 +3719,8 @@ fn specfence_iter30_lean_safe_nested_apply_default_on() {
         );
         let _ = (
             m.absolute_jump_applied,
-            m.bind_snap_capture,
-            m.bind_snap_credit,
+            m.ordered_admit_snap_capture,
+            m.ordered_admit_snap_credit,
         );
     }
 }
@@ -3706,7 +3728,7 @@ fn specfence_iter30_lean_safe_nested_apply_default_on() {
 /// Iter24 dig: Mass SNAP+JUMP still aj>0∧fail=0 (refuse-if-stale). Ignored.
 #[ignore = "Iter24 dig: Mass SNAP+JUMP refuse-if-stale; run solo --ignored --test-threads=1"]
 #[test]
-fn specfence_iter24_erc20_mass_bind_jump_dig() {
+fn specfence_iter24_erc20_mass_ordered_admit_jump_dig() {
     unsafe {
         std::env::set_var("SPECFENCE_BIND_SNAP", "1");
         std::env::set_var("SPECFENCE_BIND_SNAP_JUMP", "1");
@@ -3754,7 +3776,7 @@ fn specfence_iter24_erc20_mass_bind_jump_dig() {
                 fail += 1;
                 eprintln!(
                     "iter24 mass dig FAIL seq≠par run={run} aj={} bsnap={}",
-                    m.absolute_jump_applied, m.bind_snap_capture
+                    m.absolute_jump_applied, m.ordered_admit_snap_capture
                 );
             }
         } else if parallel != sequential {
@@ -3819,7 +3841,7 @@ fn specfence_iter25_silent_default_resume_path() {
     }
 }
 
-/// Complete-arch: SoftWait Soft=0; edge π records Bind/Spec/WaitFor; seq≡par on
+/// Complete-arch: SoftWait Soft=0; edge π records OrderedAdmit/Spec/WaitFor; seq≡par on
 /// an ERC-20 cluster plus a second warm block (A6 prior).
 #[test]
 fn complete_arch_edge_pi_seq_eq_par_softwait0() {
@@ -3843,10 +3865,10 @@ fn complete_arch_edge_pi_seq_eq_par_softwait0() {
     assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
     assert_eq!(par, sequential, "complete-arch must stay seq≡par: {m:?}");
     assert!(
-        m.edge_bind + m.edge_unfenced + m.edge_wait_for > 0
-            || m.spec_read_count + m.bind_hits > 0
+        m.edge_ordered_admit + m.edge_optimistic_read + m.edge_wait_for > 0
+            || m.optimistic_read_count + m.ordered_admit_hits > 0
             || m.occ_kernel_execs > 0,
-        "edge π, Bind/Unfenced, or OCC-identical: {m:?}"
+        "edge π, OrderedAdmit/OptimisticRead, or OCC-identical: {m:?}"
     );
     // A6 warm second block on the same Pevm (prior H + templates).
     let parallel = pevm
@@ -3864,7 +3886,7 @@ fn complete_arch_edge_pi_seq_eq_par_softwait0() {
     assert_eq!(parallel, sequential, "warm complete-arch seq≡par: {m2:?}");
 }
 
-/// Gaps-closed: known essentials WaitFor or Bind (not Unfenced leak); SoftWait Soft=0;
+/// Gaps-closed: known essentials WaitFor or OrderedAdmit (not OptimisticRead leak); SoftWait Soft=0;
 /// Avoid broadcast and Data-publish wake are live; seq≡par.
 #[test]
 fn gaps_closed_waitfor_avoid_publish_wake() {
@@ -3883,7 +3905,10 @@ fn gaps_closed_waitfor_avoid_publish_wake() {
     assert_eq!(par, sequential, "gaps-closed seq≡par: {m:?}");
     assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
     assert!(
-        m.avoid_broadcasts > 0 || m.edge_bind > 0 || m.edge_wait_for > 0 || m.occ_kernel_execs > 0,
+        m.avoid_broadcasts > 0
+            || m.edge_ordered_admit > 0
+            || m.edge_wait_for > 0
+            || m.occ_kernel_execs > 0,
         "fan_out Fence or OCC-identical: {m:?}"
     );
     let warm = pevm
@@ -3900,14 +3925,14 @@ fn gaps_closed_waitfor_avoid_publish_wake() {
     assert_eq!(warm, sequential, "gaps-closed warm seq≡par: {m2:?}");
     assert_eq!(m2.soft_wait_arms, 0, "warm SoftWait Soft=0: {m2:?}");
     assert!(
-        m2.edge_wait_for + m2.edge_bind > 0 || m2.occ_kernel_execs > 0,
+        m2.edge_wait_for + m2.edge_ordered_admit > 0 || m2.occ_kernel_execs > 0,
         "warm fan_out Fence or OCC-identical: {m2:?}"
     );
 }
 
-/// Fence cover: after first-wave canary / Avoid, hot cluster Regions Bind or
-/// WaitFor. SoftWait Soft=0. Process Unfenced-after-Avoid on the hottest ℓ
-/// must not dominate Bind+Wait.
+/// Fence cover: after first-wave canary / Avoid, hot cluster Regions OrderedAdmit or
+/// WaitFor. SoftWait Soft=0. Process OptimisticRead-after-Avoid on the hottest ℓ
+/// must not dominate OrderedAdmit+Wait.
 #[test]
 fn fence_cover_hot_region_after_canary() {
     let (state, bytecodes, txs) = erc20::generate_cluster(6, 16, 8);
@@ -3926,16 +3951,16 @@ fn fence_cover_hot_region_after_canary() {
     assert_eq!(m.soft_wait_arms, 0, "SoftWait Soft must stay 0: {m:?}");
     let p = pevm.last_exec_process();
     assert!(
-        p.bind_total + p.wait_for_total > 0
-            || m.edge_bind + m.edge_wait_for > 0
+        p.ordered_admit_total + p.wait_for_total > 0
+            || m.edge_ordered_admit + m.edge_wait_for > 0
             || m.occ_kernel_execs > 0,
         "fan_out Fence or OCC-identical: process={p:?} metrics={m:?}"
     );
     if let Some(hot) = &p.hot_fanout_l {
         assert!(
-            hot.unfenced_after_avoid <= hot.bind_after_avoid + hot.wait_after_avoid
-                || hot.unfenced_after_avoid == 0,
-            "hot ℓ Unfenced-after-Avoid must not dominate Fence: {hot:?}"
+            hot.optimistic_read_after_avoid <= hot.ordered_admit_after_avoid + hot.wait_after_avoid
+                || hot.optimistic_read_after_avoid == 0,
+            "hot ℓ OptimisticRead-after-Avoid must not dominate Fence: {hot:?}"
         );
     }
     let warm = pevm
@@ -3953,13 +3978,13 @@ fn fence_cover_hot_region_after_canary() {
     assert_eq!(warm, sequential, "fence-cover warm seq≡par: {m2:?}");
     assert_eq!(m2.soft_wait_arms, 0, "warm SoftWait Soft=0: {m2:?}");
     assert!(
-        p2.wait_for_total + p2.bind_total > 0 || m2.occ_kernel_execs > 0,
+        p2.wait_for_total + p2.ordered_admit_total > 0 || m2.occ_kernel_execs > 0,
         "warm fan_out Fence or OCC-identical: {p2:?}"
     );
 }
 
 /// U1–U6 / S1 / S4: force_prefix carries a writer or serial Fence; no
-/// must_wait→Unfenced leak; SoftWait Soft=0; independents may still Unfence.
+/// must_wait→OptimisticRead leak; SoftWait Soft=0; independents may still optimistic_read.
 #[test]
 fn general_fixes_force_prefix_writer_and_multi_spine() {
     let (state, bytecodes, txs) = erc20::generate_cluster(5, 14, 7);
@@ -3979,12 +4004,12 @@ fn general_fixes_force_prefix_writer_and_multi_spine() {
     assert_eq!(m.await_at_a_arms, 0, "no EV Await@a door: {m:?}");
     let p = pevm.last_exec_process();
     assert_eq!(
-        p.force_prefix_none_unfenced, 0,
-        "U1: force_prefix ∧ live pred must not Unfence: {p:?}"
+        p.force_prefix_none_optimistic_read, 0,
+        "U1: force_prefix ∧ live pred must not optimistic_read: {p:?}"
     );
     assert!(
-        p.bind_total + p.wait_for_total > 0
-            || m.edge_bind + m.edge_wait_for > 0
+        p.ordered_admit_total + p.wait_for_total > 0
+            || m.edge_ordered_admit + m.edge_wait_for > 0
             || m.occ_kernel_execs > 0,
         "fan_out Fence or OCC-identical: process={p:?} metrics={m:?}"
     );
@@ -4003,22 +4028,22 @@ fn general_fixes_force_prefix_writer_and_multi_spine() {
     assert_eq!(warm, sequential, "general-fixes warm seq≡par: {m2:?}");
     assert_eq!(m2.soft_wait_arms, 0, "warm SoftWait Soft=0: {m2:?}");
     assert_eq!(
-        p2.force_prefix_none_unfenced, 0,
-        "U1 warm: force_prefix Unfenced leak: {p2:?}"
+        p2.force_prefix_none_optimistic_read, 0,
+        "U1 warm: force_prefix OptimisticRead leak: {p2:?}"
     );
     assert!(
-        p2.independent_unfenced_total > 0
-            || m2.independent_unfenced > 0
-            || p2.unfenced_total > 0
+        p2.independent_optimistic_read_total > 0
+            || m2.independent_optimistic_read > 0
+            || p2.optimistic_read_total > 0
             || m2.occ_kernel_execs > 0,
-        "S2: independents Unfence or OCC-identical: {p2:?}"
+        "S2: independents optimistic_read or OCC-identical: {p2:?}"
     );
 }
 
-/// Sub-grain frozen π: Detect/Unfenced≡OCC first-pass; Bind after abort+Data;
+/// Sub-grain frozen π: Detect/OptimisticRead≡OCC first-pass; OrderedAdmit after abort+Data;
 /// SoftWait Soft=0; no Await@a; PreferAdmit is WaitFor-only (not required).
 #[test]
-fn subgrain_done_bind_r1_canary_prefer_admit() {
+fn subgrain_done_ordered_admit_partial_abort_canary_prefer_admit() {
     let (state, bytecodes, txs) = erc20::generate_cluster(6, 16, 8);
     let storage = InMemoryStorage::new(state, Arc::new(bytecodes), Default::default());
     let (par, m, mut pevm) = run_mode(ConcurrencyMode::SpecFence, &storage, txs.clone());
@@ -4036,14 +4061,14 @@ fn subgrain_done_bind_r1_canary_prefer_admit() {
     assert_eq!(m.await_at_a_arms, 0, "no EV Await@a door: {m:?}");
     let p = pevm.last_exec_process();
     assert_eq!(
-        p.force_prefix_none_unfenced, 0,
+        p.force_prefix_none_optimistic_read, 0,
         "U1 leak must stay 0: {p:?}"
     );
     assert!(
-        p.bind_total + m.bind_residual + m.edge_bind > 0
-            || m.edge_unfenced + m.spec_read_count > 0
+        p.ordered_admit_total + m.ordered_admit_residual + m.edge_ordered_admit > 0
+            || m.edge_optimistic_read + m.optimistic_read_count > 0
             || m.occ_kernel_execs > 0,
-        "Detect/Unfenced≡OCC, Bind, or OCC kernel: process={p:?} metrics={m:?}"
+        "Detect/OptimisticRead≡OCC, OrderedAdmit, or OCC kernel: process={p:?} metrics={m:?}"
     );
     // PreferAdmit-as-primary is deleted (SoT). WaitFor (if any) admits the
     // writer spine; ¬PredictedEssential first pass is OCC-width.
@@ -4066,16 +4091,16 @@ fn subgrain_done_bind_r1_canary_prefer_admit() {
     assert_eq!(warm, sequential, "subgrain warm seq≡par: {m2:?}");
     assert_eq!(m2.soft_wait_arms, 0, "warm SoftWait Soft=0: {m2:?}");
     assert!(
-        p2.bind_total + m2.bind_residual + m2.edge_bind > 0
-            || m2.unfenced_occ_fast + m2.edge_unfenced > 0
+        p2.ordered_admit_total + m2.ordered_admit_residual + m2.edge_ordered_admit > 0
+            || m2.optimistic_read_occ_fast + m2.edge_optimistic_read > 0
             || m2.occ_kernel_execs > 0,
-        "warm Bind if PCC ROI, else Unfenced≡OCC / OCC kernel: process={p2:?} metrics={m2:?}"
+        "warm OrderedAdmit if PCC ROI, else OptimisticRead≡OCC / OCC kernel: process={p2:?} metrics={m2:?}"
     );
     assert!(
-        p2.independent_unfenced_total > 0
-            || m2.independent_unfenced > 0
-            || p2.unfenced_total > 0
+        p2.independent_optimistic_read_total > 0
+            || m2.independent_optimistic_read > 0
+            || p2.optimistic_read_total > 0
             || m2.occ_kernel_execs > 0,
-        "independents Unfence or OCC-identical: {p2:?}"
+        "independents optimistic_read or OCC-identical: {p2:?}"
     );
 }

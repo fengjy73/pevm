@@ -1,9 +1,9 @@
-//! Access-prefix certificate strips — not a tx-global bit from one Bind.
+//! Access-prefix certificate strips — not a tx-global bit from one OrderedAdmit.
 //!
 //! Plant SoT: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md` §3.3.
 //!
-//! `note_success` only after a **successful** Fence verb (Bind after Data,
-//! WaitFor armed, SerialLane exclusive progress). Bind-decide then Data miss
+//! `note_success` only after a **successful** Fence verb (OrderedAdmit after Data,
+//! WaitFor armed, SerialLane exclusive progress). OrderedAdmit-decide then Data miss
 //! must not write a strip. Spec never certifies.
 //!
 //! `may_resolve` ≡ strip covers the **failed locations**, not `had_fence(tx)`.
@@ -58,9 +58,9 @@ impl CertificateTable {
     }
 
     /// New incarnation. Repair-armed keeps a prefix certificate.
-    /// **M5:** location strips survive PinHold / same-incarnation resume
+    /// **M5:** location strips survive WaitForDependency / same-incarnation resume
     /// (`incarnation == 0` must **not** wipe). Only [`Self::begin_block`]
-    /// clears. Kept strips still do **not** cover sibling Spec (`covers_all`).
+    /// clears. Kept strips still do **not** cover sibling optimistic_read (`covers_all`).
     #[inline]
     pub(crate) fn begin_execute(&self, tx_idx: TxIdx, repair_armed: bool, incarnation: usize) {
         let _ = incarnation;
@@ -140,8 +140,8 @@ impl CertificateTable {
         invalid.iter().all(|l| st.locs.contains(l))
     }
 
-    /// Strip membership only — **not** repair_armed. R1b must not treat
-    /// PinHold RewindTo as covering sibling Spec (Iter26 seq≠par).
+    /// Strip membership only — **not** repair_armed. PartialAbortRewind must not treat
+    /// WaitForDependency RewindTo as covering sibling optimistic_read (Iter26 seq≠par).
     #[inline]
     pub(crate) fn covers_strips_all(&self, tx_idx: TxIdx, invalid: &[MemoryLocationHash]) -> bool {
         if invalid.is_empty() {
@@ -178,14 +178,14 @@ mod tests {
     }
 
     #[test]
-    fn one_bind_does_not_cover_sibling_spec() {
+    fn one_ordered_admit_does_not_cover_sibling_spec() {
         let t = CertificateTable::new(1);
         t.begin_execute(0, false, 0);
         t.note_success(0, 7);
         assert!(t.covers_all(0, &[7]));
         assert!(
             !t.covers_all(0, &[7, 9]),
-            "tx-global cert from one Bind is forbidden"
+            "tx-global cert from one OrderedAdmit is forbidden"
         );
         assert!(!t.covers_all(0, &[9]));
     }
@@ -232,11 +232,14 @@ mod tests {
         t.begin_execute(0, false, 0);
         t.note_success(0, 7);
         t.begin_execute(0, false, 1);
-        assert!(t.has_any(0), "WaitFor/Bind strip must survive inc>0 resume");
+        assert!(
+            t.has_any(0),
+            "WaitFor/OrderedAdmit strip must survive inc>0 resume"
+        );
         assert!(t.covers(0, 7));
         assert!(
             !t.covers_all(0, &[7, 9]),
-            "kept strip must not cover sibling Spec"
+            "kept strip must not cover sibling optimistic_read"
         );
     }
 
@@ -246,7 +249,10 @@ mod tests {
         t.begin_execute(0, true, 0);
         t.note_success(0, 7);
         assert!(t.covers_all(0, &[7, 9]), "repair_armed covers_all");
-        assert!(!t.covers_strips_all(0, &[7, 9]), "R1b must use strips only");
+        assert!(
+            !t.covers_strips_all(0, &[7, 9]),
+            "PartialAbortRewind must use strips only"
+        );
         assert!(t.covers_strips_all(0, &[7]));
     }
 }

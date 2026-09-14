@@ -14,8 +14,8 @@ use revm::{
 
 use crate::chain::{PevmChain, PevmEthereum};
 use crate::specfence::{
-    nested_bind_stash_armed, pending_resume_armed, try_apply_pending_pc_resume,
-    try_consume_nested_bind_resume,
+    nested_ordered_admit_stash_armed, pending_resume_armed, try_apply_pending_pc_resume,
+    try_consume_nested_ordered_admit_resume,
 };
 
 /// MainnetHandler that skips beneficiary reward (pevm applies via MvMemory).
@@ -87,17 +87,17 @@ where
             let result = match call_or_result {
                 ItemOrResult::Item(init) => match evm.frame_init(init)? {
                     ItemOrResult::Item(_) => {
-                        // Iter29: hang-free nested Bind consume after natural CALL
+                        // Iter29: hang-free nested OrderedAdmit consume after natural CALL
                         // enters a new frame — stash is consulted only here (PENDING
                         // cleared on mismatch; ≠ Iter28e frame_init-defer).
-                        if nested_bind_stash_armed() {
+                        if nested_ordered_admit_stash_armed() {
                             let evm_ptr = evm as *mut Self::Evm;
                             unsafe {
                                 let frame = (*evm_ptr).frame_stack().get();
                                 let depth = frame.depth.min(u16::MAX as usize) as u16;
                                 let interp = &mut frame.interpreter;
                                 let ctx = (*evm_ptr).ctx();
-                                try_consume_nested_bind_resume(interp, ctx, depth);
+                                try_consume_nested_ordered_admit_resume(interp, ctx, depth);
                             }
                         }
                         continue;

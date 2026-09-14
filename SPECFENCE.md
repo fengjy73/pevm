@@ -1,5 +1,8 @@
 # SpecFence
 
+Live concurrency-control vocabulary: [`lab/notes/specfence-cc-glossary.md`](lab/notes/specfence-cc-glossary.md)
+(wait_for_dependency, partial_abort, full_abort_reexecute, optimistic_read, ordered_admit, refuse_admit; Soft=0).
+
 Runtime-fact-driven **adaptive fine-grained** concurrency control for the blockchain execution layer.
 
 This is **not** “faster OCC”, “finer MVCC alone”, or “account-hint Wait on top of Block-STM”. The first `specfence` branch prototype (account-level Wait + whole-tx abort) is an incomplete baseline and is expected to lose to OCC when it only adds waiting without region-local repair.
@@ -56,24 +59,24 @@ SpecFence discovers the true DAG **during** execution and dynamically fuses opti
 
 - **Spec v1 frozen:** `lab/notes/specfence-rem-spec-v1.md` (authoritative contract).
 - **P1a in progress / landed plant:** region events, per-location validate API, `readers[ℓ]`,
-  selective invalidate (+ aborted-incarnation detection), revokeable Bayes Wait/SpecRead/Bind
+  selective invalidate (+ aborted-incarnation detection), revokeable Bayes Wait/OptimisticRead/OrderedAdmit
   (placeholder from prior incarnation write-set). See `lab/notes/specfence-p1a-status.md`.
 
 ### P1a plant (this branch)
 
 - **Unit of control**: `MemoryLocationHash` (slot/Basic/CodeHash).
-- **π**: `WaitHard` / `Bind` / `SpecRead` with `τ_w=0.35`, `τ_s=0.50`, `τ_revoke=0.20`
+- **π**: `WaitHard` / `OrderedAdmit` / `OptimisticRead` with `τ_w=0.35`, `τ_s=0.50`, `τ_revoke=0.20`
   (block-start seed still uses `DEFAULT_TAU=0.30` for inter-block carry).
 - **Revoke**: sticky Wait cleared when `P_conflict < τ_revoke` (no forever Wait).
 - **Selective invalidate**: ESTIMATE only locations with higher `readers[ℓ]`; otherwise keep
   Data + aborted-incarnation stamp so late readers cannot silently accept.
 - **Cascade fence** retained; fence prefers selectively-invalidated locations' readers.
-- P2 **semantic PartialRetry**: certified-prefix Bind on reexec; failed-suffix InvalidateSelective (no global aborted stamp when safe). Wave ready-queue still Phase-2+/P3.
+- P2 **semantic PartialRetry**: certified-prefix OrderedAdmit on reexec; failed-suffix InvalidateSelective (no global aborted stamp when safe). Wave ready-queue still Phase-2+/P3.
 
-Metrics: prior bayes/fence counters plus `region_validate_fail`, `tx_full_retry`, `bind_hits`,
-`wait_hard_count`, `spec_read_count`, `selective_invalidate_count`, `cascade_revalidate_count`,
+Metrics: prior bayes/fence counters plus `region_validate_fail`, `tx_full_abort_reexecute`, `ordered_admit_hits`,
+`wait_hard_count`, `optimistic_read_count`, `selective_invalidate_count`, `cascade_revalidate_count`,
 `soft_edge_revokes`, `selective_fallback_full`, `checkpoint_opportunities`, plus plant v2 M0
-`evm_entries` / `tx_head_reexec` / `full_restart` / `resume_count` / `rebind_only` /
+`evm_entries` / `tx_head_reexec` / `full_abort_reexecute` / `resume_count` / `rebind_only` /
 `rewind_to_cp` (M1 RewindTo/RebindOnly), M1b `journal_ff_entries` /
 `journal_ff_hits` / `db_heavy_ops`, plus M2 `wait_park_count` /
 `wait_park_ns` / `ready_steal_on_wait` / `wave_width_mean`.
@@ -87,7 +90,7 @@ See `lab/notes/specfence-plant-v2-m0-status.md`.
 
 Checkpoints `(t,inc,k)` on SpecFence path; validation fail with certified prefix →
 `RebindOnly` (no abort) or `RewindTo` (resume entry: `rewind_to_cp`/`resume_count`,
-**not** `evm_entries`/`tx_head_reexec`). `FullRestart` only when prefix empty.
+**not** `evm_entries`/`tx_head_reexec`). `FullAbortReexecute` only when prefix empty.
 See `lab/notes/specfence-plant-v2-m1-status.md`.
 
 ### Plant v2 M1b — Journal FF / boundary resume (L1 stronger partial)
@@ -109,6 +112,7 @@ Metrics: `wait_park_count`, `wait_park_ns`, `ready_steal_on_wait`, `wave_width_m
 
 ## Design specs
 
+- **Live CC vocabulary:** `lab/notes/specfence-cc-glossary.md`
 - First principles: `lab/notes/specfence-cc-architecture-v4-first-principles.md`
 - **Implementable contract (frozen):** `lab/notes/specfence-rem-spec-v1.md`
 

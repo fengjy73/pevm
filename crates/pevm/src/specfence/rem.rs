@@ -1,6 +1,6 @@
 //! Region Execution Machine (REM) — Lean SuffixRepair + SoftWait Soft research.
 //!
-//! WavePark / PinHold live in [`super::wave`] (file-SRP). SoftWait Soft stays
+//! WavePark / WaitForDependency live in [`super::wave`] (file-SRP). SoftWait Soft stays
 //! here as a **quarantined** museum (Soft=0 on the product path).
 //!
 //! Phase-1 still drives one interpreter session per incarnation (`RunTx`), but
@@ -10,20 +10,20 @@
 //!
 //! | API | Entry | Default Lean? | What it arms |
 //! |-----|-------|---------------|--------------|
-//! | **SuffixRepair** (Lean) | [`PartialRetryTable::apply_suffix_repair`] | **yes** | hang-free RewindTo + journal FF + force-bind (SoftWait-wake subset) |
-//! | **Research plant** | [`PartialRetryTable::research_apply_abort_repair`] | **no** (`SPECFENCE_ENABLE_INSPECT`) | RewindTo + journal FF + force-bind (may pair with inspect resume) |
-//! | SoftWait wake (P4) | [`PartialRetryTable::try_arm_park_resume_at_k`] | yes (hang-free) | journal FF + force-bind only; **no** absolute jump |
+//! | **SuffixRepair** (Lean) | [`PartialRetryTable::apply_suffix_repair`] | **yes** | hang-free RewindTo + journal FF + force-ordered_admit (SoftWait-wake subset) |
+//! | **Research plant** | [`PartialRetryTable::research_apply_abort_repair`] | **no** (`SPECFENCE_ENABLE_INSPECT`) | RewindTo + journal FF + force-ordered_admit (may pair with inspect resume) |
+//! | SoftWait wake (P4) | [`PartialRetryTable::try_arm_park_resume_at_k`] | yes (hang-free) | journal FF + force-ordered_admit only; **no** absolute jump |
 //!
 //! SpecFence-native resolve: validation fail → **SuffixRepair** (resume at certified
-//! checkpoint ≤ k), not OCC-style head FullRestart. Absolute PC jump / valued
+//! checkpoint ≤ k), not OCC-style head FullAbortReexecute. Absolute PC jump / valued
 //! CallOutcome stay research-only (`SPECFENCE_ENABLE_INSPECT`).
 //!
 //! V5-P3 A/B on block 14689597: full inspect **hangs** → plant stays research-only.
 //! Never graduate by default: absolute PC jump, multi-SSTORE/LOG jump mythology,
 //! valued CallOutcome SC, fanout→WaitHard.
 //!
-//! P3 EarlyAbort: [`PartialRetryTable::arm_early_abort`] (RewindTo/FullRetry + force-bind).
-//! P2 semantic PartialRetry: Bind-when-Data / SpecRead-else on certified prefix;
+//! P3 EarlyAbort: [`PartialRetryTable::arm_early_abort`] (RewindTo/FullAbortReexecute + force-ordered_admit).
+//! P2 semantic PartialRetry: OrderedAdmit-when-Data / OptimisticRead-else on certified prefix;
 //! selective suffix invalidate (no global aborted stamp).
 //!
 //! M1a–M1l research checkpoints / jump / CallOutcome SC remain behind inspect flag.
@@ -97,7 +97,7 @@ pub(crate) enum CheckpointKind {
     AccountWrite,
     /// Storage slot write boundary.
     StorageWrite,
-    /// Generic effect boundary (certified Bind / EarlyVal).
+    /// Generic effect boundary (certified OrderedAdmit / EarlyVal).
     EffectBoundary,
 }
 
@@ -222,14 +222,14 @@ pub(crate) enum RepairPlan {
         k_fail: usize,
         suffix_writes: Vec<MemoryLocationHash>,
     },
-    /// Empty prefix / control-flow broken — FullRestart from tx head.
-    FullRestart,
+    /// Empty prefix / control-flow broken — FullAbortReexecute from tx head.
+    FullAbortReexecute,
 }
 
 /// SpecFence-native Lean abort / validation resolve outcome.
 ///
 /// Default verb is [`Self::SuffixRepair`] (hang-free RewindTo + journal FF +
-/// force-bind) when a certified mid-tx checkpoint exists before fail `k`.
+/// force-ordered_admit) when a certified mid-tx checkpoint exists before fail `k`.
 /// Absolute PC jump / valued CallOutcome remain research-only.
 #[derive(Debug, Clone)]
 pub(crate) enum LeanAbortRepair {
@@ -240,17 +240,17 @@ pub(crate) enum LeanAbortRepair {
         /// Suggested `LiveLearner::note_reexec_cost` sample (~0.6).
         reexec_cost: f64,
     },
-    /// Certified prefix but no usable mid-tx checkpoint → force-bind + head reexec.
+    /// Certified prefix but no usable mid-tx checkpoint → force-ordered_admit + head reexec.
     /// `suffix_writes` alone are ESTIMATEd; certified/`prefix` Data stays (no selective abort stamp).
-    ForceBind {
+    ForceOrderedAdmit {
         certified: Vec<MemoryLocationHash>,
         /// Failed-suffix write locations to ESTIMATE (certified prefix kept as Data).
         suffix_writes: Vec<MemoryLocationHash>,
         /// Suggested `LiveLearner::note_reexec_cost` sample.
         reexec_cost: f64,
     },
-    /// No usable certified prefix / control-flow broken → FullRestart from tx head.
-    FullRestart { reexec_cost: f64 },
+    /// No usable certified prefix / control-flow broken → FullAbortReexecute from tx head.
+    FullAbortReexecute { reexec_cost: f64 },
 }
 
 impl LeanAbortRepair {
@@ -258,14 +258,17 @@ impl LeanAbortRepair {
     pub(crate) fn reexec_cost(&self) -> f64 {
         match self {
             Self::SuffixRepair { reexec_cost, .. }
-            | Self::ForceBind { reexec_cost, .. }
-            | Self::FullRestart { reexec_cost } => *reexec_cost,
+            | Self::ForceOrderedAdmit { reexec_cost, .. }
+            | Self::FullAbortReexecute { reexec_cost } => *reexec_cost,
         }
     }
 
     #[inline]
-    pub(crate) fn did_force_bind(&self) -> bool {
-        matches!(self, Self::ForceBind { .. } | Self::SuffixRepair { .. })
+    pub(crate) fn did_force_ordered_admit(&self) -> bool {
+        matches!(
+            self,
+            Self::ForceOrderedAdmit { .. } | Self::SuffixRepair { .. }
+        )
     }
 
     #[inline]
@@ -280,22 +283,24 @@ impl LeanAbortRepair {
 /// path gates those behind `SPECFENCE_ABSOLUTE_JUMP` / inspect + safety checks.
 #[derive(Debug, Clone)]
 pub(crate) enum ResearchAbortRepair {
-    /// Armed RewindTo + journal FF continuation + force-bind.
+    /// Armed RewindTo + journal FF continuation + force-ordered_admit.
     RewindTo {
         certified: Vec<MemoryLocationHash>,
         suffix_writes: Vec<MemoryLocationHash>,
         /// Suggested `LiveLearner::note_reexec_cost` sample (~0.6).
         reexec_cost: f64,
     },
-    /// No usable checkpoint → FullRestart (caller selective/full invalidate).
-    FullRestart { reexec_cost: f64 },
+    /// No usable checkpoint → FullAbortReexecute (caller selective/full invalidate).
+    FullAbortReexecute { reexec_cost: f64 },
 }
 
 impl ResearchAbortRepair {
     #[inline]
     pub(crate) fn reexec_cost(&self) -> f64 {
         match self {
-            Self::RewindTo { reexec_cost, .. } | Self::FullRestart { reexec_cost } => *reexec_cost,
+            Self::RewindTo { reexec_cost, .. } | Self::FullAbortReexecute { reexec_cost } => {
+                *reexec_cost
+            }
         }
     }
 
@@ -412,7 +417,7 @@ impl PartialRetryState {
         k
     }
 
-    /// Unfenced≡OCC: increment \(k\) + first_k for Detect/abort grain, **no**
+    /// OptimisticRead≡OCC: increment \(k\) + first_k for Detect/abort grain, **no**
     /// journal / checkpoint (those are Fenced-path PrefixSkip tax).
     pub(crate) fn note_access_k_only(&mut self, location: MemoryLocationHash) -> usize {
         self.k += 1;
@@ -480,7 +485,7 @@ impl PartialRetryState {
         mut replay: StorageWriteReplay,
     ) {
         // Iter10: finalize re-notes with gas=0 must NOT touch first_k (that shifted
-        // true_suffix/RebindOnly). Iter11: *plant* notes (gas>0) pin first_k at the
+        // true_suffix/RebindOnly). Iter11: *plant* notes (gas>0) wait_for_dependency first_k at the
         // current effect ordinal so build_continuation keeps tip write_replays when
         // abort hits before finalize Write note_access (otherwise fk=MAX drops them
         // → cont.write_replays empty → Handler jump never arms).
@@ -584,13 +589,13 @@ impl PartialRetryState {
                 values.insert(*loc, val.clone());
             }
         }
-        // Iter19: among live snaps with k < k_fail, prefer Bind/read-boundary
+        // Iter19: among live snaps with k < k_fail, prefer OrderedAdmit/read-boundary
         // (sstore_index=0, !post_sstore) certified-prefix end — post-SSTORE plant
         // tips are usually k≥k_fail on RAW-read fails (Iter18 aj=0).
-        // Iter26: among Bind tips prefer tip_sloads≡FF (Validated-fresh / FF-path
+        // Iter26: among OrderedAdmit tips prefer tip_sloads≡FF (Validated-fresh / FF-path
         // captures) so refuse-if-stale can arm jump.
         // Iter27: tip≡FF = ≥1 tip_sload matches FF Storage and none conflict
-        // (cumulative Bind SLOAD log often has extras absent from certified
+        // (cumulative OrderedAdmit SLOAD log often has extras absent from certified
         // values — old all-match refused every 597 arm). Prefer steps within
         // jump_is_safe cap (not max steps — that selected steps_over tips).
         let tip_ff_status = |s: &BoundarySnapshot| -> (bool, bool) {
@@ -619,7 +624,7 @@ impl PartialRetryState {
         };
         let tip_matches_ff = |s: &BoundarySnapshot| -> bool { tip_ff_status(s).0 };
         let steps_cap = |s: &BoundarySnapshot| -> u64 {
-            // Three-pillar resolve: tip≡FF/storage/write/call → 8192 (597 Bind tips
+            // Three-pillar resolve: tip≡FF/storage/write/call → 8192 (597 OrderedAdmit tips
             // at PC 2–6k were refused steps_over under 2048); Basic-only stays 128.
             let has_storage = values
                 .values()
@@ -726,7 +731,7 @@ impl PartialRetryState {
         self.attach_live_boundary_at(self.k, snap, blob);
     }
 
-    /// Iter26: attach at capture-time k (TLS-deferred Bind-snap).
+    /// Iter26: attach at capture-time k (TLS-deferred OrderedAdmit-snap).
     pub(crate) fn attach_live_boundary_at(
         &mut self,
         k: usize,
@@ -785,7 +790,7 @@ impl PartialRetryState {
             .find(|cp| cp.id.k < k_fail)
             .map(|cp| cp.id)
             .or_else(|| {
-                // M1f: if SpecRead skipped EffectBoundary but step_end attached a
+                // M1f: if OptimisticRead skipped EffectBoundary but step_end attached a
                 // live snap, rewind to that tip so jump_snap is available.
                 self.live_boundaries
                     .keys()
@@ -823,8 +828,8 @@ impl PartialRetryState {
         self.k
     }
 
-    /// True when every grain \(1..=cp_k\) was journaled (Fenced Bind).
-    /// Unfenced `note_access_k_only` leaves holes — PrefixSkip FF would be stale.
+    /// True when every grain \(1..=cp_k\) was journaled (Fenced OrderedAdmit).
+    /// OptimisticRead `note_access_k_only` leaves holes — PrefixSkip FF would be stale.
     pub(crate) fn journal_covers_prefix(&self, cp_k: usize) -> bool {
         if cp_k == 0 || self.journal.len() < cp_k {
             return false;
@@ -852,8 +857,8 @@ impl PartialRetryState {
 pub(crate) struct PartialRetryTable {
     /// Per-tx rem journal. Single-executor invariant (see Sync impl).
     states: Vec<UnsafeCell<PartialRetryState>>,
-    /// Locations π must Bind/WaitHard on the next incarnation of `t`.
-    force_bind: DashMap<TxIdx, Vec<MemoryLocationHash>, BuildIdentityHasher>,
+    /// Locations π must OrderedAdmit/WaitHard on the next incarnation of `t`.
+    force_ordered_admit: DashMap<TxIdx, Vec<MemoryLocationHash>, BuildIdentityHasher>,
     /// U4: ℓ→writer identity preserved across R2/R4 (not predicted-writer sticky).
     force_writers: DashMap<
         TxIdx,
@@ -876,10 +881,10 @@ pub(crate) struct PartialRetryTable {
     last_jump_applied: DashMap<TxIdx, bool, BuildIdentityHasher>,
     /// M1e: absolute jump disabled after a jumped resume failed validation (anti-livelock).
     jump_disabled: DashMap<TxIdx, (), BuildIdentityHasher>,
-    /// After force_bind_reabort: next Lean execute should open narrow inspect to
+    /// After force_ordered_admit_reabort: next Lean execute should open narrow inspect to
     /// capture live jump_snap (CallEntry/EffectBoundary + Storage FF path).
     needs_live_capture: DashMap<TxIdx, (), BuildIdentityHasher>,
-    /// Per-tx SuffixRepair/ForceBind resolve depth this block. Cap → FullRestart.
+    /// Per-tx SuffixRepair/ForceOrderedAdmit resolve depth this block. Cap → FullAbortReexecute.
     suffix_repair_depth: Vec<AtomicUsize>,
     /// Iter3: serial-barrier park count this block (cap in try_claim).
     serial_barrier_count: Vec<AtomicUsize>,
@@ -887,7 +892,7 @@ pub(crate) struct PartialRetryTable {
     jump_defer_count: Vec<AtomicUsize>,
     /// Iter16: validate-defer / RebindOnly-after-spine claims (cap 1/tx/block).
     validation_defer_count: Vec<AtomicUsize>,
-    /// Iter5: certified-prefix FF values retained across escalate FullRestart (DB skip).
+    /// Iter5: certified-prefix FF values retained across escalate FullAbortReexecute (DB skip).
     ff_head: DashMap<
         TxIdx,
         HashMap<MemoryLocationHash, FfValue, BuildIdentityHasher>,
@@ -914,7 +919,7 @@ impl PartialRetryTable {
             states: (0..block_size)
                 .map(|_| UnsafeCell::new(PartialRetryState::default()))
                 .collect(),
-            force_bind: DashMap::default(),
+            force_ordered_admit: DashMap::default(),
             force_writers: DashMap::default(),
             post_softwait_wake: DashMap::default(),
             softwait_parked: DashMap::default(),
@@ -950,13 +955,13 @@ impl PartialRetryTable {
         st.note_access(tx_idx, location, mode)
     }
 
-    /// Unfenced≡OCC grain: \(k\) + first_k only (no journal / checkpoint).
+    /// OptimisticRead≡OCC grain: \(k\) + first_k only (no journal / checkpoint).
     pub(crate) fn note_access_k_only(&self, tx_idx: TxIdx, location: MemoryLocationHash) -> usize {
         let mut st = unsafe { self.state_mut(tx_idx) };
         st.note_access_k_only(location)
     }
 
-    /// PE-probe ordinal only (no `first_k`). Safe on Unfenced.
+    /// PE-probe ordinal only (no `first_k`). Safe on OptimisticRead.
     #[inline]
     pub(crate) fn bump_k_only(&self, tx_idx: TxIdx) -> usize {
         if tx_idx >= self.states.len() {
@@ -969,7 +974,7 @@ impl PartialRetryTable {
         unsafe { self.state_mut(tx_idx) }.note_certified(location);
     }
 
-    /// Bind-on-Data lite: journal Read access + certify + lightweight EffectBoundary
+    /// OrderedAdmit-on-Data lite: journal Read access + certify + lightweight EffectBoundary
     /// checkpoint under **one** rem lock (no BoundarySnapshot alloc).
     pub(crate) fn note_access_certified_checkpoint(
         &self,
@@ -985,7 +990,7 @@ impl PartialRetryTable {
         }
     }
 
-    /// Bind-on-Data lite (legacy): certify + lightweight EffectBoundary under one lock.
+    /// OrderedAdmit-on-Data lite (legacy): certify + lightweight EffectBoundary under one lock.
     pub(crate) fn note_certified_with_effect_boundary(
         &self,
         tx_idx: TxIdx,
@@ -1050,7 +1055,7 @@ impl PartialRetryTable {
         }
     }
 
-    /// ℓ already seen on a prior incarnation of this tx (residual Bind, not UnfencedCold).
+    /// ℓ already seen on a prior incarnation of this tx (residual OrderedAdmit, not OptimisticReadCold).
     #[inline]
     pub(crate) fn inc_carry_seen(&self, tx_idx: TxIdx, location: MemoryLocationHash) -> bool {
         if tx_idx >= self.states.len() {
@@ -1154,9 +1159,9 @@ impl PartialRetryTable {
     ///
     /// **Safe subset:** if a checkpoint with `0 < cp.k < armed_at_k` exists in the
     /// parked incarnation journal, arm existing RewindTo + journal FF (no new
-    /// live-Interpreter park). Otherwise return [`ParkResumeKind::FullRetry`]
+    /// live-Interpreter park). Otherwise return [`ParkResumeKind::FullAbortReexecute`]
     /// (tx-grain head reexec — M2 behaviour). Absolute PC jump remains gated by
-    /// M1e/M1l safety on the resume path — this only arms journal FF + force-bind.
+    /// M1e/M1l safety on the resume path — this only arms journal FF + force-ordered_admit.
     pub(crate) fn try_arm_park_resume_at_k(
         &self,
         tx_idx: TxIdx,
@@ -1169,21 +1174,21 @@ impl PartialRetryTable {
         &self,
         tx_idx: TxIdx,
         armed_at_k: u64,
-        force_bind: bool,
+        force_ordered_admit: bool,
     ) -> ParkResumeKind {
         let k_fail = armed_at_k as usize;
         if k_fail == 0 {
-            self.repair.insert(tx_idx, RepairPlan::FullRestart);
-            return ParkResumeKind::FullRetry;
+            self.repair.insert(tx_idx, RepairPlan::FullAbortReexecute);
+            return ParkResumeKind::FullAbortReexecute;
         }
         let Some(cp) = self.last_checkpoint_before(tx_idx, k_fail) else {
-            self.repair.insert(tx_idx, RepairPlan::FullRestart);
-            return ParkResumeKind::FullRetry;
+            self.repair.insert(tx_idx, RepairPlan::FullAbortReexecute);
+            return ParkResumeKind::FullAbortReexecute;
         };
-        // Require real mid-tx progress — synthetic CallEntry at k=0 alone is FullRetry.
+        // Require real mid-tx progress — synthetic CallEntry at k=0 alone is FullAbortReexecute.
         if cp.k == 0 || cp.k >= k_fail {
-            self.repair.insert(tx_idx, RepairPlan::FullRestart);
-            return ParkResumeKind::FullRetry;
+            self.repair.insert(tx_idx, RepairPlan::FullAbortReexecute);
+            return ParkResumeKind::FullAbortReexecute;
         }
 
         let st = unsafe { self.state_mut(tx_idx) };
@@ -1203,8 +1208,8 @@ impl PartialRetryTable {
         }
         if certified.is_empty() {
             drop(st);
-            self.repair.insert(tx_idx, RepairPlan::FullRestart);
-            return ParkResumeKind::FullRetry;
+            self.repair.insert(tx_idx, RepairPlan::FullAbortReexecute);
+            return ParkResumeKind::FullAbortReexecute;
         }
         let mut suffix_writes = Vec::new();
         let mut prefix_writes = Vec::new();
@@ -1230,16 +1235,16 @@ impl PartialRetryTable {
             suffix_writes,
             prefix_writes,
         );
-        if force_bind {
-            self.set_force_bind(tx_idx, certified);
+        if force_ordered_admit {
+            self.set_force_ordered_admit(tx_idx, certified);
         }
         ParkResumeKind::ResumeAtK { checkpoint_k: cp.k }
     }
 
-    /// PinHold wake: RewindTo + FF **without** force-bind (Bind-theater on a
+    /// WaitForDependency wake: RewindTo + FF **without** force-ordered_admit (OrderedAdmit-theater on a
     /// Done producer is the 14689597 abort class). SoftWait still uses
     /// [`Self::try_arm_park_resume_at_k`].
-    pub(crate) fn try_arm_pinhold_resume_at_k(
+    pub(crate) fn try_arm_wait_for_dependency_resume_at_k(
         &self,
         tx_idx: TxIdx,
         armed_at_k: u64,
@@ -1247,15 +1252,15 @@ impl PartialRetryTable {
         self.try_arm_park_resume_at_k_inner(tx_idx, armed_at_k, false)
     }
 
-    /// PinWithoutThrow: plant rem checkpoint from **snapped** prefix reads
-    /// so wake [`Self::try_arm_pinhold_resume_at_k`] can ResumeAtK.
+    /// wait_for_dependency: plant rem checkpoint from **snapped** prefix reads
+    /// so wake [`Self::try_arm_wait_for_dependency_resume_at_k`] can ResumeAtK.
     ///
-    /// Empty first-access (no `value_snap`) stays FullRetry — planting a
-    /// synthetic k=1 grain livelocks 19807137 (Pin→RewindTo→Pin) and pays
-    /// rem tax ≫ OCC B0. Wait loc is **not** prefix-certified. Soft=0.
+    /// Empty first-access (no `value_snap`) stays FullAbortReexecute — planting a
+    /// synthetic k=1 grain livelocks 19807137 (WaitForDependency→RewindTo→WaitForDependency) and pays
+    /// rem tax ≫ OCC full_abort_reexecute. Wait loc is **not** prefix-certified. Soft=0.
     ///
     /// Returns `armed_at_k` (`> checkpoint k`), or 0 if no honest prefix.
-    pub(crate) fn arm_pinhold_checkpoint(
+    pub(crate) fn arm_wait_for_dependency_checkpoint(
         &self,
         tx_idx: TxIdx,
         wait_loc: MemoryLocationHash,
@@ -1292,9 +1297,9 @@ impl PartialRetryTable {
         if st.k == 0 {
             return 0;
         }
-        // Tiny prefix ResumeAtK pays rem tax ≫ OCC FullRetry (14689597
+        // Tiny prefix ResumeAtK pays rem tax ≫ OCC FullAbortReexecute (14689597
         // 0.17 / 19807137 0.09 with 300–1200 resume_k). Cash only when
-        // prefix skip is real (same bar as `prefix_skip_beats_b0`).
+        // prefix skip is real (same bar as `prefix_skip_beats_full_abort`).
         if st.k < 8 {
             return 0;
         }
@@ -1307,12 +1312,12 @@ impl PartialRetryTable {
         st.k.saturating_add(1).max(access_k as usize) as u64
     }
 
-    /// R1b timely Resolve: arm RewindTo when a mid-tx checkpoint exists.
+    /// PartialAbortRewind timely Resolve: arm RewindTo when a mid-tx checkpoint exists.
     ///
     /// Unlike [`Self::apply_suffix_repair`], this does **not** require
-    /// `prefix_skip_beats_b0` (cp_k≥8) — that gate made cert-covered R1 theater
-    /// (attempt then OCC B0). SoftWait Soft stays 0.
-    pub(crate) fn try_arm_r1b_covered(
+    /// `prefix_skip_beats_full_abort` (cp_k≥8) — that gate made cert-covered partial_abort theater
+    /// (attempt then OCC full_abort_reexecute). SoftWait Soft stays 0.
+    pub(crate) fn try_arm_partial_abort_rewind(
         &self,
         tx_idx: TxIdx,
         read_locations: &[MemoryLocationHash],
@@ -1320,7 +1325,7 @@ impl PartialRetryTable {
         write_locations: &[MemoryLocationHash],
     ) -> Option<LeanAbortRepair> {
         // One RewindTo per tx. A second strip-cover without progress is the
-        // 19807137 livelock (never-B0 ForceBind/R1b train).
+        // 19807137 livelock (never-full_abort_reexecute ForceOrderedAdmit/PartialAbortRewind train).
         if self.suffix_repair_depth(tx_idx) != 0 {
             return None;
         }
@@ -1344,7 +1349,7 @@ impl PartialRetryTable {
             plan.suffix_writes.clone(),
             plan.prefix_writes.clone(),
         );
-        self.set_force_bind(tx_idx, plan.certified.clone());
+        self.set_force_ordered_admit(tx_idx, plan.certified.clone());
         self.note_suffix_repair(tx_idx);
         Some(LeanAbortRepair::SuffixRepair {
             certified: plan.certified,
@@ -1370,7 +1375,7 @@ impl PartialRetryTable {
         {
             return Some(v);
         }
-        // Iter5: head-FF after escalate FullRestart (origin-checked in try_ff_*).
+        // Iter5: head-FF after escalate FullAbortReexecute (origin-checked in try_ff_*).
         self.ff_head
             .get(&tx_idx)
             .and_then(|m| m.get(&location).cloned())
@@ -1454,7 +1459,7 @@ impl PartialRetryTable {
         }
     }
 
-    /// Iter26: attach Bind-snap at capture-time effect ordinal.
+    /// Iter26: attach OrderedAdmit-snap at capture-time effect ordinal.
     pub(crate) fn attach_live_boundary_at(
         &self,
         tx_idx: TxIdx,
@@ -1553,30 +1558,38 @@ impl PartialRetryTable {
         unsafe { self.state_mut(tx_idx) }.first_k(location)
     }
 
-    /// Locations π should force Bind/WaitHard for this incarnation (from prior repair).
-    pub(crate) fn force_bind_locations(&self, tx_idx: TxIdx) -> Vec<MemoryLocationHash> {
-        self.force_bind
+    /// Locations π should force OrderedAdmit/WaitHard for this incarnation (from prior repair).
+    pub(crate) fn force_ordered_admit_locations(&self, tx_idx: TxIdx) -> Vec<MemoryLocationHash> {
+        self.force_ordered_admit
             .get(&tx_idx)
             .map(|v| v.clone())
             .unwrap_or_default()
     }
 
-    pub(crate) fn must_force_bind(&self, tx_idx: TxIdx, location: MemoryLocationHash) -> bool {
-        self.force_bind
+    pub(crate) fn must_force_ordered_admit(
+        &self,
+        tx_idx: TxIdx,
+        location: MemoryLocationHash,
+    ) -> bool {
+        self.force_ordered_admit
             .get(&tx_idx)
             .is_some_and(|v| v.iter().any(|l| *l == location))
     }
 
-    pub(crate) fn set_force_bind(&self, tx_idx: TxIdx, locations: Vec<MemoryLocationHash>) {
+    pub(crate) fn set_force_ordered_admit(
+        &self,
+        tx_idx: TxIdx,
+        locations: Vec<MemoryLocationHash>,
+    ) {
         if locations.is_empty() {
-            self.force_bind.remove(&tx_idx);
+            self.force_ordered_admit.remove(&tx_idx);
         } else {
-            self.force_bind.insert(tx_idx, locations);
+            self.force_ordered_admit.insert(tx_idx, locations);
         }
     }
 
-    pub(crate) fn clear_force_bind(&self, tx_idx: TxIdx) {
-        self.force_bind.remove(&tx_idx);
+    pub(crate) fn clear_force_ordered_admit(&self, tx_idx: TxIdx) {
+        self.force_ordered_admit.remove(&tx_idx);
     }
 
     /// U4: record the observed writer of ℓ for the next incarnation.
@@ -1641,18 +1654,24 @@ impl PartialRetryTable {
         }
     }
 
-    /// True when a certified-prefix force_bind set is armed for this tx.
-    pub(crate) fn has_force_bind(&self, tx_idx: TxIdx) -> bool {
-        self.force_bind.get(&tx_idx).is_some_and(|v| !v.is_empty())
+    /// True when a certified-prefix force_ordered_admit set is armed for this tx.
+    pub(crate) fn has_force_ordered_admit(&self, tx_idx: TxIdx) -> bool {
+        self.force_ordered_admit
+            .get(&tx_idx)
+            .is_some_and(|v| !v.is_empty())
     }
 
-    /// Sticky resolve: union conflict locations into the armed force_bind set.
-    pub(crate) fn extend_force_bind(&self, tx_idx: TxIdx, locations: &[MemoryLocationHash]) {
+    /// Sticky resolve: union conflict locations into the armed force_ordered_admit set.
+    pub(crate) fn extend_force_ordered_admit(
+        &self,
+        tx_idx: TxIdx,
+        locations: &[MemoryLocationHash],
+    ) {
         if locations.is_empty() {
             return;
         }
         let mut merged = self
-            .force_bind
+            .force_ordered_admit
             .get(&tx_idx)
             .map(|v| v.clone())
             .unwrap_or_default();
@@ -1661,7 +1680,7 @@ impl PartialRetryTable {
                 merged.push(loc);
             }
         }
-        self.set_force_bind(tx_idx, merged);
+        self.set_force_ordered_admit(tx_idx, merged);
     }
 
     /// Mark SoftWait wake → next incarnation (for dig wake→validate counters).
@@ -1702,7 +1721,7 @@ impl PartialRetryTable {
         self.post_await_at_a_wake.remove(&tx_idx).is_some()
     }
 
-    /// Count of SuffixRepair/ForceBind resolves armed for `tx` this block.
+    /// Count of SuffixRepair/ForceOrderedAdmit resolves armed for `tx` this block.
     #[inline]
     pub(crate) fn suffix_repair_depth(&self, tx_idx: TxIdx) -> usize {
         self.suffix_repair_depth
@@ -1711,7 +1730,7 @@ impl PartialRetryTable {
             .unwrap_or(0)
     }
 
-    /// Note one SuffixRepair / ForceBind arm (depth for escalate-after-N).
+    /// Note one SuffixRepair / ForceOrderedAdmit arm (depth for escalate-after-N).
     #[inline]
     pub(crate) fn note_suffix_repair(&self, tx_idx: TxIdx) {
         if let Some(a) = self.suffix_repair_depth.get(tx_idx) {
@@ -1719,7 +1738,7 @@ impl PartialRetryTable {
         }
     }
 
-    /// Clear repair depth (success validate or escalate FullRestart).
+    /// Clear repair depth (success validate or escalate FullAbortReexecute).
     #[inline]
     pub(crate) fn clear_suffix_repair_depth(&self, tx_idx: TxIdx) {
         if let Some(a) = self.suffix_repair_depth.get(tx_idx) {
@@ -1778,7 +1797,7 @@ impl PartialRetryTable {
         true
     }
 
-    pub(crate) fn escalate_full_restart(&self, tx_idx: TxIdx) -> LeanAbortRepair {
+    pub(crate) fn escalate_full_abort_reexecute(&self, tx_idx: TxIdx) -> LeanAbortRepair {
         // Iter5 write-prefix skip: retain **armed continuation** FF values only for
         // head reexec DB skip (origin-checked in try_ff_*). Do **not** merge live
         // value_snap — that included post-fail reads and caused seq≠par / outliers.
@@ -1787,25 +1806,25 @@ impl PartialRetryTable {
                 self.ff_head.insert(tx_idx, cont.values.clone());
             }
         }
-        self.clear_force_bind(tx_idx);
-        // U4: keep ℓ→writer identity through R4 FullRestart. force_prefix may
+        self.clear_force_ordered_admit(tx_idx);
+        // U4: keep ℓ→writer identity through R4 FullAbortReexecute. force_prefix may
         // be cleared; the next incarnation still resolves the same writer.
         self.clear_repair(tx_idx);
         self.clear_suffix_repair_depth(tx_idx);
         self.needs_live_capture.remove(&tx_idx);
-        LeanAbortRepair::FullRestart { reexec_cost: 2.2 }
+        LeanAbortRepair::FullAbortReexecute { reexec_cost: 2.2 }
     }
 
-    /// Frozen-grain Resolve: **R1a RebindThis** at validate (`try_validate`);
-    /// this arms **R1b CertifiedPrefixSkip** only when a mid-tx checkpoint
-    /// exists. No checkpoint / grain identity lost → **B0 FullRestart**
+    /// Frozen-grain Resolve: **PartialAbortRebind RebindThis** at validate (`try_validate`);
+    /// this arms **PartialAbortRewind CertifiedPrefixSkip** only when a mid-tx checkpoint
+    /// exists. No checkpoint / grain identity lost → **full_abort_reexecute FullAbortReexecute**
     /// (OCC residual). SuffixRepair / ForcePrefix is **not** the default.
     ///
     /// ```text
     /// if plan_partial_retry + checkpoint with 0 < cp.k < k_fail:
     ///   arm_rewind_to + journal FF  → CertifiedPrefixSkip (SuffixRepair rust name)
     /// else:
-    ///   clear_force_bind; clear_repair → B0 FullRestart
+    ///   clear_force_ordered_admit; clear_repair → full_abort_reexecute FullAbortReexecute
     /// ```
     ///
     /// Absolute PC jump is **not** armed here — the execute path may hang-free
@@ -1824,11 +1843,15 @@ impl PartialRetryTable {
         self.apply_suffix_repair_planned(tx_idx, plan)
     }
 
-    /// Certified PrefixSkip cheaper than OCC B0 reincarnation?
+    /// Certified PrefixSkip cheaper than OCC full_abort_reexecute reincarnation?
     /// Tiny rewind (1–2 accesses) pays FF/repair tax ≫ saved work (19807137).
     /// First repair only; substantial prefix (≥8) covering ≥ half the grain.
     #[inline]
-    pub(crate) fn prefix_skip_beats_b0(cp_k: usize, k_fail: usize, repair_depth: usize) -> bool {
+    pub(crate) fn prefix_skip_beats_full_abort(
+        cp_k: usize,
+        k_fail: usize,
+        repair_depth: usize,
+    ) -> bool {
         repair_depth == 0 && cp_k >= 8 && k_fail > cp_k + 2 && cp_k.saturating_mul(2) >= k_fail
     }
 
@@ -1841,12 +1864,12 @@ impl PartialRetryTable {
         match plan {
             Some(plan) if !plan.certified.is_empty() => {
                 let k_fail = plan.k_fail;
-                // Certified prefix skip **only** when cheaper than OCC B0.
+                // Certified prefix skip **only** when cheaper than OCC full_abort_reexecute.
                 // Tiny PrefixSkip / rewind-on-every-fail loses to reincarnation
-                // (19807137 SuffixRepair makespan). Default is B0.
+                // (19807137 SuffixRepair makespan). Default is full_abort_reexecute.
                 if k_fail > 0 {
                     if let Some(cp) = self.last_checkpoint_before(tx_idx, k_fail) {
-                        if Self::prefix_skip_beats_b0(
+                        if Self::prefix_skip_beats_full_abort(
                             cp.k,
                             k_fail,
                             self.suffix_repair_depth(tx_idx),
@@ -1860,7 +1883,7 @@ impl PartialRetryTable {
                                 plan.suffix_writes.clone(),
                                 plan.prefix_writes.clone(),
                             );
-                            self.set_force_bind(tx_idx, plan.certified.clone());
+                            self.set_force_ordered_admit(tx_idx, plan.certified.clone());
                             return LeanAbortRepair::SuffixRepair {
                                 certified: plan.certified,
                                 suffix_writes: plan.suffix_writes,
@@ -1869,16 +1892,16 @@ impl PartialRetryTable {
                         }
                     }
                 }
-                // No cheap certified skip → B0 residual reincarnation
-                // (OCC-identical). ForceBind / SuffixRepair is not the default.
-                self.clear_force_bind(tx_idx);
+                // No cheap certified skip → full_abort_reexecute residual reincarnation
+                // (OCC-identical). ForceOrderedAdmit / SuffixRepair is not the default.
+                self.clear_force_ordered_admit(tx_idx);
                 self.clear_repair(tx_idx);
-                LeanAbortRepair::FullRestart { reexec_cost: 2.2 }
+                LeanAbortRepair::FullAbortReexecute { reexec_cost: 2.2 }
             }
             _ => {
-                self.clear_force_bind(tx_idx);
+                self.clear_force_ordered_admit(tx_idx);
                 self.clear_repair(tx_idx);
-                LeanAbortRepair::FullRestart { reexec_cost: 2.2 }
+                LeanAbortRepair::FullAbortReexecute { reexec_cost: 2.2 }
             }
         }
     }
@@ -1898,8 +1921,8 @@ impl PartialRetryTable {
     /// V5-P3 — **research plant** abort arming (thin wrapper over plan_repair + arm_rewind_to).
     ///
     /// Call only when `research_inspect_enabled()` / non-lean execute. Arms
-    /// RewindTo + journal FF + force-bind when a checkpoint exists; otherwise
-    /// clears to FullRestart. Does **not** enable absolute PC jump or valued
+    /// RewindTo + journal FF + force-ordered_admit when a checkpoint exists; otherwise
+    /// clears to FullAbortReexecute. Does **not** enable absolute PC jump or valued
     /// CallOutcome SC (resume path). V5-P3 A/B: inspect hangs on 597 path →
     /// **not** graduated to Lean default.
     pub(crate) fn research_apply_abort_repair(
@@ -1925,26 +1948,26 @@ impl PartialRetryTable {
                         suffix_writes.clone(),
                         plan.prefix_writes.clone(),
                     );
-                    self.set_force_bind(tx_idx, certified.clone());
+                    self.set_force_ordered_admit(tx_idx, certified.clone());
                     ResearchAbortRepair::RewindTo {
                         certified,
                         suffix_writes,
                         reexec_cost: 0.6,
                     }
                 }
-                RepairPlan::RebindOnly { .. } | RepairPlan::FullRestart => {
-                    ResearchAbortRepair::FullRestart { reexec_cost: 2.2 }
+                RepairPlan::RebindOnly { .. } | RepairPlan::FullAbortReexecute => {
+                    ResearchAbortRepair::FullAbortReexecute { reexec_cost: 2.2 }
                 }
             },
-            None => ResearchAbortRepair::FullRestart { reexec_cost: 2.2 },
+            None => ResearchAbortRepair::FullAbortReexecute { reexec_cost: 2.2 },
         }
     }
 
     /// P3 EarlyAbort: arm rem repair for the next incarnation after cutting at `fail_location`.
     ///
     /// Mirrors EarlyVal-fail path: RewindTo + journal FF when a checkpoint exists,
-    /// else FullRestart; always `set_force_bind` on the certified prefix so the
-    /// reincarnation Bind/WaitHards instead of SpecReading the same early cross.
+    /// else FullAbortReexecute; always `set_force_ordered_admit` on the certified prefix so the
+    /// reincarnation OrderedAdmit/WaitHards instead of OptimisticReading the same early cross.
     /// Hang-freedom is the caller's Blocking(writer) — this only arms rem state.
     pub(crate) fn arm_early_abort(
         &self,
@@ -1972,10 +1995,10 @@ impl PartialRetryTable {
                 Vec::new(),
             );
         } else {
-            // No certified checkpoint → FullRestart from tx head on next incarnation.
-            self.set_repair(tx_idx, RepairPlan::FullRestart);
+            // No certified checkpoint → FullAbortReexecute from tx head on next incarnation.
+            self.set_repair(tx_idx, RepairPlan::FullAbortReexecute);
         }
-        self.set_force_bind(tx_idx, certified);
+        self.set_force_ordered_admit(tx_idx, certified);
     }
 
     pub(crate) fn set_repair(&self, tx_idx: TxIdx, plan: RepairPlan) {
@@ -2017,7 +2040,7 @@ impl PartialRetryTable {
     }
 
     /// Mark tx for one Lean inspect capture (live jump_snap) after SuffixRepair
-    /// with Storage write_replays (Iter2 hang-free prime — not bare force_bind).
+    /// with Storage write_replays (Iter2 hang-free prime — not bare force_ordered_admit).
     pub(crate) fn mark_needs_live_capture(&self, tx_idx: TxIdx) {
         self.needs_live_capture.insert(tx_idx, ());
     }
@@ -2138,7 +2161,7 @@ impl PartialRetryTable {
             .is_some_and(|p| matches!(*p, RepairPlan::RewindTo { .. }))
     }
 
-    /// Classify validation failure into PartialRetry plan, or `None` if unsafe → FullRetry.
+    /// Classify validation failure into PartialRetry plan, or `None` if unsafe → FullAbortReexecute.
     ///
     /// Safe when there is a non-empty certified-prefix of still-valid reads and we can
     /// split writes: prefix writes ⊆ certified (same location was a certified read before
@@ -2209,11 +2232,11 @@ impl PartialRetryTable {
     ///
     /// Caller may attempt `RebindOnly` first when `suffix_writes` is empty
     /// (patch origins in place without abort). Otherwise prefer `RewindTo`
-    /// when a checkpoint exists; `FullRestart` only if prefix/control-flow
+    /// when a checkpoint exists; `FullAbortReexecute` only if prefix/control-flow
     /// cannot be recovered.
     pub(crate) fn plan_repair(&self, tx_idx: TxIdx, plan: &PartialRetryPlan) -> RepairPlan {
         if plan.certified.is_empty() {
-            return RepairPlan::FullRestart;
+            return RepairPlan::FullAbortReexecute;
         }
         match self.last_checkpoint_before(tx_idx, plan.k_fail) {
             Some(cp) => RepairPlan::RewindTo {
@@ -2222,7 +2245,7 @@ impl PartialRetryTable {
                 k_fail: plan.k_fail,
                 suffix_writes: plan.suffix_writes.clone(),
             },
-            None => RepairPlan::FullRestart,
+            None => RepairPlan::FullAbortReexecute,
         }
     }
 }
@@ -2329,19 +2352,19 @@ mod p4_tk_park_tests {
     fn try_arm_park_resume_falls_back_when_k_zero_or_no_cp() {
         let table = PartialRetryTable::new(4);
         table.reset_incarnation(1, 0);
-        // k=0 → FullRetry
+        // k=0 → FullAbortReexecute
         assert_eq!(
             table.try_arm_park_resume_at_k(1, 0),
-            ParkResumeKind::FullRetry
+            ParkResumeKind::FullAbortReexecute
         );
         // Journaled observe but only synthetic path with no mid-tx cp > 0
         table.note_access(1, 10, AccessMode::Read);
         // CallEntry-style cp at k after note would be at current k; push at k=1
         let _ = table.push_checkpoint(1, CheckpointKind::CallEntry);
-        // armed_at_k == cp.k → need cp.k < armed_at_k; arm at same k → FullRetry
+        // armed_at_k == cp.k → need cp.k < armed_at_k; arm at same k → FullAbortReexecute
         assert_eq!(
             table.try_arm_park_resume_at_k(1, 1),
-            ParkResumeKind::FullRetry
+            ParkResumeKind::FullAbortReexecute
         );
     }
 
@@ -2376,16 +2399,16 @@ mod p4_tk_park_tests {
             other => panic!("expected ResumeAtK, got {other:?}"),
         }
         assert!(table.is_rewind_resume(2));
-        assert!(table.must_force_bind(2, 1));
-        assert!(table.must_force_bind(2, 2));
+        assert!(table.must_force_ordered_admit(2, 1));
+        assert!(table.must_force_ordered_admit(2, 2));
     }
 
     #[test]
-    fn arm_pinhold_checkpoint_makes_product_park_resume() {
+    fn arm_wait_for_dependency_checkpoint_makes_product_park_resume() {
         let table = PartialRetryTable::new(2);
         table.reset_incarnation(0, 0);
         // Snapped prefix (maybe_note_value) — honest rem grain. k≥8 so
-        // ResumeAtK is cheaper than FullRetry.
+        // ResumeAtK is cheaper than FullAbortReexecute.
         let prefix: Vec<(u64, u32)> = (1..=8).map(|i| (10 + i as u64, i)).collect();
         for &(loc, i) in &prefix {
             unsafe { &mut *table.states[0].get() }.note_value(
@@ -2398,23 +2421,23 @@ mod p4_tk_park_tests {
                 },
             );
         }
-        let armed = table.arm_pinhold_checkpoint(0, 99, 9, &prefix);
+        let armed = table.arm_wait_for_dependency_checkpoint(0, 99, 9, &prefix);
         assert!(armed > 8, "armed_at_k must exceed prefix checkpoint");
-        match table.try_arm_pinhold_resume_at_k(0, armed) {
+        match table.try_arm_wait_for_dependency_resume_at_k(0, armed) {
             ParkResumeKind::ResumeAtK { checkpoint_k } => {
                 assert!(checkpoint_k > 0 && checkpoint_k < armed as usize);
             }
-            other => panic!("PinHold must ResumeAtK, got {other:?}"),
+            other => panic!("WaitForDependency must ResumeAtK, got {other:?}"),
         }
         assert!(table.is_rewind_resume(0));
         assert!(
-            !table.must_force_bind(0, 10),
-            "PinHold resume must not force-bind"
+            !table.must_force_ordered_admit(0, 10),
+            "WaitForDependency resume must not force-ordered_admit"
         );
     }
 
     #[test]
-    fn arm_pinhold_tiny_snapped_prefix_is_full_retry() {
+    fn arm_wait_for_dependency_tiny_snapped_prefix_is_full_abort_reexecute() {
         let table = PartialRetryTable::new(2);
         table.reset_incarnation(0, 0);
         unsafe { &mut *table.states[0].get() }.note_value(
@@ -2426,24 +2449,24 @@ mod p4_tk_park_tests {
                 origin: None,
             },
         );
-        let armed = table.arm_pinhold_checkpoint(0, 99, 2, &[(10, 1)]);
+        let armed = table.arm_wait_for_dependency_checkpoint(0, 99, 2, &[(10, 1)]);
         assert_eq!(armed, 0, "tiny prefix must not ResumeAtK");
     }
 
     #[test]
-    fn arm_pinhold_first_access_is_full_retry() {
+    fn arm_wait_for_dependency_first_access_is_full_abort_reexecute() {
         let table = PartialRetryTable::new(2);
         table.reset_incarnation(0, 0);
-        let armed = table.arm_pinhold_checkpoint(0, 7, 1, &[]);
+        let armed = table.arm_wait_for_dependency_checkpoint(0, 7, 1, &[]);
         assert_eq!(armed, 0, "no snapped prefix → no synthetic checkpoint");
         assert_eq!(
-            table.try_arm_pinhold_resume_at_k(0, armed),
-            ParkResumeKind::FullRetry
+            table.try_arm_wait_for_dependency_resume_at_k(0, armed),
+            ParkResumeKind::FullAbortReexecute
         );
     }
 
     #[test]
-    fn try_arm_r1b_covered_without_cp_k8_gate() {
+    fn try_arm_partial_abort_rewind_without_cp_k8_gate() {
         let table = PartialRetryTable::new(1);
         table.reset_incarnation(0, 0);
         table.note_access(0, 10, AccessMode::Read);
@@ -2453,19 +2476,23 @@ mod p4_tk_park_tests {
         let _ = table.push_checkpoint(0, CheckpointKind::EffectBoundary);
         table.note_access(0, 20, AccessMode::Read);
         match table.apply_suffix_repair(0, &[10, 11, 20], &[20], &[]) {
-            LeanAbortRepair::FullRestart { .. } => {}
-            other => panic!("cp_k<8 must stay B0 on apply_suffix_repair, got {other:?}"),
+            LeanAbortRepair::FullAbortReexecute { .. } => {}
+            other => panic!(
+                "cp_k<8 must stay full_abort_reexecute on apply_suffix_repair, got {other:?}"
+            ),
         }
-        match table.try_arm_r1b_covered(0, &[10, 11, 20], &[20], &[]) {
+        match table.try_arm_partial_abort_rewind(0, &[10, 11, 20], &[20], &[]) {
             Some(LeanAbortRepair::SuffixRepair { .. }) => {}
-            other => panic!("R1b covered must RewindTo without cp_k≥8, got {other:?}"),
+            other => {
+                panic!("PartialAbortRewind covered must RewindTo without cp_k≥8, got {other:?}")
+            }
         }
         assert!(table.is_rewind_resume(0));
         assert!(
             table
-                .try_arm_r1b_covered(0, &[10, 11, 20], &[20], &[])
+                .try_arm_partial_abort_rewind(0, &[10, 11, 20], &[20], &[])
                 .is_none(),
-            "second R1b must escalate (no RewindTo train)"
+            "second PartialAbortRewind must escalate (no RewindTo train)"
         );
     }
 }
@@ -2475,14 +2502,14 @@ mod p3_early_abort_tests {
     use super::*;
 
     #[test]
-    fn arm_early_abort_full_restart_without_cp() {
+    fn arm_early_abort_full_abort_reexecute_without_cp() {
         let table = PartialRetryTable::new(2);
         table.reset_incarnation(0, 0);
         table.note_access(0, 7, AccessMode::Read);
         table.arm_early_abort(0, 7, vec![1, 2]);
-        assert!(table.must_force_bind(0, 1));
-        assert!(table.must_force_bind(0, 2));
-        // No mid-tx checkpoint → FullRestart repair, not RewindTo.
+        assert!(table.must_force_ordered_admit(0, 1));
+        assert!(table.must_force_ordered_admit(0, 2));
+        // No mid-tx checkpoint → FullAbortReexecute repair, not RewindTo.
         assert!(!table.is_rewind_resume(0));
     }
 
@@ -2495,7 +2522,7 @@ mod p3_early_abort_tests {
         let _ = table.push_checkpoint(0, CheckpointKind::EffectBoundary);
         table.note_access(0, 9, AccessMode::Read);
         table.arm_early_abort(0, 9, vec![1]);
-        assert!(table.must_force_bind(0, 1));
+        assert!(table.must_force_ordered_admit(0, 1));
         assert!(table.is_rewind_resume(0));
     }
 
@@ -2561,7 +2588,7 @@ mod p3_early_abort_tests {
 mod abort_cheapening_tests {
     use super::*;
 
-    /// Lean-style abort: CallEntry floor + certified prefix → RewindTo (not bare FullRestart).
+    /// Lean-style abort: CallEntry floor + certified prefix → RewindTo (not bare FullAbortReexecute).
     #[test]
     fn plan_repair_prefers_rewind_with_call_entry_floor() {
         let table = PartialRetryTable::new(2);
@@ -2595,7 +2622,7 @@ mod abort_cheapening_tests {
     #[test]
     fn plan_repair_synthesizes_k0_rewind_when_no_explicit_cp() {
         // last_checkpoint_before synthesizes k=0 when k_fail>0 so abort can still
-        // arm hang-free RewindTo+force-bind (cheaper than bare FullRestart).
+        // arm hang-free RewindTo+force-ordered_admit (cheaper than bare FullAbortReexecute).
         let table = PartialRetryTable::new(1);
         table.reset_incarnation(0, 0);
         table.note_access(0, 1, AccessMode::Read);
@@ -2619,12 +2646,12 @@ mod abort_cheapening_tests {
         table.note_access(0, 1, AccessMode::Read);
         assert!(
             table.plan_partial_retry(0, &[1], &[1], &[]).is_none(),
-            "all-invalid → no PartialRetry plan → FullRestart caller path"
+            "all-invalid → no PartialRetry plan → FullAbortReexecute caller path"
         );
     }
 
     #[test]
-    fn arm_rewind_sets_force_bind_for_next_incarnation() {
+    fn arm_rewind_sets_force_ordered_admit_for_next_incarnation() {
         let table = PartialRetryTable::new(1);
         table.reset_incarnation(0, 0);
         let _ = table.push_checkpoint(0, CheckpointKind::CallEntry);
@@ -2649,13 +2676,13 @@ mod abort_cheapening_tests {
             suffix_writes,
             plan.prefix_writes.clone(),
         );
-        table.set_force_bind(0, certified);
+        table.set_force_ordered_admit(0, certified);
         assert!(table.is_rewind_resume(0));
-        assert!(table.must_force_bind(0, 5));
-        assert!(!table.must_force_bind(0, 6));
+        assert!(table.must_force_ordered_admit(0, 5));
+        assert!(!table.must_force_ordered_admit(0, 6));
     }
 
-    /// Tiny certified prefix (1 access) is **not** cheaper than OCC B0.
+    /// Tiny certified prefix (1 access) is **not** cheaper than OCC full_abort_reexecute.
     #[test]
     fn apply_suffix_repair_tiny_prefix_is_b0_not_rewind() {
         let table = PartialRetryTable::new(1);
@@ -2667,14 +2694,16 @@ mod abort_cheapening_tests {
         table.note_access(0, 11, AccessMode::Read);
 
         match table.apply_suffix_repair(0, &[10, 11], &[11], &[]) {
-            LeanAbortRepair::FullRestart { reexec_cost } => {
+            LeanAbortRepair::FullAbortReexecute { reexec_cost } => {
                 assert!((reexec_cost - 2.2).abs() < 1e-9);
             }
-            other => panic!("expected B0 FullRestart (tiny PrefixSkip tax), got {other:?}"),
+            other => panic!(
+                "expected full_abort_reexecute FullAbortReexecute (tiny PrefixSkip tax), got {other:?}"
+            ),
         }
         assert!(
-            !table.must_force_bind(0, 10),
-            "tiny prefix must not arm ForceBind / SuffixRepair"
+            !table.must_force_ordered_admit(0, 10),
+            "tiny prefix must not arm ForceOrderedAdmit / SuffixRepair"
         );
         assert!(!table.is_rewind_resume(0));
     }
@@ -2710,7 +2739,7 @@ mod abort_cheapening_tests {
             }
             other => panic!("expected PrefixSkip, got {other:?}"),
         }
-        assert!(table.must_force_bind(0, 100));
+        assert!(table.must_force_ordered_admit(0, 100));
         assert!(
             table.is_rewind_resume(0),
             "cheap PrefixSkip must arm RewindTo"
@@ -2718,14 +2747,14 @@ mod abort_cheapening_tests {
     }
 
     #[test]
-    fn prefix_skip_rejects_unfenced_journal_holes() {
+    fn prefix_skip_rejects_optimistic_read_journal_holes() {
         let table = PartialRetryTable::new(1);
         table.reset_incarnation(0, 0);
         let _ = table.push_checkpoint(0, CheckpointKind::CallEntry);
         let mut reads = Vec::new();
         for i in 0..8 {
             let loc = 100 + i;
-            table.note_access_k_only(0, loc); // Unfenced hole
+            table.note_access_k_only(0, loc); // OptimisticRead hole
             reads.push(loc);
         }
         let _ = table.push_checkpoint(0, CheckpointKind::EffectBoundary);
@@ -2735,23 +2764,23 @@ mod abort_cheapening_tests {
         reads.extend_from_slice(&[200, 201, 202]);
         assert!(!table.journal_covers_prefix(0, 8));
         match table.apply_suffix_repair(0, &reads, &[202], &[]) {
-            LeanAbortRepair::FullRestart { .. } => {}
-            other => panic!("Unfenced holes must B0, got {other:?}"),
+            LeanAbortRepair::FullAbortReexecute { .. } => {}
+            other => panic!("OptimisticRead holes must full_abort_reexecute, got {other:?}"),
         }
     }
 
     #[test]
-    fn prefix_skip_beats_b0_predicate() {
-        assert!(!PartialRetryTable::prefix_skip_beats_b0(1, 2, 0));
-        assert!(!PartialRetryTable::prefix_skip_beats_b0(8, 9, 0));
-        assert!(PartialRetryTable::prefix_skip_beats_b0(8, 11, 0));
-        assert!(!PartialRetryTable::prefix_skip_beats_b0(8, 11, 1));
-        assert!(!PartialRetryTable::prefix_skip_beats_b0(8, 20, 0));
+    fn prefix_skip_beats_full_abort_predicate() {
+        assert!(!PartialRetryTable::prefix_skip_beats_full_abort(1, 2, 0));
+        assert!(!PartialRetryTable::prefix_skip_beats_full_abort(8, 9, 0));
+        assert!(PartialRetryTable::prefix_skip_beats_full_abort(8, 11, 0));
+        assert!(!PartialRetryTable::prefix_skip_beats_full_abort(8, 11, 1));
+        assert!(!PartialRetryTable::prefix_skip_beats_full_abort(8, 20, 0));
     }
 
-    /// Certified prefix but only k=0 CallEntry → B0 FullRestart (no ForcePrefix π).
+    /// Certified prefix but only k=0 CallEntry → full_abort_reexecute FullAbortReexecute (no ForcePrefix π).
     #[test]
-    fn apply_suffix_repair_force_bind_without_mid_tx_checkpoint() {
+    fn apply_suffix_repair_force_ordered_admit_without_mid_tx_checkpoint() {
         let table = PartialRetryTable::new(1);
         table.reset_incarnation(0, 0);
         let _ = table.push_checkpoint(0, CheckpointKind::CallEntry);
@@ -2762,14 +2791,16 @@ mod abort_cheapening_tests {
         table.note_access(0, 20, AccessMode::Write);
 
         match table.apply_suffix_repair(0, &[10, 11], &[11], &[10, 20]) {
-            LeanAbortRepair::FullRestart { reexec_cost } => {
+            LeanAbortRepair::FullAbortReexecute { reexec_cost } => {
                 assert!((reexec_cost - 2.2).abs() < 1e-9);
             }
-            other => panic!("expected B0 FullRestart (no ForcePrefix default), got {other:?}"),
+            other => panic!(
+                "expected full_abort_reexecute FullAbortReexecute (no ForcePrefix default), got {other:?}"
+            ),
         }
         assert!(
-            !table.must_force_bind(0, 10),
-            "ForceBind / ForcePrefix must not arm without a certified prefix skip"
+            !table.must_force_ordered_admit(0, 10),
+            "ForceOrderedAdmit / ForcePrefix must not arm without a certified prefix skip"
         );
         assert!(
             !table.is_rewind_resume(0),
@@ -2777,28 +2808,28 @@ mod abort_cheapening_tests {
         );
     }
 
-    /// No certified prefix → FullRestart + cleared force-bind.
+    /// No certified prefix → FullAbortReexecute + cleared force-ordered_admit.
     #[test]
-    fn apply_suffix_repair_full_restart_without_prefix() {
+    fn apply_suffix_repair_full_abort_reexecute_without_prefix() {
         let table = PartialRetryTable::new(1);
         table.reset_incarnation(0, 0);
         table.note_access(0, 1, AccessMode::Read);
-        table.set_force_bind(0, vec![99]);
+        table.set_force_ordered_admit(0, vec![99]);
         match table.apply_suffix_repair(0, &[1], &[1], &[]) {
-            LeanAbortRepair::FullRestart { reexec_cost } => {
+            LeanAbortRepair::FullAbortReexecute { reexec_cost } => {
                 assert!((reexec_cost - 2.2).abs() < 1e-9);
             }
-            other => panic!("expected FullRestart, got {other:?}"),
+            other => panic!("expected FullAbortReexecute, got {other:?}"),
         }
-        assert!(!table.must_force_bind(0, 99));
+        assert!(!table.must_force_ordered_admit(0, 99));
         assert!(!table.is_rewind_resume(0));
     }
 
     /// Research + Lean SuffixRepair both arm RewindTo when mid-tx cp exists.
 
-    /// Escalate clears force_bind + repair depth and returns FullRestart.
+    /// Escalate clears force_ordered_admit + repair depth and returns FullAbortReexecute.
     #[test]
-    fn escalate_full_restart_clears_force_bind_and_depth() {
+    fn escalate_full_abort_reexecute_clears_force_ordered_admit_and_depth() {
         let table = PartialRetryTable::new(1);
         table.reset_incarnation(0, 0);
         let _ = table.push_checkpoint(0, CheckpointKind::CallEntry);
@@ -2816,21 +2847,21 @@ mod abort_cheapening_tests {
         reads.extend_from_slice(&[200, 201, 202]);
         let _ = table.apply_suffix_repair(0, &reads, &[202], &[]);
         table.note_suffix_repair(0);
-        assert!(table.has_force_bind(0));
+        assert!(table.has_force_ordered_admit(0));
         assert_eq!(table.suffix_repair_depth(0), 1);
-        match table.escalate_full_restart(0) {
-            LeanAbortRepair::FullRestart { reexec_cost } => {
+        match table.escalate_full_abort_reexecute(0) {
+            LeanAbortRepair::FullAbortReexecute { reexec_cost } => {
                 assert!((reexec_cost - 2.2).abs() < 1e-9);
             }
-            other => panic!("expected FullRestart, got {other:?}"),
+            other => panic!("expected FullAbortReexecute, got {other:?}"),
         }
-        assert!(!table.has_force_bind(0));
+        assert!(!table.has_force_ordered_admit(0));
         assert_eq!(table.suffix_repair_depth(0), 0);
         assert!(!table.is_rewind_resume(0));
     }
 
     #[test]
-    fn escalate_full_restart_retains_ff_head_for_db_skip() {
+    fn escalate_full_abort_reexecute_retains_ff_head_for_db_skip() {
         let table = PartialRetryTable::new(1);
         table.reset_incarnation(0, 0);
         let _ = table.push_checkpoint(0, CheckpointKind::CallEntry);
@@ -2849,13 +2880,16 @@ mod abort_cheapening_tests {
         // Arm SuffixRepair-like RewindTo so ff_resume has values.
         let cp = table.last_checkpoint_before(0, 2).expect("cp");
         table.arm_rewind_to(0, cp, 2, vec![loc], vec![], vec![loc]);
-        table.set_force_bind(0, vec![loc]);
+        table.set_force_ordered_admit(0, vec![loc]);
         assert!(table.ff_value(0, loc).is_some());
-        match table.escalate_full_restart(0) {
-            LeanAbortRepair::FullRestart { .. } => {}
-            other => panic!("expected FullRestart, got {other:?}"),
+        match table.escalate_full_abort_reexecute(0) {
+            LeanAbortRepair::FullAbortReexecute { .. } => {}
+            other => panic!("expected FullAbortReexecute, got {other:?}"),
         }
-        assert!(!table.has_force_bind(0), "force_bind cleared");
+        assert!(
+            !table.has_force_ordered_admit(0),
+            "force_ordered_admit cleared"
+        );
         assert!(!table.is_rewind_resume(0), "RewindTo cleared");
         assert!(table.has_ff_head(0), "head FF retained");
         assert!(table.ff_value(0, loc).is_some(), "ff_value via ff_head");
@@ -2868,9 +2902,12 @@ mod abort_cheapening_tests {
         let table = PartialRetryTable::new(4);
         table.note_force_writer(2, 99, 1);
         assert_eq!(table.force_writer(2, 99), Some(1));
-        table.set_force_bind(2, vec![99]);
-        let _ = table.escalate_full_restart(2);
-        assert!(!table.has_force_bind(2), "R4 drops force_bind");
+        table.set_force_ordered_admit(2, vec![99]);
+        let _ = table.escalate_full_abort_reexecute(2);
+        assert!(
+            !table.has_force_ordered_admit(2),
+            "R4 drops force_ordered_admit"
+        );
         assert_eq!(
             table.force_writer(2, 99),
             Some(1),
@@ -2881,7 +2918,7 @@ mod abort_cheapening_tests {
     }
 
     #[test]
-    fn r1_value_stable_when_identity_and_ff_match() {
+    fn partial_abort_value_stable_when_identity_and_ff_match() {
         let table = PartialRetryTable::new(4);
         table.note_force_writer(3, 11, 1);
         table.note_force_writer(3, 12, 2);
@@ -2923,7 +2960,7 @@ mod abort_cheapening_tests {
         table.arm_rewind_to(0, cp, 2, vec![loc], vec![], vec![loc]);
         assert!(table.is_rewind_resume(0));
         assert!(table.has_ff_resume_values(0), "Iter6 cheap-resume gate");
-        let _ = table.escalate_full_restart(0);
+        let _ = table.escalate_full_abort_reexecute(0);
         assert!(!table.has_ff_resume_values(0));
         assert!(table.has_ff_head(0));
     }
@@ -2958,20 +2995,20 @@ mod abort_cheapening_tests {
             other => panic!("expected research RewindTo, got {other:?}"),
         }
         assert!(table.is_rewind_resume(0));
-        assert!(table.must_force_bind(0, 100));
+        assert!(table.must_force_ordered_admit(0, 100));
 
-        // Lean PrefixSkip only when ROI says cheaper than B0 (same substantial prefix).
+        // Lean PrefixSkip only when ROI says cheaper than full_abort_reexecute (same substantial prefix).
         match table.apply_suffix_repair(0, &reads, &[202], &[]) {
             LeanAbortRepair::SuffixRepair { .. } => {}
             other => panic!("expected Lean PrefixSkip, got {other:?}"),
         }
         assert!(
             table.is_rewind_resume(0),
-            "Lean PrefixSkip must arm RewindTo when skip beats B0"
+            "Lean PrefixSkip must arm RewindTo when skip beats full_abort_reexecute"
         );
     }
     #[test]
-    fn extend_force_bind_merges_conflict_locs_after_suffix_repair() {
+    fn extend_force_ordered_admit_merges_conflict_locs_after_suffix_repair() {
         let table = PartialRetryTable::new(1);
         table.reset_incarnation(0, 0);
         let _ = table.push_checkpoint(0, CheckpointKind::CallEntry);
@@ -2990,12 +3027,12 @@ mod abort_cheapening_tests {
         let repair = table.apply_suffix_repair(0, &reads, &[202], &[]);
         assert!(
             matches!(repair, LeanAbortRepair::SuffixRepair { .. })
-                || matches!(repair, LeanAbortRepair::ForceBind { .. })
+                || matches!(repair, LeanAbortRepair::ForceOrderedAdmit { .. })
         );
-        assert!(table.has_force_bind(0));
-        table.extend_force_bind(0, &[202, 203]);
-        assert!(table.must_force_bind(0, 202));
-        assert!(table.must_force_bind(0, 203));
+        assert!(table.has_force_ordered_admit(0));
+        table.extend_force_ordered_admit(0, &[202, 203]);
+        assert!(table.must_force_ordered_admit(0, 202));
+        assert!(table.must_force_ordered_admit(0, 203));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //!
 //! Intra-block: live fanout + morphology posterior + EV estimators
 //! (`E_wait_time`, `E_cascade`, `E_reexec`, `E_idle_steal`, SoftWait latency,
-//! bind/wait_useful, meta tax) updated on outcomes.
+//! ordered_admit/wait_useful, meta tax) updated on outcomes.
 //! Inter-block: `InterBlockPrior` EMA + flip decay; seeds HotSet/Bayes + **engagement
 //! mode** (quiet vs storm) — never arms SoftWait Soft from prior alone.
 //!
@@ -114,7 +114,7 @@ pub(crate) struct AdaptiveParams {
     pub alpha_fanout: f64,
     /// β in `EV_Spec = P_abort * (W_remain + β * E_cascade + γ * E_reexec)`.
     pub beta_cascade: f64,
-    /// γ weight of measured E_reexec inside EV_Spec (V5-P1 lean ForceBind vs FullRestart).
+    /// γ weight of measured E_reexec inside EV_Spec (V5-P1 lean ForceOrderedAdmit vs FullAbortReexecute).
     pub gamma_reexec: f64,
     /// δ weight of idle-steal tax added to EV_Wait (park without steal raises Wait).
     pub delta_idle: f64,
@@ -130,18 +130,18 @@ pub(crate) struct AdaptiveParams {
     pub e_reexec: f64,
     /// Prior idle-steal tax (0 = cores stay busy on Wait via steal).
     pub e_idle_prior: f64,
-    /// Meta budget ρ: if meta_ops/useful_effects > ρ → force SpecRead (OCC fallback).
+    /// Meta budget ρ: if meta_ops/useful_effects > ρ → force OptimisticRead (OCC fallback).
     pub meta_budget_rho: f64,
-    /// Tiny EV gap bias: if EV_Wait beats EV_Spec by < meta_gap_eps*(1+meta_tax) → SpecRead.
+    /// Tiny EV gap bias: if EV_Wait beats EV_Spec by < meta_gap_eps*(1+meta_tax) → OptimisticRead.
     pub meta_gap_eps: f64,
     /// EarlyAbort niche only: known d ≤ d_early (not a Wait cut).
     pub d_early: f64,
-    /// Bind escalation when published Data + very-high P (not a Wait gate).
+    /// OrderedAdmit escalation when published Data + very-high P (not a Wait gate).
     pub tau_very_high: f64,
     pub tau_w: f64,
     pub tau_s: f64,
     pub tau_revoke: f64,
-    /// Legacy SpecRead cost scale (maps into W_remain / docs).
+    /// Legacy OptimisticRead cost scale (maps into W_remain / docs).
     pub c_retry: f64,
     /// DEPRECATED — not a Wait gate in AEC π (kept for lab JSON compatibility).
     pub d_wait: f64,
@@ -175,7 +175,7 @@ impl AdaptiveParams {
             e_cascade_prior: 1.0,
             e_reexec: 1.5,
             e_idle_prior: 0.20,
-            // SoftWait/meta_ops over useful effects > ρ → OCC SpecRead (after warmup).
+            // SoftWait/meta_ops over useful effects > ρ → OCC OptimisticRead (after warmup).
             meta_budget_rho: 0.30,
             // Near-tie Wait wins → Spec when measured meta tax (no SoftWait storm).
             meta_gap_eps: 0.05,
@@ -332,8 +332,8 @@ struct LocLive {
     aborts: AtomicUsize,
     program_reads: AtomicUsize,
     handler_reads: AtomicUsize,
-    /// Bind success credits (π Bind hit + Publish→bind prior).
-    bind_hits: AtomicUsize,
+    /// OrderedAdmit success credits (π OrderedAdmit hit + Publish→ordered_admit prior).
+    ordered_admit_hits: AtomicUsize,
     /// SoftWait wake was useful (producer published while waiter armed).
     wait_useful: AtomicUsize,
     /// Producer status hist: Data / Running-ish (coarse bits).
@@ -348,9 +348,9 @@ struct LocLive {
     e_wait_bits: AtomicU64,
     /// Fixed-point ×1e6 EMA of E_cascade.
     e_cascade_bits: AtomicU64,
-    /// Sticky resolve: conflict ℓ after force_bind_reabort (Bind/Await bias).
+    /// Sticky resolve: conflict ℓ after force_ordered_admit_reabort (OrderedAdmit/Await bias).
     sticky_resolve: AtomicUsize,
-    /// Done∅Data Unfenced / residual Bind — long-tail H/Avoid prior.
+    /// Done∅Data OptimisticRead / residual OrderedAdmit — long-tail H/Avoid prior.
     writer_done: AtomicUsize,
     /// Avoid ∧ Done∅Data (u_aa) — serial_lane fuel for secondary ℓs.
     u_aa: AtomicUsize,
@@ -380,7 +380,7 @@ pub(crate) struct LiveLearner {
     abort_events: AtomicUsize,
     cascade_sum: AtomicU64,
     publish_events: AtomicUsize,
-    bind_success_total: AtomicUsize,
+    ordered_admit_success_total: AtomicUsize,
     wait_useful_total: AtomicUsize,
     /// Cheap EMA of measured gross-work / effect-progress depth samples.
     d_sum_bits: AtomicU64,
@@ -393,7 +393,7 @@ pub(crate) struct LiveLearner {
     park_ns_proxy: AtomicU64,
     /// Meta ops counted toward ρ budget (SoftWait arms observed by π).
     meta_ops: AtomicUsize,
-    /// Useful effects (bind + wait_useful + publishes) for ρ denominator.
+    /// Useful effects (ordered_admit + wait_useful + publishes) for ρ denominator.
     useful_effects: AtomicUsize,
     /// Global EMA E_wait_time / E_cascade / E_reexec / E_idle (fixed-point ×1e6).
     global_e_wait_bits: AtomicU64,
@@ -415,7 +415,7 @@ pub(crate) struct LiveLearner {
     /// Intra-block marks (abort / first-wave) vs prior seed — quiet must not
     /// suppress intra evidence.
     predicted_intra: DashMap<(MemoryLocationHash, u8), AtomicUsize, FxBuildHasher>,
-    /// Cheap emptiness for the Unfenced≡OCC fast path (no DashMap scan).
+    /// Cheap emptiness for the OptimisticRead≡OCC fast path (no DashMap scan).
     predicted_n: AtomicUsize,
     /// Locations with any PE class — T6: non-PE ℓ stays byte-identical OCC.
     predicted_locs: DashMap<MemoryLocationHash, (), BuildIdentityHasher>,
@@ -443,7 +443,7 @@ impl LiveLearner {
         self.abort_events.store(0, Ordering::Relaxed);
         self.cascade_sum.store(0, Ordering::Relaxed);
         self.publish_events.store(0, Ordering::Relaxed);
-        self.bind_success_total.store(0, Ordering::Relaxed);
+        self.ordered_admit_success_total.store(0, Ordering::Relaxed);
         self.wait_useful_total.store(0, Ordering::Relaxed);
         self.d_sum_bits.store(0, Ordering::Relaxed);
         self.d_count.store(0, Ordering::Relaxed);
@@ -481,7 +481,7 @@ impl LiveLearner {
     }
 
     #[inline]
-    pub(crate) fn note_resolve_r1(&self) {
+    pub(crate) fn note_resolve_partial_abort(&self) {
         self.rebind_total.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -498,12 +498,12 @@ impl LiveLearner {
     /// PreferAdmit / steal width when WaitFor parks starve independents.
     #[inline]
     pub(crate) fn prefer_admit_heat(&self) -> bool {
-        self.park_heat.load(Ordering::Relaxed) >= 2 || self.r1_underfire()
+        self.park_heat.load(Ordering::Relaxed) >= 2 || self.partial_abort_underfire()
     }
 
-    /// rewind ≫ rebind — R1 is under-firing; Resolve must prefer RebindOnly.
+    /// rewind ≫ rebind — partial_abort is under-firing; Resolve must prefer RebindOnly.
     #[inline]
-    pub(crate) fn r1_underfire(&self) -> bool {
+    pub(crate) fn partial_abort_underfire(&self) -> bool {
         let rw = self.rewind_total.load(Ordering::Relaxed);
         let rb = self.rebind_total.load(Ordering::Relaxed);
         rw >= 4 && rw > rb.saturating_mul(2)
@@ -511,15 +511,15 @@ impl LiveLearner {
 
     /// Live Resolve prior: identity/FF abundant or rewind:rebind skewed.
     #[inline]
-    pub(crate) fn r1_first_bias(&self) -> bool {
-        self.r1_underfire()
+    pub(crate) fn partial_abort_first_bias(&self) -> bool {
+        self.partial_abort_underfire()
             || self.identity_hits.load(Ordering::Relaxed)
                 > self.rebind_total.load(Ordering::Relaxed)
     }
 
     /// Quiet cohort: Fence-off. Do not arm collapse/absorb/Storm-shaped repair.
     #[inline]
-    pub(crate) fn quiet_fence_off(&self) -> bool {
+    pub(crate) fn quiet_pessimistic_off(&self) -> bool {
         self.morph_weights().dominant_quiet()
             && self.abort_events.load(Ordering::Relaxed) < 4
             && self.park_heat.load(Ordering::Relaxed) < 2
@@ -550,13 +550,13 @@ impl LiveLearner {
 
     /// Strict makespan: enter the Fenced path only if predicted Fence_tax
     /// < predicted OCC_reexec_waste for this \(a\). Conservative — prior-only
-    /// PE is **not** enough (Bind tax on 19807137). Intra abort evidence is.
-    /// Park/rewind storms stay Unfenced≡OCC (miss → cheap reincarnation).
+    /// PE is **not** enough (OrderedAdmit tax on 19807137). Intra abort evidence is.
+    /// Park/rewind storms stay OptimisticRead≡OCC (miss → cheap reincarnation).
     #[inline]
     pub(crate) fn pcc_makespan_win(&self, location: MemoryLocationHash, k: u32) -> bool {
-        // Quiet cohort stays Unfenced≡OCC even after a lone intra mark
-        // (2179522: one abort must not Bind-tax the rest of the block).
-        if self.quiet_fence_off() {
+        // Quiet cohort stays OptimisticRead≡OCC even after a lone intra mark
+        // (2179522: one abort must not OrderedAdmit-tax the rest of the block).
+        if self.quiet_pessimistic_off() {
             return false;
         }
         if !self.predicted_essential_intra(location, k) {
@@ -568,8 +568,8 @@ impl LiveLearner {
         if parks > aborts.saturating_add(aborts / 2).saturating_add(8) {
             return false;
         }
-        // PrefixSkip/rewind storm: repair tax > OCC B0.
-        if self.r1_underfire() && parks >= 4 {
+        // PrefixSkip/rewind storm: repair tax > OCC full_abort_reexecute.
+        if self.partial_abort_underfire() && parks >= 4 {
             return false;
         }
         true
@@ -586,7 +586,7 @@ impl LiveLearner {
     }
 
     /// Park heat already losing to OCC reincarnation — `decide()` stays Spec
-    /// except Bind-on-Data.
+    /// except OrderedAdmit-on-Data.
     #[inline]
     pub(crate) fn park_storm(&self) -> bool {
         self.park_heat.load(Ordering::Relaxed) >= 8
@@ -596,7 +596,7 @@ impl LiveLearner {
     /// Observe makespan — not Soft, not `mark_pcc`. HotSet/WŜ are not Wait OR.
     #[inline]
     pub(crate) fn prior_pe_fire_wins(&self, vis: &super::access_policy::AccessVis) -> bool {
-        if self.quiet_fence_off() || self.park_storm() {
+        if self.quiet_pessimistic_off() || self.park_storm() {
             return false;
         }
         let m = self.morph_weights();
@@ -606,13 +606,13 @@ impl LiveLearner {
         m.dominant_fan_out() && (vis.published_data || vis.writer_executing)
     }
 
-    /// Bind↑ without abort relief — disable Bind for the rest of the block.
+    /// OrderedAdmit↑ without abort relief — disable OrderedAdmit for the rest of the block.
     ///
     /// `binds>=16 ∧ abort>0` (v8 try) **lost** 14689597: 0.424→0.199 and
     /// aborts 176→965. Keep the strict `aborts >= binds` trip only.
     #[inline]
-    pub(crate) fn bind_tax_losing(&self) -> bool {
-        let binds = self.bind_success_total.load(Ordering::Relaxed);
+    pub(crate) fn ordered_admit_tax_losing(&self) -> bool {
+        let binds = self.ordered_admit_success_total.load(Ordering::Relaxed);
         let aborts = self.abort_events.load(Ordering::Relaxed);
         binds >= 16 && aborts >= binds
     }
@@ -636,7 +636,7 @@ impl LiveLearner {
         entry.readers.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Intra-block abort / first-wave mark (survives quiet_fence_off).
+    /// Intra-block abort / first-wave mark (survives quiet_pessimistic_off).
     #[inline]
     pub(crate) fn predicted_essential_intra(&self, location: MemoryLocationHash, k: u32) -> bool {
         if self.armed_any_k.contains_key(&location) {
@@ -813,7 +813,7 @@ impl LiveLearner {
         if let Some(k) = k.filter(|&k| k > 0) {
             self.mark_predicted_essential(location, k);
         } else if !self.location_predicted(location)
-            && (!self.quiet_fence_off() || cascade_hint >= 8)
+            && (!self.quiet_pessimistic_off() || cascade_hint >= 8)
         {
             // Residual: no ordinal and no seeded class. Arm location any-k
             // — never template spray `[1,6,10,20]` on fan_out (v8 ban).
@@ -822,14 +822,14 @@ impl LiveLearner {
         }
     }
 
-    /// Record conflict location after force_bind_reabort (sticky resolve).
-    /// Next touch: raise EV_Spec / lower EV_Wait so Bind/Await beat SpecRead loops.
+    /// Record conflict location after force_ordered_admit_reabort (sticky resolve).
+    /// Next touch: raise EV_Spec / lower EV_Wait so OrderedAdmit/Await beat OptimisticRead loops.
     pub(crate) fn note_sticky_resolve(&self, location: MemoryLocationHash) {
         let entry = self.locs.entry(location).or_default();
         entry.sticky_resolve.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// True when ℓ is sticky after a force_bind_reabort this block.
+    /// True when ℓ is sticky after a force_ordered_admit_reabort this block.
     pub(crate) fn is_sticky_resolve(&self, location: MemoryLocationHash) -> bool {
         self.locs
             .get(&location)
@@ -859,12 +859,12 @@ impl LiveLearner {
             .is_some_and(|e| e.writer_done.load(Ordering::Relaxed) > 0)
     }
 
-    /// Live prior: Bind already succeeded on ℓ (`bind_success_total` reader).
+    /// Live prior: OrderedAdmit already succeeded on ℓ (`ordered_admit_success_total` reader).
     #[inline]
-    pub(crate) fn bind_cover(&self, location: MemoryLocationHash) -> bool {
+    pub(crate) fn ordered_admit_cover(&self, location: MemoryLocationHash) -> bool {
         self.locs
             .get(&location)
-            .is_some_and(|e| e.bind_hits.load(Ordering::Relaxed) > 0)
+            .is_some_and(|e| e.ordered_admit_hits.load(Ordering::Relaxed) > 0)
     }
 
     /// Cheap reader bump on hot-candidate first-cross (no morph/π tax).
@@ -888,9 +888,9 @@ impl LiveLearner {
         location: MemoryLocationHash,
         hotset: bool,
         prior_ws: bool,
-        force_bind: bool,
+        force_ordered_admit: bool,
     ) -> bool {
-        if force_bind || hotset || prior_ws || self.is_sticky_resolve(location) {
+        if force_ordered_admit || hotset || prior_ws || self.is_sticky_resolve(location) {
             return true;
         }
         self.fanout_live(location) >= HOT_FANOUT_THRESH
@@ -904,20 +904,22 @@ impl LiveLearner {
 
     pub(crate) fn note_publish(&self, location: MemoryLocationHash) {
         self.publish_events.fetch_add(1, Ordering::Relaxed);
-        // Publish Data ⇒ Bind would have succeeded — cheap bind-prior credit.
+        // Publish Data ⇒ OrderedAdmit would have succeeded — cheap ordered_admit-prior credit.
         let entry = self.locs.entry(location).or_default();
-        entry.bind_hits.fetch_add(1, Ordering::Relaxed);
+        entry.ordered_admit_hits.fetch_add(1, Ordering::Relaxed);
         entry.status_data.fetch_add(1, Ordering::Relaxed);
-        self.bind_success_total.fetch_add(1, Ordering::Relaxed);
+        self.ordered_admit_success_total
+            .fetch_add(1, Ordering::Relaxed);
         self.useful_effects.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// π Bind hit credit (symmetric with Bayes observe_bind_hit).
-    pub(crate) fn note_bind_success(&self, location: MemoryLocationHash) {
-        self.bind_success_total.fetch_add(1, Ordering::Relaxed);
+    /// π OrderedAdmit hit credit (symmetric with Bayes observe_ordered_admit_hit).
+    pub(crate) fn note_ordered_admit_success(&self, location: MemoryLocationHash) {
+        self.ordered_admit_success_total
+            .fetch_add(1, Ordering::Relaxed);
         self.useful_effects.fetch_add(1, Ordering::Relaxed);
         let entry = self.locs.entry(location).or_default();
-        entry.bind_hits.fetch_add(1, Ordering::Relaxed);
+        entry.ordered_admit_hits.fetch_add(1, Ordering::Relaxed);
         entry.status_data.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1029,7 +1031,7 @@ impl LiveLearner {
     }
 
     /// Feed measured abort→reexec cost into E_reexec EMA (∉ TCB).
-    /// Typical samples: RebindOnly≈0.1, RewindTo/FF≈0.6, FullRestart≈2.0+.
+    /// Typical samples: RebindOnly≈0.1, RewindTo/FF≈0.6, FullAbortReexecute≈2.0+.
     pub(crate) fn note_reexec_cost(&self, cost: f64) {
         let sample = cost.clamp(0.05, 8.0);
         let params = *self.params_bits.lock().unwrap();
@@ -1161,8 +1163,8 @@ impl LiveLearner {
         Some(sum / n as f64)
     }
 
-    pub(crate) fn bind_success_total(&self) -> usize {
-        self.bind_success_total.load(Ordering::Relaxed)
+    pub(crate) fn ordered_admit_success_total(&self) -> usize {
+        self.ordered_admit_success_total.load(Ordering::Relaxed)
     }
 
     pub(crate) fn wait_useful_total(&self) -> usize {
@@ -1283,7 +1285,7 @@ impl LiveLearner {
     }
 
     /// Empirical morph hat from counters (for inter-block EMA).
-    /// Metric↔L1 calibration: fan_out requires abort/bind evidence, not
+    /// Metric↔L1 calibration: fan_out requires abort/ordered_admit evidence, not
     /// readers-alone (heuristic over-call). Quiet stays quiet without that.
     pub(crate) fn morph_hat(&self) -> MorphWeights {
         let prog = self.program_obs.load(Ordering::Relaxed) as f64;
@@ -1419,21 +1421,21 @@ mod tests {
     }
 
     #[test]
-    fn g4_bind_and_wait_useful_and_publish_credit() {
+    fn g4_ordered_admit_and_wait_useful_and_publish_credit() {
         let live = LiveLearner::new();
         live.begin_block(MorphWeights::default());
-        live.note_bind_success(1);
+        live.note_ordered_admit_success(1);
         live.note_wait_useful(1);
         live.note_publish(2);
         live.note_depth_sample(0.9);
-        assert_eq!(live.bind_success_total(), 2); // bind + publish
+        assert_eq!(live.ordered_admit_success_total(), 2); // ordered_admit + publish
         assert_eq!(live.wait_useful_total(), 1);
         assert!((live.mean_depth_sample().unwrap() - 0.9).abs() < 1e-6);
         assert!(
-            live.bind_cover(1),
-            "bind_success_total is a live Avoid prior"
+            live.ordered_admit_cover(1),
+            "ordered_admit_success_total is a live Avoid prior"
         );
-        assert!(live.bind_cover(2));
+        assert!(live.ordered_admit_cover(2));
     }
 
     #[test]
@@ -1500,7 +1502,7 @@ mod tests {
         for i in 0..70 {
             live.note_observe(i as u64, true, 1);
         }
-        live.note_bind_success(1);
+        live.note_ordered_admit_success(1);
         for _ in 0..40 {
             live.note_meta_op();
         }
@@ -1544,15 +1546,15 @@ mod tests {
     }
 
     #[test]
-    fn v5_p2_reexec_ema_tracks_lean_force_bind_vs_full_restart() {
+    fn v5_p2_reexec_ema_tracks_lean_force_ordered_admit_vs_full_abort_reexecute() {
         let live = LiveLearner::new();
         let params = AdaptiveParams::from_l3();
         live.begin_block_with_params(MorphWeights::default(), params);
-        // V5-P1 Lean ForceBind sample.
+        // V5-P1 Lean ForceOrderedAdmit sample.
         live.note_reexec_cost(1.2);
         let mid = live.e_reexec();
         assert!(mid > 1.0 && mid < 1.6, "{mid}");
-        // Bare FullRestart raises E_reexec.
+        // Bare FullAbortReexecute raises E_reexec.
         for _ in 0..6 {
             live.note_reexec_cost(2.2);
         }
@@ -1569,7 +1571,7 @@ mod tests {
         for i in 0..70 {
             live.note_observe(i as u64, true, 1);
         }
-        live.note_bind_success(1);
+        live.note_ordered_admit_success(1);
         for _ in 0..5 {
             live.note_meta_op();
         }
@@ -1579,34 +1581,34 @@ mod tests {
     }
 
     #[test]
-    fn structural_park_and_r1_bias_are_readable() {
+    fn structural_park_and_partial_abort_bias_are_readable() {
         let live = LiveLearner::new();
         live.begin_block(MorphWeights::default());
         assert!(!live.prefer_admit_heat());
-        assert!(!live.r1_underfire());
+        assert!(!live.partial_abort_underfire());
         live.note_park_heat();
         live.note_park_heat();
         assert!(live.prefer_admit_heat());
         for _ in 0..6 {
             live.note_resolve_r2();
         }
-        live.note_resolve_r1();
-        assert!(live.r1_underfire());
-        assert!(live.r1_first_bias());
+        live.note_resolve_partial_abort();
+        assert!(live.partial_abort_underfire());
+        assert!(live.partial_abort_first_bias());
         live.note_identity_hit();
-        assert!(live.r1_first_bias());
+        assert!(live.partial_abort_first_bias());
     }
 
     #[test]
-    fn quiet_fence_off_protects_low_abort() {
+    fn quiet_pessimistic_off_protects_low_abort() {
         let live = LiveLearner::new();
         live.begin_block(MorphWeights::default());
-        assert!(live.quiet_fence_off(), "quiet-biased cold start");
+        assert!(live.quiet_pessimistic_off(), "quiet-biased cold start");
         live.note_abort(1, 1);
         live.note_abort(1, 1);
         live.note_abort(1, 1);
         live.note_abort(1, 1);
-        assert!(!live.quiet_fence_off());
+        assert!(!live.quiet_pessimistic_off());
     }
 
     #[test]
@@ -1702,7 +1704,7 @@ mod tests {
             live.predicted_essential(7, 6) && live.predicted_essential(7, 1),
             "unknown-k arms location any-k, not four template classes"
         );
-        assert!(!live.bind_tax_losing());
+        assert!(!live.ordered_admit_tax_losing());
     }
 
     #[test]
@@ -1731,12 +1733,12 @@ mod tests {
         assert!(live.predicted_essential(7, 6));
         assert!(
             !live.pcc_makespan_win(7, 6),
-            "prior-only PE must stay Unfenced≡OCC (Bind tax)"
+            "prior-only PE must stay OptimisticRead≡OCC (OrderedAdmit tax)"
         );
         live.note_abort_access(7, 2, Some(6));
         assert!(
             !live.pcc_makespan_win(7, 6),
-            "quiet_fence_off: one abort must not Bind-tax quiet"
+            "quiet_pessimistic_off: one abort must not OrderedAdmit-tax quiet"
         );
         live.begin_block(MorphWeights {
             fan_out: 0.70,
@@ -1751,7 +1753,7 @@ mod tests {
         );
         assert!(
             !live.pcc_makespan_win(7, 12),
-            "sibling k-class stays Unfenced"
+            "sibling k-class stays OptimisticRead"
         );
     }
 
@@ -1773,7 +1775,7 @@ mod tests {
         }
         assert!(
             !live.waitfor_makespan_win(1, true),
-            "park storm → Unfenced≡OCC"
+            "park storm → OptimisticRead≡OCC"
         );
     }
 }

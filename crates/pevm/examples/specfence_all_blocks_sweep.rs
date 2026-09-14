@@ -152,95 +152,95 @@ fn metrics_json(m: &pevm::SpecFenceMetrics, n: usize) -> serde_json::Value {
         "soft_wait_arms": m.soft_wait_arms,
         "wait_hard": m.wait_hard_count,
         "occ_aborts": m.occ_aborts,
-        "edge_bind": m.edge_bind,
+        "edge_ordered_admit": m.edge_ordered_admit,
         "edge_wait_for": m.edge_wait_for,
-        "edge_unfenced": m.edge_unfenced,
+        "edge_optimistic_read": m.edge_optimistic_read,
         "avoid_broadcasts": m.avoid_broadcasts,
         "canary_probes": m.canary_probes,
-        "independent_unfenced": m.independent_unfenced,
-        "force_prefix_unfenced": m.force_prefix_unfenced,
+        "independent_optimistic_read": m.independent_optimistic_read,
+        "force_prefix_optimistic_read": m.force_prefix_optimistic_read,
         "prefer_admit": m.prefer_admit,
         "multi_spine_admit": m.multi_spine_admit,
-        "quiet_fence_revoke": m.quiet_fence_revoke,
-        "bind_residual": m.bind_residual,
+        "quiet_pessimistic_revoke": m.quiet_pessimistic_revoke,
+        "ordered_admit_residual": m.ordered_admit_residual,
         "canary_reopen": m.canary_reopen,
         "writer_done_learned": m.writer_done_learned,
         "detect_accesses": m.detect_accesses,
         "predicted_essential_hits": m.predicted_essential_hits,
         "pcc_fire_at_a": m.pcc_fire_at_a,
         "pcc_roi_skip": m.pcc_roi_skip,
-        "unfenced_occ_fast": m.unfenced_occ_fast,
+        "optimistic_read_occ_fast": m.optimistic_read_occ_fast,
         "occ_kernel_execs": m.occ_kernel_execs,
         "pcc_kernel_execs": m.pcc_kernel_execs,
         "occ_kernel_validates": m.occ_kernel_validates,
-        "prefix_skip_roi_b0": m.prefix_skip_roi_b0,
+        "prefix_skip_roi_full_abort": m.prefix_skip_roi_full_abort,
         "force_prefix_as_pi": m.force_prefix_as_pi,
         "canary_live_verb": m.canary_live_verb,
         "inc_avoid_hits": m.inc_avoid_hits,
         "h_or_wait_door": m.h_or_wait_door,
-        "morph_fence_actuator": m.morph_fence_actuator,
-        "writer_validated_bind_gate": m.writer_validated_bind_gate,
+        "morph_pessimistic_actuator": m.morph_pessimistic_actuator,
+        "writer_validated_ordered_admit_gate": m.writer_validated_ordered_admit_gate,
         "flat_edgekey_sot": m.flat_edgekey_sot,
         "writer_identity_preserved": m.writer_identity_preserved,
         "rebind_only": m.rebind_only,
-        "full_restart": m.full_restart,
+        "full_abort_reexecute": m.full_abort_reexecute,
         "rewind_to_cp": m.rewind_to_cp,
         "evm_entries": m.evm_entries,
         "reexec_entries": reexec_entries,
         "resume_count": m.resume_count,
-        "bind_hits": m.bind_hits,
-        "spec_read_count": m.spec_read_count,
+        "ordered_admit_hits": m.ordered_admit_hits,
+        "optimistic_read_count": m.optimistic_read_count,
         "lean_mode_txs": m.lean_mode_txs,
         "hotset_size": m.hotset_size,
         "ready_steal_on_wait": m.ready_steal_on_wait,
         "wait_park_count": m.wait_park_count,
         "wait_park_ns": m.wait_park_ns,
-        "force_bind_reabort": m.force_bind_reabort,
+        "force_ordered_admit_reabort": m.force_ordered_admit_reabort,
         "fanout_fr_collapse": m.fanout_fr_collapse,
         "fanout_validate_defer": m.fanout_validate_defer,
         "fanout_absorb": m.fanout_absorb,
-        "tx_full_retry": m.tx_full_retry,
+        "tx_full_abort_reexecute": m.tx_full_abort_reexecute,
         "partial_retry_count": m.partial_retry_count,
         "await_at_a_arms": m.await_at_a_arms,
         "engagement_switches": m.engagement_switches,
         "journal_ff_hits": m.journal_ff_hits,
-        "cold_spec_fast": m.cold_spec_fast,
+        "cold_optimistic_fast": m.cold_optimistic_fast,
         "occ_fast_first": m.occ_fast_first,
         "profile_handler_ns": m.profile_handler_ns,
         "profile_maybe_wait_ns": m.profile_maybe_wait_ns,
         "profile_validate_ns": m.profile_validate_ns,
         "profile_scheduler_ns": m.profile_scheduler_ns,
-        "waitfor_pin": m.waitfor_pin,
-        "waitfor_aborting": m.waitfor_aborting,
-        "schedule_refuse": m.schedule_refuse,
-        "bind_after_done": m.bind_after_done,
-        "r1_win": m.r1_win,
-        "r1_attempt": m.r1_attempt,
+        "wait_for_dependency": m.wait_for_dependency,
+        "wait_for_full_abort": m.wait_for_full_abort,
+        "refuse_admit": m.refuse_admit,
+        "ordered_admit_after_done": m.ordered_admit_after_done,
+        "partial_abort_win": m.partial_abort_win,
+        "partial_abort_attempt": m.partial_abort_attempt,
         "park_resume_at_k": m.park_resume_at_k,
-        "park_resume_full_retry": m.park_resume_full_retry,
+        "park_resume_full_abort_reexecute": m.park_resume_full_abort_reexecute,
     })
 }
 
 fn classify_morph(sf: &serde_json::Value) -> &'static str {
     let m = &sf["metrics"];
     let n = sf["n_tx"].as_u64().unwrap_or(1).max(1) as f64;
-    let bind = m["edge_bind"].as_u64().unwrap_or(0) as f64;
+    let ordered_admit = m["edge_ordered_admit"].as_u64().unwrap_or(0) as f64;
     let wait = m["edge_wait_for"].as_u64().unwrap_or(0) as f64;
-    let unf = m["edge_unfenced"].as_u64().unwrap_or(0) as f64;
+    let unf = m["edge_optimistic_read"].as_u64().unwrap_or(0) as f64;
     let rewind = m["rewind_to_cp"].as_u64().unwrap_or(0) as f64;
     let park = m["wait_park_count"].as_u64().unwrap_or(0) as f64;
     let hot = m["hotset_size"].as_u64().unwrap_or(0) as f64;
-    let bind_per = bind / n;
+    let ordered_admit_per = ordered_admit / n;
     let wait_per = wait / n;
     let unf_per = unf / n;
     let rewind_per = rewind / n;
-    if hot <= 5.0 && wait_per < 0.05 && bind_per < 0.3 && park < 5.0 && rewind_per < 0.05 {
+    if hot <= 5.0 && wait_per < 0.05 && ordered_admit_per < 0.3 && park < 5.0 && rewind_per < 0.05 {
         "quiet"
-    } else if bind_per >= 1.0 || (rewind_per >= 0.05 && unf_per >= 1.5) {
+    } else if ordered_admit_per >= 1.0 || (rewind_per >= 0.05 && unf_per >= 1.5) {
         "fan_out"
     } else if wait_per >= 0.05 || park >= 20.0 || (hot >= 100.0 && wait_per >= 0.02) {
         "spine"
-    } else if bind_per >= 0.4 || rewind_per >= 0.02 {
+    } else if ordered_admit_per >= 0.4 || rewind_per >= 0.02 {
         "mixed"
     } else {
         "quiet_ish"
@@ -253,8 +253,8 @@ fn dominant_metric(sf: &serde_json::Value) -> String {
     let park_ms = m["wait_park_ns"].as_u64().unwrap_or(0) as f64 / 1e6;
     let rewind = m["rewind_to_cp"].as_u64().unwrap_or(0);
     let rebind = m["rebind_only"].as_u64().unwrap_or(0);
-    let full = m["full_restart"].as_u64().unwrap_or(0);
-    let bind = m["edge_bind"].as_u64().unwrap_or(0);
+    let full = m["full_abort_reexecute"].as_u64().unwrap_or(0);
+    let ordered_admit = m["edge_ordered_admit"].as_u64().unwrap_or(0);
     let wait = m["edge_wait_for"].as_u64().unwrap_or(0);
     let soft = m["soft_wait_arms"].as_u64().unwrap_or(0);
     let idle = if wall > 0.0 {
@@ -269,15 +269,15 @@ fn dominant_metric(sf: &serde_json::Value) -> String {
     } else if rewind >= full.max(1) && rewind > rebind {
         format!("SuffixRepair_R2 rewind={rewind}")
     } else if full > rewind && full > 10 {
-        format!("full_restart={full}")
-    } else if bind > wait * 3 && bind > 100 {
-        format!("edge_bind={bind}")
+        format!("full_abort_reexecute={full}")
+    } else if ordered_admit > wait * 3 && ordered_admit > 100 {
+        format!("edge_ordered_admit={ordered_admit}")
     } else if wait > 50 {
         format!("edge_wait_for={wait}")
     } else {
         format!(
-            "meta/cold bind={bind} unf={}",
-            m["edge_unfenced"].as_u64().unwrap_or(0)
+            "meta/cold ordered_admit={ordered_admit} unf={}",
+            m["edge_optimistic_read"].as_u64().unwrap_or(0)
         )
     }
 }
@@ -377,13 +377,13 @@ fn run_mode(
         row["decision_fields"] = serde_json::to_value(&proc.decision_fields).unwrap_or_default();
         if process_trace {
             row["process_summary"] = serde_json::json!({
-                "unfenced_total": proc.unfenced_total,
+                "optimistic_read_total": proc.optimistic_read_total,
                 "wait_for_total": proc.wait_for_total,
-                "bind_total": proc.bind_total,
-                "unfenced_after_avoid_total": proc.unfenced_after_avoid_total,
-                "force_prefix_none_unfenced": proc.force_prefix_none_unfenced,
-                "independent_unfenced_total": proc.independent_unfenced_total,
-                "unfenced_after_fence_on_hot_l": proc.unfenced_after_fence_on_hot_l,
+                "ordered_admit_total": proc.ordered_admit_total,
+                "optimistic_read_after_avoid_total": proc.optimistic_read_after_avoid_total,
+                "force_prefix_none_optimistic_read": proc.force_prefix_none_optimistic_read,
+                "independent_optimistic_read_total": proc.independent_optimistic_read_total,
+                "optimistic_read_after_pessimistic_admit_on_hot_l": proc.optimistic_read_after_pessimistic_admit_on_hot_l,
                 "reason_histogram": proc.reason_histogram,
                 "hot_fanout_l": proc.hot_fanout_l,
                 "per_tx_len": proc.per_tx.len(),
@@ -454,22 +454,24 @@ fn main() {
                 for mode in ["occ", "specfence"] {
                     let row = run_mode(&chain, &loaded, mode, 8, iters, false);
                     eprintln!(
-                        "  {mode:10} ok={} tps={:.0} wall_ms={:.1} soft={} aborts={} bind={} wait={} unf={} rewind={} rebind={} full={} r1={}/{} resume_k={} full_retry={}",
+                        "  {mode:10} ok={} tps={:.0} wall_ms={:.1} soft={} aborts={} ordered_admit={} wait={} unf={} rewind={} rebind={} full={} r1={}/{} resume_k={} full_retry={}",
                         row["ok"],
                         row["tps"].as_f64().unwrap_or(0.0),
                         row["wall_ms"].as_f64().unwrap_or(0.0),
                         row["metrics"]["soft_wait_arms"].as_u64().unwrap_or(0),
                         row["metrics"]["occ_aborts"].as_u64().unwrap_or(0),
-                        row["metrics"]["edge_bind"].as_u64().unwrap_or(0),
+                        row["metrics"]["edge_ordered_admit"].as_u64().unwrap_or(0),
                         row["metrics"]["edge_wait_for"].as_u64().unwrap_or(0),
-                        row["metrics"]["edge_unfenced"].as_u64().unwrap_or(0),
+                        row["metrics"]["edge_optimistic_read"].as_u64().unwrap_or(0),
                         row["metrics"]["rewind_to_cp"].as_u64().unwrap_or(0),
                         row["metrics"]["rebind_only"].as_u64().unwrap_or(0),
-                        row["metrics"]["full_restart"].as_u64().unwrap_or(0),
-                        row["metrics"]["r1_win"].as_u64().unwrap_or(0),
-                        row["metrics"]["r1_attempt"].as_u64().unwrap_or(0),
+                        row["metrics"]["full_abort_reexecute"].as_u64().unwrap_or(0),
+                        row["metrics"]["partial_abort_win"].as_u64().unwrap_or(0),
+                        row["metrics"]["partial_abort_attempt"]
+                            .as_u64()
+                            .unwrap_or(0),
                         row["metrics"]["park_resume_at_k"].as_u64().unwrap_or(0),
-                        row["metrics"]["park_resume_full_retry"]
+                        row["metrics"]["park_resume_full_abort_reexecute"]
                             .as_u64()
                             .unwrap_or(0),
                     );
@@ -540,25 +542,25 @@ fn main() {
                     "morph_heuristic": morph,
                     "dominant_metric": dominant,
                     "soft_wait_arms": sf["metrics"]["soft_wait_arms"],
-                    "edge_bind": sf["metrics"]["edge_bind"],
+                    "edge_ordered_admit": sf["metrics"]["edge_ordered_admit"],
                     "edge_wait_for": sf["metrics"]["edge_wait_for"],
-                    "edge_unfenced": sf["metrics"]["edge_unfenced"],
+                    "edge_optimistic_read": sf["metrics"]["edge_optimistic_read"],
                     "avoid_broadcasts": sf["metrics"]["avoid_broadcasts"],
                     "rebind_only": sf["metrics"]["rebind_only"],
-                    "full_restart": sf["metrics"]["full_restart"],
+                    "full_abort_reexecute": sf["metrics"]["full_abort_reexecute"],
                     "rewind_to_cp": sf["metrics"]["rewind_to_cp"],
                     "occ_aborts_sf": sf["metrics"]["occ_aborts"],
                     "occ_aborts_occ": occ["metrics"]["occ_aborts"],
                     "hotset_size": sf["metrics"]["hotset_size"],
                     "wait_park_count": sf["metrics"]["wait_park_count"],
-                    "waitfor_pin": sf["metrics"]["waitfor_pin"],
-                    "waitfor_aborting": sf["metrics"]["waitfor_aborting"],
-                    "bind_after_done": sf["metrics"]["bind_after_done"],
-                    "r1_win": sf["metrics"]["r1_win"],
-                    "r1_attempt": sf["metrics"]["r1_attempt"],
-                    "schedule_refuse": sf["metrics"]["schedule_refuse"],
+                    "wait_for_dependency": sf["metrics"]["wait_for_dependency"],
+                    "wait_for_full_abort": sf["metrics"]["wait_for_full_abort"],
+                    "ordered_admit_after_done": sf["metrics"]["ordered_admit_after_done"],
+                    "partial_abort_win": sf["metrics"]["partial_abort_win"],
+                    "partial_abort_attempt": sf["metrics"]["partial_abort_attempt"],
+                    "refuse_admit": sf["metrics"]["refuse_admit"],
                     "park_resume_at_k": sf["metrics"]["park_resume_at_k"],
-                    "park_resume_full_retry": sf["metrics"]["park_resume_full_retry"],
+                    "park_resume_full_abort_reexecute": sf["metrics"]["park_resume_full_abort_reexecute"],
                 }));
             }
             _ => {}

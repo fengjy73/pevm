@@ -35,7 +35,7 @@ pub(crate) fn research_inspect_enabled() -> bool {
     }
 }
 
-/// Dig A/B: `SPECFENCE_DISABLE_SOFTWAIT=1` forces π SpecRead-only (never arm SoftWait).
+/// Dig A/B: `SPECFENCE_DISABLE_SOFTWAIT=1` forces π OptimisticRead-only (never arm SoftWait).
 /// Lean default SoftWait stays scarce; this is for makespan comparison only.
 pub(crate) fn softwait_disabled() -> bool {
     match std::env::var_os("SPECFENCE_DISABLE_SOFTWAIT") {
@@ -94,7 +94,7 @@ impl BlockEngagementMode {
 }
 
 /// `SPECFENCE_PROFILE=1` enables ns Instant buckets (handler/maybe_wait/validate/sched).
-/// Default off — Instant tax on every SpecRead biases wall vs OCC.
+/// Default off — Instant tax on every OptimisticRead biases wall vs OCC.
 pub(crate) fn profile_timing_enabled() -> bool {
     match std::env::var_os("SPECFENCE_PROFILE") {
         None => false,

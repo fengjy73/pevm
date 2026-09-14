@@ -275,40 +275,40 @@ fn main() {
                     let ppath = out_dir.join(&pname);
                     let hot = proc.hot_fanout_l.as_ref();
                     println!(
-                        "  process-{bn} unfenced={} wait={} bind={} unfenced_after_avoid={} force_prefix_none_unfenced={} hot_l_unfenced_after_fence={} indep={} per_tx={} reasons={:?} hot_l={:?}",
-                        proc.unfenced_total,
+                        "  process-{bn} optimistic_read={} wait={} ordered_admit={} optimistic_read_after_avoid={} force_prefix_none_optimistic_read={} hot_l_optimistic_read_after_pessimistic_admit={} indep={} per_tx={} reasons={:?} hot_l={:?}",
+                        proc.optimistic_read_total,
                         proc.wait_for_total,
-                        proc.bind_total,
-                        proc.unfenced_after_avoid_total,
-                        proc.force_prefix_none_unfenced,
-                        proc.unfenced_after_fence_on_hot_l,
-                        proc.independent_unfenced_total,
+                        proc.ordered_admit_total,
+                        proc.optimistic_read_after_avoid_total,
+                        proc.force_prefix_none_optimistic_read,
+                        proc.optimistic_read_after_pessimistic_admit_on_hot_l,
+                        proc.independent_optimistic_read_total,
                         proc.per_tx.len(),
                         proc.reason_histogram,
                         hot.map(|h| (
                             h.location,
-                            h.unfenced,
+                            h.optimistic_read,
                             h.wait_for,
-                            h.bind,
-                            h.unfenced_after_avoid,
-                            h.unfenced_after_canary
+                            h.ordered_admit,
+                            h.optimistic_read_after_avoid,
+                            h.optimistic_read_after_canary
                         )),
                     );
                     let metrics_json = serde_json::json!({
-                        "edge_bind": m.edge_bind,
+                        "edge_ordered_admit": m.edge_ordered_admit,
                         "edge_wait_for": m.edge_wait_for,
-                        "edge_unfenced": m.edge_unfenced,
+                        "edge_optimistic_read": m.edge_optimistic_read,
                         "avoid_broadcasts": m.avoid_broadcasts,
                         "canary_probes": m.canary_probes,
-                        "independent_unfenced": m.independent_unfenced,
+                        "independent_optimistic_read": m.independent_optimistic_read,
                         "soft_wait_arms": m.soft_wait_arms,
                         "occ_aborts": m.occ_aborts,
-                        "force_prefix_unfenced": m.force_prefix_unfenced,
+                        "force_prefix_optimistic_read": m.force_prefix_optimistic_read,
                         "prefer_admit": m.prefer_admit,
                         "multi_spine_admit": m.multi_spine_admit,
-                        "quiet_fence_revoke": m.quiet_fence_revoke,
+                        "quiet_pessimistic_revoke": m.quiet_pessimistic_revoke,
                         "writer_identity_preserved": m.writer_identity_preserved,
-                        "bind_residual": m.bind_residual,
+                        "ordered_admit_residual": m.ordered_admit_residual,
                         "canary_reopen": m.canary_reopen,
                         "writer_done_learned": m.writer_done_learned,
                         "ready_steal_on_wait": m.ready_steal_on_wait,
@@ -316,9 +316,9 @@ fn main() {
                         "wait_park_ns": m.wait_park_ns,
                         "evm_entries": m.evm_entries,
                         "rebind_only": m.rebind_only,
-                        "full_restart": m.full_restart,
+                        "full_abort_reexecute": m.full_abort_reexecute,
                         "rewind_to_cp": m.rewind_to_cp,
-                        "force_bind_reabort": m.force_bind_reabort,
+                        "force_ordered_admit_reabort": m.force_ordered_admit_reabort,
                     });
                     std::fs::write(
                         &ppath,
@@ -368,7 +368,7 @@ fn main() {
                             );
                         }
                     }
-                    // Rank failing txs: parks, unfenced_after_avoid, force_prefix_none, aborts
+                    // Rank failing txs: parks, optimistic_read_after_avoid, force_prefix_none, aborts
                     let mut ranked: Vec<serde_json::Value> = proc
                         .per_tx
                         .iter()
@@ -381,16 +381,16 @@ fn main() {
                                 .unwrap_or(0);
                             serde_json::json!({
                                 "tx": t.tx,
-                                "n_bind": t.n_bind,
+                                "n_ordered_admit": t.n_ordered_admit,
                                 "n_wait_for": t.n_wait_for,
-                                "n_unfenced": t.n_unfenced,
-                                "n_unfenced_after_avoid": t.n_unfenced_after_avoid,
+                                "n_optimistic_read": t.n_optimistic_read,
+                                "n_optimistic_read_after_avoid": t.n_optimistic_read_after_avoid,
                                 "n_force_prefix_none": t.n_force_prefix_none,
                                 "n_park": t.n_park,
                                 "n_abort": n_abort,
                                 "final_incarnation": final_inc,
                                 "reasons": t.reasons,
-                                "fail_score": t.n_unfenced_after_avoid
+                                "fail_score": t.n_optimistic_read_after_avoid
                                     + t.n_force_prefix_none * 2
                                     + t.n_park
                                     + (n_abort as usize) * 3
@@ -425,13 +425,13 @@ fn main() {
                             "metrics": metrics_json,
                             "process_summary": {
                                 "reason_histogram": proc.reason_histogram,
-                                "unfenced_total": proc.unfenced_total,
+                                "optimistic_read_total": proc.optimistic_read_total,
                                 "wait_for_total": proc.wait_for_total,
-                                "bind_total": proc.bind_total,
-                                "unfenced_after_avoid_total": proc.unfenced_after_avoid_total,
-                                "force_prefix_none_unfenced": proc.force_prefix_none_unfenced,
-                                "independent_unfenced_total": proc.independent_unfenced_total,
-                                "unfenced_after_fence_on_hot_l": proc.unfenced_after_fence_on_hot_l,
+                                "ordered_admit_total": proc.ordered_admit_total,
+                                "optimistic_read_after_avoid_total": proc.optimistic_read_after_avoid_total,
+                                "force_prefix_none_optimistic_read": proc.force_prefix_none_optimistic_read,
+                                "independent_optimistic_read_total": proc.independent_optimistic_read_total,
+                                "optimistic_read_after_pessimistic_admit_on_hot_l": proc.optimistic_read_after_pessimistic_admit_on_hot_l,
                                 "hot_fanout_l": proc.hot_fanout_l,
                             },
                             "per_tx": proc.per_tx,
@@ -459,14 +459,14 @@ fn main() {
                         m.lean_mode_txs,
                         m.evm_entries,
                         reexec_entries,
-                        m.force_bind_reabort,
+                        m.force_ordered_admit_reabort,
                         m.first_repair_await,
                         m.second_repair_await,
                         m.serial_barrier_resolve,
                         m.serial_barrier_defer,
                         m.handler_sstore_capture,
-                        m.bind_snap_capture,
-                        m.bind_snap_credit,
+                        m.ordered_admit_snap_capture,
+                        m.ordered_admit_snap_credit,
                         m.serial_barrier_clique,
                         m.jump_defer,
                         m.absolute_jump_applied,
@@ -474,7 +474,7 @@ fn main() {
                         m.fanout_fr_collapse,
                         m.fanout_validate_defer,
                         m.fanout_absorb,
-                        m.cold_spec_fast,
+                        m.cold_optimistic_fast,
                         m.occ_fast_first,
                         m.ready_steal_on_wait,
                         m.park_resume_at_k,
@@ -504,8 +504,8 @@ fn main() {
                     "occ_aborts": aborts,
                     "lean_mode_txs": m.lean_mode_txs,
                     "hotset_size": m.hotset_size,
-                    "bind_hits": m.bind_hits,
-                    "spec_read_count": m.spec_read_count,
+                    "ordered_admit_hits": m.ordered_admit_hits,
+                    "optimistic_read_count": m.optimistic_read_count,
                     "evm_entries": m.evm_entries,
                     "reexec_entries": reexec_entries,
                     "rewind_to_cp": m.rewind_to_cp,
@@ -514,10 +514,10 @@ fn main() {
                     "journal_ff_hits": m.journal_ff_hits,
                     "value_stable_ff_hits": m.value_stable_ff_hits,
                     "park_resume_at_k": m.park_resume_at_k,
-                    "park_resume_full_retry": m.park_resume_full_retry,
-                    "full_restart": m.full_restart,
+                    "park_resume_full_abort_reexecute": m.park_resume_full_abort_reexecute,
+                    "full_abort_reexecute": m.full_abort_reexecute,
                     "partial_retry_count": m.partial_retry_count,
-                    "force_bind_reabort": m.force_bind_reabort,
+                    "force_ordered_admit_reabort": m.force_ordered_admit_reabort,
                     "first_repair_await": m.first_repair_await,
                     "second_repair_await": m.second_repair_await,
                     "soft_wait_wake_ok": m.soft_wait_wake_ok,
@@ -526,7 +526,7 @@ fn main() {
                     "fanout_fr_collapse": m.fanout_fr_collapse,
                     "fanout_validate_defer": m.fanout_validate_defer,
                     "fanout_absorb": m.fanout_absorb,
-                    "cold_spec_fast": m.cold_spec_fast,
+                    "cold_optimistic_fast": m.cold_optimistic_fast,
                     "occ_fast_first": m.occ_fast_first,
                     "profile_handler_ns": m.profile_handler_ns,
                     "profile_maybe_wait_ns": m.profile_maybe_wait_ns,
@@ -535,7 +535,7 @@ fn main() {
                     "absolute_jump_applied": m.absolute_jump_applied,
                     "jump_defer": m.jump_defer,
                     "absolute_jump_fallback": m.absolute_jump_fallback,
-                    "tx_full_retry": m.tx_full_retry,
+                    "tx_full_abort_reexecute": m.tx_full_abort_reexecute,
                     "wait_park_count": m.wait_park_count,
                     "wait_park_ns": m.wait_park_ns,
                     "ready_steal_on_wait": m.ready_steal_on_wait,
@@ -558,8 +558,10 @@ fn main() {
                     row["serial_barrier_resolve"] = serde_json::json!(m.serial_barrier_resolve);
                     row["serial_barrier_defer"] = serde_json::json!(m.serial_barrier_defer);
                     row["handler_sstore_capture"] = serde_json::json!(m.handler_sstore_capture);
-                    row["bind_snap_capture"] = serde_json::json!(m.bind_snap_capture);
-                    row["bind_snap_credit"] = serde_json::json!(m.bind_snap_credit);
+                    row["ordered_admit_snap_capture"] =
+                        serde_json::json!(m.ordered_admit_snap_capture);
+                    row["ordered_admit_snap_credit"] =
+                        serde_json::json!(m.ordered_admit_snap_credit);
                     row["serial_barrier_clique"] = serde_json::json!(m.serial_barrier_clique);
                 }
             }
@@ -660,13 +662,13 @@ fn main() {
                 let (ok, tps, wall_ms, soft, wh, aborts) = run_one(&chain, &mut warm, &loaded, 8);
                 let m = warm.last_specfence_metrics();
                 println!(
-                    "  fam={fam} block={bn} mode=sf-warm ok={ok} tps={tps:.0} wall_ms={wall_ms:.1} soft={soft} wait_hard={wh} aborts={aborts} edge_bind={} edge_wait={} edge_unfenced={} avoid={} canary={} indep={} spine={} hot={}",
-                    m.edge_bind,
+                    "  fam={fam} block={bn} mode=sf-warm ok={ok} tps={tps:.0} wall_ms={wall_ms:.1} soft={soft} wait_hard={wh} aborts={aborts} edge_ordered_admit={} edge_wait={} edge_optimistic_read={} avoid={} canary={} indep={} spine={} hot={}",
+                    m.edge_ordered_admit,
                     m.edge_wait_for,
-                    m.edge_unfenced,
+                    m.edge_optimistic_read,
                     m.avoid_broadcasts,
                     m.canary_probes,
-                    m.independent_unfenced,
+                    m.independent_optimistic_read,
                     m.spine_waits,
                     m.sketch_hot_size,
                 );
@@ -687,12 +689,12 @@ fn main() {
                             "wall_ms": wall_ms,
                             "ok": ok,
                             "metrics": {
-                                "edge_bind": m.edge_bind,
+                                "edge_ordered_admit": m.edge_ordered_admit,
                                 "edge_wait_for": m.edge_wait_for,
-                                "edge_unfenced": m.edge_unfenced,
+                                "edge_optimistic_read": m.edge_optimistic_read,
                                 "avoid_broadcasts": m.avoid_broadcasts,
                                 "canary_probes": m.canary_probes,
-                                "independent_unfenced": m.independent_unfenced,
+                                "independent_optimistic_read": m.independent_optimistic_read,
                                 "soft_wait_arms": soft,
                                 "occ_aborts": aborts,
                             },
@@ -702,12 +704,12 @@ fn main() {
                     )
                     .unwrap();
                     println!(
-                        "  process-597-warm unfenced={} wait={} bind={} unfenced_after_avoid={} hot_after_fence={} wrote {ppath:?}",
-                        proc.unfenced_total,
+                        "  process-597-warm optimistic_read={} wait={} ordered_admit={} optimistic_read_after_avoid={} hot_after_pessimistic_admit={} wrote {ppath:?}",
+                        proc.optimistic_read_total,
                         proc.wait_for_total,
-                        proc.bind_total,
-                        proc.unfenced_after_avoid_total,
-                        proc.unfenced_after_fence_on_hot_l,
+                        proc.ordered_admit_total,
+                        proc.optimistic_read_after_avoid_total,
+                        proc.optimistic_read_after_pessimistic_admit_on_hot_l,
                     );
                 }
                 x_rows.push(serde_json::json!({
@@ -720,23 +722,23 @@ fn main() {
                     "soft_wait_arms": soft,
                     "wait_hard": wh,
                     "occ_aborts": aborts,
-                    "full_restart": m.full_restart,
+                    "full_abort_reexecute": m.full_abort_reexecute,
                     "rebind_only": m.rebind_only,
-                    "edge_bind": m.edge_bind,
+                    "edge_ordered_admit": m.edge_ordered_admit,
                     "edge_wait_for": m.edge_wait_for,
-                    "edge_unfenced": m.edge_unfenced,
+                    "edge_optimistic_read": m.edge_optimistic_read,
                     "avoid_broadcasts": m.avoid_broadcasts,
                     "canary_probes": m.canary_probes,
-                    "independent_unfenced": m.independent_unfenced,
+                    "independent_optimistic_read": m.independent_optimistic_read,
                     "spine_waits": m.spine_waits,
                     "sketch_hot_size": m.sketch_hot_size,
                     "wait_park_count": m.wait_park_count,
-                    "force_prefix_unfenced": m.force_prefix_unfenced,
+                    "force_prefix_optimistic_read": m.force_prefix_optimistic_read,
                     "prefer_admit": m.prefer_admit,
                     "multi_spine_admit": m.multi_spine_admit,
-                    "quiet_fence_revoke": m.quiet_fence_revoke,
+                    "quiet_pessimistic_revoke": m.quiet_pessimistic_revoke,
                     "writer_identity_preserved": m.writer_identity_preserved,
-                    "bind_residual": m.bind_residual,
+                    "ordered_admit_residual": m.ordered_admit_residual,
                     "canary_reopen": m.canary_reopen,
                     "writer_done_learned": m.writer_done_learned,
                 }));
@@ -773,11 +775,11 @@ fn main() {
                         "soft_wait_arms": soft,
                         "wait_hard": wh,
                         "occ_aborts": aborts,
-                        "full_restart": m.full_restart,
+                        "full_abort_reexecute": m.full_abort_reexecute,
                         "rebind_only": m.rebind_only,
-                        "edge_bind": m.edge_bind,
+                        "edge_ordered_admit": m.edge_ordered_admit,
                         "edge_wait_for": m.edge_wait_for,
-                        "edge_unfenced": m.edge_unfenced,
+                        "edge_optimistic_read": m.edge_optimistic_read,
                         "avoid_broadcasts": m.avoid_broadcasts,
                         "wait_park_count": m.wait_park_count,
                     }));

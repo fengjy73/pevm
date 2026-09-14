@@ -235,7 +235,7 @@ impl Pevm {
         &self.last_metrics
     }
 
-    /// Process-level Fence/Unfenced reason histogram + hot-ℓ split (last block).
+    /// Process-level Fence/OptimisticRead reason histogram + hot-ℓ split (last block).
     pub const fn last_exec_process(&self) -> &ExecProcessSnapshot {
         &self.last_process
     }
@@ -468,7 +468,7 @@ impl Pevm {
             );
             if quiet && !learner.has_any_predicted() {
                 let n = sketch.revoke_prior_fences_if_quiet(true);
-                metrics_inner.record_quiet_fence_revoke(n);
+                metrics_inner.record_quiet_pessimistic_revoke(n);
             }
         }
         let wave_ref = crate::specfence::wave_for_mode(self.concurrency_mode, &wave);
@@ -633,7 +633,7 @@ impl Pevm {
         if self.concurrency_mode == ConcurrencyMode::Pcc {
             update_heat(&self.heat, &hints, &metrics_inner, block_env.beneficiary);
         }
-        let (mean_wait, mean_p_at_wait, mean_p_at_spec) =
+        let (mean_wait, mean_p_at_wait, mean_p_at_optimistic_read) =
             if self.concurrency_mode == ConcurrencyMode::SpecFence {
                 update_bayes(&self.bayes);
                 update_rw_prior(&self.rw_prior);
@@ -672,8 +672,10 @@ impl Pevm {
                 }
             }
         }
-        metrics_inner
-            .set_park_resume_metrics(wave.park_resume_at_k(), wave.park_resume_full_retry());
+        metrics_inner.set_park_resume_metrics(
+            wave.park_resume_at_k(),
+            wave.park_resume_full_abort_reexecute(),
+        );
         if self.concurrency_mode == ConcurrencyMode::SpecFence {
             self.hotset.end_block();
             // P1: pack InterBlockPrior from live morph hat + top-ℓ (flip → higher α).
@@ -698,7 +700,7 @@ impl Pevm {
             wave_id,
             mean_wait,
             mean_p_at_wait,
-            mean_p_at_spec,
+            mean_p_at_optimistic_read,
             wave.wave_width_mean(),
         );
         if self.concurrency_mode == ConcurrencyMode::SpecFence {
@@ -878,7 +880,7 @@ impl Pevm {
                 return None;
             }
             // P4: SoftWait wake may have restored a (t,k) resume intent — arm RewindTo/FF
-            // or FullRetry while the parked incarnation journal is still intact.
+            // or FullAbortReexecute while the parked incarnation journal is still intact.
             if let Some(wave) = wave {
                 vm.try_apply_park_resume(tx_version.tx_idx, wave);
             }
@@ -917,11 +919,12 @@ impl Pevm {
                     let park_kind = pending
                         .map(|p| p.kind)
                         .unwrap_or(crate::specfence::ParkKind::BlockingOther);
-                    // PinWithoutThrow: park Stage without add_dependency→Aborting.
+                    // wait_for_dependency: park Stage without add_dependency→Aborting.
                     // BlockingOther ESTIMATE may still Aborting+steal-convert.
-                    let pinned = park_kind == crate::specfence::ParkKind::PinHold;
-                    let parked = if pinned {
-                        scheduler.add_pin_hold(tx_version.tx_idx, blocking_tx_idx)
+                    let waiting_for_dependency =
+                        park_kind == crate::specfence::ParkKind::WaitForDependency;
+                    let parked = if waiting_for_dependency {
+                        scheduler.add_wait_for_dependency(tx_version.tx_idx, blocking_tx_idx)
                     } else {
                         scheduler.add_dependency(tx_version.tx_idx, blocking_tx_idx)
                     };
@@ -941,10 +944,10 @@ impl Pevm {
                                 return Some(stolen);
                             }
                         }
-                        if pinned {
-                            vm.record_waitfor_pin();
+                        if waiting_for_dependency {
+                            vm.record_wait_for_dependency();
                         } else if park_kind == crate::specfence::ParkKind::BlockingOther {
-                            vm.record_waitfor_aborting();
+                            vm.record_wait_for_full_abort();
                         }
                         wave.park_with_kind(
                             tx_version.tx_idx,
@@ -1028,7 +1031,7 @@ fn scan_invalid_spine(
 
 /// Structural repair heat: executing spine + any fan, unless quiet Fence-off.
 fn structural_spine_hot(heat: &SpineHeat, learner: &LiveLearner) -> bool {
-    if learner.quiet_fence_off() {
+    if learner.quiet_pessimistic_off() {
         return false;
     }
     heat.has_executing && heat.best_fan >= 2
@@ -1123,7 +1126,7 @@ fn try_validate(
         };
         true_suffix_flag = true_suffix;
         // Cost-class: no yield-spin to manufacture RebindThis. If Data is
-        // already published, R1a fires below; else B0 OCC reincarnation.
+        // already published, PartialAbortRebind fires below; else full_abort_reexecute OCC reincarnation.
         // Value-stable RebindOnly: same-output republish (Estimate→Data / incarnation
         // bump) is safe without reexec. Snap match first; else prior-origin MV value
         // vs current Data (covers lean paths that skipped snaps). try_rebind refuses
@@ -1174,12 +1177,12 @@ fn try_validate(
         if identity_held {
             specfence.learner.note_identity_hit();
         }
-        let r1_eligible = value_stable
+        let partial_abort_eligible = value_stable
             || (identity_held
                 && estimate_cleared
                 && !true_suffix
-                && specfence.learner.r1_first_bias());
-        let rebound = if r1_eligible || value_stable {
+                && specfence.learner.partial_abort_first_bias());
+        let rebound = if partial_abort_eligible || value_stable {
             mv_memory.try_rebind_invalid_reads_value_stable(tx_version.tx_idx, &invalid)
         } else if !true_suffix {
             mv_memory.try_rebind_invalid_reads(tx_version.tx_idx, &invalid)
@@ -1187,10 +1190,12 @@ fn try_validate(
             false
         };
         if rebound {
-            specfence.learner.note_resolve_r1();
+            specfence.learner.note_resolve_partial_abort();
             specfence.metrics.record_partial_retry();
             specfence.metrics.record_rebind_only();
-            specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
+            specfence
+                .partial_retry
+                .clear_force_ordered_admit(tx_version.tx_idx);
             specfence
                 .partial_retry
                 .clear_force_writers(tx_version.tx_idx);
@@ -1224,7 +1229,7 @@ fn try_validate(
     // SoftWait Soft=0; no Estimate park; no pre-abort Executing drain spin (15b).
     // Unsafe for true_suffix (published writes may poison higher readers).
     // Cost-class: validation-defer is WaitFor-park on the resolve path
-    // (fleet-parks independents). Hang-freedom is B0 reincarnation.
+    // (fleet-parks independents). Hang-freedom is full_abort_reexecute reincarnation.
     if false
         && !read_set_valid
         && !true_suffix_flag
@@ -1264,13 +1269,13 @@ fn try_validate(
                     specfence.metrics.record_writer_identity_preserved();
                 }
             }
-            // Dig: abort while prior ForceBind / SoftWait-wake still armed.
-            let prior_force_bind = specfence
+            // Dig: abort while prior ForceOrderedAdmit / SoftWait-wake still armed.
+            let prior_force_ordered_admit = specfence
                 .partial_retry
-                .force_bind_locations(tx_version.tx_idx);
-            let was_force_bind = !prior_force_bind.is_empty();
-            if was_force_bind {
-                specfence.metrics.record_force_bind_reabort();
+                .force_ordered_admit_locations(tx_version.tx_idx);
+            let was_force_ordered_admit = !prior_force_ordered_admit.is_empty();
+            if was_force_ordered_admit {
+                specfence.metrics.record_force_ordered_admit_reabort();
             }
             // Iter5: anti-livelock — jumped capture/jump resume that still aborted
             // disables further absolute jumps for this tx.
@@ -1293,8 +1298,8 @@ fn try_validate(
                 .unwrap_or_else(|| mv_memory.write_locations(tx_version.tx_idx));
             let read_locations = cached_read_locations
                 .unwrap_or_else(|| mv_memory.read_locations(tx_version.tx_idx));
-            // Break force_bind_reabort ≈ resume loop:
-            //  (1) escalate after 1 reabort → clear force_bind + OCC FullRestart
+            // Break force_ordered_admit_reabort ≈ resume loop:
+            //  (1) escalate after 1 reabort → clear force_ordered_admit + OCC FullAbortReexecute
             //  (3) cap SuffixRepair depth (≥2) → same escalate
             // Iter2: delay fb escalate only when preview shows jump_is_safe
             // (avoids 599/097 fb storms from blind live-snap defer).
@@ -1303,7 +1308,7 @@ fn try_validate(
                 .partial_retry
                 .suffix_repair_depth(tx_version.tx_idx);
             // Iter6: when RewindTo / FF resume values are armed, allow longer
-            // SuffixRepair (depth>=3) before FullRestart — head-FF still retained
+            // SuffixRepair (depth>=3) before FullAbortReexecute — head-FF still retained
             // on escalate (Iter5). Without cheap resume, keep classic escalate.
             // No Lean jump / SoftWait Soft.
             let cheap_resume = specfence.partial_retry.is_rewind_resume(tx_version.tx_idx)
@@ -1312,24 +1317,24 @@ fn try_validate(
                     .has_ff_resume_values(tx_version.tx_idx)
                 || specfence.partial_retry.has_ff_head(tx_version.tx_idx);
             // depth>=2 with cheap_resume: one extra SuffixRepair vs classic
-            // was_force_bind escalate-at-1 (Iter6 measure: depth>=3 cut fr but
+            // was_force_ordered_admit escalate-at-1 (Iter6 measure: depth>=3 cut fr but
             // wall↑ from fb loops — prefer one extra repair only).
             let mut escalate = if cheap_resume {
                 repair_depth >= 2
             } else {
-                was_force_bind || repair_depth >= 2
+                was_force_ordered_admit || repair_depth >= 2
             };
             let mut fanout_collapse = false;
             let mut fanout_absorb = false;
             // Iter12d: skip doomed 2nd SuffixRepair when fail-loc writers are
             // ESTIMATE/Aborting but an Executing spine writer exists for
-            // serial-barrier — prefer one FullRestart behind Data over a
-            // SpecRead-through-ESTIMATE resume that will reabort.
+            // serial-barrier — prefer one FullAbortReexecute behind Data over a
+            // OptimisticRead-through-ESTIMATE resume that will reabort.
             if !escalate
-                && was_force_bind
+                && was_force_ordered_admit
                 && cheap_resume
                 && repair_depth >= 1
-                && !specfence.learner.quiet_fence_off()
+                && !specfence.learner.quiet_pessimistic_off()
             {
                 let mut has_estimate_or_aborting = false;
                 let mut has_executing_spine = false;
@@ -1356,17 +1361,22 @@ fn try_validate(
                 }
             }
             // Iter16: cheap absorb for first-fail true_suffix + high-fan Executing
-            // spine — SuffixRepair+first_repair_await (no FullRestart) so certified
+            // spine — SuffixRepair+first_repair_await (no FullAbortReexecute) so certified
             // prefix / RewindTo+FF survive until spine publishes Data.
-            // Reserve Iter15 FullRestart collapse only when fail-loc writers are
+            // Reserve Iter15 FullAbortReexecute collapse only when fail-loc writers are
             // Estimate/Aborting *and* an Executing spine exists (doomed resume).
             // SoftWait Soft=0; no sibling park; Estimate park OFF; no 15b drain.
-            // Cost-class: SuffixRepair+absorb loses to OCC B0 (19807137 rewind).
-            if false && !escalate && !was_force_bind && repair_depth == 0 && true_suffix_flag {
+            // Cost-class: SuffixRepair+absorb loses to OCC full_abort_reexecute (19807137 rewind).
+            if false
+                && !escalate
+                && !was_force_ordered_admit
+                && repair_depth == 0
+                && true_suffix_flag
+            {
                 let heat = scan_invalid_spine(mv_memory, scheduler, tx_version.tx_idx, &invalid);
                 if structural_spine_hot(&heat, specfence.learner) {
                     if heat.has_estimate_or_aborting {
-                        // Doomed SpecRead-through-ESTIMATE — FR+barrier, no Storm gate.
+                        // Doomed OptimisticRead-through-ESTIMATE — FR+barrier, no Storm gate.
                         escalate = true;
                         fanout_collapse = true;
                         specfence.metrics.record_fanout_fr_collapse();
@@ -1378,10 +1388,10 @@ fn try_validate(
                 }
             }
             let repair = if escalate {
-                // Drop sticky force_bind; retain certified FF values for head reexec.
+                // Drop sticky force_ordered_admit; retain certified FF values for head reexec.
                 specfence
                     .partial_retry
-                    .escalate_full_restart(tx_version.tx_idx)
+                    .escalate_full_abort_reexecute(tx_version.tx_idx)
             } else {
                 let plan = cached_plan.clone().unwrap_or_else(|| {
                     specfence.partial_retry.plan_partial_retry(
@@ -1394,24 +1404,24 @@ fn try_validate(
                 let repair = specfence
                     .partial_retry
                     .apply_suffix_repair_planned(tx_version.tx_idx, plan.clone());
-                if matches!(repair, LeanAbortRepair::FullRestart { .. })
+                if matches!(repair, LeanAbortRepair::FullAbortReexecute { .. })
                     && plan.as_ref().is_some_and(|p| !p.certified.is_empty())
                 {
-                    specfence.metrics.record_prefix_skip_roi_b0();
+                    specfence.metrics.record_prefix_skip_roi_full_abort();
                 }
-                if repair.did_force_bind() {
+                if repair.did_force_ordered_admit() {
                     specfence
                         .partial_retry
                         .note_suffix_repair(tx_version.tx_idx);
                 }
                 repair
             };
-            if repair.did_force_bind() {
+            if repair.did_force_ordered_admit() {
                 specfence.metrics.record_partial_retry();
             }
             // A∩B: after SuffixRepair (not escalate), sticky conflict ℓ so other
             // consumers prefer BO Await; mark live-capture only when write_replays
-            // exist (Iter2: Storage+WR path — not bare force_bind 4× inspect).
+            // exist (Iter2: Storage+WR path — not bare force_ordered_admit 4× inspect).
             if !escalate {
                 // Iter16b: fanout_absorb skips sticky — sticky BO Await was the
                 // wall tax when SuffixRepair replaced early FR (N5 med 20.3).
@@ -1420,17 +1430,17 @@ fn try_validate(
                         specfence.learner.note_sticky_resolve(*location);
                     }
                 }
-                // Iter7: on *second* repair arm (was_force_bind), union fail locs into
-                // force_bind so force_prefix-Awaits them until Validated. First repair
-                // relies on sticky note alone (early force_bind-extend wall↑ via BO).
+                // Iter7: on *second* repair arm (was_force_ordered_admit), union fail locs into
+                // force_ordered_admit so force_prefix-Awaits them until Validated. First repair
+                // relies on sticky note alone (early force_ordered_admit-extend wall↑ via BO).
                 // Narrow: conflict invalid only — not SoftWait Soft / storm fanout.
-                if was_force_bind {
+                if was_force_ordered_admit {
                     specfence
                         .partial_retry
-                        .extend_force_bind(tx_version.tx_idx, &invalid);
+                        .extend_force_ordered_admit(tx_version.tx_idx, &invalid);
                 }
                 // Iter2: prime live snap on SuffixRepair resumes (Storage FF path).
-                // Capture is still gated in vm.rs on storage_prefix; not bare ForceBind.
+                // Capture is still gated in vm.rs on storage_prefix; not bare ForceOrderedAdmit.
                 if repair.is_suffix_repair() {
                     specfence
                         .partial_retry
@@ -1464,7 +1474,7 @@ fn try_validate(
                         estimated
                     }
                 }
-                LeanAbortRepair::ForceBind { suffix_writes, .. } => {
+                LeanAbortRepair::ForceOrderedAdmit { suffix_writes, .. } => {
                     // Certified prefix without mid-tx cp: ESTIMATE failed suffix only.
                     // Never invalidate_selective here — aborted stamp + ESTIMATE would
                     // poison ForceBound prefix Data and drive BlockingOther parks.
@@ -1488,10 +1498,10 @@ fn try_validate(
                         estimated
                     }
                 }
-                LeanAbortRepair::FullRestart { .. } => {
-                    // B0 / escalate: OCC-identical full invalidate. Never protect
-                    // a ForceBind prefix we chose not to PrefixSkip (seq≠par).
-                    let _ = (escalate, prior_force_bind);
+                LeanAbortRepair::FullAbortReexecute { .. } => {
+                    // full_abort_reexecute / escalate: OCC-identical full invalidate. Never protect
+                    // a ForceOrderedAdmit prefix we chose not to PrefixSkip (seq≠par).
+                    let _ = (escalate, prior_force_ordered_admit);
                     let (estimated, fallback) = mv_memory
                         .invalidate_selective(tx_version.tx_idx, Some(tx_version.tx_incarnation));
                     if fallback {
@@ -1501,7 +1511,7 @@ fn try_validate(
                             .metrics
                             .record_selective_invalidate(estimated.len());
                     }
-                    specfence.metrics.record_full_restart();
+                    specfence.metrics.record_full_abort_reexecute();
                     write_locations.clone()
                 }
             };
@@ -1552,14 +1562,14 @@ fn try_validate(
             // V5-P0: engagement.note_abort is metrics-only (no HotSet storm insert).
             let _ = specfence.engagement.note_abort();
             // Iter14: schedule-side Validated Await *before first SuffixRepair resume*.
-            // After arming first SuffixRepair (!was_force_bind), park behind Executing
-            // conflict writer so resume sees Data — cut doomed SpecRead-through-
+            // After arming first SuffixRepair (!was_force_ordered_admit), park behind Executing
+            // conflict writer so resume sees Data — cut doomed OptimisticRead-through-
             // unfinished first repair. Executing-only (Estimate park falsified Iter8).
             // SoftWait Soft=0; no sibling park; jump/capture OFF.
             if !escalate
-                && !was_force_bind
-                && repair.did_force_bind()
-                && !specfence.learner.quiet_fence_off()
+                && !was_force_ordered_admit
+                && repair.did_force_ordered_admit()
+                && !specfence.learner.quiet_pessimistic_off()
             {
                 let mut best: Option<(crate::TxIdx, usize)> = None;
                 for location in &invalid {
@@ -1603,12 +1613,12 @@ fn try_validate(
                     }
                 }
             }
-            // Iter7: after first SuffixRepair fail (was_force_bind, arming 2nd
+            // Iter7: after first SuffixRepair fail (was_force_ordered_admit, arming 2nd
             // SuffixRepair), sticky BO Await — park this tx behind unfinished
             // fail-loc writers until Executed/Validated before 2nd resume.
             // Iter8: first-repair Estimate park falsified (wall↑ / sra↑). SoftWait Soft=0.
             // Not SoftWait Soft; not storm-wide fanout Await (fail locs only).
-            if !escalate && was_force_bind && !specfence.learner.quiet_fence_off() {
+            if !escalate && was_force_ordered_admit && !specfence.learner.quiet_pessimistic_off() {
                 // Hang-free: only park behind *Executing* fail-loc writers (Iter3
                 // lesson). Ready/Aborting deps idle the 2nd resume (wall↑ on N=5).
                 let mut best: Option<(crate::TxIdx, usize)> = None;
@@ -1645,10 +1655,10 @@ fn try_validate(
             // (no sibling-park — Iter4 sibling hang). Executed→Validated escalate
             // spin falsified (13a wall↑).
             // Widen escalates (incl. fanout_collapse first-fail). Quiet is
-            // `quiet_fence_off` — not Storm π.
+            // `quiet_pessimistic_off` — not Storm π.
             if escalate
-                && (was_force_bind || fanout_collapse || repair_depth >= 1)
-                && !specfence.learner.quiet_fence_off()
+                && (was_force_ordered_admit || fanout_collapse || repair_depth >= 1)
+                && !specfence.learner.quiet_pessimistic_off()
                 && !specfence
                     .partial_retry
                     .serial_barrier_used(tx_version.tx_idx)
@@ -1713,15 +1723,18 @@ fn try_validate(
         };
         if specfence.mode == ConcurrencyMode::SpecFence {
             // Research-inspect abort path (`SPECFENCE_ENABLE_INSPECT`): RewindTo+FF
-            // when certified prefix + checkpoint; else same FullRestart as Lean.
-            if specfence.partial_retry.has_force_bind(tx_version.tx_idx) {
-                specfence.metrics.record_force_bind_reabort();
+            // when certified prefix + checkpoint; else same FullAbortReexecute as Lean.
+            if specfence
+                .partial_retry
+                .has_force_ordered_admit(tx_version.tx_idx)
+            {
+                specfence.metrics.record_force_ordered_admit_reabort();
                 for location in &invalid {
                     specfence.learner.note_sticky_resolve(*location);
                 }
                 specfence
                     .partial_retry
-                    .extend_force_bind(tx_version.tx_idx, &invalid);
+                    .extend_force_ordered_admit(tx_version.tx_idx, &invalid);
                 specfence
                     .partial_retry
                     .mark_needs_live_capture(tx_version.tx_idx);
@@ -1774,7 +1787,7 @@ fn try_validate(
                         .is_some()
                 {
                     first_pass += 1;
-                    specfence.metrics.record_prior_bind_miss();
+                    specfence.metrics.record_prior_ordered_admit_miss();
                 }
                 for address in specfence.hints.accounts() {
                     if address == specfence.beneficiary {
@@ -1823,12 +1836,14 @@ fn try_validate(
                         estimated
                     }
                 }
-                ResearchAbortRepair::FullRestart { .. } => research_full_restart_invalidate(
-                    &specfence,
-                    mv_memory,
-                    tx_version,
-                    &write_locations,
-                ),
+                ResearchAbortRepair::FullAbortReexecute { .. } => {
+                    research_full_abort_reexecute_invalidate(
+                        &specfence,
+                        mv_memory,
+                        tx_version,
+                        &write_locations,
+                    )
+                }
             };
 
             let rewind_to = mv_memory.min_higher_reader_of(tx_version.tx_idx, &fence_locs);
@@ -1868,7 +1883,7 @@ fn try_validate(
         }
         specfence.metrics.record_occ_abort();
         // OCC/PCC abort always restarts interpreter from tx head on next incarnation.
-        specfence.metrics.record_full_restart();
+        specfence.metrics.record_full_abort_reexecute();
         if let Some(fg) = specfence.finegrain {
             let cascade = scheduler
                 .block_size()
@@ -1902,7 +1917,9 @@ fn try_validate(
             specfence.metrics.record_await_at_a_wake_ok();
         }
         // Successful validation clears PartialRetry / RewindTo state for this tx.
-        specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
+        specfence
+            .partial_retry
+            .clear_force_ordered_admit(tx_version.tx_idx);
         specfence
             .partial_retry
             .clear_force_writers(tx_version.tx_idx);
@@ -1914,13 +1931,13 @@ fn try_validate(
         specfence
             .partial_retry
             .clear_jump_disabled(tx_version.tx_idx);
-        // M3: fold completed WŜ into process prior (inter-block Bind-before-touch).
+        // M3: fold completed WŜ into process prior (inter-block OrderedAdmit-before-touch).
         // Block-local residual remains abort/ESTIMATE-driven (Bohm-lite); publishing
         // successful WS into residual caused WaitHard storms / M2 hangs on ERC-20.
         let writes = mv_memory.write_locations(tx_version.tx_idx);
         specfence.rw_prior.observe_write_set(&writes, None);
-        // Successful SpecRead validation: O(1) opportunity + revoke sticky Waits only.
-        // Skip O(|reads|) bayes success storm — SoftWait scarce under Bind-no-park;
+        // Successful OptimisticRead validation: O(1) opportunity + revoke sticky Waits only.
+        // Skip O(|reads|) bayes success storm — SoftWait scarce under OrderedAdmit-no-park;
         // abort-path bayes/hotset still learn conflicts.
         specfence.rem.note_checkpoint_opportunity();
         let read_locations = mv_memory.read_locations(tx_version.tx_idx);
@@ -1936,19 +1953,21 @@ fn try_validate(
     scheduler.finish_validation(tx_version, aborted)
 }
 
-/// Research-inspect FullRestart arm (shared by duplicate match arms).
-/// Clears force-bind/repair, selective-invalidates, records FullRestart metrics.
-fn research_full_restart_invalidate(
+/// Research-inspect FullAbortReexecute arm (shared by duplicate match arms).
+/// Clears force-ordered_admit/repair, selective-invalidates, records FullAbortReexecute metrics.
+fn research_full_abort_reexecute_invalidate(
     specfence: &SpecFenceCtx<'_>,
     mv_memory: &MvMemory,
     tx_version: &TxVersion,
     write_locations: &[crate::MemoryLocationHash],
 ) -> Vec<crate::MemoryLocationHash> {
-    specfence.metrics.record_tx_full_retry();
-    specfence.metrics.record_full_restart();
+    specfence.metrics.record_tx_full_abort_reexecute();
+    specfence.metrics.record_full_abort_reexecute();
     specfence.metrics.record_partial_retry_fallback_full();
     specfence.learner.note_reexec_cost(2.0);
-    specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
+    specfence
+        .partial_retry
+        .clear_force_ordered_admit(tx_version.tx_idx);
     specfence.partial_retry.clear_repair(tx_version.tx_idx);
     specfence.partial_retry.clear_ff_head(tx_version.tx_idx);
     let (estimated, fallback) =

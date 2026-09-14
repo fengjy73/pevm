@@ -16,7 +16,7 @@ use crate::{BuildIdentityHasher, MemoryLocationHash, TxIdx, TxIncarnation};
 use super::edge::access_k_class;
 use super::learner::TopLocPrior;
 
-/// Done→Data residual Bind install. Region SoT: a Fenced ℓ always has a
+/// Done→Data residual OrderedAdmit install. Region SoT: a Fenced ℓ always has a
 /// residual version (last committed Data, or Storage after writer Done∅Data).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResidualBind {
@@ -46,7 +46,7 @@ pub(crate) struct ChainTemplate {
 struct LocSketch {
     canaries: AtomicUsize,
     publishes: AtomicUsize,
-    live_unfenced: AtomicUsize,
+    live_optimistic_read: AtomicUsize,
     /// `usize::MAX` = unknown.
     predicted_writer: AtomicUsize,
     /// Reader that consumed the live canary grant (`usize::MAX` = none).
@@ -60,7 +60,7 @@ impl Default for LocSketch {
         Self {
             canaries: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
-            live_unfenced: AtomicUsize::new(0),
+            live_optimistic_read: AtomicUsize::new(0),
             predicted_writer: AtomicUsize::new(usize::MAX),
             canary_tx: AtomicUsize::new(usize::MAX),
             canary_reopened: AtomicUsize::new(0),
@@ -75,9 +75,9 @@ impl LocSketch {
     }
 }
 
-/// One canary Unfenced per hot ℓ before Avoid (A2).
+/// One canary OptimisticRead per hot ℓ before Avoid (A2).
 const CANARY_GRANT: usize = 1;
-/// Clique size at which further Unfenced on unpublished ℓ is gated (A1).
+/// Clique size at which further OptimisticRead on unpublished ℓ is gated (A1).
 const CLIQUE_UNFENCED_CAP: usize = 1;
 
 /// Ahead sketch: H + chain templates + Avoid + admission grants.
@@ -92,7 +92,7 @@ pub(crate) struct HotSketch {
     /// PredictedEssential access-class set: (\(ℓ\), \(k_{\mathrm{class}}\)).
     /// First-wave / prior template — **not** a per-ℓ sticky Wait for all \(k\).
     access_class: DashMap<(MemoryLocationHash, u8), (), FxBuildHasher>,
-    /// Done→Data residual per ℓ (Bind SoT when writer is Done∅Data).
+    /// Done→Data residual per ℓ (OrderedAdmit SoT when writer is Done∅Data).
     residuals: DashMap<MemoryLocationHash, ResidualBind, BuildIdentityHasher>,
     warm_seeded: DashSet<MemoryLocationHash, BuildIdentityHasher>,
     hot_size: AtomicUsize,
@@ -194,7 +194,7 @@ impl HotSketch {
         e.publishes.fetch_add(1, Ordering::Relaxed);
         drop(e);
         self.push_spine(location, writer);
-        // Publish installs Data residual (incarnation 0 until Bind refreshes).
+        // Publish installs Data residual (incarnation 0 until OrderedAdmit refreshes).
         self.install_data_residual(location, writer, 0);
         if self.avoid.insert(location, ()).is_none() {
             self.avoid_broadcasts.fetch_add(1, Ordering::Relaxed);
@@ -204,7 +204,7 @@ impl HotSketch {
         }
     }
 
-    /// Install last committed Data as the Region residual (Done→Bind SoT).
+    /// Install last committed Data as the Region residual (Done→OrderedAdmit SoT).
     pub(crate) fn install_data_residual(
         &self,
         location: MemoryLocationHash,
@@ -235,7 +235,10 @@ impl HotSketch {
     }
 
     #[inline]
-    pub(crate) fn residual_bind(&self, location: MemoryLocationHash) -> Option<ResidualBind> {
+    pub(crate) fn residual_ordered_admit(
+        &self,
+        location: MemoryLocationHash,
+    ) -> Option<ResidualBind> {
         self.residuals.get(&location).map(|e| *e)
     }
 
@@ -317,7 +320,7 @@ impl HotSketch {
             .is_some_and(|t| t.confidence >= CONF_LIVE)
     }
 
-    /// Try to consume the single canary Unfenced grant (A2).
+    /// Try to consume the single canary OptimisticRead grant (A2).
     /// Does **not** require H — first-wave discovery on a forming clique.
     pub(crate) fn try_canary(&self, location: MemoryLocationHash, reader: TxIdx) -> bool {
         if self.avoid_broadcast(location) {
@@ -336,7 +339,7 @@ impl HotSketch {
     }
 
     /// Re-open the canary after the probe finished without Avoid (first-wave).
-    /// Concurrent Unfenced on this ℓ stays 1; not a mass-Unfenced grant.
+    /// Concurrent OptimisticRead on this ℓ stays 1; not a mass-OptimisticRead grant.
     pub(crate) fn reopen_canary_if_probe_done(
         &self,
         location: MemoryLocationHash,
@@ -368,25 +371,25 @@ impl HotSketch {
             .is_some_and(|e| e.canaries.load(Ordering::Relaxed) >= CANARY_GRANT)
     }
 
-    pub(crate) fn note_unfenced(&self, location: MemoryLocationHash) {
+    pub(crate) fn note_optimistic_read(&self, location: MemoryLocationHash) {
         self.locs
             .entry(location)
             .or_default()
-            .live_unfenced
+            .live_optimistic_read
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A1: mass Unfenced on unpublished clique is gated after the canary.
+    /// A1: mass OptimisticRead on unpublished clique is gated after the canary.
     pub(crate) fn clique_gated(&self, location: MemoryLocationHash) -> bool {
         if !self.in_h(location) && !self.avoid_broadcast(location) && !self.canary_taken(location) {
             return false;
         }
-        let unfenced = self
+        let optimistic_read = self
             .locs
             .get(&location)
-            .map(|e| e.live_unfenced.load(Ordering::Relaxed))
+            .map(|e| e.live_optimistic_read.load(Ordering::Relaxed))
             .unwrap_or(0);
-        if unfenced >= CLIQUE_UNFENCED_CAP || self.canary_taken(location) {
+        if optimistic_read >= CLIQUE_UNFENCED_CAP || self.canary_taken(location) {
             self.clique_gates.fetch_add(1, Ordering::Relaxed);
             true
         } else {
@@ -394,7 +397,7 @@ impl HotSketch {
         }
     }
 
-    /// A4: no PredictedEssential access-class on \(ℓ\) → Unfenced≡OCC.
+    /// A4: no PredictedEssential access-class on \(ℓ\) → OptimisticRead≡OCC.
     /// H / canary / location-wide Avoid are **not** independence keys.
     pub(crate) fn independence_certified(&self, location: MemoryLocationHash) -> bool {
         !self.has_access_class(location)
@@ -621,7 +624,7 @@ mod tests {
         assert!(s.broadcast_avoid(1, 0));
         assert!(s.avoid_broadcast(1));
         assert!(!s.try_canary(1, 5));
-        s.note_unfenced(1);
+        s.note_optimistic_read(1);
         assert!(s.clique_gated(1));
     }
 
@@ -863,12 +866,12 @@ mod tests {
         let r = s.install_done_residual(3, 4);
         assert_eq!(r, ResidualBind::Storage { writer: 4 });
         assert_eq!(
-            s.residual_bind(3),
+            s.residual_ordered_admit(3),
             Some(ResidualBind::Storage { writer: 4 })
         );
         s.install_data_residual(3, 2, 1);
         assert!(matches!(
-            s.residual_bind(3),
+            s.residual_ordered_admit(3),
             Some(ResidualBind::Data {
                 tx_idx: 2,
                 tx_incarnation: 1

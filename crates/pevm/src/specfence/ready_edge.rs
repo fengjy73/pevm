@@ -26,7 +26,7 @@ pub(crate) struct ReadyEdgeTable {
     /// Producers that have already `note_producer_done` — stale
     /// `note_consumer` after Done must not refuse forever.
     finished: DashMap<TxIdx, (), BuildIdentityHasher>,
-    /// Predicted RAW producer tip per ℓ (CC Bind-rare: tip == this writer).
+    /// Predicted RAW producer tip per ℓ (CC OrderedAdmit-rare: tip == this writer).
     tips: DashMap<MemoryLocationHash, AtomicUsize, BuildIdentityHasher>,
     deferred: Mutex<Vec<TxIdx>>,
     refuse: AtomicUsize,
@@ -75,7 +75,7 @@ impl ReadyEdgeTable {
         }
     }
 
-    /// Abort / HotSet RAW producer identity for Bind-rare tip check.
+    /// Abort / HotSet RAW producer identity for OrderedAdmit-rare tip check.
     #[inline]
     pub(crate) fn note_raw_producer(&self, location: MemoryLocationHash, writer: TxIdx) {
         self.note_unpublished(location, writer);
@@ -85,7 +85,7 @@ impl ReadyEdgeTable {
             .store(writer, Ordering::Relaxed);
     }
 
-    /// Predicted conflicting producer for \(\ell\) (none ⇒ Bind forbidden).
+    /// Predicted conflicting producer for \(\ell\) (none ⇒ OrderedAdmit forbidden).
     #[inline]
     pub(crate) fn predicted_producer(&self, location: MemoryLocationHash) -> Option<TxIdx> {
         self.tips

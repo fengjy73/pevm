@@ -48,17 +48,17 @@ pub(crate) struct Scheduler {
     // TODO: Consider packing [TxStatus]s into atomics instead of
     // [Mutex] given how small they are.
     transactions_status: Vec<Mutex<TxStatus>>,
-    // Lock-free mirror: true iff status is Executed|Validated (Bind/Wait hot path).
+    // Lock-free mirror: true iff status is Executed|Validated (OrderedAdmit/Wait hot path).
     done_flags: Vec<AtomicBool>,
     // Lock-free mirror: true iff status is Validated (Iter12 ESTIMATE-race gate).
-    // Bind-on-Executed can still see ESTIMATE if the writer later aborts; 2nd-repair
+    // OrderedAdmit-on-Executed can still see ESTIMATE if the writer later aborts; 2nd-repair
     // / serial-barrier paths spin for Validated without SoftWait Soft park tax.
     validated_flags: Vec<AtomicBool>,
     // The list of dependent transactions to resume when the
     // key transaction is re-executed.
     transactions_dependents: Vec<Mutex<SmallVec<[TxIdx; 1]>>>,
-    /// PinWithoutThrow waiters: park without `Aborting`; wake keeps incarnation.
-    pin_dependents: Vec<Mutex<SmallVec<[TxIdx; 1]>>>,
+    /// wait_for_dependency waiters: park without `Aborting`; wake keeps incarnation.
+    wait_for_dependency_waiters: Vec<Mutex<SmallVec<[TxIdx; 1]>>>,
     // The next transaction to try and execute.
     execution_idx: AtomicUsize,
     // The next transaction to try and validate.
@@ -91,7 +91,7 @@ impl Scheduler {
             done_flags: (0..block_size).map(|_| AtomicBool::new(false)).collect(),
             validated_flags: (0..block_size).map(|_| AtomicBool::new(false)).collect(),
             transactions_dependents: (0..block_size).map(|_| Mutex::default()).collect(),
-            pin_dependents: (0..block_size).map(|_| Mutex::default()).collect(),
+            wait_for_dependency_waiters: (0..block_size).map(|_| Mutex::default()).collect(),
             // We won't validate until we find the first non-lazy transaction that
             // needs to read explicit values. We also skip the first transaction.
             validation_idx: AtomicUsize::new(block_size),
@@ -385,13 +385,13 @@ impl Scheduler {
         true
     }
 
-    /// PinWithoutThrow: park `tx_idx` behind `blocking_tx_idx` **without**
+    /// wait_for_dependency: park `tx_idx` behind `blocking_tx_idx` **without**
     /// `Aborting` or incarnation++. Status stays `Executing` (worker has left)
-    /// until the writer finishes and [`Self::set_pin_ready`] restores Ready
+    /// until the writer finishes and [`Self::set_wait_for_dependency_ready`] restores Ready
     /// at the same incarnation.
     ///
     /// Returns `false` if the writer is already Executed|Validated (race).
-    pub(crate) fn add_pin_hold(&self, tx_idx: TxIdx, blocking_tx_idx: TxIdx) -> bool {
+    pub(crate) fn add_wait_for_dependency(&self, tx_idx: TxIdx, blocking_tx_idx: TxIdx) -> bool {
         let blocking_tx = index_mutex!(self.transactions_status, blocking_tx_idx);
         if matches!(
             blocking_tx.status,
@@ -404,13 +404,14 @@ impl Scheduler {
         debug_assert_eq!(tx.status, IncarnationStatus::Executing);
         drop(tx);
 
-        let mut pin_dependents = index_mutex!(self.pin_dependents, blocking_tx_idx);
-        pin_dependents.push(tx_idx);
+        let mut wait_for_dependency_waiters =
+            index_mutex!(self.wait_for_dependency_waiters, blocking_tx_idx);
+        wait_for_dependency_waiters.push(tx_idx);
         true
     }
 
-    /// Wake a PinHold waiter: Ready at the **same** incarnation (no FullRetry throw).
-    fn set_pin_ready(&self, tx_idx: TxIdx) {
+    /// Wake a WaitForDependency waiter: Ready at the **same** incarnation (no FullAbortReexecute throw).
+    fn set_wait_for_dependency_ready(&self, tx_idx: TxIdx) {
         let mut tx = index_mutex!(self.transactions_status, tx_idx);
         if tx.status != IncarnationStatus::Executing {
             return;
@@ -421,7 +422,7 @@ impl Scheduler {
 
     /// Iter3 serial-barrier resolve: after validation abort the tx is already
     /// `Aborting`. Park it behind an unfinished writer (`blocking_tx_idx`) so the
-    /// FullRestart runs once writers have published Data — SpecFence-native
+    /// FullAbortReexecute runs once writers have published Data — SpecFence-native
     /// barrier, not a global OCC serialize.
     ///
     /// Returns `false` if the writer is already Executed|Validated (race).
@@ -525,7 +526,7 @@ impl Scheduler {
     }
 
     /// A1/D6: pull the spine writer into the ready queue so WaitFor targets
-    /// make progress without Unfenced on known essentials.
+    /// make progress without OptimisticRead on known essentials.
     pub(crate) fn admit_spine(&self, tx_idx: TxIdx, wave: &WaveParkTable) {
         self.admit_spine_heat(tx_idx, wave, false);
     }
@@ -631,14 +632,14 @@ impl Scheduler {
         // Drain dependents first; set Executed/Validated *before* waking so SoftWait
         // `is_done` is true as soon as the writer lock is released / waiters proceed.
         let mut drained: SmallVec<[TxIdx; 4]> = SmallVec::new();
-        let mut pin_drained: SmallVec<[TxIdx; 4]> = SmallVec::new();
+        let mut wait_for_dependency_drained: SmallVec<[TxIdx; 4]> = SmallVec::new();
         {
             let mut dependents = index_mutex!(self.transactions_dependents, tx_version.tx_idx);
             drained.extend(dependents.drain(..));
         }
         {
-            let mut pins = index_mutex!(self.pin_dependents, tx_version.tx_idx);
-            pin_drained.extend(pins.drain(..));
+            let mut pins = index_mutex!(self.wait_for_dependency_waiters, tx_version.tx_idx);
+            wait_for_dependency_drained.extend(pins.drain(..));
         }
 
         // TODO: Simplify or better document this logic.
@@ -705,7 +706,7 @@ impl Scheduler {
         // add_dependency cannot lose a waiter between drain and Ready.
         // Iter16: validate-defer waiters stay Executed|Validated — re-queue
         // Validation (same incarnation, no reexec / no invalidate). Aborting
-        // dependents still go Ready→reexec (SuffixRepair / FullRestart).
+        // dependents still go Ready→reexec (SuffixRepair / FullAbortReexecute).
         for tx_idx in drained {
             let revalidate = {
                 let tx = index_mutex!(self.transactions_status, tx_idx);
@@ -724,9 +725,9 @@ impl Scheduler {
                 }
             }
         }
-        // PinHold: same-incarnation Ready (no Aborting / no incarnation++).
-        for tx_idx in pin_drained {
-            self.set_pin_ready(tx_idx);
+        // WaitForDependency: same-incarnation Ready (no Aborting / no incarnation++).
+        for tx_idx in wait_for_dependency_drained {
+            self.set_wait_for_dependency_ready(tx_idx);
             self.execution_idx.fetch_min(tx_idx, Ordering::Relaxed);
             if let Some(wave) = wave {
                 wave.push_ready(tx_idx);
@@ -963,13 +964,16 @@ mod tests {
     }
 
     #[test]
-    fn pin_hold_does_not_abort_or_bump_incarnation() {
+    fn wait_for_dependency_does_not_abort_or_bump_incarnation() {
         let s = Scheduler::new(3);
         let p = s.try_execute(0).unwrap();
         let c = s.try_execute(1).unwrap();
         assert_eq!(c.tx_incarnation, 0);
-        assert!(s.add_pin_hold(1, 0));
-        assert!(s.is_executing(1), "PinHold must not mark Aborting");
+        assert!(s.add_wait_for_dependency(1, 0));
+        assert!(
+            s.is_executing(1),
+            "WaitForDependency must not mark Aborting"
+        );
         assert!(!s.is_aborting(1));
         let _ = s.finish_execution(
             TxVersion {
@@ -980,11 +984,14 @@ mod tests {
         );
         assert!(s.is_ready(1));
         let again = s.try_execute(1).expect("same-incarnation resume");
-        assert_eq!(again.tx_incarnation, 0, "PinWithoutThrow keeps incarnation");
+        assert_eq!(
+            again.tx_incarnation, 0,
+            "wait_for_dependency keeps incarnation"
+        );
     }
 
     #[test]
-    fn pin_hold_loses_race_when_writer_done() {
+    fn wait_for_dependency_loses_race_when_writer_done() {
         let s = Scheduler::new(2);
         let p = s.try_execute(0).unwrap();
         let _ = s.finish_execution(
@@ -996,8 +1003,8 @@ mod tests {
         );
         let _ = s.try_execute(1).unwrap();
         assert!(
-            !s.add_pin_hold(1, 0),
-            "writer already Done must not pin forever"
+            !s.add_wait_for_dependency(1, 0),
+            "writer already Done must not wait_for_dependency forever"
         );
     }
 }

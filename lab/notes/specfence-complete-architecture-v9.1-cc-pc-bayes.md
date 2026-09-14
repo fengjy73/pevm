@@ -1,5 +1,7 @@
 # SpecFence complete architecture v9.1 — PC⊗CC⊗Bayes call-flow rewrite (AUTHORITATIVE SoT)
 
+**Live CC vocabulary:** [`specfence-cc-glossary.md`](specfence-cc-glossary.md) — Pin/R1/B0/Unfenced/Bind nicknames are retired.
+
 **Date:** 2026-09-14 (Asia/Shanghai, UTC+8)  
 **Status:** **AUTHORITATIVE design SoT — design only; DO NOT implement Rust yet**  
 **Tip at write:** `bb67ff7`  

@@ -1,8 +1,8 @@
 //! Frozen-grain Detect + `choose_edge_action` (v4.1-frozen π).
 //!
-//! **Spec = Region** (this `EdgeKey`), not speculate. Optimistic access is
-//! [`EdgeAction::Unfenced`] ≡ OCC-cost for **this** access when
-//! ¬PredictedEssential. Fence = Bind / WaitFor / serial-lane / ordered-admit
+//! Region is this `EdgeKey`, not “speculate”. Optimistic access is
+//! [`EdgeAction::OptimisticRead`] ≡ OCC-cost for **this** access when
+//! ¬PredictedEssential. Pessimistic admit = OrderedAdmit / WaitFor / serial-lane
 //! on **this** \(a\) only — never sticky Wait-on-tx.
 //!
 //! Frozen π:
@@ -72,13 +72,13 @@ pub(crate) struct EdgeRec {
 /// Spec is the Region (`EdgeKey`); it is not a verb on this enum.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum EdgeAction {
-    /// Fence: install a published version (A3). Writer need not be Validated.
-    Bind(TxVersion),
-    /// Fence: WaitFor unpublished PredictedEssential writer (this \(a\) only).
+    /// Pessimistic admit: install a published version (A3). Writer need not be Validated.
+    OrderedAdmit(TxVersion),
+    /// Pessimistic admit: WaitFor unpublished PredictedEssential writer (this \(a\) only).
     WaitFor(TxIdx),
     /// No Region barrier — ¬PredictedEssential / independence ≡ OCC for this \(a\).
-    /// Not Spec. Spec = Region. Never a canary / ForcePrefix tax class.
-    Unfenced,
+    /// Region is the control unit. Never a canary / ForcePrefix tax class.
+    OptimisticRead,
 }
 
 /// Access-class bucket for PredictedEssential(\(ℓ,k,\mathrm{morph}\)).
@@ -101,7 +101,7 @@ pub(crate) fn access_k_class(k: u32) -> u8 {
 /// **Observe only:** H, prior_warm, canary, clique, force_prefix, morph,
 /// `writer_validated`, Ready/Executing, avoid-as-ℓ-sticky.
 /// **Exclude as Avoid keys:** `inc`, canary verb, `force_prefix`, H-OR,
-/// morph actuator, `writer_validated` Bind gate, flat `(ℓ,reader)`.
+/// morph actuator, `writer_validated` OrderedAdmit gate, flat `(ℓ,reader)`.
 #[derive(Debug, Clone)]
 pub(crate) struct EdgeView {
     pub location: MemoryLocationHash,
@@ -109,10 +109,10 @@ pub(crate) struct EdgeView {
     pub access_k: u32,
     pub access_depth: u8,
     pub writer: Option<TxIdx>,
-    pub bind_version: Option<TxVersion>,
-    /// True when MV has non-ESTIMATE Data (A3). Not a Bind gate.
+    pub ordered_admit_version: Option<TxVersion>,
+    /// True when MV has non-ESTIMATE Data (A3). Not a OrderedAdmit gate.
     pub writer_published: bool,
-    /// Observe / metric only — **not** a Bind gate (A3).
+    /// Observe / metric only — **not** a OrderedAdmit gate (A3).
     pub writer_validated: bool,
     pub is_program: bool,
     /// Observe / prior only — **banned** as Wait OR-door.
@@ -122,7 +122,7 @@ pub(crate) struct EdgeView {
     pub avoid_broadcast: bool,
     /// Exclude: canary as live verb. Always ignored by classify.
     pub canary_ok: bool,
-    /// A4: ¬PredictedEssential certificate → Unfenced≡OCC.
+    /// A4: ¬PredictedEssential certificate → OptimisticRead≡OCC.
     pub independence_certified: bool,
     /// Live gate: PredictedEssential(\(ℓ,k,\mathrm{morph}\)) for **this** \(a\).
     pub predicted_essential: bool,
@@ -134,7 +134,7 @@ pub(crate) struct EdgeView {
     pub clique_gated: bool,
     /// Observe: writer Executing (ordered-admit heat, not a verb).
     pub writer_executing: bool,
-    /// Observe: writer Ready (ordered-admit, not Unfenced hang-freedom).
+    /// Observe: writer Ready (ordered-admit, not OptimisticRead hang-freedom).
     pub writer_ready: bool,
 }
 
@@ -142,7 +142,7 @@ pub(crate) struct EdgeView {
 /// Not `must_wait = force_prefix∨avoid∨H∨canary∨inc` — classify first, then one verb.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum EdgeVisibility {
-    /// Published Data (incl. Executed-not-Validated tip) → Bind.
+    /// Published Data (incl. Executed-not-Validated tip) → OrderedAdmit.
     PublishedData {
         version: TxVersion,
     },
@@ -163,7 +163,7 @@ pub(crate) enum EdgeVisibility {
 ///
 /// Exclude-set fields (`force_prefix`, canary, H, clique, `writer_validated`,
 /// location-wide avoid) are recorded then discarded — they never OR into Fence.
-/// Hang-freedom is serial-lane / ordered-admit / steal, never Unfenced-on-essential
+/// Hang-freedom is serial-lane / ordered-admit / steal, never OptimisticRead-on-essential
 /// and never WaitFor without a writer identity.
 pub(crate) fn classify_edge(v: &EdgeView) -> EdgeVisibility {
     let _ = (
@@ -185,11 +185,11 @@ pub(crate) fn classify_edge(v: &EdgeView) -> EdgeVisibility {
     // gate: PredictedEssential(ℓ, k, morph) for THIS a only.
     let predicted = v.predicted_essential || v.essential_antidep;
 
-    // e_vis Bind only under PredictedEssential (A3: Data→Bind, no
-    // writer_validated gate). ¬PredictedEssential must stay Unfenced≡OCC
-    // even when MV Data exists — that is the hybrid law (no Bind tax on cold).
+    // e_vis OrderedAdmit only under PredictedEssential (A3: Data→OrderedAdmit, no
+    // writer_validated gate). ¬PredictedEssential must stay OptimisticRead≡OCC
+    // even when MV Data exists — that is the hybrid law (no OrderedAdmit tax on cold).
     if predicted {
-        if let Some(version) = v.bind_version.clone() {
+        if let Some(version) = v.ordered_admit_version.clone() {
             return EdgeVisibility::PublishedData { version };
         }
         if v.writer_published {
@@ -209,7 +209,7 @@ pub(crate) fn classify_edge(v: &EdgeView) -> EdgeVisibility {
             // inversion: later/self writer is not a preset-order anti-dep
         }
         // No writer identity → do **not** WaitFor(reader-1). Serial-lane /
-        // ordered-admit happen in the scheduler; classify stays Unfenced≡OCC
+        // ordered-admit happen in the scheduler; classify stays OptimisticRead≡OCC
         // rather than invent wait_no_writer.
     }
 
@@ -220,17 +220,17 @@ pub(crate) fn classify_edge(v: &EdgeView) -> EdgeVisibility {
 }
 
 /// Decide the protocol verb from frozen π visibility.
-/// PredictedEssential ∧ Data → Bind; PredictedEssential ∧ writer → WaitFor;
-/// else Unfenced≡OCC. Canary / ForcePrefix / SerialLane-without-writer are gone.
+/// PredictedEssential ∧ Data → OrderedAdmit; PredictedEssential ∧ writer → WaitFor;
+/// else OptimisticRead≡OCC. Canary / ForcePrefix / SerialLane-without-writer are gone.
 ///
 /// **Museum.** Live Mode(a) is [`crate::specfence::decide_access_queried`].
 #[cfg(test)]
 pub(crate) fn choose_edge_action(v: &EdgeView) -> EdgeAction {
     match classify_edge(v) {
-        EdgeVisibility::PublishedData { version } => EdgeAction::Bind(version),
+        EdgeVisibility::PublishedData { version } => EdgeAction::OrderedAdmit(version),
         EdgeVisibility::UnpublishedEssential { writer } => EdgeAction::WaitFor(writer),
         EdgeVisibility::SerialLane { pred } => EdgeAction::WaitFor(pred),
-        EdgeVisibility::Independent | EdgeVisibility::Cold => EdgeAction::Unfenced,
+        EdgeVisibility::Independent | EdgeVisibility::Cold => EdgeAction::OptimisticRead,
     }
 }
 
@@ -238,7 +238,7 @@ pub(crate) fn choose_edge_action(v: &EdgeView) -> EdgeAction {
 #[derive(Debug, Default)]
 pub(crate) struct EdgeTable {
     edges: DashMap<EdgeKey, EdgeRec, FxBuildHasher>,
-    /// Per-location Avoid verb (A2). Subsequent similar edges Fence, not Unfenced.
+    /// Per-location Avoid verb (A2). Subsequent similar edges Fence, not OptimisticRead.
     avoid: DashMap<MemoryLocationHash, (), FxBuildHasher>,
     /// Distinct access keys recorded (Detect completeness).
     access_count: AtomicUsize,
@@ -379,7 +379,7 @@ mod tests {
     use super::*;
 
     fn view(
-        bind: Option<TxVersion>,
+        ordered_admit: Option<TxVersion>,
         writer: Option<TxIdx>,
         published: bool,
         validated: bool,
@@ -396,7 +396,7 @@ mod tests {
             access_k: 3,
             access_depth: 1,
             writer,
-            bind_version: bind,
+            ordered_admit_version: ordered_admit,
             writer_published: published,
             writer_validated: validated,
             is_program: true,
@@ -414,12 +414,12 @@ mod tests {
     }
 
     #[test]
-    fn a3_bind_published_data_without_writer_done() {
+    fn a3_ordered_admit_published_data_without_writer_done() {
         let v = TxVersion {
             tx_idx: 2,
             tx_incarnation: 1,
         };
-        // Hypothesis fix: Data exists → Bind even when !validated / !done.
+        // Hypothesis fix: Data exists → OrderedAdmit even when !validated / !done.
         let a = choose_edge_action(&view(
             Some(v.clone()),
             Some(2),
@@ -432,11 +432,11 @@ mod tests {
             true,
             true,
         ));
-        assert_eq!(a, EdgeAction::Bind(v));
+        assert_eq!(a, EdgeAction::OrderedAdmit(v));
     }
 
     #[test]
-    fn a3_bind_not_gated_on_validated() {
+    fn a3_ordered_admit_not_gated_on_validated() {
         let v = TxVersion {
             tx_idx: 1,
             tx_incarnation: 0,
@@ -454,11 +454,11 @@ mod tests {
             true,
             false,
         ));
-        assert_eq!(a, EdgeAction::Bind(v));
+        assert_eq!(a, EdgeAction::OrderedAdmit(v));
     }
 
     #[test]
-    fn unfenced_when_data_but_not_predicted() {
+    fn optimistic_read_when_data_but_not_predicted() {
         let v = TxVersion {
             tx_idx: 1,
             tx_incarnation: 0,
@@ -477,8 +477,8 @@ mod tests {
         ));
         assert_eq!(
             a,
-            EdgeAction::Unfenced,
-            "¬PredictedEssential must not Bind-tax published Data"
+            EdgeAction::OptimisticRead,
+            "¬PredictedEssential must not OrderedAdmit-tax published Data"
         );
     }
 
@@ -502,7 +502,7 @@ mod tests {
     #[test]
     fn location_avoid_is_not_an_or_door() {
         // Per-ℓ Avoid broadcast is observe / first-wave fuel — not a live OR.
-        // Without PredictedEssential(ℓ, k) this access stays Unfenced≡OCC.
+        // Without PredictedEssential(ℓ, k) this access stays OptimisticRead≡OCC.
         let a = choose_edge_action(&view(
             None,
             Some(4),
@@ -515,20 +515,20 @@ mod tests {
             false,
             false,
         ));
-        assert_eq!(a, EdgeAction::Unfenced);
+        assert_eq!(a, EdgeAction::OptimisticRead);
     }
 
     #[test]
-    fn a4_independence_unfenced() {
+    fn a4_independence_optimistic_read() {
         let a = choose_edge_action(&view(
             None, None, false, false, false, false, false, true, false, false,
         ));
-        assert_eq!(a, EdgeAction::Unfenced);
+        assert_eq!(a, EdgeAction::OptimisticRead);
     }
 
     #[test]
     fn canary_is_not_a_live_verb() {
-        // Exclude: canary never enters classify (was Unfenced discovery tax).
+        // Exclude: canary never enters classify (was OptimisticRead discovery tax).
         let a = choose_edge_action(&view(
             None,
             Some(1),
@@ -541,7 +541,7 @@ mod tests {
             false,
             true,
         ));
-        assert_eq!(a, EdgeAction::Unfenced);
+        assert_eq!(a, EdgeAction::OptimisticRead);
         assert!(matches!(
             classify_edge(&view(
                 None,
@@ -574,24 +574,24 @@ mod tests {
             false,
             true,
         ));
-        assert_eq!(a, EdgeAction::Unfenced);
+        assert_eq!(a, EdgeAction::OptimisticRead);
     }
 
     #[test]
-    fn clique_none_writer_first_wave_unfenced() {
+    fn clique_none_writer_first_wave_optimistic_read() {
         let a = choose_edge_action(&view(
             None, None, false, false, false, false, false, true, false, true,
         ));
         assert_eq!(
             a,
-            EdgeAction::Unfenced,
+            EdgeAction::OptimisticRead,
             "clique ∧ writer=None ∧ !PredictedEssential is OCC, not serial-all"
         );
     }
 
     #[test]
     fn independence_wins_without_predicted_essential() {
-        // Clique + writer without PredictedEssential stays Unfenced≡OCC.
+        // Clique + writer without PredictedEssential stays OptimisticRead≡OCC.
         let a = choose_edge_action(&view(
             None,
             Some(2),
@@ -606,7 +606,7 @@ mod tests {
         ));
         assert_eq!(
             a,
-            EdgeAction::Unfenced,
+            EdgeAction::OptimisticRead,
             "¬PredictedEssential must not Fence via clique/canary leftover"
         );
     }
@@ -629,16 +629,16 @@ mod tests {
         v.writer = Some(9);
         assert_eq!(
             choose_edge_action(&v),
-            EdgeAction::Unfenced,
+            EdgeAction::OptimisticRead,
             "WaitFor(later) inverts preset order"
         );
         v.writer = Some(4);
-        assert_eq!(choose_edge_action(&v), EdgeAction::Unfenced);
+        assert_eq!(choose_edge_action(&v), EdgeAction::OptimisticRead);
     }
 
     #[test]
     fn wait_for_ready_known_essential() {
-        // Ready is not an Unfenced door — admission makes the writer progress.
+        // Ready is not an OptimisticRead door — admission makes the writer progress.
         let a = choose_edge_action(&view(
             None,
             Some(3),
@@ -655,12 +655,12 @@ mod tests {
     }
 
     #[test]
-    fn hot_alone_is_cold_unfenced_not_wait() {
+    fn hot_alone_is_cold_optimistic_read_not_wait() {
         // H membership is not an OR-door into WaitFor (dissolved salad).
         let a = choose_edge_action(&view(
             None, None, false, false, true, false, false, false, false, false,
         ));
-        assert_eq!(a, EdgeAction::Unfenced);
+        assert_eq!(a, EdgeAction::OptimisticRead);
         assert!(matches!(
             classify_edge(&view(
                 None, None, false, false, true, false, false, false, false, false,
@@ -670,7 +670,7 @@ mod tests {
     }
 
     #[test]
-    fn visibility_machine_published_then_essential_then_unfenced() {
+    fn visibility_machine_published_then_essential_then_optimistic_read() {
         let v = TxVersion {
             tx_idx: 2,
             tx_incarnation: 1,
@@ -714,7 +714,7 @@ mod tests {
     }
 
     #[test]
-    fn never_unfenced_known_essential() {
+    fn never_optimistic_read_known_essential() {
         let a = choose_edge_action(&view(
             None,
             Some(3),
@@ -728,7 +728,7 @@ mod tests {
             false,
         ));
         assert!(matches!(a, EdgeAction::WaitFor(3)));
-        assert!(!matches!(a, EdgeAction::Unfenced));
+        assert!(!matches!(a, EdgeAction::OptimisticRead));
     }
 
     #[test]
@@ -740,11 +740,11 @@ mod tests {
         v.force_prefix = true;
         assert_eq!(
             choose_edge_action(&v),
-            EdgeAction::Unfenced,
+            EdgeAction::OptimisticRead,
             "force_prefix ∧ writer=None is NOT serial-lane π"
         );
         v.reader = 0;
-        assert_eq!(choose_edge_action(&v), EdgeAction::Unfenced);
+        assert_eq!(choose_edge_action(&v), EdgeAction::OptimisticRead);
     }
 
     #[test]
@@ -766,12 +766,12 @@ mod tests {
         v.independence_certified = true;
         assert_eq!(
             choose_edge_action(&v),
-            EdgeAction::Unfenced,
+            EdgeAction::OptimisticRead,
             "force_prefix is excluded; ¬PredictedEssential → OCC"
         );
         v.writer_executing = true;
         v.writer_ready = false;
-        assert_eq!(choose_edge_action(&v), EdgeAction::Unfenced);
+        assert_eq!(choose_edge_action(&v), EdgeAction::OptimisticRead);
     }
 
     #[test]
@@ -805,7 +805,7 @@ mod tests {
         ));
         assert_eq!(
             a,
-            EdgeAction::Unfenced,
+            EdgeAction::OptimisticRead,
             "PredictedEssential ∧ writer=None must not invent a serial pred"
         );
     }
@@ -834,7 +834,7 @@ mod tests {
         v.access_k = 12;
         assert_eq!(
             choose_edge_action(&v),
-            EdgeAction::Unfenced,
+            EdgeAction::OptimisticRead,
             "mixed verbs inside one tx: later k stays OCC"
         );
     }
@@ -875,13 +875,13 @@ mod tests {
         v.in_hot_set = true;
         assert_eq!(
             choose_edge_action(&v),
-            EdgeAction::Unfenced,
+            EdgeAction::OptimisticRead,
             "H membership is observe/prior, not a Wait OR-door"
         );
     }
 
     #[test]
-    fn writer_validated_is_not_a_bind_gate() {
+    fn writer_validated_is_not_a_ordered_admit_gate() {
         let ver = TxVersion {
             tx_idx: 2,
             tx_incarnation: 0,
@@ -901,8 +901,8 @@ mod tests {
         v.writer_validated = false;
         assert_eq!(
             choose_edge_action(&v),
-            EdgeAction::Bind(ver),
-            "A3: Data → Bind even if !validated"
+            EdgeAction::OrderedAdmit(ver),
+            "A3: Data → OrderedAdmit even if !validated"
         );
     }
 

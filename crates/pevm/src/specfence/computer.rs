@@ -23,7 +23,7 @@ pub(crate) fn next_sf_task(
     metrics: Option<&MetricsInner>,
 ) -> Option<Task> {
     let refuse_before = ready.refuse_count();
-    // Drop Aborting / Done reservations so a dead writer cannot pin the
+    // Drop Aborting / Done reservations so a dead writer cannot wait_for_dependency the
     // ProducerStage min and starve the rest of the ready-set.
     for _ in 0..8 {
         let Some(w) = stages.next_reserved() else {
@@ -38,7 +38,7 @@ pub(crate) fn next_sf_task(
         if let Some(tx_version) = scheduler.try_execute_producer(w) {
             if let Some(m) = metrics {
                 let n = ready.refuse_count().saturating_sub(refuse_before);
-                m.record_schedule_refuse_n(n);
+                m.record_refuse_admit_n(n);
             }
             return Some(Task::Execution(tx_version));
         }
@@ -51,7 +51,7 @@ pub(crate) fn next_sf_task(
     let task = scheduler.next_task_with_wave_ready(Some(wave), Some(ready));
     if let Some(m) = metrics {
         let n = ready.refuse_count().saturating_sub(refuse_before);
-        m.record_schedule_refuse_n(n);
+        m.record_refuse_admit_n(n);
     }
     task
 }

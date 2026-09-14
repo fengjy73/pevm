@@ -53,7 +53,7 @@ struct ModeTiming {
     abort_rate: f64,
     cascade_validations_scheduled: usize,
     evm_entries: usize,
-    full_restart: usize,
+    full_abort_reexecute: usize,
     /// Sum of (final_incarnation+1) over txs ≈ execution attempts.
     total_incarnations: usize,
     max_incarnation: usize,
@@ -264,10 +264,10 @@ fn timing_from_run(
             m.cascade_validations_scheduled
         },
         evm_entries,
-        full_restart: if mode == "sequential" {
+        full_abort_reexecute: if mode == "sequential" {
             0
         } else {
-            m.full_restart
+            m.full_abort_reexecute
         },
         total_incarnations: total_inc,
         max_incarnation: max_inc,

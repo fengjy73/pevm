@@ -2,17 +2,19 @@
 //!
 //! SoT: `lab/notes/specfence-complete-architecture-v9.4-file-srp.md` (file SRP);
 //! `v9.3-pevm-unified.md` (one spine; ban dual OCC/SF computers);
-//! `v9.1-cc-pc-bayes.md` (Bayes→admit→decide→Fence→Validate; Soft=0).
+//! `v9.1-cc-pc-bayes.md` (Bayes→admit→decide→pessimistic admit→Validate; Soft=0).
+//! Live vocabulary: `lab/notes/specfence-cc-glossary.md`.
 //! Triple = analysis lens, **not** folder kingdoms.
 //!
 //! Call order: Bayes.seed → admit_seed → Execute(if admitted) →
-//! decide←Bayes → Fence(PinWithoutThrow|Refuse; Bind rare) → Validate/R1.
-//! Quiet/cold = Spec cost class on the same spine (not `plant_is_occ` retreat).
+//! decide←Bayes → pessimistic admit (`wait_for_dependency` / `refuse_admit`;
+//! `OrderedAdmit` rare) → Validate / `partial_abort`.
+//! Quiet/cold = optimistic_read cost class on the same spine (not `plant_is_occ` retreat).
 //!
 //! `ConcurrencyMode::OCC` is pristine Block-STM (**zero** SpecFence ticks).
 //! `ConcurrencyMode::SpecFence` owns schedule / execute wrap / validate / rem.
-//! Default Spec ≡ OCC-cost (`occ_read` + bool validate + B0). Fence verbs
-//! fire only on \(a + e_{\mathrm{vis}} + \mathrm{PE}(\mathrm{true}\,k)\).
+//! Default optimistic_read ≡ OCC-cost (`occ_read` + bool validate + full_abort_reexecute).
+//! Pessimistic-admit verbs fire only on \(a + e_{\mathrm{vis}} + \mathrm{PE}(\mathrm{true}\,k)\).
 //! Mode is **access-local**, not an incarnation Occ\|Pcc fork.
 //!
 //! Frozen π: \(a=(t,k,\mathrm{depth},ℓ,\mathrm{mode})\) + \(e_{\mathrm{vis}}\) +
@@ -23,37 +25,37 @@
 //! Authoritative v2: `lab/notes/specfence-complete-architecture-v2.md`.
 //! Landed map v2: `lab/notes/specfence-architecture-v2-impl.md`.
 //! Family: preset-order hybrid OCC + ahead sketch + ordered admission +
-//! early-visible Bind + first-wave Avoid + piece-restricted resolve.
+//! early-visible OrderedAdmit + first-wave Avoid + piece-restricted resolve.
 //!
 //! # Single algorithm (hot path)
 //! ```text
 //! Inter prior → H + chain templates (A6)   # warm-start; decay on flip
 //! Block-STM scheduler + MvMemory           # L0 work-conserving
 //!     ↑
-//! choose_edge_action (A1–A4, D6)           # Bind Data / WaitFor essential / Unfenced indep
-//!                                          # Spec = Region, not Unfenced
+//! choose_edge_action (A1–A4, D6)           # OrderedAdmit Data / WaitFor essential / OptimisticRead indep
+//!                                          # Region is the control unit; OptimisticRead is the OCC-cost verb
 //!     ↑
 //! First-wave Avoid on publish (A2)         # not block-end EMA
 //!     ↑
-//! Resolve R1→R2→R3; R4 = failure (A5)
+//! Resolve partial_abort → rewind → full_abort_reexecute (A5)
 //! ```
 //!
 //! **Avoid (A):** unfinished writer on hot program ℓ → BlockingOther prefer-steal
-//! Await until Executed/Validated, then Bind. Fence intent at first-cross `a`
+//! Await until Executed/Validated, then OrderedAdmit. Fence intent at first-cross `a`
 //! records `armed_at_k`. SoftWait Soft stays ~0 unless wake EV re-proven.
 //!
 //! **Resolve (B):** RebindOnly when value-stable (Iter6: Estimate→Data spin +
 //! multi-origin Basic snap / prior match); else SuffixRepair + journal FF.
-//! Escalate FullRestart after depth≥2 when RewindTo/FF armed (one extra
+//! Escalate FullAbortReexecute after depth≥2 when RewindTo/FF armed (one extra
 //! SuffixRepair vs classic fb escalate-at-1; depth≥3 measured wall↑). Iter7:
-//! after first SuffixRepair fail, sticky BO Await on fail locs (+ force_bind
+//! after first SuffixRepair fail, sticky BO Await on fail locs (+ force_ordered_admit
 //! extend) until writers Validated before 2nd resume. Iter10: strip Iter9 hot-path
 //! tax (stock SSTORE unless plant install wanted; no first_k-from-gas on finalize).
 //! Iter11: multi-SSTORE last-tip + k<k_fail snap select; jump/capture OFF.
 //! Iter12: Validated-strict spin on 2nd-repair prefer_await (no park tax);
 //! force_prefix ESTIMATE→BO when writer Executing; doomed-2nd-repair escalate to
 //! serial-barrier when ESTIMATE/Aborting∧Executing spine; longer RebindOnly spin
-//! on force_bind/ff_head. Abort-path Validated evidence spins falsified (wall↑).
+//! on force_ordered_admit/ff_head. Abort-path Validated evidence spins falsified (wall↑).
 //! Iter13: Validated-gated Storage+Basic value-stable journal FF (origin bump,
 //! same value; Iter10 bare value-stable falsified); serial-barrier multi-candidate
 //! claim (no sibling park; Executed→Validated escalate spin falsified). Jump/
@@ -68,56 +70,56 @@
 //! falsified. Keep Iter12–14. Jump/capture OFF. SoftWait Soft ~0.
 //! Iter16: cheap absorb — !true_suffix validate-defer behind Executing spine
 //! (RebindOnly-after-spine, no invalidate); true_suffix SuffixRepair+fra absorb
-//! instead of early FullRestart (FR collapse reserved for Estimate/Aborting
+//! instead of early FullAbortReexecute (FR collapse reserved for Estimate/Aborting
 //! doomed spines). Keep Iter12–15 barrier widen / vs-spin / fra. Jump/capture
 //! OFF. SoftWait Soft ~0. No 15b drain / 15c BO-OR.
-//! Iter17: schedule Await before SpecRead via yield-spin on storm+program
+//! Iter17: schedule Await before OptimisticRead via yield-spin on storm+program
 //! live_fanout≥8 unfinished writers (no BO park). Falsified: 17a/f BO park,
 //! 17b true_suffix defer, 17d long RebindOnly wait, 17g cut vs_spin. Keep
 //! Iter16 absorb-no-sticky. Jump/capture OFF. SoftWait Soft ~0.
 //! Iter18: diagnose hang-free opcode skip on successful SuffixRepair. Falsified:
 //! Handler plant+capture (hsstore>0, aj=0 — SSTORE snaps at k≥k_fail on RAW-read
-//! fails); synthetic mid RewindTo; late-k yield192; ForceBind/park ff_head seed
+//! fails); synthetic mid RewindTo; late-k yield192; ForceOrderedAdmit/park ff_head seed
 //! (599 wall↑). Production remains Iter17 tip. Jump/capture OFF. SoftWait Soft ~0.
-//! Iter19: hang-free Bind/SLOAD snap at certified-prefix end (not post-SSTORE).
+//! Iter19: hang-free OrderedAdmit/SLOAD snap at certified-prefix end (not post-SSTORE).
 //! Opt-in `SPECFENCE_BIND_SNAP=1` → bsnap>0 with k<k_fail on 597 RAW-read fails.
 //! Absolute jump (`SPECFENCE_BIND_SNAP_JUMP=1`) hung Lean fixtures — production OFF.
 //! Capture-without-jump wall↑/599↑ — default capture OFF. Keep Iter17 yield-spin +
 //! Iter16 absorb; stock SSTORE; SoftWait Soft ~0.
-//! Iter20: hang-free Bind-snap *consume* diagnosis. Iter19 `!memory_lite_ok` left
-//! aj=0 on mainnet (Bind snaps clone memory). Fixing the gate + Validated-safe
-//! origin seed still **hangs 597** once Storage-FF Bind jump arms; Basic-only tips
+//! Iter20: hang-free OrderedAdmit-snap *consume* diagnosis. Iter19 `!memory_lite_ok` left
+//! aj=0 on mainnet (OrderedAdmit snaps clone memory). Fixing the gate + Validated-safe
+//! origin seed still **hangs 597** once Storage-FF OrderedAdmit jump arms; Basic-only tips
 //! refuse (`bytecode_no_storage_ff`). Abs jump stays hard-OFF; hang-free credit
-//! consume (`bcredit`) when Bind tip on resume. SNAP opt-in; production OFF.
+//! consume (`bcredit`) when OrderedAdmit tip on resume. SNAP opt-in; production OFF.
 //! SoftWait Soft ~0. Stock SSTORE. No mega-fan yield.
-//! Iter21: minimal Storage-FF Bind jump hang repro. Env-gated JUMP arm
+//! Iter21: minimal Storage-FF OrderedAdmit jump hang repro. Env-gated JUMP arm
 //! (`SPECFENCE_BIND_SNAP_JUMP=1`); matching MvMemory origins must be Validated;
-//! clear stale PENDING_RESUME in `with_bind_snap_tls`. Prove width=1 seq≡par
+//! clear stale PENDING_RESUME in `with_ordered_admit_snap_tls`. Prove width=1 seq≡par
 //! then width≥2 hang-free before concurrency enable. Production SNAP/JUMP OFF;
 //! SoftWait Soft ~0. Keep Iter16–17 absorb/yield-spin.
-//! Iter22: Bind-jump restore — defer FF origin seed until after successful
+//! Iter22: OrderedAdmit-jump restore — defer FF origin seed until after successful
 //! `apply_to_interp`; warm FF Storage/Basic in journal (EIP-2929); matching-origin
 //! value check; refuse truncated-memory tips. Dig for ERC-20 aj>0∧seq≡par; JUMP
 //! stays OFF under concurrency until stable + 597 no-hang. SoftWait Soft ~0.
-//! Iter23: diff-first Bind-jump vs cold SuffixRepair — tip_sloads log; refuse
-//! jump when Bind SLOAD ≠ FF (stale consumed into require/SUB → ERC-20 revert
+//! Iter23: diff-first OrderedAdmit-jump vs cold SuffixRepair — tip_sloads log; refuse
+//! jump when OrderedAdmit SLOAD ≠ FF (stale consumed into require/SUB → ERC-20 revert
 //! dgas=+661); journal warm prefer_tx=min. Non-jump: high-fan (≥32) first-repair
 //! pre-yield skip-park (cut park_ms). Dig aj>0∧fail=0 + 597 SNAP+JUMP no-hang;
 //! production stayed OFF (mass SNAP tax). SoftWait Soft ~0. Keep Iter16–17.
-//! Iter24: cautious Bind-jump enable — `SPECFENCE_BIND_SNAP=resume` ResumePath
-//! SNAP (capture only on SuffixRepair resume / force_bind / needs_live_capture;
+//! Iter24: cautious OrderedAdmit-jump enable — `SPECFENCE_BIND_SNAP=resume` ResumePath
+//! SNAP (capture only on SuffixRepair resume / force_ordered_admit / needs_live_capture;
 //! not every Handler run) + JUMP follows with refuse-if-stale. Mass=`=1`. SoftWait Soft ~0.
 //! Iter25: silent-default ResumePath (Mass JUMP was Lean hang — ResumePath+refuse
 //! hang-free + Lean seq≡par). tip_sloads skip of all-prefix Validated spin
 //! falsified (Lean p2 seq≠par); broad inc>0 SNAP falsified (tax, aj=0). SoftWait Soft ~0.
-//! Iter26: Validated-fresh tip→jump — arm Bind-snap on FF-served SLOAD (tip≡FF);
-//! Validated-only Bind-on-Data; prefer tip_sloads≡FF at jump_snap select; keep
+//! Iter26: Validated-fresh tip→jump — arm OrderedAdmit-snap on FF-served SLOAD (tip≡FF);
+//! Validated-only OrderedAdmit-on-Data; prefer tip_sloads≡FF at jump_snap select; keep
 //! all-prefix Validated spin (no tip_sloads skip). SoftWait Soft ~0.
 //! Iter27: tip≡FF overlap (extras OK) + steps_cap select + deeper all-prefix
 //! Validated spin (no tip_sloads skip / nested apply hang falsified). SoftWait Soft ~0.
-//! Iter28: diagnose 597 first-frame tip identity (router→token nested Bind tips;
+//! Iter28: diagnose 597 first-frame tip identity (router→token nested OrderedAdmit tips;
 //! nested apply / defer-until-match hung) + LAST_SNAP TLS clear. SoftWait Soft ~0.
-//! Iter29: hang-free nested Bind consume ≠ frame_init defer — stash+natural CALL
+//! Iter29: hang-free nested OrderedAdmit consume ≠ frame_init defer — stash+natural CALL
 //! apply dig hang-free; Iter29 default-on was Lean seq≠par — stayed opt-in then.
 //! Iter30: Lean-safe nested apply **default-on** — tip_sloads addr≡target ∧
 //! depth≤2 ∧ tip≡FF only (opt-out `SPECFENCE_NESTED_BIND=0`); multi-addr / deep
@@ -127,9 +129,9 @@
 //!
 //! **Three-pillar (default-on):**
 //! 1. Await@a — storm+program+live_fanout≥8 unfinished writer → BO until done +
-//!    Validated yield-spin, then Bind. SoftWait Soft stays ~0. Escape:
+//!    Validated yield-spin, then OrderedAdmit. SoftWait Soft stays ~0. Escape:
 //!    `SPECFENCE_DISABLE_AWAIT_AT_A=1`.
-//! 2. Resolve ≠ FullRestart — ResumePath Bind tips; tip≡FF max_steps 8192;
+//! 2. Resolve ≠ FullAbortReexecute — ResumePath OrderedAdmit tips; tip≡FF max_steps 8192;
 //!    best deferred tip; Lean-safe nested apply; refuse unsafe jumps.
 //! 3. Morph mode — Quiet OCC-lite vs Storm Await-ready from inter morph + live
 //!    fanout flip; Await/choose_action only on hot candidates.
@@ -209,15 +211,18 @@ pub use boundary::SpecFenceInspector;
 pub(crate) use boundary::{
     BindSnapMode, BoundarySnapshot, CachedCallOutcome, JournalBlob, absolute_jump_eligible,
     absolute_jump_env_enabled, arm_call_outcome_cache, arm_ff_origin_seeds, arm_pc_resume,
-    arm_pending_effect_cp_only, attach_current_live_snap, bind_snap_capture_wanted,
-    bind_snap_env_enabled, bind_snap_jump_enabled, bind_snap_mode, clear_pc_resume,
-    handler_bind_snap_install_wanted, handler_sstore_plant_install_wanted, in_inspect_run,
-    install_handler_bind_snap_capture, install_handler_sstore_plant_capture, jump_is_safe,
-    jump_refuse_reason, last_boundary_snap, nested_bind_consume_enabled, nested_bind_stash_armed,
-    note_pending_bind_snap, note_pending_effect_boundary, pending_resume_armed, plant_tls_active,
-    resume_was_applied, steps_this_run, suffix_repair_jump_env_ok, take_ff_origin_seeds,
-    try_apply_pending_pc_resume, try_arm_safe_absolute_jump, try_arm_safe_absolute_jump_gated,
-    try_consume_nested_bind_resume, with_bind_snap_tls, with_plant_tls, with_plant_tls_journal,
+    arm_pending_effect_cp_only, attach_current_live_snap, clear_pc_resume,
+    handler_ordered_admit_snap_install_wanted, handler_sstore_plant_install_wanted, in_inspect_run,
+    install_handler_ordered_admit_snap_capture, install_handler_sstore_plant_capture, jump_is_safe,
+    jump_refuse_reason, last_boundary_snap, nested_ordered_admit_consume_enabled,
+    nested_ordered_admit_stash_armed, note_pending_effect_boundary,
+    note_pending_ordered_admit_snap, ordered_admit_snap_capture_wanted,
+    ordered_admit_snap_env_enabled, ordered_admit_snap_jump_enabled, ordered_admit_snap_mode,
+    pending_resume_armed, plant_tls_active, resume_was_applied, steps_this_run,
+    suffix_repair_jump_env_ok, take_ff_origin_seeds, try_apply_pending_pc_resume,
+    try_arm_safe_absolute_jump, try_arm_safe_absolute_jump_gated,
+    try_consume_nested_ordered_admit_resume, with_ordered_admit_snap_tls, with_plant_tls,
+    with_plant_tls_journal,
 };
 pub(crate) use certificate::CertificateTable;
 pub(crate) use computer::next_sf_task;
@@ -231,8 +236,8 @@ pub(crate) use edge::{
 pub(crate) use engagement::{AdaptiveEngagement, profile_timing_enabled, research_inspect_enabled};
 pub(crate) use executor::{
     fence_for_mode, hinted_wait_enabled, next_occ_task, occ_read_set_valid,
-    specfence_access_is_occ, specfence_cost_class_spec, specfence_plant_is_occ,
-    specfence_r1_validate, uses_specfence_resolve, validate_occ_kernel, validate_occ_stage,
+    specfence_access_is_occ, specfence_cost_class_spec, specfence_partial_abort_validate,
+    specfence_plant_is_occ, uses_specfence_resolve, validate_occ_kernel, validate_occ_stage,
     validate_specfence, wave_for_mode,
 };
 pub use finegrain::{
@@ -294,7 +299,7 @@ pub enum ConcurrencyMode {
     Occ,
     /// Conservative PCC: hinted `from`/`to` accounts start in Wait.
     Pcc,
-    /// SpecFence complete CC: sketch + edge π + early-visible Bind + R1–R4 resolve.
+    /// SpecFence complete CC: sketch + edge π + early-visible OrderedAdmit + R1–R4 resolve.
     SpecFence,
 }
 
@@ -384,7 +389,7 @@ pub(crate) struct SpecFenceCtx<'a> {
     pub partial_retry: &'a PartialRetryTable,
     /// M2 wave park / ready deque (SpecFence only; unused by OCC/PCC).
     pub wave: &'a WaveParkTable,
-    /// M3 process-local online WŜ/RŜ prior (Bind-before-touch).
+    /// M3 process-local online WŜ/RŜ prior (OrderedAdmit-before-touch).
     pub rw_prior: &'a RwPriorMap,
     /// M4/R1 adaptive lean engagement (SpecFence only).
     pub engagement: &'a AdaptiveEngagement,
@@ -398,7 +403,7 @@ pub(crate) struct SpecFenceCtx<'a> {
     pub edges: &'a EdgeTable,
     /// A1/A2/A6: hot set H + chain templates + Avoid broadcast.
     pub sketch: &'a HotSketch,
-    /// Process-level Fence/Unfenced reason + per-ℓ timeline (lab / G7).
+    /// Process-level Fence/OptimisticRead reason + per-ℓ timeline (lab / G7).
     pub process: &'a ProcessTrace,
     /// Spec-safe AccessOrdinalLog — true \(k\) without rem DashMap.
     pub access_log: &'a crate::specfence::AccessOrdinalLog,
@@ -458,7 +463,7 @@ impl<'a> SpecFenceCtx<'a> {
         address: &Address,
         writer: Option<TxIdx>,
         writer_done: bool,
-        bind_version: Option<crate::TxVersion>,
+        ordered_admit_version: Option<crate::TxVersion>,
         residual_predicts: bool,
         prior_ws_predicts: bool,
         is_program: bool,
@@ -469,11 +474,11 @@ impl<'a> SpecFenceCtx<'a> {
         tx_heavy_hint: bool,
     ) -> ResolveAction {
         let posterior_conflict = self.bayes.conflict_probability(location, Some(address));
-        let posterior_bind = self
+        let posterior_ordered_admit = self
             .bayes
-            .bind_useful_probability(location)
+            .ordered_admit_useful_probability(location)
             .max(self.rw_prior.write_confidence(location));
-        // M3: residual / process prior makes a published version a Bind placeholder.
+        // M3: residual / process prior makes a published version a OrderedAdmit placeholder.
         let prior = residual_predicts || prior_ws_predicts;
         let morph_weights = self.learner.morph_weights();
         let e_wait_time = self.learner.e_wait_time(location);
@@ -483,16 +488,16 @@ impl<'a> SpecFenceCtx<'a> {
         let meta_tax = self.learner.meta_tax_ratio(self.params);
         let meta_budget_exceeded = self.learner.meta_budget_exceeded(self.params);
         // G3: pass published Data version into π even when writer not yet is_done —
-        // choose_action decides Bind via prior_ws / high P / placeholder_ready.
+        // choose_action decides OrderedAdmit via prior_ws / high P / placeholder_ready.
         let ctx = PolicyCtx {
             location,
-            writer_known: writer.is_some() || bind_version.is_some(),
+            writer_known: writer.is_some() || ordered_admit_version.is_some(),
             writer,
             writer_done,
             posterior_conflict,
-            posterior_bind_success: posterior_bind,
-            placeholder_ready: prior && (writer_done || bind_version.is_some()),
-            bind_version,
+            posterior_ordered_admit_success: posterior_ordered_admit,
+            placeholder_ready: prior && (writer_done || ordered_admit_version.is_some()),
+            ordered_admit_version,
             prior_ws_predicts: prior,
             is_program,
             fanout_hint,
@@ -535,18 +540,18 @@ impl<'a> SpecFenceCtx<'a> {
                 self.bayes
                     .note_cost_decision_posterior(posterior_conflict, true);
             }
-            ResolveAction::SpecRead => {
-                self.metrics.record_cost_chose_spec();
+            ResolveAction::OptimisticRead => {
+                self.metrics.record_cost_chose_optimistic_read();
                 if is_program {
-                    self.metrics.record_cost_chose_spec_program();
+                    self.metrics.record_cost_chose_optimistic_read_program();
                 } else {
-                    self.metrics.record_cost_chose_spec_handler();
+                    self.metrics.record_cost_chose_optimistic_read_handler();
                 }
                 self.bayes
                     .note_cost_decision_posterior(posterior_conflict, false);
             }
-            ResolveAction::Bind(_) => {
-                self.metrics.record_cost_chose_bind();
+            ResolveAction::OrderedAdmit(_) => {
+                self.metrics.record_cost_chose_ordered_admit();
             }
         }
         action
@@ -611,7 +616,7 @@ impl<'a> SpecFenceCtx<'a> {
             let cleared_fence = self.dag.clear(location) > 0 || self.dag.clear_wait(location);
             if morph.dominant_quiet() {
                 let n = self.sketch.revoke_prior_fences_if_quiet(true);
-                self.metrics.record_quiet_fence_revoke(n);
+                self.metrics.record_quiet_pessimistic_revoke(n);
             }
             if cleared_region || cleared_fence {
                 self.metrics.record_soft_edge_revoke();

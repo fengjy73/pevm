@@ -14,9 +14,9 @@ use serde::Serialize;
 /// Verb class after `choose_edge_action` (+ demotion proxies via reason).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DecisionVerb {
-    Bind = 0,
+    OrderedAdmit = 0,
     WaitFor = 1,
-    Unfenced = 2,
+    OptimisticRead = 2,
 }
 
 const VERB_N: usize = 3;
@@ -41,11 +41,11 @@ pub(crate) struct DecisionFieldAgg {
     /// edge kind proxy: wr only today (slot reserved)
     edge_kind_wr: [AtomicU64; VERB_N],
     /// Quality proxies
-    missed_avoid: AtomicU64, // Unfenced while avoid/essential/force
+    missed_avoid: AtomicU64, // OptimisticRead while avoid/essential/force
     false_fence_wait: AtomicU64, // Wait while published already (shouldn't)
     wait_no_writer: AtomicU64,
-    bind_no_publish: AtomicU64,
-    unfenced_essential: AtomicU64,
+    ordered_admit_no_publish: AtomicU64,
+    optimistic_read_essential: AtomicU64,
 }
 
 /// Compact feature vector at decision time (lab).
@@ -146,9 +146,10 @@ impl DecisionFieldAgg {
 
         // Quality proxies (correlational)
         let should_fence = f.essential_antidep || f.avoid_broadcast || f.force_prefix;
-        if matches!(f.verb, DecisionVerb::Unfenced) && should_fence {
+        if matches!(f.verb, DecisionVerb::OptimisticRead) && should_fence {
             self.missed_avoid.fetch_add(1, Ordering::Relaxed);
-            self.unfenced_essential.fetch_add(1, Ordering::Relaxed);
+            self.optimistic_read_essential
+                .fetch_add(1, Ordering::Relaxed);
         }
         if matches!(f.verb, DecisionVerb::WaitFor) && f.writer_published {
             self.false_fence_wait.fetch_add(1, Ordering::Relaxed);
@@ -156,8 +157,9 @@ impl DecisionFieldAgg {
         if matches!(f.verb, DecisionVerb::WaitFor) && !f.writer_present {
             self.wait_no_writer.fetch_add(1, Ordering::Relaxed);
         }
-        if matches!(f.verb, DecisionVerb::Bind) && !f.writer_published {
-            self.bind_no_publish.fetch_add(1, Ordering::Relaxed);
+        if matches!(f.verb, DecisionVerb::OrderedAdmit) && !f.writer_published {
+            self.ordered_admit_no_publish
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -178,17 +180,17 @@ impl DecisionFieldAgg {
                     (
                         "false".to_string(),
                         VerbHist {
-                            bind: slot[0].load(Ordering::Relaxed),
+                            ordered_admit: slot[0].load(Ordering::Relaxed),
                             wait_for: slot[1].load(Ordering::Relaxed),
-                            unfenced: slot[2].load(Ordering::Relaxed),
+                            optimistic_read: slot[2].load(Ordering::Relaxed),
                         },
                     ),
                     (
                         "true".to_string(),
                         VerbHist {
-                            bind: slot[3].load(Ordering::Relaxed),
+                            ordered_admit: slot[3].load(Ordering::Relaxed),
                             wait_for: slot[4].load(Ordering::Relaxed),
-                            unfenced: slot[5].load(Ordering::Relaxed),
+                            optimistic_read: slot[5].load(Ordering::Relaxed),
                         },
                     ),
                 ]),
@@ -201,9 +203,9 @@ impl DecisionFieldAgg {
             k_out.insert(
                 (*n).to_string(),
                 VerbHist {
-                    bind: c[0],
+                    ordered_admit: c[0],
                     wait_for: c[1],
-                    unfenced: c[2],
+                    optimistic_read: c[2],
                 },
             );
         }
@@ -214,9 +216,9 @@ impl DecisionFieldAgg {
             d_out.insert(
                 (*n).to_string(),
                 VerbHist {
-                    bind: c[0],
+                    ordered_admit: c[0],
                     wait_for: c[1],
-                    unfenced: c[2],
+                    optimistic_read: c[2],
                 },
             );
         }
@@ -227,9 +229,9 @@ impl DecisionFieldAgg {
             i_out.insert(
                 (*n).to_string(),
                 VerbHist {
-                    bind: c[0],
+                    ordered_admit: c[0],
                     wait_for: c[1],
-                    unfenced: c[2],
+                    optimistic_read: c[2],
                 },
             );
         }
@@ -240,9 +242,9 @@ impl DecisionFieldAgg {
             w_out.insert(
                 (*n).to_string(),
                 VerbHist {
-                    bind: c[0],
+                    ordered_admit: c[0],
                     wait_for: c[1],
-                    unfenced: c[2],
+                    optimistic_read: c[2],
                 },
             );
         }
@@ -250,9 +252,9 @@ impl DecisionFieldAgg {
         DecisionFieldSnap {
             n_decisions: self.total.load(Ordering::Relaxed),
             verb: VerbHist {
-                bind: vc[0],
+                ordered_admit: vc[0],
                 wait_for: vc[1],
-                unfenced: vc[2],
+                optimistic_read: vc[2],
             },
             binary: bin_out,
             k_bucket: k_out,
@@ -262,17 +264,17 @@ impl DecisionFieldAgg {
             edge_kind_wr: {
                 let c = load3(&self.edge_kind_wr);
                 VerbHist {
-                    bind: c[0],
+                    ordered_admit: c[0],
                     wait_for: c[1],
-                    unfenced: c[2],
+                    optimistic_read: c[2],
                 }
             },
             quality: QualityProxies {
                 missed_avoid: self.missed_avoid.load(Ordering::Relaxed),
                 false_fence_wait: self.false_fence_wait.load(Ordering::Relaxed),
                 wait_no_writer: self.wait_no_writer.load(Ordering::Relaxed),
-                bind_no_publish: self.bind_no_publish.load(Ordering::Relaxed),
-                unfenced_essential: self.unfenced_essential.load(Ordering::Relaxed),
+                ordered_admit_no_publish: self.ordered_admit_no_publish.load(Ordering::Relaxed),
+                optimistic_read_essential: self.optimistic_read_essential.load(Ordering::Relaxed),
             },
         }
     }
@@ -299,9 +301,9 @@ const FEATURE_NAMES: [&str; 16] = [
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct VerbHist {
-    pub bind: u64,
+    pub ordered_admit: u64,
     pub wait_for: u64,
-    pub unfenced: u64,
+    pub optimistic_read: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -309,8 +311,8 @@ pub struct QualityProxies {
     pub missed_avoid: u64,
     pub false_fence_wait: u64,
     pub wait_no_writer: u64,
-    pub bind_no_publish: u64,
-    pub unfenced_essential: u64,
+    pub ordered_admit_no_publish: u64,
+    pub optimistic_read_essential: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -329,24 +331,24 @@ pub struct DecisionFieldSnap {
 impl DecisionFieldSnap {
     pub fn merge_from(&mut self, other: &Self) {
         self.n_decisions += other.n_decisions;
-        self.verb.bind += other.verb.bind;
+        self.verb.ordered_admit += other.verb.ordered_admit;
         self.verb.wait_for += other.verb.wait_for;
-        self.verb.unfenced += other.verb.unfenced;
-        self.edge_kind_wr.bind += other.edge_kind_wr.bind;
+        self.verb.optimistic_read += other.verb.optimistic_read;
+        self.edge_kind_wr.ordered_admit += other.edge_kind_wr.ordered_admit;
         self.edge_kind_wr.wait_for += other.edge_kind_wr.wait_for;
-        self.edge_kind_wr.unfenced += other.edge_kind_wr.unfenced;
+        self.edge_kind_wr.optimistic_read += other.edge_kind_wr.optimistic_read;
         self.quality.missed_avoid += other.quality.missed_avoid;
         self.quality.false_fence_wait += other.quality.false_fence_wait;
         self.quality.wait_no_writer += other.quality.wait_no_writer;
-        self.quality.bind_no_publish += other.quality.bind_no_publish;
-        self.quality.unfenced_essential += other.quality.unfenced_essential;
+        self.quality.ordered_admit_no_publish += other.quality.ordered_admit_no_publish;
+        self.quality.optimistic_read_essential += other.quality.optimistic_read_essential;
         for (k, v) in &other.binary {
             let e = self.binary.entry(k.clone()).or_default();
             for (bk, vh) in v {
                 let t = e.entry(bk.clone()).or_default();
-                t.bind += vh.bind;
+                t.ordered_admit += vh.ordered_admit;
                 t.wait_for += vh.wait_for;
-                t.unfenced += vh.unfenced;
+                t.optimistic_read += vh.optimistic_read;
             }
         }
         for (map, src) in [
@@ -357,9 +359,9 @@ impl DecisionFieldSnap {
         ] {
             for (k, vh) in src {
                 let t = map.entry(k.clone()).or_default();
-                t.bind += vh.bind;
+                t.ordered_admit += vh.ordered_admit;
                 t.wait_for += vh.wait_for;
-                t.unfenced += vh.unfenced;
+                t.optimistic_read += vh.optimistic_read;
             }
         }
     }

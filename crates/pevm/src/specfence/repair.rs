@@ -1,4 +1,4 @@
-//! Repair grain — R1 at first failed Fenced \(a\); Spec-only fail → B0.
+//! Repair grain — R1 at first failed Fenced \(a\); Spec-only fail → full_abort_reexecute.
 //!
 //! Plant SoT: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md` §4.
 
@@ -10,12 +10,12 @@ use super::certificate::CertificateTable;
 /// Validate fail grain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RepairGrain {
-    /// All fail locations are on the Fenced-prefix strip → R1a/R1b.
+    /// All fail locations are on the Fenced-prefix strip → PartialAbortRebind/PartialAbortRewind.
     R1,
-    /// Fenced RAW subset may R1; Spec residual stays B0 unless rebind heals RS.
+    /// Fenced RAW subset may R1; Spec residual stays full_abort_reexecute unless rebind heals RS.
     R1Selective,
-    /// Spec-only fail → OCC B0 + PE(true k).
-    B0,
+    /// Spec-only fail → OCC full_abort_reexecute + PE(true k).
+    full_abort_reexecute,
 }
 
 /// Selective grain: R1 if strip covers every invalid; R1Selective if any fenced.
@@ -30,7 +30,7 @@ pub(crate) fn repair_grain(
     } else if invalid.iter().any(|&l| cert.covers(tx_idx, l)) {
         RepairGrain::R1Selective
     } else {
-        RepairGrain::B0
+        RepairGrain::full_abort_reexecute
     }
 }
 
@@ -42,7 +42,7 @@ mod tests {
     fn spec_only_fail_is_b0() {
         let c = CertificateTable::new(1);
         c.begin_execute(0, false, 0);
-        assert_eq!(repair_grain(&c, 0, &[7]), RepairGrain::B0);
+        assert_eq!(repair_grain(&c, 0, &[7]), RepairGrain::full_abort_reexecute);
     }
 
     #[test]

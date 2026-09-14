@@ -1,5 +1,7 @@
 # SpecFence complete architecture v9.4 — file single-responsibility (AUTHORITATIVE structure correction)
 
+**Live CC vocabulary:** [`specfence-cc-glossary.md`](specfence-cc-glossary.md) — Pin/R1/B0/Unfenced/Bind nicknames are retired.
+
 **Date:** 2026-09-14 (Asia/Shanghai, UTC+8)  
 **Status:** **AUTHORITATIVE design SoT for structure law** — **DESIGN ONLY**; **DO NOT land**; **DO NOT implement Rust**; no immediate refactor suggested  
 **Tip at write:** `1ee6dda` (docs tip; equivalent content lineage `bb67ff7`+docs)  

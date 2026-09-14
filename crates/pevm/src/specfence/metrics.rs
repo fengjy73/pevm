@@ -45,14 +45,14 @@ pub struct SpecFenceMetrics {
     pub speculate_addresses: Vec<Address>,
     /// Per-location validation failures.
     pub region_validate_fail: usize,
-    /// FullRetry (whole-tx re-exec) counts.
-    pub tx_full_retry: usize,
-    /// Bind hits (read matched predicted writer).
-    pub bind_hits: usize,
+    /// FullAbortReexecute (whole-tx re-exec) counts.
+    pub tx_full_abort_reexecute: usize,
+    /// OrderedAdmit hits (read matched predicted writer).
+    pub ordered_admit_hits: usize,
     /// WaitHard decisions / admissions at location grain.
     pub wait_hard_count: usize,
-    /// Legacy AEC Unfenced path counts (not Spec — Spec = Region).
-    pub spec_read_count: usize,
+    /// Legacy AEC OptimisticRead path counts (OCC-cost verb; Region is the control unit).
+    pub optimistic_read_count: usize,
     /// Selective invalidate applications.
     pub selective_invalidate_count: usize,
     /// Cascade revalidations scheduled (alias tracking for Spec v1 metrics).
@@ -63,35 +63,35 @@ pub struct SpecFenceMetrics {
     pub selective_fallback_full: usize,
     /// Checkpoint opportunities recorded (Phase-2 prep).
     pub checkpoint_opportunities: usize,
-    /// Semantic PartialRetry applications (certified-prefix Bind on reexec).
+    /// Semantic PartialRetry applications (certified-prefix OrderedAdmit on reexec).
     pub partial_retry_count: usize,
-    /// PartialRetry attempted but fell back to FullRetry (unsafe split).
+    /// PartialRetry attempted but fell back to FullAbortReexecute (unsafe split).
     pub partial_retry_fallback_full: usize,
     /// Cost-aware π chose WaitHard.
     pub cost_chose_wait: usize,
-    /// Cost-aware π chose SpecRead.
-    pub cost_chose_spec: usize,
-    /// Cost-aware π chose Bind.
-    pub cost_chose_bind: usize,
+    /// Cost-aware π chose OptimisticRead.
+    pub cost_chose_optimistic_read: usize,
+    /// Cost-aware π chose OrderedAdmit.
+    pub cost_chose_ordered_admit: usize,
     /// Mean P_conflict among cost-aware WaitHard decisions.
     pub mean_p_at_wait: f64,
-    /// Mean P_conflict among cost-aware SpecRead decisions.
-    pub mean_p_at_spec: f64,
+    /// Mean P_conflict among cost-aware OptimisticRead decisions.
+    pub mean_p_at_optimistic_read: f64,
     /// Plant v2 M0: fresh EVM/transact/interpreter starts (new incarnation from tx head).
     /// Incremented at `Vm::execute` immediately before the handler `run` (OCC + SpecFence).
-    /// Baseline today: ≈ n_tx + head-reexecs (PartialRetry and FullRetry both restart from head).
+    /// Baseline today: ≈ n_tx + head-reexecs (PartialRetry and FullAbortReexecute both restart from head).
     pub evm_entries: usize,
     /// M1+: resume from checkpoint without fresh interpreter start (stays 0 until RewindTo).
     pub resume_count: usize,
     /// M1+: rebind-only repair without rewind/restart (stays 0 until Rebind).
     pub rebind_only: usize,
-    /// Cold SpecRead fast path: skipped Bayes/HotSet/π (OCC-like discovery).
-    pub cold_spec_fast: usize,
-    /// First-incarnation OCC-identical SpecRead (no FenceGraph/π/writer lookups).
+    /// Cold OptimisticRead fast path: skipped Bayes/HotSet/π (OCC-like discovery).
+    pub cold_optimistic_fast: usize,
+    /// First-incarnation OCC-identical OptimisticRead (no FenceGraph/π/writer lookups).
     pub occ_fast_first: usize,
     /// Profile: ns spent in Handler::run / inspect_run (includes DB/maybe_wait).
     pub profile_handler_ns: u64,
-    /// Profile: ns spent inside maybe_wait (π / Bind / SoftWait decide).
+    /// Profile: ns spent inside maybe_wait (π / OrderedAdmit / SoftWait decide).
     pub profile_maybe_wait_ns: u64,
     /// Profile: ns spent in try_validate + SuffixRepair/RebindOnly.
     pub profile_validate_ns: u64,
@@ -99,10 +99,10 @@ pub struct SpecFenceMetrics {
     pub profile_scheduler_ns: u64,
     /// M1+: rewind journal/PC to checkpoint then resume (stays 0 until RewindTo).
     pub rewind_to_cp: usize,
-    /// FullRestart decisions: OCC abort reexec, or SpecFence FullRetry (no certified prefix).
+    /// FullAbortReexecute decisions: OCC abort reexec, or SpecFence FullAbortReexecute (no certified prefix).
     /// Each corresponding reexec also increments `evm_entries` at the next `Vm::execute`.
-    pub full_restart: usize,
-    /// Semantic PartialRetry (and EarlyVal force-bind) that still restarts the interpreter
+    pub full_abort_reexecute: usize,
+    /// Semantic PartialRetry (and EarlyVal force-ordered_admit) that still restarts the interpreter
     /// from tx head — not an L1 resume. Documented alias for "head reexec under PartialRetry".
     /// M1 RewindTo must NOT increment this; use `resume_count` / `rewind_to_cp` instead.
     pub tx_head_reexec: usize,
@@ -153,12 +153,12 @@ pub struct SpecFenceMetrics {
     pub journal_blob_ff_accounts: usize,
     /// M1g: nested CALL short-circuits served from CallOutcome cache on resume.
     pub call_outcome_cache_hits: usize,
-    /// M3: Bind chosen because residual / process WŜ prior predicted the writer.
-    pub prior_bind_hits: usize,
-    /// M3: prior WŜ predicted a writer but SpecRead was taken and later failed,
-    /// or Bind placeholder missed (writer ESTIMATE / wrong version).
-    pub prior_bind_miss: usize,
-    /// M3: validation failures attributed to first-incarnation SpecRead waste
+    /// M3: OrderedAdmit chosen because residual / process WŜ prior predicted the writer.
+    pub prior_ordered_admit_hits: usize,
+    /// M3: prior WŜ predicted a writer but OptimisticRead was taken and later failed,
+    /// or OrderedAdmit placeholder missed (writer ESTIMATE / wrong version).
+    pub prior_ordered_admit_miss: usize,
+    /// M3: validation failures attributed to first-incarnation OptimisticRead waste
     /// (best-effort; counted when invalid reads overlap prior-predicted locations).
     pub first_pass_validate_fail: usize,
     /// M4: Tx incarnations that ran the lean OCC-fast path (meta off).
@@ -175,7 +175,7 @@ pub struct SpecFenceMetrics {
     pub soft_wait_arms: usize,
     /// Three-pillar Await@a: BO-until-Validated arms at first unresolved access a on hot ℓ.
     pub await_at_a_arms: usize,
-    /// Await@a wake → next validation succeeded (productive Bind-when-ready).
+    /// Await@a wake → next validation succeeded (productive OrderedAdmit-when-ready).
     pub await_at_a_wake_ok: usize,
     /// Await@a wake → next validation aborted again.
     pub await_at_a_wake_reabort: usize,
@@ -183,32 +183,32 @@ pub struct SpecFenceMetrics {
     pub cost_chose_wait_program: usize,
     /// P0: cost π WaitHard on handler locations (should stay ~0).
     pub cost_chose_wait_handler: usize,
-    /// P0: cost π SpecRead on program locations.
-    pub cost_chose_spec_program: usize,
-    /// P0: cost π SpecRead on handler locations.
-    pub cost_chose_spec_handler: usize,
+    /// P0: cost π OptimisticRead on program locations.
+    pub cost_chose_optimistic_read_program: usize,
+    /// P0: cost π OptimisticRead on handler locations.
+    pub cost_chose_optimistic_read_handler: usize,
     /// P3: EarlyAbort fence arms (cut incarnation at early heavy program cross).
     pub early_abort_count: usize,
     /// P4: SoftWait wakes that armed RewindTo/FF at checkpoint before `k`.
     pub park_resume_at_k: usize,
-    /// P4: SoftWait wakes that fell back to tx-grain FullRetry.
-    pub park_resume_full_retry: usize,
-    /// V5 dig: abort while force_bind / force_prefix was already armed (Lean PartialRetry reabort).
-    pub force_bind_reabort: usize,
+    /// P4: SoftWait wakes that fell back to tx-grain FullAbortReexecute.
+    pub park_resume_full_abort_reexecute: usize,
+    /// V5 dig: abort while force_ordered_admit / force_prefix was already armed (Lean PartialRetry reabort).
+    pub force_ordered_admit_reabort: usize,
     /// V5 dig: SoftWait wake → next validation succeeded without abort.
     pub soft_wait_wake_ok: usize,
     /// V5 dig: SoftWait wake → next validation aborted again.
     pub soft_wait_wake_reabort: usize,
-    /// Iter3: escalate FullRestart parked behind unfinished conflict writer.
+    /// Iter3: escalate FullAbortReexecute parked behind unfinished conflict writer.
     pub serial_barrier_resolve: usize,
-    /// Iter3: escalate FullRestart steal-first defer (no unfinished writer).
+    /// Iter3: escalate FullAbortReexecute steal-first defer (no unfinished writer).
     pub serial_barrier_defer: usize,
     /// Iter4: hang-free Handler::run post-SSTORE plant captures.
     pub handler_sstore_capture: usize,
-    /// Iter19: Handler SLOAD Bind/EffectBoundary live snaps.
-    pub bind_snap_capture: usize,
-    /// Iter20: hang-free Bind-snap credit consume (opcode_steps credited, no PC jump).
-    pub bind_snap_credit: usize,
+    /// Iter19: Handler SLOAD OrderedAdmit/EffectBoundary live snaps.
+    pub ordered_admit_snap_capture: usize,
+    /// Iter20: hang-free OrderedAdmit-snap credit consume (opcode_steps credited, no PC jump).
+    pub ordered_admit_snap_credit: usize,
     /// Iter4: sibling consumers parked in hot-ℓ clique barrier.
     pub serial_barrier_clique: usize,
     /// Iter5: fb escalate deferred once for jump_is_safe after capture window.
@@ -218,42 +218,42 @@ pub struct SpecFenceMetrics {
     /// Iter14: first SuffixRepair parked behind Executing conflict writer (schedule-side).
     pub first_repair_await: usize,
     /// Iter15: first-fail true_suffix + high-fan Executing spine → escalate+barrier
-    /// (collapse doomed SuffixRepair→fb_reabort→FullRestart chains).
+    /// (collapse doomed SuffixRepair→fb_reabort→FullAbortReexecute chains).
     pub fanout_fr_collapse: usize,
     /// Iter16: !true_suffix validate-defer behind Executing spine (RebindOnly-after-spine).
     pub fanout_validate_defer: usize,
-    /// Iter16: true_suffix SuffixRepair+barrier absorb (no FullRestart) on fan≥8 spine.
+    /// Iter16: true_suffix SuffixRepair+barrier absorb (no FullAbortReexecute) on fan≥8 spine.
     pub fanout_absorb: usize,
-    /// A3: `choose_edge_action` Bind (published Data, no writer_done gate).
-    pub edge_bind: usize,
+    /// A3: `choose_edge_action` OrderedAdmit (published Data, no writer_done gate).
+    pub edge_ordered_admit: usize,
     /// D6: essential wait-for (unpublished anti-dep).
     pub edge_wait_for: usize,
-    /// A4/A2: independence-certified or canary Unfenced (not Spec — Spec = Region).
-    pub edge_unfenced: usize,
+    /// A4/A2: independence-certified or canary OptimisticRead (OCC-cost; Region is the control unit).
+    pub edge_optimistic_read: usize,
     /// A2: first-wave Avoid broadcasts on publish.
     pub avoid_broadcasts: usize,
     /// A2: canary probes consumed.
     pub canary_probes: usize,
-    /// A4: independence-certified Unfenced.
-    pub independent_unfenced: usize,
-    /// A1: clique/spine WaitFor (mass Unfenced gated).
+    /// A4: independence-certified OptimisticRead.
+    pub independent_optimistic_read: usize,
+    /// A1: clique/spine WaitFor (mass OptimisticRead gated).
     pub spine_waits: usize,
     /// A1: |H| at block end.
     pub sketch_hot_size: usize,
     /// A2: Data-publish progressive wakes (Blocking, not SoftWait Soft).
     pub data_publish_wakes: usize,
-    /// U1/U5: must_wait/force_prefix fell through to Unfenced (should stay ~0).
-    pub force_prefix_unfenced: usize,
-    /// S1: Ready spine writer prefer-admitted before independence Unfenced.
+    /// U1/U5: must_wait/force_prefix fell through to OptimisticRead (should stay ~0).
+    pub force_prefix_optimistic_read: usize,
+    /// S1: Ready spine writer prefer-admitted before independence OptimisticRead.
     pub prefer_admit: usize,
     /// S4: admitted more than one unfinished writer on the same ℓ.
     pub multi_spine_admit: usize,
     /// U6: quiet morph revoked a prior-seeded Fence (not live Avoid).
-    pub quiet_fence_revoke: usize,
+    pub quiet_pessimistic_revoke: usize,
     /// U4: ℓ→writer identity stored across R2/R4.
     pub writer_identity_preserved: usize,
-    /// Done→Data residual Bind (Avoid/Fence, not UnfencedWriterDone).
-    pub bind_residual: usize,
+    /// Done→Data residual OrderedAdmit (Avoid/Fence, not OptimisticReadWriterDone).
+    pub ordered_admit_residual: usize,
     /// First-wave canary reopened after probe Done without Avoid.
     pub canary_reopen: usize,
     /// writer_done / u_aa learned into H/Avoid priors.
@@ -262,20 +262,20 @@ pub struct SpecFenceMetrics {
     pub detect_accesses: usize,
     /// Frozen-grain: PredictedEssential gate true at this \(a\).
     pub predicted_essential_hits: usize,
-    /// Frozen-grain: PCC Bind/WaitFor fired at this access (not tx-sticky).
+    /// Frozen-grain: PCC OrderedAdmit/WaitFor fired at this access (not tx-sticky).
     pub pcc_fire_at_a: usize,
-    /// PredictedEssential but ROI said Fence_tax ≥ OCC_reexec → stayed Unfenced.
+    /// PredictedEssential but ROI said Fence_tax ≥ OCC_reexec → stayed OptimisticRead.
     pub pcc_roi_skip: usize,
-    /// Unfenced≡OCC fast path (no Edge SM / sketch / checkpoint).
-    pub unfenced_occ_fast: usize,
+    /// OptimisticRead≡OCC fast path (no Edge SM / sketch / checkpoint).
+    pub optimistic_read_occ_fast: usize,
     /// SpecFence incarnations that executed as OccKernel (no rem).
     pub occ_kernel_execs: usize,
     /// SpecFence incarnations that executed as PccKernel (rem / Resolve).
     pub pcc_kernel_execs: usize,
     /// SpecFence validates that used the OCC bool kernel (no collect_invalid_reads tax).
     pub occ_kernel_validates: usize,
-    /// Certified prefix existed but PrefixSkip lost to B0 reincarnation.
-    pub prefix_skip_roi_b0: usize,
+    /// Certified prefix existed but PrefixSkip lost to full_abort_reexecute reincarnation.
+    pub prefix_skip_roi_full_abort: usize,
     /// Falsifier: ForcePrefix used as live Avoid key (target 0).
     pub force_prefix_as_pi: usize,
     /// Falsifier: canary live verb (target 0).
@@ -285,23 +285,23 @@ pub struct SpecFenceMetrics {
     /// Falsifier: H as Wait OR-door (target 0).
     pub h_or_wait_door: usize,
     /// Falsifier: morph Storm/Quiet as Fence actuator (target 0).
-    pub morph_fence_actuator: usize,
-    /// Falsifier: writer_validated Bind gate (target 0).
-    pub writer_validated_bind_gate: usize,
+    pub morph_pessimistic_actuator: usize,
+    /// Falsifier: writer_validated OrderedAdmit gate (target 0).
+    pub writer_validated_ordered_admit_gate: usize,
     /// Falsifier: flat EdgeKey(\(ℓ\),reader) control SoT (target 0).
     pub flat_edgekey_sot: usize,
-    /// v9.1: WaitFor PinWithoutThrow parks.
-    pub waitfor_pin: usize,
-    /// v9.1: WaitFor that still took AbortingThrow (should stay rare).
-    pub waitfor_aborting: usize,
-    /// v9.1: schedule refuse (known consumer not admitted).
-    pub schedule_refuse: usize,
-    /// v9.1: WaitFor/lane hit a Done producer (Bind-after-Done share).
-    pub bind_after_done: usize,
-    /// v9.1: R1a/R1b wins.
-    pub r1_win: usize,
-    /// v9.1: R1 attempts that fell through to B0.
-    pub r1_attempt: usize,
+    /// WaitForDependency parks (no Aborting).
+    pub wait_for_dependency: usize,
+    /// WaitFor that still took AbortingThrow (should stay rare).
+    pub wait_for_full_abort: usize,
+    /// Dependency-aware admission: known consumer not admitted.
+    pub refuse_admit: usize,
+    /// WaitFor/lane hit a Done producer (ordered admit after Done — should stay rare).
+    pub ordered_admit_after_done: usize,
+    /// PartialAbortRebind / PartialAbortRewind wins.
+    pub partial_abort_win: usize,
+    /// PartialAbortRewind attempts that fell through to full_abort_reexecute.
+    pub partial_abort_attempt: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -319,10 +319,10 @@ pub(crate) struct MetricsInner {
     bayes_success_updates: AtomicUsize,
     wave_promotions: AtomicUsize,
     region_validate_fail: AtomicUsize,
-    tx_full_retry: AtomicUsize,
-    bind_hits: AtomicUsize,
+    tx_full_abort_reexecute: AtomicUsize,
+    ordered_admit_hits: AtomicUsize,
     wait_hard_count: AtomicUsize,
-    spec_read_count: AtomicUsize,
+    optimistic_read_count: AtomicUsize,
     selective_invalidate_count: AtomicUsize,
     cascade_revalidate_count: AtomicUsize,
     soft_edge_revokes: AtomicUsize,
@@ -331,19 +331,19 @@ pub(crate) struct MetricsInner {
     partial_retry_count: AtomicUsize,
     partial_retry_fallback_full: AtomicUsize,
     cost_chose_wait: AtomicUsize,
-    cost_chose_spec: AtomicUsize,
-    cost_chose_bind: AtomicUsize,
+    cost_chose_optimistic_read: AtomicUsize,
+    cost_chose_ordered_admit: AtomicUsize,
     evm_entries: AtomicUsize,
     resume_count: AtomicUsize,
     rebind_only: AtomicUsize,
-    cold_spec_fast: AtomicUsize,
+    cold_optimistic_fast: AtomicUsize,
     occ_fast_first: AtomicUsize,
     profile_handler_ns: std::sync::atomic::AtomicU64,
     profile_maybe_wait_ns: std::sync::atomic::AtomicU64,
     profile_validate_ns: std::sync::atomic::AtomicU64,
     profile_scheduler_ns: std::sync::atomic::AtomicU64,
     rewind_to_cp: AtomicUsize,
-    full_restart: AtomicUsize,
+    full_abort_reexecute: AtomicUsize,
     tx_head_reexec: AtomicUsize,
     wait_park_count: AtomicUsize,
     wait_park_ns: std::sync::atomic::AtomicU64,
@@ -367,8 +367,8 @@ pub(crate) struct MetricsInner {
     absolute_jump_fallback: AtomicUsize,
     journal_blob_ff_accounts: AtomicUsize,
     call_outcome_cache_hits: AtomicUsize,
-    prior_bind_hits: AtomicUsize,
-    prior_bind_miss: AtomicUsize,
+    prior_ordered_admit_hits: AtomicUsize,
+    prior_ordered_admit_miss: AtomicUsize,
     first_pass_validate_fail: AtomicUsize,
     lean_mode_txs: AtomicUsize,
     full_mode_txs: AtomicUsize,
@@ -381,19 +381,19 @@ pub(crate) struct MetricsInner {
     await_at_a_wake_reabort: AtomicUsize,
     cost_chose_wait_program: AtomicUsize,
     cost_chose_wait_handler: AtomicUsize,
-    cost_chose_spec_program: AtomicUsize,
-    cost_chose_spec_handler: AtomicUsize,
+    cost_chose_optimistic_read_program: AtomicUsize,
+    cost_chose_optimistic_read_handler: AtomicUsize,
     early_abort_count: AtomicUsize,
     park_resume_at_k: AtomicUsize,
-    park_resume_full_retry: AtomicUsize,
-    force_bind_reabort: AtomicUsize,
+    park_resume_full_abort_reexecute: AtomicUsize,
+    force_ordered_admit_reabort: AtomicUsize,
     soft_wait_wake_ok: AtomicUsize,
     soft_wait_wake_reabort: AtomicUsize,
     serial_barrier_resolve: AtomicUsize,
     serial_barrier_defer: AtomicUsize,
     handler_sstore_capture: AtomicUsize,
-    bind_snap_capture: AtomicUsize,
-    bind_snap_credit: AtomicUsize,
+    ordered_admit_snap_capture: AtomicUsize,
+    ordered_admit_snap_credit: AtomicUsize,
     serial_barrier_clique: AtomicUsize,
     jump_defer: AtomicUsize,
     second_repair_await: AtomicUsize,
@@ -401,45 +401,45 @@ pub(crate) struct MetricsInner {
     fanout_fr_collapse: AtomicUsize,
     fanout_validate_defer: AtomicUsize,
     fanout_absorb: AtomicUsize,
-    edge_bind: AtomicUsize,
+    edge_ordered_admit: AtomicUsize,
     edge_wait_for: AtomicUsize,
-    edge_unfenced: AtomicUsize,
+    edge_optimistic_read: AtomicUsize,
     avoid_broadcasts: AtomicUsize,
     canary_probes: AtomicUsize,
-    independent_unfenced: AtomicUsize,
+    independent_optimistic_read: AtomicUsize,
     spine_waits: AtomicUsize,
     sketch_hot_size: AtomicUsize,
     data_publish_wakes: AtomicUsize,
-    force_prefix_unfenced: AtomicUsize,
+    force_prefix_optimistic_read: AtomicUsize,
     prefer_admit: AtomicUsize,
     multi_spine_admit: AtomicUsize,
-    quiet_fence_revoke: AtomicUsize,
+    quiet_pessimistic_revoke: AtomicUsize,
     writer_identity_preserved: AtomicUsize,
-    bind_residual: AtomicUsize,
+    ordered_admit_residual: AtomicUsize,
     canary_reopen: AtomicUsize,
     writer_done_learned: AtomicUsize,
     detect_accesses: AtomicUsize,
     predicted_essential_hits: AtomicUsize,
     pcc_fire_at_a: AtomicUsize,
     pcc_roi_skip: AtomicUsize,
-    unfenced_occ_fast: AtomicUsize,
+    optimistic_read_occ_fast: AtomicUsize,
     occ_kernel_execs: AtomicUsize,
     pcc_kernel_execs: AtomicUsize,
     occ_kernel_validates: AtomicUsize,
-    prefix_skip_roi_b0: AtomicUsize,
+    prefix_skip_roi_full_abort: AtomicUsize,
     force_prefix_as_pi: AtomicUsize,
     canary_live_verb: AtomicUsize,
     inc_avoid_hits: AtomicUsize,
     h_or_wait_door: AtomicUsize,
-    morph_fence_actuator: AtomicUsize,
-    writer_validated_bind_gate: AtomicUsize,
+    morph_pessimistic_actuator: AtomicUsize,
+    writer_validated_ordered_admit_gate: AtomicUsize,
     flat_edgekey_sot: AtomicUsize,
-    waitfor_pin: AtomicUsize,
-    waitfor_aborting: AtomicUsize,
-    schedule_refuse: AtomicUsize,
-    bind_after_done: AtomicUsize,
-    r1_win: AtomicUsize,
-    r1_attempt: AtomicUsize,
+    wait_for_dependency: AtomicUsize,
+    wait_for_full_abort: AtomicUsize,
+    refuse_admit: AtomicUsize,
+    ordered_admit_after_done: AtomicUsize,
+    partial_abort_win: AtomicUsize,
+    partial_abort_attempt: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -516,20 +516,20 @@ impl MetricsInner {
         }
     }
 
-    pub(crate) fn record_tx_full_retry(&self) {
-        self.tx_full_retry.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn record_tx_full_abort_reexecute(&self) {
+        self.tx_full_abort_reexecute.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_bind_hit(&self) {
-        self.bind_hits.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn record_ordered_admit_hit(&self) {
+        self.ordered_admit_hits.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_wait_hard(&self) {
         self.wait_hard_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_spec_read(&self) {
-        self.spec_read_count.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn record_optimistic_read(&self) {
+        self.optimistic_read_count.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_selective_invalidate(&self, n: usize) {
@@ -569,12 +569,14 @@ impl MetricsInner {
         self.cost_chose_wait.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_cost_chose_spec(&self) {
-        self.cost_chose_spec.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn record_cost_chose_optimistic_read(&self) {
+        self.cost_chose_optimistic_read
+            .fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_cost_chose_bind(&self) {
-        self.cost_chose_bind.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn record_cost_chose_ordered_admit(&self) {
+        self.cost_chose_ordered_admit
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_soft_wait_arm(&self) {
@@ -605,12 +607,14 @@ impl MetricsInner {
         self.cost_chose_wait_handler.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_cost_chose_spec_program(&self) {
-        self.cost_chose_spec_program.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn record_cost_chose_optimistic_read_program(&self) {
+        self.cost_chose_optimistic_read_program
+            .fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_cost_chose_spec_handler(&self) {
-        self.cost_chose_spec_handler.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn record_cost_chose_optimistic_read_handler(&self) {
+        self.cost_chose_optimistic_read_handler
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_early_abort(&self) {
@@ -632,8 +636,8 @@ impl MetricsInner {
         self.rebind_only.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_cold_spec_fast(&self) {
-        self.cold_spec_fast.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn record_cold_optimistic_fast(&self) {
+        self.cold_optimistic_fast.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_occ_fast_first(&self) {
@@ -673,8 +677,8 @@ impl MetricsInner {
         self.rewind_to_cp.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_full_restart(&self) {
-        self.full_restart.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn record_full_abort_reexecute(&self) {
+        self.full_abort_reexecute.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Today's PartialRetry / EarlyVal still restarts interpreter from tx head.
@@ -737,16 +741,17 @@ impl MetricsInner {
     pub(crate) fn set_park_resume_metrics(
         &self,
         park_resume_at_k: usize,
-        park_resume_full_retry: usize,
+        park_resume_full_abort_reexecute: usize,
     ) {
         self.park_resume_at_k
             .store(park_resume_at_k, Ordering::Relaxed);
-        self.park_resume_full_retry
-            .store(park_resume_full_retry, Ordering::Relaxed);
+        self.park_resume_full_abort_reexecute
+            .store(park_resume_full_abort_reexecute, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_force_bind_reabort(&self) {
-        self.force_bind_reabort.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn record_force_ordered_admit_reabort(&self) {
+        self.force_ordered_admit_reabort
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_soft_wait_wake_ok(&self) {
@@ -770,13 +775,15 @@ impl MetricsInner {
         self.handler_sstore_capture.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_handler_bind_snap_capture(&self) {
-        self.bind_snap_capture.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn record_handler_ordered_admit_snap_capture(&self) {
+        self.ordered_admit_snap_capture
+            .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Iter20: note Bind tip was present on resume but not PC-jumped (credit path).
-    pub(crate) fn record_bind_snap_credit(&self, _steps: u64) {
-        self.bind_snap_credit.fetch_add(1, Ordering::Relaxed);
+    /// Iter20: note OrderedAdmit tip was present on resume but not PC-jumped (credit path).
+    pub(crate) fn record_ordered_admit_snap_credit(&self, _steps: u64) {
+        self.ordered_admit_snap_credit
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_serial_barrier_clique(&self) {
@@ -803,47 +810,48 @@ impl MetricsInner {
         self.fanout_absorb.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_edge_bind(&self) {
-        self.edge_bind.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn record_edge_ordered_admit(&self) {
+        self.edge_ordered_admit.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_edge_wait_for(&self) {
         self.edge_wait_for.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_waitfor_pin(&self) {
-        self.waitfor_pin.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn record_wait_for_dependency(&self) {
+        self.wait_for_dependency.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_waitfor_aborting(&self) {
-        self.waitfor_aborting.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn record_wait_for_full_abort(&self) {
+        self.wait_for_full_abort.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_schedule_refuse(&self) {
-        self.record_schedule_refuse_n(1);
+    pub(crate) fn record_refuse_admit(&self) {
+        self.record_refuse_admit_n(1);
     }
 
     #[inline]
-    pub(crate) fn record_schedule_refuse_n(&self, n: usize) {
+    pub(crate) fn record_refuse_admit_n(&self, n: usize) {
         if n > 0 {
-            self.schedule_refuse.fetch_add(n, Ordering::Relaxed);
+            self.refuse_admit.fetch_add(n, Ordering::Relaxed);
         }
     }
 
-    pub(crate) fn record_bind_after_done(&self) {
-        self.bind_after_done.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn record_ordered_admit_after_done(&self) {
+        self.ordered_admit_after_done
+            .fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_r1_win(&self) {
-        self.r1_win.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn record_partial_abort_win(&self) {
+        self.partial_abort_win.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_r1_attempt(&self) {
-        self.r1_attempt.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn record_partial_abort_attempt(&self) {
+        self.partial_abort_attempt.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_edge_unfenced(&self) {
-        self.edge_unfenced.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn record_edge_optimistic_read(&self) {
+        self.edge_optimistic_read.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_avoid_broadcast(&self) {
@@ -854,8 +862,9 @@ impl MetricsInner {
         self.canary_probes.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_independent_unfenced(&self) {
-        self.independent_unfenced.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn record_independent_optimistic_read(&self) {
+        self.independent_optimistic_read
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_spine_wait(&self) {
@@ -870,8 +879,9 @@ impl MetricsInner {
         self.data_publish_wakes.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_force_prefix_unfenced(&self) {
-        self.force_prefix_unfenced.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn record_force_prefix_optimistic_read(&self) {
+        self.force_prefix_optimistic_read
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_prefer_admit(&self) {
@@ -882,9 +892,10 @@ impl MetricsInner {
         self.multi_spine_admit.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_quiet_fence_revoke(&self, n: usize) {
+    pub(crate) fn record_quiet_pessimistic_revoke(&self, n: usize) {
         if n > 0 {
-            self.quiet_fence_revoke.fetch_add(n, Ordering::Relaxed);
+            self.quiet_pessimistic_revoke
+                .fetch_add(n, Ordering::Relaxed);
         }
     }
 
@@ -893,8 +904,8 @@ impl MetricsInner {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_bind_residual(&self) {
-        self.bind_residual.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn record_ordered_admit_residual(&self) {
+        self.ordered_admit_residual.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_canary_reopen(&self) {
@@ -922,8 +933,9 @@ impl MetricsInner {
         self.pcc_roi_skip.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_unfenced_occ_fast(&self) {
-        self.unfenced_occ_fast.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn record_optimistic_read_occ_fast(&self) {
+        self.optimistic_read_occ_fast
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_occ_kernel_exec(&self) {
@@ -938,8 +950,9 @@ impl MetricsInner {
         self.occ_kernel_validates.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_prefix_skip_roi_b0(&self) {
-        self.prefix_skip_roi_b0.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn record_prefix_skip_roi_full_abort(&self) {
+        self.prefix_skip_roi_full_abort
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_jump_defer(&self) {
@@ -1014,14 +1027,16 @@ impl MetricsInner {
         }
     }
 
-    /// M3: Bind from learned / residual WŜ prior.
-    pub(crate) fn record_prior_bind_hit(&self) {
-        self.prior_bind_hits.fetch_add(1, Ordering::Relaxed);
+    /// M3: OrderedAdmit from learned / residual WŜ prior.
+    pub(crate) fn record_prior_ordered_admit_hit(&self) {
+        self.prior_ordered_admit_hits
+            .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// M3: prior WŜ did not prevent a bad SpecRead / failed Bind.
-    pub(crate) fn record_prior_bind_miss(&self) {
-        self.prior_bind_miss.fetch_add(1, Ordering::Relaxed);
+    /// M3: prior WŜ did not prevent a bad OptimisticRead / failed OrderedAdmit.
+    pub(crate) fn record_prior_ordered_admit_miss(&self) {
+        self.prior_ordered_admit_miss
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// M3: first-incarnation validate fail overlapping prior-predicted locs.
@@ -1063,7 +1078,7 @@ impl MetricsInner {
         wave_id: usize,
         mean_wait_posterior: f64,
         mean_p_at_wait: f64,
-        mean_p_at_spec: f64,
+        mean_p_at_optimistic_read: f64,
         wave_width_mean: f64,
     ) -> SpecFenceMetrics {
         let mut wait_addresses: Vec<Address> =
@@ -1093,10 +1108,10 @@ impl MetricsInner {
             wait_addresses,
             speculate_addresses,
             region_validate_fail: self.region_validate_fail.load(Ordering::Relaxed),
-            tx_full_retry: self.tx_full_retry.load(Ordering::Relaxed),
-            bind_hits: self.bind_hits.load(Ordering::Relaxed),
+            tx_full_abort_reexecute: self.tx_full_abort_reexecute.load(Ordering::Relaxed),
+            ordered_admit_hits: self.ordered_admit_hits.load(Ordering::Relaxed),
             wait_hard_count: self.wait_hard_count.load(Ordering::Relaxed),
-            spec_read_count: self.spec_read_count.load(Ordering::Relaxed),
+            optimistic_read_count: self.optimistic_read_count.load(Ordering::Relaxed),
             selective_invalidate_count: self.selective_invalidate_count.load(Ordering::Relaxed),
             cascade_revalidate_count: self.cascade_revalidate_count.load(Ordering::Relaxed),
             soft_edge_revokes: self.soft_edge_revokes.load(Ordering::Relaxed),
@@ -1105,21 +1120,21 @@ impl MetricsInner {
             partial_retry_count: self.partial_retry_count.load(Ordering::Relaxed),
             partial_retry_fallback_full: self.partial_retry_fallback_full.load(Ordering::Relaxed),
             cost_chose_wait: self.cost_chose_wait.load(Ordering::Relaxed),
-            cost_chose_spec: self.cost_chose_spec.load(Ordering::Relaxed),
-            cost_chose_bind: self.cost_chose_bind.load(Ordering::Relaxed),
+            cost_chose_optimistic_read: self.cost_chose_optimistic_read.load(Ordering::Relaxed),
+            cost_chose_ordered_admit: self.cost_chose_ordered_admit.load(Ordering::Relaxed),
             mean_p_at_wait,
-            mean_p_at_spec,
+            mean_p_at_optimistic_read,
             evm_entries: self.evm_entries.load(Ordering::Relaxed),
             resume_count: self.resume_count.load(Ordering::Relaxed),
             rebind_only: self.rebind_only.load(Ordering::Relaxed),
-            cold_spec_fast: self.cold_spec_fast.load(Ordering::Relaxed),
+            cold_optimistic_fast: self.cold_optimistic_fast.load(Ordering::Relaxed),
             occ_fast_first: self.occ_fast_first.load(Ordering::Relaxed),
             profile_handler_ns: self.profile_handler_ns.load(Ordering::Relaxed),
             profile_maybe_wait_ns: self.profile_maybe_wait_ns.load(Ordering::Relaxed),
             profile_validate_ns: self.profile_validate_ns.load(Ordering::Relaxed),
             profile_scheduler_ns: self.profile_scheduler_ns.load(Ordering::Relaxed),
             rewind_to_cp: self.rewind_to_cp.load(Ordering::Relaxed),
-            full_restart: self.full_restart.load(Ordering::Relaxed),
+            full_abort_reexecute: self.full_abort_reexecute.load(Ordering::Relaxed),
             tx_head_reexec: self.tx_head_reexec.load(Ordering::Relaxed),
             wait_park_count: self.wait_park_count.load(Ordering::Relaxed),
             wait_park_ns: self.wait_park_ns.load(Ordering::Relaxed),
@@ -1144,8 +1159,8 @@ impl MetricsInner {
             absolute_jump_fallback: self.absolute_jump_fallback.load(Ordering::Relaxed),
             journal_blob_ff_accounts: self.journal_blob_ff_accounts.load(Ordering::Relaxed),
             call_outcome_cache_hits: self.call_outcome_cache_hits.load(Ordering::Relaxed),
-            prior_bind_hits: self.prior_bind_hits.load(Ordering::Relaxed),
-            prior_bind_miss: self.prior_bind_miss.load(Ordering::Relaxed),
+            prior_ordered_admit_hits: self.prior_ordered_admit_hits.load(Ordering::Relaxed),
+            prior_ordered_admit_miss: self.prior_ordered_admit_miss.load(Ordering::Relaxed),
             first_pass_validate_fail: self.first_pass_validate_fail.load(Ordering::Relaxed),
             lean_mode_txs: self.lean_mode_txs.load(Ordering::Relaxed),
             full_mode_txs: self.full_mode_txs.load(Ordering::Relaxed),
@@ -1158,19 +1173,25 @@ impl MetricsInner {
             await_at_a_wake_reabort: self.await_at_a_wake_reabort.load(Ordering::Relaxed),
             cost_chose_wait_program: self.cost_chose_wait_program.load(Ordering::Relaxed),
             cost_chose_wait_handler: self.cost_chose_wait_handler.load(Ordering::Relaxed),
-            cost_chose_spec_program: self.cost_chose_spec_program.load(Ordering::Relaxed),
-            cost_chose_spec_handler: self.cost_chose_spec_handler.load(Ordering::Relaxed),
+            cost_chose_optimistic_read_program: self
+                .cost_chose_optimistic_read_program
+                .load(Ordering::Relaxed),
+            cost_chose_optimistic_read_handler: self
+                .cost_chose_optimistic_read_handler
+                .load(Ordering::Relaxed),
             early_abort_count: self.early_abort_count.load(Ordering::Relaxed),
             park_resume_at_k: self.park_resume_at_k.load(Ordering::Relaxed),
-            park_resume_full_retry: self.park_resume_full_retry.load(Ordering::Relaxed),
-            force_bind_reabort: self.force_bind_reabort.load(Ordering::Relaxed),
+            park_resume_full_abort_reexecute: self
+                .park_resume_full_abort_reexecute
+                .load(Ordering::Relaxed),
+            force_ordered_admit_reabort: self.force_ordered_admit_reabort.load(Ordering::Relaxed),
             soft_wait_wake_ok: self.soft_wait_wake_ok.load(Ordering::Relaxed),
             soft_wait_wake_reabort: self.soft_wait_wake_reabort.load(Ordering::Relaxed),
             serial_barrier_resolve: self.serial_barrier_resolve.load(Ordering::Relaxed),
             serial_barrier_defer: self.serial_barrier_defer.load(Ordering::Relaxed),
             handler_sstore_capture: self.handler_sstore_capture.load(Ordering::Relaxed),
-            bind_snap_capture: self.bind_snap_capture.load(Ordering::Relaxed),
-            bind_snap_credit: self.bind_snap_credit.load(Ordering::Relaxed),
+            ordered_admit_snap_capture: self.ordered_admit_snap_capture.load(Ordering::Relaxed),
+            ordered_admit_snap_credit: self.ordered_admit_snap_credit.load(Ordering::Relaxed),
             serial_barrier_clique: self.serial_barrier_clique.load(Ordering::Relaxed),
             jump_defer: self.jump_defer.load(Ordering::Relaxed),
             second_repair_await: self.second_repair_await.load(Ordering::Relaxed),
@@ -1178,45 +1199,47 @@ impl MetricsInner {
             fanout_fr_collapse: self.fanout_fr_collapse.load(Ordering::Relaxed),
             fanout_validate_defer: self.fanout_validate_defer.load(Ordering::Relaxed),
             fanout_absorb: self.fanout_absorb.load(Ordering::Relaxed),
-            edge_bind: self.edge_bind.load(Ordering::Relaxed),
+            edge_ordered_admit: self.edge_ordered_admit.load(Ordering::Relaxed),
             edge_wait_for: self.edge_wait_for.load(Ordering::Relaxed),
-            edge_unfenced: self.edge_unfenced.load(Ordering::Relaxed),
+            edge_optimistic_read: self.edge_optimistic_read.load(Ordering::Relaxed),
             avoid_broadcasts: self.avoid_broadcasts.load(Ordering::Relaxed),
             canary_probes: self.canary_probes.load(Ordering::Relaxed),
-            independent_unfenced: self.independent_unfenced.load(Ordering::Relaxed),
+            independent_optimistic_read: self.independent_optimistic_read.load(Ordering::Relaxed),
             spine_waits: self.spine_waits.load(Ordering::Relaxed),
             sketch_hot_size: self.sketch_hot_size.load(Ordering::Relaxed),
             data_publish_wakes: self.data_publish_wakes.load(Ordering::Relaxed),
-            force_prefix_unfenced: self.force_prefix_unfenced.load(Ordering::Relaxed),
+            force_prefix_optimistic_read: self.force_prefix_optimistic_read.load(Ordering::Relaxed),
             prefer_admit: self.prefer_admit.load(Ordering::Relaxed),
             multi_spine_admit: self.multi_spine_admit.load(Ordering::Relaxed),
-            quiet_fence_revoke: self.quiet_fence_revoke.load(Ordering::Relaxed),
+            quiet_pessimistic_revoke: self.quiet_pessimistic_revoke.load(Ordering::Relaxed),
             writer_identity_preserved: self.writer_identity_preserved.load(Ordering::Relaxed),
-            bind_residual: self.bind_residual.load(Ordering::Relaxed),
+            ordered_admit_residual: self.ordered_admit_residual.load(Ordering::Relaxed),
             canary_reopen: self.canary_reopen.load(Ordering::Relaxed),
             writer_done_learned: self.writer_done_learned.load(Ordering::Relaxed),
             detect_accesses: self.detect_accesses.load(Ordering::Relaxed),
             predicted_essential_hits: self.predicted_essential_hits.load(Ordering::Relaxed),
             pcc_fire_at_a: self.pcc_fire_at_a.load(Ordering::Relaxed),
             pcc_roi_skip: self.pcc_roi_skip.load(Ordering::Relaxed),
-            unfenced_occ_fast: self.unfenced_occ_fast.load(Ordering::Relaxed),
+            optimistic_read_occ_fast: self.optimistic_read_occ_fast.load(Ordering::Relaxed),
             occ_kernel_execs: self.occ_kernel_execs.load(Ordering::Relaxed),
             pcc_kernel_execs: self.pcc_kernel_execs.load(Ordering::Relaxed),
             occ_kernel_validates: self.occ_kernel_validates.load(Ordering::Relaxed),
-            prefix_skip_roi_b0: self.prefix_skip_roi_b0.load(Ordering::Relaxed),
+            prefix_skip_roi_full_abort: self.prefix_skip_roi_full_abort.load(Ordering::Relaxed),
             force_prefix_as_pi: self.force_prefix_as_pi.load(Ordering::Relaxed),
             canary_live_verb: self.canary_live_verb.load(Ordering::Relaxed),
             inc_avoid_hits: self.inc_avoid_hits.load(Ordering::Relaxed),
             h_or_wait_door: self.h_or_wait_door.load(Ordering::Relaxed),
-            morph_fence_actuator: self.morph_fence_actuator.load(Ordering::Relaxed),
-            writer_validated_bind_gate: self.writer_validated_bind_gate.load(Ordering::Relaxed),
+            morph_pessimistic_actuator: self.morph_pessimistic_actuator.load(Ordering::Relaxed),
+            writer_validated_ordered_admit_gate: self
+                .writer_validated_ordered_admit_gate
+                .load(Ordering::Relaxed),
             flat_edgekey_sot: self.flat_edgekey_sot.load(Ordering::Relaxed),
-            waitfor_pin: self.waitfor_pin.load(Ordering::Relaxed),
-            waitfor_aborting: self.waitfor_aborting.load(Ordering::Relaxed),
-            schedule_refuse: self.schedule_refuse.load(Ordering::Relaxed),
-            bind_after_done: self.bind_after_done.load(Ordering::Relaxed),
-            r1_win: self.r1_win.load(Ordering::Relaxed),
-            r1_attempt: self.r1_attempt.load(Ordering::Relaxed),
+            wait_for_dependency: self.wait_for_dependency.load(Ordering::Relaxed),
+            wait_for_full_abort: self.wait_for_full_abort.load(Ordering::Relaxed),
+            refuse_admit: self.refuse_admit.load(Ordering::Relaxed),
+            ordered_admit_after_done: self.ordered_admit_after_done.load(Ordering::Relaxed),
+            partial_abort_win: self.partial_abort_win.load(Ordering::Relaxed),
+            partial_abort_attempt: self.partial_abort_attempt.load(Ordering::Relaxed),
         }
     }
 }
