@@ -127,3 +127,21 @@ No `specfence/pc/`, `specfence/cc/`, `specfence/bayes/` directories.
 ## 5. Essence
 
 One pevm spine, file-SRP (wave extract, kernel merge, dual-π test-gated, Fence out of vm), Bayes→admit→decide→PinHold→R1, Soft=0, seq≡par tests green. Product TPS bars need a sweep — this PR does not invent 0.95.
+
+---
+
+## Soft=0 honesty sweep (tip `3687da6`)
+
+**When:** 2026-09-14 15:36 CST · artifacts: `lab/notes/v9.4-full-land-sweep-summary.json`, `lab/notes/specfence-v9.4-sweep-honesty.md`.
+
+| | Base `bb67ff7` | This tip |
+|--|---------------:|---------:|
+| nonempty median SF/OCC N=1@8 | 0.728 | **0.6853** |
+| quiet p10 | — | **0.5124** |
+| 14689597 N=3@8 | 0.362 | **0.3482** |
+| Soft | 0 | **0** (held) |
+| WaitFor / Bind (N=1 agg) | — | 2151 / 2208 |
+| R1 win/attempt | — | 6/1636 |
+| Bind-after-Done | — | 205 |
+
+Product bars still **not** met. Do not claim crush from call-order land alone.

@@ -210,6 +210,12 @@ fn metrics_json(m: &pevm::SpecFenceMetrics, n: usize) -> serde_json::Value {
         "profile_maybe_wait_ns": m.profile_maybe_wait_ns,
         "profile_validate_ns": m.profile_validate_ns,
         "profile_scheduler_ns": m.profile_scheduler_ns,
+        "waitfor_pin": m.waitfor_pin,
+        "waitfor_aborting": m.waitfor_aborting,
+        "schedule_refuse": m.schedule_refuse,
+        "bind_after_done": m.bind_after_done,
+        "r1_win": m.r1_win,
+        "r1_attempt": m.r1_attempt,
     })
 }
 
@@ -537,6 +543,12 @@ fn main() {
                     "occ_aborts_occ": occ["metrics"]["occ_aborts"],
                     "hotset_size": sf["metrics"]["hotset_size"],
                     "wait_park_count": sf["metrics"]["wait_park_count"],
+                    "waitfor_pin": sf["metrics"]["waitfor_pin"],
+                    "waitfor_aborting": sf["metrics"]["waitfor_aborting"],
+                    "bind_after_done": sf["metrics"]["bind_after_done"],
+                    "r1_win": sf["metrics"]["r1_win"],
+                    "r1_attempt": sf["metrics"]["r1_attempt"],
+                    "schedule_refuse": sf["metrics"]["schedule_refuse"],
                 }));
             }
             _ => {}
