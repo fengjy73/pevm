@@ -305,27 +305,25 @@ pub(crate) fn validate_specfence(
                 specfence.learner.note_reexec_cost(0.1);
                 return scheduler.finish_validation(tx_version, false);
             }
-            specfence.metrics.record_r1_attempt();
-            // R1b: certified prefix skip when EV[rewind] > EV[B0] (strips cover).
-            // Ban silent always-B0 while strips exist.
-            let ev_r1b = bayes_q.is_some_and(|q| {
-                q.known_star || q.depth_frac >= 0.50 || q.ev_pin_beats_abort || covers
-            });
-            if ev_r1b && matches!(grain, RepairGrain::R1 | RepairGrain::R1Selective) {
+            // R1b: **strip**-covered fail → RewindTo. repair_armed covers_all
+            // must not skip sibling Spec (Iter26 seq≠par). Soft=0.
+            let strip_covers = specfence
+                .certificates
+                .covers_strips_all(tx_version.tx_idx, &invalid);
+            if strip_covers {
                 let read_locations = mv_memory.read_locations(tx_version.tx_idx);
                 let write_locations = mv_memory.write_locations(tx_version.tx_idx);
-                let repair = specfence.partial_retry.apply_suffix_repair(
+                if let Some(LeanAbortRepair::SuffixRepair {
+                    suffix_writes,
+                    reexec_cost,
+                    ..
+                }) = specfence.partial_retry.try_arm_r1b_covered(
                     tx_version.tx_idx,
                     &read_locations,
                     &invalid,
                     &write_locations,
-                );
-                if let LeanAbortRepair::SuffixRepair {
-                    suffix_writes,
-                    reexec_cost,
-                    ..
-                } = repair
-                {
+                ) {
+                    specfence.metrics.record_r1_attempt();
                     if scheduler.try_validation_abort(tx_version) {
                         let estimated =
                             mv_memory.invalidate_partial_suffix(tx_version.tx_idx, &suffix_writes);
@@ -350,6 +348,9 @@ pub(crate) fn validate_specfence(
                         );
                     }
                 }
+                // Strips cover but R1b cannot arm (empty prefix / already
+                // rewound once): honest OCC B0. Never-B0 ForceBind livelocked
+                // 19807137. Do not increment r1_attempt (that was the theater).
             }
         }
     }

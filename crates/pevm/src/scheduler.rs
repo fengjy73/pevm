@@ -154,12 +154,11 @@ impl Scheduler {
                     && !edges.may_execute(tx_idx)
                     && let Some(w) = edges.blocking_producer(tx_idx)
                 {
-                    // Refuse only while the producer is mid-Execute (progress
-                    // visible). Ready/Validated refuse reintroduced the v6
-                    // yield-spin (iter20): consumers deferred, producer off
-                    // execution_idx, next_sf_task cannot make progress.
+                    // Refuse while producer is Executing **or Ready** (prefer-admit
+                    // ProducerStage(w) — no ReadyCanary Execute). Validated/Done
+                    // already published; Aborting is not a progress path (v6 hang).
                     // First wave (inc==0) must refuse too — SoT schedule-first Avoid.
-                    if self.is_executing(w) {
+                    if self.is_executing(w) || self.is_ready(w) {
                         edges.defer(tx_idx);
                         if let Some(wave) = wave {
                             drop(tx);
@@ -170,7 +169,7 @@ impl Scheduler {
                     if let Some(wave) = wave {
                         self.admit_spine(w, wave);
                     }
-                    // Fall through: Execute this canary; ProducerStage is reserved.
+                    // Fall through: Aborting/Validated canary; ProducerStage reserved.
                 }
                 tx.status = IncarnationStatus::Executing;
                 self.set_done_flag(tx_idx, false);
@@ -261,7 +260,7 @@ impl Scheduler {
                         if let Some(edges) = ready
                             && !edges.may_execute(tx_idx)
                             && let Some(w) = edges.blocking_producer(tx_idx)
-                            && self.is_executing(w)
+                            && (self.is_executing(w) || self.is_ready(w))
                         {
                             edges.defer(tx_idx);
                             if let Some(wave) = wave {
@@ -944,6 +943,23 @@ mod tests {
             "first-wave (inc==0) must refuse while ProducerStage(w) Executing"
         );
         assert!(ready.refuse_count() >= 1);
+    }
+
+    #[test]
+    fn refuse_known_consumer_while_producer_ready() {
+        let s = Scheduler::new(4);
+        let ready = ReadyEdgeTable::new();
+        ready.note_consumer(2, 0);
+        assert!(s.is_ready(0), "producer starts ReadyToExecute");
+        assert!(
+            s.try_execute_ready(2, None, Some(&ready)).is_none(),
+            "known consumer must not ReadyCanary while producer is still Ready"
+        );
+        assert!(ready.refuse_count() >= 1);
+        assert!(
+            s.try_execute_ready(0, None, Some(&ready)).is_some(),
+            "prefer-admit ProducerStage(w) still runs"
+        );
     }
 
     #[test]

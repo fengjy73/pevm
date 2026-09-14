@@ -10,7 +10,7 @@ use alloy_primitives::Address;
 use super::AccountHints;
 use super::bayes::BayesMap;
 use super::feeder::{seed_known_stars, top_is_known_star};
-use super::learner::{InterBlockPrior, LiveLearner};
+use super::learner::{InterBlockPrior, LiveLearner, MorphWeights, TopLocPrior};
 use super::producer_stage::ProducerStageTable;
 use super::ready_edge::ReadyEdgeTable;
 use crate::{MemoryLocation, hash_deterministic};
@@ -41,7 +41,18 @@ pub(crate) fn admit_seed_begin_block(
     let stars = seed_known_stars(learner, bayes, prior);
     let fan = learner.morph_weights().dominant_fan_out();
     let prior_star = prior.top_locations().iter().any(top_is_known_star);
-    let star_edges = fan || prior_star || stars > 0;
+    // Cold start / reset_inter_prior: a ≥16-tx hinted account is fan evidence
+    // even when morph is still quiet-biased (19807137 refuse=0).
+    let hint_fan = hints
+        .accounts()
+        .any(|a| a != beneficiary && hints.txs(&a).len() >= HINT_FANOUT_FLOOR);
+    let star_edges = fan || prior_star || stars > 0 || hint_fan;
+    // Storage RAW stars from InterPrior (not only Basic(addr) below).
+    for top in prior.top_locations() {
+        if top.k_template > 0 && (hint_fan || top_is_known_star(&top)) {
+            learner.seed_predicted_essential(top.location, top.k_template);
+        }
+    }
     let floor = if star_edges {
         HINT_STAR_FLOOR
     } else {
@@ -128,6 +139,48 @@ mod tests {
         assert!(
             !learner.predicted_essential(loc, 1),
             "true-k: hint seed is class k≈6, not any-k"
+        );
+    }
+
+    #[test]
+    fn hint_fan_seeds_small_accounts_and_storage_prior() {
+        let ready = ReadyEdgeTable::new();
+        let stages = ProducerStageTable::new();
+        let learner = LiveLearner::new();
+        learner.begin_block(MorphWeights::default());
+        let bayes = BayesMap::new();
+        let prior = InterBlockPrior::new();
+        let storage_loc = 0xabc_u64;
+        prior.end_block(
+            MorphWeights::default(),
+            vec![TopLocPrior {
+                location: storage_loc,
+                fanout_ema: 20.0,
+                abort_rate: 0.05,
+                chain_len_ema: 2.0,
+                k_template: 6,
+            }],
+        );
+        let star = Address::repeat_byte(0x33);
+        let side = Address::repeat_byte(0x44);
+        let hints = AccountHints::from_many(vec![(star, (0..16).collect()), (side, vec![1, 5, 8])]);
+        let n = admit_seed_begin_block(
+            &ready,
+            &stages,
+            &learner,
+            &bayes,
+            &prior,
+            &hints,
+            Address::ZERO,
+        );
+        assert!(
+            n >= 17,
+            "hint-fan floor=2 must OrderedAdmit star+satellite, got {n}"
+        );
+        assert!(!ready.may_execute(8), "3-tx satellite behind star producer");
+        assert!(
+            learner.predicted_essential(storage_loc, 6),
+            "true-k: hint-fan plants storage RAW PE from InterPrior, not only Basic(addr)"
         );
     }
 

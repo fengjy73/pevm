@@ -83,6 +83,25 @@ impl AccessOrdinalLog {
         // after publish (incarnation finished).
         unsafe { &*slot.get() }.first.get(&location).copied()
     }
+
+    /// First-touches with \(k < before_k\) — PinHold rem prefix (completed reads).
+    #[inline]
+    pub(crate) fn prefix_before(
+        &self,
+        tx_idx: TxIdx,
+        before_k: u32,
+    ) -> Vec<(MemoryLocationHash, u32)> {
+        let Some(slot) = self.slots.get(tx_idx) else {
+            return Vec::new();
+        };
+        // SAFETY: waiter still owns this incarnation (PinHold, not yet reset).
+        let st = unsafe { &*slot.get() };
+        st.first
+            .iter()
+            .filter(|&(_, &k)| k > 0 && k < before_k)
+            .map(|(&loc, &k)| (loc, k))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -100,5 +119,18 @@ mod tests {
         log.begin_incarnation(0);
         assert_eq!(log.first_k(0, 7), None);
         assert_eq!(log.note(0, 7), 1);
+    }
+
+    #[test]
+    fn prefix_before_excludes_fail_k() {
+        let log = AccessOrdinalLog::new(1);
+        assert_eq!(log.note(0, 7), 1);
+        assert_eq!(log.note(0, 8), 2);
+        assert_eq!(log.note(0, 9), 3);
+        let p = log.prefix_before(0, 3);
+        assert_eq!(p.len(), 2);
+        assert!(p.contains(&(7, 1)));
+        assert!(p.contains(&(8, 2)));
+        assert!(!p.iter().any(|(l, _)| *l == 9));
     }
 }

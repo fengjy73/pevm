@@ -216,6 +216,8 @@ fn metrics_json(m: &pevm::SpecFenceMetrics, n: usize) -> serde_json::Value {
         "bind_after_done": m.bind_after_done,
         "r1_win": m.r1_win,
         "r1_attempt": m.r1_attempt,
+        "park_resume_at_k": m.park_resume_at_k,
+        "park_resume_full_retry": m.park_resume_full_retry,
     })
 }
 
@@ -452,7 +454,7 @@ fn main() {
                 for mode in ["occ", "specfence"] {
                     let row = run_mode(&chain, &loaded, mode, 8, iters, false);
                     eprintln!(
-                        "  {mode:10} ok={} tps={:.0} wall_ms={:.1} soft={} aborts={} bind={} wait={} unf={} rewind={} rebind={} full={}",
+                        "  {mode:10} ok={} tps={:.0} wall_ms={:.1} soft={} aborts={} bind={} wait={} unf={} rewind={} rebind={} full={} r1={}/{} resume_k={} full_retry={}",
                         row["ok"],
                         row["tps"].as_f64().unwrap_or(0.0),
                         row["wall_ms"].as_f64().unwrap_or(0.0),
@@ -464,6 +466,12 @@ fn main() {
                         row["metrics"]["rewind_to_cp"].as_u64().unwrap_or(0),
                         row["metrics"]["rebind_only"].as_u64().unwrap_or(0),
                         row["metrics"]["full_restart"].as_u64().unwrap_or(0),
+                        row["metrics"]["r1_win"].as_u64().unwrap_or(0),
+                        row["metrics"]["r1_attempt"].as_u64().unwrap_or(0),
+                        row["metrics"]["park_resume_at_k"].as_u64().unwrap_or(0),
+                        row["metrics"]["park_resume_full_retry"]
+                            .as_u64()
+                            .unwrap_or(0),
                     );
                     rows.push(row);
                 }
@@ -549,6 +557,8 @@ fn main() {
                     "r1_win": sf["metrics"]["r1_win"],
                     "r1_attempt": sf["metrics"]["r1_attempt"],
                     "schedule_refuse": sf["metrics"]["schedule_refuse"],
+                    "park_resume_at_k": sf["metrics"]["park_resume_at_k"],
+                    "park_resume_full_retry": sf["metrics"]["park_resume_full_retry"],
                 }));
             }
             _ => {}
