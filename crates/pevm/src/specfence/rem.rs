@@ -1201,7 +1201,7 @@ impl PartialRetryTable {
                 certified.push(access.location);
             }
         }
-        if certified.is_empty() && force_bind {
+        if certified.is_empty() {
             drop(st);
             self.repair.insert(tx_idx, RepairPlan::FullRestart);
             return ParkResumeKind::FullRetry;
@@ -1247,15 +1247,14 @@ impl PartialRetryTable {
         self.try_arm_park_resume_at_k_inner(tx_idx, armed_at_k, false)
     }
 
-    /// PinWithoutThrow: plant rem checkpoint so wake ResumeAtK (not FullRetry).
+    /// PinWithoutThrow: plant rem checkpoint from **snapped** prefix reads
+    /// so wake [`Self::try_arm_pinhold_resume_at_k`] can ResumeAtK.
     ///
-    /// Journals access_log prefix (real reads). Wait loc is **not** a prefix
-    /// grain (first_k stays fail-k). First-access plants k=1 checkpoint with
-    /// empty prefix certified — PinHold resume allows empty certified
-    /// (no force-bind; empty FF → re-read; repair_armed stays false).
-    /// SoftWait Soft is **not** armed (Soft=0).
+    /// Empty first-access (no `value_snap`) stays FullRetry — planting a
+    /// synthetic k=1 grain livelocks 19807137 (Pin→RewindTo→Pin) and pays
+    /// rem tax ≫ OCC B0. Wait loc is **not** prefix-certified. Soft=0.
     ///
-    /// Returns `armed_at_k` (`> checkpoint k`).
+    /// Returns `armed_at_k` (`> checkpoint k`), or 0 if no honest prefix.
     pub(crate) fn arm_pinhold_checkpoint(
         &self,
         tx_idx: TxIdx,
@@ -1264,12 +1263,15 @@ impl PartialRetryTable {
         prefix: &[(MemoryLocationHash, u32)],
     ) -> u64 {
         if tx_idx >= self.states.len() {
-            return access_k.max(2) as u64;
+            return 0;
         }
         // SAFETY: single-executor invariant (waiter still owns this incarnation).
         let st = unsafe { self.state_mut(tx_idx) };
         for &(loc, k) in prefix {
             if k == 0 || loc == wait_loc {
+                continue;
+            }
+            if !st.value_snap.contains_key(&loc) && !st.inc_carry_snap.contains_key(&loc) {
                 continue;
             }
             let kk = k as usize;
@@ -1281,25 +1283,22 @@ impl PartialRetryTable {
                     mode: AccessMode::Read,
                 });
                 st.first_k.insert(loc, kk);
-                if st.value_snap.contains_key(&loc) || st.inc_carry_snap.contains_key(&loc) {
-                    st.certified.insert(loc);
-                }
+                st.certified.insert(loc);
             }
             if kk > st.k {
                 st.k = kk;
             }
         }
         if st.k == 0 {
-            st.k = 1;
+            return 0;
         }
         let has_mid_cp = st.checkpoints.iter().any(|c| c.id.k > 0 && c.id.k <= st.k);
         if !has_mid_cp {
             let _ = st.push_checkpoint(tx_idx, CheckpointKind::EffectBoundary);
         }
-        // Wait loc is the fail grain — not prefix-certified (covers_strips is
-        // CertificateTable note_fence_success, not rem first_k ≤ cp.k).
+        // Wait loc is the fail grain — not prefix-certified.
         let _ = wait_loc;
-        st.k.saturating_add(1).max(access_k as usize).max(2) as u64
+        st.k.saturating_add(1).max(access_k as usize) as u64
     }
 
     /// R1b timely Resolve: arm RewindTo when a mid-tx checkpoint exists.
@@ -1314,6 +1313,11 @@ impl PartialRetryTable {
         invalid: &[MemoryLocationHash],
         write_locations: &[MemoryLocationHash],
     ) -> Option<LeanAbortRepair> {
+        // One RewindTo per tx. A second strip-cover without progress is the
+        // 19807137 livelock (never-B0 ForceBind/R1b train).
+        if self.suffix_repair_depth(tx_idx) != 0 {
+            return None;
+        }
         let plan = self.plan_partial_retry(tx_idx, read_locations, invalid, write_locations)?;
         if plan.certified.is_empty() {
             return None;
@@ -1335,6 +1339,7 @@ impl PartialRetryTable {
             plan.prefix_writes.clone(),
         );
         self.set_force_bind(tx_idx, plan.certified.clone());
+        self.note_suffix_repair(tx_idx);
         Some(LeanAbortRepair::SuffixRepair {
             certified: plan.certified,
             suffix_writes: plan.suffix_writes,
@@ -2401,20 +2406,14 @@ mod p4_tk_park_tests {
     }
 
     #[test]
-    fn arm_pinhold_first_access_resumes_without_force_bind() {
+    fn arm_pinhold_first_access_is_full_retry() {
         let table = PartialRetryTable::new(2);
         table.reset_incarnation(0, 0);
         let armed = table.arm_pinhold_checkpoint(0, 7, 1, &[]);
-        assert!(armed >= 2, "first-access still arms checkpoint k=1");
-        match table.try_arm_pinhold_resume_at_k(0, armed) {
-            ParkResumeKind::ResumeAtK { checkpoint_k } => {
-                assert!(checkpoint_k > 0 && checkpoint_k < armed as usize);
-            }
-            other => panic!("PinHold must not FullRetry, got {other:?}"),
-        }
-        assert!(
-            !table.must_force_bind(0, 7),
-            "empty-prefix PinHold must not force-bind"
+        assert_eq!(armed, 0, "no snapped prefix → no synthetic checkpoint");
+        assert_eq!(
+            table.try_arm_pinhold_resume_at_k(0, armed),
+            ParkResumeKind::FullRetry
         );
     }
 
@@ -2437,6 +2436,12 @@ mod p4_tk_park_tests {
             other => panic!("R1b covered must RewindTo without cp_k≥8, got {other:?}"),
         }
         assert!(table.is_rewind_resume(0));
+        assert!(
+            table
+                .try_arm_r1b_covered(0, &[10, 11, 20], &[20], &[])
+                .is_none(),
+            "second R1b must escalate (no RewindTo train)"
+        );
     }
 }
 

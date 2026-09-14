@@ -8,8 +8,8 @@
 
 | Weld | Status |
 |------|--------|
-| PinHold arms rem checkpoint → wake ResumeAtK | **code** (Unfenced snaps + first-access k=1 ResumeAtK, no force-bind). Unit: `arm_pinhold_*` |
-| R1b `try_arm_r1b_covered` without cp_k≥8 theater | **code** (strips only). Strip-cover + no R1b → force-bind, not OCC B0. Unit: `try_arm_r1b_covered_*` / `covers_strips_all` |
+| PinHold arms rem checkpoint → wake ResumeAtK | **code** (Unfenced snaps; first-access FullRetry — no k=1 livelock). Unit: `arm_pinhold_*` |
+| R1b `try_arm_r1b_covered` without cp_k≥8 theater | **code** (strips only, **one** RewindTo). No arm → honest B0, not ForceBind train. Unit: `try_arm_r1b_covered_*` |
 | Refuse while producer Ready (not only Executing) | **code** (unit: `refuse_known_consumer_while_producer_ready`) |
 | ReadyCanary killed on Ready; DoneUnfenced cert=false | **code** (unit: `ready_producer_is_pinhold_not_canary`) |
 | hint-fan + storage InterPrior PE; access-gate Storage true-k | **code** (unit: `hint_fan_seeds_small_accounts_and_storage_prior`) |

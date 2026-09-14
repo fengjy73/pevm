@@ -348,29 +348,9 @@ pub(crate) fn validate_specfence(
                         );
                     }
                 }
-                // Strips cover: never OCC B0 (convert-all + PE spray). Force-bind
-                // the fenced locs and selective-invalidate writes. Not an R1 win
-                // (no prefix skip) — but not theater fallthrough either.
-                specfence
-                    .partial_retry
-                    .set_force_bind(tx_version.tx_idx, fenced.to_vec());
-                if scheduler.try_validation_abort(tx_version) {
-                    let estimated =
-                        mv_memory.invalidate_partial_suffix(tx_version.tx_idx, &write_locations);
-                    if !estimated.is_empty() {
-                        specfence
-                            .metrics
-                            .record_selective_invalidate(estimated.len());
-                    }
-                    specfence.metrics.record_partial_retry();
-                    specfence.learner.note_reexec_cost(1.0);
-                    return scheduler.finish_validation_fenced(
-                        tx_version,
-                        true,
-                        Some(tx_version.tx_idx + 1),
-                        Some(specfence.wave),
-                    );
-                }
+                // Strips cover but R1b cannot arm (empty prefix / already
+                // rewound once): honest OCC B0. Never-B0 ForceBind livelocked
+                // 19807137. Do not increment r1_attempt (that was the theater).
             }
         }
     }

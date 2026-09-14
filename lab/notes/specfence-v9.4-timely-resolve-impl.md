@@ -21,8 +21,8 @@ PinHold park (no rem checkpoint, armed_at_k=0)
 
 | # | Duty | Where | Done when |
 |---|------|-------|-----------|
-| 1 | **PinWithoutThrow resumes** | Unfenced PE-on reads `maybe_note_value` (prefix snaps). `arm_pinhold_checkpoint` journals access_log prefix; wait loc is **not** prefix-certified. First-access plants k=1 + ResumeAtK **without** force-bind. Empty FF → re-read; `repair_armed` only if RewindTo **and** FF values (Iter26). SoftWait empty-certified still FullRetry | mid-tx `park_resume_at_k` / `resume_count` ≫ 0; Soft=0 |
-| 2 | **R1 wins when strips cover** | R1a value-stable; R1b `try_arm_r1b_covered` **only** if `covers_strips_all` (not repair_armed covers_all). If strips cover but R1b cannot arm: force-bind + selective invalidate — **never** OCC B0. No `r1_win` on that fallback | R1 path not theater; abort_SF vs OCC on fan |
+| 1 | **PinWithoutThrow resumes** | Unfenced PE-on reads `maybe_note_value`. `arm_pinhold_checkpoint` journals **snapped** prefix only (wait loc not certified). First-access / empty snap → FullRetry (synthetic k=1 livelocked 19807137). Wake ResumeAtK without force-bind; `repair_armed` only with FF values | mid-tx snapped `park_resume_at_k`; Soft=0 |
+| 2 | **R1 wins when strips cover** | R1a value-stable; R1b `try_arm_r1b_covered` strips-only, **one** RewindTo (`suffix_repair_depth==0`). No `r1_attempt` unless R1b arms. Second strip-cover → honest OCC B0 (never-B0 ForceBind hung 19807137) | R1 path not theater; no RewindTo train |
 | 3 | **Schedule-first Avoid** | `scheduler.rs:try_execute_ready` refuses known consumers while `w` **Ready or Executing**; `admit_spine(w)` so ProducerStage progresses (no v6 yield-spin) | refuse on Ready; 19807137 refuse ≫ 0 |
 | 4 | **Kill known-edge ReadyCanary** | `fence_act::act_wait_for`: Ready → PinHold; DoneUnfenced **cert=false** (no R1-bait strip) | canary only Aborting/unknown |
 | 5 | **Storage true-k** | `admit_seed_begin_block` hint-fan (≥16-tx account) floor=2 + InterPrior storage PE; `vm::specfence_access_gate` plants Storage(addr,slot) PE at **live stream k** when Basic(addr) is a star | PE-on at real conflict ℓ |
