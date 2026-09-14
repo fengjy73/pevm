@@ -1162,6 +1162,15 @@ impl PartialRetryTable {
         tx_idx: TxIdx,
         armed_at_k: u64,
     ) -> ParkResumeKind {
+        self.try_arm_park_resume_at_k_inner(tx_idx, armed_at_k, true)
+    }
+
+    fn try_arm_park_resume_at_k_inner(
+        &self,
+        tx_idx: TxIdx,
+        armed_at_k: u64,
+        force_bind: bool,
+    ) -> ParkResumeKind {
         let k_fail = armed_at_k as usize;
         if k_fail == 0 {
             self.repair.insert(tx_idx, RepairPlan::FullRestart);
@@ -1221,19 +1230,31 @@ impl PartialRetryTable {
             suffix_writes,
             prefix_writes,
         );
-        self.set_force_bind(tx_idx, certified);
+        if force_bind {
+            self.set_force_bind(tx_idx, certified);
+        }
         ParkResumeKind::ResumeAtK { checkpoint_k: cp.k }
     }
 
-    /// PinWithoutThrow: plant rem checkpoint + certified prefix **before** park
-    /// so wake [`Self::try_arm_park_resume_at_k`] returns ResumeAtK (not FullRetry).
+    /// PinHold wake: RewindTo + FF **without** force-bind (Bind-theater on a
+    /// Done producer is the 14689597 abort class). SoftWait still uses
+    /// [`Self::try_arm_park_resume_at_k`].
+    pub(crate) fn try_arm_pinhold_resume_at_k(
+        &self,
+        tx_idx: TxIdx,
+        armed_at_k: u64,
+    ) -> ParkResumeKind {
+        self.try_arm_park_resume_at_k_inner(tx_idx, armed_at_k, false)
+    }
+
+    /// PinWithoutThrow: plant rem checkpoint from **snapped** prefix reads
+    /// so wake [`Self::try_arm_pinhold_resume_at_k`] can ResumeAtK.
     ///
-    /// Product WaitFor does not journal rem (Unfenced grain). Without this,
-    /// `current_k==0` → park k=0 → wake FullRetry (OCC-class head reexec + idle
-    /// tax OCC never pays). SoftWait Soft is **not** armed (Soft=0).
+    /// Inventing a k=1 wait-loc grain (no `value_snap`) caused Iter26 seq≠par
+    /// (stale FF + repair_armed covers_all → R1b skip). First-access Wait
+    /// stays FullRetry. SoftWait Soft is **not** armed (Soft=0).
     ///
-    /// `prefix` is access_log first-touches with `k < access_k`. Returns
-    /// `armed_at_k` for the wave park (`> checkpoint k`).
+    /// Returns `armed_at_k` (`> checkpoint k`), or 0 if no honest prefix.
     pub(crate) fn arm_pinhold_checkpoint(
         &self,
         tx_idx: TxIdx,
@@ -1242,12 +1263,15 @@ impl PartialRetryTable {
         prefix: &[(MemoryLocationHash, u32)],
     ) -> u64 {
         if tx_idx >= self.states.len() {
-            return access_k.max(2) as u64;
+            return 0;
         }
         // SAFETY: single-executor invariant (waiter still owns this incarnation).
         let st = unsafe { self.state_mut(tx_idx) };
         for &(loc, k) in prefix {
-            if k == 0 {
+            if k == 0 || loc == wait_loc {
+                continue;
+            }
+            if !st.value_snap.contains_key(&loc) && !st.inc_carry_snap.contains_key(&loc) {
                 continue;
             }
             let kk = k as usize;
@@ -1265,35 +1289,15 @@ impl PartialRetryTable {
                 st.k = kk;
             }
         }
-        let prefix_end = (access_k as usize).saturating_sub(1).max(1);
-        if st.k < prefix_end {
-            if st.first_k.get(&wait_loc).is_none() {
-                st.journal.push(RegionAccess {
-                    tx_idx,
-                    k: prefix_end,
-                    location: wait_loc,
-                    mode: AccessMode::Read,
-                });
-                st.first_k.insert(wait_loc, prefix_end);
-            }
-            st.k = prefix_end;
+        if st.k == 0 {
+            return 0;
         }
         st.certified.insert(wait_loc);
         let has_mid_cp = st.checkpoints.iter().any(|c| c.id.k > 0 && c.id.k <= st.k);
         if !has_mid_cp {
             let _ = st.push_checkpoint(tx_idx, CheckpointKind::EffectBoundary);
         }
-        let armed = st.k.saturating_add(1).max(access_k as usize).max(2);
-        if st.first_k.get(&wait_loc).is_none() {
-            st.journal.push(RegionAccess {
-                tx_idx,
-                k: armed,
-                location: wait_loc,
-                mode: AccessMode::Read,
-            });
-            st.first_k.insert(wait_loc, armed);
-        }
-        armed as u64
+        st.k.saturating_add(1).max(access_k as usize) as u64
     }
 
     /// R1b timely Resolve: arm RewindTo when a mid-tx checkpoint exists.
@@ -2367,30 +2371,42 @@ mod p4_tk_park_tests {
     fn arm_pinhold_checkpoint_makes_product_park_resume() {
         let table = PartialRetryTable::new(2);
         table.reset_incarnation(0, 0);
-        // Unfenced product path: rem empty, access_log prefix at k=1,2 wait at k=3.
+        // Snapped prefix (maybe_note_value) — honest rem grain.
+        for (loc, i) in [(10u64, 1u32), (11, 2)] {
+            unsafe { &mut *table.states[0].get() }.note_value(
+                loc,
+                FfValue::Storage {
+                    address: Address::ZERO,
+                    slot: U256::from(i),
+                    value: U256::from(i),
+                    origin: None,
+                },
+            );
+        }
         let armed = table.arm_pinhold_checkpoint(0, 99, 3, &[(10, 1), (11, 2)]);
         assert!(armed > 2, "armed_at_k must exceed prefix checkpoint");
-        match table.try_arm_park_resume_at_k(0, armed) {
+        match table.try_arm_pinhold_resume_at_k(0, armed) {
             ParkResumeKind::ResumeAtK { checkpoint_k } => {
                 assert!(checkpoint_k > 0 && checkpoint_k < armed as usize);
             }
             other => panic!("PinHold must ResumeAtK, got {other:?}"),
         }
         assert!(table.is_rewind_resume(0));
+        assert!(
+            !table.must_force_bind(0, 10),
+            "PinHold resume must not force-bind"
+        );
     }
 
     #[test]
-    fn arm_pinhold_first_access_still_resumes() {
+    fn arm_pinhold_first_access_is_full_retry() {
         let table = PartialRetryTable::new(2);
         table.reset_incarnation(0, 0);
         let armed = table.arm_pinhold_checkpoint(0, 7, 1, &[]);
-        assert!(armed >= 2);
-        assert!(
-            matches!(
-                table.try_arm_park_resume_at_k(0, armed),
-                ParkResumeKind::ResumeAtK { .. }
-            ),
-            "first-access PinHold must not FullRetry"
+        assert_eq!(armed, 0, "no snapped prefix → no synthetic checkpoint");
+        assert_eq!(
+            table.try_arm_pinhold_resume_at_k(0, armed),
+            ParkResumeKind::FullRetry
         );
     }
 

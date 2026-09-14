@@ -305,13 +305,12 @@ pub(crate) fn validate_specfence(
                 specfence.learner.note_reexec_cost(0.1);
                 return scheduler.finish_validation(tx_version, false);
             }
-            // R1b: cert-covered fail → RewindTo when a mid-tx checkpoint exists.
-            // Do **not** count an attempt that always falls through to OCC B0
-            // (`apply_suffix_repair` cp_k≥8 theater). Soft=0.
-            let ev_r1b = covers
-                || bayes_q
-                    .is_some_and(|q| q.known_star || q.depth_frac >= 0.50 || q.ev_pin_beats_abort);
-            if ev_r1b && matches!(grain, RepairGrain::R1 | RepairGrain::R1Selective) {
+            // R1b: **strip**-covered fail → RewindTo. repair_armed covers_all
+            // must not skip sibling Spec (Iter26 seq≠par). Soft=0.
+            let strip_covers = specfence
+                .certificates
+                .covers_strips_all(tx_version.tx_idx, &invalid);
+            if strip_covers {
                 let read_locations = mv_memory.read_locations(tx_version.tx_idx);
                 let write_locations = mv_memory.write_locations(tx_version.tx_idx);
                 if let Some(LeanAbortRepair::SuffixRepair {

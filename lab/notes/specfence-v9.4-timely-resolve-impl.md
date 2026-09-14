@@ -21,8 +21,8 @@ PinHold park (no rem checkpoint, armed_at_k=0)
 
 | # | Duty | Where | Done when |
 |---|------|-------|-----------|
-| 1 | **PinWithoutThrow resumes** | `vm.rs:pcc_wait_for_writer` + `park_estimate_blocking` call `rem::arm_pinhold_checkpoint` (access_log prefix + EffectBoundary). Wake `try_arm_park_resume_at_k` → **ResumeAtK** | `park_resume_at_k` / `resume_count` ≫ 0; `park_resume_full_retry` ≪ pin |
-| 2 | **R1 wins when strips cover** | `executor.rs:validate_specfence` R1a value-stable; R1b `try_arm_r1b_covered` (RewindTo **without** `prefix_skip_beats_b0` cp_k≥8). No `r1_attempt` unless R1b actually arms | R1 path not theater; abort_SF vs OCC on fan |
+| 1 | **PinWithoutThrow resumes** | `arm_pinhold_checkpoint` journals **snapped** prefix only (Iter26: no synthetic k=1 grain). Wake `try_arm_pinhold_resume_at_k` → ResumeAtK **without** force-bind. First-access Wait stays FullRetry | mid-tx `park_resume_at_k` / `resume_count` ≫ 0; Soft=0 |
+| 2 | **R1 wins when strips cover** | R1a value-stable; R1b `try_arm_r1b_covered` **only** if `covers_strips_all` (not repair_armed covers_all — sibling Spec skip was seq≠par). No `r1_attempt` unless R1b arms | R1 path not theater; abort_SF vs OCC on fan |
 | 3 | **Schedule-first Avoid** | `scheduler.rs:try_execute_ready` refuses known consumers while `w` **Ready or Executing**; `admit_spine(w)` so ProducerStage progresses (no v6 yield-spin) | refuse on Ready; 19807137 refuse ≫ 0 |
 | 4 | **Kill known-edge ReadyCanary** | `fence_act::act_wait_for`: Ready → PinHold; DoneUnfenced **cert=false** (no R1-bait strip) | canary only Aborting/unknown |
 | 5 | **Storage true-k** | `admit_seed_begin_block` hint-fan (≥16-tx account) floor=2 + InterPrior storage PE; `vm::specfence_access_gate` plants Storage(addr,slot) PE at **live stream k** when Basic(addr) is a star | PE-on at real conflict ℓ |

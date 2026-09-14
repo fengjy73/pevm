@@ -2137,7 +2137,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         let kind = self
             .specfence
             .partial_retry
-            .try_arm_park_resume_at_k(tx_idx, intent.armed_at_k);
+            .try_arm_pinhold_resume_at_k(tx_idx, intent.armed_at_k);
         match kind {
             crate::specfence::ParkResumeKind::ResumeAtK { .. } => {
                 wave.note_park_resume_at_k();

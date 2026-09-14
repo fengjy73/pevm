@@ -140,6 +140,20 @@ impl CertificateTable {
         invalid.iter().all(|l| st.locs.contains(l))
     }
 
+    /// Strip membership only — **not** repair_armed. R1b must not treat
+    /// PinHold RewindTo as covering sibling Spec (Iter26 seq≠par).
+    #[inline]
+    pub(crate) fn covers_strips_all(&self, tx_idx: TxIdx, invalid: &[MemoryLocationHash]) -> bool {
+        if invalid.is_empty() {
+            return true;
+        }
+        let Some(slot) = self.slots.get(tx_idx) else {
+            return false;
+        };
+        let st = unsafe { &*slot.get() };
+        !st.locs.is_empty() && invalid.iter().all(|l| st.locs.contains(l))
+    }
+
     /// Single-location cover (selective R1 on the fenced subset).
     #[inline]
     pub(crate) fn covers(&self, tx_idx: TxIdx, location: MemoryLocationHash) -> bool {
@@ -224,5 +238,15 @@ mod tests {
             !t.covers_all(0, &[7, 9]),
             "kept strip must not cover sibling Spec"
         );
+    }
+
+    #[test]
+    fn repair_armed_does_not_strip_cover_siblings() {
+        let t = CertificateTable::new(1);
+        t.begin_execute(0, true, 0);
+        t.note_success(0, 7);
+        assert!(t.covers_all(0, &[7, 9]), "repair_armed covers_all");
+        assert!(!t.covers_strips_all(0, &[7, 9]), "R1b must use strips only");
+        assert!(t.covers_strips_all(0, &[7]));
     }
 }
