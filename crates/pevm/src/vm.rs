@@ -934,9 +934,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
         Err(ReadError::Blocking(w))
     }
 
-    /// Fence WaitFor: never convert a known-essential / post-Avoid Region to
-    /// Unfenced for hang-freedom. Re-resolve unfinished spine writer or the
-    /// live canary; Bind if Data appeared. SoftWait Soft stays 0.
+    /// Legacy rem WaitFor museum — **not** the SpecFence product path.
+    /// Product Avoid is `pcc_wait_for_writer` → `fence_act::act_wait_for`
+    /// (PinHold / DoneUnfenced). Kept for inspect/lab residual Bind SoT.
+    /// SoftWait Soft stays 0.
+    #[allow(dead_code)]
     fn fence_wait_for(
         &self,
         address: Address,

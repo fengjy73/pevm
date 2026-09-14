@@ -117,8 +117,10 @@ pub(crate) fn decide_queried(
     } else {
         known_star || ev_adapter
     };
+    // Bind rare: tip==conflict ∧ Bind EV only. `known_star` opens WaitFor,
+    // never Bind (fan 14689597 Bind 472 vs Wait 47 was this OR).
     let bind_ev = if let Some(q) = bayes {
-        (q.ev_bind_beats_b0 || q.known_star) && (!quiet_off || known_star)
+        crate::specfence::fence_act::bind_ev_from_query(q.ev_bind_beats_b0, quiet_off, known_star)
     } else {
         ev_adapter
     };
@@ -454,6 +456,50 @@ mod tests {
             decide_queried(&live, 7, 6, Some(&exec_vis(2)), Some(q)),
             AccessDecision::WaitFor { writer: 2 },
             "decide←Bayes: ev_pin_beats_abort shapes WaitFor"
+        );
+    }
+
+    #[test]
+    fn known_star_is_not_bind_ev() {
+        // Star + Bind EV off + published conflict tip → Unfenced, never Bind.
+        let live = fan_out_learner();
+        live.seed_predicted_essential(7, 6);
+        let q = crate::specfence::BayesAccessQuery {
+            p_raw: 0.5,
+            p_bind: 0.1,
+            quiet_cold: false,
+            depth_frac: 0.10,
+            ev_pin_beats_abort: false,
+            ev_bind_beats_b0: false,
+            known_star: true,
+        };
+        assert_eq!(
+            decide_queried(&live, 7, 6, Some(&data_vis()), Some(q)),
+            AccessDecision::UnfencedOcc {
+                predicted: true,
+                roi_skip: true
+            },
+            "Bind rare: known_star is WaitFor/pin, not Bind EV"
+        );
+    }
+
+    #[test]
+    fn bind_ev_opens_bind_on_conflict_tip() {
+        let live = fan_out_learner();
+        live.seed_predicted_essential(7, 6);
+        let q = crate::specfence::BayesAccessQuery {
+            p_raw: 0.4,
+            p_bind: 0.4,
+            quiet_cold: false,
+            depth_frac: 0.15,
+            ev_pin_beats_abort: false,
+            ev_bind_beats_b0: true,
+            known_star: false,
+        };
+        assert_eq!(
+            decide_queried(&live, 7, 6, Some(&data_vis()), Some(q)),
+            AccessDecision::Bind,
+            "Bind rare: tip==conflict ∧ ev_bind_beats_b0"
         );
     }
 

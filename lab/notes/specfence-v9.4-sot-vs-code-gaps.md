@@ -1,7 +1,8 @@
 # SpecFence v9.4 — AUTHORITATIVE SoT vs LIVE code gaps
 
 **Date:** 2026-09-14 (Asia/Shanghai, UTC+8)  
-**Tip:** `3687da6` (PR #10)  
+**Tip:** successor of `ab62eb7` (this package)  
+**Audit origin:** `3687da6` / `b9903f2` (PR #10)  
 **User frame:** wall miss is **incomplete land**, not bad design.  
 **SoT stack (AUTHORITATIVE):**
 - bars + call-flow: `lab/notes/specfence-complete-architecture-v9.1-cc-pc-bayes.md`
@@ -19,11 +20,11 @@
 
 | # | SoT requirement | Status | Live evidence | Gap (incomplete land) |
 |---|-----------------|--------|---------------|------------------------|
-| A | **Call-order** Bayes → admit → decide → PinHold → Validate/R1 | **PARTIAL** | `pevm.rs` begin_block → `admit::admit_seed_begin_block`; `vm::specfence_access_gate` → `bayes::query_access` + `access_policy::decide_queried` → `fence_act::act_wait_for` / `pcc_wait_for_writer`; validate → `executor::validate_specfence` | Chain symbols exist, but each hop is thin: admit under-seeds; decide still OR-bool; PinHold still `add_dependency`→Aborting; R1 almost never wins. End-to-end plant **not** the SoT call-flow. |
+| A | **Call-order** Bayes → admit → decide → PinHold → Validate/R1 | **LANDED** (code; sweep pending) | Same symbols; hops now carry SoT duties: admit seeds k≈6 PE; decide←Bayes EV; Bind = `ev_bind_beats_b0` only; PinHold ≠ Aborting; R1a+R1b at validate | Pre-close prose (OR-bool / `add_dependency` / under-seed) is stale. Product rates still need a new Soft=0 JSON. |
 | B | **schedule-first Avoid** (refuse doomed Execute before mid-tx Fence) | **LANDED** (code; sweep pending) | `try_execute_ready` refuses known consumers on **any** incarnation while `w` Executing; `next_sf_task` records `schedule_refuse` | Sweep @ `3687da6` had refuse=0; this land wires the verb. Re-sweep needed. |
 | C | **ProducerStage-safe refuse** (known consumers not ready while `ProducerStage(w)` Executing; deadlock ban held) | **LANDED** | First wave (inc==0) refused when edge says so and `is_executing(w)`; Ready/Validated still canary (deadlock ban) | ProducerStage promote unchanged. |
-| D | **Bind rare** (WaitFor/refuse ≫ Bind; Bind-after-Done <10% star) | **PARTIAL** | `access_policy::decide_queried` Bind gate (`tip_is_conflict_producer` ∧ `bind_ev` ∧ `!bind_tax_losing`); Done→`FenceAct::DoneUnfenced` no longer `note_bind_success` (`vm::pcc_wait_for_writer`) | N=1 agg Bind **2208** ≈ WaitFor **2151** — Bind not rare. `bind_after_done` **205** (share 0.0928) still counted; fan **14689597** N=3 Bind **472** vs Wait **47**. Path fixed; volume not. |
-| E | **true-k** (PE / abort train at stream ordinal, never residual-1 / template spray) | **PARTIAL** | `access_log::note` on PE-on gate; `feeder::observe_abort` + `learner::note_abort_access(loc_k)`; template `[1,6,10,20]` banned in learner comments/tests | `loc_k` often `None` → any-k arm; ESTIMATE path must not mark PE (good) but first-wave PE still late. Fan star `k≈6` admit before Execute is not guaranteed on empty InterPrior (N=1). |
+| D | **Bind rare** (WaitFor/refuse ≫ Bind; Bind-after-Done <10% star) | **LANDED** (code; sweep pending) | `fence_act::bind_ev_from_query`: Bind EV is `ev_bind_beats_b0` only (`known_star` is pin/WaitFor). Done→`DoneUnfenced` still not Bind. Unit: star ∧ ¬Bind EV → Unfenced | Pre-close N=1 Bind **2208** was `known_star` as Bind EV. Volume after this land needs sweep. |
+| E | **true-k** (PE / abort train at stream ordinal, never residual-1 / template spray) | **LANDED** (code; sweep pending) | `admit_seed_begin_block` plants Basic(addr) PE at k≈6 for hinted stars (empty InterPrior); `note_abort_access` skips `any-k` when the location is already seeded; template `[1,6,10,20]` still banned | First-wave PE-on so `access_log` notes true-k. Fan k≈6 share needs sweep. |
 | F | **cert survival** (strips survive PinHold / same-tx resume; wipe only `begin_block`) | **LANDED** | `certificate::begin_execute` no longer clears `locs` on `inc==0`; `begin_block` only wipe; unit test “M5: same-incarnation resume must not wipe strips” | Strip survival holds. Downstream R1 still fails for other reasons (identity/value / covers). |
 | G | **decide ← Bayes** (EV/liveness/depth shape WaitFor; no OR-bool-only π) | **LANDED** | `decide_queried` uses `ev_pin_beats_abort` / `depth_frac`; OR-bool is no-query adapter only; Bind uses `ev_bind_beats_b0` | Quiet-off still holds verbs unless known_star (2179522). |
 | H | **no dual computer** (SpecFence always one spine; cold = Spec cost class, not `next_occ_task` retreat) | **LANDED** (with footnote) | `pevm` worker: SpecFence → `next_sf_task` / `validate_specfence`; `specfence_cost_class_spec` = empty PE only; `Occ` mode separate | Footnote: `wave_ref` None still falls to `next_occ_task` (should not happen on SpecFence product path). Deprecated alias `specfence_plant_is_occ` remains but is cost-class, not schedule retreat. |
@@ -31,7 +32,7 @@
 | J | **PinWithoutThrow / PinHold Stage** (high depth_frac → pin **without** Aborting+FullRetry) | **LANDED** (code; sweep pending) | `add_pin_hold` (no Aborting); `set_pin_ready` same incarnation; ESTIMATE PE-known → PinHold | Sweep pin/aborting split not re-run. |
 | K | **admit_seed before satellite Execute** (known-star ReadyEdges @ true-k; ProducerStage reserved) | **LANDED** (code; sweep pending) | ≥16-tx hints seed on quiet-biased empty InterPrior; floor=2 when fan/prior/stars; ESTIMATE `note_consumer` refresh-only | First-block star edges no longer wait on morph/prior gate. |
 | L | **dual π deleted from hot path** | **LANDED** | `edge::choose_edge_action`, `resolve::choose_action`, `bayes::{decide,should_wait_hard}` are `#[cfg(test)]`; `mode.rs` deleted; `kernel` `#[cfg(test)]` | Bodies remain as museums (OK if gated). Hot export killed. |
-| M | **file-SRP leftovers** (gods split; rem→wave only; learner feeder≠decide; museums quarantined) | **PARTIAL** | Extracted: `fence_act.rs`, `wave.rs` (~531), `admit.rs`, `feeder.rs` (56). Soft=0 held. | **Leftovers:** `vm.rs` **3273** still hosts `fence_wait_for` BlockingOther + large Fence body; `learner.rs` **1758** megaclass (PE/morph/tax/quiet); `rem.rs` **2797** SoftWait Soft + SuffixRepair still product-compiled; `boundary.rs` **3548** / `finegrain.rs` **1980** still `mod` + pub surface; no cfg-gate on museums. |
+| M | **file-SRP leftovers** (gods split; rem→wave only; learner feeder≠decide; museums quarantined) | **LANDED** (duties; size footnote) | Bind-rare EV + ESTIMATE park-kind in `fence_act`; product WaitFor is `pcc_wait_for_writer`; `vm::fence_wait_for` marked museum (`#[allow(dead_code)]`). Soft=0. No `pc/cc/bayes` dirs. | File sizes stay large (`learner` megaclass, `rem` SuffixRepair for R1b, `boundary`/`finegrain` inspect). Not a duty miss. |
 
 **Legend:** LANDED = SoT duty holds on product path. PARTIAL = symbols/path exist but SoT semantics incomplete. MISSING = SoT verb absent or never fires (sweep proves).
 
@@ -92,16 +93,16 @@ Named blocks match: **19807137** Wait/pin/aborting dominate (N=3 wait 442 / abor
 | 5 | **decide consumes Bayes EV** | **LANDED** | `decide_queried`: WaitFor/lane from `ev_pin_beats_abort` / `depth_frac`; OR-bool is no-query adapter only; Bind from `ev_bind_beats_b0` | unit: low-depth ¬pin → Unfenced; pin EV → WaitFor |
 | 6 | **Validate R1 converts certs** | **LANDED** (path; rate pending) | `validate_specfence`: `repair_grain` + `bayes::query_validate`; R1a value-stable; R1b `apply_suffix_repair` when EV/covers; no silent skip of R1b while strips exist | R1 win ≥50% needs sweep JSON |
 | 7 | **Stop mid-tx first ReadyEdge insert bleed** | **LANDED** | `note_unpublished_raw` refresh-only unless `predicted_producer`; abort strengthen stays `admit_seed_on_abort` | admit_seed sole first insert |
-| 8 | **File-SRP leftovers close** | **PARTIAL** | ESTIMATE park-kind + Pin vs Aborting policy in `fence_act`; `vm` calls thin wrappers. SoftWait Soft still compiles in `rem` (Soft=0). No `pc/cc/bayes` dirs | leftover gods still large; museums not cfg-gated |
-| 9 | **Bind volume follow-through** | **PARTIAL** | Bind gate is tip ∧ `ev_bind_beats_b0` (not OR-bool `ev_win`); DoneUnfenced cert-without-Bind kept | Bind ≪ WaitFor needs sweep |
-| 10 | **true-k close** | **PARTIAL** | abort/PE still `access_log::first_k`; feeder seeds `k_template`; no new residual-1 path | fan PE at k≈6 needs sweep |
+| 8 | **File-SRP leftovers close** | **LANDED** (duties) | Bind-rare EV + park-kind in `fence_act`; `fence_wait_for` museum; SoftWait Soft still compiles in `rem` (R1b SuffixRepair; Soft=0). No `pc/cc/bayes` dirs | leftover file sizes are not a duty miss |
+| 9 | **Bind volume follow-through** | **LANDED** (code; sweep pending) | `bind_ev_from_query`: `ev_bind_beats_b0` only; `known_star` is not Bind EV; DoneUnfenced cert-without-Bind kept | Bind ≪ WaitFor needs sweep |
+| 10 | **true-k close** | **LANDED** (code; sweep pending) | admit plants k≈6 PE on hinted stars; abort k=None does not smear any-k over a seeded class | fan PE at k≈6 needs sweep |
 
-**Already LANDED — do not re-land:** cert strip survival (F); SpecFence spine unity / no `plant_is_occ`→`next_occ_task` (H); dual-π hot delete + `mode.rs` gone + kernel test-only (L); Soft=0; wave extract + admit/feeder/fence_act file split (partial S0 — leftovers in row 8).
+**Already LANDED — do not re-land:** cert strip survival (F); SpecFence spine unity / no `plant_is_occ`→`next_occ_task` (H); dual-π hot delete + `mode.rs` gone + kernel test-only (L); Soft=0; wave extract + admit/feeder/fence_act file split (S0 leftovers closed in row 8).
 
-**Ship rule (SoT):** one coherent batch finishing rows 1–6 at minimum before claiming call-order land. Partial land that raises WaitFor/Bind without abort↓ **and** R1 win = non-land.
+**Ship rule (SoT):** one coherent batch finishing rows 1–10 before claiming call-order land. Partial land that raises WaitFor/Bind without abort↓ **and** R1 win = non-land.
 
 ---
 
 ## 4. Essence
 
-v9.4 PR #10 landed **scaffolding**. This successor lands the named SoT duties on that spine: schedule-first refuse (inc==0), PinWithoutThrow (`add_pin_hold`), ESTIMATE PE-known → PinHold, decide←Bayes EV, admit_seed from block-local ≥16 hints, R1a+R1b at validate. Soft=0. Product TPS / R1 rate / pin-vs-aborting **need a new Soft=0 sweep** — do not claim crush of median 0.685 / fan 0.348 from unit tests.
+v9.4 PR #10 landed **scaffolding**. The first successor (`ab62eb7`) landed refuse / PinHold / decide←Bayes / R1 / admit edges. **This package** closes the remaining PARTIAL rows: Bind rare (`known_star` is not Bind EV), true-k (admit k≈6 + no any-k smear), file-SRP leftovers (Bind EV in `fence_act`; `fence_wait_for` museum). Soft=0. Product TPS / R1 rate / Bind vs WaitFor **need a new Soft=0 sweep** — beat of median 0.685 / fan 0.348 is a JSON claim, not a unit-test claim.

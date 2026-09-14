@@ -163,6 +163,8 @@ Product bars still **not** met. Do not claim crush from call-order land alone.
 | R1 live | `query_validate` + `repair_grain`; R1a value-stable; R1b `apply_suffix_repair` when EV/covers |
 | admit_seed | ≥16-tx hints seed on quiet-biased empty InterPrior; floor=2 when fan/prior/stars |
 | mid-tx bleed | `note_unpublished_raw` refresh-only unless predicted producer |
-| file-SRP | ESTIMATE park-kind extracted to `fence_act`; no `pc/cc/bayes` dirs |
+| file-SRP | ESTIMATE park-kind + Bind-rare EV in `fence_act`; `vm::fence_wait_for` museum; no `pc/cc/bayes` dirs |
+| Bind rare | `bind_ev_from_query`: `ev_bind_beats_b0` only — `known_star` is pin/WaitFor, not Bind EV |
+| true-k | admit plants Basic(addr) PE at k≈6 for hinted stars; `note_abort_access` skips any-k when class already seeded |
 
-**Honesty:** tip sweep median **0.6853** / fan **0.3482** / R1 **6/1636** / refuse **0** is the *pre-close* wall. This land does **not** attach a new all-blocks JSON. Product bars (median ≥0.95, fan ≥0.90, R1 ≥50%) remain **unclaimed**. Soft=0 held in tests.
+**Honesty:** tip sweep median **0.6853** / fan **0.3482** / R1 **6/1636** / refuse **0** is the *pre-close* wall at `3687da6`. This package lands the remaining PARTIAL rows. Product bars (median ≥0.95, fan ≥0.90, R1 ≥50%) stay **unclaimed** until a new Soft=0 JSON. Soft=0 held in tests.
