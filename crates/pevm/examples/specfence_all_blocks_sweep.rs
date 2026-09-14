@@ -1,13 +1,16 @@
-//! Sweep SpecFence@8 vs OCC@8 across every loadable ethereum block snapshot.
+//! Sweep SpecFence@8 vs OCC@8 (Soft=0) on the high-bound OCC-gap collection by default.
 //!
 //! ```
 //! cargo run -p pevm --release --config 'profile.release.lto=false' --example specfence_all_blocks_sweep
 //!
+//! # Default block set: lab/notes/specfence-high-bound-occ-gap-block-ids.txt (~52)
 //! # Optional:
 //! SPECFENCE_ALL_ITERS=1          # default 1; set 3 for slow outliers
 //! SPECFENCE_ALL_PROCESS_TOP=10   # process-trace top-K worst SF/OCC (default 10; 0=off)
 //! SPECFENCE_ALL_OUT=lab/results/all-blocks-sf-occ-sweep.json
-//! SPECFENCE_ALL_BLOCKS=14689597,19606599   # subset override
+//! SPECFENCE_ALL_BLOCKS=all                 # full ~99 corpus
+//! SPECFENCE_ALL_BLOCKS=14689597,19606599   # ad-hoc subset
+//! SPECFENCE_ALL_BLOCK_IDS=/path/to/ids.txt # alternate id list (one bn per line)
 //! ```
 
 #![allow(missing_docs)]
@@ -78,6 +81,69 @@ fn discover_block_numbers(blocks_dir: &Path) -> Vec<u64> {
     }
     nums.sort_unstable();
     nums
+}
+
+fn default_collection_block_ids_path() -> PathBuf {
+    repo_root().join("lab/notes/specfence-high-bound-occ-gap-block-ids.txt")
+}
+
+fn read_block_ids_file(path: &Path) -> Vec<u64> {
+    let raw = fs::read_to_string(path).unwrap_or_else(|e| {
+        panic!("failed to read block-ids file {}: {e}", path.display())
+    });
+    let mut nums: Vec<u64> = raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| {
+            l.parse::<u64>()
+                .unwrap_or_else(|_| panic!("bad block id in {}: {l}", path.display()))
+        })
+        .collect();
+    nums.sort_unstable();
+    nums.dedup();
+    nums
+}
+
+fn resolve_block_numbers(blocks_dir: &Path) -> (Vec<u64>, String) {
+    if let Ok(raw) = std::env::var("SPECFENCE_ALL_BLOCKS") {
+        let trimmed = raw.trim();
+        if trimmed.eq_ignore_ascii_case("all")
+            || trimmed == "*"
+            || trimmed.eq_ignore_ascii_case("full")
+        {
+            let nums = discover_block_numbers(blocks_dir);
+            return (
+                nums.clone(),
+                format!("SPECFENCE_ALL_BLOCKS=all (full corpus, {} ids)", nums.len()),
+            );
+        }
+        let nums: Vec<u64> = trimmed
+            .split(',')
+            .map(str::trim)
+            .filter(|x| !x.is_empty())
+            .map(|x| {
+                x.parse::<u64>()
+                    .unwrap_or_else(|_| panic!("bad SPECFENCE_ALL_BLOCKS entry: {x}"))
+            })
+            .collect();
+        let n = nums.len();
+        return (nums, format!("SPECFENCE_ALL_BLOCKS comma list ({n} ids)"));
+    }
+    let ids_path = std::env::var("SPECFENCE_ALL_BLOCK_IDS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| default_collection_block_ids_path());
+    let ids_path = if ids_path.is_absolute() {
+        ids_path
+    } else {
+        repo_root().join(ids_path)
+    };
+    let nums = read_block_ids_file(&ids_path);
+    let n = nums.len();
+    (
+        nums,
+        format!("block-ids file {} ({n} ids)", ids_path.display()),
+    )
 }
 
 fn try_load_block(
@@ -418,13 +484,9 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(10usize);
-    let block_override: Option<Vec<u64>> = std::env::var("SPECFENCE_ALL_BLOCKS")
-        .ok()
-        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect());
-
-    let numbers = block_override.unwrap_or_else(|| discover_block_numbers(&blocks_dir));
+    let (numbers, numbers_src) = resolve_block_numbers(&blocks_dir);
     eprintln!(
-        "all-blocks sweep: {} candidates, iters={iters}, process_top={process_top}, out={}",
+        "all-blocks sweep: {} candidates ({numbers_src}), iters={iters}, process_top={process_top}, out={}",
         numbers.len(),
         out_path.display()
     );

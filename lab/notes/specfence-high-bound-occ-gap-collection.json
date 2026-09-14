@@ -28,14 +28,15 @@
       ],
       "measured": 98
     },
-    "n_selected": 61,
+    "n_selected": 52,
     "n_universe_nonempty": 98,
     "class_histogram": {
-      "near_independent_meta_gap": 9,
-      "mixed_RAW_WAW": 49,
-      "RAW_fan_out": 3
+      "RAW_fan_out": 3,
+      "mixed_RAW_WAW": 49
     },
-    "appendix_WAW_spine_count": 8
+    "appendix_WAW_spine_count": 8,
+    "appendix_excluded_meta_gap_count": 9,
+    "exclusion_note": "near_independent_meta_gap removed from main selected set: no analysis value for SpecFence; meta/scheduler/cold-start overhead is unavoidable and SpecFence cannot optimize it. Kept in appendix_excluded_meta_gap for reference."
   },
   "thresholds": {
     "min_bound_at_8": 5.0,
@@ -44,7 +45,8 @@
     "min_abs_waste_ms": 0.5,
     "exclude_morphs_from_main": [
       "WAW_spine",
-      "trivial"
+      "trivial",
+      "near_independent_meta_gap"
     ],
     "rationale": {
       "min_bound_at_8": "Corpus p25 bound@8\u22485.96; \u22655 keeps only high structural ceilings (excludes pure spines ~1\u20132.5\u00d7).",
@@ -54,17 +56,6 @@
     }
   },
   "classes": {
-    "near_independent_meta_gap": [
-      2179522,
-      4330482,
-      5891667,
-      11814555,
-      12047794,
-      12300570,
-      12520364,
-      13287210,
-      14396881
-    ],
     "mixed_RAW_WAW": [
       3356896,
       5283152,
@@ -323,7 +314,7 @@
       "occ_src": "finegrain",
       "fallback_self_destruct_capture": false,
       "morph": "near_independent_meta_gap",
-      "selected": true
+      "selected": false
     },
     {
       "bn": 2462997,
@@ -547,7 +538,7 @@
       "occ_src": "finegrain",
       "fallback_self_destruct_capture": false,
       "morph": "near_independent_meta_gap",
-      "selected": true
+      "selected": false
     },
     {
       "bn": 4369999,
@@ -739,7 +730,7 @@
       "occ_src": "finegrain",
       "fallback_self_destruct_capture": false,
       "morph": "near_independent_meta_gap",
-      "selected": true
+      "selected": false
     },
     {
       "bn": 6137495,
@@ -1123,7 +1114,7 @@
       "occ_src": "finegrain",
       "fallback_self_destruct_capture": false,
       "morph": "near_independent_meta_gap",
-      "selected": true
+      "selected": false
     },
     {
       "bn": 12047794,
@@ -1155,7 +1146,7 @@
       "occ_src": "finegrain",
       "fallback_self_destruct_capture": true,
       "morph": "near_independent_meta_gap",
-      "selected": true
+      "selected": false
     },
     {
       "bn": 12159808,
@@ -1283,7 +1274,7 @@
       "occ_src": "finegrain",
       "fallback_self_destruct_capture": false,
       "morph": "near_independent_meta_gap",
-      "selected": true
+      "selected": false
     },
     {
       "bn": 12459406,
@@ -1347,7 +1338,7 @@
       "occ_src": "finegrain",
       "fallback_self_destruct_capture": false,
       "morph": "near_independent_meta_gap",
-      "selected": true
+      "selected": false
     },
     {
       "bn": 12522062,
@@ -1507,7 +1498,7 @@
       "occ_src": "finegrain",
       "fallback_self_destruct_capture": false,
       "morph": "near_independent_meta_gap",
-      "selected": true
+      "selected": false
     },
     {
       "bn": 14029313,
@@ -1635,7 +1626,7 @@
       "occ_src": "finegrain",
       "fallback_self_destruct_capture": false,
       "morph": "near_independent_meta_gap",
-      "selected": true
+      "selected": false
     },
     {
       "bn": 14545870,
@@ -3271,32 +3262,23 @@
     }
   ],
   "selected_block_numbers": [
-    2179522,
     3356896,
-    4330482,
     4864590,
     5283152,
-    5891667,
     8038679,
     8889776,
     9069000,
     10760440,
     11114732,
     11743952,
-    11814555,
-    12047794,
     12159808,
     12243999,
     12244000,
-    12300570,
     12459406,
-    12520364,
     13217637,
-    13287210,
     14029313,
     14334629,
     14383540,
-    14396881,
     14683600,
     14689597,
     14689598,
@@ -3332,5 +3314,16 @@
     19933122,
     19933597,
     19934116
+  ],
+  "appendix_excluded_meta_gap": [
+    2179522,
+    4330482,
+    5891667,
+    11814555,
+    12047794,
+    12300570,
+    12520364,
+    13287210,
+    14396881
   ]
 }

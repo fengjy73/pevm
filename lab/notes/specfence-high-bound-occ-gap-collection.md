@@ -11,7 +11,7 @@
 
 ## Goal
 
-From all nonempty `data/ethereum/blocks` (98 / 99; empty `19910734`), keep blocks where the **theoretical parallel upper bound @8 is high** but **pure OCC@8 Soft=0 does badly** versus that bound. Classify them into a new **全部跑一遍** set for SpecFence iteration (scoring harness only; no plant protocol change).
+From all nonempty `data/ethereum/blocks` (98 / 99; empty `19910734`), keep blocks where the **theoretical parallel upper bound @8 is high** but **pure OCC@8 Soft=0 does badly** versus that bound — and where SpecFence can act (conflict morphology: `RAW_fan_out` / `mixed_RAW_WAW`). Meta-only gaps and WAW spines are appendix-excluded. Scoring harness only; no plant protocol change.
 
 ---
 
@@ -37,16 +37,17 @@ Measurement: scoring example `crates/pevm/examples/specfence_all_blocks_upper_bo
 | `occ_over_ideal` | **≥ 4.0** | Among bound≥5, median gap≈5.75; keeps named high-bound 10-block members (19469097≈4.8×, 19606599≈4.3×). |
 | `n_tx` | **≥ 30** | Microblocks inflate OCC/ideal via fixed OCC overhead. |
 | `abs_waste_ms` | **≥ 0.5** | Drop huge-ratio quiet crumbs with <0.5 ms absolute waste (e.g. 116525, 1796867). |
-| morphology | **exclude `WAW_spine`, `trivial`** | User ask: 上限高而OCC做不好 — prefer high-bound shortfall; spines are low-bound control (appendix). |
+| morphology | **exclude `WAW_spine`, `trivial`, `near_independent_meta_gap`** | High-bound shortfall from conflict (RAW/mixed). Meta-gap + spines are appendix-only. |
 
-Grid check (bound≥5 ∧ gap≥4 ∧ n≥30 ∧ waste≥0.5 ∧ ¬spine): **61 / 98**. Looser gap≥3 adds ~10 mixed blocks with milder shortfall; tighter gap≥5 drops named mixed anchors 19469097 / 19606599.
+Grid check (bound≥5 ∧ gap≥4 ∧ n≥30 ∧ waste≥0.5 ∧ ¬spine ∧ ¬meta_gap): **52 / 98**. Pre-exclusion of meta_gap was 61; the 9 near-independent blocks are appendix-only (no SpecFence lever). Looser gap≥3 adds ~10 mixed with milder shortfall; tighter gap≥5 drops named mixed anchors 19469097 / 19606599.
 
 ---
 
 ## Headline
 
-- **Selected:** **61 / 98** nonempty
-- **Class histogram:** `RAW_fan_out`=3, `mixed_RAW_WAW`=49, `near_independent_meta_gap`=9
+- **Selected:** **52 / 98** nonempty (`RAW_fan_out` + `mixed_RAW_WAW` only)
+- **Class histogram:** `RAW_fan_out`=3, `mixed_RAW_WAW`=49
+- **Appendix `excluded_meta_gap` (`near_independent_meta_gap`):** 9 — no SpecFence analysis value; meta/scheduler overhead unavoidable
 - **Appendix WAW_spine (excluded from main):** 8 — `[2641321, 4370000, 6137495, 6196166, 7280000, 12522062, 19469096, 19807137]`
 
 ---
@@ -57,7 +58,7 @@ Grid check (bound≥5 ∧ gap≥4 ∧ n≥30 ∧ waste≥0.5 ∧ ¬spine): **61 
 |-------|------------|-----------------------------------|
 | `RAW_fan_out` | RAW-heavy, wide `W`, `L` not spine-long | Consumers take **optimistic_read** of unfinished / wrong version → validate → **full_abort_reexecute** fan-out storms. |
 | `mixed_RAW_WAW` | Both RAW and WAW material | Mix of optimistic_read waste and WAW validate storms; still high `bound@8` so width exists. |
-| `near_independent_meta_gap` | Few RAW/WAW edges, high indep_frac, short `L` | Structural bound ≈8× but OCC wall ≫ ideal — **meta / scheduler / cold-start overhead**, not conflict critical path. |
+| `near_independent_meta_gap` *(appendix `excluded_meta_gap` only)* | Few RAW/WAW edges, high indep_frac, short `L` | Bound ≈8× but gap is **meta / scheduler / cold-start** — SpecFence cannot optimize; **excluded from main**. |
 | `WAW_spine` *(appendix only)* | WAW-dominated long `L`, `bound@8`≲3.5 | Structural ceiling already low; excluded from main all-run set. |
 
 ---
@@ -98,7 +99,9 @@ Grid check (bound≥5 ∧ gap≥4 ∧ n≥30 ∧ waste≥0.5 ∧ ¬spine): **61 
 | 19929064 | 103 | 11 | 82 | 12 | 36 | 8.00× | 2.98 | 0.47 | 6.37× | 1.26× |
 | … | (37 more in JSON) | | | | | | | | | |
 
-### `near_independent_meta_gap` (9)
+### Appendix — `excluded_meta_gap` (`near_independent_meta_gap`) (9)
+
+User: no SpecFence analysis value; meta overhead unavoidable; SpecFence cannot optimize. Removed from main selected set / block-ids.
 
 ```
 2179522, 4330482, 5891667, 11814555, 12047794, 12300570, 12520364, 13287210, 14396881
@@ -153,7 +156,7 @@ cargo run -p pevm --release --config 'profile.release.lto=false' \
 
 ### SpecFence vs OCC all-run on this collection
 
-Feed `lab/notes/specfence-high-bound-occ-gap-block-ids.txt` into existing Soft=0 sweeps / process dumps (`specfence_all_blocks_sweep` style, Soft=0). Prefer N≥3 on outliers. Compare walls to `ideal_ms` / `bound_at_8` in the JSON — the goal is closing **OCC/ideal**, not beating a low spine bound.
+`specfence_all_blocks_sweep` defaults to `lab/notes/specfence-high-bound-occ-gap-block-ids.txt` (52 ids; Soft=0). Override with `SPECFENCE_ALL_BLOCKS=all` for the full ~99 corpus, or a comma list for an ad-hoc subset. Prefer N≥3 on outliers. Compare walls to `ideal_ms` / `bound_at_8` in the JSON — the goal is closing **OCC/ideal**, not beating a low spine bound / meta gap.
 
 ### Named anchors (sanity)
 
@@ -161,8 +164,8 @@ Feed `lab/notes/specfence-high-bound-occ-gap-block-ids.txt` into existing Soft=0
 |------:|-------|------|
 | 14689597 | RAW_fan_out | classic storage RAW fan-out |
 | 19606599 / 19469097 | mixed_RAW_WAW | high-bound mixed |
-| 2179522 / 14396881 / 12047794 | near_independent_meta_gap | bound=8×, meta/overhead gap |
 | 8889776 | mixed_RAW_WAW | Soft=0 worst/mixed (still bound≈5.9×) |
+| 2179522 / 14396881 / 12047794 | excluded_meta_gap (appendix) | bound=8× meta/overhead — not in main run |
 | 19807137 | WAW_spine (appendix) | low-bound control |
 
 ---
