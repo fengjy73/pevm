@@ -154,11 +154,11 @@ impl Scheduler {
                     && !edges.may_execute(tx_idx)
                     && let Some(w) = edges.blocking_producer(tx_idx)
                 {
-                    // Refuse while producer is Executing **or Ready** (prefer-admit
-                    // ProducerStage(w) — no ReadyCanary Execute). Validated/Done
-                    // already published; Aborting is not a progress path (v6 hang).
-                    // First wave (inc==0) must refuse too — SoT schedule-first Avoid.
-                    if self.is_executing(w) || self.is_ready(w) {
+                    // Refuse only while producer is **Executing**. Ready-refuse
+                    // spun 31k on 19606599 and idled cores (wall 0.50 vs parent
+                    // 0.83). Ready consumer → fence_act PinHold, not Spec canary.
+                    // Aborting is not a progress path (v6 hang).
+                    if self.is_executing(w) {
                         edges.defer(tx_idx);
                         if let Some(wave) = wave {
                             drop(tx);
@@ -260,7 +260,7 @@ impl Scheduler {
                         if let Some(edges) = ready
                             && !edges.may_execute(tx_idx)
                             && let Some(w) = edges.blocking_producer(tx_idx)
-                            && (self.is_executing(w) || self.is_ready(w))
+                            && self.is_executing(w)
                         {
                             edges.defer(tx_idx);
                             if let Some(wave) = wave {
@@ -946,16 +946,15 @@ mod tests {
     }
 
     #[test]
-    fn refuse_known_consumer_while_producer_ready() {
+    fn ready_producer_does_not_refuse_spin() {
         let s = Scheduler::new(4);
         let ready = ReadyEdgeTable::new();
         ready.note_consumer(2, 0);
         assert!(s.is_ready(0), "producer starts ReadyToExecute");
         assert!(
-            s.try_execute_ready(2, None, Some(&ready)).is_none(),
-            "known consumer must not ReadyCanary while producer is still Ready"
+            s.try_execute_ready(2, None, Some(&ready)).is_some(),
+            "Ready-refuse spin idled 19606599; consumer PinHolds at WaitFor"
         );
-        assert!(ready.refuse_count() >= 1);
         assert!(
             s.try_execute_ready(0, None, Some(&ready)).is_some(),
             "prefer-admit ProducerStage(w) still runs"
