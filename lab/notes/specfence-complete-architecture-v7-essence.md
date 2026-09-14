@@ -1,7 +1,7 @@
 # SpecFence complete architecture v7 — PC⊗CC essence (AUTHORITATIVE SoT)
 
 **Date:** 2026-09-13 (Asia/Shanghai, UTC+8)  
-**Status:** **AUTHORITATIVE** complete architecture — **diagnosis + design only; DO NOT implement in this task**  
+**Status:** **SUPERSEDED** by `lab/notes/specfence-complete-architecture-v8-parallel-computer.md` — v7 gaps kept; framing corrected (PC ⊗ CC are **peers**, CC is not an edge-annotation layer).  
 **Tip at write:** `3376ac4`  
 **Diagnosis:** `lab/notes/specfence-v6-postland-all-blocks-diagnosis.md`  
 **Catalog:** `lab/notes/specfence-v6-postland-per-block-catalog.json`  

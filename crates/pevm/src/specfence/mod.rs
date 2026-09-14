@@ -1,7 +1,12 @@
-//! SpecFence **parallel computer** — stages + ready-edge Mode(a) CC.
+//! SpecFence **PC ⊗ CC parallel computer** — first-class peers.
 //!
-//! Plant SoT: `lab/notes/specfence-complete-architecture-v6-essence.md`.
+//! Plant SoT: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md`.
 //! π SoT: `lab/notes/specfence-complete-architecture-v4-frozen-grain.md`.
+//! PC owns Stages / ready-set / steal / ProducerStage / wall.
+//! CC owns Detect / Avoid / Resolve / Mode(a) / Fence / PE / certs / R1.
+//! They **co-design** the same ready-set and Repair plans. Neither is
+//! demoted — CC is not an edge-annotation layer; PC is not a schedule
+//! shell around Mode(a).
 //!
 //! `ConcurrencyMode::OCC` is pristine Block-STM (**zero** SpecFence ticks).
 //! `ConcurrencyMode::SpecFence` owns schedule / execute wrap / validate / rem.
@@ -179,6 +184,7 @@ mod metrics;
 mod mode;
 mod prior;
 mod process;
+mod producer_stage;
 mod ready_edge;
 mod region;
 mod rem;
@@ -218,7 +224,7 @@ pub(crate) use engagement::{AdaptiveEngagement, profile_timing_enabled, research
 pub(crate) use executor::{
     fence_for_mode, hinted_wait_enabled, next_occ_task, occ_read_set_valid,
     specfence_access_is_occ, specfence_plant_is_occ, specfence_r1_validate, uses_specfence_resolve,
-    validate_occ_kernel, validate_occ_stage, wave_for_mode,
+    validate_occ_kernel, validate_occ_stage, validate_specfence, wave_for_mode,
 };
 pub use finegrain::{
     AbortEvent, AccountGrainObserve, ConsumerFirstCross, DagStats, EffectClass, EffectLogEntry,
@@ -240,6 +246,7 @@ pub use metrics::SpecFenceMetrics;
 pub(crate) use prior::RwPriorMap;
 pub(crate) use process::ProcessTrace;
 pub use process::{ExecProcessSnapshot, LocProcessSnap, PerTxProcessSnap, ProcessReason};
+pub(crate) use producer_stage::ProducerStageTable;
 pub(crate) use ready_edge::ReadyEdgeTable;
 pub use region::RegionMode;
 pub(crate) use region::RegionTable;
@@ -366,6 +373,8 @@ pub(crate) struct SpecFenceCtx<'a> {
     pub certificates: &'a crate::specfence::CertificateTable,
     /// PE unpublished-RAW ready-edges (schedule Avoid).
     pub ready_edges: &'a crate::specfence::ReadyEdgeTable,
+    /// PC ProducerStage reservations (refuse-safe progress path).
+    pub producer_stages: &'a crate::specfence::ProducerStageTable,
     /// SerialLane / OrderedAdmit progress tokens.
     pub lanes: &'a crate::specfence::LaneTable,
     /// Opt-in lab fine-grain OCC/RW tracer (None = disabled, zero cost).

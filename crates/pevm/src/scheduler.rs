@@ -120,9 +120,24 @@ impl Scheduler {
         self.try_execute_ready(tx_idx, None, None)
     }
 
-    /// Refuse Execute when PE unpublished-RAW is still live (v6 ready-edge).
-    /// First incarnation always starts so it can plant ESTIMATE writes.
-    /// Reincarnation of a known consumer waits for the producer (S1).
+    /// Execute a reserved ProducerStage — never PE-refused (PC progress path).
+    pub(crate) fn try_execute_producer(&self, tx_idx: TxIdx) -> Option<TxVersion> {
+        self.try_execute_ready(tx_idx, None, None)
+    }
+
+    /// True when writer \(w\) has a live Stage (Ready/Executing/Done/Validated).
+    /// Aborting is **not** a progress path — refusing behind it deadlocks.
+    #[inline]
+    pub(crate) fn producer_stage_runnable(&self, writer: TxIdx) -> bool {
+        self.is_done(writer)
+            || self.is_ready(writer)
+            || self.is_executing(writer)
+            || self.is_validated(writer)
+    }
+
+    /// Refuse Execute when CC ReadyEdge is live **and** PC ProducerStage(w)
+    /// is runnable. Known consumers (any incarnation) wait. If the producer
+    /// has no Stage, do **not** refuse (v6 collaborative-index deadlock).
     fn try_execute_ready(
         &self,
         tx_idx: TxIdx,
@@ -135,15 +150,24 @@ impl Scheduler {
                 if let Some(edges) = ready
                     && tx.incarnation > 0
                     && !edges.may_execute(tx_idx)
+                    && let Some(w) = edges.blocking_producer(tx_idx)
                 {
-                    edges.defer(tx_idx);
-                    if let Some(wave) = wave
-                        && let Some(w) = edges.blocking_producer(tx_idx)
-                    {
-                        drop(tx);
+                    // Refuse only while the producer is mid-Execute (progress
+                    // visible). Ready/Validated refuse reintroduced the v6
+                    // yield-spin (iter20): consumers deferred, producer off
+                    // execution_idx, next_sf_task cannot make progress.
+                    if self.is_executing(w) {
+                        edges.defer(tx_idx);
+                        if let Some(wave) = wave {
+                            drop(tx);
+                            self.admit_spine(w, wave);
+                        }
+                        return None;
+                    }
+                    if let Some(wave) = wave {
                         self.admit_spine(w, wave);
                     }
-                    return None;
+                    // Fall through: Execute this canary; ProducerStage is reserved.
                 }
                 tx.status = IncarnationStatus::Executing;
                 self.set_done_flag(tx_idx, false);
@@ -234,11 +258,11 @@ impl Scheduler {
                         if let Some(edges) = ready
                             && tx.incarnation > 0
                             && !edges.may_execute(tx_idx)
+                            && let Some(w) = edges.blocking_producer(tx_idx)
+                            && self.is_executing(w)
                         {
                             edges.defer(tx_idx);
-                            if let Some(wave) = wave
-                                && let Some(w) = edges.blocking_producer(tx_idx)
-                            {
+                            if let Some(wave) = wave {
                                 drop(tx);
                                 self.admit_spine(w, wave);
                             }

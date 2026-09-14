@@ -1,10 +1,11 @@
-//! SpecFence Mode(a) — decide + cost-aware prior (v6 `mode.rs`).
+//! SpecFence Mode(a) — CC Avoid decide (WaitFor/lane primary; Bind rare).
 //!
-//! Authoritative plant: `lab/notes/specfence-complete-architecture-v6-essence.md`.
+//! Authoritative plant: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md`.
 //! π: `lab/notes/specfence-complete-architecture-v4-frozen-grain.md`.
 //!
 //! Unfenced ⇒ caller **must** invoke the shared OCC read helper. This module
-//! never touches rem journal / FF.
+//! never touches rem journal / FF. CC is a first-class control plane — not
+//! an edge-annotation layer.
 
 use crate::{MemoryLocationHash, TxIdx};
 
@@ -22,6 +23,8 @@ pub(crate) struct AccessVis {
     pub ws_hat: bool,
     /// Stale PE may Unfence when independence is certified (FM9 consume).
     pub independence_certified: bool,
+    /// Bind-rare: MV tip identity == predicted RAW producer for this \(\ell\).
+    pub tip_is_conflict_producer: bool,
 }
 
 /// Live verb after the PredictedEssential / \(e_{\mathrm{vis}}\) gate.
@@ -81,33 +84,39 @@ pub(crate) fn decide(
         };
     }
 
-    // SoT §3.2 — event-driven + cost-aware prior-PE Fire.
+    // SoT §3.2 — WaitFor/lane primary; Bind only conflict-tip ∧ EV.
     // HotSet / WŜ are posterior / ready-edge priors, not SerialLane OR-doors.
     let intra = learner.predicted_essential_intra(location, access_k);
     let fan = learner.morph_weights().dominant_fan_out();
     let quiet_off = learner.quiet_fence_off();
+    let ev_win = !quiet_off && (intra || (fan && learner.prior_pe_fire_wins(vis)));
     // WaitFor pins one *executing* producer. Quiet-off blocks first-wave
     // tax (2179522). Prior-only still needs the T3 fan_out EV brake.
     if vis.unfinished == 1
         && vis.writer_executing
         && let Some(w) = vis.writer
+        && ev_win
     {
-        if !quiet_off && (intra || (fan && learner.prior_pe_fire_wins(vis))) {
-            return AccessDecision::WaitFor { writer: w };
-        }
+        return AccessDecision::WaitFor { writer: w };
     }
-    // SerialLane / Bind: fan_out + cost gate. Never Bind while unfinished>0
+    // SerialLane: multi-writer PE class. Never Bind while unfinished>0
     // (later writers not yet in MV — stale last_data theater).
-    let park_ok = fan && !quiet_off && (intra || learner.prior_pe_fire_wins(vis));
     if vis.unfinished > 1 || (vis.in_serial_lane && vis.unfinished > 0) {
-        if park_ok
+        if ev_win
             && vis.writer_executing
             && let Some(w) = vis.writer
         {
             return AccessDecision::SerialLane { writer: w };
         }
     }
-    if vis.unfinished == 0 && vis.published_data && park_ok {
+    // Bind RARE: published tip must be the predicted RAW producer, EV win,
+    // and Bind must not be a tax (Bind↑ ∧ abort not↓).
+    if vis.unfinished == 0
+        && vis.published_data
+        && vis.tip_is_conflict_producer
+        && ev_win
+        && !learner.bind_tax_losing()
+    {
         return AccessDecision::Bind;
     }
     AccessDecision::UnfencedOcc {
@@ -142,6 +151,7 @@ mod tests {
             hot: false,
             ws_hat: true,
             independence_certified: false,
+            tip_is_conflict_producer: true,
         }
     }
 
@@ -155,6 +165,7 @@ mod tests {
             hot: true,
             ws_hat: true,
             independence_certified: false,
+            tip_is_conflict_producer: false,
         }
     }
 
@@ -168,6 +179,7 @@ mod tests {
             hot: false,
             ws_hat: false,
             independence_certified: false,
+            tip_is_conflict_producer: false,
         }
     }
 
@@ -181,6 +193,7 @@ mod tests {
             hot: true,
             ws_hat: false,
             independence_certified: false,
+            tip_is_conflict_producer: false,
         }
     }
 
@@ -217,7 +230,17 @@ mod tests {
         assert_eq!(
             decide(&live, 7, 6, Some(&data_vis())),
             AccessDecision::Bind,
-            "SoT: Data ∧ unfinished=0 → Bind (OCC read + cert, no rem overlay)"
+            "v8: Data ∧ unfinished=0 ∧ tip==conflict producer ∧ EV → Bind"
+        );
+        let mut mere_data = data_vis();
+        mere_data.tip_is_conflict_producer = false;
+        assert_eq!(
+            decide(&live, 7, 6, Some(&mere_data)),
+            AccessDecision::UnfencedOcc {
+                predicted: true,
+                roi_skip: true
+            },
+            "v8: Bind-on-any-Data is tax — tip must be the RAW producer"
         );
     }
 
@@ -330,6 +353,32 @@ mod tests {
                 roi_skip: true
             },
             "T3: quiet prior-PE Bind-on-Data is Fence tax"
+        );
+    }
+
+    #[test]
+    fn bind_tax_trips_only_when_aborts_match_binds() {
+        let live = fan_out_learner();
+        live.seed_predicted_essential(7, 6);
+        for _ in 0..16 {
+            live.note_bind_success(7);
+        }
+        live.note_abort_access(7, 2, Some(6));
+        assert_eq!(
+            decide(&live, 7, 6, Some(&data_vis())),
+            AccessDecision::Bind,
+            "loose abort>0 trip lost 14689597 (965 aborts); residual abort alone is not enough"
+        );
+        for _ in 0..16 {
+            live.note_abort_access(7, 2, Some(6));
+        }
+        assert_eq!(
+            decide(&live, 7, 6, Some(&data_vis())),
+            AccessDecision::UnfencedOcc {
+                predicted: true,
+                roi_skip: true
+            },
+            "aborts >= binds still trips Bind"
         );
     }
 

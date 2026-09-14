@@ -1,8 +1,9 @@
-//! Ready-edge graph over Region-accesses — PE unpublished-RAW refuses Execute.
+//! Ready-edge graph — PC ⊗ CC shared ready membership (not CC annotation).
 //!
-//! Plant SoT: `lab/notes/specfence-complete-architecture-v6-essence.md` §2.1.
+//! Plant SoT: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md`.
 //! First-wave Avoid at **schedule** for **known** consumers only.
-//! A suffix-global refuse (any later t) deadlocks later producers.
+//! Refuse only when ProducerStage(w) is runnable — v6 “defer consumer only”
+//! deadlocked when w was off the collaborative index.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -25,6 +26,8 @@ pub(crate) struct ReadyEdgeTable {
     /// Producers that have already `note_producer_done` — stale
     /// `note_consumer` after Done must not refuse forever.
     finished: DashMap<TxIdx, (), BuildIdentityHasher>,
+    /// Predicted RAW producer tip per ℓ (CC Bind-rare: tip == this writer).
+    tips: DashMap<MemoryLocationHash, AtomicUsize, BuildIdentityHasher>,
     deferred: Mutex<Vec<TxIdx>>,
     refuse: AtomicUsize,
 }
@@ -70,6 +73,25 @@ impl ReadyEdgeTable {
         {
             e.store(NONE, Ordering::Relaxed);
         }
+    }
+
+    /// Abort / HotSet RAW producer identity for Bind-rare tip check.
+    #[inline]
+    pub(crate) fn note_raw_producer(&self, location: MemoryLocationHash, writer: TxIdx) {
+        self.note_unpublished(location, writer);
+        self.tips
+            .entry(location)
+            .or_insert_with(|| AtomicUsize::new(writer))
+            .store(writer, Ordering::Relaxed);
+    }
+
+    /// Predicted conflicting producer for \(\ell\) (none ⇒ Bind forbidden).
+    #[inline]
+    pub(crate) fn predicted_producer(&self, location: MemoryLocationHash) -> Option<TxIdx> {
+        self.tips
+            .get(&location)
+            .map(|e| e.load(Ordering::Relaxed))
+            .filter(|&w| w != NONE)
     }
 
     /// Writer finished. Wake known consumers whose producer is now done.
@@ -164,6 +186,14 @@ mod tests {
         t.note_producer_done(0, &wave);
         assert!(t.may_execute(4));
         assert_eq!(wave.pop_ready(), Some(4));
+    }
+
+    #[test]
+    fn predicted_producer_is_conflict_tip() {
+        let t = ReadyEdgeTable::new();
+        assert!(t.predicted_producer(7).is_none());
+        t.note_raw_producer(7, 2);
+        assert_eq!(t.predicted_producer(7), Some(2));
     }
 
     #[test]

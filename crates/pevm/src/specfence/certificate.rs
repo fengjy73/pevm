@@ -1,6 +1,6 @@
 //! Access-prefix certificate strips — not a tx-global bit from one Bind.
 //!
-//! Plant SoT: `lab/notes/specfence-complete-architecture-v6-essence.md` §3.3.
+//! Plant SoT: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md` §3.3.
 //!
 //! `note_success` only after a **successful** Fence verb (Bind after Data,
 //! WaitFor armed, SerialLane exclusive progress). Bind-decide then Data miss
@@ -58,11 +58,26 @@ impl CertificateTable {
     }
 
     /// New incarnation. Repair-armed keeps a prefix certificate (no locs).
+    /// Incarnation 0 clears strips. Later incarnations **keep location
+    /// strips** so WaitFor/Bind certs survive Blocking resume (CC → R1).
+    /// They still do **not** cover sibling Spec misses (`covers_all`).
     #[inline]
-    pub(crate) fn begin_execute(&self, tx_idx: TxIdx, repair_armed: bool) {
+    pub(crate) fn begin_execute(
+        &self,
+        tx_idx: TxIdx,
+        repair_armed: bool,
+        incarnation: usize,
+    ) {
         if let Some(slot) = self.slots.get(tx_idx) {
             // SAFETY: one executor owns `tx_idx` at a time.
-            unsafe { &mut *slot.get() }.clear(repair_armed);
+            let st = unsafe { &mut *slot.get() };
+            if repair_armed {
+                st.clear(true);
+            } else if incarnation == 0 {
+                st.clear(false);
+            } else {
+                st.repair = false;
+            }
         }
     }
 
@@ -102,6 +117,16 @@ impl CertificateTable {
         }
         invalid.iter().all(|l| st.locs.contains(l))
     }
+
+    /// Single-location cover (selective R1 on the fenced subset).
+    #[inline]
+    pub(crate) fn covers(&self, tx_idx: TxIdx, location: MemoryLocationHash) -> bool {
+        let Some(slot) = self.slots.get(tx_idx) else {
+            return false;
+        };
+        let st = unsafe { &*slot.get() };
+        st.repair || st.locs.contains(&location)
+    }
 }
 
 #[cfg(test)]
@@ -111,7 +136,7 @@ mod tests {
     #[test]
     fn no_strip_without_success() {
         let t = CertificateTable::new(2);
-        t.begin_execute(0, false);
+        t.begin_execute(0, false, 0);
         assert!(!t.has_any(0));
         assert!(!t.covers_all(0, &[7]));
     }
@@ -119,7 +144,7 @@ mod tests {
     #[test]
     fn one_bind_does_not_cover_sibling_spec() {
         let t = CertificateTable::new(1);
-        t.begin_execute(0, false);
+        t.begin_execute(0, false, 0);
         t.note_success(0, 7);
         assert!(t.covers_all(0, &[7]));
         assert!(
@@ -132,7 +157,7 @@ mod tests {
     #[test]
     fn repair_armed_is_prefix_certificate() {
         let t = CertificateTable::new(1);
-        t.begin_execute(0, true);
+        t.begin_execute(0, true, 0);
         assert!(t.has_any(0));
         assert!(t.covers_all(0, &[1, 2]));
     }
@@ -140,9 +165,23 @@ mod tests {
     #[test]
     fn next_execute_clears_unless_repair() {
         let t = CertificateTable::new(1);
-        t.begin_execute(0, false);
+        t.begin_execute(0, false, 0);
         t.note_success(0, 3);
-        t.begin_execute(0, false);
+        t.begin_execute(0, false, 0);
         assert!(!t.has_any(0));
+    }
+
+    #[test]
+    fn wait_resume_keeps_location_strips() {
+        let t = CertificateTable::new(1);
+        t.begin_execute(0, false, 0);
+        t.note_success(0, 7);
+        t.begin_execute(0, false, 1);
+        assert!(t.has_any(0), "WaitFor/Bind strip must survive inc>0 resume");
+        assert!(t.covers(0, 7));
+        assert!(
+            !t.covers_all(0, &[7, 9]),
+            "kept strip must not cover sibling Spec"
+        );
     }
 }

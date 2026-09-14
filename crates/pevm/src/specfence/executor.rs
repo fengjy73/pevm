@@ -1,10 +1,10 @@
 //! SpecFence parallel computer — Spec validate / OCC helpers.
 //!
-//! Owns SpecFence **validate**. Ready/steal lives in `computer.rs`.
+//! Owns SpecFence **validate** (CC Resolve). Ready/steal lives in `computer.rs` (PC).
 //! Spec-only incarnations use the shared OCC validate kernel (bool walk + B0).
 //! R1 Resolve runs only when a certificate **strip** covers fail locations.
 //!
-//! Plant SoT: `lab/notes/specfence-complete-architecture-v6-essence.md`.
+//! Plant SoT: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md`.
 
 use super::ConcurrencyMode;
 use super::SpecFenceCtx;
@@ -65,10 +65,14 @@ pub(crate) fn specfence_r1_validate(
         && repair_grain(cert, tx_idx, invalid) == RepairGrain::R1
 }
 
-/// Empty PE table: quiet path is byte-identical OCC (no ordinal / PE probe).
+/// Empty PE **or** quiet-fence-off: byte-identical OCC computer
+/// (schedule / execute / access). A lone quiet abort must not flip the
+/// ready-set to wave+refuse (13287210 / 2179522 tax).
 #[inline]
 pub(crate) fn specfence_plant_is_occ(mode: ConcurrencyMode, learner: &LiveLearner) -> bool {
-    mode != ConcurrencyMode::SpecFence || !learner.has_any_predicted()
+    mode != ConcurrencyMode::SpecFence
+        || !learner.has_any_predicted()
+        || learner.quiet_fence_off()
 }
 
 /// Per-access OCC fast path: empty PE **or** this \(\ell\) has no PE class.
@@ -170,8 +174,9 @@ pub(crate) fn validate_occ_kernel(
             && w < tx_version.tx_idx
             && !scheduler.is_done(w)
         {
-            specfence.ready_edges.note_unpublished(*location, w);
+            specfence.ready_edges.note_raw_producer(*location, w);
             specfence.ready_edges.note_consumer(tx_version.tx_idx, w);
+            specfence.producer_stages.reserve(w);
             specfence.sketch.push_spine(*location, w);
         }
     }
@@ -200,6 +205,86 @@ pub(crate) fn validate_occ_kernel(
     )
 }
 
+/// CC Resolve: split RS_spec / RS_fence. Never always-B0 while certs exist.
+///
+/// No strip → OCC B0 + PE(true k). `covers_all` → R1a rebind; else B0.
+pub(crate) fn validate_specfence(
+    mv_memory: &MvMemory,
+    scheduler: &Scheduler,
+    tx_version: &TxVersion,
+    specfence: SpecFenceCtx<'_>,
+) -> Option<Task> {
+    let has_cert = specfence.certificates.has_any(tx_version.tx_idx)
+        || specfence.kernel.may_resolve(tx_version.tx_idx);
+    if !has_cert {
+        return validate_occ_kernel(mv_memory, scheduler, tx_version, specfence);
+    }
+
+    specfence.metrics.record_occ_kernel_validate();
+    if occ_read_set_valid(mv_memory, tx_version.tx_idx) {
+        return scheduler.finish_validation(tx_version, false);
+    }
+
+    let invalid = mv_memory.collect_invalid_reads(tx_version.tx_idx);
+    if !invalid.is_empty() {
+        let covers = specfence
+            .certificates
+            .covers_all(tx_version.tx_idx, &invalid);
+        let selective: Vec<_> = if covers {
+            Vec::new()
+        } else {
+            // SoT §4 mixed: R1 on fenced fail; Spec residual stays B0 unless
+            // the rebind makes the whole RS valid.
+            invalid
+                .iter()
+                .copied()
+                .filter(|&loc| specfence.certificates.covers(tx_version.tx_idx, loc))
+                .collect()
+        };
+        let fenced: &[MemoryLocationHash] = if covers {
+            &invalid
+        } else {
+            &selective
+        };
+        if !fenced.is_empty() {
+            // Caller must prove same-output before value-stable rebind
+            // (`try_rebind_*_value_stable` only relaxes multi-origin, it does
+            // not check values — patching without this proof is seq≠par).
+            let estimate_cleared = fenced.iter().all(|&loc| {
+                mv_memory
+                    .current_data_value(tx_version.tx_idx, loc)
+                    .is_some()
+            });
+            let value_stable = estimate_cleared
+                && fenced
+                    .iter()
+                    .all(|&loc| mv_memory.prior_read_value_stable(tx_version.tx_idx, loc));
+            if value_stable
+                && mv_memory.try_rebind_invalid_reads_value_stable(tx_version.tx_idx, &fenced)
+                && (fenced.len() == invalid.len()
+                    || occ_read_set_valid(mv_memory, tx_version.tx_idx))
+            {
+                specfence.learner.note_resolve_r1();
+                specfence.metrics.record_rebind_only();
+                specfence.metrics.record_partial_retry();
+                specfence.partial_retry.clear_force_bind(tx_version.tx_idx);
+                specfence
+                    .partial_retry
+                    .clear_force_writers(tx_version.tx_idx);
+                specfence.partial_retry.clear_repair(tx_version.tx_idx);
+                specfence.partial_retry.clear_ff_head(tx_version.tx_idx);
+                specfence
+                    .partial_retry
+                    .clear_suffix_repair_depth(tx_version.tx_idx);
+                specfence.learner.note_reexec_cost(0.1);
+                return scheduler.finish_validation(tx_version, false);
+            }
+        }
+    }
+
+    validate_occ_kernel(mv_memory, scheduler, tx_version, specfence)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,7 +302,7 @@ mod tests {
         k.note_fence(0);
         assert!(uses_specfence_resolve(ConcurrencyMode::SpecFence, &k, 0));
         let cert = CertificateTable::new(1);
-        cert.begin_execute(0, false);
+        cert.begin_execute(0, false, 0);
         assert!(!specfence_r1_validate(
             ConcurrencyMode::SpecFence,
             &cert,
@@ -237,5 +322,20 @@ mod tests {
             0,
             &[7, 9]
         ));
+    }
+
+    #[test]
+    fn quiet_lone_pe_keeps_occ_computer() {
+        let live = LiveLearner::new();
+        live.begin_block(crate::specfence::learner::MorphWeights::default());
+        live.note_abort_access(7, 2, Some(6));
+        assert!(
+            live.has_any_predicted(),
+            "intra abort may arm PE"
+        );
+        assert!(
+            specfence_plant_is_occ(ConcurrencyMode::SpecFence, &live),
+            "quiet_fence_off must not flip the PC ready-set"
+        );
     }
 }

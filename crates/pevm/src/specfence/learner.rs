@@ -419,6 +419,8 @@ pub(crate) struct LiveLearner {
     predicted_n: AtomicUsize,
     /// Locations with any PE class — T6: non-PE ℓ stays byte-identical OCC.
     predicted_locs: DashMap<MemoryLocationHash, (), BuildIdentityHasher>,
+    /// Unknown-\(k\) abort arm (fan_out): location any-k, **not** template spray.
+    armed_any_k: DashMap<MemoryLocationHash, (), BuildIdentityHasher>,
 }
 
 impl LiveLearner {
@@ -468,6 +470,7 @@ impl LiveLearner {
         self.predicted.clear();
         self.predicted_intra.clear();
         self.predicted_locs.clear();
+        self.armed_any_k.clear();
         self.predicted_n.store(0, Ordering::Relaxed);
     }
 
@@ -529,10 +532,14 @@ impl LiveLearner {
         if !self.has_any_predicted() {
             return false;
         }
+        if k == 0 {
+            return false;
+        }
         let cls = access_k_class(k);
         self.predicted
             .get(&(location, cls))
             .is_some_and(|e| e.load(Ordering::Relaxed) > 0)
+            || self.armed_any_k.contains_key(&location)
     }
 
     /// True when any PredictedEssential mark exists this block (prior or intra).
@@ -599,6 +606,26 @@ impl LiveLearner {
         m.dominant_fan_out() && (vis.published_data || vis.writer_executing)
     }
 
+    /// Bind↑ without abort relief — disable Bind for the rest of the block.
+    ///
+    /// `binds>=16 ∧ abort>0` (v8 try) **lost** 14689597: 0.424→0.199 and
+    /// aborts 176→965. Keep the strict `aborts >= binds` trip only.
+    #[inline]
+    pub(crate) fn bind_tax_losing(&self) -> bool {
+        let binds = self.bind_success_total.load(Ordering::Relaxed);
+        let aborts = self.abort_events.load(Ordering::Relaxed);
+        binds >= 16 && aborts >= binds
+    }
+
+    /// Unknown-\(k\) abort: arm \(\ell\) any-k. Never spray `[1,6,10,20]`.
+    #[inline]
+    pub(crate) fn arm_location_any_k(&self, location: MemoryLocationHash) {
+        if self.armed_any_k.insert(location, ()).is_none() {
+            self.predicted_n.fetch_add(1, Ordering::Relaxed);
+        }
+        self.predicted_locs.insert(location, ());
+    }
+
     /// HotSet / WŜ → PE posterior (not a SerialLane / Wait OR-door).
     #[inline]
     pub(crate) fn note_hot_ws_posterior(&self, location: MemoryLocationHash, hot_or_ws: bool) {
@@ -612,6 +639,9 @@ impl LiveLearner {
     /// Intra-block abort / first-wave mark (survives quiet_fence_off).
     #[inline]
     pub(crate) fn predicted_essential_intra(&self, location: MemoryLocationHash, k: u32) -> bool {
+        if self.armed_any_k.contains_key(&location) {
+            return k > 0;
+        }
         let cls = access_k_class(k);
         self.predicted_intra
             .get(&(location, cls))
@@ -783,11 +813,9 @@ impl LiveLearner {
         if let Some(k) = k.filter(|&k| k > 0) {
             self.mark_predicted_essential(location, k);
         } else if !self.quiet_fence_off() || cascade_hint >= 8 {
-            // First-wave has no ordinal. Template only off quiet / on heat
-            // so 2179522 does not open PE after a lone abort.
-            for template in [1u32, 6, 10, 20] {
-                self.mark_predicted_essential(location, template);
-            }
+            // First-wave has no ordinal. Arm location any-k — never template
+            // spray `[1,6,10,20]` on fan_out (v8 ban).
+            self.arm_location_any_k(location);
         }
     }
 
@@ -1653,6 +1681,25 @@ mod tests {
             "last_k must not become inter-block PredictedEssential"
         );
         assert!(!live.predicted_essential(13, 6));
+    }
+
+    #[test]
+    fn fan_out_abort_without_k_does_not_spray_templates() {
+        let live = LiveLearner::new();
+        live.begin_block(MorphWeights {
+            fan_out: 0.70,
+            mixed: 0.15,
+            waw_spine: 0.10,
+            quiet: 0.05,
+        });
+        live.note_abort_access(7, 4, None);
+        assert!(live.has_any_predicted());
+        assert!(live.location_predicted(7));
+        assert!(
+            live.predicted_essential(7, 6) && live.predicted_essential(7, 1),
+            "unknown-k arms location any-k, not four template classes"
+        );
+        assert!(!live.bind_tax_losing());
     }
 
     #[test]

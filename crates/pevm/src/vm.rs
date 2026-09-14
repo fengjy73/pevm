@@ -190,9 +190,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
             let repair_armed = self.specfence.partial_retry.is_rewind_resume(tx_idx)
                 || self.specfence.partial_retry.has_ff_head(tx_idx);
             self.specfence.kernel.begin_execute(tx_idx, repair_armed);
-            self.specfence
-                .certificates
-                .begin_execute(tx_idx, repair_armed);
+            self.specfence.certificates.begin_execute(
+                tx_idx,
+                repair_armed,
+                incarnation,
+            );
             self.specfence.access_log.begin_incarnation(tx_idx);
             self.specfence
                 .partial_retry
@@ -453,8 +455,8 @@ impl<'a, S: Storage> VmDb<'a, S> {
 
     /// SpecFence access gate. Mode(a) from \(a + e_{\mathrm{vis}} + \mathrm{PE}\).
     /// Quiet + empty PE ⇒ byte-identical OCC (`Ok(())`, no detect / ordinal).
-    /// First incarnation always OCC (ESTIMATE must plant). Fence certs only
-    /// after a successful verb. Never `pcc_armed` rem overlay.
+    /// PE-on: live true-\(k\) on the access stream; decide only for PE \(\ell\).
+    /// Fence certs only after a successful verb. Never `pcc_armed` rem overlay.
     fn specfence_access_gate(
         &self,
         address: Address,
@@ -465,18 +467,19 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if address == self.specfence.beneficiary || self.is_lazy {
             return Ok(());
         }
-        if self.tx_incarnation == 0
-            || crate::specfence::specfence_access_is_occ(
-                crate::ConcurrencyMode::SpecFence,
-                self.specfence.learner,
-                location_hash,
-            )
-        {
+        if crate::specfence::specfence_plant_is_occ(
+            crate::ConcurrencyMode::SpecFence,
+            self.specfence.learner,
+        ) {
+            return Ok(());
+        }
+        // PE-on: true stream \(k\). Empty-PE never reaches HashMap note.
+        let access_k = self.specfence.access_log.note(self.tx_idx, location_hash);
+        if !self.specfence.learner.location_predicted(location_hash) {
             return Ok(());
         }
 
         let vis = self.access_vis(location_hash);
-        let access_k = self.specfence.learner.dominant_k(location_hash).max(1);
         match crate::specfence::decide_access(
             self.specfence.learner,
             location_hash,
@@ -498,7 +501,15 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 self.specfence.metrics.record_pcc_fire_at_a();
                 self.specfence.metrics.record_edge_bind();
                 self.specfence.learner.note_bind_success(location_hash);
-                let _ = (address, is_program);
+                self.record_fence_process(
+                    location_hash,
+                    access_k,
+                    is_program,
+                    &vis,
+                    ProcessReason::BindPublished,
+                    DecisionVerb::Bind,
+                );
+                let _ = address;
                 Ok(())
             }
             AccessDecision::WaitFor { writer } => {
@@ -549,7 +560,20 @@ impl<'a, S: Storage> VmDb<'a, S> {
             self.specfence
                 .learner
                 .note_hot_ws_posterior(location_hash, true);
+            // Consume HotSet/WŜ as ReadyEdges + ProducerStage (not a Wait OR-door).
+            if let Some(w) = writer
+                && unfinished > 0
+                && w < self.tx_idx
+            {
+                self.specfence
+                    .ready_edges
+                    .note_raw_producer(location_hash, w);
+                self.specfence.ready_edges.note_consumer(self.tx_idx, w);
+                self.specfence.producer_stages.reserve(w);
+                self.specfence.scheduler.admit_spine(w, self.specfence.wave);
+            }
         }
+        let predicted = self.specfence.ready_edges.predicted_producer(location_hash);
         AccessVis {
             published_data,
             writer,
@@ -560,7 +584,48 @@ impl<'a, S: Storage> VmDb<'a, S> {
             ws_hat,
             independence_certified: self.specfence.sketch.independence_certified(location_hash)
                 && unfinished == 0,
+            tip_is_conflict_producer: writer.is_some() && writer == predicted,
         }
+    }
+
+    /// Telemetry for a successful Fence verb (CC process plane).
+    fn record_fence_process(
+        &self,
+        location_hash: MemoryLocationHash,
+        access_k: u32,
+        is_program: bool,
+        vis: &AccessVis,
+        reason: ProcessReason,
+        verb: DecisionVerb,
+    ) {
+        self.specfence
+            .process
+            .record(location_hash, self.tx_idx, reason, true, false);
+        self.specfence.process.record_decision(DecisionFeat {
+            verb,
+            access_k,
+            depth: 0,
+            incarnation: self.tx_incarnation,
+            is_program,
+            writer_published: vis.published_data,
+            writer_validated: vis
+                .writer
+                .is_some_and(|w| self.specfence.scheduler.is_validated(w)),
+            writer_executing: vis.writer_executing,
+            writer_ready: vis
+                .writer
+                .is_some_and(|w| self.specfence.scheduler.is_ready(w)),
+            writer_present: vis.writer.is_some(),
+            avoid_broadcast: false,
+            canary_ok: false,
+            independence_certified: vis.independence_certified,
+            essential_antidep: true,
+            force_prefix: false,
+            clique_gated: false,
+            in_hot_set: vis.hot,
+            prior_warm: vis.ws_hat,
+            mode_read: true,
+        });
     }
 
     /// Successful Fence verb — strip + rem-legal mirror. Never call on Data miss.
@@ -590,8 +655,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.specfence.lanes.grant(location_hash, access_k, w);
         self.specfence
             .ready_edges
-            .note_unpublished(location_hash, w);
+            .note_raw_producer(location_hash, w);
         self.specfence.ready_edges.note_consumer(self.tx_idx, w);
+        self.specfence.producer_stages.reserve(w);
         self.specfence.scheduler.admit_spine(w, self.specfence.wave);
         if self.specfence.scheduler.is_done(w) {
             self.note_fence_success(location_hash);
@@ -600,8 +666,19 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if self.specfence.scheduler.is_executing(w) {
             return self.pcc_wait_for_writer(address, location_hash, access_k, is_program, w);
         }
-        // Ready/Aborting: token is admit of the head. Parking the reader
-        // before ESTIMATE writes cascades B0 on later dependents.
+        // Ready/Validated/Aborting: one Spec canary + ProducerStage/edge so
+        // the next incarnation is refused while w is Executing. Parking or
+        // ready-refuse of a Ready head yield-spins (iter20 / v6 hang class).
+        // Not prefer_admit-without-progress: w is reserved and admitted.
+        if self.specfence.scheduler.is_ready(w) || self.specfence.scheduler.is_validated(w) {
+            self.specfence.process.record(
+                location_hash,
+                self.tx_idx,
+                ProcessReason::WaitForSerial,
+                true,
+                false,
+            );
+        }
         self.occ_unfenced()
     }
 
@@ -619,6 +696,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.specfence
             .ready_edges
             .note_consumer(self.tx_idx, writer);
+        self.specfence.producer_stages.reserve(writer);
         let hot_or_ws = self.specfence.hotset.contains(location)
             || self.specfence.rw_prior.predicts_write(location);
         self.specfence
@@ -728,8 +806,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
         let _ = (address, is_program);
         self.specfence
             .ready_edges
-            .note_unpublished(location_hash, w);
+            .note_raw_producer(location_hash, w);
         self.specfence.ready_edges.note_consumer(self.tx_idx, w);
+        self.specfence.producer_stages.reserve(w);
         self.specfence.scheduler.admit_spine(w, self.specfence.wave);
         if self.specfence.scheduler.is_done(w) {
             // Producer published. OCC reads Data (or ESTIMATE of a later w).
@@ -739,7 +818,8 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return self.occ_unfenced();
         }
         if !self.specfence.scheduler.is_executing(w) {
-            // Ready/Aborting: do not park — ESTIMATE plant / OCC Blocking.
+            // Ready/Aborting: do not park (ESTIMATE cascade / hang).
+            // ProducerStage + ReadyEdge refuse the *next* incarnation.
             return self.occ_unfenced();
         }
         self.note_fence_success(location_hash);
@@ -748,6 +828,34 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.specfence.metrics.record_pcc_fire_at_a();
         self.specfence.metrics.record_edge_wait_for();
         self.specfence.metrics.record_wait_hard();
+        self.specfence.process.record(
+            location_hash,
+            self.tx_idx,
+            ProcessReason::WaitForWriter,
+            true,
+            false,
+        );
+        self.specfence.process.record_decision(DecisionFeat {
+            verb: DecisionVerb::WaitFor,
+            access_k,
+            depth: 0,
+            incarnation: self.tx_incarnation,
+            is_program,
+            writer_published: false,
+            writer_validated: false,
+            writer_executing: true,
+            writer_ready: false,
+            writer_present: true,
+            avoid_broadcast: false,
+            canary_ok: false,
+            independence_certified: false,
+            essential_antidep: true,
+            force_prefix: false,
+            clique_gated: false,
+            in_hot_set: false,
+            prior_warm: false,
+            mode_read: true,
+        });
         let key = EdgeKey {
             location: location_hash,
             reader: self.tx_idx,
@@ -1957,6 +2065,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         wave: &crate::specfence::WaveParkTable,
     ) {
         self.specfence.ready_edges.note_producer_done(writer, wave);
+        self.specfence.producer_stages.note_done(writer);
     }
 
     pub(crate) fn credit_softwait_wakes(&self, fence: &crate::specfence::FenceGraph) {
