@@ -247,6 +247,14 @@ impl WaveParkTable {
     }
 
     fn record_resume_intent(&self, p: &ParkedWait) {
+        // BlockingOther / empty-prefix WaitFor is OCC abort+reexec.
+        // Recording an intent forces rem FullAbortReexecute tax on wake
+        // (14689597: 355 park_resume_full_abort vs 14 real ResumeAtK).
+        if matches!(p.kind, ParkKind::BlockingOther | ParkKind::EarlyAbort)
+            || (p.kind == ParkKind::WaitForDependency && p.armed_at_k == 0)
+        {
+            return;
+        }
         self.resume_intents.insert(
             p.waiter,
             ParkResumeIntent {
@@ -521,6 +529,19 @@ mod tests {
         assert_eq!(p.location, 42);
         assert_eq!(p.armed_at_k, 9);
         assert!(wave.take_pending_park().is_none());
+    }
+
+    #[test]
+    #[test]
+    fn blocking_other_wake_does_not_arm_resume_intent() {
+        let wave = WaveParkTable::new();
+        wave.park_with_kind(4, 1, 7, 3, ParkKind::BlockingOther);
+        let _ = wave.wake_writer_done(1);
+        assert!(
+            wave.take_resume_intent(4).is_none(),
+            "OCC BlockingOther must not plant rem FullAbortReexecute on wake"
+        );
+        assert_eq!(wave.pop_ready(), Some(4));
     }
 
     #[test]

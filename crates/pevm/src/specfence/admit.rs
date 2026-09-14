@@ -76,10 +76,9 @@ pub(crate) fn admit_seed_begin_block(
         }
         let producer = txs[0];
         stages.reserve(producer);
-        // True-k before Execute: Basic(addr) at k≈6 so the access gate is
-        // PE-on for the star and abort notes a class, not any-k.
-        // `note_raw_producer` makes later storage RAW of this account a
-        // known edge (refuse / vis refresh), not a first-wave canary.
+        // True-k PE on Basic(addr)@k≈6 so abort notes a class. Storage slots
+        // are **not** cloned from this PE (access_gate). ReadyEdges refuse
+        // known account consumers while the producer is Ready|Executing.
         let basic = hash_deterministic(MemoryLocation::Basic(addr));
         learner.seed_predicted_essential(basic, FAN_STAR_K);
         ready.note_raw_producer(basic, producer);
@@ -144,12 +143,13 @@ mod tests {
         let loc = hash_deterministic(MemoryLocation::Basic(addr));
         assert!(
             learner.predicted_essential(loc, FAN_STAR_K),
-            "true-k: ≥16-tx hint plants k≈6 PE before Execute"
+            "true-k: ≥16-tx hint plants k≈6 Basic PE before Execute"
         );
         assert!(
             !learner.predicted_essential(loc, 1),
             "true-k: hint seed is class k≈6, not any-k"
         );
+        assert_eq!(ready.predicted_producer(loc), Some(0));
     }
 
     #[test]
