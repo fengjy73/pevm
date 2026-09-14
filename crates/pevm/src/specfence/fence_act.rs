@@ -6,6 +6,7 @@
 //!
 //! Plant SoT: `lab/notes/specfence-complete-architecture-v9.1-cc-pc-bayes.md` §2.4.
 
+use super::wave::ParkKind;
 use crate::TxIdx;
 use crate::scheduler::Scheduler;
 
@@ -44,6 +45,29 @@ pub(crate) fn act_bind_has_data(has_data: bool) -> bool {
     has_data
 }
 
+/// Bind EV from the Bayes port. `known_star` is a **pin / WaitFor** signal,
+/// not a Bind door — OR-ing it in was the volume bug (N=1 Bind ≈ WaitFor).
+/// Quiet-off still holds Bind unless the star posterior is on (2179522).
+#[inline]
+pub(crate) fn bind_ev_from_query(
+    ev_bind_beats_b0: bool,
+    quiet_off: bool,
+    known_star: bool,
+) -> bool {
+    ev_bind_beats_b0 && (!quiet_off || known_star)
+}
+
+/// ESTIMATE Avoid: PE-known RAW is PinHold (not BlockingOther Aborting default).
+/// Unknown ESTIMATE stays BlockingOther (true OCC).
+#[inline]
+pub(crate) fn estimate_park_kind(pe_known: bool) -> ParkKind {
+    if pe_known {
+        ParkKind::PinHold
+    } else {
+        ParkKind::BlockingOther
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -52,5 +76,25 @@ mod tests {
     fn bind_requires_data() {
         assert!(act_bind_has_data(true));
         assert!(!act_bind_has_data(false));
+    }
+
+    #[test]
+    fn estimate_pe_known_is_pinhold() {
+        assert_eq!(estimate_park_kind(true), ParkKind::PinHold);
+        assert_eq!(estimate_park_kind(false), ParkKind::BlockingOther);
+    }
+
+    #[test]
+    fn known_star_is_not_bind_ev() {
+        assert!(
+            !bind_ev_from_query(false, false, true),
+            "star without Bind EV must not Bind"
+        );
+        assert!(bind_ev_from_query(true, false, false));
+        assert!(
+            !bind_ev_from_query(true, true, false),
+            "quiet-off holds Bind unless star posterior"
+        );
+        assert!(bind_ev_from_query(true, true, true));
     }
 }

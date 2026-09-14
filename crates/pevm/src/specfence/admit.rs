@@ -13,15 +13,22 @@ use super::feeder::{seed_known_stars, top_is_known_star};
 use super::learner::{InterBlockPrior, LiveLearner};
 use super::producer_stage::ProducerStageTable;
 use super::ready_edge::ReadyEdgeTable;
+use crate::{MemoryLocation, hash_deterministic};
 
 /// High-fanout account: OrderedAdmit later hinted txs behind the earliest.
 const HINT_FANOUT_FLOOR: usize = 16;
+/// When fan / InterPrior / seeded stars are present, OrderedAdmit from 2 txs.
+const HINT_STAR_FLOOR: usize = 2;
+/// Fan-star access class (k≈6 → bucket 4–7). Empty InterPrior still plants
+/// true-k PE so first-wave abort notes a class, not any-k residual.
+const FAN_STAR_K: u32 = 6;
 
-/// begin_block admit: seed PE for known stars; optionally OrderedAdmit
-/// high-fanout hinted accounts when fan_out / star evidence is present.
+/// begin_block admit: seed PE for known stars; OrderedAdmit hinted accounts.
 ///
-/// Truly cold (empty PE ∧ no stars ∧ Bayes.cold) seeds nothing — Mode(a)=Spec
-/// on the **same** spine (v9.3). Does **not** flip to an OCC computer.
+/// Block-local ≥16-tx accounts are star evidence even on quiet-biased cold
+/// start / empty InterPrior (hints≥16-only **after** a morph/prior gate was
+/// too weak — first-wave satellites executed before edges existed).
+/// Truly empty hints + no stars seeds nothing — Mode(a)=Spec on the same spine.
 pub(crate) fn admit_seed_begin_block(
     ready: &ReadyEdgeTable,
     stages: &ProducerStageTable,
@@ -34,20 +41,27 @@ pub(crate) fn admit_seed_begin_block(
     let stars = seed_known_stars(learner, bayes, prior);
     let fan = learner.morph_weights().dominant_fan_out();
     let prior_star = prior.top_locations().iter().any(top_is_known_star);
-    if stars == 0 && !fan && !prior_star {
-        return 0;
-    }
+    let star_edges = fan || prior_star || stars > 0;
+    let floor = if star_edges {
+        HINT_STAR_FLOOR
+    } else {
+        HINT_FANOUT_FLOOR
+    };
     let mut edges = 0;
     for addr in hints.accounts() {
         if addr == beneficiary {
             continue;
         }
         let txs = hints.txs(&addr);
-        if txs.len() < HINT_FANOUT_FLOOR {
+        if txs.len() < floor {
             continue;
         }
         let producer = txs[0];
         stages.reserve(producer);
+        // True-k before Execute: Basic(addr) at k≈6 so the access gate is
+        // PE-on for the star and abort notes a class, not any-k.
+        learner
+            .seed_predicted_essential(hash_deterministic(MemoryLocation::Basic(addr)), FAN_STAR_K);
         for &t in &txs[1..] {
             ready.note_consumer(t, producer);
             edges += 1;
@@ -71,4 +85,72 @@ pub(crate) fn admit_seed_on_abort(
     ready.note_raw_producer(location, producer);
     ready.note_consumer(consumer, producer);
     stages.reserve(producer);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::specfence::AccountHints;
+    use crate::{MemoryLocation, hash_deterministic};
+    use alloy_primitives::Address;
+
+    #[test]
+    fn hints_fanout_seeds_without_prior() {
+        let ready = ReadyEdgeTable::new();
+        let stages = ProducerStageTable::new();
+        let learner = LiveLearner::new();
+        learner.begin_block(crate::specfence::learner::MorphWeights::default());
+        let bayes = BayesMap::new();
+        let prior = InterBlockPrior::new();
+        let addr = Address::repeat_byte(0x11);
+        let hints = AccountHints::from_account_txs(addr, (0..20).collect());
+        let n = admit_seed_begin_block(
+            &ready,
+            &stages,
+            &learner,
+            &bayes,
+            &prior,
+            &hints,
+            Address::ZERO,
+        );
+        assert!(
+            n >= 19,
+            "quiet-biased cold start must still OrderedAdmit ≥16-tx stars, got {n}"
+        );
+        assert!(!ready.may_execute(19));
+        assert_eq!(ready.blocking_producer(19), Some(0));
+        assert!(stages.is_reserved(0));
+        let loc = hash_deterministic(MemoryLocation::Basic(addr));
+        assert!(
+            learner.predicted_essential(loc, FAN_STAR_K),
+            "true-k: ≥16-tx hint plants k≈6 PE before Execute"
+        );
+        assert!(
+            !learner.predicted_essential(loc, 1),
+            "true-k: hint seed is class k≈6, not any-k"
+        );
+    }
+
+    #[test]
+    fn quiet_small_account_does_not_seed() {
+        let ready = ReadyEdgeTable::new();
+        let stages = ProducerStageTable::new();
+        let learner = LiveLearner::new();
+        learner.begin_block(crate::specfence::learner::MorphWeights::default());
+        let bayes = BayesMap::new();
+        let prior = InterBlockPrior::new();
+        let addr = Address::repeat_byte(0x22);
+        let hints = AccountHints::from_account_txs(addr, vec![0, 1, 2]);
+        let n = admit_seed_begin_block(
+            &ready,
+            &stages,
+            &learner,
+            &bayes,
+            &prior,
+            &hints,
+            Address::ZERO,
+        );
+        assert_eq!(n, 0, "quiet 3-tx account is not a star");
+        assert!(ready.may_execute(2));
+    }
 }

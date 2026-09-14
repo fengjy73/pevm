@@ -812,9 +812,12 @@ impl LiveLearner {
         drop(m);
         if let Some(k) = k.filter(|&k| k > 0) {
             self.mark_predicted_essential(location, k);
-        } else if !self.quiet_fence_off() || cascade_hint >= 8 {
-            // First-wave has no ordinal. Arm location any-k — never template
-            // spray `[1,6,10,20]` on fan_out (v8 ban).
+        } else if !self.location_predicted(location)
+            && (!self.quiet_fence_off() || cascade_hint >= 8)
+        {
+            // Residual: no ordinal and no seeded class. Arm location any-k
+            // — never template spray `[1,6,10,20]` on fan_out (v8 ban).
+            // Admit-seeded stars skip this so first-wave abort keeps true-k.
             self.arm_location_any_k(location);
         }
     }
@@ -1700,6 +1703,24 @@ mod tests {
             "unknown-k arms location any-k, not four template classes"
         );
         assert!(!live.bind_tax_losing());
+    }
+
+    #[test]
+    fn seeded_class_abort_without_k_does_not_smear_any_k() {
+        let live = LiveLearner::new();
+        live.begin_block(MorphWeights {
+            fan_out: 0.70,
+            mixed: 0.15,
+            waw_spine: 0.10,
+            quiet: 0.05,
+        });
+        live.seed_predicted_essential(7, 6);
+        live.note_abort_access(7, 4, None);
+        assert!(live.predicted_essential(7, 6));
+        assert!(
+            !live.predicted_essential(7, 1),
+            "admit-seeded class must not pick up any-k on k=None abort"
+        );
     }
 
     #[test]

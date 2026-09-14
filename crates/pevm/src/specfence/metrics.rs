@@ -820,7 +820,14 @@ impl MetricsInner {
     }
 
     pub(crate) fn record_schedule_refuse(&self) {
-        self.schedule_refuse.fetch_add(1, Ordering::Relaxed);
+        self.record_schedule_refuse_n(1);
+    }
+
+    #[inline]
+    pub(crate) fn record_schedule_refuse_n(&self, n: usize) {
+        if n > 0 {
+            self.schedule_refuse.fetch_add(n, Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn record_bind_after_done(&self) {

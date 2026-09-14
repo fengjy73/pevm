@@ -7,6 +7,7 @@
 //! Plant SoT: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md`.
 
 use super::ConcurrencyMode;
+use super::LeanAbortRepair;
 use super::SpecFenceCtx;
 use super::certificate::CertificateTable;
 use super::dag::FenceGraph;
@@ -239,9 +240,8 @@ pub(crate) fn validate_specfence(
 
     let invalid = mv_memory.collect_invalid_reads(tx_version.tx_idx);
     if !invalid.is_empty() {
-        let covers = specfence
-            .certificates
-            .covers_all(tx_version.tx_idx, &invalid);
+        let grain = repair_grain(specfence.certificates, tx_version.tx_idx, &invalid);
+        let covers = grain == RepairGrain::R1;
         let selective: Vec<_> = if covers {
             Vec::new()
         } else {
@@ -252,6 +252,14 @@ pub(crate) fn validate_specfence(
                 .collect()
         };
         let fenced: &[MemoryLocationHash] = if covers { &invalid } else { &selective };
+        let bayes_q = invalid.first().copied().map(|loc| {
+            let w_exec = mv_memory
+                .last_writer_before(loc, tx_version.tx_idx)
+                .is_some_and(|w| scheduler.is_executing(w));
+            specfence
+                .bayes
+                .query_validate(loc, !fenced.is_empty(), w_exec)
+        });
         if !fenced.is_empty() {
             let estimate_cleared = fenced.iter().all(|&loc| {
                 mv_memory
@@ -276,11 +284,11 @@ pub(crate) fn validate_specfence(
             if identity_held {
                 specfence.learner.note_identity_hit();
             }
-            if value_stable
+            let r1a = value_stable
                 && mv_memory.try_rebind_invalid_reads_value_stable(tx_version.tx_idx, fenced)
                 && (fenced.len() == invalid.len()
-                    || occ_read_set_valid(mv_memory, tx_version.tx_idx))
-            {
+                    || occ_read_set_valid(mv_memory, tx_version.tx_idx));
+            if r1a {
                 specfence.learner.note_resolve_r1();
                 specfence.metrics.record_rebind_only();
                 specfence.metrics.record_r1_win();
@@ -298,6 +306,51 @@ pub(crate) fn validate_specfence(
                 return scheduler.finish_validation(tx_version, false);
             }
             specfence.metrics.record_r1_attempt();
+            // R1b: certified prefix skip when EV[rewind] > EV[B0] (strips cover).
+            // Ban silent always-B0 while strips exist.
+            let ev_r1b = bayes_q.is_some_and(|q| {
+                q.known_star || q.depth_frac >= 0.50 || q.ev_pin_beats_abort || covers
+            });
+            if ev_r1b && matches!(grain, RepairGrain::R1 | RepairGrain::R1Selective) {
+                let read_locations = mv_memory.read_locations(tx_version.tx_idx);
+                let write_locations = mv_memory.write_locations(tx_version.tx_idx);
+                let repair = specfence.partial_retry.apply_suffix_repair(
+                    tx_version.tx_idx,
+                    &read_locations,
+                    &invalid,
+                    &write_locations,
+                );
+                if let LeanAbortRepair::SuffixRepair {
+                    suffix_writes,
+                    reexec_cost,
+                    ..
+                } = repair
+                {
+                    if scheduler.try_validation_abort(tx_version) {
+                        let estimated =
+                            mv_memory.invalidate_partial_suffix(tx_version.tx_idx, &suffix_writes);
+                        if !estimated.is_empty() {
+                            specfence
+                                .metrics
+                                .record_selective_invalidate(estimated.len());
+                        }
+                        specfence.learner.note_resolve_r1();
+                        specfence.metrics.record_r1_win();
+                        specfence.metrics.record_rewind_to_cp();
+                        specfence.metrics.record_partial_retry();
+                        specfence.learner.note_reexec_cost(reexec_cost);
+                        specfence
+                            .partial_retry
+                            .mark_needs_live_capture(tx_version.tx_idx);
+                        return scheduler.finish_validation_fenced(
+                            tx_version,
+                            true,
+                            Some(tx_version.tx_idx + 1),
+                            Some(specfence.wave),
+                        );
+                    }
+                }
+            }
         }
     }
 

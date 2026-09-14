@@ -6,6 +6,7 @@
 //! Steal only Stages in ready. Never steal a PE-blocked Execute "to look busy".
 //! Refuse consumer only when ProducerStage(w) is runnable (v6 deadlock designed out).
 
+use super::metrics::MetricsInner;
 use super::producer_stage::ProducerStageTable;
 use super::ready_edge::ReadyEdgeTable;
 use super::wave::WaveParkTable;
@@ -19,7 +20,9 @@ pub(crate) fn next_sf_task(
     wave: &WaveParkTable,
     ready: &ReadyEdgeTable,
     stages: &ProducerStageTable,
+    metrics: Option<&MetricsInner>,
 ) -> Option<Task> {
+    let refuse_before = ready.refuse_count();
     // Drop Aborting / Done reservations so a dead writer cannot pin the
     // ProducerStage min and starve the rest of the ready-set.
     for _ in 0..8 {
@@ -33,6 +36,10 @@ pub(crate) fn next_sf_task(
         scheduler.admit_spine(w, wave);
         stages.note_promote();
         if let Some(tx_version) = scheduler.try_execute_producer(w) {
+            if let Some(m) = metrics {
+                let n = ready.refuse_count().saturating_sub(refuse_before);
+                m.record_schedule_refuse_n(n);
+            }
             return Some(Task::Execution(tx_version));
         }
         if !scheduler.producer_stage_runnable(w) {
@@ -41,5 +48,10 @@ pub(crate) fn next_sf_task(
         }
         break;
     }
-    scheduler.next_task_with_wave_ready(Some(wave), Some(ready))
+    let task = scheduler.next_task_with_wave_ready(Some(wave), Some(ready));
+    if let Some(m) = metrics {
+        let n = ready.refuse_count().saturating_sub(refuse_before);
+        m.record_schedule_refuse_n(n);
+    }
+    task
 }

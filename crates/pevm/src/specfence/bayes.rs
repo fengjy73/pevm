@@ -221,6 +221,22 @@ impl BayesMap {
         }
     }
 
+    /// Validate/Repair port: P(covers_all∣strips) + tip-snap prior (v9.1).
+    /// Not a Boolean π — decide still lives in `access_policy` / `repair_grain`.
+    pub(crate) fn query_validate(
+        &self,
+        location: MemoryLocationHash,
+        covers: bool,
+        writer_executing: bool,
+    ) -> BayesAccessQuery {
+        let mut q = self.query_access(location, writer_executing, if covers { 0 } else { 2 }, true);
+        if covers {
+            q.ev_bind_beats_b0 = true;
+            q.depth_frac = q.depth_frac.max(0.55);
+        }
+        q
+    }
+
     /// Boolean π museums — **not** SpecFence decide.
     #[cfg(test)]
     pub(crate) fn decide(
