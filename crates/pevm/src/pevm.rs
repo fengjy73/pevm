@@ -501,7 +501,15 @@ impl Pevm {
                 block_env.beneficiary,
                 &self.cost_policy,
                 &contracts,
+                Some(&metrics_inner),
             );
+            // PC-W1: seed the true ready bag with independents (not A1-blocked).
+            for t in 0..block_size {
+                if ready_edges.may_execute(t) {
+                    wave.push_ready(t);
+                }
+            }
+            ready_edges.sample_ready_width(wave.ready_depth());
             self.last_begin_blocked = ready_edges.blocked_consumers();
             if quiet && !learner.has_any_predicted() {
                 let n = sketch.revoke_prior_fences_if_quiet(true);
@@ -730,15 +738,34 @@ impl Pevm {
             let reexec: usize = incs.iter().sum();
             let mut miss = 0usize;
             for (tx, &inc) in incs.iter().enumerate() {
-                if inc > 0 && !ready_edges.was_queued(tx) {
-                    miss += 1;
-                    self.cost_policy.note_a0_reexec();
-                    self.cost_policy.bump_miss_detect();
+                if inc == 0 || ready_edges.was_queued(tx) {
+                    continue;
+                }
+                // CC-D1: first conflict ℓ — effective non-lazy → learn; lazy → ignore.
+                match self.cost_policy.conflict_of(tx) {
+                    Some(note) if note.lazy => {
+                        self.cost_policy.note_conflict_ignore();
+                    }
+                    Some(note) => {
+                        miss += 1;
+                        self.cost_policy.note_conflict_promote();
+                        self.cost_policy.bump_miss_detect();
+                        let _ = note.location;
+                    }
+                    None => {
+                        miss += 1;
+                        self.cost_policy.bump_miss_detect();
+                    }
                 }
             }
             let ready_w = ready_edges.ready_width_mean();
             let idle = ready_edges.idle_core_ns();
             let refuse = ready_edges.refuse_count();
+            let refuse_ns = ready_edges.refuse_ns();
+            if refuse_ns > 0 {
+                self.cost_policy.note_refuse_ns(refuse_ns);
+                metrics_inner.record_refuse_ns(refuse_ns);
+            }
             let refuse_unit = if refuse == 0 {
                 0.0
             } else {
@@ -755,6 +782,18 @@ impl Pevm {
                 miss,
                 report.a1_cohorts,
                 report.lean_a0_cohorts,
+            );
+            metrics_inner.set_ns_learn_metrics(
+                report.refuse_ns,
+                report.reexec_ns,
+                report.thin_shell,
+                report.ns_ev_keep_a1,
+                report.ns_ev_demote,
+                report.k_cap_demote,
+                report.commute_skip,
+                report.batch_repair,
+                report.conflict_promote,
+                report.conflict_ignore,
             );
             self.last_learn_report = report;
             self.last_incarnations = incs;
@@ -961,8 +1000,12 @@ impl Pevm {
             if let Some(wave) = wave {
                 vm.try_apply_park_resume(tx_version.tx_idx, wave);
             }
+            let exec_t0 = Instant::now();
             return match vm.execute(&tx_version, result_slot) {
                 Ok(flags) => {
+                    if tx_version.tx_incarnation > 0 {
+                        vm.note_hot_reexec_ns(exec_t0.elapsed().as_nanos() as u64);
+                    }
                     // PublishWrite ≈ incarnation finished: wake location waiters + ready.
                     let done_idx = tx_version.tx_idx;
                     let task =

@@ -15,6 +15,7 @@ use super::AccountHints;
 use super::bayes::BayesMap;
 use super::feeder::{seed_known_stars, top_is_known_star};
 use super::learner::{InterBlockPrior, LiveLearner};
+use super::metrics::MetricsInner;
 use super::policy::{CohortKind, CostPolicy};
 use super::producer_stage::ProducerStageTable;
 use super::ready_edge::ReadyEdgeTable;
@@ -104,6 +105,7 @@ pub(crate) fn admit_seed_begin_block(
     beneficiary: Address,
     policy: &CostPolicy,
     contracts: &HashSet<Address>,
+    metrics: Option<&MetricsInner>,
 ) -> usize {
     let stars = seed_known_stars(learner, bayes, prior);
     let fan = learner.morph_weights().dominant_fan_out();
@@ -126,8 +128,14 @@ pub(crate) fn admit_seed_begin_block(
         learner.seed_predicted_essential(loc, FAN_STAR_K);
     });
 
-    let mut edges = 0;
-    let mut queued: HashSet<TxIdx> = HashSet::new();
+    struct Cand {
+        kind: CohortKind,
+        addr: Address,
+        is_contract: bool,
+        score: i64,
+        txs: Vec<TxIdx>,
+    }
+    let mut cands: Vec<Cand> = Vec::new();
 
     // Calldata ≥16: RAW fan-out star (v10). First — PC-3 so later same-from
     // / empty-to cannot dual-tax the same txs.
@@ -141,24 +149,18 @@ pub(crate) fn admit_seed_begin_block(
         }
         let p_beta = bayes.account_wait_probability(&addr);
         if !policy.choose_a1(CohortKind::RawFan, addr, txs.len(), true, p_beta) {
+            if let Some(m) = metrics {
+                m.record_edge_optimistic_read();
+            }
             continue;
         }
-        let producer = txs[0];
-        stages.reserve(producer);
-        let basic = hash_deterministic(MemoryLocation::Basic(addr));
-        if star_edges {
-            learner.seed_predicted_essential(basic, FAN_STAR_K);
-        }
-        ready.note_raw_producer(basic, producer);
-        queued.insert(producer);
-        for &t in &txs[1..] {
-            if queued.contains(&t) {
-                continue;
-            }
-            ready.note_consumer_on(t, producer, Some(basic));
-            queued.insert(t);
-            edges += 1;
-        }
+        cands.push(Cand {
+            kind: CohortKind::RawFan,
+            addr,
+            is_contract: true,
+            score: CostPolicy::a1_score(CohortKind::RawFan, txs.len(), true),
+            txs: txs.to_vec(),
+        });
     }
 
     // Calldata 2..15: short contract WAW. Predecessor chain, no Basic(to) PE.
@@ -173,10 +175,18 @@ pub(crate) fn admit_seed_begin_block(
         }
         let p_beta = bayes.account_wait_probability(&addr);
         if !policy.choose_a1(CohortKind::CallWaw, addr, txs.len(), true, p_beta) {
+            if let Some(m) = metrics {
+                m.record_edge_optimistic_read();
+            }
             continue;
         }
-        let loc = envelope_loc(addr);
-        edges += note_predecessor_chain(ready, txs, loc, &mut queued);
+        cands.push(Cand {
+            kind: CohortKind::CallWaw,
+            addr,
+            is_contract: true,
+            score: CostPolicy::a1_score(CohortKind::CallWaw, txs.len(), true),
+            txs: txs.to_vec(),
+        });
     }
 
     // Empty-calldata `to`: D2 cold-start probe **only** when B3 says A1
@@ -195,10 +205,18 @@ pub(crate) fn admit_seed_begin_block(
         let is_contract = contracts.contains(&addr);
         let p_beta = bayes.account_wait_probability(&addr);
         if !policy.choose_a1(CohortKind::EmptyTo, addr, txs.len(), is_contract, p_beta) {
+            if let Some(m) = metrics {
+                m.record_edge_optimistic_read();
+            }
             continue;
         }
-        let loc = envelope_loc(addr);
-        edges += note_probe_star(ready, txs, loc, &mut queued);
+        cands.push(Cand {
+            kind: CohortKind::EmptyTo,
+            addr,
+            is_contract,
+            score: CostPolicy::a1_score(CohortKind::EmptyTo, txs.len(), is_contract),
+            txs: txs.to_vec(),
+        });
     }
 
     // Same-from: PC-2 — basic_lazy / empty-calldata spines default A0.
@@ -216,11 +234,72 @@ pub(crate) fn admit_seed_begin_block(
         }
         let p_beta = bayes.account_wait_probability(&addr);
         if !policy.choose_a1(CohortKind::SameFrom, addr, txs.len(), false, p_beta) {
+            if let Some(m) = metrics {
+                m.record_edge_optimistic_read();
+            }
             continue;
         }
-        let basic = hash_deterministic(MemoryLocation::Basic(addr));
-        ready.note_raw_producer(basic, txs[0]);
-        edges += note_predecessor_chain(ready, txs, basic, &mut queued);
+        cands.push(Cand {
+            kind: CohortKind::SameFrom,
+            addr,
+            is_contract: false,
+            score: CostPolicy::a1_score(CohortKind::SameFrom, txs.len(), false),
+            txs: txs.to_vec(),
+        });
+    }
+
+    cands.sort_by(|a, b| b.score.cmp(&a.score));
+    let cap = policy.thin_a1_k();
+    if cands.len() > cap {
+        for extra in cands.drain(cap..) {
+            policy.note_k_cap_demote();
+            if let Some(m) = metrics {
+                m.record_edge_optimistic_read();
+            }
+            let _ = extra;
+        }
+    }
+
+    let mut edges = 0;
+    let mut queued: HashSet<TxIdx> = HashSet::new();
+    for c in cands {
+        if let Some(m) = metrics {
+            m.record_edge_ordered_admit();
+        }
+        match c.kind {
+            CohortKind::RawFan => {
+                let producer = c.txs[0];
+                stages.reserve(producer);
+                let basic = hash_deterministic(MemoryLocation::Basic(c.addr));
+                if star_edges {
+                    learner.seed_predicted_essential(basic, FAN_STAR_K);
+                }
+                ready.note_raw_producer(basic, producer);
+                queued.insert(producer);
+                for &t in &c.txs[1..] {
+                    if queued.contains(&t) {
+                        continue;
+                    }
+                    ready.note_consumer_on(t, producer, Some(basic));
+                    queued.insert(t);
+                    edges += 1;
+                }
+            }
+            CohortKind::CallWaw => {
+                let loc = envelope_loc(c.addr);
+                edges += note_predecessor_chain(ready, &c.txs, loc, &mut queued);
+            }
+            CohortKind::EmptyTo => {
+                let loc = envelope_loc(c.addr);
+                edges += note_probe_star(ready, &c.txs, loc, &mut queued);
+            }
+            CohortKind::SameFrom => {
+                let basic = hash_deterministic(MemoryLocation::Basic(c.addr));
+                ready.note_raw_producer(basic, c.txs[0]);
+                edges += note_predecessor_chain(ready, &c.txs, basic, &mut queued);
+            }
+        }
+        let _ = c.is_contract;
     }
 
     edges
@@ -408,6 +487,7 @@ mod tests {
             Address::ZERO,
             &policy,
             contracts,
+            None,
         )
     }
 

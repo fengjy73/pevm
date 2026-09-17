@@ -16,7 +16,9 @@ use super::repair::{RepairGrain, repair_grain};
 use super::wave::WaveParkTable;
 use crate::mv_memory::MvMemory;
 use crate::scheduler::Scheduler;
-use crate::{MemoryLocationHash, Task, TxIdx, TxVersion};
+use crate::{
+    MemoryLocation, MemoryLocationHash, MemoryValue, Task, TxIdx, TxVersion, hash_deterministic,
+};
 
 /// OCC schedule / execute / validate never take wave or fence handles.
 #[inline]
@@ -115,6 +117,85 @@ pub(crate) fn validate_occ_stage(
     scheduler.finish_validation(tx_version, aborted)
 }
 
+/// CC-X1: 21k empty-calldata transfer whose stale reads are only beneficiary
+/// and/or recipient — those writes commute (lazy add). Sender nonce does not.
+fn commute_invalid(
+    specfence: SpecFenceCtx<'_>,
+    mv_memory: &MvMemory,
+    tx_idx: TxIdx,
+    invalid: &[MemoryLocationHash],
+) -> bool {
+    if invalid.is_empty() || !specfence.hints.is_pure_transfer(tx_idx) {
+        return false;
+    }
+    let from = specfence.hints.from_of(tx_idx);
+    let from_loc = hash_deterministic(MemoryLocation::Basic(from));
+    let to_loc = specfence
+        .hints
+        .to_of(tx_idx)
+        .map(|t| hash_deterministic(MemoryLocation::Basic(t)));
+    let ben_loc = hash_deterministic(MemoryLocation::Basic(specfence.beneficiary));
+    for &loc in invalid {
+        if loc == from_loc {
+            return false;
+        }
+        if loc == ben_loc {
+            continue;
+        }
+        if to_loc == Some(loc) {
+            if let Some(val) = mv_memory.current_data_value(tx_idx, loc)
+                && !matches!(
+                    val,
+                    MemoryValue::LazyRecipient(_) | MemoryValue::LazySender(_)
+                )
+            {
+                return false;
+            }
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+fn location_is_lazy(mv_memory: &MvMemory, tx_idx: TxIdx, loc: MemoryLocationHash) -> bool {
+    matches!(
+        mv_memory.current_data_value(tx_idx, loc),
+        Some(MemoryValue::LazyRecipient(_)) | Some(MemoryValue::LazySender(_))
+    )
+}
+
+/// CC-R3: park an off-edge abort behind the unfinished writer (no suffix storm).
+fn batch_park_abort(
+    mv_memory: &MvMemory,
+    scheduler: &Scheduler,
+    tx_version: &TxVersion,
+    specfence: SpecFenceCtx<'_>,
+    invalid: &[MemoryLocationHash],
+) -> Option<Task> {
+    let writer = invalid.iter().find_map(|&loc| {
+        mv_memory
+            .last_writer_before(loc, tx_version.tx_idx)
+            .filter(|&w| w < tx_version.tx_idx && !scheduler.is_done(w))
+    });
+    if !scheduler.try_validation_abort(tx_version) {
+        return scheduler.finish_validation(tx_version, false);
+    }
+    mv_memory.convert_writes_to_estimates(tx_version.tx_idx);
+    specfence.metrics.record_occ_abort();
+    specfence.metrics.record_full_abort_reexecute();
+    if let Some(w) = writer
+        && scheduler.add_dependency_from_aborting(tx_version.tx_idx, w)
+    {
+        specfence.metrics.record_batch_repair();
+        if let Some(p) = specfence.policy {
+            p.note_batch_repair();
+        }
+        return scheduler.finish_validation_fenced_barrier_park(tx_version, None);
+    }
+    scheduler.finish_validation(tx_version, true)
+}
+
 /// Spec-only validate: same OCC kernel. Fail ⇒ full_abort_reexecute + learn PE at **true \(k\)**.
 /// Never RebindThis / PrefixSkip — journal-less repair is a protocol bug.
 pub(crate) fn validate_occ_kernel(
@@ -125,12 +206,37 @@ pub(crate) fn validate_occ_kernel(
 ) -> Option<Task> {
     specfence.metrics.record_occ_kernel_validate();
     let valid = occ_read_set_valid(mv_memory, tx_version.tx_idx);
-    let aborted = !valid && scheduler.try_validation_abort(tx_version);
+    if valid {
+        return scheduler.finish_validation(tx_version, false);
+    }
+    let invalid = mv_memory.collect_invalid_reads(tx_version.tx_idx);
+    if let Some(&loc) = invalid.first()
+        && let Some(p) = specfence.policy
+    {
+        p.note_conflict_ell(
+            tx_version.tx_idx,
+            loc,
+            location_is_lazy(mv_memory, tx_version.tx_idx, loc),
+        );
+    }
+    if commute_invalid(specfence, mv_memory, tx_version.tx_idx, &invalid) {
+        let _ = mv_memory.try_rebind_invalid_reads_value_stable(tx_version.tx_idx, &invalid)
+            || mv_memory.try_rebind_invalid_reads(tx_version.tx_idx, &invalid);
+        specfence.metrics.record_commute_skip();
+        if let Some(p) = specfence.policy {
+            p.note_commute_skip();
+        }
+        return scheduler.finish_validation(tx_version, false);
+    }
+    let thin_a0 = specfence.policy.is_some_and(|p| p.is_thin_shell())
+        && !specfence.ready_edges.was_queued(tx_version.tx_idx);
+    if thin_a0 {
+        return batch_park_abort(mv_memory, scheduler, tx_version, specfence, &invalid);
+    }
+    let aborted = scheduler.try_validation_abort(tx_version);
     if !aborted {
         return scheduler.finish_validation(tx_version, false);
     }
-
-    let invalid = mv_memory.collect_invalid_reads(tx_version.tx_idx);
     let write_locations = mv_memory.write_locations(tx_version.tx_idx);
     mv_memory.convert_writes_to_estimates(tx_version.tx_idx);
     specfence.metrics.record_occ_abort();
@@ -151,6 +257,7 @@ pub(crate) fn validate_occ_kernel(
         .clear_suffix_repair_depth(tx_version.tx_idx);
 
     let cascade_hint = invalid.len().max(1);
+    let queued = specfence.ready_edges.was_queued(tx_version.tx_idx);
     for location in &invalid {
         specfence.metrics.record_bayes_conflict();
         specfence.hotset.note_abort(*location);
@@ -170,13 +277,17 @@ pub(crate) fn validate_occ_kernel(
                     .min_k_of_location(tx_version.tx_idx, *location)
             })
             .filter(|&k| k > 0);
-        crate::specfence::feeder::observe_abort(
-            specfence.learner,
-            specfence.bayes,
-            *location,
-            cascade_hint,
-            loc_k,
-        );
+        // CC-D1: lazy noise on off-edge A0 must not seed PE / re-A1.
+        let lazy = location_is_lazy(mv_memory, tx_version.tx_idx, *location);
+        if queued || !lazy {
+            crate::specfence::feeder::observe_abort(
+                specfence.learner,
+                specfence.bayes,
+                *location,
+                cascade_hint,
+                loc_k,
+            );
+        }
         if let Some(k) = loc_k {
             specfence.sketch.mark_access_class(*location, k);
         }
@@ -241,6 +352,31 @@ pub(crate) fn validate_specfence(
     }
 
     let invalid = mv_memory.collect_invalid_reads(tx_version.tx_idx);
+    if let Some(&loc) = invalid.first()
+        && let Some(p) = specfence.policy
+    {
+        p.note_conflict_ell(
+            tx_version.tx_idx,
+            loc,
+            location_is_lazy(mv_memory, tx_version.tx_idx, loc),
+        );
+    }
+    // CC-X1: 21k disjoint/recipient commute — accept without abort.
+    if commute_invalid(specfence, mv_memory, tx_version.tx_idx, &invalid) {
+        let _ = mv_memory.try_rebind_invalid_reads_value_stable(tx_version.tx_idx, &invalid)
+            || mv_memory.try_rebind_invalid_reads(tx_version.tx_idx, &invalid);
+        specfence.metrics.record_commute_skip();
+        if let Some(p) = specfence.policy {
+            p.note_commute_skip();
+        }
+        return scheduler.finish_validation(tx_version, false);
+    }
+    // PC-S1 + CC-R3: thin-shell A0 — cheap batch park, no PE seed / suffix storm.
+    let thin_a0 = specfence.policy.is_some_and(|p| p.is_thin_shell())
+        && !specfence.ready_edges.was_queued(tx_version.tx_idx);
+    if thin_a0 {
+        return batch_park_abort(mv_memory, scheduler, tx_version, specfence, &invalid);
+    }
     if !invalid.is_empty() {
         let grain = repair_grain(specfence.certificates, tx_version.tx_idx, &invalid);
         let covers = grain == RepairGrain::PartialAbort;

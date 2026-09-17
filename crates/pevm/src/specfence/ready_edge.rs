@@ -7,6 +7,7 @@
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Instant;
 
 use dashmap::{DashMap, DashSet};
 
@@ -41,6 +42,10 @@ pub(crate) struct ReadyEdgeTable {
     ready_width_n: AtomicUsize,
     /// PC-4: ns spent in scheduler yield / empty refuse.
     idle_core_ns: AtomicU64,
+    /// PC-W1: A1-blocked heads — do not re-probe until pred Done.
+    sleeping: DashSet<TxIdx, BuildIdentityHasher>,
+    /// L6: ns spent in refuse / defer path.
+    refuse_ns: AtomicU64,
 }
 
 impl ReadyEdgeTable {
@@ -278,6 +283,7 @@ impl ReadyEdgeTable {
         let mut d = self.deferred.lock().unwrap();
         d.retain(|&t| {
             if self.may_execute(t) {
+                self.sleeping.remove(&t);
                 wave.push_ready(t);
                 false
             } else {
@@ -313,14 +319,37 @@ impl ReadyEdgeTable {
 
     /// Defer a known consumer. Count once until the producer finishes —
     /// re-probing the same head must not spin `refuse_admit` (19606599 31k).
+    /// PC-W1: mark sleeping so steal/index skip this head until pred Done.
     #[inline]
     pub(crate) fn defer(&self, tx_idx: TxIdx) {
+        let t0 = Instant::now();
         let mut d = self.deferred.lock().unwrap();
         if d.iter().any(|&t| t == tx_idx) {
+            self.sleeping.insert(tx_idx);
             return;
         }
         self.refuse.fetch_add(1, Ordering::Relaxed);
+        self.sleeping.insert(tx_idx);
         d.push(tx_idx);
+        drop(d);
+        self.add_refuse_ns(t0.elapsed().as_nanos() as u64);
+    }
+
+    #[inline]
+    pub(crate) fn is_sleeping(&self, tx_idx: TxIdx) -> bool {
+        self.sleeping.contains(&tx_idx) && !self.may_execute(tx_idx)
+    }
+
+    #[inline]
+    pub(crate) fn add_refuse_ns(&self, ns: u64) {
+        if ns > 0 {
+            self.refuse_ns.fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn refuse_ns(&self) -> u64 {
+        self.refuse_ns.load(Ordering::Relaxed)
     }
 
     #[inline]
@@ -337,6 +366,7 @@ impl ReadyEdgeTable {
         let was_deferred = d.iter().any(|&t| t == consumer);
         d.retain(|&t| t != consumer);
         drop(d);
+        self.sleeping.remove(&consumer);
         if was_deferred || self.may_execute(consumer) {
             wave.push_ready(consumer);
         }
@@ -446,6 +476,20 @@ mod tests {
         t.note_consumer(8, 3);
         assert!(!t.may_execute(8));
         t.force_a0(8);
+        assert!(t.may_execute(8));
+    }
+
+    #[test]
+    fn pcw1_sleeping_head_not_redeferred() {
+        let t = ReadyEdgeTable::new();
+        t.note_consumer(8, 3);
+        t.defer(8);
+        t.defer(8);
+        assert_eq!(t.refuse_count(), 1);
+        assert!(t.is_sleeping(8));
+        let wave = WaveParkTable::new();
+        t.note_producer_done(3, &wave);
+        assert!(!t.is_sleeping(8));
         assert!(t.may_execute(8));
     }
 }

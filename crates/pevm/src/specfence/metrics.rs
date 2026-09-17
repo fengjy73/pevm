@@ -316,6 +316,26 @@ pub struct SpecFenceMetrics {
     pub a1_cohorts: usize,
     /// PC-5: cohorts forced A0 because E[meta_A1] > E[abort_A0].
     pub lean_a0_cohorts: usize,
+    /// L6: measured refuse-path nanoseconds.
+    pub refuse_ns: u64,
+    /// L6: measured incarnation>0 execute nanoseconds.
+    pub reexec_ns: u64,
+    /// PC-S1: thin SpecFence shell this block.
+    pub thin_shell: bool,
+    /// L1: ns-EV kept A1.
+    pub ns_ev_keep_a1: usize,
+    /// L1: ns-EV demoted A1→A0.
+    pub ns_ev_demote: usize,
+    /// PC-S1: A1 candidates beyond K.
+    pub k_cap_demote: usize,
+    /// CC-X1: 21k commute accepts.
+    pub commute_skip: usize,
+    /// CC-R3: batch-parked off-edge aborts.
+    pub batch_repair: usize,
+    /// CC-D1: effective conflict promote.
+    pub conflict_promote: usize,
+    /// CC-D1: lazy-noise ignore.
+    pub conflict_ignore: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -461,6 +481,16 @@ pub(crate) struct MetricsInner {
     miss_detect: AtomicUsize,
     a1_cohorts: AtomicUsize,
     lean_a0_cohorts: AtomicUsize,
+    refuse_ns: AtomicU64,
+    reexec_ns: AtomicU64,
+    thin_shell: AtomicUsize,
+    ns_ev_keep_a1: AtomicUsize,
+    ns_ev_demote: AtomicUsize,
+    k_cap_demote: AtomicUsize,
+    commute_skip: AtomicUsize,
+    batch_repair: AtomicUsize,
+    conflict_promote: AtomicUsize,
+    conflict_ignore: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -893,6 +923,58 @@ impl MetricsInner {
             .store(lean_a0_cohorts, Ordering::Relaxed);
     }
 
+    pub(crate) fn set_ns_learn_metrics(
+        &self,
+        refuse_ns: u64,
+        reexec_ns: u64,
+        thin_shell: bool,
+        ns_ev_keep_a1: usize,
+        ns_ev_demote: usize,
+        k_cap_demote: usize,
+        commute_skip: usize,
+        batch_repair: usize,
+        conflict_promote: usize,
+        conflict_ignore: usize,
+    ) {
+        self.refuse_ns.store(refuse_ns, Ordering::Relaxed);
+        self.reexec_ns.store(reexec_ns, Ordering::Relaxed);
+        self.thin_shell
+            .store(usize::from(thin_shell), Ordering::Relaxed);
+        self.ns_ev_keep_a1.store(ns_ev_keep_a1, Ordering::Relaxed);
+        self.ns_ev_demote.store(ns_ev_demote, Ordering::Relaxed);
+        self.k_cap_demote.store(k_cap_demote, Ordering::Relaxed);
+        self.commute_skip.store(commute_skip, Ordering::Relaxed);
+        self.batch_repair.store(batch_repair, Ordering::Relaxed);
+        self.conflict_promote
+            .store(conflict_promote, Ordering::Relaxed);
+        self.conflict_ignore
+            .store(conflict_ignore, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn record_refuse_ns(&self, ns: u64) {
+        if ns > 0 {
+            self.refuse_ns.fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn record_reexec_ns(&self, ns: u64) {
+        if ns > 0 {
+            self.reexec_ns.fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn record_commute_skip(&self) {
+        self.commute_skip.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn record_batch_repair(&self) {
+        self.batch_repair.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_edge_optimistic_read(&self) {
         self.edge_optimistic_read.fetch_add(1, Ordering::Relaxed);
     }
@@ -1290,6 +1372,16 @@ impl MetricsInner {
             miss_detect: self.miss_detect.load(Ordering::Relaxed),
             a1_cohorts: self.a1_cohorts.load(Ordering::Relaxed),
             lean_a0_cohorts: self.lean_a0_cohorts.load(Ordering::Relaxed),
+            refuse_ns: self.refuse_ns.load(Ordering::Relaxed),
+            reexec_ns: self.reexec_ns.load(Ordering::Relaxed),
+            thin_shell: self.thin_shell.load(Ordering::Relaxed) != 0,
+            ns_ev_keep_a1: self.ns_ev_keep_a1.load(Ordering::Relaxed),
+            ns_ev_demote: self.ns_ev_demote.load(Ordering::Relaxed),
+            k_cap_demote: self.k_cap_demote.load(Ordering::Relaxed),
+            commute_skip: self.commute_skip.load(Ordering::Relaxed),
+            batch_repair: self.batch_repair.load(Ordering::Relaxed),
+            conflict_promote: self.conflict_promote.load(Ordering::Relaxed),
+            conflict_ignore: self.conflict_ignore.load(Ordering::Relaxed),
         }
     }
 }

@@ -93,6 +93,17 @@ struct IterRow {
     idle_core_ns: u64,
     a1_cohorts: usize,
     lean_a0_cohorts: usize,
+    edge_ordered_admit: usize,
+    edge_optimistic_read: usize,
+    refuse_ns: u64,
+    reexec_ns: u64,
+    thin_shell: bool,
+    ns_ev_keep_a1: usize,
+    ns_ev_demote: usize,
+    commute_skip: usize,
+    batch_repair: usize,
+    conflict_promote: usize,
+    conflict_ignore: usize,
     begin_blocked: Vec<usize>,
     taxed_indep_blocked: Vec<usize>,
     main_inc_gt0: Vec<usize>,
@@ -193,7 +204,7 @@ fn main() {
                         .map(|(t, _)| t)
                         .collect();
                     println!(
-                        "  {mode_name}[{i}] ok wall_ms={wall_ms:.3} tps={:.0} occ_aborts={} inc>0={} reexec={} refuse_admit={} wait_for_dependency={} soft_wait_arms={} idle_ns={} ready_width={:.2} a1={} lean_a0={} taxed_begin={} edge_4_31={} miss_detect={}",
+                        "  {mode_name}[{i}] ok wall_ms={wall_ms:.3} tps={:.0} occ_aborts={} inc>0={} reexec={} refuse_admit={} wait_for_dependency={} soft_wait_arms={} idle_ns={} ready_width={:.2} a1={} lean_a0={} edge_oa={} edge_or={} refuse_ns={} reexec_ns={} thin={} ns_keep={} ns_demote={} commute={} batch={} d1_prom={} d1_ign={} taxed_begin={} edge_4_31={} miss_detect={}",
                         n as f64 / (wall_ms / 1000.0),
                         m.occ_aborts,
                         m.incarnation_gt0,
@@ -205,6 +216,17 @@ fn main() {
                         m.ready_width_mean,
                         m.a1_cohorts,
                         m.lean_a0_cohorts,
+                        m.edge_ordered_admit,
+                        m.edge_optimistic_read,
+                        m.refuse_ns,
+                        m.reexec_ns,
+                        m.thin_shell,
+                        m.ns_ev_keep_a1,
+                        m.ns_ev_demote,
+                        m.commute_skip,
+                        m.batch_repair,
+                        m.conflict_promote,
+                        m.conflict_ignore,
                         taxed.len(),
                         edge_4_31,
                         m.miss_detect
@@ -225,6 +247,17 @@ fn main() {
                         idle_core_ns: m.idle_core_ns,
                         a1_cohorts: m.a1_cohorts,
                         lean_a0_cohorts: m.lean_a0_cohorts,
+                        edge_ordered_admit: m.edge_ordered_admit,
+                        edge_optimistic_read: m.edge_optimistic_read,
+                        refuse_ns: m.refuse_ns,
+                        reexec_ns: m.reexec_ns,
+                        thin_shell: m.thin_shell,
+                        ns_ev_keep_a1: m.ns_ev_keep_a1,
+                        ns_ev_demote: m.ns_ev_demote,
+                        commute_skip: m.commute_skip,
+                        batch_repair: m.batch_repair,
+                        conflict_promote: m.conflict_promote,
+                        conflict_ignore: m.conflict_ignore,
                         begin_blocked: begin,
                         taxed_indep_blocked: taxed,
                         main_inc_gt0: inc_gt0_in(&incs, MAIN_CHAIN),
@@ -249,7 +282,7 @@ fn main() {
         }
         if let Some(m) = last {
             println!(
-                "  {mode_name} median_wall_ms={:.3} last refuse_admit={} inc>0={} reexec={} wait_for_dependency={} occ_aborts={} soft_wait_arms={} idle_ns={} ready_width={:.2}",
+                "  {mode_name} median_wall_ms={:.3} last refuse_admit={} inc>0={} reexec={} wait_for_dependency={} occ_aborts={} soft_wait_arms={} idle_ns={} ready_width={:.2} edge_oa={} edge_or={} thin={} commute={} batch={}",
                 median(walls),
                 m.refuse_admit,
                 m.incarnation_gt0,
@@ -258,7 +291,12 @@ fn main() {
                 m.occ_aborts,
                 m.soft_wait_arms,
                 m.idle_core_ns,
-                m.ready_width_mean
+                m.ready_width_mean,
+                m.edge_ordered_admit,
+                m.edge_optimistic_read,
+                m.thin_shell,
+                m.commute_skip,
+                m.batch_repair
             );
         }
     }
