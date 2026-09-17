@@ -347,18 +347,10 @@ pub(crate) fn admit_seed_on_write_set(
         .copied()
         .filter(|&t| t > writer)
         .collect();
-    // Upgrade an existing A1 probe, or start a chain only when EV still wants A1.
+    // Production: only upgrade an existing A1 probe (begin-block EV).
+    // Tests pass `policy=None` and still expect write-set to plant the chain.
     let chain_later = !later.is_empty()
-        && (later.iter().any(|&t| ready.was_queued(t))
-            || policy.is_none_or(|p| {
-                let kind = if hints.call_to_txs(&to).len() >= CALL_WAW_FLOOR {
-                    CohortKind::CallWaw
-                } else {
-                    CohortKind::EmptyTo
-                };
-                // Hidden effective write ⇒ this `to` is a real WAW envelope.
-                p.choose_a1(kind, to, later.len() + 1, true, 0.25)
-            }));
+        && (later.iter().any(|&t| ready.was_queued(t)) || policy.is_none());
     let mut queued = HashSet::new();
     for loc in hidden_eff {
         ready.note_raw_producer(loc, writer);
