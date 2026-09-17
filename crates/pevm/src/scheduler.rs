@@ -412,8 +412,8 @@ impl Scheduler {
     }
 
     /// After `refuse_admit` of `from`, run the next independent.
-    /// Does **not** `fetch_max(from+1)` (that fights `admit_spine` fetch_min).
-    /// PC-1: search the whole block after a short forward window — no empty spin.
+    /// PC-W1: prefer the ready bag. Do **not** walk the whole block (that
+    /// ate small-block wall). Short forward window only as fallback.
     fn try_fill_independent_after_refuse(
         &self,
         from: TxIdx,
@@ -427,7 +427,11 @@ impl Scheduler {
             return None;
         }
         while let Some(tx_idx) = wave.pop_ready() {
+            if edges.is_sleeping(tx_idx) {
+                continue;
+            }
             if let Some(tx_version) = self.try_execute_ready(tx_idx, Some(wave), ready) {
+                edges.sample_ready_width(wave.ready_depth().max(1));
                 wave.note_ready_steal_if_after_park();
                 return Some(Task::Execution(tx_version));
             }
@@ -442,23 +446,12 @@ impl Scheduler {
             }
             *ready_n += 1;
             let tx_version = self.try_execute_ready(cand, Some(wave), ready)?;
-            // PC-W4: honest |Ready| = wave bag depth, not steal-path may_execute mean.
             edges.sample_ready_width(wave.ready_depth().max(*ready_n).max(1));
             wave.note_ready_steal_if_after_park();
             Some(Task::Execution(tx_version))
         };
         let end = from.saturating_add(WAVE_FILL_WINDOW).min(self.block_size);
         for cand in (from + 1)..end {
-            if let Some(task) = steal(cand, &mut ready_n) {
-                return Some(task);
-            }
-        }
-        for cand in end..self.block_size {
-            if let Some(task) = steal(cand, &mut ready_n) {
-                return Some(task);
-            }
-        }
-        for cand in 0..from {
             if let Some(task) = steal(cand, &mut ready_n) {
                 return Some(task);
             }

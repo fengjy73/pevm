@@ -3302,8 +3302,11 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         &all_write_locs,
                         &effective_write_locs,
                     );
-                    // Learning is consumed by decide() — always observe HotSet / WŜ.
-                    if self.specfence.certificates.rem_legal(tx_version.tx_idx) {
+                    let thin_a0 = self.specfence.policy.is_some_and(|p| p.is_thin_shell())
+                        && !self.specfence.ready_edges.was_queued(tx_version.tx_idx);
+                    if thin_a0 {
+                        // PC-S1: skip HotSet / WŜ / Avoid broadcast on A0.
+                    } else if self.specfence.certificates.rem_legal(tx_version.tx_idx) {
                         let locs: Vec<_> = self.mv_memory.write_locations(tx_version.tx_idx);
                         self.specfence.rw_prior.observe_write_set(&locs, None);
                         for loc in &hotset_writer_locs {
