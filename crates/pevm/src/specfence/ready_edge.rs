@@ -203,7 +203,10 @@ impl ReadyEdgeTable {
 
     #[inline]
     pub(crate) fn was_queued(&self, tx: TxIdx) -> bool {
-        self.queued_on.contains_key(&tx) || self.consumers.contains_key(&tx)
+        // Probe heads are producers (waiters) but not consumers — they are A1.
+        self.queued_on.contains_key(&tx)
+            || self.consumers.contains_key(&tx)
+            || self.waiters.contains_key(&tx)
     }
 
     /// PC-5: force A0 on this consumer (execute anyway).
@@ -511,6 +514,23 @@ mod tests {
         t.note_producer_done(3, &wave);
         assert!(!t.is_sleeping(8));
         assert!(t.may_execute(8));
+    }
+
+    #[test]
+    fn producer_done_does_not_wake_rebased_probe_star() {
+        let t = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        t.note_consumer(66, 31);
+        t.note_consumer(67, 31);
+        t.note_consumer(67, 66);
+        assert_eq!(t.blocking_producer(67), Some(66));
+        t.note_producer_done(31, &wave);
+        assert_eq!(wave.pop_ready(), Some(66));
+        assert!(
+            wave.pop_ready().is_none(),
+            "67 must stay behind 66 after probe-star rebase"
+        );
+        assert_eq!(t.blocking_producer(67), Some(66));
     }
 
     #[test]
