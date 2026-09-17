@@ -15,6 +15,7 @@ use super::AccountHints;
 use super::bayes::BayesMap;
 use super::feeder::{seed_known_stars, top_is_known_star};
 use super::learner::{InterBlockPrior, LiveLearner};
+use super::metrics::MetricsInner;
 use super::policy::{CohortKind, CostPolicy};
 use super::producer_stage::ProducerStageTable;
 use super::ready_edge::ReadyEdgeTable;
@@ -104,6 +105,7 @@ pub(crate) fn admit_seed_begin_block(
     beneficiary: Address,
     policy: &CostPolicy,
     contracts: &HashSet<Address>,
+    metrics: Option<&MetricsInner>,
 ) -> usize {
     let stars = seed_known_stars(learner, bayes, prior);
     let fan = learner.morph_weights().dominant_fan_out();
@@ -126,8 +128,14 @@ pub(crate) fn admit_seed_begin_block(
         learner.seed_predicted_essential(loc, FAN_STAR_K);
     });
 
-    let mut edges = 0;
-    let mut queued: HashSet<TxIdx> = HashSet::new();
+    struct Cand {
+        kind: CohortKind,
+        addr: Address,
+        is_contract: bool,
+        score: i64,
+        txs: Vec<TxIdx>,
+    }
+    let mut cands: Vec<Cand> = Vec::new();
 
     // Calldata ≥16: RAW fan-out star (v10). First — PC-3 so later same-from
     // / empty-to cannot dual-tax the same txs.
@@ -141,24 +149,18 @@ pub(crate) fn admit_seed_begin_block(
         }
         let p_beta = bayes.account_wait_probability(&addr);
         if !policy.choose_a1(CohortKind::RawFan, addr, txs.len(), true, p_beta) {
+            if let Some(m) = metrics {
+                m.record_edge_optimistic_read();
+            }
             continue;
         }
-        let producer = txs[0];
-        stages.reserve(producer);
-        let basic = hash_deterministic(MemoryLocation::Basic(addr));
-        if star_edges {
-            learner.seed_predicted_essential(basic, FAN_STAR_K);
-        }
-        ready.note_raw_producer(basic, producer);
-        queued.insert(producer);
-        for &t in &txs[1..] {
-            if queued.contains(&t) {
-                continue;
-            }
-            ready.note_consumer_on(t, producer, Some(basic));
-            queued.insert(t);
-            edges += 1;
-        }
+        cands.push(Cand {
+            kind: CohortKind::RawFan,
+            addr,
+            is_contract: true,
+            score: CostPolicy::a1_score(CohortKind::RawFan, txs.len(), true),
+            txs: txs.to_vec(),
+        });
     }
 
     // Calldata 2..15: short contract WAW. Predecessor chain, no Basic(to) PE.
@@ -173,10 +175,18 @@ pub(crate) fn admit_seed_begin_block(
         }
         let p_beta = bayes.account_wait_probability(&addr);
         if !policy.choose_a1(CohortKind::CallWaw, addr, txs.len(), true, p_beta) {
+            if let Some(m) = metrics {
+                m.record_edge_optimistic_read();
+            }
             continue;
         }
-        let loc = envelope_loc(addr);
-        edges += note_predecessor_chain(ready, txs, loc, &mut queued);
+        cands.push(Cand {
+            kind: CohortKind::CallWaw,
+            addr,
+            is_contract: true,
+            score: CostPolicy::a1_score(CohortKind::CallWaw, txs.len(), true),
+            txs: txs.to_vec(),
+        });
     }
 
     // Empty-calldata `to`: D2 cold-start probe **only** when B3 says A1
@@ -195,10 +205,18 @@ pub(crate) fn admit_seed_begin_block(
         let is_contract = contracts.contains(&addr);
         let p_beta = bayes.account_wait_probability(&addr);
         if !policy.choose_a1(CohortKind::EmptyTo, addr, txs.len(), is_contract, p_beta) {
+            if let Some(m) = metrics {
+                m.record_edge_optimistic_read();
+            }
             continue;
         }
-        let loc = envelope_loc(addr);
-        edges += note_probe_star(ready, txs, loc, &mut queued);
+        cands.push(Cand {
+            kind: CohortKind::EmptyTo,
+            addr,
+            is_contract,
+            score: CostPolicy::a1_score(CohortKind::EmptyTo, txs.len(), is_contract),
+            txs: txs.to_vec(),
+        });
     }
 
     // Same-from: PC-2 — basic_lazy / empty-calldata spines default A0.
@@ -216,11 +234,72 @@ pub(crate) fn admit_seed_begin_block(
         }
         let p_beta = bayes.account_wait_probability(&addr);
         if !policy.choose_a1(CohortKind::SameFrom, addr, txs.len(), false, p_beta) {
+            if let Some(m) = metrics {
+                m.record_edge_optimistic_read();
+            }
             continue;
         }
-        let basic = hash_deterministic(MemoryLocation::Basic(addr));
-        ready.note_raw_producer(basic, txs[0]);
-        edges += note_predecessor_chain(ready, txs, basic, &mut queued);
+        cands.push(Cand {
+            kind: CohortKind::SameFrom,
+            addr,
+            is_contract: false,
+            score: CostPolicy::a1_score(CohortKind::SameFrom, txs.len(), false),
+            txs: txs.to_vec(),
+        });
+    }
+
+    cands.sort_by(|a, b| b.score.cmp(&a.score));
+    let cap = policy.thin_a1_k();
+    if cands.len() > cap {
+        for extra in cands.drain(cap..) {
+            policy.note_k_cap_demote();
+            if let Some(m) = metrics {
+                m.record_edge_optimistic_read();
+            }
+            let _ = extra;
+        }
+    }
+
+    let mut edges = 0;
+    let mut queued: HashSet<TxIdx> = HashSet::new();
+    for c in cands {
+        if let Some(m) = metrics {
+            m.record_edge_ordered_admit();
+        }
+        match c.kind {
+            CohortKind::RawFan => {
+                let producer = c.txs[0];
+                stages.reserve(producer);
+                let basic = hash_deterministic(MemoryLocation::Basic(c.addr));
+                if star_edges {
+                    learner.seed_predicted_essential(basic, FAN_STAR_K);
+                }
+                ready.note_raw_producer(basic, producer);
+                queued.insert(producer);
+                for &t in &c.txs[1..] {
+                    if queued.contains(&t) {
+                        continue;
+                    }
+                    ready.note_consumer_on(t, producer, Some(basic));
+                    queued.insert(t);
+                    edges += 1;
+                }
+            }
+            CohortKind::CallWaw => {
+                let loc = envelope_loc(c.addr);
+                edges += note_predecessor_chain(ready, &c.txs, loc, &mut queued);
+            }
+            CohortKind::EmptyTo => {
+                let loc = envelope_loc(c.addr);
+                edges += note_probe_star(ready, &c.txs, loc, &mut queued);
+            }
+            CohortKind::SameFrom => {
+                let basic = hash_deterministic(MemoryLocation::Basic(c.addr));
+                ready.note_raw_producer(basic, c.txs[0]);
+                edges += note_predecessor_chain(ready, &c.txs, basic, &mut queued);
+            }
+        }
+        let _ = c.is_contract;
     }
 
     edges
@@ -262,6 +341,14 @@ pub(crate) fn admit_seed_on_write_set(
     effective_locs: &[MemoryLocationHash],
 ) {
     let from_loc = hash_deterministic(MemoryLocation::Basic(from));
+    // PC-S1: thin-shell A0 — D1 writer order only. No ReadyEdge / B2 / release.
+    // 4→31 still lands when the A1 probe publishes (`note_immediate_pred`).
+    if policy.is_some_and(|p| p.is_thin_shell()) && !ready.was_queued(writer) {
+        for &loc in all_write_locs {
+            ready.note_location_writer(loc, writer);
+        }
+        return;
+    }
     // D1: record every writer (lazy included) so 4→31 is visible in order.
     // PC-2 / D3: ReadyEdge A1 only on effective (non-lazy Data / Storage).
     for &loc in all_write_locs {
@@ -349,8 +436,8 @@ pub(crate) fn admit_seed_on_write_set(
         .collect();
     // Production: only upgrade an existing A1 probe (begin-block EV).
     // Tests pass `policy=None` and still expect write-set to plant the chain.
-    let chain_later = !later.is_empty()
-        && (later.iter().any(|&t| ready.was_queued(t)) || policy.is_none());
+    let chain_later =
+        !later.is_empty() && (later.iter().any(|&t| ready.was_queued(t)) || policy.is_none());
     let mut queued = HashSet::new();
     for loc in hidden_eff {
         ready.note_raw_producer(loc, writer);
@@ -408,6 +495,7 @@ mod tests {
             Address::ZERO,
             &policy,
             contracts,
+            None,
         )
     }
 
@@ -816,6 +904,33 @@ mod tests {
         assert!(
             learner.predicted_essential(storage_loc, 6),
             "true-k: hint-fan plants storage RAW PE from InterPrior, not Basic→Storage clone"
+        );
+    }
+
+    #[test]
+    fn thin_a0_write_set_records_d1_only() {
+        let ready = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        let policy = policy_for(176);
+        assert!(policy.is_thin_shell());
+        let to = Address::repeat_byte(0x99);
+        let hot = Address::repeat_byte(0x32);
+        let loc = 0x32be_u64;
+        admit_seed_on_write_set(
+            &ready,
+            &AccountHints::from_to_txs(to, vec![4]),
+            &wave,
+            Some(&policy),
+            4,
+            hot,
+            Some(to),
+            &[loc],
+            &[loc],
+        );
+        assert_eq!(ready.writers_of(loc), vec![4], "thin A0 still records D1");
+        assert!(
+            ready.may_execute(31),
+            "thin A0 must not plant a ReadyEdge on later writers"
         );
     }
 

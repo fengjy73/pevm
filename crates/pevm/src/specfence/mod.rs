@@ -327,6 +327,12 @@ pub(crate) struct AccountHints {
     call_to_by_account: HashMap<Address, Vec<TxIdx>, BuildSuffixHasher>,
     /// Per-tx: true when envelope calldata is empty (lazy-transfer class).
     empty_calldata: Vec<bool>,
+    /// Per-tx gas limit (CC-X1: 21000 pure transfer).
+    gas_limit: Vec<u64>,
+    /// Per-tx sender.
+    from_of: Vec<Address>,
+    /// Per-tx envelope `to`.
+    to_of: Vec<Option<Address>>,
 }
 
 impl AccountHints {
@@ -340,13 +346,19 @@ impl AccountHints {
         let mut call_to_by_account: HashMap<Address, Vec<TxIdx>, BuildSuffixHasher> =
             HashMap::with_hasher(BuildSuffixHasher::default());
         let mut empty_calldata = vec![true; txs.len()];
+        let mut gas_limit = vec![0u64; txs.len()];
+        let mut from_of = vec![Address::ZERO; txs.len()];
+        let mut to_of = vec![None; txs.len()];
         for (idx, tx) in txs.iter().enumerate() {
             let env = chain.tx_env(tx);
             by_account.entry(env.caller).or_default().push(idx);
             from_by_account.entry(env.caller).or_default().push(idx);
             let empty = env.data.is_empty();
             empty_calldata[idx] = empty;
+            gas_limit[idx] = env.gas_limit;
+            from_of[idx] = env.caller;
             if let Some(to) = env.kind.to() {
+                to_of[idx] = Some(*to);
                 by_account.entry(*to).or_default().push(idx);
                 to_by_account.entry(*to).or_default().push(idx);
                 if !empty {
@@ -371,6 +383,9 @@ impl AccountHints {
             to_by_account,
             call_to_by_account,
             empty_calldata,
+            gas_limit,
+            from_of,
+            to_of,
         }
     }
 
@@ -438,6 +453,22 @@ impl AccountHints {
         !txs.is_empty() && txs.iter().all(|&t| self.is_empty_calldata(t))
     }
 
+    /// CC-X1: gas=21000 empty-calldata transfer.
+    #[inline]
+    pub(crate) fn is_pure_transfer(&self, idx: TxIdx) -> bool {
+        self.is_empty_calldata(idx) && self.gas_limit.get(idx).copied() == Some(21_000)
+    }
+
+    #[inline]
+    pub(crate) fn from_of(&self, idx: TxIdx) -> Address {
+        self.from_of.get(idx).copied().unwrap_or(Address::ZERO)
+    }
+
+    #[inline]
+    pub(crate) fn to_of(&self, idx: TxIdx) -> Option<Address> {
+        self.to_of.get(idx).copied().flatten()
+    }
+
     pub(crate) fn n_txs(&self) -> usize {
         self.empty_calldata.len()
     }
@@ -461,12 +492,24 @@ impl AccountHints {
             .copied()
             .max()
             .unwrap_or(0);
+        let n = max + 1;
+        let mut from_of = vec![Address::ZERO; n];
+        for (addr, txs) in from_by_account.iter() {
+            for &t in txs {
+                if t < n {
+                    from_of[t] = *addr;
+                }
+            }
+        }
         Self {
             by_account,
             from_by_account,
             to_by_account: HashMap::with_hasher(BuildSuffixHasher::default()),
             call_to_by_account: HashMap::with_hasher(BuildSuffixHasher::default()),
-            empty_calldata: vec![true; max + 1],
+            empty_calldata: vec![true; n],
+            gas_limit: vec![21_000; n],
+            from_of,
+            to_of: vec![None; n],
         }
     }
 
@@ -476,13 +519,23 @@ impl AccountHints {
         let mut to_by_account = HashMap::with_hasher(BuildSuffixHasher::default());
         let max = txs.iter().copied().max().unwrap_or(0);
         by_account.insert(addr, txs.clone());
-        to_by_account.insert(addr, txs);
+        to_by_account.insert(addr, txs.clone());
+        let n = max + 1;
+        let mut to_opt = vec![None; n];
+        for &t in &txs {
+            if t < n {
+                to_opt[t] = Some(addr);
+            }
+        }
         Self {
             by_account,
             from_by_account: HashMap::with_hasher(BuildSuffixHasher::default()),
             to_by_account,
             call_to_by_account: HashMap::with_hasher(BuildSuffixHasher::default()),
-            empty_calldata: vec![true; max + 1],
+            empty_calldata: vec![true; n],
+            gas_limit: vec![21_000; n],
+            from_of: vec![Address::ZERO; n],
+            to_of: to_opt,
         }
     }
 
@@ -494,7 +547,23 @@ impl AccountHints {
             h.empty_calldata.resize(max + 1, true);
         }
         h.to_by_account.insert(to, txs.clone());
-        h.by_account.entry(to).or_insert(txs);
+        h.by_account.entry(to).or_insert(txs.clone());
+        let n = h.empty_calldata.len();
+        if h.to_of.len() < n {
+            h.to_of.resize(n, None);
+        }
+        if h.from_of.len() < n {
+            h.from_of.resize(n, Address::ZERO);
+        }
+        if h.gas_limit.len() < n {
+            h.gas_limit.resize(n, 21_000);
+        }
+        for &t in &txs {
+            if t < n {
+                h.to_of[t] = Some(to);
+                h.from_of[t] = from;
+            }
+        }
         h
     }
 
@@ -506,13 +575,23 @@ impl AccountHints {
         let max = txs.iter().copied().max().unwrap_or(0);
         by_account.insert(addr, txs.clone());
         to_by_account.insert(addr, txs.clone());
-        call_to_by_account.insert(addr, txs);
+        call_to_by_account.insert(addr, txs.clone());
+        let n = max + 1;
+        let mut to_opt = vec![None; n];
+        for &t in &txs {
+            if t < n {
+                to_opt[t] = Some(addr);
+            }
+        }
         Self {
             by_account,
             from_by_account: HashMap::with_hasher(BuildSuffixHasher::default()),
             to_by_account,
             call_to_by_account,
-            empty_calldata: vec![false; max + 1],
+            empty_calldata: vec![false; n],
+            gas_limit: vec![100_000; n],
+            from_of: vec![Address::ZERO; n],
+            to_of: to_opt,
         }
     }
 

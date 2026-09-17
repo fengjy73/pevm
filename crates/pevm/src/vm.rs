@@ -470,6 +470,12 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if address == self.specfence.beneficiary || self.is_lazy {
             return Ok(());
         }
+        // PC-S1: thin-shell A0 txs stay OCC-cost even after a few aborts seed PE.
+        if self.specfence.policy.is_some_and(|p| p.is_thin_shell())
+            && !self.specfence.ready_edges.was_queued(self.tx_idx)
+        {
+            return Ok(());
+        }
         // Same-spine optimistic_read cost class: empty PE → Mode(a)=Spec, no Fence meta.
         // Not a plant_is_occ computer retreat (v9.3).
         if crate::specfence::specfence_cost_class_spec(
@@ -2193,6 +2199,28 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         self.specfence.metrics.record_wait_for_full_abort();
     }
 
+    /// L6: one hot-path A0/A1 execute tick (not access-level museum counters).
+    pub(crate) fn note_execute_edge(&self, tx_idx: crate::TxIdx) {
+        if self.specfence.mode != crate::ConcurrencyMode::SpecFence {
+            return;
+        }
+        if self.specfence.ready_edges.was_queued(tx_idx) {
+            self.specfence.metrics.record_edge_ordered_admit();
+        } else {
+            self.specfence.metrics.record_edge_optimistic_read();
+        }
+    }
+
+    pub(crate) fn note_hot_reexec_ns(&self, ns: u64) {
+        if self.specfence.mode != crate::ConcurrencyMode::SpecFence || ns == 0 {
+            return;
+        }
+        self.specfence.metrics.record_reexec_ns(ns);
+        if let Some(p) = self.specfence.policy {
+            p.note_reexec_ns(ns);
+        }
+    }
+
     pub(crate) fn release_ready_edges(
         &self,
         writer: TxIdx,
@@ -2285,6 +2313,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         let full_tx = unsafe { self.txs.get_unchecked(tx_version.tx_idx) };
         let tx = self.chain.tx_env(full_tx);
 
+        self.note_execute_edge(tx_version.tx_idx);
         let from_hash = hash_deterministic(MemoryLocation::Basic(tx.caller));
         let to_hash = tx
             .kind

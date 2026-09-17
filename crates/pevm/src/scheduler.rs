@@ -159,6 +159,11 @@ impl Scheduler {
                     && !edges.may_execute(tx_idx)
                     && let Some(w) = edges.blocking_producer(tx_idx)
                 {
+                    // PC-W1: already refused this A1 head — do not re-hammer
+                    // until pred completion wakes it.
+                    if edges.is_sleeping(tx_idx) {
+                        return None;
+                    }
                     // Refuse while producer is Executing **or Ready** (prefer-admit
                     // ProducerStage(w) — no ReadyCanary Execute). Validated/Done
                     // already published; Aborting is not a progress path (v6 hang).
@@ -259,10 +264,12 @@ impl Scheduler {
                     self.execution_idx
                         .fetch_max(execution_idx + 1, Ordering::Relaxed);
                     if let Some(wave) = wave {
-                        if let Some(w) = edges.blocking_producer(execution_idx) {
-                            self.admit_spine_heat(w, wave, true);
+                        if !edges.is_sleeping(execution_idx) {
+                            if let Some(w) = edges.blocking_producer(execution_idx) {
+                                self.admit_spine_heat(w, wave, true);
+                            }
+                            edges.defer(execution_idx);
                         }
-                        edges.defer(execution_idx);
                         if let Some(task) =
                             self.try_fill_independent_after_refuse(execution_idx, wave, ready)
                         {
@@ -405,8 +412,8 @@ impl Scheduler {
     }
 
     /// After `refuse_admit` of `from`, run the next independent.
-    /// Does **not** `fetch_max(from+1)` (that fights `admit_spine` fetch_min).
-    /// PC-1: search the whole block after a short forward window — no empty spin.
+    /// PC-W1: bag first (skip sleeping A1 heads). Then a short window and a
+    /// full-block scan so cores stay filled after the bag drains.
     fn try_fill_independent_after_refuse(
         &self,
         from: TxIdx,
@@ -420,7 +427,11 @@ impl Scheduler {
             return None;
         }
         while let Some(tx_idx) = wave.pop_ready() {
+            if edges.is_sleeping(tx_idx) {
+                continue;
+            }
             if let Some(tx_version) = self.try_execute_ready(tx_idx, Some(wave), ready) {
+                edges.sample_ready_width(wave.ready_depth().max(1));
                 wave.note_ready_steal_if_after_park();
                 return Some(Task::Execution(tx_version));
             }
@@ -430,12 +441,12 @@ impl Scheduler {
             if cand >= self.block_size || self.is_done(cand) {
                 return None;
             }
-            if !edges.may_execute(cand) {
+            if edges.is_sleeping(cand) || !edges.may_execute(cand) {
                 return None;
             }
             *ready_n += 1;
             let tx_version = self.try_execute_ready(cand, Some(wave), ready)?;
-            edges.sample_ready_width((*ready_n).max(1));
+            edges.sample_ready_width(wave.ready_depth().max(*ready_n).max(1));
             wave.note_ready_steal_if_after_park();
             Some(Task::Execution(tx_version))
         };
@@ -445,6 +456,8 @@ impl Scheduler {
                 return Some(task);
             }
         }
+        // Fallback scan so a woken A1 successor is found if the bag missed it.
+        // Skip sleeping heads (PC-W1). Independents are usually bag-first.
         for cand in end..self.block_size {
             if let Some(task) = steal(cand, &mut ready_n) {
                 return Some(task);
@@ -455,8 +468,8 @@ impl Scheduler {
                 return Some(task);
             }
         }
-        if ready_n > 0 {
-            edges.sample_ready_width(ready_n);
+        if ready_n > 0 || wave.ready_depth() > 0 {
+            edges.sample_ready_width(wave.ready_depth().max(ready_n));
         }
         None
     }
