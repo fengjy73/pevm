@@ -158,6 +158,20 @@ impl ReadyEdgeTable {
     pub(crate) fn refuse_count(&self) -> usize {
         self.refuse.load(Ordering::Relaxed)
     }
+
+    /// Drop a provisional consumer bit and wake it (lazy `to` was not a real WAW).
+    pub(crate) fn release_consumer(&self, consumer: TxIdx, wave: &WaveParkTable) {
+        if let Some(e) = self.consumers.get(&consumer) {
+            e.store(NONE, Ordering::Relaxed);
+        }
+        let mut d = self.deferred.lock().unwrap();
+        let was_deferred = d.iter().any(|&t| t == consumer);
+        d.retain(|&t| t != consumer);
+        drop(d);
+        if was_deferred || self.may_execute(consumer) {
+            wave.push_ready(consumer);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -219,5 +233,17 @@ mod tests {
             t.may_execute(3),
             "note_consumer after Done must not refuse forever"
         );
+    }
+
+    #[test]
+    fn release_consumer_clears_provisional_wait() {
+        let t = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        t.note_consumer(5, 2);
+        t.defer(5);
+        assert!(!t.may_execute(5));
+        t.release_consumer(5, &wave);
+        assert!(t.may_execute(5));
+        assert_eq!(wave.pop_ready(), Some(5));
     }
 }
