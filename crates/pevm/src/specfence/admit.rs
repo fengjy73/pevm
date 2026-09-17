@@ -1,9 +1,10 @@
 //! Admit seed — ReadyEdges + ProducerStage **before** satellite Execute.
 //!
 //! Detect uses real write locations: same-`from` Basic WAW, calldata RAW fan-out,
-//! and intra-block write-set WAW on hidden locations (not envelope `Basic(to)`).
-//! Avoid is a **predecessor chain** (wait-for dependency) for WAW; RAW fan-out
-//! stays a star on the first producer. Independents get no ReadyEdge / no PE.
+//! empty-`to` probe + intra-block write-set WAW on hidden locations (not
+//! envelope `Basic(to)`). Avoid is a **predecessor chain** (wait-for
+//! dependency) for WAW; RAW fan-out stays a star on the first producer.
+//! Independents get no ReadyEdge / no PE.
 //!
 //! Plant SoT: `lab/notes/specfence-complete-architecture-v10-raw-mixed.md`
 //! plus WAW-spine ordered admission (3356896). Soft=0. No Basic→Storage PE clone.
@@ -25,25 +26,43 @@ const RAW_FANOUT_FLOOR: usize = 16;
 const FROM_WAW_FLOOR: usize = 2;
 /// Short calldata WAW (storage trio, short call chains) — chain, no Basic(to) PE.
 const CALL_WAW_FLOOR: usize = 2;
-/// Empty-calldata hot payee: provisional chain until write-set confirms hidden WAW.
-const EMPTY_TO_CHAIN_FLOOR: usize = 8;
+/// Empty-calldata `to` ≥2: probe the first tx only. Later txs wait-for that
+/// prefix until its write-set Detects hidden WAW (then predecessor-chain) or
+/// lazy-only (then release). Do **not** serialize the whole payee group at
+/// begin-block (3356896 0x209c wall / independent tax).
+const EMPTY_TO_PROBE_FLOOR: usize = 2;
 /// Fan-star access class (k≈6 → bucket 4–7). RAW stars only.
 const FAN_STAR_K: u32 = 6;
 
 /// Chain `ordered[i]` behind `ordered[i-1]`. WAW Avoid — not a RAW star.
-fn note_predecessor_chain(
-    ready: &ReadyEdgeTable,
-    stages: &ProducerStageTable,
-    ordered: &[TxIdx],
-) -> usize {
+///
+/// Do **not** ProducerStage-reserve every predecessor. `next_reserved()` is a
+/// global min; reserving a long WAW spine serializes the whole block.
+fn note_predecessor_chain(ready: &ReadyEdgeTable, ordered: &[TxIdx]) -> usize {
     let mut edges = 0;
     for pair in ordered.windows(2) {
         let (pred, succ) = (pair[0], pair[1]);
         if pred >= succ {
             continue;
         }
-        stages.reserve(pred);
         ready.note_consumer(succ, pred);
+        edges += 1;
+    }
+    edges
+}
+
+/// Park later txs behind the first (probe). Write-set then chains or releases.
+fn note_probe_star(ready: &ReadyEdgeTable, ordered: &[TxIdx]) -> usize {
+    if ordered.len() < 2 {
+        return 0;
+    }
+    let probe = ordered[0];
+    let mut edges = 0;
+    for &succ in &ordered[1..] {
+        if probe >= succ {
+            continue;
+        }
+        ready.note_consumer(succ, probe);
         edges += 1;
     }
     edges
@@ -97,7 +116,7 @@ pub(crate) fn admit_seed_begin_block(
         }
         let basic = hash_deterministic(MemoryLocation::Basic(addr));
         ready.note_raw_producer(basic, txs[0]);
-        edges += note_predecessor_chain(ready, stages, txs);
+        edges += note_predecessor_chain(ready, txs);
     }
 
     // Calldata ≥16: RAW fan-out star (v10). Basic(to) refuse-covers the account
@@ -132,11 +151,11 @@ pub(crate) fn admit_seed_begin_block(
         if txs.len() < CALL_WAW_FLOOR || txs.len() >= RAW_FANOUT_FLOOR {
             continue;
         }
-        edges += note_predecessor_chain(ready, stages, txs);
+        edges += note_predecessor_chain(ready, txs);
     }
 
-    // Empty-calldata hot `to`: provisional WAW chain until write-set confirms
-    // a hidden location (e.g. 0x209c → Basic(0x32be)). No Basic(to) PE.
+    // Empty-calldata `to` ≥2: probe-then-Detect. Independents with a unique
+    // `to` are not in this loop. Popular lazy EOAs release after one write-set.
     for addr in hints.to_accounts() {
         if addr == beneficiary {
             continue;
@@ -145,10 +164,10 @@ pub(crate) fn admit_seed_begin_block(
             continue;
         }
         let txs = hints.to_txs(&addr);
-        if txs.len() < EMPTY_TO_CHAIN_FLOOR {
+        if txs.len() < EMPTY_TO_PROBE_FLOOR {
             continue;
         }
-        edges += note_predecessor_chain(ready, stages, txs);
+        edges += note_probe_star(ready, txs);
     }
 
     edges
@@ -174,12 +193,11 @@ pub(crate) fn admit_seed_on_abort(
 /// Intra-block Detect from a published non-lazy write-set.
 ///
 /// Hidden writes (not Basic(from)) associate envelope `to` with the real
-/// locations and chain remaining same-`to` txs behind this writer.
-/// Lazy-only publish **releases** a provisional empty-`to` chain so
+/// locations and upgrade a probe-star to a predecessor chain (wait-for the
+/// immediate writer). Lazy-only publish **releases** the empty-`to` probe so
 /// independent payees are not serialized.
 pub(crate) fn admit_seed_on_write_set(
     ready: &ReadyEdgeTable,
-    stages: &ProducerStageTable,
     hints: &AccountHints,
     wave: &WaveParkTable,
     writer: TxIdx,
@@ -239,7 +257,7 @@ pub(crate) fn admit_seed_on_write_set(
     let mut ordered = Vec::with_capacity(later.len() + 1);
     ordered.push(writer);
     ordered.extend(later);
-    let _ = note_predecessor_chain(ready, stages, &ordered);
+    let _ = note_predecessor_chain(ready, &ordered);
 }
 
 #[cfg(test)]
@@ -278,8 +296,10 @@ mod tests {
             "WAW Avoid is wait-for the immediate predecessor, not a star on tx 0"
         );
         assert_eq!(ready.blocking_producer(1), Some(0));
-        assert!(stages.is_reserved(0));
-        assert!(stages.is_reserved(18));
+        assert!(
+            !stages.is_reserved(18),
+            "WAW chain must not ProducerStage-reserve the whole spine"
+        );
         let loc = hash_deterministic(MemoryLocation::Basic(addr));
         assert!(
             !learner.predicted_essential(loc, FAN_STAR_K),
@@ -308,9 +328,14 @@ mod tests {
             &hints,
             Address::ZERO,
         );
-        assert!(n >= 15, "hot empty-to must provisional-chain, got {n}");
-        assert!(!ready.may_execute(8), "empty-to chain 8 waits on 7");
-        assert_eq!(ready.blocking_producer(8), Some(7));
+        assert!(n >= 15, "hot empty-to must probe-star, got {n}");
+        assert!(ready.may_execute(0), "probe head of empty-to must run");
+        assert!(!ready.may_execute(8), "empty-to later waits on the probe");
+        assert_eq!(
+            ready.blocking_producer(8),
+            Some(0),
+            "probe-star: later empty-to wait on the first, not a full begin-block chain"
+        );
         let basic = hash_deterministic(MemoryLocation::Basic(payee));
         assert!(
             !learner.predicted_essential(basic, FAN_STAR_K),
@@ -324,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn two_tx_empty_to_is_not_seeded() {
+    fn two_tx_empty_to_probes_first_only() {
         let ready = ReadyEdgeTable::new();
         let stages = ProducerStageTable::new();
         let learner = LiveLearner::new();
@@ -342,8 +367,17 @@ mod tests {
             &hints,
             Address::ZERO,
         );
-        assert_eq!(n, 0, "2-tx lazy payee must not tax independents");
-        assert!(ready.may_execute(9));
+        assert_eq!(n, 1, "2-tx empty-to probes the first; later waits");
+        assert!(ready.may_execute(3));
+        assert_eq!(ready.blocking_producer(9), Some(3));
+        assert!(
+            ready.may_execute(11),
+            "tx outside the probe must stay independent"
+        );
+        assert!(
+            !stages.is_reserved(3),
+            "empty-to probe is not a Stage reserve"
+        );
     }
 
     #[test]
@@ -414,24 +448,63 @@ mod tests {
     }
 
     #[test]
-    fn write_set_hidden_location_chains_same_to() {
+    fn empty_to_probe_then_hidden_write_set_chains_waw() {
+        // 3356896 shape: envelope `to` is the contract; real WAW is Basic(hot wallet).
         let ready = ReadyEdgeTable::new();
         let stages = ProducerStageTable::new();
+        let learner = LiveLearner::new();
+        learner.begin_block(MorphWeights::default());
+        let bayes = BayesMap::new();
+        let prior = InterBlockPrior::new();
+        let to = Address::repeat_byte(0x20);
+        let from = Address::repeat_byte(0x31);
+        let hints = AccountHints::from_to_txs(to, vec![31, 66, 67, 69]);
+        let n = admit_seed_begin_block(
+            &ready,
+            &stages,
+            &learner,
+            &bayes,
+            &prior,
+            &hints,
+            Address::ZERO,
+        );
+        assert_eq!(n, 3, "probe-star 31←66,67,69");
+        assert!(ready.may_execute(31));
+        assert_eq!(ready.blocking_producer(66), Some(31));
+        assert_eq!(ready.blocking_producer(67), Some(31));
+        assert_eq!(ready.blocking_producer(69), Some(31));
+        assert!(
+            !stages.is_reserved(31) && !stages.is_reserved(66),
+            "WAW probe must not ProducerStage-reserve the spine"
+        );
+        let hidden = 0x32be_u64;
+        let wave = WaveParkTable::new();
+        admit_seed_on_write_set(&ready, &hints, &wave, 31, from, Some(to), &[hidden]);
+        assert_eq!(ready.blocking_producer(66), Some(31));
+        assert_eq!(
+            ready.blocking_producer(67),
+            Some(66),
+            "write-set Detect upgrades probe-star to predecessor chain"
+        );
+        assert_eq!(ready.blocking_producer(69), Some(67));
+        assert_eq!(ready.predicted_producer(hidden), Some(31));
+        assert!(ready.may_execute(0), "independents stay runnable");
+        let basic_to = hash_deterministic(MemoryLocation::Basic(to));
+        assert!(
+            !learner.predicted_essential(basic_to, FAN_STAR_K),
+            "must not fake Basic(to) PE / storage clone"
+        );
+    }
+
+    #[test]
+    fn write_set_hidden_location_chains_same_to() {
+        let ready = ReadyEdgeTable::new();
         let wave = WaveParkTable::new();
         let to = Address::repeat_byte(0x20);
         let from = Address::repeat_byte(0x31);
         let hints = AccountHints::from_to_txs(to, vec![31, 66, 67, 69]);
         let hidden = 0x32be_u64;
-        admit_seed_on_write_set(
-            &ready,
-            &stages,
-            &hints,
-            &wave,
-            31,
-            from,
-            Some(to),
-            &[hidden],
-        );
+        admit_seed_on_write_set(&ready, &hints, &wave, 31, from, Some(to), &[hidden]);
         assert_eq!(ready.blocking_producer(66), Some(31));
         assert_eq!(ready.blocking_producer(67), Some(66));
         assert_eq!(ready.blocking_producer(69), Some(67));
@@ -442,26 +515,17 @@ mod tests {
     #[test]
     fn write_set_lazy_only_releases_provisional_to_chain() {
         let ready = ReadyEdgeTable::new();
-        let stages = ProducerStageTable::new();
         let wave = WaveParkTable::new();
         let to = Address::repeat_byte(0x20);
         let from = Address::repeat_byte(0x31);
         let hints = AccountHints::from_to_txs(to, (31..47).collect());
-        let n = note_predecessor_chain(&ready, &stages, hints.to_txs(&to));
+        let n = note_probe_star(&ready, hints.to_txs(&to));
         assert!(n >= 15);
         assert!(!ready.may_execute(32));
+        assert_eq!(ready.blocking_producer(32), Some(31));
         // Writer 31 published only Basic(from) — no hidden WAW.
         let from_loc = hash_deterministic(MemoryLocation::Basic(from));
-        admit_seed_on_write_set(
-            &ready,
-            &stages,
-            &hints,
-            &wave,
-            31,
-            from,
-            Some(to),
-            &[from_loc],
-        );
+        admit_seed_on_write_set(&ready, &hints, &wave, 31, from, Some(to), &[from_loc]);
         assert!(
             ready.may_execute(32),
             "lazy payee chain must release after write-set shows no hidden WAW"

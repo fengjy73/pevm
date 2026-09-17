@@ -3239,7 +3239,6 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
                     crate::specfence::admit::admit_seed_on_write_set(
                         self.specfence.ready_edges,
-                        self.specfence.producer_stages,
                         self.specfence.hints,
                         self.specfence.wave,
                         tx_version.tx_idx,
