@@ -46,6 +46,8 @@ pub(crate) struct ReadyEdgeTable {
     sleeping: DashSet<TxIdx, BuildIdentityHasher>,
     /// L6: ns spent in refuse / defer path.
     refuse_ns: AtomicU64,
+    /// Producer → known consumers (completion event → bag; no DashMap scan).
+    waiters: DashMap<TxIdx, Vec<TxIdx>, BuildIdentityHasher>,
 }
 
 impl ReadyEdgeTable {
@@ -119,6 +121,7 @@ impl ReadyEdgeTable {
                 Err(v) => cur = v,
             }
         }
+        self.waiters.entry(producer).or_default().push(consumer);
     }
 
     /// D1: record `writer` on location `ℓ` (lazy or Data). Order is consensus.
@@ -268,19 +271,32 @@ impl ReadyEdgeTable {
     }
 
     /// Writer finished. Wake known consumers whose producer is now done.
+    ///
+    /// Independents (never gated anyone, never queued) skip the deferred lock
+    /// and the producer/consumer DashMap scans — those were the thin-shell tax.
     pub(crate) fn note_producer_done(&self, writer: TxIdx, wave: &WaveParkTable) {
         self.finished.insert(writer, ());
-        for e in self.producers.iter() {
-            if e.load(Ordering::Relaxed) == writer {
-                e.store(NONE, Ordering::Relaxed);
-            }
+        let waiters = self.waiters.remove(&writer);
+        if waiters.is_none() && !self.was_queued(writer) {
+            return;
         }
-        for e in self.consumers.iter() {
-            if e.load(Ordering::Relaxed) == writer {
-                e.store(NONE, Ordering::Relaxed);
+        if let Some((_, cs)) = waiters {
+            for c in cs {
+                if let Some(e) = self.consumers.get(&c)
+                    && e.load(Ordering::Relaxed) == writer
+                {
+                    e.store(NONE, Ordering::Relaxed);
+                }
+                self.sleeping.remove(&c);
+                if self.may_execute(c) {
+                    wave.push_ready(c);
+                }
             }
         }
         let mut d = self.deferred.lock().unwrap();
+        if d.is_empty() {
+            return;
+        }
         d.retain(|&t| {
             if self.may_execute(t) {
                 self.sleeping.remove(&t);
@@ -491,5 +507,29 @@ mod tests {
         t.note_producer_done(3, &wave);
         assert!(!t.is_sleeping(8));
         assert!(t.may_execute(8));
+    }
+
+    #[test]
+    fn producer_done_wakes_non_deferred_waiter_into_bag() {
+        let t = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        t.note_consumer(16, 14);
+        assert!(!t.may_execute(16));
+        t.note_producer_done(14, &wave);
+        assert!(t.may_execute(16));
+        assert_eq!(
+            wave.pop_ready(),
+            Some(16),
+            "completion event must bag the waiter without a full-block steal"
+        );
+    }
+
+    #[test]
+    fn independent_done_skips_bag_work() {
+        let t = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        t.note_producer_done(5, &wave);
+        assert!(wave.pop_ready().is_none());
+        assert!(t.may_execute(6));
     }
 }

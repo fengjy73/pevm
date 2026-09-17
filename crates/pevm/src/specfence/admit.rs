@@ -341,6 +341,14 @@ pub(crate) fn admit_seed_on_write_set(
     effective_locs: &[MemoryLocationHash],
 ) {
     let from_loc = hash_deterministic(MemoryLocation::Basic(from));
+    // PC-S1: thin-shell A0 — D1 writer order only. No ReadyEdge / B2 / release.
+    // 4→31 still lands when the A1 probe publishes (`note_immediate_pred`).
+    if policy.is_some_and(|p| p.is_thin_shell()) && !ready.was_queued(writer) {
+        for &loc in all_write_locs {
+            ready.note_location_writer(loc, writer);
+        }
+        return;
+    }
     // D1: record every writer (lazy included) so 4→31 is visible in order.
     // PC-2 / D3: ReadyEdge A1 only on effective (non-lazy Data / Storage).
     for &loc in all_write_locs {
@@ -428,8 +436,8 @@ pub(crate) fn admit_seed_on_write_set(
         .collect();
     // Production: only upgrade an existing A1 probe (begin-block EV).
     // Tests pass `policy=None` and still expect write-set to plant the chain.
-    let chain_later = !later.is_empty()
-        && (later.iter().any(|&t| ready.was_queued(t)) || policy.is_none());
+    let chain_later =
+        !later.is_empty() && (later.iter().any(|&t| ready.was_queued(t)) || policy.is_none());
     let mut queued = HashSet::new();
     for loc in hidden_eff {
         ready.note_raw_producer(loc, writer);
@@ -896,6 +904,33 @@ mod tests {
         assert!(
             learner.predicted_essential(storage_loc, 6),
             "true-k: hint-fan plants storage RAW PE from InterPrior, not Basic→Storage clone"
+        );
+    }
+
+    #[test]
+    fn thin_a0_write_set_records_d1_only() {
+        let ready = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        let policy = policy_for(176);
+        assert!(policy.is_thin_shell());
+        let to = Address::repeat_byte(0x99);
+        let hot = Address::repeat_byte(0x32);
+        let loc = 0x32be_u64;
+        admit_seed_on_write_set(
+            &ready,
+            &AccountHints::from_to_txs(to, vec![4]),
+            &wave,
+            Some(&policy),
+            4,
+            hot,
+            Some(to),
+            &[loc],
+            &[loc],
+        );
+        assert_eq!(ready.writers_of(loc), vec![4], "thin A0 still records D1");
+        assert!(
+            ready.may_execute(31),
+            "thin A0 must not plant a ReadyEdge on later writers"
         );
     }
 

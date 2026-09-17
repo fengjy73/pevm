@@ -1000,11 +1000,11 @@ impl Pevm {
             if let Some(wave) = wave {
                 vm.try_apply_park_resume(tx_version.tx_idx, wave);
             }
-            let exec_t0 = Instant::now();
+            let exec_t0 = (tx_version.tx_incarnation > 0).then(Instant::now);
             return match vm.execute(&tx_version, result_slot) {
                 Ok(flags) => {
-                    if tx_version.tx_incarnation > 0 {
-                        vm.note_hot_reexec_ns(exec_t0.elapsed().as_nanos() as u64);
+                    if let Some(t0) = exec_t0 {
+                        vm.note_hot_reexec_ns(t0.elapsed().as_nanos() as u64);
                     }
                     // PublishWrite ≈ incarnation finished: wake location waiters + ready.
                     let done_idx = tx_version.tx_idx;

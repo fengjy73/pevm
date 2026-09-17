@@ -471,10 +471,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return Ok(());
         }
         // PC-S1: thin-shell A0 txs stay OCC-cost even after a few aborts seed PE.
-        if self
-            .specfence
-            .policy
-            .is_some_and(|p| p.is_thin_shell())
+        if self.specfence.policy.is_some_and(|p| p.is_thin_shell())
             && !self.specfence.ready_edges.was_queued(self.tx_idx)
         {
             return Ok(());
@@ -3176,8 +3173,14 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     FinishExecFlags::empty()
                 };
 
+                let thin_a0 = self.specfence.mode == crate::ConcurrencyMode::SpecFence
+                    && self.specfence.policy.is_some_and(|p| p.is_thin_shell())
+                    && !self.specfence.ready_edges.was_queued(tx_version.tx_idx);
+                let thin_pure = thin_a0 && self.specfence.hints.is_pure_transfer(tx_version.tx_idx);
+
                 if self.specfence.mode == crate::ConcurrencyMode::SpecFence
                     && self.specfence.certificates.rem_legal(tx_version.tx_idx)
+                    && !thin_pure
                 {
                     for (loc, value) in &write_set {
                         // G2: plant Write ordinal always (HotSet not required).
@@ -3302,45 +3305,48 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         &all_write_locs,
                         &effective_write_locs,
                     );
-                    // Learning is consumed by decide() — always observe HotSet / WŜ.
-                    if self.specfence.certificates.rem_legal(tx_version.tx_idx) {
-                        let locs: Vec<_> = self.mv_memory.write_locations(tx_version.tx_idx);
-                        self.specfence.rw_prior.observe_write_set(&locs, None);
-                        for loc in &hotset_writer_locs {
-                            self.specfence.hotset.note_writer(*loc, tx_version.tx_idx);
-                        }
-                        // A2: progressive DAG — Data is visible; wake Blocking waiters
-                        // before is_done (SoftWait Soft stays 0).
-                        self.wake_on_data_publish(tx_version.tx_idx, &locs);
-                    } else {
-                        self.specfence
-                            .rw_prior
-                            .observe_write_set(&hotset_writer_locs, None);
-                        for loc in &hotset_writer_locs {
-                            self.specfence.hotset.note_writer(*loc, tx_version.tx_idx);
-                        }
-                        // Spec publishers of a PE ℓ still wake / Avoid — not rem-gated.
-                        if self.specfence.learner.has_any_predicted() {
-                            let pe_locs: Vec<_> = hotset_writer_locs
-                                .iter()
-                                .copied()
-                                .filter(|&loc| {
-                                    let k = self.specfence.learner.dominant_k(loc);
-                                    self.specfence.learner.predicted_essential(loc, k.max(1))
-                                })
-                                .collect();
-                            if !pe_locs.is_empty() {
-                                for &loc in &pe_locs {
-                                    if self
-                                        .specfence
-                                        .sketch
-                                        .broadcast_avoid(loc, tx_version.tx_idx)
-                                    {
-                                        self.specfence.edges.broadcast_avoid(loc);
-                                        self.specfence.metrics.record_avoid_broadcast();
+                    // Learning is consumed by decide() — observe HotSet / WŜ
+                    // except thin-shell 21k A0 (PC-S1; tests still see A1 / call WAW).
+                    if !thin_pure {
+                        if self.specfence.certificates.rem_legal(tx_version.tx_idx) {
+                            let locs: Vec<_> = self.mv_memory.write_locations(tx_version.tx_idx);
+                            self.specfence.rw_prior.observe_write_set(&locs, None);
+                            for loc in &hotset_writer_locs {
+                                self.specfence.hotset.note_writer(*loc, tx_version.tx_idx);
+                            }
+                            // A2: progressive DAG — Data is visible; wake Blocking waiters
+                            // before is_done (SoftWait Soft stays 0).
+                            self.wake_on_data_publish(tx_version.tx_idx, &locs);
+                        } else {
+                            self.specfence
+                                .rw_prior
+                                .observe_write_set(&hotset_writer_locs, None);
+                            for loc in &hotset_writer_locs {
+                                self.specfence.hotset.note_writer(*loc, tx_version.tx_idx);
+                            }
+                            // Spec publishers of a PE ℓ still wake / Avoid — not rem-gated.
+                            if self.specfence.learner.has_any_predicted() {
+                                let pe_locs: Vec<_> = hotset_writer_locs
+                                    .iter()
+                                    .copied()
+                                    .filter(|&loc| {
+                                        let k = self.specfence.learner.dominant_k(loc);
+                                        self.specfence.learner.predicted_essential(loc, k.max(1))
+                                    })
+                                    .collect();
+                                if !pe_locs.is_empty() {
+                                    for &loc in &pe_locs {
+                                        if self
+                                            .specfence
+                                            .sketch
+                                            .broadcast_avoid(loc, tx_version.tx_idx)
+                                        {
+                                            self.specfence.edges.broadcast_avoid(loc);
+                                            self.specfence.metrics.record_avoid_broadcast();
+                                        }
                                     }
+                                    self.wake_on_data_publish(tx_version.tx_idx, &pe_locs);
                                 }
-                                self.wake_on_data_publish(tx_version.tx_idx, &pe_locs);
                             }
                         }
                     }
