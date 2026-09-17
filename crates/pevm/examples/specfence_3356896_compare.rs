@@ -184,11 +184,11 @@ fn main() {
                     let off_edge: Vec<usize> = incs
                         .iter()
                         .enumerate()
-                        .filter(|(t, &inc)| {
-                            inc > 0
-                                && !MAIN_CHAIN.contains(t)
-                                && !STORAGE_141617.contains(t)
-                                && ![20, 109, 149].contains(t)
+                        .filter(|&(t, inc)| {
+                            *inc > 0
+                                && !MAIN_CHAIN.contains(&t)
+                                && !STORAGE_141617.contains(&t)
+                                && ![20, 109, 149].contains(&t)
                         })
                         .map(|(t, _)| t)
                         .collect();
