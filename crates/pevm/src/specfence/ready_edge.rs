@@ -123,10 +123,15 @@ impl ReadyEdgeTable {
             .entry(location)
             .or_insert_with(|| Mutex::new(Vec::new()));
         let mut v = e.lock().unwrap();
-        if v.binary_search(&writer).is_err() {
-            v.push(writer);
-            v.sort_unstable();
-            v.dedup();
+        match v.last() {
+            Some(&last) if last == writer => {}
+            Some(&last) if last < writer => v.push(writer),
+            _ => {
+                if v.binary_search(&writer).is_err() {
+                    v.push(writer);
+                    v.sort_unstable();
+                }
+            }
         }
     }
 

@@ -408,6 +408,9 @@ impl Scheduler {
         }
         let mut ready_n = 0usize;
         let steal = |cand: TxIdx, ready_n: &mut usize| -> Option<Task> {
+            if cand >= self.block_size || self.is_done(cand) {
+                return None;
+            }
             if !edges.may_execute(cand) {
                 return None;
             }

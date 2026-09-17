@@ -262,11 +262,12 @@ pub(crate) fn admit_seed_on_write_set(
     effective_locs: &[MemoryLocationHash],
 ) {
     let from_loc = hash_deterministic(MemoryLocation::Basic(from));
-    // Always record writers (lazy included) so 4→31 is visible in order.
+    // D1: record every writer (lazy included) so 4→31 is visible in order.
+    // PC-2 / D3: ReadyEdge A1 only on effective (non-lazy Data / Storage).
     for &loc in all_write_locs {
         ready.note_location_writer(loc, writer);
     }
-    if all_write_locs.iter().any(|&l| l == from_loc) {
+    if effective_locs.iter().any(|&l| l == from_loc) {
         ready.note_raw_producer(from_loc, writer);
         let _ = ready.extend_writer_order(from_loc);
     }
@@ -848,6 +849,90 @@ mod tests {
             "4→31 must be a ReadyEdge after write-set, not scheduler luck"
         );
         assert_eq!(ready.blocking_producer(66), Some(31));
+    }
+
+    #[test]
+    fn write_set_d1_lazy_then_effective_still_chains_4_to_31() {
+        let ready = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        let to = Address::repeat_byte(0x20);
+        let hot = Address::repeat_byte(0x32);
+        let other = Address::repeat_byte(0x99);
+        let hints = AccountHints::from_to_txs(to, vec![31, 66, 67]);
+        let loc = 0x32be_u64;
+        // tx4 publishes lazy-only on the hot account — record, do not A1-fence.
+        admit_seed_on_write_set(
+            &ready,
+            &AccountHints::from_to_txs(other, vec![4]),
+            &wave,
+            None,
+            4,
+            hot,
+            Some(other),
+            &[loc],
+            &[],
+        );
+        assert_eq!(ready.writers_of(loc), vec![4]);
+        assert!(
+            ready.may_execute(31),
+            "lazy-only publish must not refuse the next writer before Detect"
+        );
+        admit_seed_on_write_set(
+            &ready,
+            &hints,
+            &wave,
+            None,
+            31,
+            Address::repeat_byte(0x31),
+            Some(to),
+            &[loc],
+            &[loc],
+        );
+        assert_eq!(ready.writers_of(loc), vec![4, 31]);
+        assert_eq!(
+            ready.blocking_producer(31),
+            Some(4),
+            "effective publish must extend order over the earlier lazy writer"
+        );
+        assert_eq!(ready.blocking_producer(66), Some(31));
+    }
+
+    #[test]
+    fn write_set_lazy_from_does_not_a1_same_from_spine() {
+        // PC-2: LazySender on Basic(from) is not effective WAW — no ReadyEdge tax.
+        let ready = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        let from = Address::repeat_byte(0x2a);
+        let to = Address::repeat_byte(0x11);
+        let from_loc = hash_deterministic(MemoryLocation::Basic(from));
+        let hints = AccountHints::from_from_and_to(from, to, vec![5, 6, 7, 8]);
+        admit_seed_on_write_set(
+            &ready,
+            &hints,
+            &wave,
+            None,
+            5,
+            from,
+            Some(to),
+            &[from_loc],
+            &[],
+        );
+        admit_seed_on_write_set(
+            &ready,
+            &hints,
+            &wave,
+            None,
+            6,
+            from,
+            Some(to),
+            &[from_loc],
+            &[],
+        );
+        assert_eq!(ready.writers_of(from_loc), vec![5, 6]);
+        assert!(
+            ready.may_execute(6) && ready.may_execute(7) && ready.may_execute(8),
+            "lazy same-from must stay A0 after write-set (no mid-block refuse tax)"
+        );
     }
 
     #[test]
