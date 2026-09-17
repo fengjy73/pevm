@@ -412,8 +412,8 @@ impl Scheduler {
     }
 
     /// After `refuse_admit` of `from`, run the next independent.
-    /// PC-W1: prefer the ready bag. Do **not** walk the whole block (that
-    /// ate small-block wall). Short forward window only as fallback.
+    /// PC-W1: bag first (skip sleeping A1 heads). Then a short window and a
+    /// full-block scan so cores stay filled after the bag drains.
     fn try_fill_independent_after_refuse(
         &self,
         from: TxIdx,
@@ -452,6 +452,16 @@ impl Scheduler {
         };
         let end = from.saturating_add(WAVE_FILL_WINDOW).min(self.block_size);
         for cand in (from + 1)..end {
+            if let Some(task) = steal(cand, &mut ready_n) {
+                return Some(task);
+            }
+        }
+        for cand in end..self.block_size {
+            if let Some(task) = steal(cand, &mut ready_n) {
+                return Some(task);
+            }
+        }
+        for cand in 0..from {
             if let Some(task) = steal(cand, &mut ready_n) {
                 return Some(task);
             }
