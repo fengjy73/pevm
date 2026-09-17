@@ -456,13 +456,17 @@ impl Scheduler {
                 return Some(task);
             }
         }
-        // One OCC-like collaborative steal. Full-block scan was the refuse tax;
-        // A1 consumers wake via ReadyEdge waiter index → bag (PC-W1).
-        let idx = self.execution_idx.fetch_add(1, Ordering::Relaxed);
-        if idx < self.block_size
-            && let Some(task) = steal(idx, &mut ready_n)
-        {
-            return Some(task);
+        // Fallback scan so a woken A1 successor is found if the bag missed it.
+        // Skip sleeping heads (PC-W1). Independents are usually bag-first.
+        for cand in end..self.block_size {
+            if let Some(task) = steal(cand, &mut ready_n) {
+                return Some(task);
+            }
+        }
+        for cand in 0..from {
+            if let Some(task) = steal(cand, &mut ready_n) {
+                return Some(task);
+            }
         }
         if ready_n > 0 || wave.ready_depth() > 0 {
             edges.sample_ready_width(wave.ready_depth().max(ready_n));

@@ -282,11 +282,15 @@ impl ReadyEdgeTable {
         }
         if let Some((_, cs)) = waiters {
             for c in cs {
-                if let Some(e) = self.consumers.get(&c)
-                    && e.load(Ordering::Relaxed) == writer
-                {
-                    e.store(NONE, Ordering::Relaxed);
+                // Only the consumers still gated on *this* writer. Probe-star
+                // leftovers that already rebased onto a later pred must stay.
+                let Some(e) = self.consumers.get(&c) else {
+                    continue;
+                };
+                if e.load(Ordering::Relaxed) != writer {
+                    continue;
                 }
+                e.store(NONE, Ordering::Relaxed);
                 self.sleeping.remove(&c);
                 if self.may_execute(c) {
                     wave.push_ready(c);
