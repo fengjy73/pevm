@@ -22,8 +22,10 @@ use crate::{MemoryLocation, MemoryLocationHash, TxIdx, hash_deterministic};
 
 /// RAW fan-out star (v10): ≥16 calldata calls to the same `to`.
 const RAW_FANOUT_FLOOR: usize = 16;
-/// Same-`from` is always a real Basic write (nonce / balance).
-const FROM_WAW_FLOOR: usize = 2;
+/// Same-`from` nonce/balance WAW. Floor 3 keeps 2-tx pairs on the OCC-cost
+/// path (3356896 has ~60 adjacent pairs; refusing them is pure meta tax).
+/// Longer sender spines (0x2a65 n=9, 0x9535 n=12) still chain.
+const FROM_WAW_FLOOR: usize = 3;
 /// Short calldata WAW (storage trio, short call chains) — chain, no Basic(to) PE.
 const CALL_WAW_FLOOR: usize = 2;
 /// Empty-calldata `to` ≥8: probe the first tx only. Later txs wait-for that
@@ -588,6 +590,29 @@ mod tests {
         );
         assert_eq!(n, 0, "single-tx sender is not a WAW chain");
         assert!(ready.may_execute(2));
+    }
+
+    #[test]
+    fn two_tx_same_from_is_not_seeded() {
+        let ready = ReadyEdgeTable::new();
+        let stages = ProducerStageTable::new();
+        let learner = LiveLearner::new();
+        learner.begin_block(MorphWeights::default());
+        let bayes = BayesMap::new();
+        let prior = InterBlockPrior::new();
+        let addr = Address::repeat_byte(0x56);
+        let hints = AccountHints::from_account_txs(addr, vec![56, 57]);
+        let n = admit_seed_begin_block(
+            &ready,
+            &stages,
+            &learner,
+            &bayes,
+            &prior,
+            &hints,
+            Address::ZERO,
+        );
+        assert_eq!(n, 0, "2-tx same-from stays OCC-cost (no refuse tax)");
+        assert!(ready.may_execute(57));
     }
 
     #[test]
