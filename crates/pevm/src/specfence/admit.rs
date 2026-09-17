@@ -269,7 +269,12 @@ pub(crate) fn admit_seed_on_write_set(
     }
     if effective_locs.iter().any(|&l| l == from_loc) {
         ready.note_raw_producer(from_loc, writer);
-        let _ = ready.extend_writer_order(from_loc);
+        // PC-2 / PC-5: 2-tx pairs and empty-calldata same-from stay A0 even
+        // when nonce/balance is Data — refuse meta loses to one OCC abort.
+        let from_txs = hints.from_txs(&from);
+        if from_txs.len() >= 3 && !hints.cohort_all_empty(from_txs) {
+            let _ = ready.extend_writer_order(from_loc);
+        }
     }
 
     let Some(to) = to else {
@@ -932,6 +937,31 @@ mod tests {
         assert!(
             ready.may_execute(6) && ready.may_execute(7) && ready.may_execute(8),
             "lazy same-from must stay A0 after write-set (no mid-block refuse tax)"
+        );
+    }
+
+    #[test]
+    fn write_set_two_tx_effective_from_stays_a0() {
+        let ready = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        let from = Address::repeat_byte(0x56);
+        let to = Address::repeat_byte(0x11);
+        let from_loc = hash_deterministic(MemoryLocation::Basic(from));
+        let hints = AccountHints::from_from_and_to(from, to, vec![56, 57]);
+        admit_seed_on_write_set(
+            &ready,
+            &hints,
+            &wave,
+            None,
+            56,
+            from,
+            Some(to),
+            &[from_loc],
+            &[from_loc],
+        );
+        assert!(
+            ready.may_execute(57),
+            "2-tx same-from Data nonce must stay OCC-cost"
         );
     }
 
