@@ -6,9 +6,9 @@
 //! deadlocked when w was off the collaborative index.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 
 use crate::{BuildIdentityHasher, MemoryLocationHash, TxIdx};
 
@@ -30,6 +30,17 @@ pub(crate) struct ReadyEdgeTable {
     tips: DashMap<MemoryLocationHash, AtomicUsize, BuildIdentityHasher>,
     deferred: Mutex<Vec<TxIdx>>,
     refuse: AtomicUsize,
+    /// D1: consensus-order writers observed on each location (lazy + Data).
+    location_writers: DashMap<MemoryLocationHash, Vec<TxIdx>, BuildIdentityHasher>,
+    /// PC-3: each tx belongs to at most one ReadyEdge location queue.
+    queued_on: DashMap<TxIdx, MemoryLocationHash, BuildIdentityHasher>,
+    /// PC-5: Lean / EV forced A0 — `may_execute` even if a consumer bit exists.
+    a0_force: DashSet<TxIdx, BuildIdentityHasher>,
+    /// PC-4: sampled ready width (may_execute ∧ Ready).
+    ready_width_sum: AtomicU64,
+    ready_width_n: AtomicUsize,
+    /// PC-4: ns spent in scheduler yield / empty refuse.
+    idle_core_ns: AtomicU64,
 }
 
 impl ReadyEdgeTable {
@@ -60,8 +71,37 @@ impl ReadyEdgeTable {
     /// a predecessor chain after the first write-set Detects a hidden location.
     #[inline]
     pub(crate) fn note_consumer(&self, consumer: TxIdx, producer: TxIdx) {
+        self.note_consumer_on(consumer, producer, None);
+    }
+
+    /// PC-3: bind `consumer` to at most one location queue. Write-set upgrade
+    /// rebinds from a cold-start probe onto the real location.
+    #[inline]
+    pub(crate) fn note_consumer_on(
+        &self,
+        consumer: TxIdx,
+        producer: TxIdx,
+        location: Option<MemoryLocationHash>,
+    ) {
         if producer >= consumer || self.finished.contains_key(&producer) {
             return;
+        }
+        if let Some(loc) = location {
+            if let Some(prev) = self.queued_on.get(&consumer) {
+                let prev_loc = *prev;
+                drop(prev);
+                if prev_loc != loc {
+                    // Rebind: drop the stale envelope queue (from+to dual tax).
+                    if let Some(e) = self.consumers.get(&consumer) {
+                        e.store(NONE, Ordering::Relaxed);
+                    }
+                }
+            }
+            self.queued_on.insert(consumer, loc);
+        } else if self.queued_on.contains_key(&consumer) {
+            // Already on a location queue — do not add a second anonymous edge.
+            // Immediate-pred upgrade on the existing bit is still allowed below
+            // only if a consumer entry exists.
         }
         let e = self
             .consumers
@@ -74,6 +114,123 @@ impl ReadyEdgeTable {
                 Err(v) => cur = v,
             }
         }
+    }
+
+    /// D1: record `writer` on location `ℓ` (lazy or Data). Order is consensus.
+    pub(crate) fn note_location_writer(&self, location: MemoryLocationHash, writer: TxIdx) {
+        let mut v = self.location_writers.entry(location).or_default();
+        match v.last() {
+            Some(&last) if last == writer => {}
+            Some(&last) if last < writer => v.push(writer),
+            _ => {
+                if v.binary_search(&writer).is_err() {
+                    v.push(writer);
+                    v.sort_unstable();
+                }
+            }
+        }
+    }
+
+    /// D1: extend ReadyEdge total order over **all** writers observed on `ℓ`.
+    pub(crate) fn extend_writer_order(&self, location: MemoryLocationHash) -> usize {
+        let Some(e) = self.location_writers.get(&location) else {
+            return 0;
+        };
+        let writers = e.clone();
+        drop(e);
+        let mut edges = 0;
+        for pair in writers.windows(2) {
+            let (pred, succ) = (pair[0], pair[1]);
+            if pred >= succ {
+                continue;
+            }
+            self.note_consumer_on(succ, pred, Some(location));
+            edges += 1;
+        }
+        edges
+    }
+
+    /// D1 hot path: only the immediate predecessor → `writer` edge.
+    pub(crate) fn note_immediate_pred(&self, location: MemoryLocationHash, writer: TxIdx) {
+        let pred = self
+            .location_writers
+            .get(&location)
+            .and_then(|e| e.iter().rev().copied().find(|&w| w < writer));
+        if let Some(p) = pred {
+            self.note_consumer_on(writer, p, Some(location));
+        }
+    }
+
+    /// Consensus-order writers published on `ℓ` (lab / compare).
+    pub(crate) fn writers_of(&self, location: MemoryLocationHash) -> Vec<TxIdx> {
+        self.location_writers
+            .get(&location)
+            .map(|e| e.clone())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn writer_order_snapshot(&self) -> Vec<(MemoryLocationHash, Vec<TxIdx>)> {
+        let mut out: Vec<(MemoryLocationHash, Vec<TxIdx>)> = self
+            .location_writers
+            .iter()
+            .map(|e| (*e.key(), e.value().clone()))
+            .collect();
+        out.sort_by_key(|(loc, _)| *loc);
+        out
+    }
+
+    /// Consumers that cannot execute at the moment (begin-block tax snapshot).
+    pub(crate) fn blocked_consumers(&self) -> Vec<TxIdx> {
+        let mut out: Vec<TxIdx> = self
+            .consumers
+            .iter()
+            .filter_map(|e| {
+                let t = *e.key();
+                if self.may_execute(t) { None } else { Some(t) }
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    #[inline]
+    pub(crate) fn was_queued(&self, tx: TxIdx) -> bool {
+        self.queued_on.contains_key(&tx) || self.consumers.contains_key(&tx)
+    }
+
+    /// PC-5: force A0 on this consumer (execute anyway).
+    #[inline]
+    pub(crate) fn force_a0(&self, tx: TxIdx) {
+        self.a0_force.insert(tx);
+    }
+
+    #[inline]
+    pub(crate) fn sample_ready_width(&self, width: usize) {
+        self.ready_width_sum
+            .fetch_add(width as u64, Ordering::Relaxed);
+        self.ready_width_n.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn add_idle_ns(&self, ns: u64) {
+        if ns > 0 {
+            self.idle_core_ns.fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn ready_width_mean(&self) -> f64 {
+        let n = self.ready_width_n.load(Ordering::Relaxed);
+        if n == 0 {
+            0.0
+        } else {
+            self.ready_width_sum.load(Ordering::Relaxed) as f64 / n as f64
+        }
+    }
+
+    #[inline]
+    pub(crate) fn idle_core_ns(&self) -> u64 {
+        self.idle_core_ns.load(Ordering::Relaxed)
     }
 
     /// Producer published Data for \(\ell\).
@@ -131,9 +288,10 @@ impl ReadyEdgeTable {
 
     /// Refuse only known consumers still gated by an unpublished producer.
     /// Stale bits (producer already flushed to NONE) must not refuse.
+    /// PC-5 Lean / EV A0 override executes anyway.
     #[inline]
     pub(crate) fn may_execute(&self, tx_idx: TxIdx) -> bool {
-        if tx_idx == 0 {
+        if tx_idx == 0 || self.a0_force.contains(&tx_idx) {
             return true;
         }
         match self.consumers.get(&tx_idx) {
@@ -268,5 +426,26 @@ mod tests {
         t.release_consumer(5, &wave);
         assert!(t.may_execute(5));
         assert_eq!(wave.pop_ready(), Some(5));
+    }
+
+    #[test]
+    fn d1_writer_order_includes_all_earlier() {
+        let t = ReadyEdgeTable::new();
+        t.note_location_writer(0x32be, 4);
+        t.note_location_writer(0x32be, 31);
+        t.note_location_writer(0x32be, 66);
+        assert_eq!(t.extend_writer_order(0x32be), 2);
+        assert_eq!(t.writers_of(0x32be), vec![4, 31, 66]);
+        assert_eq!(t.blocking_producer(31), Some(4));
+        assert_eq!(t.blocking_producer(66), Some(31));
+    }
+
+    #[test]
+    fn pc5_force_a0_allows_execute() {
+        let t = ReadyEdgeTable::new();
+        t.note_consumer(8, 3);
+        assert!(!t.may_execute(8));
+        t.force_a0(8);
+        assert!(t.may_execute(8));
     }
 }

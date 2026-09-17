@@ -1,6 +1,6 @@
 //! Test-visible `SpecFence` counters. Updated atomically during a block.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use alloy_primitives::Address;
 use dashmap::DashMap;
@@ -302,6 +302,20 @@ pub struct SpecFenceMetrics {
     pub partial_abort_win: usize,
     /// PartialAbortRewind attempts that fell through to full_abort_reexecute.
     pub partial_abort_attempt: usize,
+    /// PC-4: mean ready-set width (may_execute ∧ Ready) sampled on steal/refuse.
+    pub ready_width_mean: f64,
+    /// PC-4: ns spent in scheduler yield / empty refuse (idle cores).
+    pub idle_core_ns: u64,
+    /// D4: txs whose final incarnation is >0 (honest reexec count).
+    pub incarnation_gt0: usize,
+    /// D4: sum of final incarnations (= extra EVM entries from reexec).
+    pub reexec_entries: usize,
+    /// D4: incarnation>0 txs that were never on a ReadyEdge (miss-Detect).
+    pub miss_detect: usize,
+    /// B3: cohorts that chose A1 this block.
+    pub a1_cohorts: usize,
+    /// PC-5: cohorts forced A0 because E[meta_A1] > E[abort_A0].
+    pub lean_a0_cohorts: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -440,6 +454,13 @@ pub(crate) struct MetricsInner {
     ordered_admit_after_done: AtomicUsize,
     partial_abort_win: AtomicUsize,
     partial_abort_attempt: AtomicUsize,
+    ready_width_sum_bits: AtomicU64,
+    idle_core_ns: std::sync::atomic::AtomicU64,
+    incarnation_gt0: AtomicUsize,
+    reexec_entries: AtomicUsize,
+    miss_detect: AtomicUsize,
+    a1_cohorts: AtomicUsize,
+    lean_a0_cohorts: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -850,6 +871,28 @@ impl MetricsInner {
         self.partial_abort_attempt.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn set_pc_learn_metrics(
+        &self,
+        ready_width_mean: f64,
+        idle_core_ns: u64,
+        incarnation_gt0: usize,
+        reexec_entries: usize,
+        miss_detect: usize,
+        a1_cohorts: usize,
+        lean_a0_cohorts: usize,
+    ) {
+        self.ready_width_sum_bits
+            .store(ready_width_mean.to_bits(), Ordering::Relaxed);
+        self.idle_core_ns.store(idle_core_ns, Ordering::Relaxed);
+        self.incarnation_gt0
+            .store(incarnation_gt0, Ordering::Relaxed);
+        self.reexec_entries.store(reexec_entries, Ordering::Relaxed);
+        self.miss_detect.store(miss_detect, Ordering::Relaxed);
+        self.a1_cohorts.store(a1_cohorts, Ordering::Relaxed);
+        self.lean_a0_cohorts
+            .store(lean_a0_cohorts, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_edge_optimistic_read(&self) {
         self.edge_optimistic_read.fetch_add(1, Ordering::Relaxed);
     }
@@ -1240,6 +1283,13 @@ impl MetricsInner {
             ordered_admit_after_done: self.ordered_admit_after_done.load(Ordering::Relaxed),
             partial_abort_win: self.partial_abort_win.load(Ordering::Relaxed),
             partial_abort_attempt: self.partial_abort_attempt.load(Ordering::Relaxed),
+            ready_width_mean: f64::from_bits(self.ready_width_sum_bits.load(Ordering::Relaxed)),
+            idle_core_ns: self.idle_core_ns.load(Ordering::Relaxed),
+            incarnation_gt0: self.incarnation_gt0.load(Ordering::Relaxed),
+            reexec_entries: self.reexec_entries.load(Ordering::Relaxed),
+            miss_detect: self.miss_detect.load(Ordering::Relaxed),
+            a1_cohorts: self.a1_cohorts.load(Ordering::Relaxed),
+            lean_a0_cohorts: self.lean_a0_cohorts.load(Ordering::Relaxed),
         }
     }
 }

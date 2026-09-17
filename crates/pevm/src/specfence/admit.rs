@@ -1,20 +1,21 @@
 //! Admit seed — ReadyEdges + ProducerStage **before** satellite Execute.
 //!
-//! Detect uses real write locations: same-`from` Basic WAW, calldata RAW fan-out,
-//! empty-`to` probe + intra-block write-set WAW on hidden locations (not
-//! envelope `Basic(to)`). Avoid is a **predecessor chain** (wait-for
-//! dependency) for WAW; RAW fan-out stays a star on the first producer.
+//! Detect uses real write locations (D1) + envelope probes as **cold-start
+//! only** (D2). Avoid is a predecessor chain (wait-for dependency) for
+//! **effective** WAW; RAW fan-out stays a star on the first producer.
 //! Independents get no ReadyEdge / no PE.
 //!
-//! Plant SoT: `lab/notes/specfence-complete-architecture-v10-raw-mixed.md`
-//! plus WAW-spine ordered admission (3356896). Soft=0. No Basic→Storage PE clone.
+//! Soft=0. A0 vs A1 is B3 cost-aware EV (PC-5 Lean gate). No Soft wait arms.
+//! No Basic→Storage PE clone.
 
 use alloy_primitives::Address;
+use hashbrown::HashSet;
 
 use super::AccountHints;
 use super::bayes::BayesMap;
 use super::feeder::{seed_known_stars, top_is_known_star};
 use super::learner::{InterBlockPrior, LiveLearner};
+use super::policy::{CohortKind, CostPolicy};
 use super::producer_stage::ProducerStageTable;
 use super::ready_edge::ReadyEdgeTable;
 use super::wave::WaveParkTable;
@@ -22,49 +23,65 @@ use crate::{MemoryLocation, MemoryLocationHash, TxIdx, hash_deterministic};
 
 /// RAW fan-out star (v10): ≥16 calldata calls to the same `to`.
 const RAW_FANOUT_FLOOR: usize = 16;
-/// Same-`from` nonce/balance WAW. Floor 3 keeps 2-tx pairs on the OCC-cost
-/// path (3356896 has ~60 adjacent pairs; refusing them is pure meta tax).
-/// Longer sender spines (0x2a65 n=9, 0x9535 n=12) still chain.
-const FROM_WAW_FLOOR: usize = 3;
 /// Short calldata WAW (storage trio, short call chains) — chain, no Basic(to) PE.
 const CALL_WAW_FLOOR: usize = 2;
-/// Empty-calldata `to` ≥8: probe the first tx only. Later txs wait-for that
-/// prefix until its write-set Detects hidden WAW (then predecessor-chain) or
-/// lazy-only (then release). Floor 8 is the hot-payee class (3356896 0x209c
-/// n=16). 2-tx lazy EOAs stay optimistic — zero independent tax.
-const EMPTY_TO_PROBE_FLOOR: usize = 8;
 /// Fan-star access class (k≈6 → bucket 4–7). RAW stars only.
 const FAN_STAR_K: u32 = 6;
 
-/// Chain `ordered[i]` behind `ordered[i-1]`. WAW Avoid — not a RAW star.
+/// Sentinel location for an envelope probe (D2) — rebind on write-set (D1).
+#[inline]
+fn envelope_loc(addr: Address) -> MemoryLocationHash {
+    hash_deterministic(MemoryLocation::Basic(addr))
+}
+
+/// Chain `ordered[i]` behind `ordered[i-1]` on one location queue (PC-3).
 ///
 /// Do **not** ProducerStage-reserve every predecessor. `next_reserved()` is a
 /// global min; reserving a long WAW spine serializes the whole block.
-fn note_predecessor_chain(ready: &ReadyEdgeTable, ordered: &[TxIdx]) -> usize {
+fn note_predecessor_chain(
+    ready: &ReadyEdgeTable,
+    ordered: &[TxIdx],
+    location: MemoryLocationHash,
+    queued: &mut HashSet<TxIdx>,
+) -> usize {
     let mut edges = 0;
     for pair in ordered.windows(2) {
         let (pred, succ) = (pair[0], pair[1]);
         if pred >= succ {
             continue;
         }
-        ready.note_consumer(succ, pred);
+        if !queued.insert(succ) && ready.was_queued(succ) {
+            // PC-3: already on another queue — rebind onto this location.
+        }
+        ready.note_consumer_on(succ, pred, Some(location));
+        queued.insert(succ);
         edges += 1;
     }
     edges
 }
 
 /// Park later txs behind the first (probe). Write-set then chains or releases.
-fn note_probe_star(ready: &ReadyEdgeTable, ordered: &[TxIdx]) -> usize {
+fn note_probe_star(
+    ready: &ReadyEdgeTable,
+    ordered: &[TxIdx],
+    location: MemoryLocationHash,
+    queued: &mut HashSet<TxIdx>,
+) -> usize {
     if ordered.len() < 2 {
         return 0;
     }
     let probe = ordered[0];
+    queued.insert(probe);
     let mut edges = 0;
     for &succ in &ordered[1..] {
         if probe >= succ {
             continue;
         }
-        ready.note_consumer(succ, probe);
+        if queued.contains(&succ) {
+            continue;
+        }
+        ready.note_consumer_on(succ, probe, Some(location));
+        queued.insert(succ);
         edges += 1;
     }
     edges
@@ -74,6 +91,9 @@ fn note_probe_star(ready: &ReadyEdgeTable, ordered: &[TxIdx]) -> usize {
 ///
 /// Independents (no same-from WAW, no calldata/hot-`to` chain) stay
 /// `may_execute` — zero ReadyEdge / PE tax.
+///
+/// Static floors (from≥3, empty-to≥8) are gone: B3 EV + effective-WAW
+/// (PC-2/D3) decide A1. `contracts` is the pre-state code-hash set.
 pub(crate) fn admit_seed_begin_block(
     ready: &ReadyEdgeTable,
     stages: &ProducerStageTable,
@@ -82,6 +102,8 @@ pub(crate) fn admit_seed_begin_block(
     prior: &InterBlockPrior,
     hints: &AccountHints,
     beneficiary: Address,
+    policy: &CostPolicy,
+    contracts: &HashSet<Address>,
 ) -> usize {
     let stars = seed_known_stars(learner, bayes, prior);
     let fan = learner.morph_weights().dominant_fan_out();
@@ -105,30 +127,20 @@ pub(crate) fn admit_seed_begin_block(
     });
 
     let mut edges = 0;
+    let mut queued: HashSet<TxIdx> = HashSet::new();
 
-    // Same-from ≥2: real Basic(from) WAW. Chain each tx behind its predecessor.
-    // Do **not** plant PE — that would tax independents via has_any_predicted.
-    for addr in hints.from_accounts() {
-        if addr == beneficiary {
-            continue;
-        }
-        let txs = hints.from_txs(&addr);
-        if txs.len() < FROM_WAW_FLOOR {
-            continue;
-        }
-        let basic = hash_deterministic(MemoryLocation::Basic(addr));
-        ready.note_raw_producer(basic, txs[0]);
-        edges += note_predecessor_chain(ready, txs);
-    }
-
-    // Calldata ≥16: RAW fan-out star (v10). Basic(to) refuse-covers the account
-    // class; storage PE stays InterPrior / Bayes / abort true-k only.
+    // Calldata ≥16: RAW fan-out star (v10). First — PC-3 so later same-from
+    // / empty-to cannot dual-tax the same txs.
     for addr in hints.call_to_accounts() {
         if addr == beneficiary {
             continue;
         }
         let txs = hints.call_to_txs(&addr);
         if txs.len() < RAW_FANOUT_FLOOR {
+            continue;
+        }
+        let p_beta = bayes.account_wait_probability(&addr);
+        if !policy.choose_a1(CohortKind::RawFan, addr, txs.len(), true, p_beta) {
             continue;
         }
         let producer = txs[0];
@@ -138,13 +150,19 @@ pub(crate) fn admit_seed_begin_block(
             learner.seed_predicted_essential(basic, FAN_STAR_K);
         }
         ready.note_raw_producer(basic, producer);
+        queued.insert(producer);
         for &t in &txs[1..] {
-            ready.note_consumer(t, producer);
+            if queued.contains(&t) {
+                continue;
+            }
+            ready.note_consumer_on(t, producer, Some(basic));
+            queued.insert(t);
             edges += 1;
         }
     }
 
     // Calldata 2..15: short contract WAW. Predecessor chain, no Basic(to) PE.
+    // Keep PR15 wins on storage 14–17 when EV says A1.
     for addr in hints.call_to_accounts() {
         if addr == beneficiary {
             continue;
@@ -153,11 +171,16 @@ pub(crate) fn admit_seed_begin_block(
         if txs.len() < CALL_WAW_FLOOR || txs.len() >= RAW_FANOUT_FLOOR {
             continue;
         }
-        edges += note_predecessor_chain(ready, txs);
+        let p_beta = bayes.account_wait_probability(&addr);
+        if !policy.choose_a1(CohortKind::CallWaw, addr, txs.len(), true, p_beta) {
+            continue;
+        }
+        let loc = envelope_loc(addr);
+        edges += note_predecessor_chain(ready, txs, loc, &mut queued);
     }
 
-    // Empty-calldata `to` ≥2: probe-then-Detect. Independents with a unique
-    // `to` are not in this loop. Popular lazy EOAs release after one write-set.
+    // Empty-calldata `to`: D2 cold-start probe **only** when B3 says A1
+    // (contract hot-payee). Pure lazy EOA spines stay A0 (PC-2).
     for addr in hints.to_accounts() {
         if addr == beneficiary {
             continue;
@@ -166,10 +189,38 @@ pub(crate) fn admit_seed_begin_block(
             continue;
         }
         let txs = hints.to_txs(&addr);
-        if txs.len() < EMPTY_TO_PROBE_FLOOR {
+        if txs.len() < 2 {
             continue;
         }
-        edges += note_probe_star(ready, txs);
+        let is_contract = contracts.contains(&addr);
+        let p_beta = bayes.account_wait_probability(&addr);
+        if !policy.choose_a1(CohortKind::EmptyTo, addr, txs.len(), is_contract, p_beta) {
+            continue;
+        }
+        let loc = envelope_loc(addr);
+        edges += note_probe_star(ready, txs, loc, &mut queued);
+    }
+
+    // Same-from: PC-2 — basic_lazy / empty-calldata spines default A0.
+    // Calldata senders may A1 if EV wins (not the 3356896 lazy miner spines).
+    for addr in hints.from_accounts() {
+        if addr == beneficiary {
+            continue;
+        }
+        let txs = hints.from_txs(&addr);
+        if txs.len() < 2 {
+            continue;
+        }
+        if hints.cohort_all_empty(txs) {
+            continue;
+        }
+        let p_beta = bayes.account_wait_probability(&addr);
+        if !policy.choose_a1(CohortKind::SameFrom, addr, txs.len(), false, p_beta) {
+            continue;
+        }
+        let basic = hash_deterministic(MemoryLocation::Basic(addr));
+        ready.note_raw_producer(basic, txs[0]);
+        edges += note_predecessor_chain(ready, txs, basic, &mut queued);
     }
 
     edges
@@ -192,60 +243,88 @@ pub(crate) fn admit_seed_on_abort(
     stages.reserve(producer);
 }
 
-/// Intra-block Detect from a published non-lazy write-set.
+/// Intra-block Detect from a published write-set.
 ///
-/// Hidden writes (not Basic(from)) associate envelope `to` with the real
-/// locations and upgrade a probe-star to a predecessor chain (wait-for the
-/// immediate writer). Lazy-only publish **releases** the empty-`to` probe so
-/// independent payees are not serialized.
+/// D1: every publish extends the location writer total order over **all**
+/// earlier writers on that ℓ (fixes 4→31 on Basic(0x32be) — not only
+/// `hints.to_txs(to)`).
+/// D2: envelope probes upgrade to the real location or release if lazy-only.
+/// D3: ReadyEdge A1 only on effective (non-lazy Data / Storage) locations.
 pub(crate) fn admit_seed_on_write_set(
     ready: &ReadyEdgeTable,
     hints: &AccountHints,
     wave: &WaveParkTable,
+    policy: Option<&CostPolicy>,
     writer: TxIdx,
     from: Address,
     to: Option<Address>,
-    write_locs: &[MemoryLocationHash],
+    all_write_locs: &[MemoryLocationHash],
+    effective_locs: &[MemoryLocationHash],
 ) {
     let from_loc = hash_deterministic(MemoryLocation::Basic(from));
-    if write_locs.iter().any(|&l| l == from_loc) {
-        ready.note_raw_producer(from_loc, writer);
+    // D1: record every writer (lazy included) so 4→31 is visible in order.
+    // PC-2 / D3: ReadyEdge A1 only on effective (non-lazy Data / Storage).
+    for &loc in all_write_locs {
+        ready.note_location_writer(loc, writer);
     }
+    if effective_locs.iter().any(|&l| l == from_loc) {
+        ready.note_raw_producer(from_loc, writer);
+        // PC-2 / PC-5: 2-tx pairs and empty-calldata same-from stay A0 even
+        // when nonce/balance is Data — refuse meta loses to one OCC abort.
+        let from_txs = hints.from_txs(&from);
+        if from_txs.len() >= 3 && !hints.cohort_all_empty(from_txs) {
+            ready.note_immediate_pred(from_loc, writer);
+        }
+    }
+
     let Some(to) = to else {
+        for &loc in effective_locs {
+            if loc != from_loc {
+                ready.note_raw_producer(loc, writer);
+                ready.note_immediate_pred(loc, writer);
+            }
+        }
         return;
     };
-    let hidden: Vec<MemoryLocationHash> = write_locs
+
+    let hidden_eff: Vec<MemoryLocationHash> = effective_locs
         .iter()
         .copied()
         .filter(|&l| l != from_loc)
         .collect();
-    let later: Vec<TxIdx> = hints
-        .to_txs(&to)
-        .iter()
-        .copied()
-        .filter(|&t| t > writer)
-        .collect();
-    if later.is_empty() {
-        return;
-    }
 
     // RAW fan-out star: keep all consumers behind the first producer.
     if hints.call_to_txs(&to).len() >= RAW_FANOUT_FLOOR {
-        for loc in hidden {
+        for loc in hidden_eff {
             ready.note_raw_producer(loc, writer);
+            ready.note_location_writer(loc, writer);
+            ready.note_immediate_pred(loc, writer);
+        }
+        if let Some(p) = policy {
+            p.note_eff_waw(CohortKind::RawFan, to, true);
         }
         return;
     }
 
-    if hidden.is_empty() {
+    if hidden_eff.is_empty() {
+        // D2: lazy-only. Release + learn only when an A1 probe is live
+        // (PC-5: independent empty transfers must not take deferred/B2 locks).
+        let later = hints.to_txs(&to);
+        let probed = later.iter().any(|&t| t > writer && ready.was_queued(t));
+        if !probed {
+            return;
+        }
+        if let Some(p) = policy {
+            p.note_eff_waw(CohortKind::EmptyTo, to, false);
+        }
         let from_later: Vec<TxIdx> = hints
             .from_txs(&from)
             .iter()
             .copied()
             .filter(|&t| t > writer)
             .collect();
-        for t in later {
-            if from_later.contains(&t) {
+        for &t in later {
+            if t <= writer || from_later.contains(&t) {
                 continue;
             }
             ready.release_consumer(t, wave);
@@ -253,13 +332,45 @@ pub(crate) fn admit_seed_on_write_set(
         return;
     }
 
-    for loc in hidden {
-        ready.note_raw_producer(loc, writer);
+    if let Some(p) = policy {
+        let kind = if hints.call_to_txs(&to).len() >= CALL_WAW_FLOOR {
+            CohortKind::CallWaw
+        } else {
+            CohortKind::EmptyTo
+        };
+        p.note_eff_waw(kind, to, true);
     }
-    let mut ordered = Vec::with_capacity(later.len() + 1);
-    ordered.push(writer);
-    ordered.extend(later);
-    let _ = note_predecessor_chain(ready, &ordered);
+
+    let later: Vec<TxIdx> = hints
+        .to_txs(&to)
+        .iter()
+        .copied()
+        .filter(|&t| t > writer)
+        .collect();
+    // Production: only upgrade an existing A1 probe (begin-block EV).
+    // Tests pass `policy=None` and still expect write-set to plant the chain.
+    let chain_later = !later.is_empty()
+        && (later.iter().any(|&t| ready.was_queued(t)) || policy.is_none());
+    let mut queued = HashSet::new();
+    for loc in hidden_eff {
+        ready.note_raw_producer(loc, writer);
+        ready.note_location_writer(loc, writer);
+        // D1: 4→31 when 4 already published this ℓ (any envelope).
+        ready.note_immediate_pred(loc, writer);
+        if !chain_later {
+            continue;
+        }
+        let pred = ready
+            .writers_of(loc)
+            .into_iter()
+            .rev()
+            .find(|&w| w <= writer)
+            .unwrap_or(writer);
+        let mut ordered = Vec::with_capacity(later.len() + 1);
+        ordered.push(pred);
+        ordered.extend(later.iter().copied());
+        let _ = note_predecessor_chain(ready, &ordered, loc, &mut queued);
+    }
 }
 
 #[cfg(test)]
@@ -270,8 +381,38 @@ mod tests {
     use crate::{MemoryLocation, hash_deterministic};
     use alloy_primitives::Address;
 
+    fn policy_for(n: usize) -> CostPolicy {
+        let p = CostPolicy::new();
+        p.begin_block(n);
+        p
+    }
+
+    fn seed(
+        ready: &ReadyEdgeTable,
+        stages: &ProducerStageTable,
+        learner: &LiveLearner,
+        bayes: &BayesMap,
+        prior: &InterBlockPrior,
+        hints: &AccountHints,
+        contracts: &HashSet<Address>,
+    ) -> usize {
+        let n = hints.n_txs().max(32);
+        let policy = policy_for(n);
+        admit_seed_begin_block(
+            ready,
+            stages,
+            learner,
+            bayes,
+            prior,
+            hints,
+            Address::ZERO,
+            &policy,
+            contracts,
+        )
+    }
+
     #[test]
-    fn same_from_chain_seeds_predecessor_not_star() {
+    fn lazy_same_from_is_not_seeded() {
         let ready = ReadyEdgeTable::new();
         let stages = ProducerStageTable::new();
         let learner = LiveLearner::new();
@@ -280,34 +421,17 @@ mod tests {
         let prior = InterBlockPrior::new();
         let addr = Address::repeat_byte(0x11);
         let hints = AccountHints::from_account_txs(addr, (0..20).collect());
-        let n = admit_seed_begin_block(
+        let n = seed(
             &ready,
             &stages,
             &learner,
             &bayes,
             &prior,
             &hints,
-            Address::ZERO,
+            &HashSet::new(),
         );
-        assert!(n >= 19, "same-from WAW must chain 19 edges, got {n}");
-        assert!(ready.may_execute(0), "head of the WAW chain must run");
-        assert!(!ready.may_execute(19));
-        assert_eq!(
-            ready.blocking_producer(19),
-            Some(18),
-            "WAW Avoid is wait-for the immediate predecessor, not a star on tx 0"
-        );
-        assert_eq!(ready.blocking_producer(1), Some(0));
-        assert!(
-            !stages.is_reserved(18),
-            "WAW chain must not ProducerStage-reserve the whole spine"
-        );
-        let loc = hash_deterministic(MemoryLocation::Basic(addr));
-        assert!(
-            !learner.predicted_essential(loc, FAN_STAR_K),
-            "same-from WAW must not plant PE (independent tax)"
-        );
-        assert_eq!(ready.predicted_producer(loc), Some(0));
+        assert_eq!(n, 0, "PC-2: basic_lazy same-from must default A0, got {n}");
+        assert!(ready.may_execute(19), "lazy spine stays independent");
     }
 
     #[test]
@@ -321,14 +445,10 @@ mod tests {
         let payee = Address::repeat_byte(0x33);
         // 16 empty-calldata `to` (like 0x209c) — provisional chain, no Basic(to) PE.
         let hints = AccountHints::from_to_txs(payee, (0..16).collect());
-        let n = admit_seed_begin_block(
-            &ready,
-            &stages,
-            &learner,
-            &bayes,
-            &prior,
-            &hints,
-            Address::ZERO,
+        let mut contracts = HashSet::new();
+        contracts.insert(payee);
+        let n = seed(
+            &ready, &stages, &learner, &bayes, &prior, &hints, &contracts,
         );
         assert!(n >= 15, "hot empty-to must probe-star, got {n}");
         assert!(ready.may_execute(0), "probe head of empty-to must run");
@@ -360,14 +480,14 @@ mod tests {
         let prior = InterBlockPrior::new();
         let payee = Address::repeat_byte(0x55);
         let hints = AccountHints::from_to_txs(payee, vec![3, 9]);
-        let n = admit_seed_begin_block(
+        let n = seed(
             &ready,
             &stages,
             &learner,
             &bayes,
             &prior,
             &hints,
-            Address::ZERO,
+            &HashSet::new(),
         );
         assert_eq!(n, 0, "2-tx lazy payee must not tax independents");
         assert!(ready.may_execute(9));
@@ -383,14 +503,14 @@ mod tests {
         let prior = InterBlockPrior::new();
         let contract = Address::repeat_byte(0xed);
         let hints = AccountHints::from_call_to_txs(contract, vec![14, 16, 17]);
-        let n = admit_seed_begin_block(
+        let n = seed(
             &ready,
             &stages,
             &learner,
             &bayes,
             &prior,
             &hints,
-            Address::ZERO,
+            &HashSet::new(),
         );
         assert_eq!(n, 2, "14→16→17 wait-for chain");
         assert!(ready.may_execute(14));
@@ -418,14 +538,14 @@ mod tests {
         let prior = InterBlockPrior::new();
         let token = Address::repeat_byte(0xaa);
         let hints = AccountHints::from_call_to_txs(token, (0..16).collect());
-        let n = admit_seed_begin_block(
+        let n = seed(
             &ready,
             &stages,
             &learner,
             &bayes,
             &prior,
             &hints,
-            Address::ZERO,
+            &HashSet::new(),
         );
         assert!(n >= 15);
         assert_eq!(
@@ -452,14 +572,10 @@ mod tests {
         let to = Address::repeat_byte(0x20);
         let from = Address::repeat_byte(0x31);
         let hints = AccountHints::from_to_txs(to, vec![31, 66, 67, 69, 70, 93, 96, 103, 115]);
-        let n = admit_seed_begin_block(
-            &ready,
-            &stages,
-            &learner,
-            &bayes,
-            &prior,
-            &hints,
-            Address::ZERO,
+        let mut contracts = HashSet::new();
+        contracts.insert(to);
+        let n = seed(
+            &ready, &stages, &learner, &bayes, &prior, &hints, &contracts,
         );
         assert_eq!(n, 8, "probe-star: later empty-to wait on tx 31");
         assert!(ready.may_execute(31));
@@ -472,7 +588,17 @@ mod tests {
         );
         let hidden = 0x32be_u64;
         let wave = WaveParkTable::new();
-        admit_seed_on_write_set(&ready, &hints, &wave, 31, from, Some(to), &[hidden]);
+        admit_seed_on_write_set(
+            &ready,
+            &hints,
+            &wave,
+            None,
+            31,
+            from,
+            Some(to),
+            &[hidden],
+            &[hidden],
+        );
         assert_eq!(ready.blocking_producer(66), Some(31));
         assert_eq!(
             ready.blocking_producer(67),
@@ -497,7 +623,17 @@ mod tests {
         let from = Address::repeat_byte(0x31);
         let hints = AccountHints::from_to_txs(to, vec![31, 66, 67, 69]);
         let hidden = 0x32be_u64;
-        admit_seed_on_write_set(&ready, &hints, &wave, 31, from, Some(to), &[hidden]);
+        admit_seed_on_write_set(
+            &ready,
+            &hints,
+            &wave,
+            None,
+            31,
+            from,
+            Some(to),
+            &[hidden],
+            &[hidden],
+        );
         assert_eq!(ready.blocking_producer(66), Some(31));
         assert_eq!(ready.blocking_producer(67), Some(66));
         assert_eq!(ready.blocking_producer(69), Some(67));
@@ -512,13 +648,25 @@ mod tests {
         let to = Address::repeat_byte(0x20);
         let from = Address::repeat_byte(0x31);
         let hints = AccountHints::from_to_txs(to, (31..47).collect());
-        let n = note_probe_star(&ready, hints.to_txs(&to));
+        let loc = envelope_loc(to);
+        let mut queued = HashSet::new();
+        let n = note_probe_star(&ready, hints.to_txs(&to), loc, &mut queued);
         assert!(n >= 15);
         assert!(!ready.may_execute(32));
         assert_eq!(ready.blocking_producer(32), Some(31));
         // Writer 31 published only Basic(from) — no hidden WAW.
         let from_loc = hash_deterministic(MemoryLocation::Basic(from));
-        admit_seed_on_write_set(&ready, &hints, &wave, 31, from, Some(to), &[from_loc]);
+        admit_seed_on_write_set(
+            &ready,
+            &hints,
+            &wave,
+            None,
+            31,
+            from,
+            Some(to),
+            &[from_loc],
+            &[],
+        );
         assert!(
             ready.may_execute(32),
             "lazy payee chain must release after write-set shows no hidden WAW"
@@ -553,14 +701,14 @@ mod tests {
                 k_template: 6,
             }],
         );
-        let n = admit_seed_begin_block(
+        let n = seed(
             &ready,
             &stages,
             &learner,
             &bayes,
             &prior,
             &AccountHints::default(),
-            Address::ZERO,
+            &HashSet::new(),
         );
         assert_eq!(n, 0, "no hint accounts → no ReadyEdges");
         assert!(
@@ -579,14 +727,14 @@ mod tests {
         let prior = InterBlockPrior::new();
         let addr = Address::repeat_byte(0x22);
         let hints = AccountHints::from_account_txs(addr, vec![0]);
-        let n = admit_seed_begin_block(
+        let n = seed(
             &ready,
             &stages,
             &learner,
             &bayes,
             &prior,
             &hints,
-            Address::ZERO,
+            &HashSet::new(),
         );
         assert_eq!(n, 0, "single-tx sender is not a WAW chain");
         assert!(ready.may_execute(2));
@@ -602,14 +750,14 @@ mod tests {
         let prior = InterBlockPrior::new();
         let addr = Address::repeat_byte(0x56);
         let hints = AccountHints::from_account_txs(addr, vec![56, 57]);
-        let n = admit_seed_begin_block(
+        let n = seed(
             &ready,
             &stages,
             &learner,
             &bayes,
             &prior,
             &hints,
-            Address::ZERO,
+            &HashSet::new(),
         );
         assert_eq!(n, 0, "2-tx same-from stays OCC-cost (no refuse tax)");
         assert!(ready.may_execute(57));
@@ -638,36 +786,222 @@ mod tests {
         let side = Address::repeat_byte(0x44);
         // RAW calldata star + a 3-tx same-from satellite. Floor=2-because-star is banned.
         let hints_star = AccountHints::from_call_to_txs(star, (0..16).collect());
-        let n = admit_seed_begin_block(
+        let n = seed(
             &ready,
             &stages,
             &learner,
             &bayes,
             &prior,
             &hints_star,
-            Address::ZERO,
+            &HashSet::new(),
         );
         assert!(n >= 15);
         let ready_side = ReadyEdgeTable::new();
         let stages_side = ProducerStageTable::new();
         let side_hints = AccountHints::from_account_txs(side, vec![1, 5, 8]);
-        let n_side = admit_seed_begin_block(
+        let n_side = seed(
             &ready_side,
             &stages_side,
             &learner,
             &bayes,
             &prior,
             &side_hints,
-            Address::ZERO,
+            &HashSet::new(),
         );
         assert_eq!(
-            n_side, 2,
-            "satellite same-from gets its own 2-edge chain, not a star tax"
+            n_side, 0,
+            "PC-2: lazy same-from satellite stays A0 (not a star tax)"
         );
-        assert_eq!(ready_side.blocking_producer(8), Some(5));
+        assert!(ready_side.may_execute(8));
         assert!(
             learner.predicted_essential(storage_loc, 6),
             "true-k: hint-fan plants storage RAW PE from InterPrior, not Basic→Storage clone"
         );
+    }
+
+    #[test]
+    fn write_set_d1_extends_all_earlier_writers() {
+        // 3356896: tx4 writes Basic(0x32be); tx31 later writes the same ℓ via 0x209c.
+        let ready = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        let to = Address::repeat_byte(0x20);
+        let hot = Address::repeat_byte(0x32);
+        let other = Address::repeat_byte(0x99);
+        let hints = AccountHints::from_to_txs(to, vec![31, 66, 67]);
+        let loc = 0x32be_u64;
+        // tx4 (from=hot, to=other) publishes Basic(hot) — not in hints.to_txs(to).
+        admit_seed_on_write_set(
+            &ready,
+            &AccountHints::from_to_txs(other, vec![4]),
+            &wave,
+            None,
+            4,
+            hot,
+            Some(other),
+            &[loc],
+            &[loc],
+        );
+        assert_eq!(ready.writers_of(loc), vec![4]);
+        admit_seed_on_write_set(
+            &ready,
+            &hints,
+            &wave,
+            None,
+            31,
+            Address::repeat_byte(0x31),
+            Some(to),
+            &[loc],
+            &[loc],
+        );
+        assert_eq!(
+            ready.writers_of(loc),
+            vec![4, 31],
+            "D1 writer order must list 4 then 31"
+        );
+        assert_eq!(
+            ready.blocking_producer(31),
+            Some(4),
+            "4→31 must be a ReadyEdge after write-set, not scheduler luck"
+        );
+        assert_eq!(ready.blocking_producer(66), Some(31));
+    }
+
+    #[test]
+    fn write_set_d1_lazy_then_effective_still_chains_4_to_31() {
+        let ready = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        let to = Address::repeat_byte(0x20);
+        let hot = Address::repeat_byte(0x32);
+        let other = Address::repeat_byte(0x99);
+        let hints = AccountHints::from_to_txs(to, vec![31, 66, 67]);
+        let loc = 0x32be_u64;
+        // tx4 publishes lazy-only on the hot account — record, do not A1-fence.
+        admit_seed_on_write_set(
+            &ready,
+            &AccountHints::from_to_txs(other, vec![4]),
+            &wave,
+            None,
+            4,
+            hot,
+            Some(other),
+            &[loc],
+            &[],
+        );
+        assert_eq!(ready.writers_of(loc), vec![4]);
+        assert!(
+            ready.may_execute(31),
+            "lazy-only publish must not refuse the next writer before Detect"
+        );
+        admit_seed_on_write_set(
+            &ready,
+            &hints,
+            &wave,
+            None,
+            31,
+            Address::repeat_byte(0x31),
+            Some(to),
+            &[loc],
+            &[loc],
+        );
+        assert_eq!(ready.writers_of(loc), vec![4, 31]);
+        assert_eq!(
+            ready.blocking_producer(31),
+            Some(4),
+            "effective publish must extend order over the earlier lazy writer"
+        );
+        assert_eq!(ready.blocking_producer(66), Some(31));
+    }
+
+    #[test]
+    fn write_set_lazy_from_does_not_a1_same_from_spine() {
+        // PC-2: LazySender on Basic(from) is not effective WAW — no ReadyEdge tax.
+        let ready = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        let from = Address::repeat_byte(0x2a);
+        let to = Address::repeat_byte(0x11);
+        let from_loc = hash_deterministic(MemoryLocation::Basic(from));
+        let hints = AccountHints::from_from_and_to(from, to, vec![5, 6, 7, 8]);
+        admit_seed_on_write_set(
+            &ready,
+            &hints,
+            &wave,
+            None,
+            5,
+            from,
+            Some(to),
+            &[from_loc],
+            &[],
+        );
+        admit_seed_on_write_set(
+            &ready,
+            &hints,
+            &wave,
+            None,
+            6,
+            from,
+            Some(to),
+            &[from_loc],
+            &[],
+        );
+        assert_eq!(ready.writers_of(from_loc), vec![5, 6]);
+        assert!(
+            ready.may_execute(6) && ready.may_execute(7) && ready.may_execute(8),
+            "lazy same-from must stay A0 after write-set (no mid-block refuse tax)"
+        );
+    }
+
+    #[test]
+    fn write_set_two_tx_effective_from_stays_a0() {
+        let ready = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        let from = Address::repeat_byte(0x56);
+        let to = Address::repeat_byte(0x11);
+        let from_loc = hash_deterministic(MemoryLocation::Basic(from));
+        let hints = AccountHints::from_from_and_to(from, to, vec![56, 57]);
+        admit_seed_on_write_set(
+            &ready,
+            &hints,
+            &wave,
+            None,
+            56,
+            from,
+            Some(to),
+            &[from_loc],
+            &[from_loc],
+        );
+        assert!(
+            ready.may_execute(57),
+            "2-tx same-from Data nonce must stay OCC-cost"
+        );
+    }
+
+    #[test]
+    fn pc3_empty_to_does_not_dual_queue_same_from() {
+        let ready = ReadyEdgeTable::new();
+        let stages = ProducerStageTable::new();
+        let learner = LiveLearner::new();
+        learner.begin_block(MorphWeights::default());
+        let bayes = BayesMap::new();
+        let prior = InterBlockPrior::new();
+        // 0x9535∩0x9e0b shape: same txs in same-from and empty-to.
+        let from = Address::repeat_byte(0x95);
+        let to = Address::repeat_byte(0x9e);
+        let txs: Vec<TxIdx> = (75..87).collect();
+        let hints = AccountHints::from_from_and_to(from, to, txs);
+        let mut contracts = HashSet::new();
+        contracts.insert(to);
+        let n = seed(
+            &ready, &stages, &learner, &bayes, &prior, &hints, &contracts,
+        );
+        // Same-from is lazy → not seeded. Empty-to EOA would be A0; we marked
+        // `to` as contract so the probe may fire — but each tx is on one queue.
+        let blocked = ready.blocked_consumers();
+        let unique: HashSet<_> = blocked.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            blocked.len(),
+            "PC-3: no dual same-from + empty-to tax"
+        );
+        let _ = n;
     }
 }

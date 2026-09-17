@@ -189,6 +189,7 @@ mod kernel;
 mod lane;
 mod learner;
 mod metrics;
+mod policy;
 mod prior;
 mod process;
 mod producer_stage;
@@ -258,6 +259,9 @@ pub(crate) use lane::LaneTable;
 pub(crate) use learner::{AdaptiveParams, InterBlockPrior, LiveLearner};
 pub(crate) use metrics::MetricsInner;
 pub use metrics::SpecFenceMetrics;
+pub use policy::LearnReport;
+#[allow(unused_imports)]
+pub(crate) use policy::{AdmitAction, CohortKind, CostPolicy};
 pub(crate) use prior::RwPriorMap;
 pub(crate) use process::ProcessTrace;
 pub use process::{ExecProcessSnapshot, LocProcessSnap, PerTxProcessSnap, ProcessReason};
@@ -321,6 +325,8 @@ pub(crate) struct AccountHints {
     to_by_account: HashMap<Address, Vec<TxIdx>, BuildSuffixHasher>,
     /// `to` with nonempty calldata (contract calls).
     call_to_by_account: HashMap<Address, Vec<TxIdx>, BuildSuffixHasher>,
+    /// Per-tx: true when envelope calldata is empty (lazy-transfer class).
+    empty_calldata: Vec<bool>,
 }
 
 impl AccountHints {
@@ -333,14 +339,17 @@ impl AccountHints {
             HashMap::with_hasher(BuildSuffixHasher::default());
         let mut call_to_by_account: HashMap<Address, Vec<TxIdx>, BuildSuffixHasher> =
             HashMap::with_hasher(BuildSuffixHasher::default());
+        let mut empty_calldata = vec![true; txs.len()];
         for (idx, tx) in txs.iter().enumerate() {
             let env = chain.tx_env(tx);
             by_account.entry(env.caller).or_default().push(idx);
             from_by_account.entry(env.caller).or_default().push(idx);
+            let empty = env.data.is_empty();
+            empty_calldata[idx] = empty;
             if let Some(to) = env.kind.to() {
                 by_account.entry(*to).or_default().push(idx);
                 to_by_account.entry(*to).or_default().push(idx);
-                if !env.data.is_empty() {
+                if !empty {
                     call_to_by_account.entry(*to).or_default().push(idx);
                 }
             }
@@ -361,6 +370,7 @@ impl AccountHints {
             from_by_account,
             to_by_account,
             call_to_by_account,
+            empty_calldata,
         }
     }
 
@@ -416,6 +426,22 @@ impl AccountHints {
             .unwrap_or(&[])
     }
 
+    /// True when tx `idx` has empty envelope calldata (lazy-transfer class).
+    #[inline]
+    pub(crate) fn is_empty_calldata(&self, idx: TxIdx) -> bool {
+        self.empty_calldata.get(idx).copied().unwrap_or(true)
+    }
+
+    /// True when every tx in `txs` is empty-calldata (basic_lazy sender spine).
+    #[inline]
+    pub(crate) fn cohort_all_empty(&self, txs: &[TxIdx]) -> bool {
+        !txs.is_empty() && txs.iter().all(|&t| self.is_empty_calldata(t))
+    }
+
+    pub(crate) fn n_txs(&self) -> usize {
+        self.empty_calldata.len()
+    }
+
     #[cfg(test)]
     pub(crate) fn from_account_txs(addr: Address, txs: Vec<TxIdx>) -> Self {
         Self::from_many(vec![(addr, txs)])
@@ -429,11 +455,18 @@ impl AccountHints {
             by_account.insert(addr, txs.clone());
             from_by_account.insert(addr, txs);
         }
+        let max = from_by_account
+            .values()
+            .flatten()
+            .copied()
+            .max()
+            .unwrap_or(0);
         Self {
             by_account,
             from_by_account,
             to_by_account: HashMap::with_hasher(BuildSuffixHasher::default()),
             call_to_by_account: HashMap::with_hasher(BuildSuffixHasher::default()),
+            empty_calldata: vec![true; max + 1],
         }
     }
 
@@ -441,6 +474,7 @@ impl AccountHints {
     pub(crate) fn from_to_txs(addr: Address, txs: Vec<TxIdx>) -> Self {
         let mut by_account = HashMap::with_hasher(BuildSuffixHasher::default());
         let mut to_by_account = HashMap::with_hasher(BuildSuffixHasher::default());
+        let max = txs.iter().copied().max().unwrap_or(0);
         by_account.insert(addr, txs.clone());
         to_by_account.insert(addr, txs);
         Self {
@@ -448,7 +482,20 @@ impl AccountHints {
             from_by_account: HashMap::with_hasher(BuildSuffixHasher::default()),
             to_by_account,
             call_to_by_account: HashMap::with_hasher(BuildSuffixHasher::default()),
+            empty_calldata: vec![true; max + 1],
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_from_and_to(from: Address, to: Address, txs: Vec<TxIdx>) -> Self {
+        let mut h = Self::from_account_txs(from, txs.clone());
+        let max = txs.iter().copied().max().unwrap_or(0);
+        if h.empty_calldata.len() <= max {
+            h.empty_calldata.resize(max + 1, true);
+        }
+        h.to_by_account.insert(to, txs.clone());
+        h.by_account.entry(to).or_insert(txs);
+        h
     }
 
     #[cfg(test)]
@@ -456,6 +503,7 @@ impl AccountHints {
         let mut by_account = HashMap::with_hasher(BuildSuffixHasher::default());
         let mut to_by_account = HashMap::with_hasher(BuildSuffixHasher::default());
         let mut call_to_by_account = HashMap::with_hasher(BuildSuffixHasher::default());
+        let max = txs.iter().copied().max().unwrap_or(0);
         by_account.insert(addr, txs.clone());
         to_by_account.insert(addr, txs.clone());
         call_to_by_account.insert(addr, txs);
@@ -464,6 +512,7 @@ impl AccountHints {
             from_by_account: HashMap::with_hasher(BuildSuffixHasher::default()),
             to_by_account,
             call_to_by_account,
+            empty_calldata: vec![false; max + 1],
         }
     }
 
@@ -520,6 +569,8 @@ pub(crate) struct SpecFenceCtx<'a> {
     pub lanes: &'a crate::specfence::LaneTable,
     /// Opt-in lab fine-grain OCC/RW tracer (None = disabled, zero cost).
     pub finegrain: Option<&'a crate::specfence::FineGrainCollector>,
+    /// B3/B2 cost-aware A0 vs A1 policy (Soft=0).
+    pub policy: Option<&'a CostPolicy>,
 }
 
 impl<'a> SpecFenceCtx<'a> {

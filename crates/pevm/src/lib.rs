@@ -224,8 +224,8 @@ pub mod specfence;
 pub use specfence::{
     AbortEvent, AccountGrainObserve, ConcurrencyMode, ConsumerFirstCross, DagStats,
     DecisionFieldSnap, EffectClass, EffectLogEntry, EffectStreamDiag, ExecProcessSnapshot,
-    FineGrainCollector, FineGrainSnapshot, HotLocation, L1DagSummary, LocationKind, MaMdProxy,
-    MeasurementMethod, PerTxProcessSnap, RawEdge, RawEffectEdge, SpecFenceMetrics, TxRw,
+    FineGrainCollector, FineGrainSnapshot, HotLocation, L1DagSummary, LearnReport, LocationKind,
+    MaMdProxy, MeasurementMethod, PerTxProcessSnap, RawEdge, RawEffectEdge, SpecFenceMetrics, TxRw,
     TxWorkTotal, analyze_dag, classify_raw_edges, dependency_edges, effect_raw_longest_chain,
     effect_raw_max_fanout, estimate_ma_md, filter_effect_edges, hot_locations, kind_histogram,
     l1_dag_summary, percentile_f64, producer_status_canonical, program_raw_longest_chain,

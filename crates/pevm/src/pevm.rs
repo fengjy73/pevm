@@ -7,9 +7,9 @@ use std::{
     thread,
 };
 
-use alloy_primitives::{TxNonce, U256};
+use alloy_primitives::{Address, KECCAK256_EMPTY, TxNonce, U256};
 use alloy_rpc_types_eth::{Block, BlockTransactions};
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use revm::{
     DatabaseCommit, ExecuteEvm,
     context::{
@@ -29,12 +29,12 @@ use crate::{
     mv_memory::MvMemory,
     scheduler::Scheduler,
     specfence::{
-        AccountHints, AdaptiveEngagement, AdaptiveParams, BayesMap, ConcurrencyMode, DEFAULT_TAU,
-        EdgeTable, ExecProcessSnapshot, FineGrainCollector, FineGrainSnapshot, HeatMap, HotSet,
-        HotSketch, InterBlockPrior, LeanAbortRepair, LiveLearner, MetricsInner, PartialRetryTable,
-        ProcessTrace, RemCounters, ResearchAbortRepair, RwPriorMap, SpecDag, SpecFenceCtx,
-        SpecFenceMetrics, WaveParkTable, seed_wait_regions, update_bayes, update_heat,
-        update_rw_prior,
+        AccountHints, AdaptiveEngagement, AdaptiveParams, BayesMap, ConcurrencyMode, CostPolicy,
+        DEFAULT_TAU, EdgeTable, ExecProcessSnapshot, FineGrainCollector, FineGrainSnapshot,
+        HeatMap, HotSet, HotSketch, InterBlockPrior, LeanAbortRepair, LearnReport, LiveLearner,
+        MetricsInner, PartialRetryTable, ProcessTrace, RemCounters, ResearchAbortRepair,
+        RwPriorMap, SpecDag, SpecFenceCtx, SpecFenceMetrics, WaveParkTable, seed_wait_regions,
+        update_bayes, update_heat, update_rw_prior,
     },
     storage::StorageWrapper,
     vm::{
@@ -166,10 +166,16 @@ pub struct Pevm {
     hotset: HotSet,
     /// P1: inter-block morph / top-ℓ prior (warm-start only).
     inter_prior: InterBlockPrior,
+    /// B2 cross-block p_effWAW / refuse-cost calibrator (Soft=0 A0/A1).
+    cost_policy: CostPolicy,
     /// P1: tunable π constants (process-level).
     adaptive_params: AdaptiveParams,
     last_metrics: SpecFenceMetrics,
     last_process: ExecProcessSnapshot,
+    last_learn_report: LearnReport,
+    last_incarnations: Vec<usize>,
+    last_location_writers: Vec<(u64, Vec<usize>)>,
+    last_begin_blocked: Vec<usize>,
     last_initial_wait_accounts: std::collections::HashSet<alloy_primitives::Address>,
     /// M4: abort rate from the previous SpecFence block (`occ_aborts / n_tx`).
     last_abort_rate: f64,
@@ -190,9 +196,14 @@ impl Default for Pevm {
             rw_prior: RwPriorMap::new(),
             hotset: HotSet::new(),
             inter_prior: InterBlockPrior::new(),
+            cost_policy: CostPolicy::new(),
             adaptive_params: AdaptiveParams::from_l3(),
             last_metrics: SpecFenceMetrics::default(),
             last_process: ExecProcessSnapshot::default(),
+            last_learn_report: LearnReport::default(),
+            last_incarnations: Vec::new(),
+            last_location_writers: Vec::new(),
+            last_begin_blocked: Vec::new(),
             last_initial_wait_accounts: std::collections::HashSet::new(),
             last_abort_rate: 0.0,
             finegrain_enabled: false,
@@ -305,6 +316,27 @@ impl Pevm {
     /// Clear dual-horizon inter-block morph / top-ℓ prior (lab cold start).
     pub fn reset_inter_prior(&mut self) {
         self.inter_prior.reset();
+        self.cost_policy.reset();
+    }
+
+    /// B3/B2 learning report from the last SpecFence block.
+    pub const fn last_learn_report(&self) -> &LearnReport {
+        &self.last_learn_report
+    }
+
+    /// Final incarnation per tx (0 = first try). Prefer this over `occ_aborts` (D4).
+    pub fn last_incarnations(&self) -> &[usize] {
+        &self.last_incarnations
+    }
+
+    /// Location writer total order after write-set Detect (D1).
+    pub fn last_location_writers(&self) -> &[(u64, Vec<usize>)] {
+        &self.last_location_writers
+    }
+
+    /// ReadyEdge consumers blocked at begin_block (PC tax snapshot).
+    pub fn last_begin_blocked(&self) -> &[usize] {
+        &self.last_begin_blocked
     }
 
     /// G7: InterBlockPrior flip-α events observed since last reset.
@@ -457,6 +489,8 @@ impl Pevm {
             sketch.seed_from_prior_morph(&self.inter_prior.top_locations(), flipped, quiet);
             // Bayes → admit_seed before any Execute (v9.1). Known stars keep
             // PE even on quiet morph (M4). Truly cold seeds nothing.
+            self.cost_policy.begin_block(block_size);
+            let contracts = collect_contracts(storage, &hints);
             let _ = crate::specfence::admit::admit_seed_begin_block(
                 &ready_edges,
                 &producer_stages,
@@ -465,7 +499,10 @@ impl Pevm {
                 &self.inter_prior,
                 &hints,
                 block_env.beneficiary,
+                &self.cost_policy,
+                &contracts,
             );
+            self.last_begin_blocked = ready_edges.blocked_consumers();
             if quiet && !learner.has_any_predicted() {
                 let n = sketch.revoke_prior_fences_if_quiet(true);
                 metrics_inner.record_quiet_pessimistic_revoke(n);
@@ -513,6 +550,8 @@ impl Pevm {
             producer_stages: &producer_stages,
             lanes: &lanes,
             finegrain: finegrain_ref,
+            policy: (self.concurrency_mode == ConcurrencyMode::SpecFence)
+                .then_some(&self.cost_policy),
         };
 
         // TODO: Better thread handling
@@ -686,8 +725,46 @@ impl Pevm {
             metrics_inner.set_soft_wait_arms(dag.soft_arm_count());
             metrics_inner.set_sketch_hot_size(sketch.hot_size());
             self.last_process = process.snapshot(16);
+            let incs = scheduler.incarnation_snapshot();
+            let inc_gt0 = incs.iter().filter(|&&i| i > 0).count();
+            let reexec: usize = incs.iter().sum();
+            let mut miss = 0usize;
+            for (tx, &inc) in incs.iter().enumerate() {
+                if inc > 0 && !ready_edges.was_queued(tx) {
+                    miss += 1;
+                    self.cost_policy.note_a0_reexec();
+                    self.cost_policy.bump_miss_detect();
+                }
+            }
+            let ready_w = ready_edges.ready_width_mean();
+            let idle = ready_edges.idle_core_ns();
+            let refuse = ready_edges.refuse_count();
+            let refuse_unit = if refuse == 0 {
+                0.0
+            } else {
+                refuse as f64 / (block_size as f64).max(1.0)
+            };
+            self.cost_policy
+                .note_cost_sample(refuse_unit, inc_gt0 > 0, idle);
+            let report = self.cost_policy.take_report(ready_w, idle);
+            metrics_inner.set_pc_learn_metrics(
+                ready_w,
+                idle,
+                inc_gt0,
+                reexec,
+                miss,
+                report.a1_cohorts,
+                report.lean_a0_cohorts,
+            );
+            self.last_learn_report = report;
+            self.last_incarnations = incs;
+            self.last_location_writers = ready_edges.writer_order_snapshot();
         } else {
             self.last_process = ExecProcessSnapshot::default();
+            self.last_learn_report = LearnReport::default();
+            self.last_incarnations.clear();
+            self.last_location_writers.clear();
+            self.last_begin_blocked.clear();
         }
         metrics_inner.set_engagement_metrics(
             engagement.lean_mode_txs(),
@@ -2022,4 +2099,18 @@ pub fn execute_revm_sequential<S: Storage + Debug, C: PevmChain>(
         results.push(execution_result);
     }
     Ok(results)
+}
+
+/// Pre-state addresses with contract code — D2/PC-2 contract vs EOA gate.
+fn collect_contracts<S: Storage>(storage: &S, hints: &AccountHints) -> HashSet<Address> {
+    let mut out = HashSet::new();
+    for addr in hints.to_accounts().chain(hints.call_to_accounts()) {
+        match storage.code_hash(&addr) {
+            Ok(Some(h)) if h != KECCAK256_EMPTY && !h.is_zero() => {
+                out.insert(addr);
+            }
+            _ => {}
+        }
+    }
+    out
 }
