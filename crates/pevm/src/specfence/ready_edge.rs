@@ -54,15 +54,26 @@ impl ReadyEdgeTable {
     }
 
     /// Register a **known** consumer (this reader hit unpublished RAW / aborted).
+    ///
+    /// Keeps the **latest** unfinished predecessor (WAW immediate pred). A
+    /// begin-block probe-star (all later txs wait on the first) can upgrade to
+    /// a predecessor chain after the first write-set Detects a hidden location.
     #[inline]
     pub(crate) fn note_consumer(&self, consumer: TxIdx, producer: TxIdx) {
         if producer >= consumer || self.finished.contains_key(&producer) {
             return;
         }
-        self.consumers
+        let e = self
+            .consumers
             .entry(consumer)
-            .or_insert_with(|| AtomicUsize::new(producer))
-            .store(producer, Ordering::Relaxed);
+            .or_insert_with(|| AtomicUsize::new(producer));
+        let mut cur = e.load(Ordering::Relaxed);
+        while cur == NONE || producer > cur {
+            match e.compare_exchange_weak(cur, producer, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(v) => cur = v,
+            }
+        }
     }
 
     /// Producer published Data for \(\ell\).
@@ -158,6 +169,20 @@ impl ReadyEdgeTable {
     pub(crate) fn refuse_count(&self) -> usize {
         self.refuse.load(Ordering::Relaxed)
     }
+
+    /// Drop a provisional consumer bit and wake it (lazy `to` was not a real WAW).
+    pub(crate) fn release_consumer(&self, consumer: TxIdx, wave: &WaveParkTable) {
+        if let Some(e) = self.consumers.get(&consumer) {
+            e.store(NONE, Ordering::Relaxed);
+        }
+        let mut d = self.deferred.lock().unwrap();
+        let was_deferred = d.iter().any(|&t| t == consumer);
+        d.retain(|&t| t != consumer);
+        drop(d);
+        if was_deferred || self.may_execute(consumer) {
+            wave.push_ready(consumer);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -219,5 +244,29 @@ mod tests {
             t.may_execute(3),
             "note_consumer after Done must not refuse forever"
         );
+    }
+
+    #[test]
+    fn note_consumer_upgrades_probe_to_immediate_pred() {
+        let t = ReadyEdgeTable::new();
+        t.note_consumer(67, 31);
+        t.note_consumer(67, 66);
+        assert_eq!(
+            t.blocking_producer(67),
+            Some(66),
+            "WAW Avoid waits on the latest unfinished predecessor"
+        );
+    }
+
+    #[test]
+    fn release_consumer_clears_provisional_wait() {
+        let t = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        t.note_consumer(5, 2);
+        t.defer(5);
+        assert!(!t.may_execute(5));
+        t.release_consumer(5, &wave);
+        assert!(t.may_execute(5));
+        assert_eq!(wave.pop_ready(), Some(5));
     }
 }

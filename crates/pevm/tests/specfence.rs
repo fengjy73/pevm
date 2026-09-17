@@ -4104,3 +4104,41 @@ fn subgrain_done_ordered_admit_partial_abort_canary_prefer_admit() {
         "independents optimistic_read or OCC-identical: {p2:?}"
     );
 }
+
+/// WAW-chain ordered admission (3356896 shape): same-from writers wait on the
+/// immediate predecessor; independents take no ReadyEdge / refuse tax.
+#[test]
+fn specfence_waw_chain_ordered_admit_independents_untaxed() {
+    let chain_n = 8usize;
+    let indep_n = 40usize;
+    let sender = Address::from(U160::from(1));
+    let mut txs = Vec::with_capacity(chain_n + indep_n);
+    for i in 0..chain_n {
+        txs.push(self_transfer(sender, 1 + i as u64));
+    }
+    for i in 0..indep_n {
+        txs.push(self_transfer(Address::from(U160::from(20 + i)), 1));
+    }
+    let storage = storage_for(chain_n + indep_n + 32);
+    let width = NonZeroUsize::new(8).unwrap();
+    let (_, occ, _) = run_mode_conc(ConcurrencyMode::Occ, &storage, txs.clone(), width);
+    let (_, sf, _) = run_mode_conc(ConcurrencyMode::SpecFence, &storage, txs, width);
+    assert_eq!(sf.soft_wait_arms, 0, "Soft=0: {sf:?}");
+    assert!(
+        sf.occ_aborts <= occ.occ_aborts,
+        "WAW chain must not abort more than OCC: sf={} occ={} {sf:?}",
+        sf.occ_aborts,
+        occ.occ_aborts
+    );
+    // Refuse is the wait-for-dependency (predecessor chain). Independents
+    // must not be charged: refuse stays on the order of the WAW chain.
+    assert!(
+        sf.refuse_admit <= chain_n.saturating_mul(4),
+        "independents must not pay refuse_admit tax: refuse={} chain={chain_n} {sf:?}",
+        sf.refuse_admit
+    );
+    assert!(
+        !sf.wait_addresses.contains(&Address::from(U160::from(20))),
+        "independent senders must not Wait: {sf:?}"
+    );
+}

@@ -315,37 +315,102 @@ impl ConcurrencyMode {
 #[derive(Debug, Default)]
 pub(crate) struct AccountHints {
     by_account: HashMap<Address, Vec<TxIdx>, BuildSuffixHasher>,
+    /// Senders — always write Basic(from) (nonce / balance).
+    from_by_account: HashMap<Address, Vec<TxIdx>, BuildSuffixHasher>,
+    /// Recipients / callees (envelope `to`).
+    to_by_account: HashMap<Address, Vec<TxIdx>, BuildSuffixHasher>,
+    /// `to` with nonempty calldata (contract calls).
+    call_to_by_account: HashMap<Address, Vec<TxIdx>, BuildSuffixHasher>,
 }
 
 impl AccountHints {
     pub(crate) fn build<C: PevmChain>(chain: &C, txs: &[C::EvmTx]) -> Self {
         let mut by_account: HashMap<Address, Vec<TxIdx>, BuildSuffixHasher> =
             HashMap::with_hasher(BuildSuffixHasher::default());
+        let mut from_by_account: HashMap<Address, Vec<TxIdx>, BuildSuffixHasher> =
+            HashMap::with_hasher(BuildSuffixHasher::default());
+        let mut to_by_account: HashMap<Address, Vec<TxIdx>, BuildSuffixHasher> =
+            HashMap::with_hasher(BuildSuffixHasher::default());
+        let mut call_to_by_account: HashMap<Address, Vec<TxIdx>, BuildSuffixHasher> =
+            HashMap::with_hasher(BuildSuffixHasher::default());
         for (idx, tx) in txs.iter().enumerate() {
             let env = chain.tx_env(tx);
             by_account.entry(env.caller).or_default().push(idx);
+            from_by_account.entry(env.caller).or_default().push(idx);
             if let Some(to) = env.kind.to() {
                 by_account.entry(*to).or_default().push(idx);
+                to_by_account.entry(*to).or_default().push(idx);
+                if !env.data.is_empty() {
+                    call_to_by_account.entry(*to).or_default().push(idx);
+                }
             }
         }
-        for list in by_account.values_mut() {
-            list.sort_unstable();
-            list.dedup();
+        for map in [
+            &mut by_account,
+            &mut from_by_account,
+            &mut to_by_account,
+            &mut call_to_by_account,
+        ] {
+            for list in map.values_mut() {
+                list.sort_unstable();
+                list.dedup();
+            }
         }
-        Self { by_account }
+        Self {
+            by_account,
+            from_by_account,
+            to_by_account,
+            call_to_by_account,
+        }
     }
 
     pub(crate) fn accounts(&self) -> impl Iterator<Item = Address> + '_ {
         self.by_account.keys().copied()
     }
 
+    pub(crate) fn from_accounts(&self) -> impl Iterator<Item = Address> + '_ {
+        self.from_by_account.keys().copied()
+    }
+
+    pub(crate) fn to_accounts(&self) -> impl Iterator<Item = Address> + '_ {
+        self.to_by_account.keys().copied()
+    }
+
+    pub(crate) fn call_to_accounts(&self) -> impl Iterator<Item = Address> + '_ {
+        self.call_to_by_account.keys().copied()
+    }
+
     pub(crate) fn writer_count(&self, address: &Address) -> usize {
         self.by_account.get(address).map(Vec::len).unwrap_or(0)
     }
 
-    /// Consensus-order hinted txs for an account (admit_seed OrderedAdmit).
+    /// Consensus-order hinted txs for an account (union of from+to).
     pub(crate) fn txs(&self, address: &Address) -> &[TxIdx] {
         self.by_account
+            .get(address)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Consensus-order txs with this sender.
+    pub(crate) fn from_txs(&self, address: &Address) -> &[TxIdx] {
+        self.from_by_account
+            .get(address)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Consensus-order txs with this envelope `to`.
+    pub(crate) fn to_txs(&self, address: &Address) -> &[TxIdx] {
+        self.to_by_account
+            .get(address)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Consensus-order contract calls to this `to`.
+    pub(crate) fn call_to_txs(&self, address: &Address) -> &[TxIdx] {
+        self.call_to_by_account
             .get(address)
             .map(Vec::as_slice)
             .unwrap_or(&[])
@@ -359,10 +424,47 @@ impl AccountHints {
     #[cfg(test)]
     pub(crate) fn from_many(pairs: Vec<(Address, Vec<TxIdx>)>) -> Self {
         let mut by_account = HashMap::with_hasher(BuildSuffixHasher::default());
+        let mut from_by_account = HashMap::with_hasher(BuildSuffixHasher::default());
         for (addr, txs) in pairs {
-            by_account.insert(addr, txs);
+            by_account.insert(addr, txs.clone());
+            from_by_account.insert(addr, txs);
         }
-        Self { by_account }
+        Self {
+            by_account,
+            from_by_account,
+            to_by_account: HashMap::with_hasher(BuildSuffixHasher::default()),
+            call_to_by_account: HashMap::with_hasher(BuildSuffixHasher::default()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_to_txs(addr: Address, txs: Vec<TxIdx>) -> Self {
+        let mut by_account = HashMap::with_hasher(BuildSuffixHasher::default());
+        let mut to_by_account = HashMap::with_hasher(BuildSuffixHasher::default());
+        by_account.insert(addr, txs.clone());
+        to_by_account.insert(addr, txs);
+        Self {
+            by_account,
+            from_by_account: HashMap::with_hasher(BuildSuffixHasher::default()),
+            to_by_account,
+            call_to_by_account: HashMap::with_hasher(BuildSuffixHasher::default()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_call_to_txs(addr: Address, txs: Vec<TxIdx>) -> Self {
+        let mut by_account = HashMap::with_hasher(BuildSuffixHasher::default());
+        let mut to_by_account = HashMap::with_hasher(BuildSuffixHasher::default());
+        let mut call_to_by_account = HashMap::with_hasher(BuildSuffixHasher::default());
+        by_account.insert(addr, txs.clone());
+        to_by_account.insert(addr, txs.clone());
+        call_to_by_account.insert(addr, txs);
+        Self {
+            by_account,
+            from_by_account: HashMap::with_hasher(BuildSuffixHasher::default()),
+            to_by_account,
+            call_to_by_account,
+        }
     }
 
     /// Last transaction before `tx_idx` that hinted this account.

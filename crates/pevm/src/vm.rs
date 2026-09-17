@@ -3237,6 +3237,15 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 // M3: learn process WŜ from this incarnation's writes (no residual publish).
                 // R1/R3: feed HotSet writer counts (H_w) from non-lazy writes only.
                 if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+                    crate::specfence::admit::admit_seed_on_write_set(
+                        self.specfence.ready_edges,
+                        self.specfence.hints,
+                        self.specfence.wave,
+                        tx_version.tx_idx,
+                        tx.caller,
+                        tx.kind.to().copied(),
+                        &hotset_writer_locs,
+                    );
                     // Learning is consumed by decide() — always observe HotSet / WŜ.
                     if self.specfence.certificates.rem_legal(tx_version.tx_idx) {
                         let locs: Vec<_> = self.mv_memory.write_locations(tx_version.tx_idx);

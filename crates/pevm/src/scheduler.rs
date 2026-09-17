@@ -166,12 +166,15 @@ impl Scheduler {
                         edges.defer(tx_idx);
                         if let Some(wave) = wave {
                             drop(tx);
-                            self.admit_spine(w, wave);
+                            // Wave-admit the predecessor; do **not** fetch_min
+                            // execution_idx (that thrashes independents on a
+                            // long WAW spine / many same-from pairs).
+                            self.admit_spine_heat(w, wave, true);
                         }
                         return None;
                     }
                     if let Some(wave) = wave {
-                        self.admit_spine(w, wave);
+                        self.admit_spine_heat(w, wave, true);
                     }
                     // Fall through: Aborting/Validated canary; ProducerStage reserved.
                 }
@@ -277,7 +280,7 @@ impl Scheduler {
                             edges.defer(tx_idx);
                             if let Some(wave) = wave {
                                 drop(tx);
-                                self.admit_spine(w, wave);
+                                self.admit_spine_heat(w, wave, true);
                             }
                             continue;
                         }
