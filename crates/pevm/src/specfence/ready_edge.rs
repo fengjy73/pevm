@@ -173,7 +173,7 @@ impl ReadyEdgeTable {
         let mut out: Vec<(MemoryLocationHash, Vec<TxIdx>)> = self
             .location_writers
             .iter()
-            .map(|e| (*e.key(), e.value().clone())))
+            .map(|e| (*e.key(), e.value().clone()))
             .collect();
         out.sort_by_key(|(loc, _)| *loc);
         out
