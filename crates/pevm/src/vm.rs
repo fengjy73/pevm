@@ -3213,6 +3213,28 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         }
                     })
                     .collect();
+                let all_write_locs: Vec<MemoryLocationHash> = write_set
+                    .iter()
+                    .filter_map(|(loc, _)| {
+                        if *loc == self.beneficiary_location_hash {
+                            None
+                        } else {
+                            Some(*loc)
+                        }
+                    })
+                    .collect();
+                let effective_write_locs: Vec<MemoryLocationHash> = write_set
+                    .iter()
+                    .filter_map(|(loc, val)| {
+                        if *loc == self.beneficiary_location_hash {
+                            return None;
+                        }
+                        match val {
+                            MemoryValue::LazyRecipient(_) | MemoryValue::LazySender(_) => None,
+                            _ => Some(*loc),
+                        }
+                    })
+                    .collect();
                 if let Some(fg) = self.specfence.finegrain {
                     fg.deep_register_writes(
                         tx_version.tx_idx,
@@ -3241,10 +3263,12 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         self.specfence.ready_edges,
                         self.specfence.hints,
                         self.specfence.wave,
+                        self.specfence.policy,
                         tx_version.tx_idx,
                         tx.caller,
                         tx.kind.to().copied(),
-                        &hotset_writer_locs,
+                        &all_write_locs,
+                        &effective_write_locs,
                     );
                     // Learning is consumed by decide() — always observe HotSet / WŜ.
                     if self.specfence.certificates.rem_legal(tx_version.tx_idx) {

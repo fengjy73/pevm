@@ -5,6 +5,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
+    time::Instant,
 };
 
 use smallvec::SmallVec;
@@ -14,8 +15,8 @@ use crate::{
     specfence::{FenceGraph, ReadyEdgeTable, WaveParkTable},
 };
 
-/// After refuse_admit, probe this many later txs for an independent Execute.
-/// Wide enough for RAW_fan_out holes; small enough to stay work-conserving.
+/// After refuse_admit, probe later txs for an independent Execute.
+/// PC-1: steal any independent in the block — no empty refuse spin.
 const WAVE_FILL_WINDOW: usize = 32;
 
 // The Pevm collaborative scheduler coordinates execution & validation
@@ -238,7 +239,11 @@ impl Scheduler {
                         }
                     }
                 }
+                let idle_t0 = Instant::now();
                 thread::yield_now();
+                if let Some(edges) = ready {
+                    edges.add_idle_ns(idle_t0.elapsed().as_nanos() as u64);
+                }
                 continue;
             }
 
@@ -281,6 +286,12 @@ impl Scheduler {
                             if let Some(wave) = wave {
                                 drop(tx);
                                 self.admit_spine_heat(w, wave, true);
+                                // PC-1: same worker steals an independent after A1 refuse.
+                                if let Some(task) =
+                                    self.try_fill_independent_after_refuse(tx_idx, wave, ready)
+                                {
+                                    return Some(task);
+                                }
                             }
                             continue;
                         }
@@ -374,8 +385,9 @@ impl Scheduler {
         self.try_fill_independent_after_refuse(idx, wave, ready)
     }
 
-    /// After `refuse_admit` of `from`, run the next independent in a short window.
+    /// After `refuse_admit` of `from`, run the next independent.
     /// Does **not** `fetch_max(from+1)` (that fights `admit_spine` fetch_min).
+    /// PC-1: search the whole block after a short forward window — no empty spin.
     fn try_fill_independent_after_refuse(
         &self,
         from: TxIdx,
@@ -388,18 +400,41 @@ impl Scheduler {
         if edges.may_execute(from) {
             return None;
         }
-        let end = from.saturating_add(WAVE_FILL_WINDOW).min(self.block_size);
-        for cand in (from + 1)..end {
-            if !edges.may_execute(cand) {
-                continue;
-            }
-            if let Some(tx_version) = self.try_execute_ready(cand, Some(wave), ready) {
-                // Steal only — do not fetch_max(cand+1). Jumping the
-                // collaborative index past refused consumers dropped them
-                // off ready (iter11 lazy-eval unreachable / SIGSEGV).
+        while let Some(tx_idx) = wave.pop_ready() {
+            if let Some(tx_version) = self.try_execute_ready(tx_idx, Some(wave), ready) {
                 wave.note_ready_steal_if_after_park();
                 return Some(Task::Execution(tx_version));
             }
+        }
+        let mut ready_n = 0usize;
+        let steal = |cand: TxIdx, ready_n: &mut usize| -> Option<Task> {
+            if !edges.may_execute(cand) {
+                return None;
+            }
+            *ready_n += 1;
+            let tx_version = self.try_execute_ready(cand, Some(wave), ready)?;
+            edges.sample_ready_width((*ready_n).max(1));
+            wave.note_ready_steal_if_after_park();
+            Some(Task::Execution(tx_version))
+        };
+        let end = from.saturating_add(WAVE_FILL_WINDOW).min(self.block_size);
+        for cand in (from + 1)..end {
+            if let Some(task) = steal(cand, &mut ready_n) {
+                return Some(task);
+            }
+        }
+        for cand in end..self.block_size {
+            if let Some(task) = steal(cand, &mut ready_n) {
+                return Some(task);
+            }
+        }
+        for cand in 0..from {
+            if let Some(task) = steal(cand, &mut ready_n) {
+                return Some(task);
+            }
+        }
+        if ready_n > 0 {
+            edges.sample_ready_width(ready_n);
         }
         None
     }
