@@ -31,7 +31,7 @@ pub(crate) struct ReadyEdgeTable {
     deferred: Mutex<Vec<TxIdx>>,
     refuse: AtomicUsize,
     /// D1: consensus-order writers observed on each location (lazy + Data).
-    location_writers: DashMap<MemoryLocationHash, Mutex<Vec<TxIdx>>, BuildIdentityHasher>,
+    location_writers: DashMap<MemoryLocationHash, Vec<TxIdx>, BuildIdentityHasher>,
     /// PC-3: each tx belongs to at most one ReadyEdge location queue.
     queued_on: DashMap<TxIdx, MemoryLocationHash, BuildIdentityHasher>,
     /// PC-5: Lean / EV forced A0 — `may_execute` even if a consumer bit exists.
@@ -118,11 +118,7 @@ impl ReadyEdgeTable {
 
     /// D1: record `writer` on location `ℓ` (lazy or Data). Order is consensus.
     pub(crate) fn note_location_writer(&self, location: MemoryLocationHash, writer: TxIdx) {
-        let e = self
-            .location_writers
-            .entry(location)
-            .or_insert_with(|| Mutex::new(Vec::new()));
-        let mut v = e.lock().unwrap();
+        let mut v = self.location_writers.entry(location).or_default();
         match v.last() {
             Some(&last) if last == writer => {}
             Some(&last) if last < writer => v.push(writer),
@@ -140,7 +136,7 @@ impl ReadyEdgeTable {
         let Some(e) = self.location_writers.get(&location) else {
             return 0;
         };
-        let writers = e.lock().unwrap().clone();
+        let writers = e.clone();
         drop(e);
         let mut edges = 0;
         for pair in writers.windows(2) {
@@ -156,14 +152,10 @@ impl ReadyEdgeTable {
 
     /// D1 hot path: only the immediate predecessor → `writer` edge.
     pub(crate) fn note_immediate_pred(&self, location: MemoryLocationHash, writer: TxIdx) {
-        let pred = self.location_writers.get(&location).and_then(|e| {
-            e.lock()
-                .unwrap()
-                .iter()
-                .rev()
-                .copied()
-                .find(|&w| w < writer)
-        });
+        let pred = self
+            .location_writers
+            .get(&location)
+            .and_then(|e| e.iter().rev().copied().find(|&w| w < writer));
         if let Some(p) = pred {
             self.note_consumer_on(writer, p, Some(location));
         }
@@ -173,7 +165,7 @@ impl ReadyEdgeTable {
     pub(crate) fn writers_of(&self, location: MemoryLocationHash) -> Vec<TxIdx> {
         self.location_writers
             .get(&location)
-            .map(|e| e.lock().unwrap().clone())
+            .map(|e| e.clone())
             .unwrap_or_default()
     }
 
@@ -181,7 +173,7 @@ impl ReadyEdgeTable {
         let mut out: Vec<(MemoryLocationHash, Vec<TxIdx>)> = self
             .location_writers
             .iter()
-            .map(|e| (*e.key(), e.value().lock().unwrap().clone()))
+            .map(|e| (*e.key(), e.value().clone())))
             .collect();
         out.sort_by_key(|(loc, _)| *loc);
         out

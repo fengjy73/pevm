@@ -347,13 +347,25 @@ pub(crate) fn admit_seed_on_write_set(
         .copied()
         .filter(|&t| t > writer)
         .collect();
+    // Upgrade an existing A1 probe, or start a chain only when EV still wants A1.
+    let chain_later = !later.is_empty()
+        && (later.iter().any(|&t| ready.was_queued(t))
+            || policy.is_none_or(|p| {
+                let kind = if hints.call_to_txs(&to).len() >= CALL_WAW_FLOOR {
+                    CohortKind::CallWaw
+                } else {
+                    CohortKind::EmptyTo
+                };
+                // Hidden effective write ⇒ this `to` is a real WAW envelope.
+                p.choose_a1(kind, to, later.len() + 1, true, 0.25)
+            }));
     let mut queued = HashSet::new();
     for loc in hidden_eff {
         ready.note_raw_producer(loc, writer);
         ready.note_location_writer(loc, writer);
         // D1: 4→31 when 4 already published this ℓ (any envelope).
         ready.note_immediate_pred(loc, writer);
-        if later.is_empty() {
+        if !chain_later {
             continue;
         }
         let pred = ready
