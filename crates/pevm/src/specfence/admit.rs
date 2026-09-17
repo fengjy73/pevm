@@ -26,11 +26,11 @@ const RAW_FANOUT_FLOOR: usize = 16;
 const FROM_WAW_FLOOR: usize = 2;
 /// Short calldata WAW (storage trio, short call chains) — chain, no Basic(to) PE.
 const CALL_WAW_FLOOR: usize = 2;
-/// Empty-calldata `to` ≥2: probe the first tx only. Later txs wait-for that
+/// Empty-calldata `to` ≥8: probe the first tx only. Later txs wait-for that
 /// prefix until its write-set Detects hidden WAW (then predecessor-chain) or
-/// lazy-only (then release). Do **not** serialize the whole payee group at
-/// begin-block (3356896 0x209c wall / independent tax).
-const EMPTY_TO_PROBE_FLOOR: usize = 2;
+/// lazy-only (then release). Floor 8 is the hot-payee class (3356896 0x209c
+/// n=16). 2-tx lazy EOAs stay optimistic — zero independent tax.
+const EMPTY_TO_PROBE_FLOOR: usize = 8;
 /// Fan-star access class (k≈6 → bucket 4–7). RAW stars only.
 const FAN_STAR_K: u32 = 6;
 
@@ -349,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn two_tx_empty_to_probes_first_only() {
+    fn two_tx_empty_to_is_not_seeded() {
         let ready = ReadyEdgeTable::new();
         let stages = ProducerStageTable::new();
         let learner = LiveLearner::new();
@@ -367,17 +367,8 @@ mod tests {
             &hints,
             Address::ZERO,
         );
-        assert_eq!(n, 1, "2-tx empty-to probes the first; later waits");
-        assert!(ready.may_execute(3));
-        assert_eq!(ready.blocking_producer(9), Some(3));
-        assert!(
-            ready.may_execute(11),
-            "tx outside the probe must stay independent"
-        );
-        assert!(
-            !stages.is_reserved(3),
-            "empty-to probe is not a Stage reserve"
-        );
+        assert_eq!(n, 0, "2-tx lazy payee must not tax independents");
+        assert!(ready.may_execute(9));
     }
 
     #[test]
@@ -458,7 +449,7 @@ mod tests {
         let prior = InterBlockPrior::new();
         let to = Address::repeat_byte(0x20);
         let from = Address::repeat_byte(0x31);
-        let hints = AccountHints::from_to_txs(to, vec![31, 66, 67, 69]);
+        let hints = AccountHints::from_to_txs(to, vec![31, 66, 67, 69, 70, 93, 96, 103, 115]);
         let n = admit_seed_begin_block(
             &ready,
             &stages,
@@ -468,11 +459,11 @@ mod tests {
             &hints,
             Address::ZERO,
         );
-        assert_eq!(n, 3, "probe-star 31←66,67,69");
+        assert_eq!(n, 8, "probe-star: later empty-to wait on tx 31");
         assert!(ready.may_execute(31));
         assert_eq!(ready.blocking_producer(66), Some(31));
         assert_eq!(ready.blocking_producer(67), Some(31));
-        assert_eq!(ready.blocking_producer(69), Some(31));
+        assert_eq!(ready.blocking_producer(115), Some(31));
         assert!(
             !stages.is_reserved(31) && !stages.is_reserved(66),
             "WAW probe must not ProducerStage-reserve the spine"
