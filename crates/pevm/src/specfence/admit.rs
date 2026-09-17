@@ -273,7 +273,7 @@ pub(crate) fn admit_seed_on_write_set(
         // when nonce/balance is Data — refuse meta loses to one OCC abort.
         let from_txs = hints.from_txs(&from);
         if from_txs.len() >= 3 && !hints.cohort_all_empty(from_txs) {
-            let _ = ready.extend_writer_order(from_loc);
+            ready.note_immediate_pred(from_loc, writer);
         }
     }
 
@@ -281,7 +281,7 @@ pub(crate) fn admit_seed_on_write_set(
         for &loc in effective_locs {
             if loc != from_loc {
                 ready.note_raw_producer(loc, writer);
-                let _ = ready.extend_writer_order(loc);
+                ready.note_immediate_pred(loc, writer);
             }
         }
         return;
@@ -292,19 +292,13 @@ pub(crate) fn admit_seed_on_write_set(
         .copied()
         .filter(|&l| l != from_loc)
         .collect();
-    let later: Vec<TxIdx> = hints
-        .to_txs(&to)
-        .iter()
-        .copied()
-        .filter(|&t| t > writer)
-        .collect();
 
     // RAW fan-out star: keep all consumers behind the first producer.
     if hints.call_to_txs(&to).len() >= RAW_FANOUT_FLOOR {
         for loc in hidden_eff {
             ready.note_raw_producer(loc, writer);
             ready.note_location_writer(loc, writer);
-            let _ = ready.extend_writer_order(loc);
+            ready.note_immediate_pred(loc, writer);
         }
         if let Some(p) = policy {
             p.note_eff_waw(CohortKind::RawFan, to, true);
@@ -313,7 +307,13 @@ pub(crate) fn admit_seed_on_write_set(
     }
 
     if hidden_eff.is_empty() {
-        // D2: lazy-only publish releases the empty-to probe (not same-from).
+        // D2: lazy-only. Release + learn only when an A1 probe is live
+        // (PC-5: independent empty transfers must not take deferred/B2 locks).
+        let later = hints.to_txs(&to);
+        let probed = later.iter().any(|&t| t > writer && ready.was_queued(t));
+        if !probed {
+            return;
+        }
         if let Some(p) = policy {
             p.note_eff_waw(CohortKind::EmptyTo, to, false);
         }
@@ -323,8 +323,8 @@ pub(crate) fn admit_seed_on_write_set(
             .copied()
             .filter(|&t| t > writer)
             .collect();
-        for t in later {
-            if from_later.contains(&t) {
+        for &t in later {
+            if t <= writer || from_later.contains(&t) {
                 continue;
             }
             ready.release_consumer(t, wave);
@@ -341,12 +341,18 @@ pub(crate) fn admit_seed_on_write_set(
         p.note_eff_waw(kind, to, true);
     }
 
+    let later: Vec<TxIdx> = hints
+        .to_txs(&to)
+        .iter()
+        .copied()
+        .filter(|&t| t > writer)
+        .collect();
     let mut queued = HashSet::new();
     for loc in hidden_eff {
         ready.note_raw_producer(loc, writer);
         ready.note_location_writer(loc, writer);
         // D1: 4→31 when 4 already published this ℓ (any envelope).
-        let _ = ready.extend_writer_order(loc);
+        ready.note_immediate_pred(loc, writer);
         if later.is_empty() {
             continue;
         }

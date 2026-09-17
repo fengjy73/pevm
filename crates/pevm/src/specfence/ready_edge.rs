@@ -154,6 +154,21 @@ impl ReadyEdgeTable {
         edges
     }
 
+    /// D1 hot path: only the immediate predecessor → `writer` edge.
+    pub(crate) fn note_immediate_pred(&self, location: MemoryLocationHash, writer: TxIdx) {
+        let pred = self.location_writers.get(&location).and_then(|e| {
+            e.lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .copied()
+                .find(|&w| w < writer)
+        });
+        if let Some(p) = pred {
+            self.note_consumer_on(writer, p, Some(location));
+        }
+    }
+
     /// Consensus-order writers published on `ℓ` (lab / compare).
     pub(crate) fn writers_of(&self, location: MemoryLocationHash) -> Vec<TxIdx> {
         self.location_writers
