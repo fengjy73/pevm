@@ -823,34 +823,33 @@ impl Pevm {
             let inc_gt0 = incs.iter().filter(|&&i| i > 0).count();
             let reexec: usize = incs.iter().sum();
             let mut miss = 0usize;
-            for (tx, &inc) in incs.iter().enumerate() {
-                if inc == 0 || ready_edges.was_queued(tx) {
-                    continue;
-                }
-                // CC-D1: first conflict ℓ — effective non-lazy → learn; lazy → ignore.
-                match self.cost_policy.conflict_of(tx) {
-                    Some(note)
-                        if note.lazy
-                            || matches!(
-                                note.class,
-                                crate::specfence::ConflictClass::LazyNoise
-                                    | crate::specfence::ConflictClass::CommuteCandidate
-                            ) =>
-                    {
-                        // Already counted on the abort path when classified.
-                        // unfenced_reexec must not treat commute/lazy as "must A1".
-                        let _ = note.location;
+            if !thin {
+                for (tx, &inc) in incs.iter().enumerate() {
+                    if inc == 0 || ready_edges.was_queued(tx) {
+                        continue;
                     }
-                    Some(note) => {
-                        miss += 1;
-                        self.cost_policy.bump_unfenced_reexec();
-                        if !self.cost_policy.is_promoted(note.location) {
-                            self.cost_policy.promote_short_edge(note.location, 1);
+                    match self.cost_policy.conflict_of(tx) {
+                        Some(note)
+                            if note.lazy
+                                || matches!(
+                                    note.class,
+                                    crate::specfence::ConflictClass::LazyNoise
+                                        | crate::specfence::ConflictClass::CommuteCandidate
+                                ) =>
+                        {
+                            let _ = note.location;
                         }
-                    }
-                    None => {
-                        miss += 1;
-                        self.cost_policy.bump_unfenced_reexec();
+                        Some(note) => {
+                            miss += 1;
+                            self.cost_policy.bump_unfenced_reexec();
+                            if !self.cost_policy.is_promoted(note.location) {
+                                self.cost_policy.promote_short_edge(note.location, 1);
+                            }
+                        }
+                        None => {
+                            miss += 1;
+                            self.cost_policy.bump_unfenced_reexec();
+                        }
                     }
                 }
             }

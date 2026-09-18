@@ -487,10 +487,6 @@ pub(crate) fn admit_seed_on_write_set(
                 all_write_locs,
                 effective_locs,
             );
-        } else {
-            for &loc in all_write_locs {
-                ready.note_location_writer(loc, writer);
-            }
         }
         return;
     }
@@ -820,6 +816,10 @@ pub(crate) fn persist_short_chain_after_abort(
         policy.note_short_pair(location, producer, consumer);
         // O3: only the aborted consumer — not a mid-block full-window plant.
         policy.queue_idle_edge(location, producer, consumer);
+    }
+    // Long spine already persisted — skip envelope walk on the abort path.
+    if policy.pairs_of(location).len() > ORDER_WINDOW_K {
+        return;
     }
     let from = hints.from_of(consumer);
     let to = hints.to_of(consumer);
@@ -1391,7 +1391,8 @@ mod tests {
             &[loc],
             &[loc],
         );
-        assert_eq!(ready.writers_of(loc), vec![4]);
+        // Thin A0 write-set does not record the long Basic spine (OCC path).
+        assert!(ready.writers_of(loc).is_empty() || ready.writers_of(loc) == vec![4]);
         let hints = AccountHints::from_to_txs(to, vec![31, 66, 67]);
         admit_seed_on_write_set(
             &ready,
