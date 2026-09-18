@@ -295,7 +295,7 @@ fn specfence_bayes_inter_block_carry() {
     // R1: no block-wide Bayes Wait seed — HotSet process prior carries multi-writer mass.
     let metrics = pevm.last_specfence_metrics();
     assert!(
-        metrics.hotset_size > 0 || metrics.hot_local_reads > 0 || p1 >= 0.25,
+        metrics.hotset_size > 0 || metrics.location_hot_resolves > 0 || p1 >= 0.25,
         "inter-block carry via HotSet/Bayes posterior: p1={p1} m={metrics:?}"
     );
     assert!(
@@ -365,11 +365,11 @@ fn specfence_mixed_hot_and_independent() {
     // R1/R2: HotSet carries heat; WaitHard only on HotSet (may be 0 if EV prefers OptimisticRead).
     assert!(
         metrics.hotset_size > 0
-            || metrics.hot_local_reads > 0
+            || metrics.location_hot_resolves > 0
             || metrics.wait_hard_count > 0
             || metrics.ordered_admit_hits > 0
             || metrics.wait_admissions > 0,
-        "hot cluster must engage HotLocal/HotSet: {metrics:?}"
+        "hot cluster must engage location-hot resolve / HotSet: {metrics:?}"
     );
     assert!(
         metrics.speculate_executions > 0 || metrics.lean_mode_txs > 0,
@@ -577,7 +577,7 @@ fn specfence_p1a_ordered_admit_wait_reduces_abort_on_hotspot() {
         "hotspot posterior must rise"
     );
 
-    // Next block: same-sender pressure — Wait/OrderedAdmit/HotLocal should dominate.
+    // Next block: same-sender pressure — Wait/OrderedAdmit/location-hot should dominate.
     let mut txs2 = Vec::new();
     for i in 0..24 {
         txs2.push(self_transfer(hot, 1 + i as u64));
@@ -610,9 +610,9 @@ fn specfence_p1a_ordered_admit_wait_reduces_abort_on_hotspot() {
             || m.wait_admissions > 0
             || m.ordered_admit_hits > 0
             || m.bayes_wait_decisions > 0
-            || m.hot_local_reads > 0
+            || m.location_hot_resolves > 0
             || m.hotset_size > 0,
-        "second wave should WaitHard/OrderedAdmit/HotLocal on hotspot: {m:?}"
+        "second wave should WaitHard/OrderedAdmit/location-hot on hotspot: {m:?}"
     );
     // Aborts on the heated recipient wave should not explode vs block1 learning.
     assert!(
@@ -722,8 +722,8 @@ fn specfence_p2_partial_retry_on_localized_conflict() {
     for _ in 0..10 {
         let (_, metrics, _) = run_mode(ConcurrencyMode::SpecFence, &storage, txs.clone());
         last_metrics = Some(metrics.clone());
-        // R0: LeanOCC uses selective invalidate + full_abort_reexecute; PartialRetry/RewindTo
-        // remain research-inspect. HotSet/HotLocal should still engage.
+        // R0: OCC-fast / lean execute uses selective invalidate + full_abort_reexecute; PartialRetry/RewindTo
+        // remain research-inspect. HotSet / location-hot resolve should still engage.
         if metrics.partial_retry_count >= 1
             || metrics.rewind_to_cp >= 1
             || metrics.selective_invalidate_count >= 1
@@ -732,7 +732,9 @@ fn specfence_p2_partial_retry_on_localized_conflict() {
             saw_repair = true;
             assert!(metrics.occ_aborts > 0, "repair implies abort: {metrics:?}");
             assert!(
-                metrics.hotset_size > 0 || metrics.hot_local_reads > 0 || metrics.lean_mode_txs > 0,
+                metrics.hotset_size > 0
+                    || metrics.location_hot_resolves > 0
+                    || metrics.lean_mode_txs > 0,
                 "partial_abort metrics: {metrics:?}"
             );
             break;
@@ -773,7 +775,7 @@ fn specfence_p2_full_abort_reexecute_not_always_eq_aborts() {
                     || m.selective_invalidate_count > 0,
                 "abort must be Partial/Full/selective (R0): {m:?}"
             );
-            // R0 LeanOCC: full_abort_reexecute tracks aborts; selective may decouple cascade.
+            // R0 OCC-fast: full_abort_reexecute tracks aborts; selective may decouple cascade.
             if m.partial_retry_count > 0 && m.tx_full_abort_reexecute < m.occ_aborts {
                 broke_equality = true;
                 break;
@@ -3231,10 +3233,10 @@ fn specfence_m4_low_conflict_engages_lean() {
     assert_eq!(m.inspector_steps, 0, "lean skips inspect_run: {m:?}");
 }
 
-/// R1/R2: hot multi-writer populates HotSet and uses HotLocal; execute stays LeanOCC.
+/// R1/R2: hot multi-writer populates HotSet and uses location-hot resolve; execute stays OCC-fast.
 #[test]
 fn specfence_m4_high_conflict_uses_full_plant() {
-    // Keep legacy name; semantics = HotSet / HotLocal (not block-wide full inspect).
+    // Keep legacy name; semantics = HotSet / location-hot resolve (not block-wide full inspect).
     let n = 48;
     let sender = Address::from(U160::from(1));
     let txs: Vec<TxEnv> = (1..=n).map(|i| self_transfer(sender, i as u64)).collect();
@@ -3263,11 +3265,11 @@ fn specfence_m4_high_conflict_uses_full_plant() {
                 concurrency(),
             )
             .unwrap();
-        assert_eq!(seq, par, "HotLocal must preserve seq≡par");
+        assert_eq!(seq, par, "location-hot resolve must preserve seq≡par");
         let m = pevm.last_specfence_metrics().clone();
         last = Some(m.clone());
         if m.hotset_size > 0
-            || m.hot_local_reads > 0
+            || m.location_hot_resolves > 0
             || m.ordered_admit_hits > 0
             || m.wait_hard_count > 0
         {
@@ -3277,20 +3279,20 @@ fn specfence_m4_high_conflict_uses_full_plant() {
     }
     assert!(
         saw_hot,
-        "contended same-sender must populate HotSet / HotLocal: last={last:?}"
+        "contended same-sender must populate HotSet / location-hot: last={last:?}"
     );
     let m = last.unwrap();
     assert!(
         m.lean_mode_txs > 0,
-        "default execute stays LeanOCC (no inspect): {m:?}"
+        "default execute stays OCC-fast / lean execute (no inspect): {m:?}"
     );
     assert_eq!(
         m.inspector_steps, 0,
         "R0: inspector_steps=0 without SPECFENCE_ENABLE_INSPECT: {m:?}"
     );
     assert!(
-        m.hotset_size > 0 || m.hot_local_reads > 0,
-        "HotSet/HotLocal signal expected: {m:?}"
+        m.hotset_size > 0 || m.location_hot_resolves > 0,
+        "HotSet/location-hot signal expected: {m:?}"
     );
 }
 
@@ -3309,7 +3311,10 @@ fn specfence_r1_wide_block_stays_lean() {
     );
     assert_eq!(m.wait_hard_count, 0, "wide: wait_hard≈0: {m:?}");
     assert_eq!(m.inspector_steps, 0, "wide: no inspect: {m:?}");
-    assert_eq!(m.hot_local_reads, 0, "wide: no HotLocal: {m:?}");
+    assert_eq!(
+        m.location_hot_resolves, 0,
+        "wide: no location-hot resolve: {m:?}"
+    );
 }
 
 /// R1/R2: hot multi-writer → HotSet non-empty, hot_local path, seq≡par.

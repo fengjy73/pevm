@@ -5,7 +5,7 @@
 //! PE store; this module is the seed / observe API used at begin_block and
 //! abort.
 //!
-//! Plant SoT: `lab/notes/specfence-complete-architecture-v9.4-file-srp.md`.
+//! Protocol: `lab/notes/specfence-complete-architecture-v9.4-file-srp.md`.
 
 use crate::MemoryLocationHash;
 

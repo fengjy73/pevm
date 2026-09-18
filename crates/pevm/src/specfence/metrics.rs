@@ -77,7 +77,7 @@ pub struct SpecFenceMetrics {
     pub mean_p_at_wait: f64,
     /// Mean P_conflict among cost-aware OptimisticRead decisions.
     pub mean_p_at_optimistic_read: f64,
-    /// Plant v2 M0: fresh EVM/transact/interpreter starts (new incarnation from tx head).
+    /// M0: fresh EVM/transact/interpreter starts (new incarnation from tx head).
     /// Incremented at `Vm::execute` immediately before the handler `run` (OCC + SpecFence).
     /// Baseline today: ≈ n_tx + head-reexecs (PartialRetry and FullAbortReexecute both restart from head).
     pub evm_entries: usize,
@@ -167,8 +167,8 @@ pub struct SpecFenceMetrics {
     pub full_mode_txs: usize,
     /// M4: Times engagement flipped lean → full within a block.
     pub engagement_switches: usize,
-    /// R1: HotLocal resolve invocations (ℓ ∈ HotSet).
-    pub hot_local_reads: usize,
+    /// R1: location-hot resolve invocations (ℓ ∈ HotSet).
+    pub location_hot_resolves: usize,
     /// R1: |HotSet| at block end.
     pub hotset_size: usize,
     /// P0/P2: SoftWait arms created (FenceGraph.arm_soft).
@@ -310,22 +310,22 @@ pub struct SpecFenceMetrics {
     pub incarnation_gt0: usize,
     /// D4: sum of final incarnations (= extra EVM entries from reexec).
     pub reexec_entries: usize,
-    /// D4: incarnation>0 txs that were never on a ReadyEdge (miss-Detect).
-    pub miss_detect: usize,
+    /// Incarnation>0 txs that were never dependency-admitted (A0 conflict reexec).
+    pub unfenced_reexec: usize,
     /// B3: cohorts that chose A1 this block.
     pub a1_cohorts: usize,
     /// PC-5: cohorts forced A0 because E[meta_A1] > E[abort_A0].
-    pub lean_a0_cohorts: usize,
+    pub a0_cohorts: usize,
     /// L6: measured refuse-path nanoseconds.
     pub refuse_ns: u64,
     /// L6: measured incarnation>0 execute nanoseconds.
     pub reexec_ns: u64,
-    /// PC-S1: thin SpecFence shell this block.
-    pub thin_shell: bool,
+    /// A0-majority / low-meta block (ReadyEdge only on ordered-admit).
+    pub a0_majority_block: bool,
     /// L1: ns-EV kept A1.
-    pub ns_ev_keep_a1: usize,
+    pub cost_ev_keep_ordered: usize,
     /// L1: ns-EV demoted A1→A0.
-    pub ns_ev_demote: usize,
+    pub cost_ev_demote_optimistic: usize,
     /// PC-S1: A1 candidates beyond K.
     pub k_cap_demote: usize,
     /// CC-X1: A0 commute accepts (empty-input transfer class).
@@ -336,6 +336,8 @@ pub struct SpecFenceMetrics {
     pub conflict_promote: usize,
     /// CC-D1: lazy-noise ignore.
     pub conflict_ignore: usize,
+    /// Begin-block admit_seed wall (one Instant, not per-tx).
+    pub admit_seed_begin_ns: u64,
 }
 
 /// Shared counters written by worker threads.
@@ -407,7 +409,7 @@ pub(crate) struct MetricsInner {
     lean_mode_txs: AtomicUsize,
     full_mode_txs: AtomicUsize,
     engagement_switches: AtomicUsize,
-    hot_local_reads: AtomicUsize,
+    location_hot_resolves: AtomicUsize,
     hotset_size: AtomicUsize,
     soft_wait_arms: AtomicUsize,
     await_at_a_arms: AtomicUsize,
@@ -478,19 +480,20 @@ pub(crate) struct MetricsInner {
     idle_core_ns: std::sync::atomic::AtomicU64,
     incarnation_gt0: AtomicUsize,
     reexec_entries: AtomicUsize,
-    miss_detect: AtomicUsize,
+    unfenced_reexec: AtomicUsize,
     a1_cohorts: AtomicUsize,
-    lean_a0_cohorts: AtomicUsize,
+    a0_cohorts: AtomicUsize,
     refuse_ns: AtomicU64,
     reexec_ns: AtomicU64,
-    thin_shell: AtomicUsize,
-    ns_ev_keep_a1: AtomicUsize,
-    ns_ev_demote: AtomicUsize,
+    a0_majority_block: AtomicUsize,
+    cost_ev_keep_ordered: AtomicUsize,
+    cost_ev_demote_optimistic: AtomicUsize,
     k_cap_demote: AtomicUsize,
     commute_skip: AtomicUsize,
     batch_repair: AtomicUsize,
     conflict_promote: AtomicUsize,
     conflict_ignore: AtomicUsize,
+    admit_seed_begin_ns: AtomicU64,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -907,9 +910,9 @@ impl MetricsInner {
         idle_core_ns: u64,
         incarnation_gt0: usize,
         reexec_entries: usize,
-        miss_detect: usize,
+        unfenced_reexec: usize,
         a1_cohorts: usize,
-        lean_a0_cohorts: usize,
+        a0_cohorts: usize,
     ) {
         self.ready_width_sum_bits
             .store(ready_width_mean.to_bits(), Ordering::Relaxed);
@@ -917,19 +920,19 @@ impl MetricsInner {
         self.incarnation_gt0
             .store(incarnation_gt0, Ordering::Relaxed);
         self.reexec_entries.store(reexec_entries, Ordering::Relaxed);
-        self.miss_detect.store(miss_detect, Ordering::Relaxed);
+        self.unfenced_reexec
+            .store(unfenced_reexec, Ordering::Relaxed);
         self.a1_cohorts.store(a1_cohorts, Ordering::Relaxed);
-        self.lean_a0_cohorts
-            .store(lean_a0_cohorts, Ordering::Relaxed);
+        self.a0_cohorts.store(a0_cohorts, Ordering::Relaxed);
     }
 
     pub(crate) fn set_ns_learn_metrics(
         &self,
         refuse_ns: u64,
         reexec_ns: u64,
-        thin_shell: bool,
-        ns_ev_keep_a1: usize,
-        ns_ev_demote: usize,
+        a0_majority_block: bool,
+        cost_ev_keep_ordered: usize,
+        cost_ev_demote_optimistic: usize,
         k_cap_demote: usize,
         commute_skip: usize,
         batch_repair: usize,
@@ -938,10 +941,12 @@ impl MetricsInner {
     ) {
         self.refuse_ns.store(refuse_ns, Ordering::Relaxed);
         self.reexec_ns.store(reexec_ns, Ordering::Relaxed);
-        self.thin_shell
-            .store(usize::from(thin_shell), Ordering::Relaxed);
-        self.ns_ev_keep_a1.store(ns_ev_keep_a1, Ordering::Relaxed);
-        self.ns_ev_demote.store(ns_ev_demote, Ordering::Relaxed);
+        self.a0_majority_block
+            .store(usize::from(a0_majority_block), Ordering::Relaxed);
+        self.cost_ev_keep_ordered
+            .store(cost_ev_keep_ordered, Ordering::Relaxed);
+        self.cost_ev_demote_optimistic
+            .store(cost_ev_demote_optimistic, Ordering::Relaxed);
         self.k_cap_demote.store(k_cap_demote, Ordering::Relaxed);
         self.commute_skip.store(commute_skip, Ordering::Relaxed);
         self.batch_repair.store(batch_repair, Ordering::Relaxed);
@@ -949,6 +954,11 @@ impl MetricsInner {
             .store(conflict_promote, Ordering::Relaxed);
         self.conflict_ignore
             .store(conflict_ignore, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn set_admit_seed_begin_ns(&self, ns: u64) {
+        self.admit_seed_begin_ns.store(ns, Ordering::Relaxed);
     }
 
     #[inline]
@@ -1178,15 +1188,15 @@ impl MetricsInner {
         lean_mode_txs: usize,
         full_mode_txs: usize,
         engagement_switches: usize,
-        hot_local_reads: usize,
+        location_hot_resolves: usize,
         hotset_size: usize,
     ) {
         self.lean_mode_txs.store(lean_mode_txs, Ordering::Relaxed);
         self.full_mode_txs.store(full_mode_txs, Ordering::Relaxed);
         self.engagement_switches
             .store(engagement_switches, Ordering::Relaxed);
-        self.hot_local_reads
-            .store(hot_local_reads, Ordering::Relaxed);
+        self.location_hot_resolves
+            .store(location_hot_resolves, Ordering::Relaxed);
         self.hotset_size.store(hotset_size, Ordering::Relaxed);
     }
 
@@ -1290,7 +1300,7 @@ impl MetricsInner {
             lean_mode_txs: self.lean_mode_txs.load(Ordering::Relaxed),
             full_mode_txs: self.full_mode_txs.load(Ordering::Relaxed),
             engagement_switches: self.engagement_switches.load(Ordering::Relaxed),
-            hot_local_reads: self.hot_local_reads.load(Ordering::Relaxed),
+            location_hot_resolves: self.location_hot_resolves.load(Ordering::Relaxed),
             hotset_size: self.hotset_size.load(Ordering::Relaxed),
             soft_wait_arms: self.soft_wait_arms.load(Ordering::Relaxed),
             await_at_a_arms: self.await_at_a_arms.load(Ordering::Relaxed),
@@ -1369,19 +1379,20 @@ impl MetricsInner {
             idle_core_ns: self.idle_core_ns.load(Ordering::Relaxed),
             incarnation_gt0: self.incarnation_gt0.load(Ordering::Relaxed),
             reexec_entries: self.reexec_entries.load(Ordering::Relaxed),
-            miss_detect: self.miss_detect.load(Ordering::Relaxed),
+            unfenced_reexec: self.unfenced_reexec.load(Ordering::Relaxed),
             a1_cohorts: self.a1_cohorts.load(Ordering::Relaxed),
-            lean_a0_cohorts: self.lean_a0_cohorts.load(Ordering::Relaxed),
+            a0_cohorts: self.a0_cohorts.load(Ordering::Relaxed),
             refuse_ns: self.refuse_ns.load(Ordering::Relaxed),
             reexec_ns: self.reexec_ns.load(Ordering::Relaxed),
-            thin_shell: self.thin_shell.load(Ordering::Relaxed) != 0,
-            ns_ev_keep_a1: self.ns_ev_keep_a1.load(Ordering::Relaxed),
-            ns_ev_demote: self.ns_ev_demote.load(Ordering::Relaxed),
+            a0_majority_block: self.a0_majority_block.load(Ordering::Relaxed) != 0,
+            cost_ev_keep_ordered: self.cost_ev_keep_ordered.load(Ordering::Relaxed),
+            cost_ev_demote_optimistic: self.cost_ev_demote_optimistic.load(Ordering::Relaxed),
             k_cap_demote: self.k_cap_demote.load(Ordering::Relaxed),
             commute_skip: self.commute_skip.load(Ordering::Relaxed),
             batch_repair: self.batch_repair.load(Ordering::Relaxed),
             conflict_promote: self.conflict_promote.load(Ordering::Relaxed),
             conflict_ignore: self.conflict_ignore.load(Ordering::Relaxed),
+            admit_seed_begin_ns: self.admit_seed_begin_ns.load(Ordering::Relaxed),
         }
     }
 }

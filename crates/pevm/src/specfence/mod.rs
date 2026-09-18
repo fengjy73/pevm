@@ -1,4 +1,4 @@
-//! SpecFence — pevm's fused PC⊗CC⊗Bayes plant on **one** parallel spine.
+//! SpecFence — pevm's fused PC⊗CC⊗Bayes protocol on **one** parallel spine.
 //!
 //! SoT: `lab/notes/specfence-complete-architecture-v10-raw-mixed.md`
 //! (RAW_fan_out + mixed_RAW_WAW; wave-fill refuse; wait_for resumes or does not park);
@@ -10,7 +10,7 @@
 //! Call order: Bayes.seed → admit_seed → Execute(if admitted) →
 //! decide←Bayes → pessimistic admit (`wait_for_dependency` / `refuse_admit`;
 //! `OrderedAdmit` rare) → Validate / `partial_abort`.
-//! Quiet/cold = optimistic_read cost class on the same spine (not `plant_is_occ` retreat).
+//! Quiet/cold = optimistic_read cost class on the same spine (not an OCC-computer retreat).
 //!
 //! `ConcurrencyMode::OCC` is pristine Block-STM (**zero** SpecFence ticks).
 //! `ConcurrencyMode::SpecFence` owns schedule / execute wrap / validate / rem.
@@ -150,7 +150,7 @@
 //!
 //! # Research-only (not default behavior) — V5-P3
 //! Inspect / absolute jump / CallOutcome SC stay behind `SPECFENCE_ENABLE_INSPECT=1`.
-//! Plant M1a–M1l + [`research_apply_abort_repair`] remain research; **not** graduated
+//! M1a–M1l + [`research_apply_abort_repair`] remain research; **not** graduated
 //! (A/B: inspect hangs on 597 path). Lean SoftWait wake may still arm hang-free
 //! journal FF via `try_arm_park_resume_at_k` (no absolute jump).
 //! Finegrain collectors are lab opt-in.
@@ -180,7 +180,6 @@ mod edge;
 mod engagement;
 mod executor;
 pub(crate) mod feeder;
-pub(crate) mod fence_act;
 #[allow(missing_docs)]
 mod finegrain;
 mod heat;
@@ -190,6 +189,7 @@ mod kernel;
 mod lane;
 mod learner;
 mod metrics;
+pub(crate) mod ordered_admit_act;
 mod policy;
 mod prior;
 mod process;
@@ -215,23 +215,23 @@ pub(crate) use boundary::{
     BoundarySnapshot, CachedCallOutcome, JournalBlob, OrderedAdmitSnapMode, absolute_jump_eligible,
     absolute_jump_env_enabled, arm_call_outcome_cache, arm_ff_origin_seeds, arm_pc_resume,
     arm_pending_effect_cp_only, attach_current_live_snap, clear_pc_resume,
-    handler_ordered_admit_snap_install_wanted, handler_sstore_plant_install_wanted, in_inspect_run,
-    install_handler_ordered_admit_snap_capture, install_handler_sstore_plant_capture, jump_is_safe,
-    jump_refuse_reason, last_boundary_snap, nested_ordered_admit_consume_enabled,
-    nested_ordered_admit_stash_armed, note_pending_effect_boundary,
-    note_pending_ordered_admit_snap, ordered_admit_snap_capture_wanted,
-    ordered_admit_snap_env_enabled, ordered_admit_snap_jump_enabled, ordered_admit_snap_mode,
-    pending_resume_armed, plant_tls_active, resume_was_applied, steps_this_run,
-    suffix_repair_jump_env_ok, take_ff_origin_seeds, try_apply_pending_pc_resume,
-    try_arm_safe_absolute_jump, try_arm_safe_absolute_jump_gated,
-    try_consume_nested_ordered_admit_resume, with_ordered_admit_snap_tls, with_plant_tls,
-    with_plant_tls_journal,
+    handler_ordered_admit_snap_install_wanted, handler_sstore_protocol_install_wanted,
+    in_inspect_run, install_handler_ordered_admit_snap_capture,
+    install_handler_sstore_protocol_capture, jump_is_safe, jump_refuse_reason, last_boundary_snap,
+    nested_ordered_admit_consume_enabled, nested_ordered_admit_stash_armed,
+    note_pending_effect_boundary, note_pending_ordered_admit_snap,
+    ordered_admit_snap_capture_wanted, ordered_admit_snap_env_enabled,
+    ordered_admit_snap_jump_enabled, ordered_admit_snap_mode, pending_resume_armed,
+    protocol_tls_active, resume_was_applied, steps_this_run, suffix_repair_jump_env_ok,
+    take_ff_origin_seeds, try_apply_pending_pc_resume, try_arm_safe_absolute_jump,
+    try_arm_safe_absolute_jump_gated, try_consume_nested_ordered_admit_resume,
+    with_ordered_admit_snap_tls, with_protocol_tls, with_protocol_tls_journal,
 };
 pub(crate) use certificate::CertificateTable;
 #[allow(unused_imports)]
 pub(crate) use collateral::{
-    ConflictClass, FirstConflict, classify_first_conflict, commute_ok, envelopes_disjoint,
-    is_value_transfer, location_is_lazy, thin_a0_hinted_lazy,
+    ConflictClass, FirstConflict, a0_majority_hinted_lazy, classify_first_conflict, commute_ok,
+    envelopes_disjoint, is_value_transfer, location_is_lazy,
 };
 pub(crate) use computer::next_sf_task;
 pub(crate) use dag::{FenceGraph, SpecDag};
@@ -289,8 +289,8 @@ pub(crate) use repair::{RepairGrain, repair_grain};
 use resolve::choose_action;
 #[allow(unused_imports)]
 pub(crate) use resolve::{
-    BindTarget, C_RETRY, COST_MARGIN, D_EARLY, D_WAIT, EvScores, SelectiveOutcome, TAU_REVOKE,
-    TAU_S, TAU_VERY_HIGH, TAU_W, compute_ev, cost_prefers_wait, early_val_probability,
+    C_RETRY, COST_MARGIN, D_EARLY, D_WAIT, EvScores, OrderedAdmitTarget, SelectiveOutcome,
+    TAU_REVOKE, TAU_S, TAU_VERY_HIGH, TAU_W, compute_ev, cost_prefers_wait, early_val_probability,
 };
 #[cfg(test)]
 pub(crate) use resolve::{PolicyCtx, ResolveAction};

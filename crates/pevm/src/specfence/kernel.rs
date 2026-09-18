@@ -1,6 +1,6 @@
 //! Debug rem-legal mirror — **not** the v6 certificate SoT.
 //!
-//! Plant SoT: `lab/notes/specfence-complete-architecture-v6-essence.md`.
+//! Protocol: `lab/notes/specfence-complete-architecture-v6-essence.md`.
 //! Strips live in [`crate::specfence::CertificateTable`]. This table only
 //! mirrors "any successful Fence this incarnation" for rem journal legality.
 //! Frozen π is unchanged. `inc` is not an Avoid key.

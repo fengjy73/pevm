@@ -29,7 +29,7 @@ pub enum ProcessReason {
     OptimisticReadCold,
     OptimisticReadInversion,
     OptimisticReadWriterDone,
-    OptimisticReadPlantTls,
+    OptimisticReadProtocolTls,
     /// Should be ~0 on a Fenced hot ℓ after Avoid/publish.
     OptimisticReadAfterAvoid,
 }
@@ -49,7 +49,7 @@ impl ProcessReason {
             Self::OptimisticReadCold => 7,
             Self::OptimisticReadInversion => 8,
             Self::OptimisticReadWriterDone => 9,
-            Self::OptimisticReadPlantTls => 10,
+            Self::OptimisticReadProtocolTls => 10,
             Self::OptimisticReadAfterAvoid => 11,
         }
     }
@@ -66,7 +66,7 @@ impl ProcessReason {
             7 => Self::OptimisticReadCold,
             8 => Self::OptimisticReadInversion,
             9 => Self::OptimisticReadWriterDone,
-            10 => Self::OptimisticReadPlantTls,
+            10 => Self::OptimisticReadProtocolTls,
             11 => Self::OptimisticReadAfterAvoid,
             _ => return None,
         })
@@ -85,7 +85,7 @@ impl ProcessReason {
             Self::OptimisticReadCold => "optimistic_read_cold",
             Self::OptimisticReadInversion => "optimistic_read_inversion",
             Self::OptimisticReadWriterDone => "optimistic_read_writer_done",
-            Self::OptimisticReadPlantTls => "optimistic_read_plant_tls",
+            Self::OptimisticReadProtocolTls => "optimistic_read_protocol_tls",
             Self::OptimisticReadAfterAvoid => "optimistic_read_after_avoid",
         }
     }
@@ -99,7 +99,7 @@ impl ProcessReason {
                 | Self::OptimisticReadCold
                 | Self::OptimisticReadInversion
                 | Self::OptimisticReadWriterDone
-                | Self::OptimisticReadPlantTls
+                | Self::OptimisticReadProtocolTls
                 | Self::OptimisticReadAfterAvoid
         )
     }

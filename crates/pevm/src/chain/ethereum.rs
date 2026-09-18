@@ -27,8 +27,8 @@ use crate::{
     mv_memory::MvMemory,
     specfence::{
         SpecFenceInspector, handler_ordered_admit_snap_install_wanted,
-        handler_sstore_plant_install_wanted, install_handler_ordered_admit_snap_capture,
-        install_handler_sstore_plant_capture,
+        handler_sstore_protocol_install_wanted, install_handler_ordered_admit_snap_capture,
+        install_handler_sstore_protocol_capture,
     },
 };
 
@@ -145,8 +145,8 @@ impl PevmChain for PevmEthereum {
         }
         // Iter4/10: hang-free post-SSTORE plant only when capture/jump/inspect may arm.
         // Production jump/capture OFF → stock SSTORE (no per-opcode TLS tax).
-        if handler_sstore_plant_install_wanted() {
-            install_handler_sstore_plant_capture(&mut evm.instruction);
+        if handler_sstore_protocol_install_wanted() {
+            install_handler_sstore_protocol_capture(&mut evm.instruction);
         }
         evm
     }

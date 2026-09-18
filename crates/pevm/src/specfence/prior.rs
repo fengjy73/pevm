@@ -1,4 +1,4 @@
-//! Plant v2 M3 — online WŜ / RŜ learning for OrderedAdmit-before-touch.
+//! M3 — online WŜ / RŜ learning for OrderedAdmit-before-touch.
 //!
 //! Learning ∉ TCB: wrong priors only change π (more OptimisticRead / Wait / validate
 //! fail / repair). Sequential equivalence still holds via validate.

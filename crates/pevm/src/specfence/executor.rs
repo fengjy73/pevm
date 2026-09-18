@@ -4,7 +4,7 @@
 //! Spec-only incarnations use the shared OCC validate kernel (bool walk + full_abort_reexecute).
 //! partial_abort Resolve runs only when a certificate **strip** covers fail locations.
 //!
-//! Plant SoT: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md`.
+//! Protocol: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md`.
 
 use super::ConcurrencyMode;
 use super::LeanAbortRepair;
@@ -66,9 +66,9 @@ pub(crate) fn specfence_partial_abort_validate(
         && repair_grain(cert, tx_idx, invalid) == RepairGrain::PartialAbort
 }
 
-/// **Deprecated name.** v9.3: this is **not** a computer switch.
-/// Cold Spec cost-class (empty PE). Quiet-off alone must **not** switch
-/// the scheduler to `next_occ_task` (no second OCC engine).
+/// **Deprecated name** (`specfence_cost_class_spec`). v9.3: this is **not**
+/// a computer switch. Cold Spec cost-class (empty PE). Quiet-off alone must
+/// **not** switch the scheduler to `next_occ_task` (no second OCC engine).
 #[inline]
 pub(crate) fn specfence_plant_is_occ(mode: ConcurrencyMode, learner: &LiveLearner) -> bool {
     specfence_cost_class_spec(mode, learner)
@@ -219,9 +219,9 @@ pub(crate) fn validate_occ_kernel(
     if note_and_try_commute(specfence, mv_memory, tx_version.tx_idx, &invalid) {
         return scheduler.finish_validation(tx_version, false);
     }
-    let thin_a0 = specfence.policy.is_some_and(|p| p.is_thin_shell())
+    let a0_ungated = specfence.policy.is_some_and(|p| p.is_a0_majority_block())
         && !specfence.ready_edges.was_queued(tx_version.tx_idx);
-    if thin_a0 {
+    if a0_ungated {
         return batch_park_abort(mv_memory, scheduler, tx_version, specfence, &invalid);
     }
     let aborted = scheduler.try_validation_abort(tx_version);
@@ -378,9 +378,9 @@ pub(crate) fn validate_specfence(
         return scheduler.finish_validation(tx_version, false);
     }
     // Thin-shell A0: cheap batch park, no PE seed / suffix storm.
-    let thin_a0 = specfence.policy.is_some_and(|p| p.is_thin_shell())
+    let a0_ungated = specfence.policy.is_some_and(|p| p.is_a0_majority_block())
         && !specfence.ready_edges.was_queued(tx_version.tx_idx);
-    if thin_a0 {
+    if a0_ungated {
         return batch_park_abort(mv_memory, scheduler, tx_version, specfence, &invalid);
     }
     if !invalid.is_empty() {

@@ -1,11 +1,12 @@
 //! SpecFenceComputer — fused ready-set on one pevm spine (v10).
 //!
-//! Plant SoT: `lab/notes/specfence-complete-architecture-v10-raw-mixed.md`.
-//! PC: Stages / steal / pipeline / ProducerStage / wave-fill / wall.
-//! CC: ReadyEdge / lane / OrderedAdmit / PE refuse — first-class, not annotation.
+//! Protocol: `lab/notes/specfence-complete-architecture-v10-raw-mixed.md`.
+//! Scheduler: Stages / steal / pipeline / ProducerStage / wave-fill / wall.
+//! Admission: ReadyEdge / lane / OrderedAdmit / PE refuse — first-class, not annotation.
 //! Steal only Stages in ready. Never steal a PE-blocked Execute "to look busy".
 //! Refuse consumer only when ProducerStage(w) is runnable (v6 deadlock designed out).
 //! After refuse: scheduler wave-fills the next independent (`optimistic_read`).
+//! A0 / ungated majority: skip empty ProducerStage scan; ReadyEdge tax only on gated txs.
 
 use super::metrics::MetricsInner;
 use super::producer_stage::ProducerStageTable;
@@ -24,6 +25,15 @@ pub(crate) fn next_sf_task(
     metrics: Option<&MetricsInner>,
 ) -> Option<Task> {
     let refuse_before = ready.refuse_count();
+    // A0-majority / no RAW-fan reservation: OCC-class pick (no empty DashMap scan).
+    if !stages.has_reserved() {
+        let task = scheduler.next_task_with_wave_ready(Some(wave), Some(ready));
+        if let Some(m) = metrics {
+            let n = ready.refuse_count().saturating_sub(refuse_before);
+            m.record_refuse_admit_n(n);
+        }
+        return task;
+    }
     // Drop Aborting / Done reservations so a dead writer cannot wait_for_dependency the
     // ProducerStage min and starve the rest of the ready-set.
     for _ in 0..8 {

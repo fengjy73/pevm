@@ -1,4 +1,4 @@
-//! Plant v2 M1c–M1e: CALL / effect-boundary PC resume + safe absolute jump.
+//! M1c–M1e: CALL / effect-boundary PC resume + safe absolute jump.
 //!
 //! Uses a stock revm Inspector (not a custom `run_exec_loop`) to:
 //! 1. Count opcodes and snapshot interpreter PC/stack/memory/gas at boundaries
@@ -121,7 +121,7 @@ pub(crate) struct BoundarySnapshot {
     /// completed — gas_remaining / refund already include SSTORE dynamic cost
     /// (M1i post-SSTORE gas-equal jump gate).
     pub post_sstore: bool,
-    /// Handler-plant SSTORE ordinal (1 = first SSTORE this plant TLS). 0 = Inspector.
+    /// Handler SSTORE ordinal (1 = first SSTORE this protocol TLS). 0 = Inspector.
     /// Iter9: require write_replays.len() >= this so we never jump past unreplayed SSTORE.
     pub sstore_index: u64,
     /// Iter9: exact storage presents at this Handler tip (ordered plant notes).
@@ -621,7 +621,7 @@ pub(crate) fn valued_call_cache_env_enabled() -> bool {
 
 /// Scoped plant pointers for Inspector → PartialRetry / metrics / journal stream.
 #[derive(Clone, Copy)]
-struct PlantTls {
+struct ProtocolTls {
     tx_idx: TxIdx,
     incarnation: usize,
     partial_retry: *const PartialRetryTable,
@@ -632,10 +632,10 @@ struct PlantTls {
 }
 
 thread_local! {
-    /// M1l: true for the duration of inspect_run (with_plant_tls). WaitHard mid-inspect
+    /// M1l: true for the duration of inspect_run (with_protocol_tls). WaitHard mid-inspect
     /// parks the whole tx and livelocks multi-SSTORE at full worker width.
     static IN_INSPECT: Cell<bool> = const { Cell::new(false) };
-    static PLANT: Cell<Option<PlantTls>> = const { Cell::new(None) };
+    static PROTOCOL: Cell<Option<ProtocolTls>> = const { Cell::new(None) };
     static OPCODE_STEPS: Cell<u64> = const { Cell::new(0) };
     static CALL_DEPTH: Cell<u16> = const { Cell::new(0) };
     static CALL_SEQ: Cell<u32> = const { Cell::new(0) };
@@ -644,8 +644,8 @@ thread_local! {
     /// Iter4: SSTORE count on Handler::run plant path (hang-free, no Inspector).
     static HANDLER_SSTORE_STEPS: Cell<u64> = const { Cell::new(0) };
     /// Iter19: hang-free OrderedAdmit/EffectBoundary snap context (no IN_INSPECT / WaitHard demote).
-    /// Distinct from PLANT so stock SSTORE + SoftWait Soft~0 stay unchanged.
-    static BIND_SNAP: Cell<Option<PlantTls>> = const { Cell::new(None) };
+    /// Distinct from PROTOCOL so stock SSTORE + SoftWait Soft~0 stay unchanged.
+    static BIND_SNAP: Cell<Option<ProtocolTls>> = const { Cell::new(None) };
     /// Set by OrderedAdmit-on-Data; consumed after stock SLOAD returns in Handler wrap.
     static PENDING_BIND_SNAP: Cell<bool> = const { Cell::new(false) };
     /// OrderedAdmit-snap ordinal this incarnation (opcode_steps proxy for jump credit).
@@ -712,18 +712,18 @@ struct PendingCallMeta {
     value: U256,
 }
 
-/// Install plant TLS for the duration of `f` (SpecFence `Vm::execute` body).
-pub(crate) fn with_plant_tls<R>(
+/// Install protocol TLS for the duration of `f` (SpecFence `Vm::execute` body).
+pub(crate) fn with_protocol_tls<R>(
     tx_idx: TxIdx,
     partial_retry: &PartialRetryTable,
     metrics: &MetricsInner,
     f: impl FnOnce() -> R,
 ) -> R {
-    with_plant_tls_journal(tx_idx, 0, None, None, partial_retry, metrics, f)
+    with_protocol_tls_journal(tx_idx, 0, None, None, partial_retry, metrics, f)
 }
 
-/// Plant TLS with optional FineGrain journal stream (research inspect path).
-pub(crate) fn with_plant_tls_journal<R>(
+/// Protocol TLS with optional FineGrain journal stream (research inspect path).
+pub(crate) fn with_protocol_tls_journal<R>(
     tx_idx: TxIdx,
     incarnation: usize,
     finegrain: Option<&FineGrainCollector>,
@@ -732,7 +732,7 @@ pub(crate) fn with_plant_tls_journal<R>(
     metrics: &MetricsInner,
     f: impl FnOnce() -> R,
 ) -> R {
-    let prev = PLANT.replace(Some(PlantTls {
+    let prev = PROTOCOL.replace(Some(ProtocolTls {
         tx_idx,
         incarnation,
         partial_retry: partial_retry as *const _,
@@ -766,7 +766,7 @@ pub(crate) fn with_plant_tls_journal<R>(
     // Persist captured nested CallOutcomes into PartialRetry for next RewindTo.
     let captured = CAPTURED_CALLS.with(|c| std::mem::take(&mut *c.borrow_mut()));
     if !captured.is_empty() {
-        PLANT.with(|p| {
+        PROTOCOL.with(|p| {
             if let Some(plant) = p.get() {
                 let table = unsafe { &*plant.partial_retry };
                 table.note_call_outcomes(plant.tx_idx, captured);
@@ -776,7 +776,7 @@ pub(crate) fn with_plant_tls_journal<R>(
     // M1j: persist LOG* for jump-past-LOG (not via live_boundaries blob).
     let logs = PREFIX_LOGS.with(|c| std::mem::take(&mut *c.borrow_mut()));
     if !logs.is_empty() {
-        PLANT.with(|p| {
+        PROTOCOL.with(|p| {
             if let Some(plant) = p.get() {
                 let table = unsafe { &*plant.partial_retry };
                 table.note_log_replays(plant.tx_idx, logs);
@@ -795,7 +795,7 @@ pub(crate) fn with_plant_tls_journal<R>(
     PENDING_LOG_REPLAYS.with(|c| c.borrow_mut().clear());
     PREFIX_LOGS.with(|c| c.borrow_mut().clear());
     LAST_OPCODE.set(0);
-    PLANT.set(prev);
+    PROTOCOL.set(prev);
     out
 }
 
@@ -857,7 +857,7 @@ pub(crate) fn arm_call_outcome_cache(calls: Vec<CachedCallOutcome>) {
 }
 
 fn record_call_outcome_hit() {
-    PLANT.with(|p| {
+    PROTOCOL.with(|p| {
         if let Some(plant) = p.get() {
             let metrics = unsafe { &*plant.metrics };
             metrics.record_call_outcome_cache_hit();
@@ -866,7 +866,7 @@ fn record_call_outcome_hit() {
 }
 
 fn current_effect_k() -> usize {
-    PLANT.with(|p| {
+    PROTOCOL.with(|p| {
         p.get()
             .map(|plant| {
                 let table = unsafe { &*plant.partial_retry };
@@ -1093,9 +1093,9 @@ pub(crate) fn resume_was_applied() -> bool {
 }
 
 fn push_cp(kind: CheckpointKind, snap: Option<BoundarySnapshot>) {
-    PLANT.with(|p| {
+    PROTOCOL.with(|p| {
         if let Some(plant) = p.get() {
-            // SAFETY: pointers live for with_plant_tls scope covering inspect_run.
+            // SAFETY: pointers live for with_protocol_tls scope covering inspect_run.
             let table = unsafe { &*plant.partial_retry };
             let _ = table.push_checkpoint_with_boundary(plant.tx_idx, kind, snap);
         }
@@ -1104,11 +1104,11 @@ fn push_cp(kind: CheckpointKind, snap: Option<BoundarySnapshot>) {
 
 fn record_pc_resume(skipped: u64) {
     LAST_SKIPPED.set(skipped);
-    // Iter21: OrderedAdmit-snap Lean jumps apply via Handler run_exec_loop without PLANT
+    // Iter21: OrderedAdmit-snap Lean jumps apply via Handler run_exec_loop without PROTOCOL
     // TLS — still record aj/pc_resume via BIND_SNAP metrics so digs aren't blind
     // (aj=0 while jump applied → silent seq≠par).
     let mut recorded = false;
-    PLANT.with(|p| {
+    PROTOCOL.with(|p| {
         if let Some(plant) = p.get() {
             let metrics = unsafe { &*plant.metrics };
             metrics.record_pc_resume(skipped);
@@ -1130,7 +1130,7 @@ fn record_pc_resume(skipped: u64) {
 }
 
 fn record_journal_blob_ff(accounts: usize) {
-    PLANT.with(|p| {
+    PROTOCOL.with(|p| {
         if let Some(plant) = p.get() {
             let metrics = unsafe { &*plant.metrics };
             metrics.record_journal_blob_ff(accounts);
@@ -1139,7 +1139,7 @@ fn record_journal_blob_ff(accounts: usize) {
 }
 
 fn attach_live_to_plant(snap: BoundarySnapshot, blob: JournalBlob) {
-    PLANT.with(|p| {
+    PROTOCOL.with(|p| {
         if let Some(plant) = p.get() {
             let table = unsafe { &*plant.partial_retry };
             table.attach_live_boundary(plant.tx_idx, snap, blob);
@@ -1372,7 +1372,7 @@ fn maybe_note_journal_effect(
     const OP_SLOAD: u8 = 0x54;
     const OP_SSTORE: u8 = 0x55;
 
-    PLANT.with(|p| {
+    PROTOCOL.with(|p| {
         let Some(plant) = p.get() else { return };
         let Some(fg_ptr) = plant.finegrain else {
             return;
@@ -1558,9 +1558,9 @@ fn maybe_note_journal_effect(
     });
 }
 
-/// True while `with_plant_tls*` is active on this worker (Handler or inspect).
-pub(crate) fn plant_tls_active() -> bool {
-    PLANT.with(|p| p.get().is_some())
+/// True while `with_protocol_tls*` is active on this worker (Handler or inspect).
+pub(crate) fn protocol_tls_active() -> bool {
+    PROTOCOL.with(|p| p.get().is_some())
 }
 
 /// True when an absolute PC resume snap is armed (cheap TLS check).
@@ -2049,7 +2049,7 @@ pub(crate) fn with_ordered_admit_snap_tls<R>(
     metrics: &MetricsInner,
     mut f: impl FnMut() -> R,
 ) -> R {
-    let prev = BIND_SNAP.replace(Some(PlantTls {
+    let prev = BIND_SNAP.replace(Some(ProtocolTls {
         tx_idx,
         incarnation: 0,
         partial_retry: partial_retry as *const _,
@@ -2238,7 +2238,7 @@ pub(crate) fn install_handler_ordered_admit_snap_capture<H: revm::interpreter::H
 /// Iter10: install Handler SSTORE plant only when capture/jump/inspect may arm TLS.
 /// Production jump/capture OFF → stock SSTORE (no per-opcode TLS tax). Enable with
 /// `SPECFENCE_HANDLER_CAPTURE=1`, `SPECFENCE_ABSOLUTE_JUMP=1`, or research inspect.
-pub(crate) fn handler_sstore_plant_install_wanted() -> bool {
+pub(crate) fn handler_sstore_protocol_install_wanted() -> bool {
     if crate::specfence::research_inspect_enabled() {
         return true;
     }
@@ -2255,21 +2255,21 @@ pub(crate) fn handler_sstore_plant_install_wanted() -> bool {
 }
 
 /// EthInterpreter SSTORE plant capture (installed on Mainnet EVM instruction table).
-/// Iter10: thin fast path + #[cold] plant body so production I-cache stays stock-like.
+/// Iter10: thin fast path + #[cold] inspect body so production I-cache stays stock-like.
 #[inline(always)]
-pub(crate) fn sstore_plant_capture_eth<H: revm::interpreter::Host + ?Sized>(
+pub(crate) fn sstore_protocol_capture_eth<H: revm::interpreter::Host + ?Sized>(
     context: revm::interpreter::InstructionContext<'_, H, EthInterpreter>,
 ) {
-    // Fast path: identical to stock SSTORE when plant TLS is off (597 wall).
-    if !plant_tls_active() {
+    // Fast path: identical to stock SSTORE when protocol TLS is off (597 wall).
+    if !protocol_tls_active() {
         revm::interpreter::instructions::host::sstore(context);
         return;
     }
-    sstore_plant_capture_eth_slow(context);
+    sstore_protocol_capture_eth_slow(context);
 }
 
 #[cold]
-fn sstore_plant_capture_eth_slow<H: revm::interpreter::Host + ?Sized>(
+fn sstore_protocol_capture_eth_slow<H: revm::interpreter::Host + ?Sized>(
     context: revm::interpreter::InstructionContext<'_, H, EthInterpreter>,
 ) {
     // Iter11: never warm via `sload` before stock SSTORE (EIP-2929 −2100 → seq≠par).
@@ -2331,7 +2331,7 @@ fn sstore_plant_capture_eth_slow<H: revm::interpreter::Host + ?Sized>(
         write_replays_at_tip: Vec::new(),
         tip_sloads: Vec::new(),
     };
-    PLANT.with(|p| {
+    PROTOCOL.with(|p| {
         if let Some(plant) = p.get() {
             let table = unsafe { &*plant.partial_retry };
             table.note_post_sstore_gas(plant.tx_idx, gas_remaining);
@@ -2359,13 +2359,13 @@ fn sstore_plant_capture_eth_slow<H: revm::interpreter::Host + ?Sized>(
 }
 
 /// Install hang-free SSTORE plant capture on a Mainnet-style instruction table.
-pub(crate) fn install_handler_sstore_plant_capture<H: revm::interpreter::Host>(
+pub(crate) fn install_handler_sstore_protocol_capture<H: revm::interpreter::Host>(
     instructions: &mut revm::handler::instructions::EthInstructions<EthInterpreter, H>,
 ) {
     const OP_SSTORE: u8 = 0x55;
     instructions.insert_instruction(
         OP_SSTORE,
-        revm::interpreter::Instruction::new(sstore_plant_capture_eth::<H>, 0),
+        revm::interpreter::Instruction::new(sstore_protocol_capture_eth::<H>, 0),
     );
 }
 
@@ -2431,7 +2431,7 @@ where
         if op == OP_SSTORE {
             snap.post_sstore = true;
             let gas_after = snap.gas_remaining;
-            PLANT.with(|p| {
+            PROTOCOL.with(|p| {
                 if let Some(plant) = p.get() {
                     let table = unsafe { &*plant.partial_retry };
                     table.note_post_sstore_gas(plant.tx_idx, gas_after);
@@ -2455,7 +2455,7 @@ where
                 }
             });
             // M1k: eager flush LogReplay (same mid-abort race as CallOutcome).
-            PLANT.with(|p| {
+            PROTOCOL.with(|p| {
                 if let Some(plant) = p.get() {
                     let table = unsafe { &*plant.partial_retry };
                     let logs = PREFIX_LOGS.with(|c| c.borrow().clone());
@@ -2579,10 +2579,10 @@ where
                     outcome: outcome.clone(),
                 };
                 CAPTURED_CALLS.with(|c| c.borrow_mut().push(cached));
-                // M1k: eager flush — mid-exec abort before with_plant_tls end
+                // M1k: eager flush — mid-exec abort before with_protocol_tls end
                 // previously lost CallOutcomes while live tips sat past CALL
                 // (absolute jump skipped valued transfer → seq≠par).
-                PLANT.with(|p| {
+                PROTOCOL.with(|p| {
                     if let Some(plant) = p.get() {
                         let table = unsafe { &*plant.partial_retry };
                         let snap = CAPTURED_CALLS.with(|c| c.borrow().clone());
@@ -3215,7 +3215,7 @@ mod m1c_tests {
             try_arm_safe_absolute_jump(0, &table, &cont, &metrics),
             "opt-in path must arm absolute jump when jump_is_safe"
         );
-        with_plant_tls(0, &table, &metrics, || {
+        with_protocol_tls(0, &table, &metrics, || {
             // Production initialize_interp apply + metric path.
             let code = Bytecode::new_raw(vec![0x00; 8].into());
             let mut interp = Interpreter::<EthInterpreter>::default();

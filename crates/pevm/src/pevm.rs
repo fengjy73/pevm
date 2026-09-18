@@ -436,7 +436,7 @@ impl Pevm {
         let hints = AccountHints::build(chain, &txs);
         let metrics_inner = MetricsInner::default();
         let mut initial_wait = std::collections::HashSet::new();
-        // V5-P0: LeanOCC default; HotSet feature-only; inter-prior never arms SoftWait.
+        // V5-P0: OCC-fast / lean execute default; HotSet feature-only; inter-prior never arms SoftWait.
         let learner = LiveLearner::new();
         let mut abc_prior_morph = None;
         if self.concurrency_mode == ConcurrencyMode::SpecFence {
@@ -491,6 +491,7 @@ impl Pevm {
             // PE even on quiet morph (M4). Truly cold seeds nothing.
             self.cost_policy.begin_block(block_size);
             let contracts = collect_contracts(storage, &hints);
+            let seed_t0 = Instant::now();
             let _ = crate::specfence::admit::admit_seed_begin_block(
                 &ready_edges,
                 &producer_stages,
@@ -503,7 +504,8 @@ impl Pevm {
                 &contracts,
                 Some(&metrics_inner),
             );
-            // PC-W1: seed the true ready bag with independents (not A1-blocked).
+            metrics_inner.set_admit_seed_begin_ns(seed_t0.elapsed().as_nanos() as u64);
+            // Seed independents into the ready bag.
             for t in 0..block_size {
                 if ready_edges.may_execute(t) {
                     wave.push_ready(t);
@@ -572,7 +574,7 @@ impl Pevm {
                     let profile = crate::specfence::profile_timing_enabled();
                     // v9.3: one spine. SpecFence always uses unified next_sf
                     // (empty extras ≡ OCC walk). Occ mode is a separate computer.
-                    // Ban: plant_is_occ → next_occ_task (no second OCC engine).
+                    // Ban: cost-class empty-PE → next_occ_task (no second OCC engine).
                     let occ_mode = self.concurrency_mode == ConcurrencyMode::Occ;
                     let mut sched_t0 = profile.then(Instant::now);
                     let mut task = if occ_mode {
@@ -752,19 +754,19 @@ impl Pevm {
                             ) =>
                     {
                         // Already counted on the abort path when classified.
-                        // miss_detect must not treat commute/lazy as "must A1".
+                        // unfenced_reexec must not treat commute/lazy as "must A1".
                         let _ = note.location;
                     }
                     Some(note) => {
                         miss += 1;
-                        self.cost_policy.bump_miss_detect();
+                        self.cost_policy.bump_unfenced_reexec();
                         if !self.cost_policy.is_promoted(note.location) {
                             self.cost_policy.promote_short_edge(note.location, 0);
                         }
                     }
                     None => {
                         miss += 1;
-                        self.cost_policy.bump_miss_detect();
+                        self.cost_policy.bump_unfenced_reexec();
                     }
                 }
             }
@@ -791,14 +793,14 @@ impl Pevm {
                 reexec,
                 miss,
                 report.a1_cohorts,
-                report.lean_a0_cohorts,
+                report.a0_cohorts,
             );
             metrics_inner.set_ns_learn_metrics(
                 report.refuse_ns,
                 report.reexec_ns,
-                report.thin_shell,
-                report.ns_ev_keep_a1,
-                report.ns_ev_demote,
+                report.a0_majority_block,
+                report.cost_ev_keep_ordered,
+                report.cost_ev_demote_optimistic,
                 report.k_cap_demote,
                 report.commute_skip,
                 report.batch_repair,
@@ -819,7 +821,7 @@ impl Pevm {
             engagement.lean_mode_txs(),
             engagement.full_mode_txs(),
             engagement.engagement_switches(),
-            self.hotset.hot_local_reads(),
+            self.hotset.location_hot_resolves(),
             self.hotset.len(),
         );
         self.last_metrics = metrics_inner.snapshot(

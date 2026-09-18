@@ -1,6 +1,6 @@
 //! Access-prefix certificate strips — not a tx-global bit from one OrderedAdmit.
 //!
-//! Plant SoT: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md` §3.3.
+//! Protocol: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md` §3.3.
 //!
 //! `note_success` only after a **successful** Fence verb (OrderedAdmit after Data,
 //! WaitFor armed, SerialLane exclusive progress). OrderedAdmit-decide then Data miss

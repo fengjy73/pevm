@@ -12,7 +12,7 @@ use smallvec::SmallVec;
 
 use crate::{
     FinishExecFlags, IncarnationStatus, Task, TxIdx, TxStatus, TxVersion,
-    specfence::{FenceGraph, ReadyEdgeTable, WaveParkTable},
+    specfence::{FenceGraph, ReadyEdgeTable, WaveParkTable, profile_timing_enabled},
 };
 
 /// After refuse_admit, probe later txs for an independent Execute.
@@ -155,7 +155,9 @@ impl Scheduler {
         if tx_idx < self.block_size {
             let mut tx = index_mutex!(self.transactions_status, tx_idx);
             if tx.status == IncarnationStatus::ReadyToExecute {
+                // Ungated / A0: OCC-class pick — no ReadyEdge refuse probe.
                 if let Some(edges) = ready
+                    && edges.is_gated(tx_idx)
                     && !edges.may_execute(tx_idx)
                     && let Some(w) = edges.blocking_producer(tx_idx)
                 {
@@ -244,10 +246,14 @@ impl Scheduler {
                         }
                     }
                 }
-                let idle_t0 = Instant::now();
-                thread::yield_now();
-                if let Some(edges) = ready {
-                    edges.add_idle_ns(idle_t0.elapsed().as_nanos() as u64);
+                if profile_timing_enabled() {
+                    let idle_t0 = Instant::now();
+                    thread::yield_now();
+                    if let Some(edges) = ready {
+                        edges.add_idle_ns(idle_t0.elapsed().as_nanos() as u64);
+                    }
+                } else {
+                    thread::yield_now();
                 }
                 continue;
             }
@@ -259,6 +265,7 @@ impl Scheduler {
             // Producer is wave-admitted with park_heat (no fetch_min).
             if wave.is_some() && execution_idx < self.block_size {
                 if let Some(edges) = ready
+                    && edges.is_gated(execution_idx)
                     && !edges.may_execute(execution_idx)
                 {
                     self.execution_idx
@@ -304,6 +311,7 @@ impl Scheduler {
                     // "Steal" execution job while holding the lock
                     if tx.status == IncarnationStatus::ReadyToExecute {
                         if let Some(edges) = ready
+                            && edges.is_gated(tx_idx)
                             && !edges.may_execute(tx_idx)
                             && let Some(w) = edges.blocking_producer(tx_idx)
                             && (self.is_executing(w) || self.is_ready(w))
@@ -441,7 +449,7 @@ impl Scheduler {
             if cand >= self.block_size || self.is_done(cand) {
                 return None;
             }
-            if edges.is_sleeping(cand) || !edges.may_execute(cand) {
+            if edges.is_gated(cand) && (edges.is_sleeping(cand) || !edges.may_execute(cand)) {
                 return None;
             }
             *ready_n += 1;

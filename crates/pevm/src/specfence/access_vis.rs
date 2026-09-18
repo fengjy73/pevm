@@ -1,6 +1,6 @@
 //! EdgeVisibility — `unfinished` counts **only !done** writers (v6 S2).
 //!
-//! Plant SoT: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md` §3.1.
+//! Protocol: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md` §3.1.
 //!
 //! FORBIDDEN: pushing `last_writer_before` into `unfinished` when `is_done`.
 //! `Data ∧ unfinished=0 → OrderedAdmit` is reachable only with this filter.
