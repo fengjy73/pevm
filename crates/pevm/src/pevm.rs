@@ -728,6 +728,7 @@ impl Pevm {
             // write locations here so the next block still sees process prior.
             if self.cost_policy.is_a0_majority_block() {
                 let beneficiary = hash_deterministic(MemoryLocation::Basic(block_env.beneficiary));
+                let mut deferred = Vec::new();
                 for tx in 0..block_size {
                     if ready_edges.was_queued(tx) {
                         continue;
@@ -735,8 +736,12 @@ impl Pevm {
                     for loc in mv_memory.write_locations(tx) {
                         if loc != beneficiary {
                             self.hotset.note_writer(loc, tx);
+                            deferred.push(loc);
                         }
                     }
+                }
+                if !deferred.is_empty() {
+                    self.rw_prior.observe_write_set(&deferred, None);
                 }
             }
             self.hotset.end_block();
