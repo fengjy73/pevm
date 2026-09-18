@@ -598,9 +598,19 @@ impl Pevm {
                     while task.is_some() {
                         task = match task.unwrap() {
                             Task::Execution(tx_version) => {
-                                let occ_exec = occ_mode;
+                                let occ_exec = occ_mode
+                                    || (self.concurrency_mode == ConcurrencyMode::SpecFence
+                                        && !specfence.ready_edges.has_any_gated());
                                 if occ_exec {
-                                    self.try_execute(&mut vm, &scheduler, tx_version, None, None)
+                                    let done_idx = tx_version.tx_idx;
+                                    let next = self
+                                        .try_execute(&mut vm, &scheduler, tx_version, None, None);
+                                    // Stamp Done so a later short-edge promote cannot
+                                    // refuse forever (bitset, not DashMap).
+                                    if self.concurrency_mode == ConcurrencyMode::SpecFence {
+                                        specfence.ready_edges.note_producer_done_stamp(done_idx);
+                                    }
+                                    next
                                 } else {
                                     let fence_ref = crate::specfence::fence_for_mode(
                                         self.concurrency_mode,
@@ -613,12 +623,23 @@ impl Pevm {
                             }
                             Task::Validation(tx_version) => {
                                 let v0 = profile.then(Instant::now);
+                                let a0_ungated = specfence.mode == ConcurrencyMode::SpecFence
+                                    && !specfence.ready_edges.has_any_gated();
                                 let next = if occ_mode {
                                     crate::specfence::validate_occ_stage(
                                         &mv_memory,
                                         &scheduler,
                                         &tx_version,
                                         Some(&metrics_inner),
+                                    )
+                                } else if a0_ungated {
+                                    // P3: A1=0 validate keeps commute (OCC-effect) but
+                                    // skips certificate / repair branching.
+                                    crate::specfence::validate_occ_kernel(
+                                        &mv_memory,
+                                        &scheduler,
+                                        &tx_version,
+                                        specfence,
                                     )
                                 } else if specfence.mode == ConcurrencyMode::SpecFence {
                                     crate::specfence::validate_specfence(

@@ -284,6 +284,12 @@ impl ReadyEdgeTable {
         self.gated_n.load(Ordering::Relaxed) > 0
     }
 
+    /// Stamp Done without waiter wake (A0 OCC wrap / P3).
+    #[inline]
+    pub(crate) fn note_producer_done_stamp(&self, writer: TxIdx) {
+        self.mark_done(writer);
+    }
+
     #[inline]
     fn mark_done(&self, writer: TxIdx) {
         let i = writer / 64;
