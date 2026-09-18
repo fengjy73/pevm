@@ -223,9 +223,8 @@ fn promote_and_seed_short_edge(
         producer,
         f.location,
     );
-    // CC-L1: queue a single-hop successor only when Windowed/FullChain wins.
-    // Do **not** flush here — validate-time plant + same-thread re-exec of
-    // the aborted tx takes the gated path and livelocks (done-stamp race).
+    // T3: queue the next Win_w idle hops. Do **not** flush here —
+    // validate-time plant + same-thread re-exec livelocks (done-stamp race).
     let n_pairs = policy.pairs_of(f.location).len();
     if policy.hops_to_plant(f.location, n_pairs) > 0 {
         let from = specfence.hints.from_of(tx_idx);

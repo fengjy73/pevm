@@ -586,9 +586,10 @@ impl Pevm {
                     let mut task = if occ_mode {
                         crate::specfence::next_occ_task(&scheduler)
                     } else if self.concurrency_mode == ConcurrencyMode::SpecFence {
-                        // Persist CC-L1/L2 hops for the next begin. Do not plant
-                        // ReadyEdges mid-block — that races done-stamp / JUMP and
-                        // flakes seq≡par (iter11).
+                        // T3 idle hops are queued on abort and planted at the
+                        // *next begin* (Win_w / Seg). Do not flush ReadyEdges
+                        // mid-block — that prepaid the cold 3356896 wall and
+                        // races done-stamp / ERC-20 (iter11).
                         if let Some(w) = wave_ref {
                             crate::specfence::next_sf_task(
                                 &scheduler,
