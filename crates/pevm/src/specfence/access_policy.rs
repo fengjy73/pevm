@@ -120,7 +120,7 @@ pub(crate) fn decide_queried(
     // OrderedAdmit rare: tip==conflict ∧ OrderedAdmit EV only. `known_star` opens WaitFor,
     // never OrderedAdmit (fan 14689597 OrderedAdmit 472 vs Wait 47 was this OR).
     let ordered_admit_ev = if let Some(q) = bayes {
-        crate::specfence::fence_act::ordered_admit_ev_from_query(
+        crate::specfence::ordered_admit_act::ordered_admit_ev_from_query(
             q.ev_ordered_admit_beats_full_abort,
             quiet_off,
             known_star,

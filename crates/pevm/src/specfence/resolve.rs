@@ -48,7 +48,7 @@ pub(crate) struct PolicyCtx {
     pub location: MemoryLocationHash,
     pub writer_known: bool,
     pub writer: Option<TxIdx>,
-    /// True when last writer is Executed/Validated (wait is cheap / Bindable).
+    /// True when last writer is Executed/Validated (ordered-admit ready).
     pub writer_done: bool,
     pub posterior_conflict: f64,
     pub posterior_ordered_admit_success: f64,
@@ -331,9 +331,9 @@ pub(crate) enum SelectiveOutcome {
     FallbackFull,
 }
 
-/// Describe a OrderedAdmit target for Bohm-lite residual write-set.
+/// Describe an ordered-admit readiness target for Bohm-lite residual write-set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BindTarget {
+pub(crate) struct OrderedAdmitTarget {
     pub writer: TxIdx,
     pub incarnation: TxIncarnation,
 }

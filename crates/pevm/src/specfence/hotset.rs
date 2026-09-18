@@ -53,8 +53,8 @@ pub(crate) struct HotSet {
     aborts: DashMap<MemoryLocationHash, AtomicUsize, BuildIdentityHasher>,
     /// Process-persistent multi-writer mass (inter-block).
     process_prior: DashMap<MemoryLocationHash, f64, BuildIdentityHasher>,
-    /// Diagnostics: HotLocal resolve invocations.
-    hot_local_reads: AtomicUsize,
+    /// Diagnostics: location-hot resolve invocations (ℓ ∈ HotSet).
+    location_hot_resolves: AtomicUsize,
 }
 
 impl Default for HotSet {
@@ -70,7 +70,7 @@ impl HotSet {
             writers: DashMap::default(),
             aborts: DashMap::default(),
             process_prior: DashMap::default(),
-            hot_local_reads: AtomicUsize::new(0),
+            location_hot_resolves: AtomicUsize::new(0),
         }
     }
 
@@ -83,7 +83,7 @@ impl HotSet {
         self.members.clear();
         self.writers.clear();
         self.aborts.clear();
-        self.hot_local_reads.store(0, Ordering::Relaxed);
+        self.location_hot_resolves.store(0, Ordering::Relaxed);
     }
 
     /// Full reset (tests / replay).
@@ -92,7 +92,7 @@ impl HotSet {
         self.writers.clear();
         self.aborts.clear();
         self.process_prior.clear();
-        self.hot_local_reads.store(0, Ordering::Relaxed);
+        self.location_hot_resolves.store(0, Ordering::Relaxed);
     }
 
     #[inline]
@@ -167,12 +167,12 @@ impl HotSet {
         self.members.insert(location, ());
     }
 
-    pub(crate) fn record_hot_local_read(&self) {
-        self.hot_local_reads.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn record_location_hot_resolve(&self) {
+        self.location_hot_resolves.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn hot_local_reads(&self) -> usize {
-        self.hot_local_reads.load(Ordering::Relaxed)
+    pub(crate) fn location_hot_resolves(&self) -> usize {
+        self.location_hot_resolves.load(Ordering::Relaxed)
     }
 
     /// End-of-block: reinforce multi-writer / abort-storm locs; decay the rest.

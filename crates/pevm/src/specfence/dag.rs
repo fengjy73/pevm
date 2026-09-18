@@ -1,4 +1,4 @@
-//! FenceGraph (P2) — SoftWait / BindTarget / revoke / wake.
+//! FenceGraph (P2) — SoftWait / OrderedAdmitTarget / revoke / wake.
 //!
 //! SoftWait is the **source of truth** for SpecFence scheduling fences.
 //! `RegionTable` location Wait bits and legacy wait-flags are mirrors/facades.

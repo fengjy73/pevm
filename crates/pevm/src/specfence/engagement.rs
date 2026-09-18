@@ -2,7 +2,7 @@
 //!
 //! Authoritative: `lab/notes/specfence-abc-unified-protocol.md`.
 //!
-//! - Execute path: always LeanOCC for `Handler::run` unless research inspect.
+//! - Execute path: always OCC-fast / lean execute for `Handler::run` unless research inspect.
 //! - Block engagement mode (C): **decay-only label** (Quiet vs Storm hat).
 //!   v2: mode does **not** actuate Await / collapse / absorb. Live π is the
 //!   Edge visibility machine + partial_abort-first Resolve. SoftWait Soft stays 0.
@@ -121,7 +121,7 @@ pub(crate) struct AdaptiveEngagement {
 }
 
 impl AdaptiveEngagement {
-    /// Redesign: always start LeanOCC (ignore old M4 prove-quiet gates).
+    /// Redesign: always start OCC-fast / lean execute (ignore old M4 prove-quiet gates).
     pub(crate) fn should_start_lean() -> bool {
         !research_inspect_enabled()
     }

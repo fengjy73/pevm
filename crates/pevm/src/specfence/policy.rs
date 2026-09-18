@@ -1,4 +1,4 @@
-//! Cost-aware admit policy — L1 ns-EV + PC-S1 thin-shell + CC-D1 routing.
+//! Cost-aware admit policy — L1 cost-EV + A0-majority block + CC-D1 routing.
 //!
 //! Soft=0 actions: **A0** OptimisticRead vs **A1** OrderedAdmit (refuse +
 //! wave-admit pred). A0 is the OCC-effect path on this spine — not a hand-off
@@ -63,30 +63,30 @@ impl CohortKind {
 pub struct LearnReport {
     /// Cohorts that chose A1 this block.
     pub a1_cohorts: usize,
-    /// Cohorts that stayed A0 (Lean / EV / K-cap / empty-to EOA).
-    pub lean_a0_cohorts: usize,
+    /// Optimistic-read cohorts (A0 / cost-EV / K-cap / empty-to EOA).
+    pub a0_cohorts: usize,
     /// Mean estimated cost of A1 decisions (ns EMA).
     pub mean_c_a1: f64,
     /// Mean estimated cost of the A0 counterfactual at those decisions (ns EMA).
     pub mean_c_a0_cf: f64,
     /// A0 executions that later paid reexec (incarnation>0).
     pub a0_reexec: usize,
-    /// Off-edge incarnation>0 — miss-Detect (D4) after CC-D1 lazy filter.
-    pub miss_detect: usize,
+    /// Incarnation>0 txs that were never dependency-admitted (A0 conflict reexec).
+    pub unfenced_reexec: usize,
     /// Sampled ready-set width mean (PC-W4 |Ready| bag).
     pub ready_width_mean: f64,
     /// Idle-core nanoseconds accumulated on yield / empty refuse (PC-4).
     pub idle_core_ns: u64,
-    /// PC-S1: thin SpecFence shell this block.
-    pub thin_shell: bool,
+    /// A0-majority / low-meta block (n small; ReadyEdge only on ordered-admit).
+    pub a0_majority_block: bool,
     /// Measured refuse-path nanoseconds.
     pub refuse_ns: u64,
     /// Measured incarnation>0 execute nanoseconds.
     pub reexec_ns: u64,
-    /// ns-EV evaluations that kept A1 (ĉ_A1+δ < ĉ_A0).
-    pub ns_ev_keep_a1: usize,
-    /// ns-EV evaluations that demoted A1→A0.
-    pub ns_ev_demote: usize,
+    /// Cost-EV evaluations that kept ordered admit (ĉ_A1+δ < ĉ_A0).
+    pub cost_ev_keep_ordered: usize,
+    /// Cost-EV evaluations that demoted ordered admit → optimistic read.
+    pub cost_ev_demote_optimistic: usize,
     /// Thin-shell K-cap demotions (eligible A1 beyond K).
     pub k_cap_demote: usize,
     /// CC-X1: 21k commute accepts (no abort).
@@ -95,7 +95,7 @@ pub struct LearnReport {
     pub batch_repair: usize,
     /// CC-D1: effective non-lazy conflict → learn/promote.
     pub conflict_promote: usize,
-    /// CC-D1: lazy-noise conflict → ignorable (not miss_detect→A1).
+    /// CC-D1: lazy-noise conflict → ignorable (not unfenced_reexec→A1).
     pub conflict_ignore: usize,
 }
 
@@ -167,15 +167,15 @@ pub(crate) struct CostPolicy {
     w_p: Mutex<[f64; 6]>,
     cohorts: DashMap<(u8, Address), CohortStat, FxBuildHasher>,
     a1_decisions: AtomicUsize,
-    lean_a0: AtomicUsize,
+    a0_cohorts: AtomicUsize,
     c_a1_sum_bits: AtomicU64,
     c_a0_sum_bits: AtomicU64,
     ev_samples: AtomicUsize,
     a0_reexec: AtomicUsize,
-    miss_detect: AtomicUsize,
-    thin_shell: AtomicBool,
-    ns_ev_keep: AtomicUsize,
-    ns_ev_demote: AtomicUsize,
+    unfenced_reexec: AtomicUsize,
+    a0_majority_block: AtomicBool,
+    cost_ev_keep_ordered: AtomicUsize,
+    cost_ev_demote_optimistic: AtomicUsize,
     k_cap_demote: AtomicUsize,
     refuse_ns: AtomicU64,
     reexec_ns: AtomicU64,
@@ -208,15 +208,15 @@ impl Default for CostPolicy {
             w_p: Mutex::new([0.05, 0.90, 0.12, 1.10, -0.15, 0.80]),
             cohorts: DashMap::default(),
             a1_decisions: AtomicUsize::new(0),
-            lean_a0: AtomicUsize::new(0),
+            a0_cohorts: AtomicUsize::new(0),
             c_a1_sum_bits: AtomicU64::new(0.0f64.to_bits()),
             c_a0_sum_bits: AtomicU64::new(0.0f64.to_bits()),
             ev_samples: AtomicUsize::new(0),
             a0_reexec: AtomicUsize::new(0),
-            miss_detect: AtomicUsize::new(0),
-            thin_shell: AtomicBool::new(false),
-            ns_ev_keep: AtomicUsize::new(0),
-            ns_ev_demote: AtomicUsize::new(0),
+            unfenced_reexec: AtomicUsize::new(0),
+            a0_majority_block: AtomicBool::new(false),
+            cost_ev_keep_ordered: AtomicUsize::new(0),
+            cost_ev_demote_optimistic: AtomicUsize::new(0),
             k_cap_demote: AtomicUsize::new(0),
             refuse_ns: AtomicU64::new(0),
             reexec_ns: AtomicU64::new(0),
@@ -256,17 +256,17 @@ impl CostPolicy {
 
     fn reset_block_counters(&self) {
         self.a1_decisions.store(0, Ordering::Relaxed);
-        self.lean_a0.store(0, Ordering::Relaxed);
+        self.a0_cohorts.store(0, Ordering::Relaxed);
         self.c_a1_sum_bits
             .store(0.0f64.to_bits(), Ordering::Relaxed);
         self.c_a0_sum_bits
             .store(0.0f64.to_bits(), Ordering::Relaxed);
         self.ev_samples.store(0, Ordering::Relaxed);
         self.a0_reexec.store(0, Ordering::Relaxed);
-        self.miss_detect.store(0, Ordering::Relaxed);
-        self.thin_shell.store(false, Ordering::Relaxed);
-        self.ns_ev_keep.store(0, Ordering::Relaxed);
-        self.ns_ev_demote.store(0, Ordering::Relaxed);
+        self.unfenced_reexec.store(0, Ordering::Relaxed);
+        self.a0_majority_block.store(false, Ordering::Relaxed);
+        self.cost_ev_keep_ordered.store(0, Ordering::Relaxed);
+        self.cost_ev_demote_optimistic.store(0, Ordering::Relaxed);
         self.k_cap_demote.store(0, Ordering::Relaxed);
         self.refuse_ns.store(0, Ordering::Relaxed);
         self.reexec_ns.store(0, Ordering::Relaxed);
@@ -285,17 +285,17 @@ impl CostPolicy {
         self.reset_block_counters();
         let serial_hat = n as f64 * SERIAL_NS_PER_TX;
         let thin = n > 0 && n <= THIN_N_MAX && serial_hat < META_FLOOR_NS;
-        self.thin_shell.store(thin, Ordering::Relaxed);
+        self.a0_majority_block.store(thin, Ordering::Relaxed);
     }
 
     #[inline]
-    pub(crate) fn is_thin_shell(&self) -> bool {
-        self.thin_shell.load(Ordering::Relaxed)
+    pub(crate) fn is_a0_majority_block(&self) -> bool {
+        self.a0_majority_block.load(Ordering::Relaxed)
     }
 
     #[inline]
     pub(crate) fn thin_a1_k(&self) -> usize {
-        if self.is_thin_shell() {
+        if self.is_a0_majority_block() {
             THIN_A1_K
         } else {
             usize::MAX
@@ -322,17 +322,17 @@ impl CostPolicy {
         }
         // PC-2: envelope empty-to on an EOA is LazyRecipient — never A1.
         if kind == CohortKind::EmptyTo && !is_contract {
-            self.lean_a0.fetch_add(1, Ordering::Relaxed);
+            self.a0_cohorts.fetch_add(1, Ordering::Relaxed);
             return AdmitAction::A0OptimisticRead;
         }
         // 2-tx same-from pairs stay A0 (3356896 has ~60; refuse is pure meta).
         if kind == CohortKind::SameFrom && cohort_len < 3 {
-            self.lean_a0.fetch_add(1, Ordering::Relaxed);
+            self.a0_cohorts.fetch_add(1, Ordering::Relaxed);
             return AdmitAction::A0OptimisticRead;
         }
-        // Thin-shell: 2-tx calldata pairs stay A0 (K reserved for ≥3 spines).
-        if self.is_thin_shell() && kind == CohortKind::CallWaw && cohort_len < 3 {
-            self.lean_a0.fetch_add(1, Ordering::Relaxed);
+        // A0-majority: 2-tx calldata pairs stay A0 (K reserved for ≥3 spines).
+        if self.is_a0_majority_block() && kind == CohortKind::CallWaw && cohort_len < 3 {
+            self.a0_cohorts.fetch_add(1, Ordering::Relaxed);
             return AdmitAction::A0OptimisticRead;
         }
         let (c_a0, c_a1) = self.ns_ev();
@@ -345,12 +345,13 @@ impl CostPolicy {
         let keep = proven || c_a1 + NS_DELTA < c_a0;
         let _ = p_beta; // feature only — used in p_eff for reports, not decide().
         if keep {
-            self.ns_ev_keep.fetch_add(1, Ordering::Relaxed);
+            self.cost_ev_keep_ordered.fetch_add(1, Ordering::Relaxed);
             self.a1_decisions.fetch_add(1, Ordering::Relaxed);
             AdmitAction::A1OrderedAdmit
         } else {
-            self.ns_ev_demote.fetch_add(1, Ordering::Relaxed);
-            self.lean_a0.fetch_add(1, Ordering::Relaxed);
+            self.cost_ev_demote_optimistic
+                .fetch_add(1, Ordering::Relaxed);
+            self.a0_cohorts.fetch_add(1, Ordering::Relaxed);
             AdmitAction::A0OptimisticRead
         }
     }
@@ -373,7 +374,7 @@ impl CostPolicy {
         (c_a0, c_a1)
     }
 
-    /// Plant-score for thin-shell K-cap (storage/call WAW > contract empty-to).
+    /// Score for A0-majority K-cap (storage/call WAW > contract empty-to).
     pub(crate) fn a1_score(kind: CohortKind, cohort_len: usize, is_contract: bool) -> i64 {
         let class = match kind {
             CohortKind::RawFan => 4000,
@@ -390,7 +391,7 @@ impl CostPolicy {
         if a1 > 0 {
             self.a1_decisions.fetch_sub(1, Ordering::Relaxed);
         }
-        self.lean_a0.fetch_add(1, Ordering::Relaxed);
+        self.a0_cohorts.fetch_add(1, Ordering::Relaxed);
         self.k_cap_demote.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -549,6 +550,15 @@ impl CostPolicy {
         self.commute_skip.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Probe-star early release: commute absorbed and no measured reexec —
+    /// cost-EV demotes remaining EmptyTo ordered-admit waiters.
+    #[inline]
+    pub(crate) fn should_release_probe_star(&self) -> bool {
+        self.is_a0_majority_block()
+            && self.commute_skip.load(Ordering::Relaxed) >= 8
+            && self.reexec_ns.load(Ordering::Relaxed) == 0
+    }
+
     pub(crate) fn note_batch_repair(&self) {
         self.batch_repair.fetch_add(1, Ordering::Relaxed);
     }
@@ -592,7 +602,7 @@ impl CostPolicy {
         self.note_reexec_ns_at(Some(location), reexec_ns);
     }
 
-    /// C4: commute / LazyNoise → ignore (do not raise miss_detect→A1).
+    /// C4: commute / LazyNoise → ignore (do not raise unfenced_reexec→A1).
     pub(crate) fn ignore_conflict(&self, location: Option<MemoryLocationHash>) {
         self.note_conflict_ignore();
         if let Some(loc) = location {
@@ -623,13 +633,13 @@ impl CostPolicy {
     }
 
     /// D4: off-edge incarnation>0 — miss-Detect, raise p_eff on the location class.
-    pub(crate) fn note_miss_detect(&self, kind: CohortKind, addr: Address) {
-        self.bump_miss_detect();
+    pub(crate) fn note_unfenced_reexec(&self, kind: CohortKind, addr: Address) {
+        self.bump_unfenced_reexec();
         self.note_eff_waw(kind, addr, true);
     }
 
-    pub(crate) fn bump_miss_detect(&self) {
-        self.miss_detect.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn bump_unfenced_reexec(&self) {
+        self.unfenced_reexec.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn note_a0_reexec(&self) {
@@ -641,7 +651,7 @@ impl CostPolicy {
         let n = self.ev_samples.load(Ordering::Relaxed).max(1) as f64;
         LearnReport {
             a1_cohorts: self.a1_decisions.load(Ordering::Relaxed),
-            lean_a0_cohorts: self.lean_a0.load(Ordering::Relaxed),
+            a0_cohorts: self.a0_cohorts.load(Ordering::Relaxed),
             mean_c_a1: {
                 let ema = self.c_a1_ns.lock().unwrap().mean;
                 if ema > 0.0 {
@@ -659,14 +669,14 @@ impl CostPolicy {
                 }
             },
             a0_reexec: self.a0_reexec.load(Ordering::Relaxed),
-            miss_detect: self.miss_detect.load(Ordering::Relaxed),
+            unfenced_reexec: self.unfenced_reexec.load(Ordering::Relaxed),
             ready_width_mean,
             idle_core_ns,
-            thin_shell: self.is_thin_shell(),
+            a0_majority_block: self.is_a0_majority_block(),
             refuse_ns: self.refuse_ns.load(Ordering::Relaxed),
             reexec_ns: self.reexec_ns.load(Ordering::Relaxed),
-            ns_ev_keep_a1: self.ns_ev_keep.load(Ordering::Relaxed),
-            ns_ev_demote: self.ns_ev_demote.load(Ordering::Relaxed),
+            cost_ev_keep_ordered: self.cost_ev_keep_ordered.load(Ordering::Relaxed),
+            cost_ev_demote_optimistic: self.cost_ev_demote_optimistic.load(Ordering::Relaxed),
             k_cap_demote: self.k_cap_demote.load(Ordering::Relaxed),
             commute_skip: self.commute_skip.load(Ordering::Relaxed),
             batch_repair: self.batch_repair.load(Ordering::Relaxed),
@@ -766,13 +776,13 @@ mod tests {
     }
 
     #[test]
-    fn thin_shell_on_small_block() {
+    fn a0_majority_block_on_small_block() {
         let p = CostPolicy::new();
         p.begin_block(176);
-        assert!(p.is_thin_shell(), "n=176 serial_hat < meta floor");
+        assert!(p.is_a0_majority_block(), "n=176 serial_hat < meta floor");
         assert_eq!(p.thin_a1_k(), THIN_A1_K, "K is a cap on thin-shell");
         p.begin_block(4096);
-        assert!(!p.is_thin_shell(), "large n keeps full shell");
+        assert!(!p.is_a0_majority_block(), "large n keeps full shell");
         assert_eq!(p.thin_a1_k(), usize::MAX);
     }
 
@@ -804,7 +814,7 @@ mod tests {
     }
 
     #[test]
-    fn ns_ev_demotes_when_refuse_dominates() {
+    fn cost_ev_demote_optimistics_when_refuse_dominates() {
         let p = CostPolicy::new();
         p.begin_block(176);
         for _ in 0..8 {
@@ -822,7 +832,21 @@ mod tests {
     }
 
     #[test]
-    fn ns_ev_keeps_proven_contract_spine() {
+    fn probe_star_releases_when_commute_absorbs() {
+        let p = CostPolicy::new();
+        p.begin_block(176);
+        assert!(!p.should_release_probe_star(), "cold block keeps Detect");
+        for _ in 0..8 {
+            p.note_commute_skip();
+        }
+        assert!(
+            p.should_release_probe_star(),
+            "commute-absorbed EmptyTo with reexec_ns=0 demotes leftover waiters"
+        );
+    }
+
+    #[test]
+    fn cost_ev_keeps_proven_contract_spine() {
         let p = CostPolicy::new();
         p.begin_block(176);
         let addr = Address::repeat_byte(0x20);

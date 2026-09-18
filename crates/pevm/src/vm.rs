@@ -31,7 +31,7 @@ use crate::{
         ordered_admit_snap_jump_enabled, ordered_admit_snap_mode, resume_was_applied,
         steps_this_run, suffix_repair_jump_env_ok, take_ff_origin_seeds,
         try_arm_safe_absolute_jump, try_arm_safe_absolute_jump_gated, with_ordered_admit_snap_tls,
-        with_plant_tls_journal,
+        with_protocol_tls_journal,
     },
 };
 
@@ -148,7 +148,7 @@ pub(crate) struct VmDb<'a, S: Storage> {
     // Only applied to raw transfers' senders & recipients at the moment.
     is_lazy: bool,
     /// Thin-shell short same-from/to force-lazy (not the generic first-touch lazy).
-    thin_a0_lazy: bool,
+    a0_majority_lazy: bool,
     /// PCC overlay armed for the current access (PE ∩ ROI). OptimisticRead = OCC read.
     pcc_armed: Cell<bool>,
     /// OptimisticRead accesses this incarnation (end-tx process flush; no DashMap).
@@ -182,7 +182,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.to_code_hash = None;
         self.flush_access_census();
         self.is_lazy = false;
-        self.thin_a0_lazy = false;
+        self.a0_majority_lazy = false;
         self.has_nonce = has_nonce;
         self.read_set.clear();
         self.read_accounts.clear();
@@ -224,23 +224,25 @@ impl<'a, S: Storage> VmDb<'a, S> {
             let already = eoa
                 && (self.mv_memory.data.contains_key(&from_hash)
                     || self.mv_memory.data.contains_key(&to_hash.unwrap()));
-            // Thin-shell A0: also lazy-accumulate empty-input EOA that share
+            // A0-majority: also lazy-accumulate empty-input EOA that share
             // from/to with another tx (2-tx same-from 21k). Avoids first-touch
-            // Basic WAW without planting a ReadyEdge on the whole spine.
-            let thin_a0_lazy = eoa
+            // Basic WAW without a ReadyEdge on the whole spine.
+            let a0_majority_lazy = eoa
                 && self.specfence.mode == crate::ConcurrencyMode::SpecFence
-                && crate::specfence::thin_a0_hinted_lazy(
+                && crate::specfence::a0_majority_hinted_lazy(
                     self.specfence.hints,
                     tx.caller,
                     Some(to),
                     tx.data.is_empty(),
                     true,
-                    self.specfence.policy.is_some_and(|p| p.is_thin_shell()),
+                    self.specfence
+                        .policy
+                        .is_some_and(|p| p.is_a0_majority_block()),
                     self.specfence.ready_edges.was_queued(tx_idx),
                 );
-            self.thin_a0_lazy = thin_a0_lazy;
-            self.is_lazy = already || thin_a0_lazy;
-            if thin_a0_lazy && self.specfence.hints.prev(&tx.caller, tx_idx).is_some() {
+            self.a0_majority_lazy = a0_majority_lazy;
+            self.is_lazy = already || a0_majority_lazy;
+            if a0_majority_lazy && self.specfence.hints.prev(&tx.caller, tx_idx).is_some() {
                 self.specfence.metrics.record_commute_skip();
                 if let Some(p) = self.specfence.policy {
                     p.note_commute_skip();
@@ -498,7 +500,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return Ok(());
         }
         // Thin-shell A0: same cost class as occ_optimistic_read even after aborts seed PE.
-        if self.specfence.policy.is_some_and(|p| p.is_thin_shell())
+        if self
+            .specfence
+            .policy
+            .is_some_and(|p| p.is_a0_majority_block())
             && !self.specfence.ready_edges.was_queued(self.tx_idx)
         {
             return Ok(());
@@ -715,15 +720,15 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.specfence.ready_edges.note_consumer(self.tx_idx, w);
         self.specfence.producer_stages.reserve(w);
         self.specfence.scheduler.admit_spine(w, self.specfence.wave);
-        match crate::specfence::fence_act::act_serial_lane(self.specfence.scheduler, w) {
-            crate::specfence::fence_act::FenceAct::DoneOptimisticRead { cert } => {
+        match crate::specfence::ordered_admit_act::act_serial_lane(self.specfence.scheduler, w) {
+            crate::specfence::ordered_admit_act::OrderedAdmitAct::DoneOptimisticRead { cert } => {
                 if cert {
                     self.note_fence_success(location_hash);
                     self.specfence.metrics.record_ordered_admit_after_done();
                 }
                 return self.occ_optimistic_read();
             }
-            crate::specfence::fence_act::FenceAct::WaitForDependency { writer } => {
+            crate::specfence::ordered_admit_act::OrderedAdmitAct::WaitForDependency { writer } => {
                 return self.pcc_wait_for_writer(
                     address,
                     location_hash,
@@ -732,7 +737,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     writer,
                 );
             }
-            crate::specfence::fence_act::FenceAct::ReadyCanary => {}
+            crate::specfence::ordered_admit_act::OrderedAdmitAct::ReadyCanary => {}
         }
         // Ready/Validated/Aborting: one Spec canary + ProducerStage/edge so
         // the next incarnation is refused while w is Executing. Parking or
@@ -795,7 +800,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 .ready_edges
                 .predicted_producer(location_hash)
                 .is_some();
-        let mut kind = crate::specfence::fence_act::estimate_park_kind(pe_known);
+        let mut kind = crate::specfence::ordered_admit_act::estimate_park_kind(pe_known);
         let access_k = self
             .specfence
             .access_log
@@ -815,7 +820,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     access_k.max(1),
                     &prefix,
                 );
-            if crate::specfence::fence_act::wait_for_resume_armed(armed) {
+            if crate::specfence::ordered_admit_act::wait_for_resume_armed(armed) {
                 armed
             } else {
                 // No honest prefix — WaitForDependency park wakes FullAbortReexecute
@@ -940,8 +945,8 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.specfence.ready_edges.note_consumer(self.tx_idx, w);
         self.specfence.producer_stages.reserve(w);
         self.specfence.scheduler.admit_spine(w, self.specfence.wave);
-        match crate::specfence::fence_act::act_wait_for(self.specfence.scheduler, w) {
-            crate::specfence::fence_act::FenceAct::DoneOptimisticRead { cert } => {
+        match crate::specfence::ordered_admit_act::act_wait_for(self.specfence.scheduler, w) {
+            crate::specfence::ordered_admit_act::OrderedAdmitAct::DoneOptimisticRead { cert } => {
                 // OrderedAdmit-after-Done is tax. DoneOptimisticRead cert is partial_abort bait
                 // (sibling optimistic_read stays uncertified → attempt then full_abort_reexecute).
                 if cert {
@@ -950,10 +955,12 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 }
                 return self.occ_optimistic_read();
             }
-            crate::specfence::fence_act::FenceAct::ReadyCanary => {
+            crate::specfence::ordered_admit_act::OrderedAdmitAct::ReadyCanary => {
                 return self.occ_optimistic_read();
             }
-            crate::specfence::fence_act::FenceAct::WaitForDependency { writer: _ } => {}
+            crate::specfence::ordered_admit_act::OrderedAdmitAct::WaitForDependency {
+                writer: _,
+            } => {}
         }
         let prefix = self
             .specfence
@@ -965,7 +972,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
             .arm_wait_for_dependency_checkpoint(self.tx_idx, location_hash, access_k, &prefix);
         // Edges already reserved. Park only when rem can ResumeAtK.
         // Park-then-full_abort_reexecute is idle + OCC abort (14689597).
-        if !crate::specfence::fence_act::wait_for_resume_armed(armed_at_k) {
+        if !crate::specfence::ordered_admit_act::wait_for_resume_armed(armed_at_k) {
             return self.occ_optimistic_read();
         }
         self.note_fence_success(location_hash);
@@ -1025,7 +1032,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
     }
 
     /// Legacy rem WaitFor museum — **not** the SpecFence product path.
-    /// Product Avoid is `pcc_wait_for_writer` → `fence_act::act_wait_for`
+    /// Product Avoid is `pcc_wait_for_writer` → `ordered_admit_act::act_wait_for`
     /// (WaitForDependency / DoneOptimisticRead). Kept for inspect/lab residual OrderedAdmit SoT.
     /// SoftWait Soft stays 0.
     #[allow(dead_code)]
@@ -1041,12 +1048,12 @@ impl<'a, S: Storage> VmDb<'a, S> {
         force_prefix: bool,
         must_wait: bool,
     ) -> Result<(), ReadError> {
-        // U1: plant TLS must not optimistic_read a force_prefix / must_wait Region.
-        if crate::specfence::plant_tls_active() && !must_wait {
+        // U1: protocol TLS must not optimistic_read a force_prefix / must_wait Region.
+        if crate::specfence::protocol_tls_active() && !must_wait {
             self.specfence.process.record(
                 location_hash,
                 self.tx_idx,
-                ProcessReason::OptimisticReadPlantTls,
+                ProcessReason::OptimisticReadProtocolTls,
                 avoid,
                 canary_taken,
             );
@@ -1160,7 +1167,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
             self.specfence.wave.set_pending_park(
                 location_hash,
                 armed_at_k,
-                crate::specfence::fence_act::estimate_park_kind(pe_known),
+                crate::specfence::ordered_admit_act::estimate_park_kind(pe_known),
             );
             self.specfence.process.note_park(self.tx_idx);
             return Err(ReadError::Blocking(t));
@@ -1389,7 +1396,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 .note_certified(self.tx_idx, location_hash);
             self.specfence.rem.note_checkpoint_opportunity();
             self.specfence.metrics.record_checkpoint_opportunity();
-            // M1d: live Inspector snap via step_end when plant TLS active.
+            // M1d: live Inspector snap via step_end when protocol TLS active.
             note_pending_effect_boundary(self.tx_idx, self.specfence.partial_retry);
             Ok(())
         } else {
@@ -2117,7 +2124,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             to_hash: None,
             to_code_hash: None,
             is_lazy: false,
-            thin_a0_lazy: false,
+            a0_majority_lazy: false,
             pcc_armed: Cell::new(false),
             optimistic_read_this_tx: Cell::new(0),
             pcc_this_tx: Cell::new(0),
@@ -2719,9 +2726,9 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         }
         let profile = crate::specfence::profile_timing_enabled();
         let handler_t0 = profile.then(Instant::now);
-        // Iter19: read-prefix OrderedAdmit-snap jump arms WITHOUT plant TLS (no WaitHard
-        // demote / SSTORE plant). Plant TLS only for research inspect / capture_window.
-        let plant_handler = self.specfence.mode == crate::ConcurrencyMode::SpecFence
+        // Iter19: read-prefix OrderedAdmit-snap jump arms WITHOUT protocol TLS (no WaitHard
+        // demote / SSTORE inspect). Protocol TLS only for research inspect / capture_window.
+        let protocol_handler = self.specfence.mode == crate::ConcurrencyMode::SpecFence
             && (use_inspect || capture_window);
         // Iter24/25: OrderedAdmit-snap TLS — Mass (=1 dig) on every Lean execute; ResumePath
         // (silent default) only on SuffixRepair resume / force_ordered_admit /
@@ -2745,14 +2752,14 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 OrderedAdmitSnapMode::Mass => true,
                 OrderedAdmitSnapMode::ResumePath => repair_capture,
             };
-        let run_result = if plant_handler {
+        let run_result = if protocol_handler {
             let partial_retry = self.specfence.partial_retry;
             let metrics = self.specfence.metrics;
             let tx_idx = tx_version.tx_idx;
             let incarnation = tx_version.tx_incarnation;
             let fg = self.specfence.finegrain.filter(|f| f.journal_enabled());
             let gas_limit = Some(tx.gas_limit);
-            with_plant_tls_journal(
+            with_protocol_tls_journal(
                 tx_idx,
                 incarnation,
                 fg,
@@ -2810,7 +2817,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             let mut run_body = || {
                 // Iter20: arm OrderedAdmit-snap read-prefix absolute jump hang-free when
                 // Validated-safe seed passed (suffix_jump). Handler run_exec_loop
-                // applies PENDING_RESUME; no plant TLS / inspect_run.
+                // applies PENDING_RESUME; no protocol TLS / inspect_run.
                 let mut did_jump = false;
                 if suffix_jump && rewind_resume {
                     did_jump = partial_retry.ff_continuation(tx_idx).is_some_and(|cont| {
@@ -3184,12 +3191,12 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     }
                 }
 
-                let (is_lazy, thin_a0_lazy, read_set) = {
+                let (is_lazy, a0_majority_lazy, read_set) = {
                     let db = ctx.db_mut();
                     db.flush_access_census();
                     (
                         db.is_lazy,
-                        db.thin_a0_lazy,
+                        db.a0_majority_lazy,
                         std::mem::take(&mut db.read_set),
                     )
                 };
@@ -3319,8 +3326,11 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     self.mv_memory.record(tx_version, read_set, write_set);
                 // M3: learn process WŜ from this incarnation's writes (no residual publish).
                 // R1/R3: feed HotSet writer counts (H_w) from non-lazy writes only.
-                let thin_a0 = self.specfence.mode == crate::ConcurrencyMode::SpecFence
-                    && self.specfence.policy.is_some_and(|p| p.is_thin_shell())
+                let a0_ungated = self.specfence.mode == crate::ConcurrencyMode::SpecFence
+                    && self
+                        .specfence
+                        .policy
+                        .is_some_and(|p| p.is_a0_majority_block())
                     && !self.specfence.ready_edges.was_queued(tx_version.tx_idx);
                 // U2: short force-lazy pairs + unique 21k stay OCC-cost. Do not
                 // treat generic first-touch lazy on long same-from spines as skip
@@ -3331,7 +3341,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         .kind
                         .to()
                         .is_none_or(|to| self.specfence.hints.to_txs(to).len() < 2);
-                let skip_a0_learn = thin_a0 && (thin_a0_lazy || unique_empty);
+                let skip_a0_learn = a0_ungated && (a0_majority_lazy || unique_empty);
                 if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
                     crate::specfence::admit::admit_seed_on_write_set(
                         self.specfence.ready_edges,

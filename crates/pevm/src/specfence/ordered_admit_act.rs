@@ -5,7 +5,7 @@
 //! Ordered admit after Done is **not** an `OrderedAdmit` verb.
 //!
 //! Vocabulary: `lab/notes/specfence-cc-glossary.md`.
-//! Plant SoT: `lab/notes/specfence-complete-architecture-v9.1-cc-pc-bayes.md` §2.4.
+//! Protocol: `lab/notes/specfence-complete-architecture-v9.1-cc-pc-bayes.md` §2.4.
 
 use super::wave::ParkKind;
 use crate::TxIdx;
@@ -13,7 +13,7 @@ use crate::scheduler::Scheduler;
 
 /// Policy outcome for an admitted Fence verb (CC act).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FenceAct {
+pub(crate) enum OrderedAdmitAct {
     /// Writer already Done — OCC read; **not** OrderedAdmit-after-Done theater.
     DoneOptimisticRead { cert: bool },
     /// Writer Ready/Validated/Aborting — canary optimistic_read; edges already reserved.
@@ -27,20 +27,20 @@ pub(crate) enum FenceAct {
 /// the leak that forces mid-tx Wait + OCC abort. Aborting stays canary
 /// (WaitForDependency behind Aborting deadlocks — no progress path).
 #[inline]
-pub(crate) fn act_wait_for(scheduler: &Scheduler, writer: TxIdx) -> FenceAct {
+pub(crate) fn act_wait_for(scheduler: &Scheduler, writer: TxIdx) -> OrderedAdmitAct {
     if scheduler.is_done(writer) {
         // DoneOptimisticRead cert is partial_abort bait (sibling optimistic_read stays uncertified).
-        return FenceAct::DoneOptimisticRead { cert: false };
+        return OrderedAdmitAct::DoneOptimisticRead { cert: false };
     }
     if scheduler.is_executing(writer) || scheduler.is_ready(writer) {
-        return FenceAct::WaitForDependency { writer };
+        return OrderedAdmitAct::WaitForDependency { writer };
     }
-    FenceAct::ReadyCanary
+    OrderedAdmitAct::ReadyCanary
 }
 
 /// SerialLane exclusive: Done → optimistic_read cert; Executing → wait_for_dependency; else canary.
 #[inline]
-pub(crate) fn act_serial_lane(scheduler: &Scheduler, writer: TxIdx) -> FenceAct {
+pub(crate) fn act_serial_lane(scheduler: &Scheduler, writer: TxIdx) -> OrderedAdmitAct {
     act_wait_for(scheduler, writer)
 }
 
@@ -103,14 +103,14 @@ mod tests {
         assert!(s.is_ready(0));
         assert_eq!(
             act_wait_for(&s, 0),
-            FenceAct::WaitForDependency { writer: 0 },
+            OrderedAdmitAct::WaitForDependency { writer: 0 },
             "known Ready producer must WaitForDependency, not ReadyCanary optimistic_read"
         );
         let v = s.try_execute_producer(0).unwrap();
         assert!(s.is_executing(0));
         assert_eq!(
             act_wait_for(&s, 0),
-            FenceAct::WaitForDependency { writer: 0 }
+            OrderedAdmitAct::WaitForDependency { writer: 0 }
         );
         let _ = s.finish_execution(
             crate::TxVersion {
@@ -122,13 +122,12 @@ mod tests {
         assert!(
             matches!(
                 act_wait_for(&s, 0),
-                FenceAct::DoneOptimisticRead { cert: false }
+                OrderedAdmitAct::DoneOptimisticRead { cert: false }
             ),
             "DoneOptimisticRead must not write partial_abort bait cert"
         );
     }
 
-    #[test]
     #[test]
     fn wait_for_parks_only_when_resume_armed() {
         assert!(!wait_for_resume_armed(0), "empty prefix must not park");

@@ -367,7 +367,7 @@ pub struct EffectStreamDiag {
     pub account_grain_would_ordered_admit: usize,
     /// Slot-grain RAW edges that also had account prior (informational).
     pub slot_and_account_both: usize,
-    /// WAW-only multi-writer locs with no location RAW (HotLocal writer-count spurious Wait proxy).
+    /// WAW-only multi-writer locs with no location RAW (location-hot writer-count spurious Wait proxy).
     pub waw_only_multi_writer_locs: usize,
     pub multi_writer_locs: usize,
     pub spurious_hotlocal_writer_count_waits: usize,

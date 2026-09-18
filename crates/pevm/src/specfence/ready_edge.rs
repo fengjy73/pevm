@@ -1,9 +1,11 @@
-//! Ready-edge graph — PC ⊗ CC shared ready membership (not CC annotation).
+//! Ready-edge graph — dependency-aware admission membership (not CC annotation).
 //!
-//! Plant SoT: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md`.
+//! Protocol: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md`.
 //! First-wave Avoid at **schedule** for **known** consumers only.
 //! Refuse only when ProducerStage(w) is runnable — v6 “defer consumer only”
 //! deadlocked when w was off the collaborative index.
+//!
+//! Ungated / A0-majority txs use an OCC-class `may_execute` (bitset; no DashMap).
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -13,12 +15,16 @@ use dashmap::{DashMap, DashSet};
 
 use crate::{BuildIdentityHasher, MemoryLocationHash, TxIdx};
 
+use super::engagement::profile_timing_enabled;
 use super::wave::WaveParkTable;
 
 const NONE: usize = usize::MAX;
+/// Bitset words for ordered-admit gated txs (64×64 = 4096). Beyond this,
+/// `is_gated` falls back to the consumer map.
+const GATED_WORDS: usize = 64;
 
 /// `(consumer_t) ← producer_t` on PE / RAW class.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct ReadyEdgeTable {
     /// Earliest unpublished producer per PE location (observe / wake).
     producers: DashMap<MemoryLocationHash, AtomicUsize, BuildIdentityHasher>,
@@ -35,7 +41,7 @@ pub(crate) struct ReadyEdgeTable {
     location_writers: DashMap<MemoryLocationHash, Vec<TxIdx>, BuildIdentityHasher>,
     /// PC-3: each tx belongs to at most one ReadyEdge location queue.
     queued_on: DashMap<TxIdx, MemoryLocationHash, BuildIdentityHasher>,
-    /// PC-5: Lean / EV forced A0 — `may_execute` even if a consumer bit exists.
+    /// PC-5: EV forced A0 — `may_execute` even if a consumer bit exists.
     a0_force: DashSet<TxIdx, BuildIdentityHasher>,
     /// PC-4: sampled ready width (may_execute ∧ Ready).
     ready_width_sum: AtomicU64,
@@ -48,6 +54,32 @@ pub(crate) struct ReadyEdgeTable {
     refuse_ns: AtomicU64,
     /// Producer → known consumers (completion event → bag; no DashMap scan).
     waiters: DashMap<TxIdx, Vec<TxIdx>, BuildIdentityHasher>,
+    /// Ordered-admit gated txs. Marked **before** the consumer map insert so
+    /// an ungated steal cannot race past a newly created wait-for edge.
+    gated_bits: [AtomicU64; GATED_WORDS],
+}
+
+impl Default for ReadyEdgeTable {
+    fn default() -> Self {
+        Self {
+            producers: DashMap::default(),
+            consumers: DashMap::default(),
+            finished: DashMap::default(),
+            tips: DashMap::default(),
+            deferred: Mutex::new(Vec::new()),
+            refuse: AtomicUsize::new(0),
+            location_writers: DashMap::default(),
+            queued_on: DashMap::default(),
+            a0_force: DashSet::default(),
+            ready_width_sum: AtomicU64::new(0),
+            ready_width_n: AtomicUsize::new(0),
+            idle_core_ns: AtomicU64::new(0),
+            sleeping: DashSet::default(),
+            refuse_ns: AtomicU64::new(0),
+            waiters: DashMap::default(),
+            gated_bits: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
 }
 
 impl ReadyEdgeTable {
@@ -93,6 +125,9 @@ impl ReadyEdgeTable {
         if producer >= consumer || self.finished.contains_key(&producer) {
             return;
         }
+        // Mark first: ungated `may_execute` must not observe a missing bit
+        // while the consumer map already refuses.
+        self.mark_gated(consumer);
         if let Some(loc) = location {
             if let Some(prev) = self.queued_on.get(&consumer) {
                 let prev_loc = *prev;
@@ -209,6 +244,29 @@ impl ReadyEdgeTable {
             || self.waiters.contains_key(&tx)
     }
 
+    /// Ordered-admit readiness: this tx has (or is gaining) a wait-for edge.
+    #[inline]
+    fn mark_gated(&self, tx: TxIdx) {
+        let i = tx / 64;
+        if i < self.gated_bits.len() {
+            let bit = 1u64 << (tx % 64);
+            self.gated_bits[i].fetch_or(bit, Ordering::Release);
+        }
+    }
+
+    /// True when this tx is on a dependency-aware admission edge.
+    /// Ungated (A0 / independent) is a single Acquire bit load — OCC-class.
+    #[inline]
+    pub(crate) fn is_gated(&self, tx: TxIdx) -> bool {
+        let i = tx / 64;
+        if i < self.gated_bits.len() {
+            let bit = 1u64 << (tx % 64);
+            self.gated_bits[i].load(Ordering::Acquire) & bit != 0
+        } else {
+            self.consumers.contains_key(&tx)
+        }
+    }
+
     /// PC-5: force A0 on this consumer (execute anyway).
     #[inline]
     pub(crate) fn force_a0(&self, tx: TxIdx) {
@@ -282,7 +340,7 @@ impl ReadyEdgeTable {
     /// Writer finished. Wake known consumers whose producer is now done.
     ///
     /// Independents (never gated anyone, never queued) skip the deferred lock
-    /// and the producer/consumer DashMap scans — those were the thin-shell tax.
+    /// and the producer/consumer DashMap scans — those were the A0-majority tax.
     pub(crate) fn note_producer_done(&self, writer: TxIdx, wave: &WaveParkTable) {
         self.finished.insert(writer, ());
         let waiters = self.waiters.remove(&writer);
@@ -323,10 +381,17 @@ impl ReadyEdgeTable {
 
     /// Refuse only known consumers still gated by an unpublished producer.
     /// Stale bits (producer already flushed to NONE) must not refuse.
-    /// PC-5 Lean / EV A0 override executes anyway.
+    /// Ungated / independent txs skip DashMap (OCC-class pick).
+    /// PC-5 EV A0 override executes anyway (gated set only).
     #[inline]
     pub(crate) fn may_execute(&self, tx_idx: TxIdx) -> bool {
-        if tx_idx == 0 || self.a0_force.contains(&tx_idx) {
+        if tx_idx == 0 {
+            return true;
+        }
+        if !self.is_gated(tx_idx) {
+            return true;
+        }
+        if self.a0_force.contains(&tx_idx) {
             return true;
         }
         match self.consumers.get(&tx_idx) {
@@ -334,7 +399,9 @@ impl ReadyEdgeTable {
                 let w = e.load(Ordering::Relaxed);
                 w == NONE || w >= tx_idx || self.finished.contains_key(&w)
             }
-            None => true,
+            // Gated bit is stored *before* the consumer-map insert. Treat the
+            // window as not-ready so an OCC-class steal cannot pass the edge.
+            None => false,
         }
     }
 
@@ -351,7 +418,7 @@ impl ReadyEdgeTable {
     /// PC-W1: mark sleeping so steal/index skip this head until pred Done.
     #[inline]
     pub(crate) fn defer(&self, tx_idx: TxIdx) {
-        let t0 = Instant::now();
+        let t0 = profile_timing_enabled().then(Instant::now);
         let mut d = self.deferred.lock().unwrap();
         if d.iter().any(|&t| t == tx_idx) {
             self.sleeping.insert(tx_idx);
@@ -361,7 +428,9 @@ impl ReadyEdgeTable {
         self.sleeping.insert(tx_idx);
         d.push(tx_idx);
         drop(d);
-        self.add_refuse_ns(t0.elapsed().as_nanos() as u64);
+        if let Some(t0) = t0 {
+            self.add_refuse_ns(t0.elapsed().as_nanos() as u64);
+        }
     }
 
     #[inline]
@@ -561,5 +630,25 @@ mod tests {
         t.note_producer_done(5, &wave);
         assert!(wave.pop_ready().is_none());
         assert!(t.may_execute(6));
+    }
+
+    #[test]
+    fn ungated_may_execute_is_occ_class() {
+        let t = ReadyEdgeTable::new();
+        assert!(!t.is_gated(3));
+        assert!(t.may_execute(3), "no dependency gate → OCC-class pick");
+        t.note_unpublished(7, 1);
+        assert!(
+            !t.is_gated(3),
+            "unpublished producer alone does not gate strangers"
+        );
+        t.note_consumer(3, 1);
+        assert!(t.is_gated(3));
+        assert!(!t.may_execute(3));
+        t.force_a0(3);
+        assert!(
+            t.may_execute(3),
+            "EV A0 override still executes a gated consumer"
+        );
     }
 }

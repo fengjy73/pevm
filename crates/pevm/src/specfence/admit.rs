@@ -39,7 +39,7 @@ fn envelope_loc(addr: Address) -> MemoryLocationHash {
 ///
 /// Do **not** ProducerStage-reserve every predecessor. `next_reserved()` is a
 /// global min; reserving a long WAW spine serializes the whole block.
-/// Thin-shell: only the first successor (short edge). Later writers stay A0.
+/// A0-majority: only the first successor (short edge). Later writers stay A0.
 fn note_predecessor_chain(
     ready: &ReadyEdgeTable,
     ordered: &[TxIdx],
@@ -69,7 +69,7 @@ fn note_predecessor_chain(
 }
 
 /// Park later txs behind the first (probe). Write-set then chains or releases.
-/// Thin-shell: first successor only — do not refuse the rest of the payee spine.
+/// A0-majority: first successor only — do not refuse the rest of the payee spine.
 fn note_probe_star(
     ready: &ReadyEdgeTable,
     ordered: &[TxIdx],
@@ -356,9 +356,9 @@ pub(crate) fn admit_seed_on_write_set(
     effective_locs: &[MemoryLocationHash],
 ) {
     let from_loc = hash_deterministic(MemoryLocation::Basic(from));
-    // PC-S1: thin-shell A0 — D1 writer order only. No ReadyEdge / B2 / release.
+    // PC-S1: A0-majority — D1 writer order only. No ReadyEdge / B2 / release.
     // 4→31 still lands when the A1 probe publishes (`note_immediate_pred`).
-    if policy.is_some_and(|p| p.is_thin_shell()) && !ready.was_queued(writer) {
+    if policy.is_some_and(|p| p.is_a0_majority_block()) && !ready.was_queued(writer) {
         for &loc in all_write_locs {
             ready.note_location_writer(loc, writer);
             // C4: EffectiveWAW short edge only — not a whole lazy same-from spine.
@@ -417,6 +417,8 @@ pub(crate) fn admit_seed_on_write_set(
     if hidden_eff.is_empty() {
         // D2: lazy-only. Release + learn only when an A1 probe is live
         // (PC-5: independent empty transfers must not take deferred/B2 locks).
+        // P0-B: write-set proves no effective waiters — same as cost-EV demote
+        // (`should_release_probe_star`) when commute absorbed the star.
         let later = hints.to_txs(&to);
         let probed = later.iter().any(|&t| t > writer && ready.was_queued(t));
         if !probed {
@@ -456,11 +458,11 @@ pub(crate) fn admit_seed_on_write_set(
         .filter(|&t| t > writer)
         .collect();
     // Production: only upgrade an existing A1 probe (begin-block EV).
-    // Tests pass `policy=None` and still expect write-set to plant the chain.
+    // Tests pass `policy=None` and still expect write-set to seed the chain.
     let chain_later =
         !later.is_empty() && (later.iter().any(|&t| ready.was_queued(t)) || policy.is_none());
     let mut queued = HashSet::new();
-    for loc in hidden_eff {
+    for &loc in &hidden_eff {
         ready.note_raw_producer(loc, writer);
         ready.note_location_writer(loc, writer);
         // D1: 4→31 when 4 already published this ℓ (any envelope).
@@ -478,6 +480,16 @@ pub(crate) fn admit_seed_on_write_set(
         ordered.push(pred);
         ordered.extend(later.iter().copied());
         let _ = note_predecessor_chain(ready, &ordered, loc, &mut queued, false);
+    }
+    // P0-B: cost-EV demote / commute-absorbed star — release later envelope
+    // waiters that D1 did **not** keep as WAW. Never release when the keep-set
+    // is empty (that dropped RawFan waiters). Do not re-A1 lazy same-from.
+    if policy.is_some_and(|p| p.should_release_probe_star()) && !queued.is_empty() {
+        for &t in &later {
+            if t > writer && !queued.contains(&t) {
+                ready.release_consumer(t, wave);
+            }
+        }
     }
 }
 
@@ -929,11 +941,11 @@ mod tests {
     }
 
     #[test]
-    fn thin_a0_write_set_records_d1_only() {
+    fn a0_ungated_write_set_records_d1_only() {
         let ready = ReadyEdgeTable::new();
         let wave = WaveParkTable::new();
         let policy = policy_for(176);
-        assert!(policy.is_thin_shell());
+        assert!(policy.is_a0_majority_block());
         let to = Address::repeat_byte(0x99);
         let hot = Address::repeat_byte(0x32);
         let loc = 0x32be_u64;

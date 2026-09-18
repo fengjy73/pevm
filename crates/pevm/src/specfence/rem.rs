@@ -1474,7 +1474,7 @@ impl PartialRetryTable {
 
     /// M1g: persist nested CallOutcomes from Inspector capture into tx state.
     /// Also patch an already-armed RewindTo continuation (EarlyVal may arm mid-run
-    /// before `with_plant_tls` ends and flushes captures).
+    /// before `with_protocol_tls` ends and flushes captures).
     pub(crate) fn note_call_outcomes(&self, tx_idx: TxIdx, calls: Vec<CachedCallOutcome>) {
         if tx_idx < self.states.len() {
             // SAFETY: single-executor invariant

@@ -166,20 +166,20 @@ pub(crate) fn classify_first_conflict(
     })
 }
 
-/// Thin-shell A0: force lazy on empty-input EOA that share from/to with another
+/// A0-majority: force lazy on empty-input EOA that share from/to with another
 /// tx in this block. Avoids first-touch Basic WAW on 2-tx same-from pairs
-/// without planting a ReadyEdge on the whole spine.
+/// without a ReadyEdge on the whole spine.
 #[inline]
-pub(crate) fn thin_a0_hinted_lazy(
+pub(crate) fn a0_majority_hinted_lazy(
     hints: &AccountHints,
     from: alloy_primitives::Address,
     to: Option<alloy_primitives::Address>,
     empty_input: bool,
     eoa: bool,
-    thin_shell: bool,
+    a0_majority_block: bool,
     queued: bool,
 ) -> bool {
-    if !thin_shell || queued || !empty_input || !eoa {
+    if !a0_majority_block || queued || !empty_input || !eoa {
         return false;
     }
     // Short same-from / same-to only. Long spines (≥16) stay eager so HotSet /
@@ -233,11 +233,11 @@ mod tests {
     }
 
     #[test]
-    fn thin_a0_hinted_lazy_same_from_only() {
+    fn a0_majority_hinted_lazy_same_from_only() {
         let from = Address::repeat_byte(0x2a);
         let to = Address::repeat_byte(0x11);
         let hints = AccountHints::from_from_and_to(from, to, vec![5, 6]);
-        assert!(thin_a0_hinted_lazy(
+        assert!(a0_majority_hinted_lazy(
             &hints,
             from,
             Some(to),
@@ -247,13 +247,13 @@ mod tests {
             false
         ));
         assert!(
-            !thin_a0_hinted_lazy(&hints, from, Some(to), true, true, true, true),
+            !a0_majority_hinted_lazy(&hints, from, Some(to), true, true, true, true),
             "A1-queued must not take the A0 lazy commute"
         );
         let solo = Address::repeat_byte(0x99);
         let h1 = AccountHints::from_from_and_to(solo, Address::repeat_byte(0x88), vec![3]);
         assert!(
-            !thin_a0_hinted_lazy(
+            !a0_majority_hinted_lazy(
                 &h1,
                 solo,
                 Some(Address::repeat_byte(0x88)),
@@ -268,7 +268,7 @@ mod tests {
         let long: Vec<TxIdx> = (0..32).collect();
         let h32 = AccountHints::from_from_and_to(from, to, long);
         assert!(
-            !thin_a0_hinted_lazy(&h32, from, Some(to), true, true, true, false),
+            !a0_majority_hinted_lazy(&h32, from, Some(to), true, true, true, false),
             "n_from=32 ≥ SHORT_SPINE must not force-lazy"
         );
     }

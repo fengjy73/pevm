@@ -1,7 +1,7 @@
 //! Repair grain — partial_abort at first failed pessimistic-admit \(a\);
 //! optimistic-read-only fail → full_abort_reexecute.
 //!
-//! Plant SoT: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md` §4.
+//! Protocol: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md` §4.
 //! Vocabulary: `lab/notes/specfence-cc-glossary.md`.
 
 use crate::MemoryLocationHash;

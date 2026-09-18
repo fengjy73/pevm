@@ -84,7 +84,7 @@ struct RunRow {
     lean_mode_txs: usize,
     full_mode_txs: usize,
     engagement_switches: usize,
-    hot_local_reads: usize,
+    location_hot_resolves: usize,
     hotset_size: usize,
     inspector_steps: usize,
     inspector_steps_resume: usize,
@@ -234,7 +234,7 @@ fn zeros_row(
         lean_mode_txs: 0,
         full_mode_txs: 0,
         engagement_switches: 0,
-        hot_local_reads: 0,
+        location_hot_resolves: 0,
         hotset_size: 0,
         inspector_steps: 0,
         inspector_steps_resume: 0,
@@ -424,7 +424,11 @@ fn measure(
                 lean_mode_txs: if sequential { 0 } else { m.lean_mode_txs },
                 full_mode_txs: if sequential { 0 } else { m.full_mode_txs },
                 engagement_switches: if sequential { 0 } else { m.engagement_switches },
-                hot_local_reads: if sequential { 0 } else { m.hot_local_reads },
+                location_hot_resolves: if sequential {
+                    0
+                } else {
+                    m.location_hot_resolves
+                },
                 hotset_size: if sequential { 0 } else { m.hotset_size },
                 inspector_steps: if sequential { 0 } else { m.inspector_steps },
                 inspector_steps_resume: if sequential {
@@ -512,7 +516,7 @@ fn write_outputs(out: &Path, rows: &[RunRow]) {
                 "lean_mode_txs": r.lean_mode_txs,
                 "full_mode_txs": r.full_mode_txs,
                 "engagement_switches": r.engagement_switches,
-                "hot_local_reads": r.hot_local_reads,
+                "location_hot_resolves": r.location_hot_resolves,
                 "hotset_size": r.hotset_size,
                 "inspector_steps": r.inspector_steps,
                 "inspector_steps_resume": r.inspector_steps_resume,
@@ -529,7 +533,7 @@ fn write_outputs(out: &Path, rows: &[RunRow]) {
     let mut csv = File::create(&csv_path).expect("write csv");
     writeln!(
         csv,
-        "block,n_tx,gas_used,mode,cores,repeat,elapsed_ms,tps,occ_aborts,abort_rate,wait_admissions,speculate_executions,region_promotions,cascade_validations_scheduled,independent_txs_skipped_by_fence,bayes_wait_decisions,bayes_speculate_decisions,bayes_conflict_updates,bayes_success_updates,wave_promotions,mean_wait_posterior,ordered_admit_hits,wait_hard_count,optimistic_read_count,selective_invalidate_count,tx_full_abort_reexecute,region_validate_fail,soft_edge_revokes,selective_fallback_full,partial_retry_count,partial_retry_fallback_full,cost_chose_wait,cost_chose_optimistic_read,cost_chose_ordered_admit,mean_p_at_wait,mean_p_at_optimistic_read,evm_entries,resume_count,rebind_only,rewind_to_cp,full_abort_reexecute,tx_head_reexec,absolute_jump_applied,absolute_jump_fallback,prior_ordered_admit_hits,prior_ordered_admit_miss,journal_ff_entries,journal_ff_hits,prefix_opcodes_skipped,ready_steal_on_wait,lean_mode_txs,full_mode_txs,engagement_switches,hot_local_reads,hotset_size,inspector_steps,inspector_steps_resume,ok,error"
+        "block,n_tx,gas_used,mode,cores,repeat,elapsed_ms,tps,occ_aborts,abort_rate,wait_admissions,speculate_executions,region_promotions,cascade_validations_scheduled,independent_txs_skipped_by_fence,bayes_wait_decisions,bayes_speculate_decisions,bayes_conflict_updates,bayes_success_updates,wave_promotions,mean_wait_posterior,ordered_admit_hits,wait_hard_count,optimistic_read_count,selective_invalidate_count,tx_full_abort_reexecute,region_validate_fail,soft_edge_revokes,selective_fallback_full,partial_retry_count,partial_retry_fallback_full,cost_chose_wait,cost_chose_optimistic_read,cost_chose_ordered_admit,mean_p_at_wait,mean_p_at_optimistic_read,evm_entries,resume_count,rebind_only,rewind_to_cp,full_abort_reexecute,tx_head_reexec,absolute_jump_applied,absolute_jump_fallback,prior_ordered_admit_hits,prior_ordered_admit_miss,journal_ff_entries,journal_ff_hits,prefix_opcodes_skipped,ready_steal_on_wait,lean_mode_txs,full_mode_txs,engagement_switches,location_hot_resolves,hotset_size,inspector_steps,inspector_steps_resume,ok,error"
     )
     .unwrap();
     for r in rows {
@@ -590,7 +594,7 @@ fn write_outputs(out: &Path, rows: &[RunRow]) {
             r.lean_mode_txs,
             r.full_mode_txs,
             r.engagement_switches,
-            r.hot_local_reads,
+            r.location_hot_resolves,
             r.hotset_size,
             r.inspector_steps,
             r.inspector_steps_resume,

@@ -1,6 +1,6 @@
 //! Lightweight AccessOrdinalLog — Spec-safe \((\ell,k)\) without rem journal.
 //!
-//! Plant SoT v6 §5/§6: HashMap first_k **only when PE nonempty or learning
+//! Protocol v6 §5/§6: HashMap first_k **only when PE nonempty or learning
 //! arm**. Quiet empty-PE must not call [`AccessOrdinalLog::note`].
 //! Single-executor per `tx_idx` (same invariant as rem `state_mut`).
 

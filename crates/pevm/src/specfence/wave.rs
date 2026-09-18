@@ -3,7 +3,7 @@
 //! SoftWait Soft + SuffixRepair research stay in [`super::rem`] (quarantined;
 //! Soft=0). This file **owns** WaveParkTable.
 //!
-//! Plant SoT: `lab/notes/specfence-complete-architecture-v9.4-file-srp.md`.
+//! Protocol: `lab/notes/specfence-complete-architecture-v9.4-file-srp.md`.
 
 use parking_lot::Mutex;
 use std::cmp::Reverse;
@@ -15,7 +15,7 @@ use dashmap::DashMap;
 
 use crate::{BuildIdentityHasher, MemoryLocationHash, TxIdx};
 
-// --- Plant v2 M2: wave park / ready-queue (L2) --------------------------------
+// --- M2: wave park / ready-queue (L2) --------------------------------
 
 thread_local! {
     /// Set when this worker just parked a WaitHard; next successful ready steal counts.

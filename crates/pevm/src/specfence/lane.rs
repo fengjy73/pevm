@@ -1,6 +1,6 @@
 //! SerialLane / OrderedAdmit **progress tokens** — not prefer_admit+Spec.
 //!
-//! Plant SoT: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md` §3.4.
+//! Protocol: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md` §3.4.
 //!
 //! Token is held by the earliest unfinished producer (or admitted head).
 //! Consumers are blocked in the ready-set or park via WaitFor — they must
