@@ -363,7 +363,7 @@ impl ReadyEdgeTable {
     }
 
     #[inline]
-    fn is_writer_done(&self, writer: TxIdx) -> bool {
+    pub(crate) fn is_writer_done(&self, writer: TxIdx) -> bool {
         let i = writer / 64;
         if i < self.done_bits.len() {
             let bit = 1u64 << (writer % 64);

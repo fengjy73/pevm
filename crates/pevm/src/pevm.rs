@@ -586,9 +586,13 @@ impl Pevm {
                     let mut task = if occ_mode {
                         crate::specfence::next_occ_task(&scheduler)
                     } else if self.concurrency_mode == ConcurrencyMode::SpecFence {
-                        // Persist CC-L1/L2 hops for the next begin. Do not plant
-                        // ReadyEdges mid-block — that races done-stamp / JUMP and
-                        // flakes seq≡par (iter11).
+                        // T3: next-quantum idle hops only. Skip started / already-
+                        // done preds (validate-time plant races done-stamp and
+                        // flakes ERC-20 / iter11 seq≡par).
+                        crate::specfence::admit::flush_pending_idle_edges(
+                            specfence.ready_edges,
+                            &self.cost_policy,
+                        );
                         if let Some(w) = wave_ref {
                             crate::specfence::next_sf_task(
                                 &scheduler,
@@ -694,6 +698,10 @@ impl Pevm {
                             task = if occ_mode {
                                 crate::specfence::next_occ_task(&scheduler)
                             } else if self.concurrency_mode == ConcurrencyMode::SpecFence {
+                                crate::specfence::admit::flush_pending_idle_edges(
+                                    specfence.ready_edges,
+                                    &self.cost_policy,
+                                );
                                 if let Some(w) = wave_ref {
                                     crate::specfence::next_sf_task(
                                         &scheduler,

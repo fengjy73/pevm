@@ -16,7 +16,7 @@ use super::bayes::BayesMap;
 use super::feeder::{seed_known_stars, top_is_known_star};
 use super::learner::{InterBlockPrior, LiveLearner};
 use super::metrics::MetricsInner;
-use super::policy::{CohortKind, CostPolicy, ORDER_WINDOW_K, THIN_ORDERED_K};
+use super::policy::{CohortKind, CostPolicy, ORDER_WINDOW_K, THIN_ORDERED_K, WINDOWED_W_MAX};
 use super::producer_stage::ProducerStageTable;
 use super::ready_edge::ReadyEdgeTable;
 use super::wave::WaveParkTable;
@@ -414,13 +414,14 @@ fn admit_seed_promoted_short_edges(
     let mut edges = 0;
     for (loc, mut pairs) in locs {
         pairs.sort_unstable_by_key(|(pred, _)| *pred);
-        let keep = policy.hops_to_plant(loc, pairs.len());
-        if keep == 0 {
+        let n_pairs = pairs.len();
+        if policy.hops_to_plant(loc, n_pairs) == 0 {
             continue;
         }
-        policy.note_hops_decision(loc, pairs.len());
-        pairs.truncate(keep);
-        for (pred, succ) in pairs {
+        policy.note_hops_decision(loc, n_pairs);
+        let strategy = policy.loc_strategy(loc, n_pairs);
+        let plant = CostPolicy::select_pairs_for_strategy(strategy, &pairs);
+        for (pred, succ) in plant {
             ready.note_consumer_on(succ, pred, Some(loc));
             policy.note_short_edge_admit();
             if let Some(m) = metrics {
@@ -832,7 +833,10 @@ pub(crate) fn persist_short_chain_after_abort(
     }
 }
 
-/// CC-L1: nearest unfinished (not started) successor on `ℓ` after a published pred.
+/// T3: queue the next `w` idle hops on `ℓ` after a published pred.
+///
+/// Never inserts ReadyEdges here (validate-time plant livelocks ERC-20).
+/// `flush_pending_idle_edges` at the next pick quantum plants idle hops only.
 pub(crate) fn queue_nearest_unfinished_successor(
     ready: &ReadyEdgeTable,
     policy: &CostPolicy,
@@ -842,25 +846,39 @@ pub(crate) fn queue_nearest_unfinished_successor(
     from: Address,
     to: Option<Address>,
 ) {
-    let mut succs: Vec<TxIdx> = policy
+    let n_pairs = policy.pairs_of(location).len();
+    let w = policy
+        .window_w_of(location, n_pairs)
+        .clamp(1, WINDOWED_W_MAX);
+    let mut hops: Vec<(TxIdx, TxIdx)> = policy
         .pairs_of(location)
         .into_iter()
         .filter(|&(pred, succ)| pred >= published && pred < succ)
-        .map(|(_, succ)| succ)
         .collect();
-    succs.extend(location_successors(hints, location, published, from, to));
-    succs.sort_unstable();
-    succs.dedup();
-    if let Some(&succ) = succs
-        .iter()
-        .find(|&&s| s > published && !ready.is_started(s))
-    {
-        policy.queue_idle_edge(location, published, succ);
+    let later = location_successors(hints, location, published, from, to);
+    if hops.is_empty() {
+        if let Some(&succ) = later
+            .iter()
+            .find(|&&s| s > published && !ready.is_started(s))
+        {
+            hops.push((published, succ));
+        }
+    }
+    hops.sort_unstable();
+    hops.dedup();
+    hops.truncate(w);
+    for (pred, succ) in hops {
+        if succ > published && !ready.is_started(succ) && !ready.is_writer_done(pred) {
+            policy.queue_idle_edge(location, pred, succ);
+        }
     }
 }
 
-/// CC-L1/L2: plant queued idle hops. Started successors stay OptimisticRead.
-/// At most the retry consumer plus one successor hop per ℓ (CC-L3).
+/// T3: plant queued idle hops at the next pick quantum / next incarnation.
+///
+/// Started successors stay OptimisticRead this incarnation. Preds that are
+/// already done-stamped are skipped (done-stamp race / ERC-20 livelock).
+/// Cap is the learned Win_w — never a full-spine prepaid list.
 pub(crate) fn flush_pending_idle_edges(ready: &ReadyEdgeTable, policy: &CostPolicy) -> usize {
     let pending = policy.take_pending_idle();
     if pending.is_empty() {
@@ -876,12 +894,13 @@ pub(crate) fn flush_pending_idle_edges(ready: &ReadyEdgeTable, policy: &CostPoli
     for (loc, mut pairs) in by_loc {
         pairs.sort_unstable();
         pairs.dedup();
-        // CC-L3: retry + one successor hop. Never a full-spine prepaid list.
-        if pairs.len() > 2 {
-            pairs.truncate(2);
+        let n_pairs = policy.pairs_of(loc).len().max(pairs.len());
+        let cap = policy.window_w_of(loc, n_pairs).clamp(1, WINDOWED_W_MAX);
+        if pairs.len() > cap {
+            pairs.truncate(cap);
         }
         for (pred, succ) in pairs {
-            if pred >= succ || ready.is_started(succ) {
+            if pred >= succ || ready.is_started(succ) || ready.is_writer_done(pred) {
                 continue;
             }
             if ready.note_consumer_on_if_idle(succ, pred, Some(loc)) {
@@ -1803,17 +1822,21 @@ mod tests {
             &HashSet::new(),
             None,
         );
-        assert_eq!(n, 1, "CC-L3: reuse plants WindowedOrdered k=1, got {n}");
+        assert!(
+            n >= 1 && n <= WINDOWED_W_MAX,
+            "T1: reuse plants Win_w hops (1..3), got {n}"
+        );
         assert_eq!(
             ready.blocking_producer(31),
             Some(4),
-            "CC-L3: only nearest unfinished writer (4→31)"
-        );
-        assert!(
-            ready.may_execute(66) && ready.may_execute(67),
-            "CC-L3: no prepaid 31→66→67 full-spine list"
+            "T1: head hop 4→31 is always planted"
         );
         assert!(ready.may_execute(4), "chain head stays runnable");
+        // Win_1 leaves 66/67 OptimisticRead; F7 may plant Win_2/3. Never FullChain.
+        assert!(
+            n < 4,
+            "T1: must not plant the full 4→31→66→67 prepaid list at begin, got {n}"
+        );
     }
 
     #[test]
@@ -1855,20 +1878,17 @@ mod tests {
         assert_eq!(
             ready.blocking_producer(31),
             Some(4),
-            "CC-L3: long Basic spine plants only 4→31"
+            "T1: long Basic spine always plants 4→31"
         );
-        assert!(
-            ready.may_execute(66),
-            "CC-L3: tail of the long spine stays OptimisticRead at begin"
-        );
+        assert!(ready.may_execute(4), "chain head stays runnable");
         assert_eq!(ready.blocking_producer(16), Some(14));
         let extra_blocked = [11usize, 13, 19]
             .iter()
             .filter(|&&t| !ready.may_execute(t))
             .count();
         assert!(
-            extra_blocked <= 2 && n <= 2 + 1 + 1,
-            "C5: thin reuse plants ≤K locations after dropping the long spine (extras_blocked={extra_blocked} edges={n})"
+            extra_blocked <= 2 && n <= WINDOWED_W_MAX + 2 + 1,
+            "C5: thin reuse plants ≤K locations; long spine is Win_w (extras_blocked={extra_blocked} edges={n})"
         );
     }
 
@@ -1887,6 +1907,28 @@ mod tests {
         assert!(
             ready.may_execute(67),
             "O3: started 67 must stay A0 this incarnation"
+        );
+    }
+
+    #[test]
+    fn flush_skips_done_pred_and_started_succ() {
+        let ready = ReadyEdgeTable::new();
+        let policy = policy_for(176);
+        policy.promote_short_edge(0x32be, 40_000);
+        policy.note_short_pair(0x32be, 4, 31);
+        policy.note_short_pair(0x32be, 31, 66);
+        policy.queue_idle_edge(0x32be, 4, 31);
+        policy.queue_idle_edge(0x32be, 31, 66);
+        ready.note_producer_done_stamp(4);
+        ready.note_started(66);
+        let n = flush_pending_idle_edges(&ready, &policy);
+        assert_eq!(
+            n, 0,
+            "T3: done pred and started succ must not plant, got {n}"
+        );
+        assert!(
+            ready.may_execute(31) && ready.may_execute(66),
+            "T3: skipped hops stay OptimisticRead"
         );
     }
 }
