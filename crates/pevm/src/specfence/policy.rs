@@ -670,6 +670,8 @@ impl CostPolicy {
         // unless OptimisticRead is clearly cheaper.
         if measured
             && n_pairs > ORDER_WINDOW_K
+            && leftover < LEFTOVER_WIN3
+            && escalate_n == 0
             && c_opt + NS_DELTA < costs[1].min(costs[2]).min(costs[3]).min(costs[4])
         {
             return LocStrategy::OptimisticRead;
@@ -1590,13 +1592,19 @@ impl CostPolicy {
             let n_pairs = self.short_chain.get(e.key()).map(|c| c.len()).unwrap_or(0);
             let planted = Self::hops_for_strategy(e.decision, n_pairs);
             let leftover_hops = n_pairs.saturating_sub(planted) as u32;
-            // F7 leftover is *measured* reexec, not unplanted hop count
-            // (commute / already-published tail is not an escalate signal).
-            e.leftover_reexec = e.block_reexec_n;
-            if e.block_reexec_n >= 2 || (leftover_hops >= LEFTOVER_WIN3 && e.block_reexec_n >= 1) {
+            // Opt + a long unplanted spine must escalate (cold 4→31…171).
+            // After OrderedAdmit, leftover is measured reexec only.
+            if e.decision == LocStrategy::OptimisticRead && leftover_hops >= LEFTOVER_WIN3 {
+                e.leftover_reexec = leftover_hops.max(e.block_reexec_n);
                 e.escalate_n = e.escalate_n.saturating_add(1);
-            } else if e.block_reexec_n == 0 {
+            } else if e.block_reexec_n >= 2 {
+                e.leftover_reexec = e.block_reexec_n;
+                e.escalate_n = e.escalate_n.saturating_add(1);
+            } else if e.block_reexec_n == 0 && e.decision.is_ordered() {
+                e.leftover_reexec = 0;
                 e.escalate_n = 0;
+            } else {
+                e.leftover_reexec = e.block_reexec_n;
             }
             if e.decision == LocStrategy::FullChain && n_pairs > ORDER_WINDOW_K {
                 if e.c_full + NS_DELTA >= e.c_opt.min(e.c_win) {
