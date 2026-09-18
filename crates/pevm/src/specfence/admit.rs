@@ -1329,10 +1329,9 @@ mod tests {
             &[loc],
             &[loc],
         );
-        assert_eq!(
-            ready.writers_of(loc),
-            vec![4],
-            "C1: first effective write records D1"
+        assert!(
+            ready.writers_of(loc).is_empty(),
+            "O1: thin A0 unique write is OCC — D1 comes from end-block MV"
         );
         assert!(
             ready.may_execute(31),

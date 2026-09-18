@@ -823,7 +823,14 @@ impl Pevm {
             let inc_gt0 = incs.iter().filter(|&&i| i > 0).count();
             let reexec: usize = incs.iter().sum();
             let mut miss = 0usize;
-            if !thin {
+            if thin {
+                for (tx, &inc) in incs.iter().enumerate() {
+                    if inc > 0 && !ready_edges.was_queued(tx) {
+                        miss += 1;
+                        self.cost_policy.bump_unfenced_reexec();
+                    }
+                }
+            } else {
                 for (tx, &inc) in incs.iter().enumerate() {
                     if inc == 0 || ready_edges.was_queued(tx) {
                         continue;
