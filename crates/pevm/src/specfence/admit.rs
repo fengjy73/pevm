@@ -291,12 +291,7 @@ pub(crate) fn admit_seed_begin_block(
                 }
                 ready.note_raw_producer(basic, producer);
                 queued.insert(producer);
-                let rest: &[TxIdx] = if short_edge && c.txs.len() >= 2 {
-                    &c.txs[1..2]
-                } else {
-                    &c.txs[1..]
-                };
-                for &t in rest {
+                for &t in &c.txs[1..] {
                     if queued.contains(&t) {
                         continue;
                     }
@@ -307,16 +302,19 @@ pub(crate) fn admit_seed_begin_block(
             }
             CohortKind::CallWaw => {
                 let loc = envelope_loc(c.addr);
-                edges += note_predecessor_chain(ready, &c.txs, loc, &mut queued, short_edge);
+                // Storage / calldata WAW keeps the full pred chain (seq≡par).
+                edges += note_predecessor_chain(ready, &c.txs, loc, &mut queued, false);
             }
             CohortKind::EmptyTo => {
                 let loc = envelope_loc(c.addr);
+                // Thin-shell: first successor only. 3356896 4→31 stays A1;
+                // 66…171 stay A0 (no probe-star refuse).
                 edges += note_probe_star(ready, &c.txs, loc, &mut queued, short_edge);
             }
             CohortKind::SameFrom => {
                 let basic = hash_deterministic(MemoryLocation::Basic(c.addr));
                 ready.note_raw_producer(basic, c.txs[0]);
-                edges += note_predecessor_chain(ready, &c.txs, basic, &mut queued, short_edge);
+                edges += note_predecessor_chain(ready, &c.txs, basic, &mut queued, false);
             }
         }
         let _ = c.is_contract;
