@@ -703,8 +703,9 @@ fn from_successors(
 /// Account-location consecutive only:
 /// - `ℓ = Basic(from)` → later same-from
 /// - `ℓ = Basic(to)` → later same `to`
-/// - hidden ℓ + empty-to → later empty-to of that `to` (0x209c → Basic(0x32be))
 /// - hidden ℓ + short CallWaw (3..=7) → later calldata of that `to` (14→16→17)
+/// Hidden empty-to (0x209c → Basic(0x32be)) is completed from D1 at end-block,
+/// not by cloning the envelope onto every abort ℓ.
 /// Wide CallWaw / RAW fans stay empty — different slots must not serialize.
 fn location_successors(
     hints: &AccountHints,
@@ -735,13 +736,10 @@ fn location_successors(
             .collect();
     }
     let call_n = hints.call_to_txs(&to).len();
-    if call_n >= RAW_FANOUT_FLOOR {
+    if call_n >= RAW_FANOUT_FLOOR || call_n >= 8 {
         return Vec::new();
     }
     if call_n >= CALL_WAW_FLOOR {
-        if call_n >= 8 {
-            return Vec::new();
-        }
         return hints
             .call_to_txs(&to)
             .iter()
@@ -749,14 +747,8 @@ fn location_successors(
             .filter(|&t| t > writer)
             .collect();
     }
-    if hints.is_empty_calldata(writer) {
-        return hints
-            .to_txs(&to)
-            .iter()
-            .copied()
-            .filter(|&t| t > writer)
-            .collect();
-    }
+    // Hidden ℓ + empty-to: do **not** clone the envelope tail onto this ℓ.
+    // 0x209c writers of Basic(0x32be) are completed from D1 at end-block.
     Vec::new()
 }
 
@@ -1627,11 +1619,12 @@ mod tests {
         persist_short_chain_after_abort(&hints, &policy, 31, 4, loc);
         let pairs = policy.promoted_short_pairs();
         assert!(
-            pairs.iter().any(|&(l, a, b)| l == loc && a == 4 && b == 31)
-                && pairs.iter().any(|&(l, a, b)| l == loc && a == 31 && b == 66)
-                && pairs.iter().any(|&(l, a, b)| l == loc && a == 66 && b == 67)
-                && pairs.iter().any(|&(l, a, b)| l == loc && a == 67 && b == 69),
-            "abort must persist 4→31→66→67→69 on the account location: {pairs:?}"
+            pairs.iter().any(|&(l, a, b)| l == loc && a == 4 && b == 31),
+            "abort must persist the proven 4→31 pair: {pairs:?}"
+        );
+        assert!(
+            !pairs.iter().any(|&(l, a, b)| l == loc && a == 31 && b == 66),
+            "empty-to envelope must not be cloned onto a hidden ℓ: {pairs:?}"
         );
     }
 
