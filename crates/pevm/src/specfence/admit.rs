@@ -39,14 +39,21 @@ fn envelope_loc(addr: Address) -> MemoryLocationHash {
 ///
 /// Do **not** ProducerStage-reserve every predecessor. `next_reserved()` is a
 /// global min; reserving a long WAW spine serializes the whole block.
+/// Thin-shell: only the first successor (short edge). Later writers stay A0.
 fn note_predecessor_chain(
     ready: &ReadyEdgeTable,
     ordered: &[TxIdx],
     location: MemoryLocationHash,
     queued: &mut HashSet<TxIdx>,
+    short_edge: bool,
 ) -> usize {
+    let chain = if short_edge && ordered.len() >= 2 {
+        &ordered[..2]
+    } else {
+        ordered
+    };
     let mut edges = 0;
-    for pair in ordered.windows(2) {
+    for pair in chain.windows(2) {
         let (pred, succ) = (pair[0], pair[1]);
         if pred >= succ {
             continue;
@@ -62,19 +69,26 @@ fn note_predecessor_chain(
 }
 
 /// Park later txs behind the first (probe). Write-set then chains or releases.
+/// Thin-shell: first successor only — do not refuse the rest of the payee spine.
 fn note_probe_star(
     ready: &ReadyEdgeTable,
     ordered: &[TxIdx],
     location: MemoryLocationHash,
     queued: &mut HashSet<TxIdx>,
+    short_edge: bool,
 ) -> usize {
     if ordered.len() < 2 {
         return 0;
     }
     let probe = ordered[0];
     queued.insert(probe);
+    let succs: &[TxIdx] = if short_edge {
+        &ordered[1..2]
+    } else {
+        &ordered[1..]
+    };
     let mut edges = 0;
-    for &succ in &ordered[1..] {
+    for &succ in succs {
         if probe >= succ {
             continue;
         }
@@ -262,6 +276,7 @@ pub(crate) fn admit_seed_begin_block(
 
     let mut edges = 0;
     let mut queued: HashSet<TxIdx> = HashSet::new();
+    let short_edge = policy.is_thin_shell();
     for c in cands {
         if let Some(m) = metrics {
             m.record_edge_ordered_admit();
@@ -276,7 +291,12 @@ pub(crate) fn admit_seed_begin_block(
                 }
                 ready.note_raw_producer(basic, producer);
                 queued.insert(producer);
-                for &t in &c.txs[1..] {
+                let rest: &[TxIdx] = if short_edge && c.txs.len() >= 2 {
+                    &c.txs[1..2]
+                } else {
+                    &c.txs[1..]
+                };
+                for &t in rest {
                     if queued.contains(&t) {
                         continue;
                     }
@@ -287,16 +307,16 @@ pub(crate) fn admit_seed_begin_block(
             }
             CohortKind::CallWaw => {
                 let loc = envelope_loc(c.addr);
-                edges += note_predecessor_chain(ready, &c.txs, loc, &mut queued);
+                edges += note_predecessor_chain(ready, &c.txs, loc, &mut queued, short_edge);
             }
             CohortKind::EmptyTo => {
                 let loc = envelope_loc(c.addr);
-                edges += note_probe_star(ready, &c.txs, loc, &mut queued);
+                edges += note_probe_star(ready, &c.txs, loc, &mut queued, short_edge);
             }
             CohortKind::SameFrom => {
                 let basic = hash_deterministic(MemoryLocation::Basic(c.addr));
                 ready.note_raw_producer(basic, c.txs[0]);
-                edges += note_predecessor_chain(ready, &c.txs, basic, &mut queued);
+                edges += note_predecessor_chain(ready, &c.txs, basic, &mut queued, short_edge);
             }
         }
         let _ = c.is_contract;
@@ -462,7 +482,7 @@ pub(crate) fn admit_seed_on_write_set(
         let mut ordered = Vec::with_capacity(later.len() + 1);
         ordered.push(pred);
         ordered.extend(later.iter().copied());
-        let _ = note_predecessor_chain(ready, &ordered, loc, &mut queued);
+        let _ = note_predecessor_chain(ready, &ordered, loc, &mut queued, false);
     }
 }
 
@@ -744,7 +764,7 @@ mod tests {
         let hints = AccountHints::from_to_txs(to, (31..47).collect());
         let loc = envelope_loc(to);
         let mut queued = HashSet::new();
-        let n = note_probe_star(&ready, hints.to_txs(&to), loc, &mut queued);
+        let n = note_probe_star(&ready, hints.to_txs(&to), loc, &mut queued, false);
         assert!(n >= 15);
         assert!(!ready.may_execute(32));
         assert_eq!(ready.blocking_producer(32), Some(31));
