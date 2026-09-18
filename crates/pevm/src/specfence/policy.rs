@@ -1590,16 +1590,12 @@ impl CostPolicy {
             let n_pairs = self.short_chain.get(e.key()).map(|c| c.len()).unwrap_or(0);
             let planted = Self::hops_for_strategy(e.decision, n_pairs);
             let leftover_hops = n_pairs.saturating_sub(planted) as u32;
-            e.leftover_reexec = e.block_reexec_n.max(leftover_hops);
-            // F7: leftover tail or continued reexec escalates Win_w / Seg.
-            if leftover_hops >= LEFTOVER_WIN3 && e.block_reexec_n >= 1 {
+            // F7 leftover is *measured* reexec, not unplanted hop count
+            // (commute / already-published tail is not an escalate signal).
+            e.leftover_reexec = e.block_reexec_n;
+            if e.block_reexec_n >= 2 || (leftover_hops >= LEFTOVER_WIN3 && e.block_reexec_n >= 1) {
                 e.escalate_n = e.escalate_n.saturating_add(1);
-            } else if e.block_reexec_n >= 2 {
-                e.escalate_n = e.escalate_n.saturating_add(1);
-            } else if e.block_reexec_n == 0
-                && e.block_ordered_n > 0
-                && leftover_hops < LEFTOVER_WIN3
-            {
+            } else if e.block_reexec_n == 0 {
                 e.escalate_n = 0;
             }
             if e.decision == LocStrategy::FullChain && n_pairs > ORDER_WINDOW_K {
