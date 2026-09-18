@@ -775,20 +775,26 @@ impl Pevm {
             } else {
                 mv_writer_order_snapshot(&mv_memory, block_size, beneficiary)
             };
-            // Promoted-ℓ MV merge (lazy tx4 on Basic(0x32be) is off ready D1
-            // unless write-set recorded it). Cheap: only promoted locations.
-            for (loc, writers) in mv_writers_for_locs(
-                &mv_memory,
-                &self.cost_policy.promoted_locations(),
-                block_size,
-                beneficiary,
-            ) {
-                if let Some((_, w)) = d1_orders.iter_mut().find(|(l, _)| *l == loc) {
-                    w.extend(writers);
-                    w.sort_unstable();
-                    w.dedup();
-                } else {
-                    d1_orders.push((loc, writers));
+            // Promoted-ℓ MV merge only when ready D1 missed 4→31 (lazy tx4).
+            let ready_has_4_31 = d1_orders.iter().any(|(_, w)| {
+                let i4 = w.iter().position(|&t| t == 4);
+                let i31 = w.iter().position(|&t| t == 31);
+                matches!((i4, i31), (Some(a), Some(b)) if a < b)
+            });
+            if !ready_has_4_31 {
+                for (loc, writers) in mv_writers_for_locs(
+                    &mv_memory,
+                    &self.cost_policy.promoted_locations(),
+                    block_size,
+                    beneficiary,
+                ) {
+                    if let Some((_, w)) = d1_orders.iter_mut().find(|(l, _)| *l == loc) {
+                        w.extend(writers);
+                        w.sort_unstable();
+                        w.dedup();
+                    } else {
+                        d1_orders.push((loc, writers));
+                    }
                 }
             }
             let thin = self.cost_policy.is_a0_majority_block();

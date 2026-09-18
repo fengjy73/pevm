@@ -223,7 +223,13 @@ fn promote_and_seed_short_edge(
         producer,
         f.location,
     );
-    // O3: retry is idle; plant a window only for not-started successors.
+    // O3: plant one idle hop only when leftover-aware EV still wants order.
+    // Long thin spines already lost to OCC abort — planting here rebuilds prepaid.
+    let n_pairs = policy.pairs_of(f.location).len();
+    if n_pairs > super::policy::ORDER_WINDOW_K && policy.hops_to_plant(f.location, n_pairs) == 0 {
+        let _ = policy.take_pending_idle();
+        return;
+    }
     specfence.ready_edges.clear_started(tx_idx);
     let _ = crate::specfence::admit::flush_pending_idle_edges(specfence.ready_edges, policy);
 }

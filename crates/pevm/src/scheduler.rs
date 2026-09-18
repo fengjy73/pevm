@@ -15,10 +15,6 @@ use crate::{
     specfence::{FenceGraph, ReadyEdgeTable, WaveParkTable, profile_timing_enabled},
 };
 
-/// After refuse_admit, probe later txs for an independent Execute.
-/// PC-1: steal any independent in the block — no empty refuse spin.
-const WAVE_FILL_WINDOW: usize = 32;
-
 // The Pevm collaborative scheduler coordinates execution & validation
 // tasks among work threads.
 //
@@ -450,27 +446,6 @@ impl Scheduler {
                 wave.note_ready_steal_if_after_park();
                 return Some(Task::Execution(tx_version));
             }
-        }
-        let steal = |cand: TxIdx| -> Option<Task> {
-            if cand >= self.block_size || self.is_done(cand) {
-                return None;
-            }
-            if edges.is_gated(cand) && (edges.is_sleeping(cand) || !edges.may_execute(cand)) {
-                return None;
-            }
-            let tx_version = self.try_execute_ready(cand, Some(wave), ready)?;
-            edges.sample_ready_width(wave.ready_depth().max(1));
-            wave.note_ready_steal_if_after_park();
-            Some(Task::Execution(tx_version))
-        };
-        let end = from.saturating_add(WAVE_FILL_WINDOW).min(self.block_size);
-        for cand in (from + 1)..end {
-            if let Some(task) = steal(cand) {
-                return Some(task);
-            }
-        }
-        if wave.ready_depth() > 0 {
-            edges.sample_ready_width(wave.ready_depth());
         }
         None
     }
