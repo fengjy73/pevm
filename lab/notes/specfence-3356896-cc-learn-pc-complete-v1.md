@@ -38,7 +38,11 @@
 | commute / ignore / taxed / soft | — | 77 / 77 / 0 / 0 |
 | `edge_4_31` | — | **true** |
 
-PRIMARY `sf_le_occ` **false**。主账本仍是 0x209c 主链 unfenced reexec（`reexec_ns` 212–439µs）。storage 短边已落地。
+PRIMARY `sf_le_occ` **false**（默认每 iter `new Pevm`）。主账本仍是 0x209c 主链 unfenced reexec（`reexec_ns` 212–439µs）。storage 短边已落地。
+
+## 同 Pevm reuse（L4）
+
+`SPECFENCE_REUSE_SF` n=4：`reuse[0]` unfenced=14 a1=6 edge_oa=10；**`reuse[1..3]` unfenced=0 a1=22 edge_oa=43**。PR20 reuse 六次仍 a1=0。学习闭环在同实例下已通。
 
 ## 非目标
 恢复 Soft；懒同 from 整脊 A1；Basic→Storage PE 伪造；为学而学却不降 wall。
