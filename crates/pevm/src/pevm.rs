@@ -808,17 +808,18 @@ impl Pevm {
                 }
             }
             let thin = self.cost_policy.is_optimistic_majority_block();
-            // M2: HotSet/sketch off on thin when D1 already has 4→31.
-            if !thin || !ready_has_4_31 {
-                for (loc, writers) in &d1_orders {
-                    if writers.len() < 2 {
-                        continue;
-                    }
-                    self.rw_prior.observe_write_set(&[*loc], None);
-                    if !thin || writers.len() >= 3 || self.cost_policy.is_promoted(*loc) {
-                        for &tx in writers {
-                            self.hotset.note_writer(*loc, tx);
-                        }
+            // M2: skip MV merge when D1 already has 4→31 (above). HotSet is
+            // block-end sampling only — still note ≥3-writer / promoted ℓ.
+            // Do not use ready_has_4_31 as a global HotSet off-switch: any
+            // 32+ same-ℓ spine contains idx 4 and 31.
+            for (loc, writers) in &d1_orders {
+                if writers.len() < 2 {
+                    continue;
+                }
+                self.rw_prior.observe_write_set(&[*loc], None);
+                if !thin || writers.len() >= 3 || self.cost_policy.is_promoted(*loc) {
+                    for &tx in writers {
+                        self.hotset.note_writer(*loc, tx);
                     }
                 }
             }
