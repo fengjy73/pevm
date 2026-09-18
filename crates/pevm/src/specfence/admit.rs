@@ -121,6 +121,21 @@ pub(crate) fn admit_seed_begin_block(
     contracts: &HashSet<Address>,
     metrics: Option<&MetricsInner>,
 ) -> usize {
+    // L1/P3: thin cold start is A1=0 — no hint walk, no Bayes seed, no ReadyEdge.
+    if !policy.should_seed_thin_a1() {
+        let _ = (
+            ready,
+            stages,
+            learner,
+            bayes,
+            prior,
+            hints,
+            beneficiary,
+            contracts,
+            metrics,
+        );
+        return 0;
+    }
     let stars = seed_known_stars(learner, bayes, prior);
     let fan = learner.morph_weights().dominant_fan_out();
     let prior_star = prior.top_locations().iter().any(top_is_known_star);

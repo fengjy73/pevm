@@ -149,6 +149,8 @@ pub(crate) struct VmDb<'a, S: Storage> {
     is_lazy: bool,
     /// Thin-shell short same-from/to force-lazy (not the generic first-touch lazy).
     a0_majority_lazy: bool,
+    /// A1=0 ungated: skip access-gate / rem / ReadyEdge (P3 ≡ OCC).
+    a0_skip_gate: bool,
     /// PCC overlay armed for the current access (PE ∩ ROI). OptimisticRead = OCC read.
     pcc_armed: Cell<bool>,
     /// OptimisticRead accesses this incarnation (end-tx process flush; no DashMap).
@@ -183,6 +185,12 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.flush_access_census();
         self.is_lazy = false;
         self.a0_majority_lazy = false;
+        self.a0_skip_gate = self.specfence.mode == crate::ConcurrencyMode::SpecFence
+            && self
+                .specfence
+                .policy
+                .is_some_and(|p| p.is_a0_majority_block())
+            && !self.specfence.ready_edges.was_queued(tx_idx);
         self.has_nonce = has_nonce;
         self.read_set.clear();
         self.read_accounts.clear();
@@ -190,7 +198,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if let Some(fg) = self.specfence.finegrain {
             fg.deep_begin_consumer(tx_idx, incarnation);
         }
-        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+        if self.specfence.mode == crate::ConcurrencyMode::SpecFence && !self.a0_skip_gate {
             // repair_armed covers_all only with real FF values. WaitForDependency ResumeAtK
             // with empty FF must not pretend sibling optimistic_read is certified (Iter26).
             let repair_armed = (self.specfence.partial_retry.is_rewind_resume(tx_idx)
@@ -428,7 +436,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
     /// End-tx OptimisticRead census (no per-SLOAD process DashMap).
     fn flush_access_census(&self) {
         let n = self.optimistic_read_this_tx.get();
-        if n > 0 && self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+        if n > 0 && self.specfence.mode == crate::ConcurrencyMode::SpecFence && !self.a0_skip_gate {
             self.specfence
                 .process
                 .note_optimistic_read_occ(self.tx_idx, n);
@@ -449,6 +457,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
         match self.specfence.mode {
             crate::ConcurrencyMode::Occ => Ok(()),
             crate::ConcurrencyMode::Pcc => self.maybe_wait_pcc(address, location_hash),
+            crate::ConcurrencyMode::SpecFence if self.a0_skip_gate || self.is_lazy => Ok(()),
             crate::ConcurrencyMode::SpecFence => {
                 self.specfence_access_gate(address, location_hash, is_program)
             }
@@ -2125,6 +2134,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             to_code_hash: None,
             is_lazy: false,
             a0_majority_lazy: false,
+            a0_skip_gate: false,
             pcc_armed: Cell::new(false),
             optimistic_read_this_tx: Cell::new(0),
             pcc_this_tx: Cell::new(0),
@@ -2383,9 +2393,17 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         // resume path on Lean too — do NOT gate on `!lean`. Journal FF (`try_ff_*`)
         // already keys off table `is_rewind_resume`; this also seeds read origins,
         // prefers `record_resume`, and may narrow-arm hang-free absolute jump.
+        let a0_ungated_exec = self.specfence.mode == crate::ConcurrencyMode::SpecFence
+            && self
+                .specfence
+                .policy
+                .is_some_and(|p| p.is_a0_majority_block())
+            && !self.specfence.ready_edges.was_queued(tx_version.tx_idx);
         let lean = self.specfence.mode == crate::ConcurrencyMode::SpecFence
+            && !a0_ungated_exec
             && self.specfence.engagement.begin_tx(tx_version.tx_idx);
         let repair_armed = self.specfence.mode == crate::ConcurrencyMode::SpecFence
+            && !a0_ungated_exec
             && (self
                 .specfence
                 .partial_retry
@@ -3212,7 +3230,14 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     FinishExecFlags::empty()
                 };
 
-                if self.specfence.mode == crate::ConcurrencyMode::SpecFence
+                let a0_ungated = self.specfence.mode == crate::ConcurrencyMode::SpecFence
+                    && self
+                        .specfence
+                        .policy
+                        .is_some_and(|p| p.is_a0_majority_block())
+                    && !self.specfence.ready_edges.was_queued(tx_version.tx_idx);
+                if !a0_ungated
+                    && self.specfence.mode == crate::ConcurrencyMode::SpecFence
                     && self.specfence.certificates.rem_legal(tx_version.tx_idx)
                 {
                     for (loc, value) in &write_set {
@@ -3263,6 +3288,28 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     self.specfence
                         .partial_retry
                         .note_incarnation_finish(tx_version.tx_idx, exec_result.tx_gas_used());
+                }
+
+                // L4/P3: A0 ungated records MV only — no write-set Vecs / ReadyEdge / regions.
+                if a0_ungated {
+                    let (wrote_new_location, _contended) =
+                        self.mv_memory.record(tx_version, read_set, write_set);
+                    if wrote_new_location {
+                        flags |= FinishExecFlags::WroteNewLocation;
+                    }
+                    let receipt = receipt_from_revm(exec_result);
+                    let state = state_transitions_from_revm(self.is_eip_161_enabled, state);
+                    if let Some(slot) = result_slot {
+                        slot.receipt = receipt;
+                        slot.state.clear();
+                        slot.state.extend(state);
+                    } else {
+                        *result_slot = Some(PevmTxExecutionResult {
+                            receipt,
+                            state: state.collect(),
+                        });
+                    }
+                    return Ok(flags);
                 }
 
                 // R3: HotSet H_w ignores LazyRecipient multi-writer noise (popular
@@ -3326,15 +3373,6 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     self.mv_memory.record(tx_version, read_set, write_set);
                 // M3: learn process WŜ from this incarnation's writes (no residual publish).
                 // R1/R3: feed HotSet writer counts (H_w) from non-lazy writes only.
-                let a0_ungated = self.specfence.mode == crate::ConcurrencyMode::SpecFence
-                    && self
-                        .specfence
-                        .policy
-                        .is_some_and(|p| p.is_a0_majority_block())
-                    && !self.specfence.ready_edges.was_queued(tx_version.tx_idx);
-                // L4: A0 ungated skips HotSet/Bayes on the execute hot path.
-                // Process prior is flushed at block end (pevm::execute).
-                let skip_a0_learn = a0_ungated;
                 let _ = a0_majority_lazy;
                 if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
                     crate::specfence::admit::admit_seed_on_write_set(
@@ -3348,15 +3386,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         &all_write_locs,
                         &effective_write_locs,
                     );
-                    if skip_a0_learn {
-                        if self
-                            .specfence
-                            .ready_edges
-                            .has_known_waiters(tx_version.tx_idx)
-                        {
-                            self.wake_on_data_publish(tx_version.tx_idx, &all_write_locs);
-                        }
-                    } else if self.specfence.certificates.rem_legal(tx_version.tx_idx) {
+                    if self.specfence.certificates.rem_legal(tx_version.tx_idx) {
                         let locs: Vec<_> = self.mv_memory.write_locations(tx_version.tx_idx);
                         self.specfence.rw_prior.observe_write_set(&locs, None);
                         for loc in &hotset_writer_locs {

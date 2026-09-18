@@ -490,21 +490,27 @@ impl Pevm {
             // Bayes → admit_seed before any Execute (v9.1). Known stars keep
             // PE even on quiet morph (M4). Truly cold seeds nothing.
             self.cost_policy.begin_block(block_size);
-            let contracts = collect_contracts(storage, &hints);
-            let seed_t0 = Instant::now();
-            let _ = crate::specfence::admit::admit_seed_begin_block(
-                &ready_edges,
-                &producer_stages,
-                &learner,
-                &self.bayes,
-                &self.inter_prior,
-                &hints,
-                block_env.beneficiary,
-                &self.cost_policy,
-                &contracts,
-                Some(&metrics_inner),
-            );
-            metrics_inner.set_admit_seed_begin_ns(seed_t0.elapsed().as_nanos() as u64);
+            // L1/P3: thin cold A1=0 skips contract storage walk + admit_seed.
+            // PROFILE Instant only (product path must not pay begin Instant).
+            if self.cost_policy.should_seed_thin_a1() {
+                let contracts = collect_contracts(storage, &hints);
+                let seed_t0 = crate::specfence::profile_timing_enabled().then(Instant::now);
+                let _ = crate::specfence::admit::admit_seed_begin_block(
+                    &ready_edges,
+                    &producer_stages,
+                    &learner,
+                    &self.bayes,
+                    &self.inter_prior,
+                    &hints,
+                    block_env.beneficiary,
+                    &self.cost_policy,
+                    &contracts,
+                    Some(&metrics_inner),
+                );
+                if let Some(t0) = seed_t0 {
+                    metrics_inner.set_admit_seed_begin_ns(t0.elapsed().as_nanos() as u64);
+                }
+            }
             // P4: bag serves gated wake only. A0 / independents use OCC
             // `execution_idx` — seeding may_execute txs here mutex-taxed the
             // A0-majority path (PR19 residual).
@@ -756,7 +762,6 @@ impl Pevm {
                     }
                     for loc in mv_memory.write_locations(tx) {
                         if loc != beneficiary {
-                            self.hotset.note_writer(loc, tx);
                             deferred.push(loc);
                         }
                     }
@@ -849,19 +854,14 @@ impl Pevm {
             );
             self.last_learn_report = report;
             self.last_incarnations = incs;
-            // A0-majority skipped live D1; rebuild writer order from MV.
+            // A0-majority skipped live D1; snapshot writer order from MV (no DashMap).
             if self.cost_policy.is_a0_majority_block() && !ready_edges.has_any_gated() {
-                let beneficiary =
-                    hash_deterministic(MemoryLocation::Basic(block_env.beneficiary));
-                for tx in 0..block_size {
-                    for loc in mv_memory.write_locations(tx) {
-                        if loc != beneficiary {
-                            ready_edges.note_location_writer(loc, tx);
-                        }
-                    }
-                }
+                let beneficiary = hash_deterministic(MemoryLocation::Basic(block_env.beneficiary));
+                self.last_location_writers =
+                    mv_writer_order_snapshot(&mv_memory, block_size, beneficiary);
+            } else {
+                self.last_location_writers = ready_edges.writer_order_snapshot();
             }
-            self.last_location_writers = ready_edges.writer_order_snapshot();
         } else {
             self.last_process = ExecProcessSnapshot::default();
             self.last_learn_report = LearnReport::default();
@@ -2206,6 +2206,25 @@ pub fn execute_revm_sequential<S: Storage + Debug, C: PevmChain>(
         results.push(execution_result);
     }
     Ok(results)
+}
+
+/// End-block D1 snapshot from MV (A0 skipped live DashMap writer order).
+fn mv_writer_order_snapshot(
+    mv_memory: &MvMemory,
+    block_size: usize,
+    beneficiary: MemoryLocationHash,
+) -> Vec<(MemoryLocationHash, Vec<TxIdx>)> {
+    let mut map: HashMap<MemoryLocationHash, Vec<TxIdx>> = HashMap::new();
+    for tx in 0..block_size {
+        for loc in mv_memory.write_locations(tx) {
+            if loc != beneficiary {
+                map.entry(loc).or_default().push(tx);
+            }
+        }
+    }
+    let mut out: Vec<_> = map.into_iter().collect();
+    out.sort_by_key(|(loc, _)| *loc);
+    out
 }
 
 /// Pre-state addresses with contract code — D2/PC-2 contract vs EOA gate.

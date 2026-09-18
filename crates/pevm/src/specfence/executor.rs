@@ -155,6 +155,8 @@ fn note_and_try_commute(
 }
 
 /// CC-R3: park an off-edge abort behind the unfinished writer (no suffix storm).
+/// Gated / non-thin validate still owns this; A1=0 uses `occ_abort_ungated`.
+#[allow(dead_code)]
 fn batch_park_abort(
     mv_memory: &MvMemory,
     scheduler: &Scheduler,
@@ -202,6 +204,25 @@ fn batch_park_abort(
     scheduler.finish_validation(tx_version, true)
 }
 
+/// A1=0 / ungated: OCC abort after a failed commute. No ReadyEdge seed.
+fn occ_abort_ungated(
+    mv_memory: &MvMemory,
+    scheduler: &Scheduler,
+    tx_version: &TxVersion,
+    specfence: SpecFenceCtx<'_>,
+) -> Option<Task> {
+    let aborted = scheduler.try_validation_abort(tx_version);
+    if aborted {
+        mv_memory.convert_writes_to_estimates(tx_version.tx_idx);
+        specfence.metrics.record_occ_abort();
+        specfence.metrics.record_full_abort_reexecute();
+        if let Some(p) = specfence.policy {
+            p.note_wave_off_edge_reexec();
+        }
+    }
+    scheduler.finish_validation(tx_version, aborted)
+}
+
 /// Spec-only validate: same OCC kernel. Fail ⇒ full_abort_reexecute + learn PE at **true \(k\)**.
 /// Never RebindThis / PrefixSkip — journal-less repair is a protocol bug.
 pub(crate) fn validate_occ_kernel(
@@ -222,7 +243,9 @@ pub(crate) fn validate_occ_kernel(
     let a0_ungated = specfence.policy.is_some_and(|p| p.is_a0_majority_block())
         && !specfence.ready_edges.was_queued(tx_version.tx_idx);
     if a0_ungated {
-        return batch_park_abort(mv_memory, scheduler, tx_version, specfence, &invalid);
+        // P3: commute already tried. Failed commute ≡ OCC abort (no batch-park
+        // serialization, no PE seed that would flip has_any_gated mid-block).
+        return occ_abort_ungated(mv_memory, scheduler, tx_version, specfence);
     }
     let aborted = scheduler.try_validation_abort(tx_version);
     if !aborted {
@@ -377,11 +400,11 @@ pub(crate) fn validate_specfence(
     if note_and_try_commute(specfence, mv_memory, tx_version.tx_idx, &invalid) {
         return scheduler.finish_validation(tx_version, false);
     }
-    // Thin-shell A0: cheap batch park, no PE seed / suffix storm.
+    // Thin-shell A0: commute already tried; failed commute ≡ OCC abort.
     let a0_ungated = specfence.policy.is_some_and(|p| p.is_a0_majority_block())
         && !specfence.ready_edges.was_queued(tx_version.tx_idx);
     if a0_ungated {
-        return batch_park_abort(mv_memory, scheduler, tx_version, specfence, &invalid);
+        return occ_abort_ungated(mv_memory, scheduler, tx_version, specfence);
     }
     if !invalid.is_empty() {
         let grain = repair_grain(specfence.certificates, tx_version.tx_idx, &invalid);

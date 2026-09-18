@@ -351,6 +351,27 @@ impl CostPolicy {
         self.a0_majority_block.load(Ordering::Relaxed)
     }
 
+    /// Thin / a0_majority: plant A1 only when a measured pair or ℓ EV says
+    /// prepaid is cheaper. Cold start stays A1=0 (no hint walk / no contracts).
+    pub(crate) fn should_seed_thin_a1(&self) -> bool {
+        if !self.is_a0_majority_block() {
+            return true;
+        }
+        for e in self.promoted.iter() {
+            if self.is_promoted(*e.key()) {
+                return true;
+            }
+        }
+        for e in self.cohorts.iter() {
+            let s = e.value();
+            if (s.c_a0.n >= 2.0 || s.c_a1.n >= 2.0) && s.c_a1.mean + NS_DELTA < s.c_a0.mean.max(1.0)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     #[inline]
     pub(crate) fn thin_a1_k(&self) -> usize {
         if self.is_a0_majority_block() {
@@ -1105,6 +1126,21 @@ mod tests {
             "L3: two prepaid-losing blocks must decay prior: {r:?}"
         );
         assert!(r.prepaid_ns > r.abort_cf_ns);
+    }
+
+    #[test]
+    fn thin_cold_should_not_seed_a1() {
+        let p = CostPolicy::new();
+        p.begin_block(176);
+        assert!(
+            !p.should_seed_thin_a1(),
+            "L1: thin cold start must not seed A1"
+        );
+        p.promote_short_edge(0x32be, 80_000);
+        assert!(
+            p.should_seed_thin_a1(),
+            "L1: measured expensive abort may seed a short edge"
+        );
     }
 
     #[test]
