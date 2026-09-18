@@ -356,6 +356,11 @@ pub(crate) fn admit_seed_on_write_set(
     effective_locs: &[MemoryLocationHash],
 ) {
     let from_loc = hash_deterministic(MemoryLocation::Basic(from));
+    // L4/S: A0-majority with no gated txs — skip D1 DashMap on the execute
+    // hot path. Writer order is reconstructed at block end for compare.
+    if policy.is_some_and(|p| p.is_a0_majority_block()) && !ready.has_any_gated() {
+        return;
+    }
     // PC-S1: A0-majority — D1 writer order only. No ReadyEdge / B2 / release.
     // 4→31 still lands when the A1 probe publishes (`note_immediate_pred`).
     if policy.is_some_and(|p| p.is_a0_majority_block()) && !ready.was_queued(writer) {
@@ -960,7 +965,10 @@ mod tests {
             &[loc],
             &[loc],
         );
-        assert_eq!(ready.writers_of(loc), vec![4], "thin A0 still records D1");
+        assert!(
+            ready.writers_of(loc).is_empty(),
+            "thin A0 defers D1 off the execute hot path (block-end snapshot)"
+        );
         assert!(
             ready.may_execute(31),
             "thin A0 must not plant a ReadyEdge on later writers"

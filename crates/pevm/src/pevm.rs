@@ -849,6 +849,18 @@ impl Pevm {
             );
             self.last_learn_report = report;
             self.last_incarnations = incs;
+            // A0-majority skipped live D1; rebuild writer order from MV.
+            if self.cost_policy.is_a0_majority_block() && !ready_edges.has_any_gated() {
+                let beneficiary =
+                    hash_deterministic(MemoryLocation::Basic(block_env.beneficiary));
+                for tx in 0..block_size {
+                    for loc in mv_memory.write_locations(tx) {
+                        if loc != beneficiary {
+                            ready_edges.note_location_writer(loc, tx);
+                        }
+                    }
+                }
+            }
             self.last_location_writers = ready_edges.writer_order_snapshot();
         } else {
             self.last_process = ExecProcessSnapshot::default();
