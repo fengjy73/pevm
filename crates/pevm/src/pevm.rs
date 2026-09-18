@@ -762,6 +762,7 @@ impl Pevm {
                     }
                     for loc in mv_memory.write_locations(tx) {
                         if loc != beneficiary {
+                            self.hotset.note_writer(loc, tx);
                             deferred.push(loc);
                         }
                     }

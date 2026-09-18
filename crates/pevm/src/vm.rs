@@ -2400,7 +2400,6 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 .is_some_and(|p| p.is_a0_majority_block())
             && !self.specfence.ready_edges.was_queued(tx_version.tx_idx);
         let lean = self.specfence.mode == crate::ConcurrencyMode::SpecFence
-            && !a0_ungated_exec
             && self.specfence.engagement.begin_tx(tx_version.tx_idx);
         let repair_armed = self.specfence.mode == crate::ConcurrencyMode::SpecFence
             && !a0_ungated_exec
@@ -3290,12 +3289,32 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         .note_incarnation_finish(tx_version.tx_idx, exec_result.tx_gas_used());
                 }
 
-                // L4/P3: A0 ungated records MV only — no write-set Vecs / ReadyEdge / regions.
+                // L4/P3: A0 ungated records MV only — no write-set Vecs / ReadyEdge.
+                // Keep speculate + contended Bayes so thin tests / next-block prior still learn.
                 if a0_ungated {
-                    let (wrote_new_location, _contended) =
+                    let (wrote_new_location, contended) =
                         self.mv_memory.record(tx_version, read_set, write_set);
                     if wrote_new_location {
                         flags |= FinishExecFlags::WroteNewLocation;
+                    }
+                    self.specfence
+                        .metrics
+                        .record_speculate(tx.caller, tx.kind.to().copied());
+                    for loc in contended {
+                        if loc == self.beneficiary_location_hash {
+                            continue;
+                        }
+                        let addr = if loc == from_hash {
+                            Some(tx.caller)
+                        } else if Some(loc) == to_hash {
+                            tx.kind.to().copied()
+                        } else {
+                            None
+                        };
+                        if addr == Some(self.specfence.beneficiary) {
+                            continue;
+                        }
+                        self.promote_region(loc, addr);
                     }
                     let receipt = receipt_from_revm(exec_result);
                     let state = state_transitions_from_revm(self.is_eip_161_enabled, state);
