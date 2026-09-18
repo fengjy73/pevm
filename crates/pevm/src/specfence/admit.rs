@@ -126,7 +126,7 @@ pub(crate) fn admit_seed_begin_block(
     if policy.is_a0_majority_block() {
         let mut edges = 0;
         if policy.should_seed_thin_a1() {
-            edges += admit_seed_promoted_short_edges(ready, policy, metrics);
+            edges += admit_seed_promoted_short_edges(ready, hints, policy, metrics);
         }
         edges += admit_seed_hint_short_edges(ready, hints, policy, metrics);
         let _ = (stages, learner, bayes, prior, beneficiary, contracts);
@@ -385,6 +385,7 @@ fn admit_seed_hint_short_edges(
 /// Basic(0x32be) 4→31→66→… and storage 14→16→17 win over 2-writer ERC-20 slots.
 fn admit_seed_promoted_short_edges(
     ready: &ReadyEdgeTable,
+    hints: &AccountHints,
     policy: &CostPolicy,
     metrics: Option<&MetricsInner>,
 ) -> usize {
@@ -395,19 +396,19 @@ fn admit_seed_promoted_short_edges(
         }
         by_loc.entry(loc).or_default().push((pred, succ));
     }
+    by_loc.retain(|_, pairs| {
+        let mut txs: Vec<TxIdx> = pairs.iter().flat_map(|(a, b)| [*a, *b]).collect();
+        txs.sort_unstable();
+        txs.dedup();
+        !is_wide_envelope_writer_set(hints, &txs)
+    });
     let mut locs: Vec<(MemoryLocationHash, Vec<(TxIdx, TxIdx)>)> = by_loc.into_iter().collect();
     locs.sort_unstable_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
     if policy.is_a0_majority_block() && locs.len() > THIN_A1_K {
         locs.truncate(THIN_A1_K);
     }
     let mut edges = 0;
-    for (loc, mut pairs) in locs {
-        // C5: short path only (storage 14→16→17, main 4→31→66). Do not
-        // refuse the whole 0x209c spine at begin.
-        if policy.is_a0_majority_block() && pairs.len() > 2 {
-            pairs.sort_unstable_by_key(|(pred, _)| *pred);
-            pairs.truncate(2);
-        }
+    for (loc, pairs) in locs {
         for (pred, succ) in pairs {
             ready.note_consumer_on(succ, pred, Some(loc));
             policy.note_short_edge_admit();
@@ -1716,13 +1717,10 @@ mod tests {
             &HashSet::new(),
             None,
         );
-        assert!(n >= 2, "L4: reuse must plant 4→31→66, got {n}");
+        assert!(n >= 3, "L4: reuse must plant 4→31→66→67, got {n}");
         assert_eq!(ready.blocking_producer(31), Some(4));
         assert_eq!(ready.blocking_producer(66), Some(31));
-        assert!(
-            ready.may_execute(67),
-            "C5: thin reuse plants a short path, not 66→67→…"
-        );
+        assert_eq!(ready.blocking_producer(67), Some(66));
         assert!(ready.may_execute(4), "chain head stays runnable");
     }
 
