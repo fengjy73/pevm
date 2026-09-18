@@ -399,7 +399,9 @@ impl ReadyEdgeTable {
                 let w = e.load(Ordering::Relaxed);
                 w == NONE || w >= tx_idx || self.finished.contains_key(&w)
             }
-            None => true,
+            // Gated bit is stored *before* the consumer-map insert. Treat the
+            // window as not-ready so an OCC-class steal cannot pass the edge.
+            None => false,
         }
     }
 

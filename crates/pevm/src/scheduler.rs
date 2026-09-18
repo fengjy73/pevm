@@ -159,8 +159,11 @@ impl Scheduler {
                 if let Some(edges) = ready
                     && edges.is_gated(tx_idx)
                     && !edges.may_execute(tx_idx)
-                    && let Some(w) = edges.blocking_producer(tx_idx)
                 {
+                    let Some(w) = edges.blocking_producer(tx_idx) else {
+                        // Gated, edge not visible yet — do not OCC-steal.
+                        return None;
+                    };
                     // PC-W1: already refused this A1 head — do not re-hammer
                     // until pred completion wakes it.
                     if edges.is_sleeping(tx_idx) {
@@ -313,21 +316,24 @@ impl Scheduler {
                         if let Some(edges) = ready
                             && edges.is_gated(tx_idx)
                             && !edges.may_execute(tx_idx)
-                            && let Some(w) = edges.blocking_producer(tx_idx)
-                            && (self.is_executing(w) || self.is_ready(w))
                         {
-                            edges.defer(tx_idx);
-                            if let Some(wave) = wave {
-                                drop(tx);
-                                self.admit_spine_heat(w, wave, true);
-                                // PC-1: same worker steals an independent after A1 refuse.
-                                if let Some(task) =
-                                    self.try_fill_independent_after_refuse(tx_idx, wave, ready)
-                                {
-                                    return Some(task);
+                            let Some(w) = edges.blocking_producer(tx_idx) else {
+                                continue;
+                            };
+                            if self.is_executing(w) || self.is_ready(w) {
+                                edges.defer(tx_idx);
+                                if let Some(wave) = wave {
+                                    drop(tx);
+                                    self.admit_spine_heat(w, wave, true);
+                                    // PC-1: same worker steals an independent after A1 refuse.
+                                    if let Some(task) =
+                                        self.try_fill_independent_after_refuse(tx_idx, wave, ready)
+                                    {
+                                        return Some(task);
+                                    }
                                 }
+                                continue;
                             }
-                            continue;
                         }
                         tx.status = IncarnationStatus::Executing;
                         self.set_done_flag(tx_idx, false);
