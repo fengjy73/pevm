@@ -186,7 +186,9 @@ fn batch_park_abort(
             invalid,
         ) {
             match f.class {
-                ConflictClass::EffectiveWAW => p.promote_short_edge(f.location, 0),
+                ConflictClass::EffectiveWAW => {
+                    promote_and_seed_short_edge(specfence, p, tx_version.tx_idx, &f);
+                }
                 ConflictClass::LazyNoise | ConflictClass::CommuteCandidate => {
                     p.ignore_conflict(Some(f.location));
                 }
@@ -205,13 +207,37 @@ fn batch_park_abort(
     scheduler.finish_validation(tx_version, true)
 }
 
-/// A1=0 / ungated: OCC abort after a failed commute. No ReadyEdge seed.
+/// L2: first EffectiveWAW abort → record ℓ and raise the next short edge.
+fn promote_and_seed_short_edge(
+    specfence: SpecFenceCtx<'_>,
+    policy: &super::policy::CostPolicy,
+    tx_idx: TxIdx,
+    f: &super::collateral::FirstConflict,
+) {
+    policy.promote_short_edge(f.location, 0);
+    if let Some(w) = f.peer.filter(|&w| w < tx_idx) {
+        policy.note_short_pair(f.location, w, tx_idx);
+    }
+    let _ = specfence;
+}
+
+/// A0 / ungated: OCC abort after a failed commute. L2 still promotes the ℓ.
 fn occ_abort_ungated(
     mv_memory: &MvMemory,
     scheduler: &Scheduler,
     tx_version: &TxVersion,
     specfence: SpecFenceCtx<'_>,
+    invalid: &[MemoryLocationHash],
 ) -> Option<Task> {
+    let first = specfence.policy.and_then(|_| {
+        classify_first_conflict(
+            specfence.hints,
+            mv_memory,
+            specfence.beneficiary,
+            tx_version.tx_idx,
+            invalid,
+        )
+    });
     let aborted = scheduler.try_validation_abort(tx_version);
     if aborted {
         mv_memory.convert_writes_to_estimates(tx_version.tx_idx);
@@ -219,9 +245,36 @@ fn occ_abort_ungated(
         specfence.metrics.record_full_abort_reexecute();
         if let Some(p) = specfence.policy {
             p.note_wave_off_edge_reexec();
+            if let Some(f) = first {
+                match f.class {
+                    ConflictClass::EffectiveWAW => {
+                        promote_and_seed_short_edge(specfence, p, tx_version.tx_idx, &f);
+                    }
+                    ConflictClass::LazyNoise | ConflictClass::CommuteCandidate => {
+                        p.ignore_conflict(Some(f.location));
+                    }
+                }
+            }
         }
     }
     scheduler.finish_validation(tx_version, aborted)
+}
+
+/// P1: A0 validate — OCC-identical on the no-conflict path; commute only on miss.
+pub(crate) fn validate_a0_fast(
+    mv_memory: &MvMemory,
+    scheduler: &Scheduler,
+    tx_version: &TxVersion,
+    specfence: SpecFenceCtx<'_>,
+) -> Option<Task> {
+    if occ_read_set_valid(mv_memory, tx_version.tx_idx) {
+        return scheduler.finish_validation(tx_version, false);
+    }
+    let invalid = mv_memory.collect_invalid_reads(tx_version.tx_idx);
+    if note_and_try_commute(specfence, mv_memory, tx_version.tx_idx, &invalid) {
+        return scheduler.finish_validation(tx_version, false);
+    }
+    occ_abort_ungated(mv_memory, scheduler, tx_version, specfence, &invalid)
 }
 
 /// Spec-only validate: same OCC kernel. Fail ⇒ full_abort_reexecute + learn PE at **true \(k\)**.
@@ -232,21 +285,19 @@ pub(crate) fn validate_occ_kernel(
     tx_version: &TxVersion,
     specfence: SpecFenceCtx<'_>,
 ) -> Option<Task> {
-    specfence.metrics.record_occ_kernel_validate();
     let valid = occ_read_set_valid(mv_memory, tx_version.tx_idx);
     if valid {
         return scheduler.finish_validation(tx_version, false);
     }
+    specfence.metrics.record_occ_kernel_validate();
     let invalid = mv_memory.collect_invalid_reads(tx_version.tx_idx);
     if note_and_try_commute(specfence, mv_memory, tx_version.tx_idx, &invalid) {
         return scheduler.finish_validation(tx_version, false);
     }
     let a0_ungated = specfence.policy.is_some_and(|p| p.is_a0_majority_block())
-        && !specfence.ready_edges.was_queued(tx_version.tx_idx);
+        && !specfence.ready_edges.is_gated(tx_version.tx_idx);
     if a0_ungated {
-        // P3: commute already tried. Failed commute ≡ OCC abort (no batch-park
-        // serialization, no PE seed that would flip has_any_gated mid-block).
-        return occ_abort_ungated(mv_memory, scheduler, tx_version, specfence);
+        return occ_abort_ungated(mv_memory, scheduler, tx_version, specfence, &invalid);
     }
     let aborted = scheduler.try_validation_abort(tx_version);
     if !aborted {
@@ -286,7 +337,9 @@ pub(crate) fn validate_occ_kernel(
         }
         if let Some(f) = first {
             match f.class {
-                ConflictClass::EffectiveWAW => p.promote_short_edge(f.location, 0),
+                ConflictClass::EffectiveWAW => {
+                    promote_and_seed_short_edge(specfence, p, tx_version.tx_idx, &f);
+                }
                 ConflictClass::LazyNoise | ConflictClass::CommuteCandidate => {
                     p.ignore_conflict(Some(f.location));
                 }
@@ -403,9 +456,9 @@ pub(crate) fn validate_specfence(
     }
     // Thin-shell A0: commute already tried; failed commute ≡ OCC abort.
     let a0_ungated = specfence.policy.is_some_and(|p| p.is_a0_majority_block())
-        && !specfence.ready_edges.was_queued(tx_version.tx_idx);
+        && !specfence.ready_edges.is_gated(tx_version.tx_idx);
     if a0_ungated {
-        return occ_abort_ungated(mv_memory, scheduler, tx_version, specfence);
+        return occ_abort_ungated(mv_memory, scheduler, tx_version, specfence, &invalid);
     }
     if !invalid.is_empty() {
         let grain = repair_grain(specfence.certificates, tx_version.tx_idx, &invalid);

@@ -16,7 +16,7 @@ use super::bayes::BayesMap;
 use super::feeder::{seed_known_stars, top_is_known_star};
 use super::learner::{InterBlockPrior, LiveLearner};
 use super::metrics::MetricsInner;
-use super::policy::{CohortKind, CostPolicy};
+use super::policy::{CohortKind, CostPolicy, THIN_A1_K};
 use super::producer_stage::ProducerStageTable;
 use super::ready_edge::ReadyEdgeTable;
 use super::wave::WaveParkTable;
@@ -121,20 +121,16 @@ pub(crate) fn admit_seed_begin_block(
     contracts: &HashSet<Address>,
     metrics: Option<&MetricsInner>,
 ) -> usize {
-    // L1/P3: thin cold start is A1=0 — no hint walk, no Bayes seed, no ReadyEdge.
-    if !policy.should_seed_thin_a1() {
-        let _ = (
-            ready,
-            stages,
-            learner,
-            bayes,
-            prior,
-            hints,
-            beneficiary,
-            contracts,
-            metrics,
-        );
-        return 0;
+    // L1/C5: thin never plants an envelope A1=3 star. CallWaw spines get a
+    // consecutive short-edge chain (14→16→17, 31→66→…). Empty-to stays A0.
+    if policy.is_a0_majority_block() {
+        let mut edges = 0;
+        if policy.should_seed_thin_a1() {
+            edges += admit_seed_promoted_short_edges(ready, policy, metrics);
+        }
+        edges += admit_seed_hint_short_edges(ready, hints, policy, metrics);
+        let _ = (stages, learner, bayes, prior, beneficiary, contracts);
+        return edges;
     }
     let stars = seed_known_stars(learner, bayes, prior);
     let fan = learner.morph_weights().dominant_fan_out();
@@ -335,6 +331,76 @@ pub(crate) fn admit_seed_begin_block(
     edges
 }
 
+/// C1/C5: thin begin — storage-trio CallWaw only (`3..=4`).
+/// Wide ERC-20 / RAW fans stay A0 (same `to`, different slots). Empty-to A0.
+/// Cap **locations** at `THIN_A1_K`. Hottest first.
+fn admit_seed_hint_short_edges(
+    ready: &ReadyEdgeTable,
+    hints: &AccountHints,
+    policy: &CostPolicy,
+    metrics: Option<&MetricsInner>,
+) -> usize {
+    let mut addrs: Vec<(Address, usize)> = hints
+        .call_to_accounts()
+        .map(|a| (a, hints.call_to_txs(&a).len()))
+        .filter(|&(_, n)| (3..=4).contains(&n))
+        .collect();
+    addrs.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut edges = 0;
+    let mut used = 0usize;
+    for (addr, n) in addrs {
+        if used >= THIN_A1_K {
+            break;
+        }
+        let txs = hints.call_to_txs(&addr);
+        let loc = envelope_loc(addr);
+        if !policy.should_gate_short_after_write(loc, false, n.saturating_sub(1)) {
+            continue;
+        }
+        let mut planted = 0usize;
+        for pair in txs.windows(2) {
+            let (pred, succ) = (pair[0], pair[1]);
+            if pred >= succ {
+                continue;
+            }
+            ready.note_consumer_on(succ, pred, Some(loc));
+            policy.note_short_pair(loc, pred, succ);
+            policy.note_short_edge_admit();
+            if let Some(m) = metrics {
+                m.record_edge_ordered_admit();
+            }
+            planted += 1;
+        }
+        if planted > 0 {
+            policy.promote_short_edge(loc, 0);
+            used += 1;
+            edges += planted;
+        }
+    }
+    edges
+}
+
+/// L4/C5: reuse / measured prior → one ReadyEdge per promoted ℓ (not a cohort).
+fn admit_seed_promoted_short_edges(
+    ready: &ReadyEdgeTable,
+    policy: &CostPolicy,
+    metrics: Option<&MetricsInner>,
+) -> usize {
+    let mut edges = 0;
+    for (loc, pred, succ) in policy.promoted_short_pairs() {
+        if pred >= succ || !policy.is_promoted(loc) {
+            continue;
+        }
+        ready.note_consumer_on(succ, pred, Some(loc));
+        policy.note_short_edge_admit();
+        if let Some(m) = metrics {
+            m.record_edge_ordered_admit();
+        }
+        edges += 1;
+    }
+    edges
+}
+
 /// Abort strengthen: known consumer ← discovered RAW/WAW producer + ProducerStage.
 #[inline]
 pub(crate) fn admit_seed_on_abort(
@@ -371,23 +437,20 @@ pub(crate) fn admit_seed_on_write_set(
     effective_locs: &[MemoryLocationHash],
 ) {
     let from_loc = hash_deterministic(MemoryLocation::Basic(from));
-    // L4/S: A0-majority with no gated txs — skip D1 DashMap on the execute
-    // hot path. Writer order is reconstructed at block end for compare.
-    if policy.is_some_and(|p| p.is_a0_majority_block()) && !ready.has_any_gated() {
-        return;
-    }
-    // PC-S1: A0-majority — D1 writer order only. No ReadyEdge / B2 / release.
-    // 4→31 still lands when the A1 probe publishes (`note_immediate_pred`).
+    // C1/C2: thin A0 may start ungated, but the first effective non-lazy
+    // publish must be able to raise a short ReadyEdge. Lazy-only stays A0.
     if policy.is_some_and(|p| p.is_a0_majority_block()) && !ready.was_queued(writer) {
-        for &loc in all_write_locs {
-            ready.note_location_writer(loc, writer);
-            // C4: EffectiveWAW short edge only — not a whole lazy same-from spine.
-            if policy.is_some_and(|p| p.is_promoted(loc))
-                && effective_locs.iter().any(|&l| l == loc)
-            {
-                ready.note_immediate_pred(loc, writer);
-            }
-        }
+        seed_short_edges_after_publish(
+            ready,
+            hints,
+            policy,
+            writer,
+            from,
+            to,
+            from_loc,
+            all_write_locs,
+            effective_locs,
+        );
         return;
     }
     // D1: record every writer (lazy included) so 4→31 is visible in order.
@@ -509,6 +572,169 @@ pub(crate) fn admit_seed_on_write_set(
             if t > writer && !queued.contains(&t) {
                 ready.release_consumer(t, wave);
             }
+        }
+    }
+}
+
+/// C1/C2: after an effective publish, record D1 and raise at most one
+/// successor ReadyEdge per ℓ (location total order, not a lazy same-from spine).
+fn seed_short_edges_after_publish(
+    ready: &ReadyEdgeTable,
+    hints: &AccountHints,
+    policy: Option<&CostPolicy>,
+    writer: TxIdx,
+    from: Address,
+    to: Option<Address>,
+    from_loc: MemoryLocationHash,
+    all_write_locs: &[MemoryLocationHash],
+    effective_locs: &[MemoryLocationHash],
+) {
+    if effective_locs.is_empty() {
+        return;
+    }
+    let envelope_later = envelope_successors(hints, to, writer);
+    let from_later = from_successors(hints, from, writer, from_loc, effective_locs);
+    // Envelope `to` is a same-ℓ proxy only for short CallWaw (storage trio).
+    // Wide ERC-20 / RAW fans write different slots — do not chain them.
+    let envelope_is_loc = to.is_some_and(|t| {
+        let call_n = hints.call_to_txs(&t).len();
+        let pay_n = hints.to_txs(&t).len();
+        (call_n >= CALL_WAW_FLOOR && call_n < 8)
+            || (call_n < CALL_WAW_FLOOR && pay_n >= 2 && pay_n < 8)
+    });
+    for &loc in all_write_locs {
+        if !effective_locs.iter().any(|&l| l == loc) {
+            continue;
+        }
+        ready.note_location_writer(loc, writer);
+        let has_earlier = ready.writers_of(loc).iter().any(|&w| w < writer);
+        let later: &[TxIdx] = if loc == from_loc {
+            &from_later
+        } else if envelope_is_loc {
+            &envelope_later
+        } else {
+            &[]
+        };
+        let hint_n = later.len();
+        let gate = policy
+            .map(|p| p.should_gate_short_after_write(loc, has_earlier, hint_n))
+            .unwrap_or(has_earlier || hint_n >= 2);
+        if !gate {
+            continue;
+        }
+        if let Some(p) = policy {
+            p.promote_short_edge(loc, 0);
+            if let Some(&succ) = later.first() {
+                p.note_short_pair(loc, writer, succ);
+            }
+            if has_earlier {
+                if let Some(pred) = ready
+                    .writers_of(loc)
+                    .into_iter()
+                    .rev()
+                    .find(|&w| w < writer)
+                {
+                    p.note_short_pair(loc, pred, writer);
+                }
+            }
+        }
+        if has_earlier {
+            if let Some(pred) = ready
+                .writers_of(loc)
+                .into_iter()
+                .rev()
+                .find(|&w| w < writer)
+            {
+                let _ = ready.note_consumer_on_if_idle(writer, pred, Some(loc));
+            }
+        }
+        if let Some(&succ) = later.first() {
+            let _ = ready.note_consumer_on_if_idle(succ, writer, Some(loc));
+        }
+    }
+}
+
+fn envelope_successors(hints: &AccountHints, to: Option<Address>, writer: TxIdx) -> Vec<TxIdx> {
+    let Some(to) = to else {
+        return Vec::new();
+    };
+    let call = hints.call_to_txs(&to);
+    let payee = hints.to_txs(&to);
+    let src = if call.len() >= CALL_WAW_FLOOR {
+        call
+    } else {
+        payee
+    };
+    src.iter().copied().filter(|&t| t > writer).collect()
+}
+
+fn from_successors(
+    hints: &AccountHints,
+    from: Address,
+    writer: TxIdx,
+    from_loc: MemoryLocationHash,
+    effective_locs: &[MemoryLocationHash],
+) -> Vec<TxIdx> {
+    if !effective_locs.iter().any(|&l| l == from_loc) {
+        return Vec::new();
+    }
+    let from_txs = hints.from_txs(&from);
+    if from_txs.len() < 3 || hints.cohort_all_empty(from_txs) {
+        return Vec::new();
+    }
+    from_txs.iter().copied().filter(|&t| t > writer).collect()
+}
+
+#[allow(dead_code)]
+fn later_hint_successors(
+    hints: &AccountHints,
+    from: Address,
+    to: Option<Address>,
+    writer: TxIdx,
+    from_loc: MemoryLocationHash,
+    effective_locs: &[MemoryLocationHash],
+) -> Vec<TxIdx> {
+    let mut later = envelope_successors(hints, to, writer);
+    later.extend(from_successors(
+        hints,
+        from,
+        writer,
+        from_loc,
+        effective_locs,
+    ));
+    later.sort_unstable();
+    later.dedup();
+    later
+}
+
+/// L2: first EffectiveWAW abort → short-edge the immediate remaining successor.
+#[allow(dead_code)]
+pub(crate) fn admit_seed_next_successor(
+    ready: &ReadyEdgeTable,
+    hints: &AccountHints,
+    policy: Option<&CostPolicy>,
+    consumer: TxIdx,
+    producer: TxIdx,
+    location: MemoryLocationHash,
+    from: Address,
+    to: Option<Address>,
+) {
+    if producer >= consumer {
+        return;
+    }
+    ready.note_raw_producer(location, producer);
+    ready.note_location_writer(location, producer);
+    ready.note_location_writer(location, consumer);
+    ready.note_consumer_on(consumer, producer, Some(location));
+    if let Some(p) = policy {
+        p.note_short_pair(location, producer, consumer);
+        p.note_short_edge_admit();
+    }
+    let later = later_hint_successors(hints, from, to, consumer, 0, &[]);
+    if let Some(&succ) = later.first() {
+        ready.note_consumer_on_if_idle(succ, consumer, Some(location));
+        if let Some(p) = policy {
+            p.note_short_pair(location, consumer, succ);
         }
     }
 }
@@ -961,7 +1187,7 @@ mod tests {
     }
 
     #[test]
-    fn a0_ungated_write_set_records_d1_only() {
+    fn a0_unique_write_records_d1_without_edge() {
         let ready = ReadyEdgeTable::new();
         let wave = WaveParkTable::new();
         let policy = policy_for(176);
@@ -980,13 +1206,94 @@ mod tests {
             &[loc],
             &[loc],
         );
-        assert!(
-            ready.writers_of(loc).is_empty(),
-            "thin A0 defers D1 off the execute hot path (block-end snapshot)"
+        assert_eq!(
+            ready.writers_of(loc),
+            vec![4],
+            "C1: first effective write records D1"
         );
         assert!(
             ready.may_execute(31),
-            "thin A0 must not plant a ReadyEdge on later writers"
+            "unique writer with no hint successor must not refuse 31"
+        );
+    }
+
+    #[test]
+    fn thin_write_set_promotes_14_to_16() {
+        let ready = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        let policy = policy_for(176);
+        let contract = Address::repeat_byte(0xed);
+        let from = Address::repeat_byte(0x14);
+        let loc = 0xedba_u64;
+        let hints = AccountHints::from_call_to_txs(contract, vec![14, 16, 17]);
+        admit_seed_on_write_set(
+            &ready,
+            &hints,
+            &wave,
+            Some(&policy),
+            14,
+            from,
+            Some(contract),
+            &[loc],
+            &[loc],
+        );
+        assert_eq!(
+            ready.blocking_producer(16),
+            Some(14),
+            "C1/L1: first effective storage write must raise 14→16"
+        );
+        assert!(
+            ready.may_execute(17),
+            "C5: short edge only — 17 stays A0 until 16 publishes"
+        );
+    }
+
+    #[test]
+    fn thin_write_set_promotes_4_to_31() {
+        let ready = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        let policy = policy_for(176);
+        let to = Address::repeat_byte(0x20);
+        let hot = Address::repeat_byte(0x32);
+        let other = Address::repeat_byte(0x99);
+        let loc = 0x32be_u64;
+        admit_seed_on_write_set(
+            &ready,
+            &AccountHints::from_to_txs(other, vec![4]),
+            &wave,
+            Some(&policy),
+            4,
+            hot,
+            Some(other),
+            &[loc],
+            &[loc],
+        );
+        assert_eq!(ready.writers_of(loc), vec![4]);
+        let hints = AccountHints::from_to_txs(to, vec![31, 66, 67]);
+        admit_seed_on_write_set(
+            &ready,
+            &hints,
+            &wave,
+            Some(&policy),
+            31,
+            Address::repeat_byte(0x31),
+            Some(to),
+            &[loc],
+            &[loc],
+        );
+        assert_eq!(
+            ready.blocking_producer(31),
+            Some(4),
+            "C1: 4→31 after the second effective write on ℓ"
+        );
+        assert_eq!(
+            ready.blocking_producer(66),
+            Some(31),
+            "C1: immediate successor 31→66"
+        );
+        assert!(
+            ready.may_execute(67),
+            "C5: do not plant the whole 0x209c spine"
         );
     }
 
@@ -1202,8 +1509,65 @@ mod tests {
             &contracts,
             None,
         );
-        assert_eq!(n, 0, "L1: thin cold start must allow A1=0, got {n}");
-        assert!(!ready.has_any_gated(), "no gated txs on thin cold start");
+        assert_eq!(n, 0, "C4: empty-to payee spine stays A0 on thin, got {n}");
+        assert!(ready.may_execute(0), "probe head stays runnable");
         assert!(ready.may_execute(8), "later empty-to stays OCC-runnable");
+    }
+
+    #[test]
+    fn thin_begin_seeds_call_waw_chain() {
+        let ready = ReadyEdgeTable::new();
+        let stages = ProducerStageTable::new();
+        let learner = LiveLearner::new();
+        learner.begin_block(MorphWeights::default());
+        let bayes = BayesMap::new();
+        let prior = InterBlockPrior::new();
+        let storage = Address::repeat_byte(0xed);
+        let hints = AccountHints::from_call_to_txs(storage, vec![14, 16, 17]);
+        let policy = policy_for(176);
+        let n = admit_seed_begin_block(
+            &ready,
+            &stages,
+            &learner,
+            &bayes,
+            &prior,
+            &hints,
+            Address::ZERO,
+            &policy,
+            &HashSet::new(),
+            None,
+        );
+        assert_eq!(n, 2, "C1: 14→16→17 is two short edges, got {n}");
+        assert_eq!(ready.blocking_producer(16), Some(14));
+        assert_eq!(ready.blocking_producer(17), Some(16));
+        assert!(ready.may_execute(14), "storage head stays runnable");
+    }
+
+    #[test]
+    fn thin_begin_call_waw_chain_not_star() {
+        let ready = ReadyEdgeTable::new();
+        let stages = ProducerStageTable::new();
+        let learner = LiveLearner::new();
+        learner.begin_block(MorphWeights::default());
+        let bayes = BayesMap::new();
+        let prior = InterBlockPrior::new();
+        let main = Address::repeat_byte(0x20);
+        let hints = AccountHints::from_call_to_txs(main, vec![31, 66, 67, 69, 70, 93, 96, 103]);
+        let policy = policy_for(176);
+        let n = admit_seed_begin_block(
+            &ready,
+            &stages,
+            &learner,
+            &bayes,
+            &prior,
+            &hints,
+            Address::ZERO,
+            &policy,
+            &HashSet::new(),
+            None,
+        );
+        assert_eq!(n, 0, "C5: wide CallWaw stays A0 at thin begin, got {n}");
+        assert!(ready.may_execute(31), "wide head stays runnable");
+        assert!(ready.may_execute(66), "wide tail stays runnable");
     }
 }

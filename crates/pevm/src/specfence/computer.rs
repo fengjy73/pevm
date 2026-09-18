@@ -25,8 +25,9 @@ pub(crate) fn next_sf_task(
     metrics: Option<&MetricsInner>,
 ) -> Option<Task> {
     let refuse_before = ready.refuse_count();
-    // P1/P3: no gated txs and no ProducerStage → byte-class OCC pick.
-    // ReadyEdge / wave bag stay off the A0 path.
+    // P3/P4: no gated txs → OCC idx pick (bag stays off the A0 path).
+    // After a short edge exists, wave/refuse applies only to `is_gated` txs;
+    // independents still steal via execution_idx.
     if !stages.has_reserved() && !ready.has_any_gated() {
         return scheduler.next_task();
     }

@@ -3289,8 +3289,9 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         .note_incarnation_finish(tx_version.tx_idx, exec_result.tx_gas_used());
                 }
 
-                // L4/P3: A0 ungated records MV only — no write-set Vecs / ReadyEdge.
-                // Keep speculate + contended Bayes so thin tests / next-block prior still learn.
+                // L4/P3: A0 ungated records MV only. Mid-execute ReadyEdge
+                // insert races seq≡par (iter9 / mixed SIGSEGV). C1/L2 seed
+                // at begin (hint / prior) or on the next block after promote.
                 if a0_ungated {
                     let (wrote_new_location, contended) =
                         self.mv_memory.record(tx_version, read_set, write_set);

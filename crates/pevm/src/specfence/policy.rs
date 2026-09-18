@@ -113,6 +113,8 @@ pub struct LearnReport {
     pub abort_cf_ns: u64,
     /// L3: prior decay steps applied because prepaid lost.
     pub prior_decay: usize,
+    /// P2: end-block HotSet / prior / D1 / learn wall (one Instant).
+    pub end_block_ns: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -159,8 +161,12 @@ pub(crate) struct ConflictNote {
 struct PromotedLoc {
     hits: u32,
     reexec_ns_ema: f64,
-    /// True after a measured incarnation>0 sample on this ℓ (not the cold prior).
+    /// True after an EffectiveWAW observation (abort hat if `reexec_ns` was 0).
     measured: bool,
+    /// Immediate predecessor on this ℓ (reuse / mid-block seed).
+    pred: TxIdx,
+    /// Immediate successor on this ℓ (reuse / mid-block seed).
+    succ: TxIdx,
 }
 
 /// Per-address B2 context: p_effWAW + refuse-cost EMA + per-pair cost-EV.
@@ -209,6 +215,8 @@ pub(crate) struct CostPolicy {
     conflicts: DashMap<TxIdx, ConflictNote, FxBuildHasher>,
     /// C4: EffectiveWAW locations eligible for a short-edge A1 (cap-limited).
     promoted: DashMap<MemoryLocationHash, PromotedLoc, FxBuildHasher>,
+    /// L4: consecutive (pred, succ) pairs on a hot ℓ (beyond one stored pair).
+    short_chain: DashMap<MemoryLocationHash, Vec<(TxIdx, TxIdx)>, FxBuildHasher>,
     /// L2: reexec_ns EMA keyed by location (feeds U3 / per-ℓ EV).
     loc_reexec_ns: DashMap<MemoryLocationHash, OnlineStat, FxBuildHasher>,
     /// L2: refuse/prepaid EMA keyed by location.
@@ -224,6 +232,8 @@ pub(crate) struct CostPolicy {
     /// C3: off-edge reexecs in this block (wave).
     wave_off_edge: AtomicUsize,
     wave_batch_noted: AtomicBool,
+    /// L4: previous block size — reuse may seed stored (pred, succ) idx pairs.
+    last_block_n: AtomicUsize,
 }
 
 impl Default for CostPolicy {
@@ -258,6 +268,7 @@ impl Default for CostPolicy {
             conflict_ignore: AtomicUsize::new(0),
             conflicts: DashMap::default(),
             promoted: DashMap::default(),
+            short_chain: DashMap::default(),
             loc_reexec_ns: DashMap::default(),
             loc_c_a1: DashMap::default(),
             c_a0_snap_bits: AtomicU64::new(PRIOR_C_A0_NS.to_bits()),
@@ -268,6 +279,7 @@ impl Default for CostPolicy {
             abort_cf_ns: AtomicU64::new(0),
             wave_off_edge: AtomicUsize::new(0),
             wave_batch_noted: AtomicBool::new(false),
+            last_block_n: AtomicUsize::new(0),
         }
     }
 }
@@ -288,9 +300,11 @@ impl CostPolicy {
         self.cohorts.clear();
         self.conflicts.clear();
         self.promoted.clear();
+        self.short_chain.clear();
         self.loc_reexec_ns.clear();
         self.loc_c_a1.clear();
         self.prepaid_lose_streak.store(0, Ordering::Relaxed);
+        self.last_block_n.store(0, Ordering::Relaxed);
         self.c_a0_snap_bits
             .store(PRIOR_C_A0_NS.to_bits(), Ordering::Relaxed);
         self.c_a1_snap_bits
@@ -328,6 +342,10 @@ impl CostPolicy {
     }
 
     pub(crate) fn begin_block(&self, n: usize) {
+        let prev = self.block_n.load(Ordering::Relaxed);
+        if prev > 0 {
+            self.last_block_n.store(prev, Ordering::Relaxed);
+        }
         self.block_n.store(n, Ordering::Relaxed);
         self.reset_block_counters();
         let serial_hat = n as f64 * SERIAL_NS_PER_TX;
@@ -686,21 +704,157 @@ impl CostPolicy {
     }
 
     /// C4: EffectiveWAW → short-edge promote (location only, not a lazy spine).
-    /// Thin blocks only **gate** the edge when measured EV says ordered is cheaper
-    /// (`is_promoted`); the observation is always recorded.
+    ///
+    /// L1: `reexec_ns == 0` still sets `measured=true` using the location EMA or
+    /// the abort hat. Passing 0 must not lock the edge unpromoted for the block.
     pub(crate) fn promote_short_edge(&self, location: MemoryLocationHash, reexec_ns: u64) {
+        let measured_ns = if reexec_ns > 0 {
+            reexec_ns as f64
+        } else {
+            self.loc_reexec_ns
+                .get(&location)
+                .map(|s| s.mean)
+                .filter(|m| *m > 1.0)
+                .unwrap_or(PRIOR_C_A0_NS)
+        };
         let mut e = self.promoted.entry(location).or_insert(PromotedLoc {
             hits: 0,
             reexec_ns_ema: PRIOR_C_A0_NS,
             measured: false,
+            pred: usize::MAX,
+            succ: usize::MAX,
         });
         e.hits = e.hits.saturating_add(1);
-        if reexec_ns > 0 {
-            e.reexec_ns_ema = (1.0 - EMA_ALPHA) * e.reexec_ns_ema + EMA_ALPHA * (reexec_ns as f64);
-            e.measured = true;
-        }
+        e.reexec_ns_ema = (1.0 - EMA_ALPHA) * e.reexec_ns_ema + EMA_ALPHA * measured_ns;
+        e.measured = true;
+        drop(e);
         self.note_conflict_promote();
         self.note_reexec_ns_at(Some(location), reexec_ns);
+    }
+
+    /// L2/L4: remember the immediate (pred, succ) pair on a hot ℓ.
+    pub(crate) fn note_short_pair(&self, location: MemoryLocationHash, pred: TxIdx, succ: TxIdx) {
+        if pred >= succ {
+            return;
+        }
+        let mut e = self.promoted.entry(location).or_insert(PromotedLoc {
+            hits: 0,
+            reexec_ns_ema: PRIOR_C_A0_NS,
+            measured: false,
+            pred: usize::MAX,
+            succ: usize::MAX,
+        });
+        if e.pred == usize::MAX || pred < e.pred {
+            e.pred = pred;
+            e.succ = succ;
+        }
+        drop(e);
+        let mut chain = self.short_chain.entry(location).or_default();
+        if !chain.iter().any(|&(p, s)| p == pred && s == succ) {
+            chain.push((pred, succ));
+        }
+    }
+
+    /// L4: stored short-edge pairs whose idx still match this block size.
+    pub(crate) fn promoted_short_pairs(&self) -> Vec<(MemoryLocationHash, TxIdx, TxIdx)> {
+        let n = self.block_n();
+        let prev = self.last_block_n.load(Ordering::Relaxed);
+        let same_shape = n > 0 && (prev == 0 || prev == n);
+        if !same_shape {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for e in self.promoted.iter() {
+            let s = *e.value();
+            if s.hits >= 1 && s.measured && s.pred < s.succ && s.succ < n {
+                out.push((*e.key(), s.pred, s.succ));
+            }
+        }
+        for e in self.short_chain.iter() {
+            let loc = *e.key();
+            if !self.is_promoted(loc) {
+                continue;
+            }
+            for &(pred, succ) in e.value() {
+                if pred < succ && succ < n {
+                    out.push((loc, pred, succ));
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// C3: keep a short edge when ĉ_reexec (ℓ EMA) > ĉ_ordered.
+    /// First EffectiveWAW / stored pair is enough proof on a thin block.
+    pub(crate) fn loc_ev_prefers_ordered(&self, location: MemoryLocationHash) -> bool {
+        let c_reexec = self
+            .promoted
+            .get(&location)
+            .map(|s| s.reexec_ns_ema)
+            .or_else(|| self.loc_reexec_ns.get(&location).map(|s| s.mean))
+            .unwrap_or(PRIOR_C_A0_NS)
+            .max(1.0);
+        let c_ord = self
+            .loc_c_a1
+            .get(&location)
+            .map(|s| s.mean)
+            .unwrap_or_else(|| f64::from_bits(self.c_a1_snap_bits.load(Ordering::Relaxed)))
+            .max(1.0);
+        c_ord + NS_DELTA < c_reexec
+    }
+
+    /// C1/C2/C3: gate a short ReadyEdge after an effective publish.
+    ///
+    /// `has_earlier` — D1 already saw a prior writer (4→31).
+    /// `hint_later` — envelope successors still unpublished (14→16, 31→66).
+    pub(crate) fn should_gate_short_after_write(
+        &self,
+        location: MemoryLocationHash,
+        has_earlier: bool,
+        hint_later: usize,
+    ) -> bool {
+        if self.is_promoted(location) {
+            return true;
+        }
+        if !has_earlier && hint_later < 2 {
+            return false;
+        }
+        if self.is_a0_majority_block() && !self.can_add_short_loc(location) {
+            self.cost_ev_demote_optimistic
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        // C2: first effective write with a known successor, or 2nd writer on ℓ.
+        // C3: loc EV / abort hat must still beat prepaid.
+        let keep = has_earlier || hint_later >= 2 || self.loc_ev_prefers_ordered(location);
+        if keep {
+            self.cost_ev_keep_ordered.fetch_add(1, Ordering::Relaxed);
+            self.a1_decisions.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.cost_ev_demote_optimistic
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        keep
+    }
+
+    fn can_add_short_loc(&self, location: MemoryLocationHash) -> bool {
+        if self.promoted.contains_key(&location) {
+            return true;
+        }
+        let n = self
+            .promoted
+            .iter()
+            .filter(|e| e.measured && e.hits >= 1)
+            .count();
+        n < THIN_A1_K
+    }
+
+    /// C5: one real short edge (not an envelope cohort).
+    pub(crate) fn note_short_edge_admit(&self) {
+        self.a1_decisions.fetch_add(1, Ordering::Relaxed);
+        self.cost_ev_keep_ordered.fetch_add(1, Ordering::Relaxed);
     }
 
     /// C4: commute / LazyNoise → ignore (do not raise unfenced_reexec→A1).
@@ -727,12 +881,17 @@ impl CostPolicy {
         if !self.is_a0_majority_block() {
             return true;
         }
-        // L1 thin: do not gate on an unmeasured hit (would freeze A1 on this block).
         if !s.measured {
             return false;
         }
-        let c_a1 = f64::from_bits(self.c_a1_snap_bits.load(Ordering::Relaxed)).max(1.0);
-        c_a1 + NS_DELTA < s.reexec_ns_ema
+        // C3: per-ℓ abort EMA vs prepaid snap (not the thin global 6µs A0 prior).
+        let c_ord = self
+            .loc_c_a1
+            .get(&location)
+            .map(|e| e.mean)
+            .unwrap_or_else(|| f64::from_bits(self.c_a1_snap_bits.load(Ordering::Relaxed)))
+            .max(1.0);
+        c_ord + NS_DELTA < s.reexec_ns_ema
     }
 
     pub(crate) fn conflict_of(&self, tx: TxIdx) -> Option<ConflictNote> {
@@ -829,10 +988,23 @@ impl CostPolicy {
         } else {
             self.prepaid_lose_streak.store(0, Ordering::Relaxed);
         }
-        // Next-block snapshot from flushed EMAs (thin still prefers A0 cold).
-        if !self.is_a0_majority_block() {
-            let c_a0 = self.c_a0_ns.lock().unwrap().mean.max(1.0);
-            let c_a1 = self.c_a1_ns.lock().unwrap().mean.max(1.0);
+        // L-E: abort_cf without prepaid → raise short-edge prior (do not decay).
+        if abort_cf > prepaid {
+            for mut e in self.promoted.iter_mut() {
+                if e.measured {
+                    e.hits = e.hits.saturating_add(1);
+                }
+            }
+        }
+        // L-D: refresh thin snap from flushed EMAs so next begin can seed.
+        // Use per-tx abort hat, not the whole-block reexec sum.
+        let c_a0 = if abort_cf > 0 {
+            self.c_a0_ns.lock().unwrap().mean.max(PRIOR_C_A0_NS)
+        } else {
+            self.c_a0_ns.lock().unwrap().mean.max(1.0)
+        };
+        let c_a1 = self.c_a1_ns.lock().unwrap().mean.max(1.0);
+        if !self.is_a0_majority_block() || abort_cf > 0 {
             self.c_a0_snap_bits.store(c_a0.to_bits(), Ordering::Relaxed);
             self.c_a1_snap_bits.store(c_a1.to_bits(), Ordering::Relaxed);
         }
@@ -891,7 +1063,12 @@ impl CostPolicy {
             prepaid_ns: self.prepaid_ns.load(Ordering::Relaxed),
             abort_cf_ns: self.abort_cf_ns.load(Ordering::Relaxed),
             prior_decay: self.prior_decay.load(Ordering::Relaxed),
+            end_block_ns: 0,
         }
+    }
+
+    pub(crate) fn set_end_block_ns(&self, report: &mut LearnReport, ns: u64) {
+        report.end_block_ns = ns;
     }
 }
 
@@ -1144,18 +1321,57 @@ mod tests {
     }
 
     #[test]
-    fn thin_unmeasured_promote_does_not_gate() {
+    fn thin_zero_ns_promote_uses_abort_hat() {
         let p = CostPolicy::new();
         p.begin_block(176);
         p.promote_short_edge(0x32be, 0);
         assert!(
-            !p.is_promoted(0x32be),
-            "thin: unmeasured EffectiveWAW hit must not gate A1"
+            p.is_promoted(0x32be),
+            "L1: promote_short_edge(ℓ, 0) must set measured and gate when abort hat wins"
         );
         p.promote_short_edge(0x32be, 80_000);
         assert!(
             p.is_promoted(0x32be),
-            "thin: measured expensive abort must gate when EV wins"
+            "thin: measured expensive abort must keep the short edge"
+        );
+    }
+
+    #[test]
+    fn thin_write_set_gates_known_successors() {
+        let p = CostPolicy::new();
+        p.begin_block(176);
+        assert!(
+            p.should_gate_short_after_write(0xedba, false, 2),
+            "C2: first effective write with ≥2 later hint txs must promote"
+        );
+        assert!(
+            p.should_gate_short_after_write(0x32be, true, 0),
+            "C1: earlier writer on ℓ must raise the immediate successor"
+        );
+        assert!(
+            !p.should_gate_short_after_write(0xabc, false, 0),
+            "unique writer without a successor stays A0"
+        );
+    }
+
+    #[test]
+    fn reuse_promoted_pair_survives_next_begin() {
+        let p = CostPolicy::new();
+        p.begin_block(176);
+        p.promote_short_edge(0x32be, 40_000);
+        p.note_short_pair(0x32be, 4, 31);
+        p.end_block_learn();
+        p.begin_block(176);
+        assert!(
+            p.should_seed_thin_a1(),
+            "L4: reuse must raise short-edge A1"
+        );
+        let pairs = p.promoted_short_pairs();
+        assert!(
+            pairs
+                .iter()
+                .any(|&(loc, pred, succ)| loc == 0x32be && pred == 4 && succ == 31),
+            "L4: stored 4→31 pair must survive begin: {pairs:?}"
         );
     }
 }

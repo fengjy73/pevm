@@ -490,10 +490,14 @@ impl Pevm {
             // Bayes → admit_seed before any Execute (v9.1). Known stars keep
             // PE even on quiet morph (M4). Truly cold seeds nothing.
             self.cost_policy.begin_block(block_size);
-            // L1/P3: thin cold A1=0 skips contract storage walk + admit_seed.
+            // Thin CallWaw chain needs hints only (P2: skip contract walk).
             // PROFILE Instant only (product path must not pay begin Instant).
-            if self.cost_policy.should_seed_thin_a1() {
-                let contracts = collect_contracts(storage, &hints);
+            {
+                let contracts = if self.cost_policy.is_a0_majority_block() {
+                    HashSet::new()
+                } else {
+                    collect_contracts(storage, &hints)
+                };
                 let seed_t0 = crate::specfence::profile_timing_enabled().then(Instant::now);
                 let _ = crate::specfence::admit::admit_seed_begin_block(
                     &ready_edges,
@@ -511,12 +515,13 @@ impl Pevm {
                     metrics_inner.set_admit_seed_begin_ns(t0.elapsed().as_nanos() as u64);
                 }
             }
-            // P4: bag serves gated wake only. A0 / independents use OCC
-            // `execution_idx` — seeding may_execute txs here mutex-taxed the
-            // A0-majority path (PR19 residual).
+            // P3/P4: bag serves gated wake only. A0 never seeds the bag.
+            // Do not sample block_size as ready_width when A1=0 (that read as 176).
             self.last_begin_blocked = ready_edges.blocked_consumers();
-            ready_edges
-                .sample_ready_width(block_size.saturating_sub(self.last_begin_blocked.len()));
+            if ready_edges.has_any_gated() {
+                ready_edges
+                    .sample_ready_width(block_size.saturating_sub(self.last_begin_blocked.len()));
+            }
             if quiet && !learner.has_any_predicted() {
                 let n = sketch.revoke_prior_fences_if_quiet(true);
                 metrics_inner.record_quiet_pessimistic_revoke(n);
@@ -604,17 +609,32 @@ impl Pevm {
                     while task.is_some() {
                         task = match task.unwrap() {
                             Task::Execution(tx_version) => {
+                                if self.concurrency_mode == ConcurrencyMode::SpecFence {
+                                    specfence.ready_edges.note_started(tx_version.tx_idx);
+                                }
                                 let occ_exec = occ_mode
                                     || (self.concurrency_mode == ConcurrencyMode::SpecFence
-                                        && !specfence.ready_edges.has_any_gated());
+                                        && !specfence.ready_edges.is_gated(tx_version.tx_idx));
                                 if occ_exec {
                                     let done_idx = tx_version.tx_idx;
                                     let next = self
                                         .try_execute(&mut vm, &scheduler, tx_version, None, None);
-                                    // Stamp Done so a later short-edge promote cannot
-                                    // refuse forever (bitset, not DashMap).
                                     if self.concurrency_mode == ConcurrencyMode::SpecFence {
-                                        specfence.ready_edges.note_producer_done_stamp(done_idx);
+                                        if specfence.ready_edges.has_any_gated() {
+                                            if let Some(w) = wave_ref {
+                                                specfence
+                                                    .ready_edges
+                                                    .note_producer_done(done_idx, w);
+                                            } else {
+                                                specfence
+                                                    .ready_edges
+                                                    .note_producer_done_stamp(done_idx);
+                                            }
+                                        } else {
+                                            specfence
+                                                .ready_edges
+                                                .note_producer_done_stamp(done_idx);
+                                        }
                                     }
                                     next
                                 } else {
@@ -630,7 +650,7 @@ impl Pevm {
                             Task::Validation(tx_version) => {
                                 let v0 = profile.then(Instant::now);
                                 let a0_ungated = specfence.mode == ConcurrencyMode::SpecFence
-                                    && !specfence.ready_edges.has_any_gated();
+                                    && !specfence.ready_edges.is_gated(tx_version.tx_idx);
                                 let next = if occ_mode {
                                     crate::specfence::validate_occ_stage(
                                         &mv_memory,
@@ -639,9 +659,7 @@ impl Pevm {
                                         Some(&metrics_inner),
                                     )
                                 } else if a0_ungated {
-                                    // P3: A1=0 validate keeps commute (OCC-effect) but
-                                    // skips certificate / repair branching.
-                                    crate::specfence::validate_occ_kernel(
+                                    crate::specfence::validate_a0_fast(
                                         &mv_memory,
                                         &scheduler,
                                         &tx_version,
@@ -751,24 +769,25 @@ impl Pevm {
             wave.park_resume_full_abort_reexecute(),
         );
         if self.concurrency_mode == ConcurrencyMode::SpecFence {
-            // L4: A0 skipped HotSet/Bayes on the execute hot path — flush
-            // write locations here so the next block still sees process prior.
+            let end_t0 = Instant::now();
+            // P2: skip A0 full-block HotSet/write-loc flush. Promoted ℓ already
+            // persist in CostPolicy; L5 keeps HotSet/Bayes off the A0 hot path.
+            // P2: HotSet only from D1 multi-writer locs (not every A0 write).
             if self.cost_policy.is_a0_majority_block() {
                 let beneficiary = hash_deterministic(MemoryLocation::Basic(block_env.beneficiary));
-                let mut deferred = Vec::new();
-                for tx in 0..block_size {
-                    if ready_edges.was_queued(tx) {
+                let orders = if ready_edges.has_any_gated() {
+                    ready_edges.writer_order_snapshot()
+                } else {
+                    mv_writer_order_snapshot(&mv_memory, block_size, beneficiary)
+                };
+                for (loc, writers) in &orders {
+                    if writers.len() < 2 {
                         continue;
                     }
-                    for loc in mv_memory.write_locations(tx) {
-                        if loc != beneficiary {
-                            self.hotset.note_writer(loc, tx);
-                            deferred.push(loc);
-                        }
+                    for &tx in writers {
+                        self.hotset.note_writer(*loc, tx);
                     }
-                }
-                if !deferred.is_empty() {
-                    self.rw_prior.observe_write_set(&deferred, None);
+                    self.rw_prior.observe_write_set(&[*loc], None);
                 }
             }
             self.hotset.end_block();
@@ -806,7 +825,7 @@ impl Pevm {
                         miss += 1;
                         self.cost_policy.bump_unfenced_reexec();
                         if !self.cost_policy.is_promoted(note.location) {
-                            self.cost_policy.promote_short_edge(note.location, 0);
+                            self.cost_policy.promote_short_edge(note.location, 1);
                         }
                     }
                     None => {
@@ -831,7 +850,8 @@ impl Pevm {
             self.cost_policy
                 .note_cost_sample(refuse_unit, inc_gt0 > 0, idle);
             self.cost_policy.end_block_learn();
-            let report = self.cost_policy.take_report(ready_w, idle);
+            let mut report = self.cost_policy.take_report(ready_w, idle);
+            report.end_block_ns = end_t0.elapsed().as_nanos() as u64;
             metrics_inner.set_pc_learn_metrics(
                 ready_w,
                 idle,
@@ -855,14 +875,10 @@ impl Pevm {
             );
             self.last_learn_report = report;
             self.last_incarnations = incs;
-            // A0-majority skipped live D1; snapshot writer order from MV (no DashMap).
-            if self.cost_policy.is_a0_majority_block() && !ready_edges.has_any_gated() {
-                let beneficiary = hash_deterministic(MemoryLocation::Basic(block_env.beneficiary));
-                self.last_location_writers =
-                    mv_writer_order_snapshot(&mv_memory, block_size, beneficiary);
-            } else {
-                self.last_location_writers = ready_edges.writer_order_snapshot();
-            }
+            // D1 compare snapshot from MV (covers A0 writes that skip live DashMap).
+            let beneficiary = hash_deterministic(MemoryLocation::Basic(block_env.beneficiary));
+            self.last_location_writers =
+                mv_writer_order_snapshot(&mv_memory, block_size, beneficiary);
         } else {
             self.last_process = ExecProcessSnapshot::default();
             self.last_learn_report = LearnReport::default();

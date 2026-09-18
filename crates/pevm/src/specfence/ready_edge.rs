@@ -61,6 +61,8 @@ pub(crate) struct ReadyEdgeTable {
     gated_n: AtomicUsize,
     /// Done writers (bitset). A0 finish is an atomic or — no `finished` DashMap.
     done_bits: [AtomicU64; GATED_WORDS],
+    /// Execute started (bitset). Write-set must not refuse an in-flight succ.
+    started_bits: [AtomicU64; GATED_WORDS],
 }
 
 impl Default for ReadyEdgeTable {
@@ -84,6 +86,7 @@ impl Default for ReadyEdgeTable {
             gated_bits: std::array::from_fn(|_| AtomicU64::new(0)),
             gated_n: AtomicUsize::new(0),
             done_bits: std::array::from_fn(|_| AtomicU64::new(0)),
+            started_bits: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 }
@@ -288,6 +291,43 @@ impl ReadyEdgeTable {
     #[inline]
     pub(crate) fn note_producer_done_stamp(&self, writer: TxIdx) {
         self.mark_done(writer);
+    }
+
+    /// Mark Execute started so write-set will not refuse this incarnation.
+    #[inline]
+    pub(crate) fn note_started(&self, tx: TxIdx) {
+        let i = tx / 64;
+        if i < self.started_bits.len() {
+            let bit = 1u64 << (tx % 64);
+            self.started_bits[i].fetch_or(bit, Ordering::Release);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_started(&self, tx: TxIdx) -> bool {
+        let i = tx / 64;
+        if i < self.started_bits.len() {
+            let bit = 1u64 << (tx % 64);
+            self.started_bits[i].load(Ordering::Acquire) & bit != 0
+        } else {
+            false
+        }
+    }
+
+    /// C1: raise a short edge only when the successor has not started (idle).
+    /// In-flight successors stay OCC this incarnation; L2 abort seeds reexec.
+    #[inline]
+    pub(crate) fn note_consumer_on_if_idle(
+        &self,
+        consumer: TxIdx,
+        producer: TxIdx,
+        location: Option<MemoryLocationHash>,
+    ) -> bool {
+        if self.is_started(consumer) {
+            return false;
+        }
+        self.note_consumer_on(consumer, producer, location);
+        true
     }
 
     #[inline]
