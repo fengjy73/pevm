@@ -166,7 +166,7 @@ pub struct Pevm {
     hotset: HotSet,
     /// P1: inter-block morph / top-ℓ prior (warm-start only).
     inter_prior: InterBlockPrior,
-    /// B2 cross-block p_effWAW / refuse-cost calibrator (Soft=0 A0/A1).
+    /// Cross-block A0/A1 calibrator (Soft=0). A0 = OCC-effect on this spine.
     cost_policy: CostPolicy,
     /// P1: tunable π constants (process-level).
     adaptive_params: AdaptiveParams,
@@ -572,7 +572,7 @@ impl Pevm {
                     let profile = crate::specfence::profile_timing_enabled();
                     // v9.3: one spine. SpecFence always uses unified next_sf
                     // (empty extras ≡ OCC walk). Occ mode is a separate computer.
-                    // Ban: plant_is_occ → next_occ_task retreat.
+                    // Ban: plant_is_occ → next_occ_task (no second OCC engine).
                     let occ_mode = self.concurrency_mode == ConcurrencyMode::Occ;
                     let mut sched_t0 = profile.then(Instant::now);
                     let mut task = if occ_mode {
@@ -743,14 +743,24 @@ impl Pevm {
                 }
                 // CC-D1: first conflict ℓ — effective non-lazy → learn; lazy → ignore.
                 match self.cost_policy.conflict_of(tx) {
-                    Some(note) if note.lazy => {
-                        self.cost_policy.note_conflict_ignore();
+                    Some(note)
+                        if note.lazy
+                            || matches!(
+                                note.class,
+                                crate::specfence::ConflictClass::LazyNoise
+                                    | crate::specfence::ConflictClass::CommuteCandidate
+                            ) =>
+                    {
+                        // Already counted on the abort path when classified.
+                        // miss_detect must not treat commute/lazy as "must A1".
+                        let _ = note.location;
                     }
                     Some(note) => {
                         miss += 1;
-                        self.cost_policy.note_conflict_promote();
                         self.cost_policy.bump_miss_detect();
-                        let _ = note.location;
+                        if !self.cost_policy.is_promoted(note.location) {
+                            self.cost_policy.promote_short_edge(note.location, 0);
+                        }
                     }
                     None => {
                         miss += 1;

@@ -1,8 +1,10 @@
 //! Cost-aware admit policy — L1 ns-EV + PC-S1 thin-shell + CC-D1 routing.
 //!
 //! Soft=0 actions: **A0** OptimisticRead vs **A1** OrderedAdmit (refuse +
-//! wave-admit pred). Beta posteriors are **features**, not `decide()` authority.
-//! Decide is measured-ns EMA: keep A1 iff ĉ_A1 + δ < ĉ_A0.
+//! wave-admit pred). A0 is the OCC-effect path on this spine — not a hand-off
+//! to a second OCC runtime. Beta posteriors are **features**, not `decide()`
+//! authority. Decide is measured-ns EMA: keep A1 iff ĉ_A1 + δ < ĉ_A0.
+//! `THIN_A1_K` is a **cap**, not a frozen set of exactly 3.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -14,11 +16,14 @@ use rustc_hash::FxBuildHasher;
 
 use crate::{MemoryLocationHash, TxIdx};
 
+use super::collateral::ConflictClass;
+
 /// Small-block serial estimate below this → thin SpecFence shell (PC-S1).
 const META_FLOOR_NS: f64 = 400_000.0;
 /// ~2µs/tx cold serial hat (21k transfer class).
 const SERIAL_NS_PER_TX: f64 = 2_000.0;
-/// Thin-shell A1 spine cap (3356896: 0x209c / 0xedba / 0xe94b).
+/// Thin-shell A1 spine **cap** (not “always exactly 3”). Promote/ignore may
+/// change the set; ns-EV may keep fewer. 3356896 proven spines stay under K.
 pub(crate) const THIN_A1_K: usize = 3;
 const THIN_N_MAX: usize = 256;
 /// ns-EV hysteresis: keep A1 only if ĉ_A1 + δ < ĉ_A0.
@@ -58,7 +63,7 @@ impl CohortKind {
 pub struct LearnReport {
     /// Cohorts that chose A1 this block.
     pub a1_cohorts: usize,
-    /// Cohorts forced A0 by the Lean / EV gate (PC-5).
+    /// Cohorts that stayed A0 (Lean / EV / K-cap / empty-to EOA).
     pub lean_a0_cohorts: usize,
     /// Mean estimated cost of A1 decisions (ns EMA).
     pub mean_c_a1: f64,
@@ -128,7 +133,16 @@ impl OnlineStat {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ConflictNote {
     pub location: MemoryLocationHash,
+    pub peer: Option<TxIdx>,
+    pub class: ConflictClass,
     pub lazy: bool,
+}
+
+/// Cross-block short-edge promote (location, not a whole lazy spine).
+#[derive(Debug, Clone, Copy)]
+struct PromotedLoc {
+    hits: u32,
+    reexec_ns_ema: f64,
 }
 
 /// Per-address B2 context: p_effWAW + refuse-cost EMA.
@@ -172,6 +186,13 @@ pub(crate) struct CostPolicy {
     conflict_ignore: AtomicUsize,
     /// CC-D1: first conflict ℓ per off-edge tx.
     conflicts: DashMap<TxIdx, ConflictNote, FxBuildHasher>,
+    /// C4: EffectiveWAW locations eligible for a short-edge A1 (cap-limited).
+    promoted: DashMap<MemoryLocationHash, PromotedLoc, FxBuildHasher>,
+    /// C4: reexec_ns EMA keyed by location (feeds U3).
+    loc_reexec_ns: DashMap<MemoryLocationHash, OnlineStat, FxBuildHasher>,
+    /// C3: off-edge reexecs in this block (wave).
+    wave_off_edge: AtomicUsize,
+    wave_batch_noted: AtomicBool,
 }
 
 impl Default for CostPolicy {
@@ -205,6 +226,10 @@ impl Default for CostPolicy {
             conflict_promote: AtomicUsize::new(0),
             conflict_ignore: AtomicUsize::new(0),
             conflicts: DashMap::default(),
+            promoted: DashMap::default(),
+            loc_reexec_ns: DashMap::default(),
+            wave_off_edge: AtomicUsize::new(0),
+            wave_batch_noted: AtomicBool::new(false),
         }
     }
 }
@@ -224,6 +249,8 @@ impl CostPolicy {
         *self.w_p.lock().unwrap() = [0.05, 0.90, 0.12, 1.10, -0.15, 0.80];
         self.cohorts.clear();
         self.conflicts.clear();
+        self.promoted.clear();
+        self.loc_reexec_ns.clear();
         self.reset_block_counters();
     }
 
@@ -249,6 +276,8 @@ impl CostPolicy {
         self.conflict_promote.store(0, Ordering::Relaxed);
         self.conflict_ignore.store(0, Ordering::Relaxed);
         self.conflicts.clear();
+        self.wave_off_edge.store(0, Ordering::Relaxed);
+        self.wave_batch_noted.store(false, Ordering::Relaxed);
     }
 
     pub(crate) fn begin_block(&self, n: usize) {
@@ -296,12 +325,12 @@ impl CostPolicy {
             self.lean_a0.fetch_add(1, Ordering::Relaxed);
             return AdmitAction::A0OptimisticRead;
         }
-        // 2-tx same-from pairs are OCC-cost (3356896 has ~60; refuse is pure meta).
+        // 2-tx same-from pairs stay A0 (3356896 has ~60; refuse is pure meta).
         if kind == CohortKind::SameFrom && cohort_len < 3 {
             self.lean_a0.fetch_add(1, Ordering::Relaxed);
             return AdmitAction::A0OptimisticRead;
         }
-        // Thin-shell: 2-tx calldata pairs stay OCC-cost (K reserved for ≥3 spines).
+        // Thin-shell: 2-tx calldata pairs stay A0 (K reserved for ≥3 spines).
         if self.is_thin_shell() && kind == CohortKind::CallWaw && cohort_len < 3 {
             self.lean_a0.fetch_add(1, Ordering::Relaxed);
             return AdmitAction::A0OptimisticRead;
@@ -415,7 +444,7 @@ impl CostPolicy {
         } else {
             0.0
         };
-        // PC-5 small-block: inflate A1 meta so lazy cohorts retreat to OCC-cost.
+        // PC-5 small-block: inflate A1 meta so lazy cohorts stay A0.
         let n = self.block_n() as f64;
         let lean = if n > 0.0 && n <= 256.0 { 1.15 } else { 1.0 };
         (base * lean + short).clamp(0.08, 1.5)
@@ -472,12 +501,23 @@ impl CostPolicy {
 
     /// L1: measured incarnation>0 execute ns (hot-path).
     pub(crate) fn note_reexec_ns(&self, ns: u64) {
+        self.note_reexec_ns_at(None, ns);
+    }
+
+    /// C4: reexec_ns EMA on a conflict ℓ (or global if `loc` is None).
+    pub(crate) fn note_reexec_ns_at(&self, loc: Option<MemoryLocationHash>, ns: u64) {
         if ns == 0 {
             return;
         }
         self.reexec_ns.fetch_add(ns, Ordering::Relaxed);
         self.c_a0_ns.lock().unwrap().ema_ns(ns as f64, EMA_ALPHA);
         self.a0_reexec.fetch_add(1, Ordering::Relaxed);
+        if let Some(loc) = loc {
+            self.loc_reexec_ns
+                .entry(loc)
+                .or_insert(OnlineStat::new(PRIOR_C_A0_NS))
+                .ema_ns(ns as f64, EMA_ALPHA);
+        }
     }
 
     /// L1: idle-core ns attributed as A1 width loss.
@@ -513,11 +553,61 @@ impl CostPolicy {
         self.batch_repair.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// CC-D1: first conflict ℓ on an off-edge inc>0 tx.
-    pub(crate) fn note_conflict_ell(&self, tx: TxIdx, location: MemoryLocationHash, lazy: bool) {
-        self.conflicts
-            .entry(tx)
-            .or_insert(ConflictNote { location, lazy });
+    /// CC-D1: first conflict ℓ + peer + class on an off-edge inc>0 tx.
+    pub(crate) fn note_conflict_ell(
+        &self,
+        tx: TxIdx,
+        location: MemoryLocationHash,
+        peer: Option<TxIdx>,
+        class: ConflictClass,
+        lazy: bool,
+    ) {
+        self.conflicts.entry(tx).or_insert(ConflictNote {
+            location,
+            peer,
+            class,
+            lazy,
+        });
+    }
+
+    /// C3: one off-edge reexec in this wave. First time count ≥ 2 → batch_repair.
+    pub(crate) fn note_wave_off_edge_reexec(&self) {
+        let n = self.wave_off_edge.fetch_add(1, Ordering::Relaxed) + 1;
+        if n >= 2 && !self.wave_batch_noted.swap(true, Ordering::Relaxed) {
+            self.note_batch_repair();
+        }
+    }
+
+    /// C4: EffectiveWAW → short-edge promote (location only, not a lazy spine).
+    pub(crate) fn promote_short_edge(&self, location: MemoryLocationHash, reexec_ns: u64) {
+        let mut e = self.promoted.entry(location).or_insert(PromotedLoc {
+            hits: 0,
+            reexec_ns_ema: PRIOR_C_A0_NS,
+        });
+        e.hits = e.hits.saturating_add(1);
+        if reexec_ns > 0 {
+            e.reexec_ns_ema = (1.0 - EMA_ALPHA) * e.reexec_ns_ema + EMA_ALPHA * (reexec_ns as f64);
+        }
+        self.note_conflict_promote();
+        self.note_reexec_ns_at(Some(location), reexec_ns);
+    }
+
+    /// C4: commute / LazyNoise → ignore (do not raise miss_detect→A1).
+    pub(crate) fn ignore_conflict(&self, location: Option<MemoryLocationHash>) {
+        self.note_conflict_ignore();
+        if let Some(loc) = location {
+            // Successful commute lowers the promote weight on this ℓ.
+            if let Some(mut e) = self.promoted.get_mut(&loc)
+                && e.hits > 0
+            {
+                e.hits -= 1;
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_promoted(&self, location: MemoryLocationHash) -> bool {
+        self.promoted.get(&location).is_some_and(|s| s.hits >= 1)
     }
 
     pub(crate) fn conflict_of(&self, tx: TxIdx) -> Option<ConflictNote> {
@@ -646,7 +736,7 @@ mod tests {
         let addr = Address::repeat_byte(0x56);
         assert!(
             !p.choose_a1(CohortKind::SameFrom, addr, 2, false, 0.20),
-            "2-tx same-from must stay OCC-cost"
+            "2-tx same-from must stay A0"
         );
     }
 
@@ -657,7 +747,7 @@ mod tests {
         let addr = Address::repeat_byte(0xab);
         assert!(
             !p.choose_a1(CohortKind::CallWaw, addr, 2, true, 0.25),
-            "thin-shell 2-tx calldata stays OCC-cost; K reserved for ≥3 spines"
+            "thin-shell 2-tx calldata stays A0; K reserved for ≥3 spines"
         );
     }
 
@@ -680,8 +770,37 @@ mod tests {
         let p = CostPolicy::new();
         p.begin_block(176);
         assert!(p.is_thin_shell(), "n=176 serial_hat < meta floor");
+        assert_eq!(p.thin_a1_k(), THIN_A1_K, "K is a cap on thin-shell");
         p.begin_block(4096);
         assert!(!p.is_thin_shell(), "large n keeps full shell");
+        assert_eq!(p.thin_a1_k(), usize::MAX);
+    }
+
+    #[test]
+    fn thin_a1_k_is_cap_not_exact_set() {
+        let p = CostPolicy::new();
+        p.begin_block(176);
+        assert_eq!(p.thin_a1_k(), 3);
+        // Promote does not freeze A1 at exactly 3 — it can add a short edge
+        // that later admit ranks under the same cap.
+        p.promote_short_edge(0x32be, 4_000);
+        assert!(p.is_promoted(0x32be));
+        p.ignore_conflict(Some(0x32be));
+        assert!(!p.is_promoted(0x32be), "ignore can drop a promoted ℓ");
+    }
+
+    #[test]
+    fn batch_repair_fires_on_second_off_edge_reexec() {
+        let p = CostPolicy::new();
+        p.begin_block(176);
+        p.note_wave_off_edge_reexec();
+        assert_eq!(p.take_report(0.0, 0).batch_repair, 0);
+        p.note_wave_off_edge_reexec();
+        assert_eq!(
+            p.take_report(0.0, 0).batch_repair,
+            1,
+            "C3: second off-edge abort in the wave is one batch_repair"
+        );
     }
 
     #[test]

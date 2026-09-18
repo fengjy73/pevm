@@ -172,6 +172,7 @@ pub(crate) mod admit;
 mod bayes;
 mod boundary;
 mod certificate;
+mod collateral;
 mod computer;
 mod dag;
 mod decision_field;
@@ -227,6 +228,11 @@ pub(crate) use boundary::{
     with_plant_tls_journal,
 };
 pub(crate) use certificate::CertificateTable;
+#[allow(unused_imports)]
+pub(crate) use collateral::{
+    ConflictClass, FirstConflict, classify_first_conflict, commute_ok, envelopes_disjoint,
+    is_value_transfer, location_is_lazy, thin_a0_hinted_lazy,
+};
 pub(crate) use computer::next_sf_task;
 pub(crate) use dag::{FenceGraph, SpecDag};
 pub(crate) use decision_field::{DecisionFeat, DecisionVerb};
@@ -453,10 +459,16 @@ impl AccountHints {
         !txs.is_empty() && txs.iter().all(|&t| self.is_empty_calldata(t))
     }
 
+    /// Empty-input value transfer (21k class; gas may be 21k or 90k).
+    #[inline]
+    pub(crate) fn is_value_transfer(&self, idx: TxIdx) -> bool {
+        self.is_empty_calldata(idx)
+    }
+
     /// CC-X1: gas=21000 empty-calldata transfer.
     #[inline]
     pub(crate) fn is_pure_transfer(&self, idx: TxIdx) -> bool {
-        self.is_empty_calldata(idx) && self.gas_limit.get(idx).copied() == Some(21_000)
+        self.is_value_transfer(idx) && self.gas_limit.get(idx).copied() == Some(21_000)
     }
 
     #[inline]
@@ -564,6 +576,27 @@ impl AccountHints {
                 h.from_of[t] = from;
             }
         }
+        h
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_two_transfers(
+        from_a: Address,
+        to_a: Address,
+        from_b: Address,
+        to_b: Address,
+    ) -> Self {
+        let mut h = Self::from_from_and_to(from_a, to_a, vec![0]);
+        h.empty_calldata.resize(2, true);
+        h.gas_limit.resize(2, 21_000);
+        h.from_of.resize(2, Address::ZERO);
+        h.to_of.resize(2, None);
+        h.from_of[1] = from_b;
+        h.to_of[1] = Some(to_b);
+        h.from_by_account.entry(from_b).or_default().push(1);
+        h.to_by_account.entry(to_b).or_default().push(1);
+        h.by_account.entry(from_b).or_default().push(1);
+        h.by_account.entry(to_b).or_default().push(1);
         h
     }
 

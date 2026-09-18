@@ -1,4 +1,6 @@
-//! SpecFence vs OCC on Ethereum mainnet block 3356896 (Soft=0).
+//! SpecFence (A0/A1 adaptive OCC on one Block-STM spine) vs harness OCC
+//! baseline on Ethereum mainnet block 3356896 (Soft=0). Compare is measurement
+//! only — not a protocol fork.
 //!
 //! ```
 //! SPECFENCE_COMPARE_ITERS=5 cargo run -p pevm --release \

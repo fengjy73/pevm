@@ -5,7 +5,7 @@
 //! **effective** WAW; RAW fan-out stays a star on the first producer.
 //! Independents get no ReadyEdge / no PE.
 //!
-//! Soft=0. A0 vs A1 is B3 cost-aware EV (PC-5 Lean gate). No Soft wait arms.
+//! Soft=0. A0 vs A1 is ns-EV (K is a cap). No Soft wait arms. No second OCC engine.
 //! No Basic→Storage PE clone.
 
 use alloy_primitives::Address;
@@ -346,6 +346,12 @@ pub(crate) fn admit_seed_on_write_set(
     if policy.is_some_and(|p| p.is_thin_shell()) && !ready.was_queued(writer) {
         for &loc in all_write_locs {
             ready.note_location_writer(loc, writer);
+            // C4: EffectiveWAW short edge only — not a whole lazy same-from spine.
+            if policy.is_some_and(|p| p.is_promoted(loc))
+                && effective_locs.iter().any(|&l| l == loc)
+            {
+                ready.note_immediate_pred(loc, writer);
+            }
         }
         return;
     }
@@ -847,7 +853,7 @@ mod tests {
             &hints,
             &HashSet::new(),
         );
-        assert_eq!(n, 0, "2-tx same-from stays OCC-cost (no refuse tax)");
+        assert_eq!(n, 0, "2-tx same-from stays A0 (no refuse tax)");
         assert!(ready.may_execute(57));
     }
 
@@ -1086,7 +1092,7 @@ mod tests {
         );
         assert!(
             ready.may_execute(57),
-            "2-tx same-from Data nonce must stay OCC-cost"
+            "2-tx same-from Data nonce must stay A0"
         );
     }
 

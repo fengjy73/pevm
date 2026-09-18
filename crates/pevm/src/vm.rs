@@ -217,9 +217,32 @@ impl<'a, S: Storage> VmDb<'a, S> {
             // evaluating it concurrently.
             // TODO: Only lazy update in block syncing mode, not for block
             // building.
-            self.is_lazy = self.to_code_hash.is_none()
+            let eoa = self.to_code_hash.is_none();
+            let already = eoa
                 && (self.mv_memory.data.contains_key(&from_hash)
                     || self.mv_memory.data.contains_key(&to_hash.unwrap()));
+            // Thin-shell A0: also lazy-accumulate empty-input EOA that share
+            // from/to with another tx (2-tx same-from 21k). Avoids first-touch
+            // Basic WAW without planting a ReadyEdge on the whole spine.
+            let thin_a0_lazy = eoa
+                && self.specfence.mode == crate::ConcurrencyMode::SpecFence
+                && crate::specfence::thin_a0_hinted_lazy(
+                    self.specfence.hints,
+                    tx.caller,
+                    Some(to),
+                    tx.data.is_empty(),
+                    true,
+                    self.specfence.policy.is_some_and(|p| p.is_thin_shell()),
+                    self.specfence.ready_edges.was_queued(tx_idx),
+                );
+            self.is_lazy = already || thin_a0_lazy;
+            if thin_a0_lazy && self.specfence.hints.prev(&tx.caller, tx_idx).is_some() {
+                self.specfence.metrics.record_commute_skip();
+                if let Some(p) = self.specfence.policy {
+                    p.note_commute_skip();
+                    p.ignore_conflict(Some(from_hash));
+                }
+            }
         }
         Ok(())
     }
@@ -470,14 +493,14 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if address == self.specfence.beneficiary || self.is_lazy {
             return Ok(());
         }
-        // PC-S1: thin-shell A0 txs stay OCC-cost even after a few aborts seed PE.
+        // Thin-shell A0: same cost class as occ_optimistic_read even after aborts seed PE.
         if self.specfence.policy.is_some_and(|p| p.is_thin_shell())
             && !self.specfence.ready_edges.was_queued(self.tx_idx)
         {
             return Ok(());
         }
-        // Same-spine optimistic_read cost class: empty PE → Mode(a)=Spec, no Fence meta.
-        // Not a plant_is_occ computer retreat (v9.3).
+        // Same-spine A0: empty PE → OptimisticRead, no Fence meta.
+        // Not a second OCC runtime (v9.3).
         if crate::specfence::specfence_cost_class_spec(
             crate::ConcurrencyMode::SpecFence,
             self.specfence.learner,
@@ -3287,6 +3310,9 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     self.mv_memory.record(tx_version, read_set, write_set);
                 // M3: learn process WŜ from this incarnation's writes (no residual publish).
                 // R1/R3: feed HotSet writer counts (H_w) from non-lazy writes only.
+                let thin_a0 = self.specfence.mode == crate::ConcurrencyMode::SpecFence
+                    && self.specfence.policy.is_some_and(|p| p.is_thin_shell())
+                    && !self.specfence.ready_edges.was_queued(tx_version.tx_idx);
                 if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
                     crate::specfence::admit::admit_seed_on_write_set(
                         self.specfence.ready_edges,
@@ -3299,8 +3325,10 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         &all_write_locs,
                         &effective_write_locs,
                     );
-                    // Learning is consumed by decide() — always observe HotSet / WŜ.
-                    if self.specfence.certificates.rem_legal(tx_version.tx_idx) {
+                    // U2: thin-shell A0 — D1 writer order only. No HotSet / B2 / wake tax.
+                    if thin_a0 {
+                        // fall through to flags / receipt
+                    } else if self.specfence.certificates.rem_legal(tx_version.tx_idx) {
                         let locs: Vec<_> = self.mv_memory.write_locations(tx_version.tx_idx);
                         self.specfence.rw_prior.observe_write_set(&locs, None);
                         for loc in &hotset_writer_locs {
@@ -3345,7 +3373,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 if wrote_new_location {
                     flags |= FinishExecFlags::WroteNewLocation;
                 }
-                if self.specfence.mode.uses_regions() {
+                if self.specfence.mode.uses_regions() && !thin_a0 {
                     let from_wait = self
                         .specfence
                         .should_wait_account(&self.mv_memory.regions, &tx.caller);

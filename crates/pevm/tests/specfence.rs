@@ -4142,3 +4142,28 @@ fn specfence_waw_chain_ordered_admit_independents_untaxed() {
         "independent senders must not Wait: {sf:?}"
     );
 }
+
+/// 3356896 collateral shape: 2-tx same-from empty 21k pairs stay A0.
+/// Thin-shell lazy-accumulate = CC-X1 commute; do not A1 the spine.
+#[test]
+fn specfence_same_from_21k_pairs_commute_a0() {
+    let mut txs = Vec::new();
+    for i in 0..12 {
+        let from = Address::from(U160::from(100 + i));
+        txs.push(transfer(from, Address::from(U160::from(200 + i)), 1));
+        txs.push(transfer(from, Address::from(U160::from(300 + i)), 2));
+    }
+    let storage = storage_for(400);
+    let (_, sf, pevm) = run_mode(ConcurrencyMode::SpecFence, &storage, txs);
+    let report = pevm.last_learn_report();
+    assert_eq!(sf.soft_wait_arms, 0, "Soft=0: {sf:?}");
+    assert!(
+        report.commute_skip + report.conflict_ignore + sf.commute_skip >= 4,
+        "CC-X1 commute or ignore must fire on same-from 21k pairs: report={report:?} {sf:?}"
+    );
+    let inc_gt0 = pevm.last_incarnations().iter().filter(|&&i| i > 0).count();
+    assert!(
+        inc_gt0 <= 10,
+        "same-from 21k pairs must not mass-reexec: inc>0={inc_gt0} {sf:?}"
+    );
+}
