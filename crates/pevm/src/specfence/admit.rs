@@ -16,7 +16,7 @@ use super::bayes::BayesMap;
 use super::feeder::{seed_known_stars, top_is_known_star};
 use super::learner::{InterBlockPrior, LiveLearner};
 use super::metrics::MetricsInner;
-use super::policy::{CohortKind, CostPolicy, THIN_A1_K};
+use super::policy::{CohortKind, CostPolicy, ORDER_WINDOW_K, THIN_A1_K};
 use super::producer_stage::ProducerStageTable;
 use super::ready_edge::ReadyEdgeTable;
 use super::wave::WaveParkTable;
@@ -632,11 +632,14 @@ fn seed_short_edges_after_publish(
         (call_n >= CALL_WAW_FLOOR && call_n < 8)
             || (call_n < CALL_WAW_FLOOR && pay_n >= 2 && pay_n < 8)
     });
+    // D1: record lazy + Data so 4→31 is visible even when tx4 is lazy-only.
+    for &loc in all_write_locs {
+        ready.note_location_writer(loc, writer);
+    }
     for &loc in all_write_locs {
         if !effective_locs.iter().any(|&l| l == loc) {
             continue;
         }
-        ready.note_location_writer(loc, writer);
         let has_earlier = ready.writers_of(loc).iter().any(|&w| w < writer);
         let later: &[TxIdx] = if loc == from_loc {
             &from_later
@@ -651,6 +654,13 @@ fn seed_short_edges_after_publish(
             .unwrap_or(has_earlier || hint_n >= 2);
         if !gate {
             continue;
+        }
+        // O1/O2: do not plant a long-spine hop the leftover EV already lost.
+        if let Some(p) = policy {
+            let n_pairs = p.pairs_of(loc).len().max(1);
+            if p.hops_to_plant(loc, n_pairs) == 0 && n_pairs > ORDER_WINDOW_K {
+                continue;
+            }
         }
         if let Some(p) = policy {
             p.promote_short_edge(loc, 0);

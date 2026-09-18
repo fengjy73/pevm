@@ -992,6 +992,16 @@ impl CostPolicy {
         hint_later: usize,
     ) -> bool {
         if self.is_promoted(location) {
+            let n_pairs = self
+                .short_chain
+                .get(&location)
+                .map(|c| c.len())
+                .unwrap_or(0);
+            // Promoted long thin spine: begin already demoted to A0. Do not
+            // re-gate mid-block (that rebuilt the 16-writer prepaid wall).
+            if n_pairs > ORDER_WINDOW_K && self.is_a0_majority_block() {
+                return self.hops_to_plant(location, n_pairs) > 0;
+            }
             return true;
         }
         if !has_earlier && hint_later < 2 {
@@ -1634,6 +1644,14 @@ mod tests {
         assert!(
             p.spine_ordered_loses(0x32be, 16),
             "O2: 16-writer prepaid must lose to one abort sample"
+        );
+        assert!(
+            !p.should_gate_short_after_write(0x32be, true, 0),
+            "O2: write-set must not re-gate a leftover-lose long spine"
+        );
+        assert!(
+            p.should_gate_short_after_write(0xedba, true, 0),
+            "O1: storage write-set still raises the short edge"
         );
     }
 

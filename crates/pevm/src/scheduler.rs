@@ -426,8 +426,8 @@ impl Scheduler {
     }
 
     /// After `refuse_admit` of `from`, run the next independent.
-    /// PC-W1: bag first (skip sleeping A1 heads). Then a short window and a
-    /// full-block scan so cores stay filled after the bag drains.
+    /// P3: bag first, then a short window. No full-block mutex scan — that
+    /// prepaid the thin A0 path worse than OCC abort. Waiters wake into the bag.
     fn try_fill_independent_after_refuse(
         &self,
         from: TxIdx,
@@ -465,18 +465,6 @@ impl Scheduler {
         };
         let end = from.saturating_add(WAVE_FILL_WINDOW).min(self.block_size);
         for cand in (from + 1)..end {
-            if let Some(task) = steal(cand) {
-                return Some(task);
-            }
-        }
-        // Fallback scan so a woken A1 successor is found if the bag missed it.
-        // Skip sleeping heads (PC-W1). Independents are usually bag-first.
-        for cand in end..self.block_size {
-            if let Some(task) = steal(cand) {
-                return Some(task);
-            }
-        }
-        for cand in 0..from {
             if let Some(task) = steal(cand) {
                 return Some(task);
             }

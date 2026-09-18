@@ -770,11 +770,27 @@ impl Pevm {
             // promoted ℓ. Skip HotSet decay + sketch on thin (not next-begin).
             let beneficiary = hash_deterministic(MemoryLocation::Basic(block_env.beneficiary));
             let ready_d1 = ready_edges.writer_order_snapshot();
-            let d1_orders = if ready_d1.iter().any(|(_, w)| w.len() >= 2) {
+            let mut d1_orders = if ready_d1.iter().any(|(_, w)| w.len() >= 2) {
                 ready_d1
             } else {
                 mv_writer_order_snapshot(&mv_memory, block_size, beneficiary)
             };
+            // Promoted-ℓ MV merge (lazy tx4 on Basic(0x32be) is off ready D1
+            // unless write-set recorded it). Cheap: only promoted locations.
+            for (loc, writers) in mv_writers_for_locs(
+                &mv_memory,
+                &self.cost_policy.promoted_locations(),
+                block_size,
+                beneficiary,
+            ) {
+                if let Some((_, w)) = d1_orders.iter_mut().find(|(l, _)| *l == loc) {
+                    w.extend(writers);
+                    w.sort_unstable();
+                    w.dedup();
+                } else {
+                    d1_orders.push((loc, writers));
+                }
+            }
             let thin = self.cost_policy.is_a0_majority_block();
             for (loc, writers) in &d1_orders {
                 if writers.len() < 2 {
@@ -843,16 +859,6 @@ impl Pevm {
                 .filter(|(_, w)| !crate::specfence::admit::is_wide_envelope_writer_set(&hints, w))
                 .cloned()
                 .collect();
-            let persist = if persist.iter().any(|(_, w)| w.len() >= 2) {
-                persist
-            } else {
-                mv_writers_for_locs(
-                    &mv_memory,
-                    &self.cost_policy.promoted_locations(),
-                    block_size,
-                    beneficiary,
-                )
-            };
             self.cost_policy.note_promoted_writer_orders(&persist);
             let mut d1_orders = d1_orders;
             for (loc, writers) in self.cost_policy.writer_orders_from_pairs() {
