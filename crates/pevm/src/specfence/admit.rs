@@ -752,6 +752,20 @@ fn location_successors(
     Vec::new()
 }
 
+/// True when `writers` is a wide empty-to / CallWaw envelope (not a hidden Basic).
+pub(crate) fn is_wide_envelope_writer_set(hints: &AccountHints, writers: &[TxIdx]) -> bool {
+    if writers.len() < 8 {
+        return false;
+    }
+    hints.to_accounts().any(|a| {
+        let t = hints.to_txs(&a);
+        t.len() >= 8 && writers.iter().all(|w| t.contains(w))
+    }) || hints.call_to_accounts().any(|a| {
+        let t = hints.call_to_txs(&a);
+        t.len() >= RAW_FANOUT_FLOOR && writers.iter().all(|w| t.contains(w))
+    })
+}
+
 /// L2: first EffectiveWAW abort → persist consecutive pairs on this ℓ.
 ///
 /// Do **not** insert ReadyEdges here. Mid-block insert races A0
@@ -1607,6 +1621,25 @@ mod tests {
         assert_eq!(n, 0, "C5: wide CallWaw stays A0 at thin begin, got {n}");
         assert!(ready.may_execute(31), "wide head stays runnable");
         assert!(ready.may_execute(66), "wide tail stays runnable");
+    }
+
+    #[test]
+    fn wide_envelope_writer_set_skips_empty_to_not_hidden_basic() {
+        let to = Address::repeat_byte(0x20);
+        let writers: Vec<TxIdx> = vec![
+            31, 66, 67, 69, 70, 93, 96, 103, 115, 131, 132, 135, 138, 141, 166, 171,
+        ];
+        let hints = AccountHints::from_to_txs(to, writers.clone());
+        assert!(
+            is_wide_envelope_writer_set(&hints, &writers),
+            "pure 0x209c envelope must not be persisted as a location chain"
+        );
+        let mut with_hot = writers.clone();
+        with_hot.insert(0, 4);
+        assert!(
+            !is_wide_envelope_writer_set(&hints, &with_hot),
+            "Basic(0x32be) writers 4∪0x209c are not a wide envelope"
+        );
     }
 
     #[test]
