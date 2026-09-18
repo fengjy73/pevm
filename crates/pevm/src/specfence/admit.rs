@@ -381,8 +381,9 @@ fn admit_seed_hint_short_edges(
 }
 
 /// L4/C5: reuse / measured prior → ReadyEdges on promoted ℓ (not a cohort).
-/// Thin: ≤`THIN_A1_K` locations, longest first. O1 windows long spines to
-/// `ORDER_WINDOW_K` hops (4→31→66); storage 14→16→17 stays fully ordered.
+/// Thin: ≤`THIN_A1_K` locations, longest first. O1: storage 14→16→17 stays
+/// fully ordered. Long Basic WAW is A0 at begin when leftover-aware EV
+/// loses (prefix-window + tail abort lost PRIMARY); O3 strengthens one hop.
 fn admit_seed_promoted_short_edges(
     ready: &ReadyEdgeTable,
     hints: &AccountHints,
@@ -404,6 +405,9 @@ fn admit_seed_promoted_short_edges(
     });
     let mut locs: Vec<(MemoryLocationHash, Vec<(TxIdx, TxIdx)>)> = by_loc.into_iter().collect();
     locs.sort_unstable_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+    // Drop zero-hop (demoted / leftover-lose) locs *before* the K-cap so a
+    // 16-writer Basic spine cannot evict storage 14→16→17.
+    locs.retain(|(loc, pairs)| policy.hops_to_plant(*loc, pairs.len()) > 0);
     if policy.is_a0_majority_block() && locs.len() > THIN_A1_K {
         locs.truncate(THIN_A1_K);
     }
@@ -1756,12 +1760,10 @@ mod tests {
             &HashSet::new(),
             None,
         );
-        assert!(n >= 2, "O1: reuse plants 4→31→66 (window), got {n}");
-        assert_eq!(ready.blocking_producer(31), Some(4));
-        assert_eq!(ready.blocking_producer(66), Some(31));
+        assert_eq!(n, 0, "O1/O2: long thin spine stays A0 at begin, got {n}");
         assert!(
-            ready.may_execute(67),
-            "O1: 67 stays A0 — not the full 16-writer serialize"
+            ready.may_execute(31) && ready.may_execute(66) && ready.may_execute(67),
+            "O1: no prepaid 4→31→66 — OCC abort is cheaper than prefix order"
         );
         assert!(ready.may_execute(4), "chain head stays runnable");
     }
@@ -1802,15 +1804,18 @@ mod tests {
             &HashSet::new(),
             None,
         );
-        assert_eq!(ready.blocking_producer(31), Some(4));
+        assert!(
+            ready.may_execute(31),
+            "O1/O2: long Basic spine must not consume a thin K slot"
+        );
         assert_eq!(ready.blocking_producer(16), Some(14));
         let extra_blocked = [11usize, 13, 19]
             .iter()
             .filter(|&&t| !ready.may_execute(t))
             .count();
         assert!(
-            extra_blocked <= 1 && n <= 3 + 2 + 1,
-            "C5: thin reuse plants ≤K locations (extras_blocked={extra_blocked} edges={n})"
+            extra_blocked <= 2 && n <= 2 + 1 + 1,
+            "C5: thin reuse plants ≤K locations after dropping the long spine (extras_blocked={extra_blocked} edges={n})"
         );
     }
 

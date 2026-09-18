@@ -620,22 +620,15 @@ impl Pevm {
                                     let next = self
                                         .try_execute(&mut vm, &scheduler, tx_version, None, None);
                                     if self.concurrency_mode == ConcurrencyMode::SpecFence {
-                                        // P1: A0 completions stamp. Wake only if this
-                                        // writer has a waiter (not "any gated in block").
+                                        // P1: always stamp. Wake only if this writer
+                                        // has waiters (insert-during-execute still wakes).
+                                        specfence.ready_edges.note_producer_done_stamp(done_idx);
                                         if specfence.ready_edges.has_known_waiters(done_idx) {
                                             if let Some(w) = wave_ref {
                                                 specfence
                                                     .ready_edges
                                                     .note_producer_done(done_idx, w);
-                                            } else {
-                                                specfence
-                                                    .ready_edges
-                                                    .note_producer_done_stamp(done_idx);
                                             }
-                                        } else {
-                                            specfence
-                                                .ready_edges
-                                                .note_producer_done_stamp(done_idx);
                                         }
                                     }
                                     next
@@ -772,10 +765,16 @@ impl Pevm {
         );
         if self.concurrency_mode == ConcurrencyMode::SpecFence {
             let end_t0 = Instant::now();
-            // P2: one D1 walk (PR22 did two). Thin HotSet only on ≥3-writer /
-            // promoted ℓ — 2-writer ERC-20 slots stay off the storm.
+            // P2: prefer live D1 (write-set already recorded). MV walk only
+            // when the ready table saw no writers. Thin HotSet: ≥3-writer /
+            // promoted ℓ. Skip HotSet decay + sketch on thin (not next-begin).
             let beneficiary = hash_deterministic(MemoryLocation::Basic(block_env.beneficiary));
-            let d1_orders = mv_writer_order_snapshot(&mv_memory, block_size, beneficiary);
+            let ready_d1 = ready_edges.writer_order_snapshot();
+            let d1_orders = if ready_d1.iter().any(|(_, w)| w.len() >= 2) {
+                ready_d1
+            } else {
+                mv_writer_order_snapshot(&mv_memory, block_size, beneficiary)
+            };
             let thin = self.cost_policy.is_a0_majority_block();
             for (loc, writers) in &d1_orders {
                 if writers.len() < 2 {
@@ -788,12 +787,16 @@ impl Pevm {
                     }
                 }
             }
-            self.hotset.end_block();
+            if !thin {
+                self.hotset.end_block();
+            }
             // P1: pack InterBlockPrior from live morph hat + top-ℓ (flip → higher α).
             let morph_hat = learner.morph_hat();
             let top = learner.pack_top_locations();
             let _alpha = self.inter_prior.end_block(morph_hat, top);
-            sketch.decay_warm_failures(|loc| learner.abort_rate_of(loc));
+            if !thin {
+                sketch.decay_warm_failures(|loc| learner.abort_rate_of(loc));
+            }
             metrics_inner.set_soft_wait_arms(dag.soft_arm_count());
             metrics_inner.set_sketch_hot_size(sketch.hot_size());
             self.last_process = process.snapshot(16);
@@ -840,7 +843,27 @@ impl Pevm {
                 .filter(|(_, w)| !crate::specfence::admit::is_wide_envelope_writer_set(&hints, w))
                 .cloned()
                 .collect();
+            let persist = if persist.iter().any(|(_, w)| w.len() >= 2) {
+                persist
+            } else {
+                mv_writers_for_locs(
+                    &mv_memory,
+                    &self.cost_policy.promoted_locations(),
+                    block_size,
+                    beneficiary,
+                )
+            };
             self.cost_policy.note_promoted_writer_orders(&persist);
+            let mut d1_orders = d1_orders;
+            for (loc, writers) in self.cost_policy.writer_orders_from_pairs() {
+                if let Some((_, w)) = d1_orders.iter_mut().find(|(l, _)| *l == loc) {
+                    w.extend(writers);
+                    w.sort_unstable();
+                    w.dedup();
+                } else {
+                    d1_orders.push((loc, writers));
+                }
+            }
             self.last_location_writers = d1_orders;
             let ready_w = ready_edges.ready_width_mean();
             let idle = ready_edges.idle_core_ns();
@@ -849,9 +872,6 @@ impl Pevm {
             if refuse_ns > 0 {
                 self.cost_policy.note_refuse_ns(refuse_ns);
                 metrics_inner.record_refuse_ns(refuse_ns);
-            } else if refuse > 0 {
-                // PROFILE Instant is off on the product path — still feed EV.
-                self.cost_policy.note_refuse_count(refuse);
             }
             let refuse_unit = if refuse == 0 {
                 0.0
@@ -2230,6 +2250,31 @@ pub fn execute_revm_sequential<S: Storage + Debug, C: PevmChain>(
         results.push(execution_result);
     }
     Ok(results)
+}
+
+/// Promoted-ℓ D1 only — cheaper than a full-location map when ready D1 is empty.
+fn mv_writers_for_locs(
+    mv_memory: &MvMemory,
+    locs: &[MemoryLocationHash],
+    block_size: usize,
+    beneficiary: MemoryLocationHash,
+) -> Vec<(MemoryLocationHash, Vec<TxIdx>)> {
+    if locs.is_empty() {
+        return Vec::new();
+    }
+    let want: HashSet<MemoryLocationHash> =
+        locs.iter().copied().filter(|&l| l != beneficiary).collect();
+    let mut map: HashMap<MemoryLocationHash, Vec<TxIdx>> = HashMap::new();
+    for tx in 0..block_size {
+        for loc in mv_memory.write_locations(tx) {
+            if want.contains(&loc) {
+                map.entry(loc).or_default().push(tx);
+            }
+        }
+    }
+    let mut out: Vec<_> = map.into_iter().filter(|(_, w)| w.len() >= 2).collect();
+    out.sort_by_key(|(loc, _)| *loc);
+    out
 }
 
 /// End-block D1 snapshot from MV (A0 skipped live DashMap writer order).

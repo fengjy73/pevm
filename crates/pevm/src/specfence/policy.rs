@@ -5,7 +5,8 @@
 //! to a second OCC runtime. Beta posteriors are **features**, not `decide()`
 //! authority. Decide is measured-ns EMA: keep A1 iff ĉ_A1 + δ < ĉ_A0.
 //!
-//! O1: long WAW is windowed (`ORDER_WINDOW_K` hops), not a full-spine serialize.
+//! O1: short WAW (≤`ORDER_WINDOW_K` hops) is fully ordered; long thin spines
+//! stay A0 at begin (leftover-aware EV) — not a prefix-window serialize.
 //! O2/L1: if ĉ_ordered_spine loses to abort EMA, demote that ℓ to A0.
 //!
 //! **L1 (thin / a0_majority_block):** default A0. Cold start may be A1=0.
@@ -416,8 +417,9 @@ impl CostPolicy {
     /// O1/O2: how many consecutive hops to plant on `ℓ`.
     ///
     /// Short chains (≤`ORDER_WINDOW_K`) plant all (storage 14→16→17).
-    /// Long spines never full-serialize on thin — window or demote to A0
-    /// when ĉ_ordered_spine (hops×refuse) loses to abort EMA.
+    /// Long thin spines: leftover-aware EV. Prefix-window + tail abort is
+    /// the worst of both worlds (PR22 PRIMARY miss). Plant 0 at begin when
+    /// A0-all wins; O3 may add one idle hop after an abort.
     pub(crate) fn hops_to_plant(&self, location: MemoryLocationHash, n_pairs: usize) -> usize {
         if n_pairs == 0 {
             return 0;
@@ -436,10 +438,25 @@ impl CostPolicy {
         if !self.is_a0_majority_block() {
             return n_pairs;
         }
-        // Long thin spine: never plant the full chain (PR22 PRIMARY miss).
-        // Window unless a prior block marked this ℓ demoted (measured prepaid lose).
+        if self.long_spine_window_loses(location, n_pairs) {
+            self.cost_ev_demote_optimistic
+                .fetch_add(1, Ordering::Relaxed);
+            return 0;
+        }
         self.cost_ev_keep_ordered.fetch_add(1, Ordering::Relaxed);
         ORDER_WINDOW_K
+    }
+
+    /// Leftover-aware: cost(W) = W·stall + (n−W)·abort vs cost(A0) = n·abort.
+    /// Prefix plant loses iff stall ≥ abort. Thin stall is the A1 prior — a
+    /// 16-writer wait-for is not 18µs of refuse; it is pred-execute overlap
+    /// loss, so thin long spines default to A0 (OCC abort).
+    fn long_spine_window_loses(&self, location: MemoryLocationHash, n_pairs: usize) -> bool {
+        if n_pairs <= ORDER_WINDOW_K {
+            return false;
+        }
+        self.spine_ordered_loses(location, n_pairs)
+            || self.spine_ordered_loses(location, ORDER_WINDOW_K)
     }
 
     /// ĉ_ordered_spine = hops × ĉ_A1 vs loc abort EMA (not hops×abort).
@@ -454,6 +471,12 @@ impl CostPolicy {
             .map(|s| s.mean)
             .unwrap_or_else(|| f64::from_bits(self.c_a1_snap_bits.load(Ordering::Relaxed)))
             .max(1.0);
+        // Thin: refuse prior understates wait-for-pred stall (31 blocked on 4).
+        let stall = if self.is_a0_majority_block() {
+            c_ord.max(PRIOR_C_A1_THIN_NS)
+        } else {
+            c_ord
+        };
         let c_abort = self
             .promoted
             .get(&location)
@@ -461,13 +484,38 @@ impl CostPolicy {
             .or_else(|| self.loc_reexec_ns.get(&location).map(|s| s.mean))
             .unwrap_or_else(|| f64::from_bits(self.c_a0_snap_bits.load(Ordering::Relaxed)))
             .max(1.0);
-        let ordered_spine = hops as f64 * c_ord;
-        ordered_spine + NS_DELTA >= c_abort
+        let leftover = hops.saturating_sub(1) as f64 * c_abort.max(PRIOR_C_A0_THIN_NS);
+        let ordered_spine = hops as f64 * stall + leftover;
+        ordered_spine + NS_DELTA >= c_abort * hops.max(1) as f64
     }
 
     #[inline]
     pub(crate) fn loc_demoted(&self, location: MemoryLocationHash) -> bool {
         self.promoted.get(&location).is_some_and(|s| s.demoted)
+    }
+
+    pub(crate) fn promoted_locations(&self) -> Vec<MemoryLocationHash> {
+        self.promoted.iter().map(|e| *e.key()).collect()
+    }
+
+    /// D1-shaped writer lists from stored short-edge pairs (edge_4_31 without MV walk).
+    pub(crate) fn writer_orders_from_pairs(&self) -> Vec<(MemoryLocationHash, Vec<TxIdx>)> {
+        let mut map: hashbrown::HashMap<MemoryLocationHash, Vec<TxIdx>> = hashbrown::HashMap::new();
+        for (loc, pred, succ) in self.promoted_short_pairs() {
+            let v = map.entry(loc).or_default();
+            v.push(pred);
+            v.push(succ);
+        }
+        let mut out: Vec<_> = map
+            .into_iter()
+            .map(|(loc, mut w)| {
+                w.sort_unstable();
+                w.dedup();
+                (loc, w)
+            })
+            .collect();
+        out.sort_by_key(|(loc, _)| *loc);
+        out
     }
 
     /// Stored consecutive pairs on `ℓ` (consensus order).
@@ -728,16 +776,6 @@ impl CostPolicy {
             return;
         }
         self.refuse_ns.fetch_add(ns, Ordering::Relaxed);
-    }
-
-    /// Product path: PROFILE Instant is off — hat prepaid from refuse count
-    /// so O2 can demote a long spine when abort_cf is 0.
-    pub(crate) fn note_refuse_count(&self, n: usize) {
-        if n == 0 || self.refuse_ns.load(Ordering::Relaxed) > 0 {
-            return;
-        }
-        let hat = (n as f64 * PRIOR_C_A1_THIN_NS) as u64;
-        self.refuse_ns.store(hat, Ordering::Relaxed);
     }
 
     /// L1: measured incarnation>0 execute ns (atomic; EMA at end-block / loc).
@@ -1131,12 +1169,21 @@ impl CostPolicy {
         } else {
             self.prepaid_lose_streak.store(0, Ordering::Relaxed);
         }
-        // L-E: abort_cf without prepaid → raise short-edge prior (do not decay).
+        // L-E: abort_cf without prepaid → raise *short* edges. Long spines
+        // that O2 demoted stay A0 — those aborts are the cheaper path.
         if abort_cf > prepaid {
+            let long: hashbrown::HashSet<MemoryLocationHash> = self
+                .short_chain
+                .iter()
+                .filter(|e| e.value().len() > ORDER_WINDOW_K)
+                .map(|e| *e.key())
+                .collect();
             for mut e in self.promoted.iter_mut() {
                 if e.measured {
                     e.hits = e.hits.saturating_add(1);
-                    e.demoted = false;
+                    if !long.contains(e.key()) {
+                        e.demoted = false;
+                    }
                 }
             }
         }
@@ -1576,8 +1623,8 @@ mod tests {
         p.note_short_pair(0xedba, 16, 17);
         assert_eq!(
             p.hops_to_plant(0x32be, 4),
-            ORDER_WINDOW_K,
-            "O1: long Basic WAW plants a window, not the full chain"
+            0,
+            "O1/O2: leftover-aware EV demotes long thin spine to A0"
         );
         assert_eq!(
             p.hops_to_plant(0xedba, 2),
