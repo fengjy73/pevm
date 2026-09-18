@@ -685,56 +685,106 @@ fn from_successors(
     from_txs.iter().copied().filter(|&t| t > writer).collect()
 }
 
-#[allow(dead_code)]
-fn later_hint_successors(
+/// Later writers of `location` that hints can name without a wide CallWaw star.
+///
+/// Account-location consecutive only:
+/// - `ℓ = Basic(from)` → later same-from
+/// - `ℓ = Basic(to)` → later same `to`
+/// - hidden ℓ + empty-to → later empty-to of that `to` (0x209c → Basic(0x32be))
+/// - hidden ℓ + short CallWaw (3..=7) → later calldata of that `to` (14→16→17)
+/// Wide CallWaw / RAW fans stay empty — different slots must not serialize.
+fn location_successors(
     hints: &AccountHints,
+    location: MemoryLocationHash,
+    writer: TxIdx,
     from: Address,
     to: Option<Address>,
-    writer: TxIdx,
-    from_loc: MemoryLocationHash,
-    effective_locs: &[MemoryLocationHash],
 ) -> Vec<TxIdx> {
-    let mut later = envelope_successors(hints, to, writer);
-    later.extend(from_successors(
-        hints,
-        from,
-        writer,
-        from_loc,
-        effective_locs,
-    ));
-    later.sort_unstable();
-    later.dedup();
-    later
+    let from_loc = hash_deterministic(MemoryLocation::Basic(from));
+    if location == from_loc {
+        return hints
+            .from_txs(&from)
+            .iter()
+            .copied()
+            .filter(|&t| t > writer)
+            .collect();
+    }
+    let Some(to) = to else {
+        return Vec::new();
+    };
+    let to_loc = hash_deterministic(MemoryLocation::Basic(to));
+    if location == to_loc {
+        return hints
+            .to_txs(&to)
+            .iter()
+            .copied()
+            .filter(|&t| t > writer)
+            .collect();
+    }
+    let call_n = hints.call_to_txs(&to).len();
+    if call_n >= RAW_FANOUT_FLOOR {
+        return Vec::new();
+    }
+    if call_n >= CALL_WAW_FLOOR {
+        if call_n >= 8 {
+            return Vec::new();
+        }
+        return hints
+            .call_to_txs(&to)
+            .iter()
+            .copied()
+            .filter(|&t| t > writer)
+            .collect();
+    }
+    if hints.is_empty_calldata(writer) {
+        return hints
+            .to_txs(&to)
+            .iter()
+            .copied()
+            .filter(|&t| t > writer)
+            .collect();
+    }
+    Vec::new()
 }
 
-/// L2: first EffectiveWAW abort → short-edge the immediate remaining successor.
-#[allow(dead_code)]
-pub(crate) fn admit_seed_next_successor(
+/// L2: first EffectiveWAW abort → OrderedAdmit on this ℓ.
+///
+/// The aborting tx is between incarnations (`clear_started`). Idle later
+/// writers of the **same location** get consecutive short edges. In-flight
+/// successors stay OCC this incarnation (no mid-execute ReadyEdge insert).
+pub(crate) fn admit_seed_after_effective_abort(
     ready: &ReadyEdgeTable,
     hints: &AccountHints,
     policy: Option<&CostPolicy>,
     consumer: TxIdx,
     producer: TxIdx,
     location: MemoryLocationHash,
-    from: Address,
-    to: Option<Address>,
 ) {
-    if producer >= consumer {
-        return;
-    }
-    ready.note_raw_producer(location, producer);
-    ready.note_location_writer(location, producer);
+    let from = hints.from_of(consumer);
+    let to = hints.to_of(consumer);
+    ready.note_raw_producer(location, producer.min(consumer));
+    ready.note_location_writer(location, producer.min(consumer));
     ready.note_location_writer(location, consumer);
-    ready.note_consumer_on(consumer, producer, Some(location));
-    if let Some(p) = policy {
-        p.note_short_pair(location, producer, consumer);
-        p.note_short_edge_admit();
-    }
-    let later = later_hint_successors(hints, from, to, consumer, 0, &[]);
-    if let Some(&succ) = later.first() {
-        ready.note_consumer_on_if_idle(succ, consumer, Some(location));
+    if producer < consumer {
+        ready.clear_started(consumer);
+        ready.note_consumer_on(consumer, producer, Some(location));
         if let Some(p) = policy {
-            p.note_short_pair(location, consumer, succ);
+            p.note_short_pair(location, producer, consumer);
+            p.note_short_edge_admit();
+        }
+    }
+    let later = location_successors(hints, location, consumer, from, to);
+    let mut pred = consumer;
+    for succ in later {
+        if ready.is_started(succ) {
+            continue;
+        }
+        if ready.note_consumer_on_if_idle(succ, pred, Some(location)) {
+            if let Some(p) = policy {
+                p.note_short_pair(location, pred, succ);
+                p.note_short_edge_admit();
+            }
+            pred = succ;
         }
     }
 }
@@ -1569,5 +1619,102 @@ mod tests {
         assert_eq!(n, 0, "C5: wide CallWaw stays A0 at thin begin, got {n}");
         assert!(ready.may_execute(31), "wide head stays runnable");
         assert!(ready.may_execute(66), "wide tail stays runnable");
+    }
+
+    #[test]
+    fn abort_seeds_idle_hidden_basic_chain() {
+        let ready = ReadyEdgeTable::new();
+        let policy = policy_for(176);
+        let to = Address::repeat_byte(0x20);
+        let loc = 0x32be_u64;
+        let hints = AccountHints::from_to_txs(to, vec![31, 66, 67, 69]);
+        policy.promote_short_edge(loc, 0);
+        admit_seed_after_effective_abort(&ready, &hints, Some(&policy), 31, 4, loc);
+        assert_eq!(
+            ready.blocking_producer(31),
+            Some(4),
+            "C1: aborting 31 waits on 4 for reexec"
+        );
+        assert_eq!(
+            ready.blocking_producer(66),
+            Some(31),
+            "C1: idle 31→66 on Basic(0x32be), not envelope star"
+        );
+        assert_eq!(ready.blocking_producer(67), Some(66));
+        assert_eq!(ready.blocking_producer(69), Some(67));
+        assert!(
+            policy
+                .promoted_short_pairs()
+                .iter()
+                .any(|&(l, p, s)| l == loc && p == 4 && s == 31),
+            "abort must persist 4→31"
+        );
+    }
+
+    #[test]
+    fn abort_skips_started_successor() {
+        let ready = ReadyEdgeTable::new();
+        let to = Address::repeat_byte(0x20);
+        let loc = 0x32be_u64;
+        let hints = AccountHints::from_to_txs(to, vec![31, 66, 67]);
+        ready.note_started(66);
+        admit_seed_after_effective_abort(&ready, &hints, None, 31, 4, loc);
+        assert!(
+            ready.may_execute(66),
+            "in-flight 66 stays OCC this incarnation"
+        );
+        assert_eq!(
+            ready.blocking_producer(67),
+            Some(31),
+            "idle tail still consecutive-admitted"
+        );
+    }
+
+    #[test]
+    fn abort_does_not_chain_wide_callwaw() {
+        let ready = ReadyEdgeTable::new();
+        let token = Address::repeat_byte(0xaa);
+        let loc = 0xabc_u64;
+        let hints = AccountHints::from_call_to_txs(token, (0..16).collect());
+        admit_seed_after_effective_abort(&ready, &hints, None, 3, 1, loc);
+        assert_eq!(ready.blocking_producer(3), Some(1));
+        assert!(
+            ready.may_execute(4) && ready.may_execute(15),
+            "C5: wide CallWaw must not serialize ERC-20 slots"
+        );
+    }
+
+    #[test]
+    fn thin_begin_reuses_main_chain_pairs() {
+        let ready = ReadyEdgeTable::new();
+        let stages = ProducerStageTable::new();
+        let learner = LiveLearner::new();
+        learner.begin_block(MorphWeights::default());
+        let bayes = BayesMap::new();
+        let prior = InterBlockPrior::new();
+        let policy = policy_for(176);
+        policy.promote_short_edge(0x32be, 40_000);
+        policy.note_short_pair(0x32be, 4, 31);
+        policy.note_short_pair(0x32be, 31, 66);
+        policy.note_short_pair(0x32be, 66, 67);
+        policy.end_block_learn();
+        policy.begin_block(176);
+        let n = admit_seed_begin_block(
+            &ready,
+            &stages,
+            &learner,
+            &bayes,
+            &prior,
+            &AccountHints::default(),
+            Address::ZERO,
+            &policy,
+            &HashSet::new(),
+            None,
+        );
+        assert!(n >= 3, "L4: reuse must plant 4→31→66→67, got {n}");
+        assert_eq!(ready.blocking_producer(31), Some(4));
+        assert_eq!(ready.blocking_producer(66), Some(31));
+        assert_eq!(ready.blocking_producer(67), Some(66));
+        assert!(ready.may_execute(4), "chain head stays runnable");
     }
 }

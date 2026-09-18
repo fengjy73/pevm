@@ -2,6 +2,10 @@
 //! baseline on Ethereum mainnet block 3356896 (Soft=0). Compare is measurement
 //! only — not a protocol fork.
 //!
+//! PRIMARY wall is the **learned** SpecFence state: one `Pevm` reused across
+//! iters. Reports cold iter0 and reuse median (iters 1..N-1).
+//! `SPECFENCE_COLD_EACH_ITER=1` restores new-Pevm-per-iter (cold-only).
+//!
 //! ```
 //! SPECFENCE_COMPARE_ITERS=5 cargo run -p pevm --release \
 //!   --config 'profile.release.lto=false' --example specfence_3356896_compare
@@ -30,7 +34,7 @@ use serde::Serialize;
 
 const BLOCK: u64 = 3_356_896;
 const DEFAULT_CORES: usize = 8;
-const DEFAULT_ITERS: usize = 3;
+const DEFAULT_ITERS: usize = 5;
 
 /// Tip-DAG independents that PR15 taxed at begin_block (same-from lazy + dual empty-to).
 const TAXED_INDEP: &[usize] = &[
@@ -74,6 +78,9 @@ fn n_tx(block: &Block<<PevmEthereum as PevmChain>::Transaction>) -> usize {
 }
 
 fn median(mut vals: Vec<f64>) -> f64 {
+    if vals.is_empty() {
+        return 0.0;
+    }
     vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
     vals[vals.len() / 2]
 }
@@ -119,6 +126,18 @@ struct IterRow {
     edge_4_31: bool,
 }
 
+#[derive(Serialize)]
+struct CompareSummary {
+    occ_median_ms: f64,
+    sf_cold_ms: Option<f64>,
+    sf_reuse_median_ms: Option<f64>,
+    sf_all_median_ms: f64,
+    primary_sf_ms: f64,
+    primary_is_reuse: bool,
+    sf_le_occ: bool,
+    soft: u8,
+}
+
 fn inc_gt0_in(incs: &[usize], set: &[usize]) -> Vec<usize> {
     set.iter()
         .copied()
@@ -135,6 +154,124 @@ fn writers_have_4_31(orders: &[(u64, Vec<usize>)]) -> bool {
             _ => false,
         }
     })
+}
+
+fn run_once(
+    pevm: &mut Pevm,
+    mode_name: &str,
+    i: usize,
+    chain: &PevmEthereum,
+    storage: &InMemoryStorage,
+    block: &Block<<PevmEthereum as PevmChain>::Transaction>,
+    cores_nz: NonZeroUsize,
+    n: usize,
+) -> IterRow {
+    let t0 = Instant::now();
+    let result = pevm.execute(chain, storage, block, cores_nz, false);
+    let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    match result {
+        Ok(_) => {
+            let m = pevm.last_specfence_metrics();
+            let incs = pevm.last_incarnations().to_vec();
+            let begin = pevm.last_begin_blocked().to_vec();
+            let taxed: Vec<usize> = begin
+                .iter()
+                .copied()
+                .filter(|t| TAXED_INDEP.contains(t))
+                .collect();
+            let edge_4_31 = writers_have_4_31(pevm.last_location_writers());
+            let learn = pevm.last_learn_report().clone();
+            let off_edge: Vec<usize> = incs
+                .iter()
+                .enumerate()
+                .filter(|&(t, inc)| {
+                    *inc > 0
+                        && !MAIN_CHAIN.contains(&t)
+                        && !STORAGE_141617.contains(&t)
+                        && ![20, 109, 149].contains(&t)
+                })
+                .map(|(t, _)| t)
+                .collect();
+            println!(
+                "  {mode_name}[{i}] ok wall_ms={wall_ms:.3} tps={:.0} occ_aborts={} inc>0={} reexec={} refuse_admit={} wait_for_dependency={} soft_wait_arms={} idle_ns={} ready_width={:.2} a1={} a0_cohorts={} edge_oa={} edge_or={} refuse_ns={} reexec_ns={} prepaid_ns={} abort_cf_ns={} prior_decay={} a0_maj={} ev_keep={} ev_demote={} commute={} batch={} d1_prom={} d1_ign={} taxed_begin={} edge_4_31={} unfenced_reexec={} main_inc={:?} storage_inc={:?} admit_seed_ns={} end_block_ns={}",
+                n as f64 / (wall_ms / 1000.0),
+                m.occ_aborts,
+                m.incarnation_gt0,
+                m.reexec_entries,
+                m.refuse_admit,
+                m.wait_for_dependency,
+                m.soft_wait_arms,
+                m.idle_core_ns,
+                m.ready_width_mean,
+                m.a1_cohorts,
+                m.a0_cohorts,
+                m.edge_ordered_admit,
+                m.edge_optimistic_read,
+                m.refuse_ns,
+                m.reexec_ns,
+                learn.prepaid_ns,
+                learn.abort_cf_ns,
+                learn.prior_decay,
+                m.a0_majority_block,
+                m.cost_ev_keep_ordered,
+                m.cost_ev_demote_optimistic,
+                m.commute_skip,
+                m.batch_repair,
+                m.conflict_promote,
+                m.conflict_ignore,
+                taxed.len(),
+                edge_4_31,
+                m.unfenced_reexec,
+                inc_gt0_in(&incs, MAIN_CHAIN),
+                inc_gt0_in(&incs, STORAGE_141617),
+                m.admit_seed_begin_ns,
+                learn.end_block_ns
+            );
+            IterRow {
+                mode: mode_name.to_string(),
+                i,
+                wall_ms,
+                occ_aborts: m.occ_aborts,
+                refuse_admit: m.refuse_admit,
+                wait_for_dependency: m.wait_for_dependency,
+                wait_for_full_abort: m.wait_for_full_abort,
+                soft_wait_arms: m.soft_wait_arms,
+                incarnation_gt0: m.incarnation_gt0,
+                reexec_entries: m.reexec_entries,
+                unfenced_reexec: m.unfenced_reexec,
+                ready_width_mean: m.ready_width_mean,
+                idle_core_ns: m.idle_core_ns,
+                a1_cohorts: m.a1_cohorts,
+                a0_cohorts: m.a0_cohorts,
+                edge_ordered_admit: m.edge_ordered_admit,
+                edge_optimistic_read: m.edge_optimistic_read,
+                refuse_ns: m.refuse_ns,
+                reexec_ns: m.reexec_ns,
+                a0_majority_block: m.a0_majority_block,
+                cost_ev_keep_ordered: m.cost_ev_keep_ordered,
+                cost_ev_demote_optimistic: m.cost_ev_demote_optimistic,
+                commute_skip: m.commute_skip,
+                batch_repair: m.batch_repair,
+                conflict_promote: m.conflict_promote,
+                conflict_ignore: m.conflict_ignore,
+                prepaid_ns: learn.prepaid_ns,
+                abort_cf_ns: learn.abort_cf_ns,
+                prior_decay: learn.prior_decay,
+                admit_seed_begin_ns: m.admit_seed_begin_ns,
+                end_block_ns: learn.end_block_ns,
+                begin_blocked: begin,
+                taxed_indep_blocked: taxed,
+                main_inc_gt0: inc_gt0_in(&incs, MAIN_CHAIN),
+                storage_inc_gt0: inc_gt0_in(&incs, STORAGE_141617),
+                off_edge_inc_gt0: off_edge,
+                edge_4_31,
+            }
+        }
+        Err(e) => {
+            eprintln!("  {mode_name}[{i}] ERROR {e:?}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn main() {
@@ -165,9 +302,13 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_ITERS)
         .max(1);
+    let cold_each = std::env::var("SPECFENCE_COLD_EACH_ITER").is_ok();
     let cores_nz = NonZeroUsize::new(cores.max(1)).unwrap();
     let n = n_tx(&block);
-    println!("block={BLOCK} n={n} cores={cores} iters={iters} Soft=0");
+    println!(
+        "block={BLOCK} n={n} cores={cores} iters={iters} Soft=0 reuse_sf={} (PRIMARY=learned)",
+        !cold_each
+    );
 
     let mut rows: Vec<IterRow> = Vec::with_capacity(iters * 2);
     let mut occ_walls = Vec::new();
@@ -175,211 +316,125 @@ fn main() {
     let mut last_occ = None;
     let mut last_sf = None;
 
+    let mut occ = Pevm::with_concurrency_mode(ConcurrencyMode::Occ);
+    let mut sf = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
+    sf.reset_heat();
+    sf.reset_inter_prior();
+
     // Interleave OCC / SpecFence so CPU warmup does not gift one mode
     // a colder first-half (measurement only — not a protocol fork).
     for i in 0..iters {
-        for mode_name in ["occ", "specfence"] {
-            let mode = if mode_name == "occ" {
-                ConcurrencyMode::Occ
-            } else {
-                ConcurrencyMode::SpecFence
-            };
-            let mut pevm = Pevm::with_concurrency_mode(mode);
-            pevm.reset_heat();
-            pevm.reset_inter_prior();
-            let t0 = Instant::now();
-            let result = pevm.execute(&chain, &storage, &block, cores_nz, false);
-            let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            match result {
-                Ok(_) => {
-                    let m = pevm.last_specfence_metrics();
-                    let incs = pevm.last_incarnations().to_vec();
-                    let begin = pevm.last_begin_blocked().to_vec();
-                    let taxed: Vec<usize> = begin
-                        .iter()
-                        .copied()
-                        .filter(|t| TAXED_INDEP.contains(t))
-                        .collect();
-                    let edge_4_31 = writers_have_4_31(pevm.last_location_writers());
-                    let learn = pevm.last_learn_report().clone();
-                    let off_edge: Vec<usize> = incs
-                        .iter()
-                        .enumerate()
-                        .filter(|&(t, inc)| {
-                            *inc > 0
-                                && !MAIN_CHAIN.contains(&t)
-                                && !STORAGE_141617.contains(&t)
-                                && ![20, 109, 149].contains(&t)
-                        })
-                        .map(|(t, _)| t)
-                        .collect();
-                    println!(
-                        "  {mode_name}[{i}] ok wall_ms={wall_ms:.3} tps={:.0} occ_aborts={} inc>0={} reexec={} refuse_admit={} wait_for_dependency={} soft_wait_arms={} idle_ns={} ready_width={:.2} a1={} a0_cohorts={} edge_oa={} edge_or={} refuse_ns={} reexec_ns={} prepaid_ns={} abort_cf_ns={} prior_decay={} a0_maj={} ev_keep={} ev_demote={} commute={} batch={} d1_prom={} d1_ign={} taxed_begin={} edge_4_31={} unfenced_reexec={} admit_seed_ns={} end_block_ns={}",
-                        n as f64 / (wall_ms / 1000.0),
-                        m.occ_aborts,
-                        m.incarnation_gt0,
-                        m.reexec_entries,
-                        m.refuse_admit,
-                        m.wait_for_dependency,
-                        m.soft_wait_arms,
-                        m.idle_core_ns,
-                        m.ready_width_mean,
-                        m.a1_cohorts,
-                        m.a0_cohorts,
-                        m.edge_ordered_admit,
-                        m.edge_optimistic_read,
-                        m.refuse_ns,
-                        m.reexec_ns,
-                        learn.prepaid_ns,
-                        learn.abort_cf_ns,
-                        learn.prior_decay,
-                        m.a0_majority_block,
-                        m.cost_ev_keep_ordered,
-                        m.cost_ev_demote_optimistic,
-                        m.commute_skip,
-                        m.batch_repair,
-                        m.conflict_promote,
-                        m.conflict_ignore,
-                        taxed.len(),
-                        edge_4_31,
-                        m.unfenced_reexec,
-                        m.admit_seed_begin_ns,
-                        learn.end_block_ns
-                    );
-                    let row = IterRow {
-                        mode: mode_name.to_string(),
-                        i,
-                        wall_ms,
-                        occ_aborts: m.occ_aborts,
-                        refuse_admit: m.refuse_admit,
-                        wait_for_dependency: m.wait_for_dependency,
-                        wait_for_full_abort: m.wait_for_full_abort,
-                        soft_wait_arms: m.soft_wait_arms,
-                        incarnation_gt0: m.incarnation_gt0,
-                        reexec_entries: m.reexec_entries,
-                        unfenced_reexec: m.unfenced_reexec,
-                        ready_width_mean: m.ready_width_mean,
-                        idle_core_ns: m.idle_core_ns,
-                        a1_cohorts: m.a1_cohorts,
-                        a0_cohorts: m.a0_cohorts,
-                        edge_ordered_admit: m.edge_ordered_admit,
-                        edge_optimistic_read: m.edge_optimistic_read,
-                        refuse_ns: m.refuse_ns,
-                        reexec_ns: m.reexec_ns,
-                        a0_majority_block: m.a0_majority_block,
-                        cost_ev_keep_ordered: m.cost_ev_keep_ordered,
-                        cost_ev_demote_optimistic: m.cost_ev_demote_optimistic,
-                        commute_skip: m.commute_skip,
-                        batch_repair: m.batch_repair,
-                        conflict_promote: m.conflict_promote,
-                        conflict_ignore: m.conflict_ignore,
-                        prepaid_ns: learn.prepaid_ns,
-                        abort_cf_ns: learn.abort_cf_ns,
-                        prior_decay: learn.prior_decay,
-                        admit_seed_begin_ns: m.admit_seed_begin_ns,
-                        end_block_ns: learn.end_block_ns,
-                        begin_blocked: begin,
-                        taxed_indep_blocked: taxed,
-                        main_inc_gt0: inc_gt0_in(&incs, MAIN_CHAIN),
-                        storage_inc_gt0: inc_gt0_in(&incs, STORAGE_141617),
-                        off_edge_inc_gt0: off_edge,
-                        edge_4_31,
-                    };
-                    if mode_name == "occ" {
-                        occ_walls.push(wall_ms);
-                        last_occ = Some(m.clone());
-                    } else {
-                        sf_walls.push(wall_ms);
-                        last_sf = Some(m.clone());
-                    }
-                    rows.push(row);
-                }
-                Err(e) => {
-                    eprintln!("  {mode_name}[{i}] ERROR {e:?}");
-                    std::process::exit(1);
-                }
-            }
+        occ = Pevm::with_concurrency_mode(ConcurrencyMode::Occ);
+        let occ_row = run_once(&mut occ, "occ", i, &chain, &storage, &block, cores_nz, n);
+        occ_walls.push(occ_row.wall_ms);
+        last_occ = Some(occ_row.occ_aborts);
+        rows.push(occ_row);
+
+        if cold_each {
+            sf = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
+            sf.reset_heat();
+            sf.reset_inter_prior();
         }
-    }
-    for (mode_name, walls, last) in [
-        ("occ", occ_walls.clone(), last_occ),
-        ("specfence", sf_walls.clone(), last_sf),
-    ] {
-        if let Some(m) = last {
-            println!(
-                "  {mode_name} median_wall_ms={:.3} last refuse_admit={} inc>0={} reexec={} wait_for_dependency={} occ_aborts={} soft_wait_arms={} idle_ns={} ready_width={:.2} edge_oa={} edge_or={} a0_maj={} commute={} batch={} admit_seed_ns={}",
-                median(walls),
-                m.refuse_admit,
-                m.incarnation_gt0,
-                m.reexec_entries,
-                m.wait_for_dependency,
-                m.occ_aborts,
-                m.soft_wait_arms,
-                m.idle_core_ns,
-                m.ready_width_mean,
-                m.edge_ordered_admit,
-                m.edge_optimistic_read,
-                m.a0_majority_block,
-                m.commute_skip,
-                m.batch_repair,
-                m.admit_seed_begin_ns
-            );
-        }
+        let sf_row = run_once(&mut sf, "specfence", i, &chain, &storage, &block, cores_nz, n);
+        sf_walls.push(sf_row.wall_ms);
+        last_sf = Some((
+            sf_row.refuse_admit,
+            sf_row.incarnation_gt0,
+            sf_row.reexec_entries,
+            sf_row.wait_for_dependency,
+            sf_row.occ_aborts,
+            sf_row.soft_wait_arms,
+            sf_row.idle_core_ns,
+            sf_row.ready_width_mean,
+            sf_row.edge_ordered_admit,
+            sf_row.edge_optimistic_read,
+            sf_row.a0_majority_block,
+            sf_row.commute_skip,
+            sf_row.batch_repair,
+            sf_row.admit_seed_begin_ns,
+            sf_row.unfenced_reexec,
+            sf_row.a1_cohorts,
+        ));
+        rows.push(sf_row);
     }
 
-    if !occ_walls.is_empty() && !sf_walls.is_empty() {
-        let occ_med = median(occ_walls);
-        let sf_med = median(sf_walls);
+    let occ_med = median(occ_walls.clone());
+    let sf_all_med = median(sf_walls.clone());
+    let sf_cold = sf_walls.first().copied();
+    let sf_reuse_med = if sf_walls.len() >= 2 {
+        Some(median(sf_walls[1..].to_vec()))
+    } else {
+        None
+    };
+    let primary_is_reuse = !cold_each && sf_reuse_med.is_some();
+    let primary_sf = if primary_is_reuse {
+        sf_reuse_med.unwrap()
+    } else {
+        sf_all_med
+    };
+    let sf_le_occ = primary_sf <= occ_med + 1e-9;
+
+    if let Some(aborts) = last_occ {
+        println!("  occ median_wall_ms={occ_med:.3} last occ_aborts={aborts}");
+    }
+    if let Some(m) = last_sf {
         println!(
-            "summary Soft=0 occ_median_ms={occ_med:.3} sf_median_ms={sf_med:.3} sf_le_occ={}",
-            sf_med <= occ_med + 1e-9
+            "  specfence all_median_ms={sf_all_med:.3} cold_ms={:.3} reuse_median_ms={} last refuse_admit={} inc>0={} reexec={} wait_for_dependency={} occ_aborts={} soft_wait_arms={} idle_ns={} ready_width={:.2} edge_oa={} edge_or={} a0_maj={} commute={} batch={} admit_seed_ns={} unfenced={} a1={}",
+            sf_cold.unwrap_or(0.0),
+            sf_reuse_med
+                .map(|v| format!("{v:.3}"))
+                .unwrap_or_else(|| "n/a".into()),
+            m.0,
+            m.1,
+            m.2,
+            m.3,
+            m.4,
+            m.5,
+            m.6,
+            m.7,
+            m.8,
+            m.9,
+            m.10,
+            m.11,
+            m.12,
+            m.13,
+            m.14,
+            m.15
         );
     }
 
-    // L4: same-Pevm reuse (prior kept). Default interleaved path resets each iter.
-    if std::env::var("SPECFENCE_REUSE_SF").is_ok() {
-        let reuse_n = std::env::var("SPECFENCE_REUSE_ITERS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(3)
-            .max(1);
-        let mut pevm = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
-        pevm.reset_heat();
-        pevm.reset_inter_prior();
-        println!("reuse_sf Soft=0 n={reuse_n} (same Pevm, prior kept after iter 0)");
-        for i in 0..reuse_n {
-            let t0 = Instant::now();
-            let result = pevm.execute(&chain, &storage, &block, cores_nz, false);
-            let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            match result {
-                Ok(_) => {
-                    let m = pevm.last_specfence_metrics();
-                    let learn = pevm.last_learn_report();
-                    println!(
-                        "  reuse[{i}] wall_ms={wall_ms:.3} a1={} edge_oa={} unfenced={} ev_keep={} ev_demote={} d1_prom={} commute={} end_block_ns={}",
-                        m.a1_cohorts,
-                        m.edge_ordered_admit,
-                        m.unfenced_reexec,
-                        m.cost_ev_keep_ordered,
-                        m.cost_ev_demote_optimistic,
-                        m.conflict_promote,
-                        m.commute_skip,
-                        learn.end_block_ns
-                    );
-                }
-                Err(e) => {
-                    eprintln!("  reuse[{i}] ERROR {e:?}");
-                    std::process::exit(1);
-                }
-            }
-        }
-    }
+    println!(
+        "summary Soft=0 occ_median_ms={occ_med:.3} sf_cold_ms={} sf_reuse_median_ms={} primary_sf_ms={primary_sf:.3} primary={} sf_le_occ={sf_le_occ}",
+        sf_cold
+            .map(|v| format!("{v:.3}"))
+            .unwrap_or_else(|| "n/a".into()),
+        sf_reuse_med
+            .map(|v| format!("{v:.3}"))
+            .unwrap_or_else(|| "n/a".into()),
+        if primary_is_reuse { "reuse" } else { "cold" }
+    );
+
+    let summary = CompareSummary {
+        occ_median_ms: occ_med,
+        sf_cold_ms: sf_cold,
+        sf_reuse_median_ms: sf_reuse_med,
+        sf_all_median_ms: sf_all_med,
+        primary_sf_ms: primary_sf,
+        primary_is_reuse,
+        sf_le_occ,
+        soft: 0,
+    };
 
     if let Ok(path) = std::env::var("SPECFENCE_COMPARE_JSON") {
         let f = File::create(&path).expect("compare json");
-        serde_json::to_writer_pretty(f, &rows).expect("write json");
+        serde_json::to_writer_pretty(f, &serde_json::json!({"rows": rows, "summary": summary}))
+            .expect("write json");
         println!("wrote {path}");
     } else {
-        println!("{}", serde_json::to_string_pretty(&rows).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({"rows": rows, "summary": summary}))
+                .unwrap()
+        );
     }
 }

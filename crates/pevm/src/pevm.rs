@@ -834,6 +834,12 @@ impl Pevm {
                     }
                 }
             }
+            // Post-publish: persist consecutive D1 pairs on promoted ℓ
+            // (4→31→66→… on Basic(0x32be)). No mid-execute ReadyEdge insert.
+            let beneficiary = hash_deterministic(MemoryLocation::Basic(block_env.beneficiary));
+            let d1_orders = mv_writer_order_snapshot(&mv_memory, block_size, beneficiary);
+            self.cost_policy.note_promoted_writer_orders(&d1_orders);
+            self.last_location_writers = d1_orders;
             let ready_w = ready_edges.ready_width_mean();
             let idle = ready_edges.idle_core_ns();
             let refuse = ready_edges.refuse_count();
@@ -875,10 +881,6 @@ impl Pevm {
             );
             self.last_learn_report = report;
             self.last_incarnations = incs;
-            // D1 compare snapshot from MV (covers A0 writes that skip live DashMap).
-            let beneficiary = hash_deterministic(MemoryLocation::Basic(block_env.beneficiary));
-            self.last_location_writers =
-                mv_writer_order_snapshot(&mv_memory, block_size, beneficiary);
         } else {
             self.last_process = ExecProcessSnapshot::default();
             self.last_learn_report = LearnReport::default();
