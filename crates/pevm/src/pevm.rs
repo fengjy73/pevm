@@ -490,29 +490,33 @@ impl Pevm {
             // Bayes → admit_seed before any Execute (v9.1). Known stars keep
             // PE even on quiet morph (M4). Truly cold seeds nothing.
             self.cost_policy.begin_block(block_size);
-            let contracts = collect_contracts(storage, &hints);
-            let seed_t0 = Instant::now();
-            let _ = crate::specfence::admit::admit_seed_begin_block(
-                &ready_edges,
-                &producer_stages,
-                &learner,
-                &self.bayes,
-                &self.inter_prior,
-                &hints,
-                block_env.beneficiary,
-                &self.cost_policy,
-                &contracts,
-                Some(&metrics_inner),
-            );
-            metrics_inner.set_admit_seed_begin_ns(seed_t0.elapsed().as_nanos() as u64);
-            // Seed independents into the ready bag.
-            for t in 0..block_size {
-                if ready_edges.may_execute(t) {
-                    wave.push_ready(t);
+            // L1/P3: thin cold A1=0 skips contract storage walk + admit_seed.
+            // PROFILE Instant only (product path must not pay begin Instant).
+            if self.cost_policy.should_seed_thin_a1() {
+                let contracts = collect_contracts(storage, &hints);
+                let seed_t0 = crate::specfence::profile_timing_enabled().then(Instant::now);
+                let _ = crate::specfence::admit::admit_seed_begin_block(
+                    &ready_edges,
+                    &producer_stages,
+                    &learner,
+                    &self.bayes,
+                    &self.inter_prior,
+                    &hints,
+                    block_env.beneficiary,
+                    &self.cost_policy,
+                    &contracts,
+                    Some(&metrics_inner),
+                );
+                if let Some(t0) = seed_t0 {
+                    metrics_inner.set_admit_seed_begin_ns(t0.elapsed().as_nanos() as u64);
                 }
             }
-            ready_edges.sample_ready_width(wave.ready_depth());
+            // P4: bag serves gated wake only. A0 / independents use OCC
+            // `execution_idx` — seeding may_execute txs here mutex-taxed the
+            // A0-majority path (PR19 residual).
             self.last_begin_blocked = ready_edges.blocked_consumers();
+            ready_edges
+                .sample_ready_width(block_size.saturating_sub(self.last_begin_blocked.len()));
             if quiet && !learner.has_any_predicted() {
                 let n = sketch.revoke_prior_fences_if_quiet(true);
                 metrics_inner.record_quiet_pessimistic_revoke(n);
@@ -600,9 +604,19 @@ impl Pevm {
                     while task.is_some() {
                         task = match task.unwrap() {
                             Task::Execution(tx_version) => {
-                                let occ_exec = occ_mode;
+                                let occ_exec = occ_mode
+                                    || (self.concurrency_mode == ConcurrencyMode::SpecFence
+                                        && !specfence.ready_edges.has_any_gated());
                                 if occ_exec {
-                                    self.try_execute(&mut vm, &scheduler, tx_version, None, None)
+                                    let done_idx = tx_version.tx_idx;
+                                    let next = self
+                                        .try_execute(&mut vm, &scheduler, tx_version, None, None);
+                                    // Stamp Done so a later short-edge promote cannot
+                                    // refuse forever (bitset, not DashMap).
+                                    if self.concurrency_mode == ConcurrencyMode::SpecFence {
+                                        specfence.ready_edges.note_producer_done_stamp(done_idx);
+                                    }
+                                    next
                                 } else {
                                     let fence_ref = crate::specfence::fence_for_mode(
                                         self.concurrency_mode,
@@ -615,12 +629,23 @@ impl Pevm {
                             }
                             Task::Validation(tx_version) => {
                                 let v0 = profile.then(Instant::now);
+                                let a0_ungated = specfence.mode == ConcurrencyMode::SpecFence
+                                    && !specfence.ready_edges.has_any_gated();
                                 let next = if occ_mode {
                                     crate::specfence::validate_occ_stage(
                                         &mv_memory,
                                         &scheduler,
                                         &tx_version,
                                         Some(&metrics_inner),
+                                    )
+                                } else if a0_ungated {
+                                    // P3: A1=0 validate keeps commute (OCC-effect) but
+                                    // skips certificate / repair branching.
+                                    crate::specfence::validate_occ_kernel(
+                                        &mv_memory,
+                                        &scheduler,
+                                        &tx_version,
+                                        specfence,
                                     )
                                 } else if specfence.mode == ConcurrencyMode::SpecFence {
                                     crate::specfence::validate_specfence(
@@ -726,6 +751,26 @@ impl Pevm {
             wave.park_resume_full_abort_reexecute(),
         );
         if self.concurrency_mode == ConcurrencyMode::SpecFence {
+            // L4: A0 skipped HotSet/Bayes on the execute hot path — flush
+            // write locations here so the next block still sees process prior.
+            if self.cost_policy.is_a0_majority_block() {
+                let beneficiary = hash_deterministic(MemoryLocation::Basic(block_env.beneficiary));
+                let mut deferred = Vec::new();
+                for tx in 0..block_size {
+                    if ready_edges.was_queued(tx) {
+                        continue;
+                    }
+                    for loc in mv_memory.write_locations(tx) {
+                        if loc != beneficiary {
+                            self.hotset.note_writer(loc, tx);
+                            deferred.push(loc);
+                        }
+                    }
+                }
+                if !deferred.is_empty() {
+                    self.rw_prior.observe_write_set(&deferred, None);
+                }
+            }
             self.hotset.end_block();
             // P1: pack InterBlockPrior from live morph hat + top-ℓ (flip → higher α).
             let morph_hat = learner.morph_hat();
@@ -785,6 +830,7 @@ impl Pevm {
             };
             self.cost_policy
                 .note_cost_sample(refuse_unit, inc_gt0 > 0, idle);
+            self.cost_policy.end_block_learn();
             let report = self.cost_policy.take_report(ready_w, idle);
             metrics_inner.set_pc_learn_metrics(
                 ready_w,
@@ -809,7 +855,14 @@ impl Pevm {
             );
             self.last_learn_report = report;
             self.last_incarnations = incs;
-            self.last_location_writers = ready_edges.writer_order_snapshot();
+            // A0-majority skipped live D1; snapshot writer order from MV (no DashMap).
+            if self.cost_policy.is_a0_majority_block() && !ready_edges.has_any_gated() {
+                let beneficiary = hash_deterministic(MemoryLocation::Basic(block_env.beneficiary));
+                self.last_location_writers =
+                    mv_writer_order_snapshot(&mv_memory, block_size, beneficiary);
+            } else {
+                self.last_location_writers = ready_edges.writer_order_snapshot();
+            }
         } else {
             self.last_process = ExecProcessSnapshot::default();
             self.last_learn_report = LearnReport::default();
@@ -2154,6 +2207,25 @@ pub fn execute_revm_sequential<S: Storage + Debug, C: PevmChain>(
         results.push(execution_result);
     }
     Ok(results)
+}
+
+/// End-block D1 snapshot from MV (A0 skipped live DashMap writer order).
+fn mv_writer_order_snapshot(
+    mv_memory: &MvMemory,
+    block_size: usize,
+    beneficiary: MemoryLocationHash,
+) -> Vec<(MemoryLocationHash, Vec<TxIdx>)> {
+    let mut map: HashMap<MemoryLocationHash, Vec<TxIdx>> = HashMap::new();
+    for tx in 0..block_size {
+        for loc in mv_memory.write_locations(tx) {
+            if loc != beneficiary {
+                map.entry(loc).or_default().push(tx);
+            }
+        }
+    }
+    let mut out: Vec<_> = map.into_iter().collect();
+    out.sort_by_key(|(loc, _)| *loc);
+    out
 }
 
 /// Pre-state addresses with contract code — D2/PC-2 contract vs EOA gate.

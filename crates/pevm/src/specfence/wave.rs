@@ -3,6 +3,10 @@
 //! SoftWait Soft + SuffixRepair research stay in [`super::rem`] (quarantined;
 //! Soft=0). This file **owns** WaveParkTable.
 //!
+//! **P4 bag:** mutex min-heap stays for **gated wake only** (lower TxIdx first;
+//! seq≡par / iteration-11 order). A0 / independents use OCC `execution_idx`
+//! and must not be seeded into this bag. Empty-bag `pop_ready` is lock-free.
+//!
 //! Protocol: `lab/notes/specfence-complete-architecture-v9.4-file-srp.md`.
 
 use parking_lot::Mutex;
@@ -14,6 +18,8 @@ use std::time::Instant;
 use dashmap::DashMap;
 
 use crate::{BuildIdentityHasher, MemoryLocationHash, TxIdx};
+
+use super::engagement::profile_timing_enabled;
 
 // --- M2: wave park / ready-queue (L2) --------------------------------
 
@@ -118,6 +124,8 @@ pub(crate) struct WaveParkTable {
     ready_steal_on_wait: AtomicUsize,
     wave_width_sum: AtomicU64,
     wave_width_samples: AtomicUsize,
+    /// P4: bag depth. Zero → `pop_ready` skips the mutex (A0 never touches the bag).
+    ready_n: AtomicUsize,
     /// P4: wakes that armed RewindTo at checkpoint before SoftWait `k`.
     park_resume_at_k: AtomicUsize,
     /// P4: wakes that fell back to tx-grain FullAbortReexecute.
@@ -212,7 +220,9 @@ impl WaveParkTable {
             .entry(writer)
             .or_default()
             .push(entry);
-        self.park_started.insert(waiter, Instant::now());
+        if profile_timing_enabled() {
+            self.park_started.insert(waiter, Instant::now());
+        }
         self.park_kind_by_waiter.insert(waiter, kind);
         self.wait_park_count.fetch_add(1, Ordering::Relaxed);
         match kind {
@@ -293,9 +303,11 @@ impl WaveParkTable {
     }
 
     /// Push a ready continuation; priority = lower TxIdx first.
+    /// Gated-wake only — do not seed A0 / independents here (P4).
     pub(crate) fn push_ready(&self, tx_idx: TxIdx) {
         let mut q = self.ready.lock();
         q.push(Reverse(tx_idx));
+        self.ready_n.store(q.len(), Ordering::Release);
         self.sample_wave_width_locked(q.len());
     }
 
@@ -305,8 +317,15 @@ impl WaveParkTable {
     }
 
     /// Pop lowest TxIdx from the ready deque (stale entries skipped by caller).
+    /// Empty bag: no mutex (A0-majority / A1=0 never pays the lock).
     pub(crate) fn pop_ready(&self) -> Option<TxIdx> {
-        self.ready.lock().pop().map(|Reverse(t)| t)
+        if self.ready_n.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let mut q = self.ready.lock();
+        let t = q.pop().map(|Reverse(t)| t);
+        self.ready_n.store(q.len(), Ordering::Release);
+        t
     }
 
     /// Arm park→steal convert without recording park idle (BlockingOther ESTIMATE path).
@@ -479,7 +498,7 @@ impl WaveParkTable {
     }
 
     pub(crate) fn ready_depth(&self) -> usize {
-        self.ready.lock().len()
+        self.ready_n.load(Ordering::Relaxed)
     }
 }
 
@@ -502,7 +521,8 @@ mod tests {
         assert_eq!(taken.armed_at_k, 7);
         assert!(wave.take_resume_intent(5).is_none());
         assert_eq!(wave.pop_ready(), Some(5));
-        assert!(wave.park_ns_softwait() > 0 || wave.wait_park_ns() > 0);
+        // Instant park_ns only when SPECFENCE_PROFILE=1.
+        let _ = wave.park_ns_softwait() + wave.wait_park_ns();
     }
 
     #[test]
@@ -532,7 +552,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn blocking_other_wake_does_not_arm_resume_intent() {
         let wave = WaveParkTable::new();
         wave.park_with_kind(4, 1, 7, 3, ParkKind::BlockingOther);
@@ -550,5 +569,17 @@ mod tests {
         wave.park_with_kind(4, 1, 7, 0, ParkKind::WaitForDependency);
         assert_eq!(wave.park_count_softwait(), 0);
         assert_eq!(wave.park_count_blocking_other(), 1);
+    }
+
+    #[test]
+    fn empty_bag_pop_is_none_without_push() {
+        let wave = WaveParkTable::new();
+        assert_eq!(wave.ready_depth(), 0);
+        assert!(wave.pop_ready().is_none());
+        wave.push_ready(3);
+        assert_eq!(wave.ready_depth(), 1);
+        assert_eq!(wave.pop_ready(), Some(3));
+        assert_eq!(wave.ready_depth(), 0);
+        assert!(wave.pop_ready().is_none());
     }
 }

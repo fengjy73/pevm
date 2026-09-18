@@ -121,6 +121,21 @@ pub(crate) fn admit_seed_begin_block(
     contracts: &HashSet<Address>,
     metrics: Option<&MetricsInner>,
 ) -> usize {
+    // L1/P3: thin cold start is A1=0 — no hint walk, no Bayes seed, no ReadyEdge.
+    if !policy.should_seed_thin_a1() {
+        let _ = (
+            ready,
+            stages,
+            learner,
+            bayes,
+            prior,
+            hints,
+            beneficiary,
+            contracts,
+            metrics,
+        );
+        return 0;
+    }
     let stars = seed_known_stars(learner, bayes, prior);
     let fan = learner.morph_weights().dominant_fan_out();
     let prior_star = prior.top_locations().iter().any(top_is_known_star);
@@ -356,6 +371,11 @@ pub(crate) fn admit_seed_on_write_set(
     effective_locs: &[MemoryLocationHash],
 ) {
     let from_loc = hash_deterministic(MemoryLocation::Basic(from));
+    // L4/S: A0-majority with no gated txs — skip D1 DashMap on the execute
+    // hot path. Writer order is reconstructed at block end for compare.
+    if policy.is_some_and(|p| p.is_a0_majority_block()) && !ready.has_any_gated() {
+        return;
+    }
     // PC-S1: A0-majority — D1 writer order only. No ReadyEdge / B2 / release.
     // 4→31 still lands when the A1 probe publishes (`note_immediate_pred`).
     if policy.is_some_and(|p| p.is_a0_majority_block()) && !ready.was_queued(writer) {
@@ -516,8 +536,8 @@ mod tests {
         hints: &AccountHints,
         contracts: &HashSet<Address>,
     ) -> usize {
-        let n = hints.n_txs().max(32);
-        let policy = policy_for(n);
+        // Structural A1 tests use a full shell. Thin / a0_majority defaults A0 (L1).
+        let policy = policy_for(4096);
         admit_seed_begin_block(
             ready,
             stages,
@@ -960,7 +980,10 @@ mod tests {
             &[loc],
             &[loc],
         );
-        assert_eq!(ready.writers_of(loc), vec![4], "thin A0 still records D1");
+        assert!(
+            ready.writers_of(loc).is_empty(),
+            "thin A0 defers D1 off the execute hot path (block-end snapshot)"
+        );
         assert!(
             ready.may_execute(31),
             "thin A0 must not plant a ReadyEdge on later writers"
@@ -1151,5 +1174,36 @@ mod tests {
             "PC-3: no dual same-from + empty-to tax"
         );
         let _ = n;
+    }
+
+    #[test]
+    fn thin_cold_start_seeds_no_a1() {
+        let ready = ReadyEdgeTable::new();
+        let stages = ProducerStageTable::new();
+        let learner = LiveLearner::new();
+        learner.begin_block(MorphWeights::default());
+        let bayes = BayesMap::new();
+        let prior = InterBlockPrior::new();
+        let payee = Address::repeat_byte(0x20);
+        let hints = AccountHints::from_to_txs(payee, (0..16).collect());
+        let mut contracts = HashSet::new();
+        contracts.insert(payee);
+        let policy = policy_for(176);
+        assert!(policy.is_a0_majority_block());
+        let n = admit_seed_begin_block(
+            &ready,
+            &stages,
+            &learner,
+            &bayes,
+            &prior,
+            &hints,
+            Address::ZERO,
+            &policy,
+            &contracts,
+            None,
+        );
+        assert_eq!(n, 0, "L1: thin cold start must allow A1=0, got {n}");
+        assert!(!ready.has_any_gated(), "no gated txs on thin cold start");
+        assert!(ready.may_execute(8), "later empty-to stays OCC-runnable");
     }
 }

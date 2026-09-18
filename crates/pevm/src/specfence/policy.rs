@@ -4,6 +4,11 @@
 //! wave-admit pred). A0 is the OCC-effect path on this spine — not a hand-off
 //! to a second OCC runtime. Beta posteriors are **features**, not `decide()`
 //! authority. Decide is measured-ns EMA: keep A1 iff ĉ_A1 + δ < ĉ_A0.
+//!
+//! **L1 (thin / a0_majority_block):** default A0. Cold start may be A1=0.
+//! Promote a short edge only when a per-ℓ / address-pair prior or observed
+//! effective-WAW cost proves ordered cheaper. Do not freeze A1=K from the
+//! optimistic full-shell prior (ĉ_A1=8µs < ĉ_A0=25µs) on a small block.
 //! `THIN_A1_K` is a **cap**, not a frozen set of exactly 3.
 
 use std::sync::Mutex;
@@ -28,9 +33,14 @@ pub(crate) const THIN_A1_K: usize = 3;
 const THIN_N_MAX: usize = 256;
 /// ns-EV hysteresis: keep A1 only if ĉ_A1 + δ < ĉ_A0.
 const NS_DELTA: f64 = 2_000.0;
-/// Cold-start EMA priors (ns). Keep proven contract WAW / empty-to A1.
+/// Full-shell cold-start EMA priors (ns). Large blocks may keep A1.
 const PRIOR_C_A1_NS: f64 = 8_000.0;
 const PRIOR_C_A0_NS: f64 = 25_000.0;
+/// Thin-block cold priors: OCC abort is cheaper than refuse/wave prepaid.
+const PRIOR_C_A1_THIN_NS: f64 = 18_000.0;
+const PRIOR_C_A0_THIN_NS: f64 = 6_000.0;
+/// Consecutive blocks where prepaid A1 loses to the abort counterfactual.
+const PREPAID_LOSE_N: u32 = 2;
 const EMA_ALPHA: f64 = 0.20;
 
 /// Soft=0 action on a candidate edge / cohort.
@@ -97,6 +107,12 @@ pub struct LearnReport {
     pub conflict_promote: usize,
     /// CC-D1: lazy-noise conflict → ignorable (not unfenced_reexec→A1).
     pub conflict_ignore: usize,
+    /// L3: A1 prepaid ns this block (refuse + width loss).
+    pub prepaid_ns: u64,
+    /// L3: counterfactual OCC abort ns (measured reexec).
+    pub abort_cf_ns: u64,
+    /// L3: prior decay steps applied because prepaid lost.
+    pub prior_decay: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -143,13 +159,18 @@ pub(crate) struct ConflictNote {
 struct PromotedLoc {
     hits: u32,
     reexec_ns_ema: f64,
+    /// True after a measured incarnation>0 sample on this ℓ (not the cold prior).
+    measured: bool,
 }
 
-/// Per-address B2 context: p_effWAW + refuse-cost EMA.
+/// Per-address B2 context: p_effWAW + refuse-cost EMA + per-pair cost-EV.
 #[derive(Debug, Clone, Copy)]
 struct CohortStat {
     p_eff: OnlineStat,
     refuse: OnlineStat,
+    c_a0: OnlineStat,
+    c_a1: OnlineStat,
+    prepaid_lose: u32,
 }
 
 /// Process-persistent cost calibrator (B2) + per-block ns-EV decide.
@@ -188,8 +209,18 @@ pub(crate) struct CostPolicy {
     conflicts: DashMap<TxIdx, ConflictNote, FxBuildHasher>,
     /// C4: EffectiveWAW locations eligible for a short-edge A1 (cap-limited).
     promoted: DashMap<MemoryLocationHash, PromotedLoc, FxBuildHasher>,
-    /// C4: reexec_ns EMA keyed by location (feeds U3).
+    /// L2: reexec_ns EMA keyed by location (feeds U3 / per-ℓ EV).
     loc_reexec_ns: DashMap<MemoryLocationHash, OnlineStat, FxBuildHasher>,
+    /// L2: refuse/prepaid EMA keyed by location.
+    loc_c_a1: DashMap<MemoryLocationHash, OnlineStat, FxBuildHasher>,
+    /// Hot-path read-only EV snapshot (written at begin/end-block).
+    c_a0_snap_bits: AtomicU64,
+    c_a1_snap_bits: AtomicU64,
+    /// L3: consecutive blocks where prepaid lost to abort_cf (process-persistent).
+    prepaid_lose_streak: AtomicUsize,
+    prior_decay: AtomicUsize,
+    prepaid_ns: AtomicU64,
+    abort_cf_ns: AtomicU64,
     /// C3: off-edge reexecs in this block (wave).
     wave_off_edge: AtomicUsize,
     wave_batch_noted: AtomicBool,
@@ -228,6 +259,13 @@ impl Default for CostPolicy {
             conflicts: DashMap::default(),
             promoted: DashMap::default(),
             loc_reexec_ns: DashMap::default(),
+            loc_c_a1: DashMap::default(),
+            c_a0_snap_bits: AtomicU64::new(PRIOR_C_A0_NS.to_bits()),
+            c_a1_snap_bits: AtomicU64::new(PRIOR_C_A1_NS.to_bits()),
+            prepaid_lose_streak: AtomicUsize::new(0),
+            prior_decay: AtomicUsize::new(0),
+            prepaid_ns: AtomicU64::new(0),
+            abort_cf_ns: AtomicU64::new(0),
             wave_off_edge: AtomicUsize::new(0),
             wave_batch_noted: AtomicBool::new(false),
         }
@@ -251,6 +289,12 @@ impl CostPolicy {
         self.conflicts.clear();
         self.promoted.clear();
         self.loc_reexec_ns.clear();
+        self.loc_c_a1.clear();
+        self.prepaid_lose_streak.store(0, Ordering::Relaxed);
+        self.c_a0_snap_bits
+            .store(PRIOR_C_A0_NS.to_bits(), Ordering::Relaxed);
+        self.c_a1_snap_bits
+            .store(PRIOR_C_A1_NS.to_bits(), Ordering::Relaxed);
         self.reset_block_counters();
     }
 
@@ -276,6 +320,9 @@ impl CostPolicy {
         self.conflict_promote.store(0, Ordering::Relaxed);
         self.conflict_ignore.store(0, Ordering::Relaxed);
         self.conflicts.clear();
+        self.prior_decay.store(0, Ordering::Relaxed);
+        self.prepaid_ns.store(0, Ordering::Relaxed);
+        self.abort_cf_ns.store(0, Ordering::Relaxed);
         self.wave_off_edge.store(0, Ordering::Relaxed);
         self.wave_batch_noted.store(false, Ordering::Relaxed);
     }
@@ -286,11 +333,43 @@ impl CostPolicy {
         let serial_hat = n as f64 * SERIAL_NS_PER_TX;
         let thin = n > 0 && n <= THIN_N_MAX && serial_hat < META_FLOOR_NS;
         self.a0_majority_block.store(thin, Ordering::Relaxed);
+        // Hot-path snapshot: thin cold defaults A0 (abort cheaper than prepaid).
+        let (c_a0, c_a1) = if thin {
+            (PRIOR_C_A0_THIN_NS, PRIOR_C_A1_THIN_NS)
+        } else {
+            (
+                self.c_a0_ns.lock().unwrap().mean.max(1.0),
+                self.c_a1_ns.lock().unwrap().mean.max(1.0),
+            )
+        };
+        self.c_a0_snap_bits.store(c_a0.to_bits(), Ordering::Relaxed);
+        self.c_a1_snap_bits.store(c_a1.to_bits(), Ordering::Relaxed);
     }
 
     #[inline]
     pub(crate) fn is_a0_majority_block(&self) -> bool {
         self.a0_majority_block.load(Ordering::Relaxed)
+    }
+
+    /// Thin / a0_majority: plant A1 only when a measured pair or ℓ EV says
+    /// prepaid is cheaper. Cold start stays A1=0 (no hint walk / no contracts).
+    pub(crate) fn should_seed_thin_a1(&self) -> bool {
+        if !self.is_a0_majority_block() {
+            return true;
+        }
+        for e in self.promoted.iter() {
+            if self.is_promoted(*e.key()) {
+                return true;
+            }
+        }
+        for e in self.cohorts.iter() {
+            let s = e.value();
+            if (s.c_a0.n >= 2.0 || s.c_a1.n >= 2.0) && s.c_a1.mean + NS_DELTA < s.c_a0.mean.max(1.0)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     #[inline]
@@ -309,6 +388,10 @@ impl CostPolicy {
 
     /// L1 ns-EV: keep A1 iff ĉ_A1 + δ < ĉ_A0. Structural vetoes stay (PC-2).
     /// Beta/`p_eff` are features only — not decide() authority.
+    ///
+    /// Thin / a0_majority_block: default A0. Cold start may be A1=0. Keep
+    /// ordered only when a **measured** per-pair (or per-ℓ) prior proves
+    /// prepaid cheaper than abort — not the full-shell 8µs-vs-25µs prior.
     pub(crate) fn choose(
         &self,
         kind: CohortKind,
@@ -335,15 +418,18 @@ impl CostPolicy {
             self.a0_cohorts.fetch_add(1, Ordering::Relaxed);
             return AdmitAction::A0OptimisticRead;
         }
-        let (c_a0, c_a1) = self.ns_ev();
-        self.record_ev(c_a0, c_a1);
-        // Proven effective WAW (B2) stays A1 even if this-block EMA is noisy.
-        let proven = self
-            .cohorts
-            .get(&(kind.as_u8(), addr))
-            .is_some_and(|s| s.p_eff.mean >= 0.40 && s.p_eff.n >= 2.0);
-        let keep = proven || c_a1 + NS_DELTA < c_a0;
         let _ = p_beta; // feature only — used in p_eff for reports, not decide().
+        let keep = if self.is_a0_majority_block() {
+            self.pair_ev_prefers_ordered(kind, addr)
+        } else {
+            let (c_a0, c_a1) = self.ns_ev_snap();
+            self.record_ev(c_a0, c_a1);
+            let proven = self
+                .cohorts
+                .get(&(kind.as_u8(), addr))
+                .is_some_and(|s| s.p_eff.mean >= 0.40 && s.p_eff.n >= 2.0);
+            proven || c_a1 + NS_DELTA < c_a0
+        };
         if keep {
             self.cost_ev_keep_ordered.fetch_add(1, Ordering::Relaxed);
             self.a1_decisions.fetch_add(1, Ordering::Relaxed);
@@ -368,10 +454,27 @@ impl CostPolicy {
         self.choose(kind, addr, cohort_len, is_contract, p_beta) == AdmitAction::A1OrderedAdmit
     }
 
-    fn ns_ev(&self) -> (f64, f64) {
-        let c_a1 = self.c_a1_ns.lock().unwrap().mean.max(1.0);
-        let c_a0 = self.c_a0_ns.lock().unwrap().mean.max(1.0);
+    #[inline]
+    fn ns_ev_snap(&self) -> (f64, f64) {
+        let c_a0 = f64::from_bits(self.c_a0_snap_bits.load(Ordering::Relaxed)).max(1.0);
+        let c_a1 = f64::from_bits(self.c_a1_snap_bits.load(Ordering::Relaxed)).max(1.0);
         (c_a0, c_a1)
+    }
+
+    /// L2: per address-pair EV. Thin cold (no measured samples) → A0.
+    fn pair_ev_prefers_ordered(&self, kind: CohortKind, addr: Address) -> bool {
+        let Some(s) = self.cohorts.get(&(kind.as_u8(), addr)) else {
+            return false;
+        };
+        // Need measured abort/prepaid samples — p_eff alone does not freeze A1.
+        let measured = s.c_a0.n >= 2.0 || s.c_a1.n >= 2.0;
+        if !measured {
+            return false;
+        }
+        let c_a0 = s.c_a0.mean.max(1.0);
+        let c_a1 = s.c_a1.mean.max(1.0);
+        self.record_ev(c_a0, c_a1);
+        c_a1 + NS_DELTA < c_a0
     }
 
     /// Score for A0-majority K-cap (storage/call WAW > contract empty-to).
@@ -465,53 +568,49 @@ impl CostPolicy {
 
     /// B2: observe effective vs lazy WAW on a cohort (write-set Detect).
     pub(crate) fn note_eff_waw(&self, kind: CohortKind, addr: Address, effective: bool) {
+        let thin = self.is_a0_majority_block();
         let mut e = self
             .cohorts
             .entry((kind.as_u8(), addr))
             .or_insert(CohortStat {
                 p_eff: OnlineStat::new(if effective { 0.55 } else { 0.12 }),
                 refuse: OnlineStat::new(0.22),
+                c_a0: OnlineStat::new(if thin {
+                    PRIOR_C_A0_THIN_NS
+                } else {
+                    PRIOR_C_A0_NS
+                }),
+                c_a1: OnlineStat::new(if thin {
+                    PRIOR_C_A1_THIN_NS
+                } else {
+                    PRIOR_C_A1_NS
+                }),
+                prepaid_lose: 0,
             });
         e.p_eff.ema(if effective { 1.0 } else { 0.0 }, 0.25);
-        // Contextual update of w_p (one SGD step).
-        let n = self.block_n().max(1);
-        let is_contract = matches!(
-            kind,
-            CohortKind::CallWaw | CohortKind::RawFan | CohortKind::EmptyTo
-        ) && effective;
-        let x = self.features(kind, 8, is_contract, if effective { 0.4 } else { 0.1 });
-        let y = if effective { 1.0 } else { 0.0 };
-        let mut w = self.w_p.lock().unwrap();
-        let pred = sigmoid(w.iter().zip(x.iter()).map(|(a, b)| a * b).sum());
-        let err = y - pred;
-        let lr = 0.08;
-        for i in 0..6 {
-            w[i] += lr * err * x[i];
-        }
-        let _ = n;
+        // L4: no w_p SGD on the Detect hot path — pair EV is enough.
+        let _ = effective;
     }
 
-    /// L1: measured refuse-path ns (hot-path).
+    /// L4: refuse ns is an atomic add; EMA flush is end-block.
     pub(crate) fn note_refuse_ns(&self, ns: u64) {
         if ns == 0 {
             return;
         }
         self.refuse_ns.fetch_add(ns, Ordering::Relaxed);
-        self.c_a1_ns.lock().unwrap().ema_ns(ns as f64, EMA_ALPHA);
     }
 
-    /// L1: measured incarnation>0 execute ns (hot-path).
+    /// L1: measured incarnation>0 execute ns (atomic; EMA at end-block / loc).
     pub(crate) fn note_reexec_ns(&self, ns: u64) {
         self.note_reexec_ns_at(None, ns);
     }
 
-    /// C4: reexec_ns EMA on a conflict ℓ (or global if `loc` is None).
+    /// L2: reexec_ns EMA on a conflict ℓ (or global if `loc` is None).
     pub(crate) fn note_reexec_ns_at(&self, loc: Option<MemoryLocationHash>, ns: u64) {
         if ns == 0 {
             return;
         }
         self.reexec_ns.fetch_add(ns, Ordering::Relaxed);
-        self.c_a0_ns.lock().unwrap().ema_ns(ns as f64, EMA_ALPHA);
         self.a0_reexec.fetch_add(1, Ordering::Relaxed);
         if let Some(loc) = loc {
             self.loc_reexec_ns
@@ -521,14 +620,12 @@ impl CostPolicy {
         }
     }
 
-    /// L1: idle-core ns attributed as A1 width loss.
+    /// L4: idle-core ns attributed as A1 width loss (atomic; EMA at end-block).
     pub(crate) fn note_width_loss_ns(&self, ns: u64) {
         if ns == 0 {
             return;
         }
         self.width_loss_ns.fetch_add(ns, Ordering::Relaxed);
-        let c_a1 = self.refuse_ns.load(Ordering::Relaxed) as f64 + ns as f64;
-        self.c_a1_ns.lock().unwrap().ema_ns(c_a1, EMA_ALPHA);
     }
 
     /// B2: observed refuse / idle / reexec cost sample (legacy units + ns feed).
@@ -589,14 +686,18 @@ impl CostPolicy {
     }
 
     /// C4: EffectiveWAW → short-edge promote (location only, not a lazy spine).
+    /// Thin blocks only **gate** the edge when measured EV says ordered is cheaper
+    /// (`is_promoted`); the observation is always recorded.
     pub(crate) fn promote_short_edge(&self, location: MemoryLocationHash, reexec_ns: u64) {
         let mut e = self.promoted.entry(location).or_insert(PromotedLoc {
             hits: 0,
             reexec_ns_ema: PRIOR_C_A0_NS,
+            measured: false,
         });
         e.hits = e.hits.saturating_add(1);
         if reexec_ns > 0 {
             e.reexec_ns_ema = (1.0 - EMA_ALPHA) * e.reexec_ns_ema + EMA_ALPHA * (reexec_ns as f64);
+            e.measured = true;
         }
         self.note_conflict_promote();
         self.note_reexec_ns_at(Some(location), reexec_ns);
@@ -617,7 +718,21 @@ impl CostPolicy {
 
     #[inline]
     pub(crate) fn is_promoted(&self, location: MemoryLocationHash) -> bool {
-        self.promoted.get(&location).is_some_and(|s| s.hits >= 1)
+        let Some(s) = self.promoted.get(&location) else {
+            return false;
+        };
+        if s.hits < 1 {
+            return false;
+        }
+        if !self.is_a0_majority_block() {
+            return true;
+        }
+        // L1 thin: do not gate on an unmeasured hit (would freeze A1 on this block).
+        if !s.measured {
+            return false;
+        }
+        let c_a1 = f64::from_bits(self.c_a1_snap_bits.load(Ordering::Relaxed)).max(1.0);
+        c_a1 + NS_DELTA < s.reexec_ns_ema
     }
 
     pub(crate) fn conflict_of(&self, tx: TxIdx) -> Option<ConflictNote> {
@@ -645,6 +760,97 @@ impl CostPolicy {
     pub(crate) fn note_a0_reexec(&self) {
         self.a0_reexec.fetch_add(1, Ordering::Relaxed);
         self.reexec_global.lock().unwrap().ema(1.0, 0.20);
+    }
+
+    /// L2 test / end-block helper: write a measured address-pair EV sample.
+    pub(crate) fn note_pair_measured_ev(
+        &self,
+        kind: CohortKind,
+        addr: Address,
+        c_a0: f64,
+        c_a1: f64,
+    ) {
+        let thin = self.is_a0_majority_block();
+        let mut e = self
+            .cohorts
+            .entry((kind.as_u8(), addr))
+            .or_insert(CohortStat {
+                p_eff: OnlineStat::new(0.55),
+                refuse: OnlineStat::new(0.22),
+                c_a0: OnlineStat::new(if thin {
+                    PRIOR_C_A0_THIN_NS
+                } else {
+                    PRIOR_C_A0_NS
+                }),
+                c_a1: OnlineStat::new(if thin {
+                    PRIOR_C_A1_THIN_NS
+                } else {
+                    PRIOR_C_A1_NS
+                }),
+                prepaid_lose: 0,
+            });
+        e.c_a0 = OnlineStat {
+            n: 3.0,
+            mean: c_a0.max(1.0),
+        };
+        e.c_a1 = OnlineStat {
+            n: 3.0,
+            mean: c_a1.max(1.0),
+        };
+    }
+
+    /// L3: flush EMAs, compare prepaid vs abort counterfactual, decay if prepaid loses.
+    pub(crate) fn end_block_learn(&self) {
+        let refuse = self.refuse_ns.load(Ordering::Relaxed);
+        let reexec = self.reexec_ns.load(Ordering::Relaxed);
+        let width = self.width_loss_ns.load(Ordering::Relaxed);
+        let prepaid = refuse.saturating_add(width);
+        let abort_cf = reexec;
+        self.prepaid_ns.store(prepaid, Ordering::Relaxed);
+        self.abort_cf_ns.store(abort_cf, Ordering::Relaxed);
+        if refuse > 0 {
+            self.c_a1_ns
+                .lock()
+                .unwrap()
+                .ema_ns(refuse as f64, EMA_ALPHA);
+        }
+        if reexec > 0 {
+            self.c_a0_ns
+                .lock()
+                .unwrap()
+                .ema_ns(reexec as f64, EMA_ALPHA);
+        }
+        let prepaid_lost = prepaid > abort_cf && prepaid > 0;
+        if prepaid_lost {
+            let n = self.prepaid_lose_streak.fetch_add(1, Ordering::Relaxed) + 1;
+            if n >= PREPAID_LOSE_N as usize {
+                self.decay_ordered_priors();
+            }
+        } else {
+            self.prepaid_lose_streak.store(0, Ordering::Relaxed);
+        }
+        // Next-block snapshot from flushed EMAs (thin still prefers A0 cold).
+        if !self.is_a0_majority_block() {
+            let c_a0 = self.c_a0_ns.lock().unwrap().mean.max(1.0);
+            let c_a1 = self.c_a1_ns.lock().unwrap().mean.max(1.0);
+            self.c_a0_snap_bits.store(c_a0.to_bits(), Ordering::Relaxed);
+            self.c_a1_snap_bits.store(c_a1.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    fn decay_ordered_priors(&self) {
+        self.prior_decay.fetch_add(1, Ordering::Relaxed);
+        for mut e in self.cohorts.iter_mut() {
+            e.p_eff.ema(0.0, 0.35);
+            let raised = e.c_a1.mean * 1.25 + PRIOR_C_A1_THIN_NS * 0.15;
+            e.c_a1.ema_ns(raised, EMA_ALPHA);
+            e.prepaid_lose = e.prepaid_lose.saturating_add(1);
+        }
+        for mut e in self.promoted.iter_mut() {
+            if e.hits > 0 {
+                e.hits -= 1;
+            }
+        }
     }
 
     pub(crate) fn take_report(&self, ready_width_mean: f64, idle_core_ns: u64) -> LearnReport {
@@ -682,6 +888,9 @@ impl CostPolicy {
             batch_repair: self.batch_repair.load(Ordering::Relaxed),
             conflict_promote: self.conflict_promote.load(Ordering::Relaxed),
             conflict_ignore: self.conflict_ignore.load(Ordering::Relaxed),
+            prepaid_ns: self.prepaid_ns.load(Ordering::Relaxed),
+            abort_cf_ns: self.abort_cf_ns.load(Ordering::Relaxed),
+            prior_decay: self.prior_decay.load(Ordering::Relaxed),
         }
     }
 }
@@ -718,24 +927,40 @@ mod tests {
     }
 
     #[test]
-    fn contract_empty_to_hot_payee_is_a1() {
+    fn thin_cold_start_defaults_a0() {
         let p = CostPolicy::new();
         p.begin_block(176);
         let addr = Address::repeat_byte(0x20);
         assert!(
-            p.choose_a1(CohortKind::EmptyTo, addr, 16, true, 0.30),
-            "contract empty-to n=16 (0x209c class) must stay A1"
+            !p.choose_a1(CohortKind::EmptyTo, addr, 16, true, 0.30),
+            "L1: thin cold start must not freeze A1 on contract empty-to"
+        );
+        let storage = Address::repeat_byte(0xed);
+        assert!(
+            !p.choose_a1(CohortKind::CallWaw, storage, 3, true, 0.25),
+            "L1: thin cold start must not freeze A1 on short calldata WAW"
         );
     }
 
     #[test]
-    fn calldata_short_waw_is_a1() {
+    fn full_shell_contract_empty_to_hot_payee_is_a1() {
         let p = CostPolicy::new();
-        p.begin_block(176);
+        p.begin_block(4096);
+        let addr = Address::repeat_byte(0x20);
+        assert!(
+            p.choose_a1(CohortKind::EmptyTo, addr, 16, true, 0.30),
+            "full-shell contract empty-to n=16 stays A1"
+        );
+    }
+
+    #[test]
+    fn full_shell_calldata_short_waw_is_a1() {
+        let p = CostPolicy::new();
+        p.begin_block(4096);
         let addr = Address::repeat_byte(0xed);
         assert!(
             p.choose_a1(CohortKind::CallWaw, addr, 3, true, 0.25),
-            "storage 14-17 class must stay A1"
+            "full-shell storage 14-17 class stays A1"
         );
     }
 
@@ -764,14 +989,33 @@ mod tests {
     #[test]
     fn b2_raises_p_after_effective_waw() {
         let p = CostPolicy::new();
-        p.begin_block(176);
+        p.begin_block(4096);
         let addr = Address::repeat_byte(0x20);
         for _ in 0..4 {
             p.note_eff_waw(CohortKind::EmptyTo, addr, true);
         }
         assert!(
             p.choose_a1(CohortKind::EmptyTo, addr, 16, true, 0.20),
-            "after effective WAW observations A1 must remain available"
+            "full-shell: after effective WAW observations A1 remains available"
+        );
+    }
+
+    #[test]
+    fn thin_promotes_only_when_pair_ev_wins() {
+        let p = CostPolicy::new();
+        p.begin_block(176);
+        let addr = Address::repeat_byte(0x20);
+        for _ in 0..4 {
+            p.note_eff_waw(CohortKind::EmptyTo, addr, true);
+        }
+        assert!(
+            !p.choose_a1(CohortKind::EmptyTo, addr, 16, true, 0.20),
+            "thin: p_eff alone must not freeze A1"
+        );
+        p.note_pair_measured_ev(CohortKind::EmptyTo, addr, 80_000.0, 8_000.0);
+        assert!(
+            p.choose_a1(CohortKind::EmptyTo, addr, 16, true, 0.20),
+            "thin: measured ĉ_A1+δ < ĉ_A0 promotes a short edge"
         );
     }
 
@@ -848,7 +1092,7 @@ mod tests {
     #[test]
     fn cost_ev_keeps_proven_contract_spine() {
         let p = CostPolicy::new();
-        p.begin_block(176);
+        p.begin_block(4096);
         let addr = Address::repeat_byte(0x20);
         for _ in 0..4 {
             p.note_eff_waw(CohortKind::EmptyTo, addr, true);
@@ -858,7 +1102,60 @@ mod tests {
         }
         assert!(
             p.choose_a1(CohortKind::EmptyTo, addr, 16, true, 0.20),
-            "proven effective WAW stays A1 (do not drop 0x209c class)"
+            "full-shell proven effective WAW stays A1 (do not drop 0x209c class)"
+        );
+    }
+
+    #[test]
+    fn thin_prepaid_loss_decays_prior() {
+        let p = CostPolicy::new();
+        p.begin_block(176);
+        let addr = Address::repeat_byte(0x20);
+        p.note_pair_measured_ev(CohortKind::EmptyTo, addr, 80_000.0, 8_000.0);
+        assert!(p.choose_a1(CohortKind::EmptyTo, addr, 16, true, 0.20));
+        p.note_refuse_ns(50_000);
+        p.note_width_loss_ns(10_000);
+        // abort_cf = 0 → prepaid loses
+        p.end_block_learn();
+        p.begin_block(176);
+        p.note_refuse_ns(50_000);
+        p.end_block_learn();
+        let r = p.take_report(0.0, 0);
+        assert!(
+            r.prior_decay >= 1,
+            "L3: two prepaid-losing blocks must decay prior: {r:?}"
+        );
+        assert!(r.prepaid_ns > r.abort_cf_ns);
+    }
+
+    #[test]
+    fn thin_cold_should_not_seed_a1() {
+        let p = CostPolicy::new();
+        p.begin_block(176);
+        assert!(
+            !p.should_seed_thin_a1(),
+            "L1: thin cold start must not seed A1"
+        );
+        p.promote_short_edge(0x32be, 80_000);
+        assert!(
+            p.should_seed_thin_a1(),
+            "L1: measured expensive abort may seed a short edge"
+        );
+    }
+
+    #[test]
+    fn thin_unmeasured_promote_does_not_gate() {
+        let p = CostPolicy::new();
+        p.begin_block(176);
+        p.promote_short_edge(0x32be, 0);
+        assert!(
+            !p.is_promoted(0x32be),
+            "thin: unmeasured EffectiveWAW hit must not gate A1"
+        );
+        p.promote_short_edge(0x32be, 80_000);
+        assert!(
+            p.is_promoted(0x32be),
+            "thin: measured expensive abort must gate when EV wins"
         );
     }
 }
