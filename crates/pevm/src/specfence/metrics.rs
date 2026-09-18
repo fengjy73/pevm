@@ -328,7 +328,7 @@ pub struct SpecFenceMetrics {
     pub ns_ev_demote: usize,
     /// PC-S1: A1 candidates beyond K.
     pub k_cap_demote: usize,
-    /// CC-X1: 21k commute accepts.
+    /// CC-X1: A0 commute accepts (empty-input transfer class).
     pub commute_skip: usize,
     /// CC-R3: batch-parked off-edge aborts.
     pub batch_repair: usize,

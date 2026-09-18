@@ -1,4 +1,6 @@
-//! SpecFence vs OCC on Ethereum mainnet block 3356896 (Soft=0).
+//! SpecFence (A0/A1 adaptive OCC on one Block-STM spine) vs harness OCC
+//! baseline on Ethereum mainnet block 3356896 (Soft=0). Compare is measurement
+//! only — not a protocol fork.
 //!
 //! ```
 //! SPECFENCE_COMPARE_ITERS=5 cargo run -p pevm --release \
@@ -165,16 +167,18 @@ fn main() {
     let mut rows: Vec<IterRow> = Vec::with_capacity(iters * 2);
     let mut occ_walls = Vec::new();
     let mut sf_walls = Vec::new();
+    let mut last_occ = None;
+    let mut last_sf = None;
 
-    for mode_name in ["occ", "specfence"] {
-        let mode = if mode_name == "occ" {
-            ConcurrencyMode::Occ
-        } else {
-            ConcurrencyMode::SpecFence
-        };
-        let mut walls = Vec::with_capacity(iters);
-        let mut last = None;
-        for i in 0..iters {
+    // Interleave OCC / SpecFence so CPU warmup does not gift one mode
+    // a colder first-half (measurement only — not a protocol fork).
+    for i in 0..iters {
+        for mode_name in ["occ", "specfence"] {
+            let mode = if mode_name == "occ" {
+                ConcurrencyMode::Occ
+            } else {
+                ConcurrencyMode::SpecFence
+            };
             let mut pevm = Pevm::with_concurrency_mode(mode);
             pevm.reset_heat();
             pevm.reset_inter_prior();
@@ -265,8 +269,13 @@ fn main() {
                         off_edge_inc_gt0: off_edge,
                         edge_4_31,
                     };
-                    walls.push(wall_ms);
-                    last = Some(m.clone());
+                    if mode_name == "occ" {
+                        occ_walls.push(wall_ms);
+                        last_occ = Some(m.clone());
+                    } else {
+                        sf_walls.push(wall_ms);
+                        last_sf = Some(m.clone());
+                    }
                     rows.push(row);
                 }
                 Err(e) => {
@@ -275,11 +284,11 @@ fn main() {
                 }
             }
         }
-        if mode_name == "occ" {
-            occ_walls = walls.clone();
-        } else {
-            sf_walls = walls.clone();
-        }
+    }
+    for (mode_name, walls, last) in [
+        ("occ", occ_walls.clone(), last_occ),
+        ("specfence", sf_walls.clone(), last_sf),
+    ] {
         if let Some(m) = last {
             println!(
                 "  {mode_name} median_wall_ms={:.3} last refuse_admit={} inc>0={} reexec={} wait_for_dependency={} occ_aborts={} soft_wait_arms={} idle_ns={} ready_width={:.2} edge_oa={} edge_or={} thin={} commute={} batch={}",

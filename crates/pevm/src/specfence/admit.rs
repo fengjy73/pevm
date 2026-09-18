@@ -5,7 +5,7 @@
 //! **effective** WAW; RAW fan-out stays a star on the first producer.
 //! Independents get no ReadyEdge / no PE.
 //!
-//! Soft=0. A0 vs A1 is B3 cost-aware EV (PC-5 Lean gate). No Soft wait arms.
+//! Soft=0. A0 vs A1 is ns-EV (K is a cap). No Soft wait arms. No second OCC engine.
 //! No Basic→Storage PE clone.
 
 use alloy_primitives::Address;
@@ -39,14 +39,21 @@ fn envelope_loc(addr: Address) -> MemoryLocationHash {
 ///
 /// Do **not** ProducerStage-reserve every predecessor. `next_reserved()` is a
 /// global min; reserving a long WAW spine serializes the whole block.
+/// Thin-shell: only the first successor (short edge). Later writers stay A0.
 fn note_predecessor_chain(
     ready: &ReadyEdgeTable,
     ordered: &[TxIdx],
     location: MemoryLocationHash,
     queued: &mut HashSet<TxIdx>,
+    short_edge: bool,
 ) -> usize {
+    let chain = if short_edge && ordered.len() >= 2 {
+        &ordered[..2]
+    } else {
+        ordered
+    };
     let mut edges = 0;
-    for pair in ordered.windows(2) {
+    for pair in chain.windows(2) {
         let (pred, succ) = (pair[0], pair[1]);
         if pred >= succ {
             continue;
@@ -62,19 +69,26 @@ fn note_predecessor_chain(
 }
 
 /// Park later txs behind the first (probe). Write-set then chains or releases.
+/// Thin-shell: first successor only — do not refuse the rest of the payee spine.
 fn note_probe_star(
     ready: &ReadyEdgeTable,
     ordered: &[TxIdx],
     location: MemoryLocationHash,
     queued: &mut HashSet<TxIdx>,
+    short_edge: bool,
 ) -> usize {
     if ordered.len() < 2 {
         return 0;
     }
     let probe = ordered[0];
     queued.insert(probe);
+    let succs: &[TxIdx] = if short_edge {
+        &ordered[1..2]
+    } else {
+        &ordered[1..]
+    };
     let mut edges = 0;
-    for &succ in &ordered[1..] {
+    for &succ in succs {
         if probe >= succ {
             continue;
         }
@@ -287,16 +301,17 @@ pub(crate) fn admit_seed_begin_block(
             }
             CohortKind::CallWaw => {
                 let loc = envelope_loc(c.addr);
-                edges += note_predecessor_chain(ready, &c.txs, loc, &mut queued);
+                // Storage / calldata WAW keeps the full pred chain (seq≡par).
+                edges += note_predecessor_chain(ready, &c.txs, loc, &mut queued, false);
             }
             CohortKind::EmptyTo => {
                 let loc = envelope_loc(c.addr);
-                edges += note_probe_star(ready, &c.txs, loc, &mut queued);
+                edges += note_probe_star(ready, &c.txs, loc, &mut queued, false);
             }
             CohortKind::SameFrom => {
                 let basic = hash_deterministic(MemoryLocation::Basic(c.addr));
                 ready.note_raw_producer(basic, c.txs[0]);
-                edges += note_predecessor_chain(ready, &c.txs, basic, &mut queued);
+                edges += note_predecessor_chain(ready, &c.txs, basic, &mut queued, false);
             }
         }
         let _ = c.is_contract;
@@ -346,6 +361,12 @@ pub(crate) fn admit_seed_on_write_set(
     if policy.is_some_and(|p| p.is_thin_shell()) && !ready.was_queued(writer) {
         for &loc in all_write_locs {
             ready.note_location_writer(loc, writer);
+            // C4: EffectiveWAW short edge only — not a whole lazy same-from spine.
+            if policy.is_some_and(|p| p.is_promoted(loc))
+                && effective_locs.iter().any(|&l| l == loc)
+            {
+                ready.note_immediate_pred(loc, writer);
+            }
         }
         return;
     }
@@ -456,7 +477,7 @@ pub(crate) fn admit_seed_on_write_set(
         let mut ordered = Vec::with_capacity(later.len() + 1);
         ordered.push(pred);
         ordered.extend(later.iter().copied());
-        let _ = note_predecessor_chain(ready, &ordered, loc, &mut queued);
+        let _ = note_predecessor_chain(ready, &ordered, loc, &mut queued, false);
     }
 }
 
@@ -738,7 +759,7 @@ mod tests {
         let hints = AccountHints::from_to_txs(to, (31..47).collect());
         let loc = envelope_loc(to);
         let mut queued = HashSet::new();
-        let n = note_probe_star(&ready, hints.to_txs(&to), loc, &mut queued);
+        let n = note_probe_star(&ready, hints.to_txs(&to), loc, &mut queued, false);
         assert!(n >= 15);
         assert!(!ready.may_execute(32));
         assert_eq!(ready.blocking_producer(32), Some(31));
@@ -847,7 +868,7 @@ mod tests {
             &hints,
             &HashSet::new(),
         );
-        assert_eq!(n, 0, "2-tx same-from stays OCC-cost (no refuse tax)");
+        assert_eq!(n, 0, "2-tx same-from stays A0 (no refuse tax)");
         assert!(ready.may_execute(57));
     }
 
@@ -1086,7 +1107,7 @@ mod tests {
         );
         assert!(
             ready.may_execute(57),
-            "2-tx same-from Data nonce must stay OCC-cost"
+            "2-tx same-from Data nonce must stay A0"
         );
     }
 
