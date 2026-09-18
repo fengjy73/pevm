@@ -3313,6 +3313,11 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 let thin_a0 = self.specfence.mode == crate::ConcurrencyMode::SpecFence
                     && self.specfence.policy.is_some_and(|p| p.is_thin_shell())
                     && !self.specfence.ready_edges.was_queued(tx_version.tx_idx);
+                // U2: unique 21k / short lazy same-from stay OCC-cost. Long eager
+                // spines still train HotSet / Bayes. D1 writer order is already
+                // recorded; wake only when a consumer is already gated.
+                let skip_a0_learn =
+                    thin_a0 && (is_lazy || self.specfence.hints.from_txs(&tx.caller).len() < 2);
                 if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
                     crate::specfence::admit::admit_seed_on_write_set(
                         self.specfence.ready_edges,
@@ -3325,9 +3330,14 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         &all_write_locs,
                         &effective_write_locs,
                     );
-                    // U2: thin-shell A0 — D1 writer order only. No HotSet / B2 / wake tax.
-                    if thin_a0 {
-                        // fall through to flags / receipt
+                    if skip_a0_learn {
+                        if self
+                            .specfence
+                            .ready_edges
+                            .has_known_waiters(tx_version.tx_idx)
+                        {
+                            self.wake_on_data_publish(tx_version.tx_idx, &all_write_locs);
+                        }
                     } else if self.specfence.certificates.rem_legal(tx_version.tx_idx) {
                         let locs: Vec<_> = self.mv_memory.write_locations(tx_version.tx_idx);
                         self.specfence.rw_prior.observe_write_set(&locs, None);
@@ -3373,7 +3383,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 if wrote_new_location {
                     flags |= FinishExecFlags::WroteNewLocation;
                 }
-                if self.specfence.mode.uses_regions() && !thin_a0 {
+                if self.specfence.mode.uses_regions() && !skip_a0_learn {
                     let from_wait = self
                         .specfence
                         .should_wait_account(&self.mv_memory.regions, &tx.caller);

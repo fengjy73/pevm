@@ -273,6 +273,12 @@ impl ReadyEdgeTable {
             .filter(|&w| w != NONE)
     }
 
+    /// True when some consumer is already gated on this writer (publish-wake needed).
+    #[inline]
+    pub(crate) fn has_known_waiters(&self, writer: TxIdx) -> bool {
+        self.waiters.get(&writer).is_some_and(|v| !v.is_empty())
+    }
+
     /// Writer finished. Wake known consumers whose producer is now done.
     ///
     /// Independents (never gated anyone, never queued) skip the deferred lock

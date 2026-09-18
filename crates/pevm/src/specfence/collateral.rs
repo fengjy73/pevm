@@ -182,13 +182,19 @@ pub(crate) fn thin_a0_hinted_lazy(
     if !thin_shell || queued || !empty_input || !eoa {
         return false;
     }
-    if hints.from_txs(&from).len() >= 2 {
+    // Short same-from / same-to only. Long spines (≥16) stay eager so HotSet /
+    // Bayes still see nonce WAW (unit tests + fan-out). 3356896 pairs are 2-tx;
+    // 0x2a65 is 9. Do not A1 those spines (C5) — lazy-accumulate instead.
+    const SHORT_SPINE: usize = 16;
+    let n_from = hints.from_txs(&from).len();
+    if (2..SHORT_SPINE).contains(&n_from) {
         return true;
     }
-    if let Some(to) = to
-        && hints.to_txs(&to).len() >= 2
-    {
-        return true;
+    if let Some(to) = to {
+        let n_to = hints.to_txs(&to).len();
+        if (2..SHORT_SPINE).contains(&n_to) {
+            return true;
+        }
     }
     false
 }
@@ -257,6 +263,13 @@ mod tests {
                 false
             ),
             "unique 21k stays eager (no single-entry lazy tax)"
+        );
+        // Long same-from spines stay eager so HotSet / Bayes still see nonce WAW.
+        let long: Vec<TxIdx> = (0..32).collect();
+        let h32 = AccountHints::from_from_and_to(from, to, long);
+        assert!(
+            !thin_a0_hinted_lazy(&h32, from, Some(to), true, true, true, false),
+            "n_from=32 ≥ SHORT_SPINE must not force-lazy"
         );
     }
 }
