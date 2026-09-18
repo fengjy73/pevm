@@ -207,7 +207,7 @@ fn batch_park_abort(
     scheduler.finish_validation(tx_version, true)
 }
 
-/// L2: first EffectiveWAW abort → record ℓ and raise the next short edge.
+/// L2: first EffectiveWAW abort → record ℓ and persist consecutive pairs.
 fn promote_and_seed_short_edge(
     specfence: SpecFenceCtx<'_>,
     policy: &super::policy::CostPolicy,
@@ -215,10 +215,14 @@ fn promote_and_seed_short_edge(
     f: &super::collateral::FirstConflict,
 ) {
     policy.promote_short_edge(f.location, 0);
-    if let Some(w) = f.peer.filter(|&w| w < tx_idx) {
-        policy.note_short_pair(f.location, w, tx_idx);
-    }
-    let _ = specfence;
+    let producer = f.peer.filter(|&w| w < tx_idx).unwrap_or(tx_idx);
+    crate::specfence::admit::persist_short_chain_after_abort(
+        specfence.hints,
+        policy,
+        tx_idx,
+        producer,
+        f.location,
+    );
 }
 
 /// A0 / ungated: OCC abort after a failed commute. L2 still promotes the ℓ.

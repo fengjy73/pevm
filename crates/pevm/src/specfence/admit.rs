@@ -9,7 +9,7 @@
 //! No Basic→Storage PE clone.
 
 use alloy_primitives::Address;
-use hashbrown::HashSet;
+use hashbrown::{HashMap, HashSet};
 
 use super::AccountHints;
 use super::bayes::BayesMap;
@@ -126,7 +126,7 @@ pub(crate) fn admit_seed_begin_block(
     if policy.is_a0_majority_block() {
         let mut edges = 0;
         if policy.should_seed_thin_a1() {
-            edges += admit_seed_promoted_short_edges(ready, policy, metrics);
+            edges += admit_seed_promoted_short_edges(ready, hints, policy, metrics);
         }
         edges += admit_seed_hint_short_edges(ready, hints, policy, metrics);
         let _ = (stages, learner, bayes, prior, beneficiary, contracts);
@@ -381,22 +381,42 @@ fn admit_seed_hint_short_edges(
 }
 
 /// L4/C5: reuse / measured prior → one ReadyEdge per promoted ℓ (not a cohort).
+/// Thin blocks keep at most `THIN_A1_K` locations, longest chain first, so
+/// Basic(0x32be) 4→31→66→… and storage 14→16→17 win over 2-writer ERC-20 slots.
 fn admit_seed_promoted_short_edges(
     ready: &ReadyEdgeTable,
+    hints: &AccountHints,
     policy: &CostPolicy,
     metrics: Option<&MetricsInner>,
 ) -> usize {
-    let mut edges = 0;
+    let mut by_loc: HashMap<MemoryLocationHash, Vec<(TxIdx, TxIdx)>> = HashMap::new();
     for (loc, pred, succ) in policy.promoted_short_pairs() {
         if pred >= succ || !policy.is_promoted(loc) {
             continue;
         }
-        ready.note_consumer_on(succ, pred, Some(loc));
-        policy.note_short_edge_admit();
-        if let Some(m) = metrics {
-            m.record_edge_ordered_admit();
+        by_loc.entry(loc).or_default().push((pred, succ));
+    }
+    by_loc.retain(|_, pairs| {
+        let mut txs: Vec<TxIdx> = pairs.iter().flat_map(|(a, b)| [*a, *b]).collect();
+        txs.sort_unstable();
+        txs.dedup();
+        !is_wide_envelope_writer_set(hints, &txs)
+    });
+    let mut locs: Vec<(MemoryLocationHash, Vec<(TxIdx, TxIdx)>)> = by_loc.into_iter().collect();
+    locs.sort_unstable_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+    if policy.is_a0_majority_block() && locs.len() > THIN_A1_K {
+        locs.truncate(THIN_A1_K);
+    }
+    let mut edges = 0;
+    for (loc, pairs) in locs {
+        for (pred, succ) in pairs {
+            ready.note_consumer_on(succ, pred, Some(loc));
+            policy.note_short_edge_admit();
+            if let Some(m) = metrics {
+                m.record_edge_ordered_admit();
+            }
+            edges += 1;
         }
-        edges += 1;
     }
     edges
 }
@@ -685,57 +705,96 @@ fn from_successors(
     from_txs.iter().copied().filter(|&t| t > writer).collect()
 }
 
-#[allow(dead_code)]
-fn later_hint_successors(
+/// Later writers of `location` that hints can name without a wide CallWaw star.
+///
+/// Account-location consecutive only:
+/// - `ℓ = Basic(from)` → later same-from
+/// - `ℓ = Basic(to)` → later same `to`
+/// - hidden ℓ + short CallWaw (3..=7) → later calldata of that `to` (14→16→17)
+/// Hidden empty-to (0x209c → Basic(0x32be)) is completed from D1 at end-block,
+/// not by cloning the envelope onto every abort ℓ.
+/// Wide CallWaw / RAW fans stay empty — different slots must not serialize.
+fn location_successors(
     hints: &AccountHints,
+    location: MemoryLocationHash,
+    writer: TxIdx,
     from: Address,
     to: Option<Address>,
-    writer: TxIdx,
-    from_loc: MemoryLocationHash,
-    effective_locs: &[MemoryLocationHash],
 ) -> Vec<TxIdx> {
-    let mut later = envelope_successors(hints, to, writer);
-    later.extend(from_successors(
-        hints,
-        from,
-        writer,
-        from_loc,
-        effective_locs,
-    ));
-    later.sort_unstable();
-    later.dedup();
-    later
+    let from_loc = hash_deterministic(MemoryLocation::Basic(from));
+    if location == from_loc {
+        return hints
+            .from_txs(&from)
+            .iter()
+            .copied()
+            .filter(|&t| t > writer)
+            .collect();
+    }
+    let Some(to) = to else {
+        return Vec::new();
+    };
+    let to_loc = hash_deterministic(MemoryLocation::Basic(to));
+    if location == to_loc {
+        return hints
+            .to_txs(&to)
+            .iter()
+            .copied()
+            .filter(|&t| t > writer)
+            .collect();
+    }
+    let call_n = hints.call_to_txs(&to).len();
+    if call_n >= RAW_FANOUT_FLOOR || call_n >= 8 {
+        return Vec::new();
+    }
+    if call_n >= CALL_WAW_FLOOR {
+        return hints
+            .call_to_txs(&to)
+            .iter()
+            .copied()
+            .filter(|&t| t > writer)
+            .collect();
+    }
+    // Hidden ℓ + empty-to: do **not** clone the envelope tail onto this ℓ.
+    // 0x209c writers of Basic(0x32be) are completed from D1 at end-block.
+    Vec::new()
 }
 
-/// L2: first EffectiveWAW abort → short-edge the immediate remaining successor.
-#[allow(dead_code)]
-pub(crate) fn admit_seed_next_successor(
-    ready: &ReadyEdgeTable,
+/// True when `writers` is a wide empty-to / CallWaw envelope (not a hidden Basic).
+pub(crate) fn is_wide_envelope_writer_set(hints: &AccountHints, writers: &[TxIdx]) -> bool {
+    if writers.len() < 8 {
+        return false;
+    }
+    hints.to_accounts().any(|a| {
+        let t = hints.to_txs(&a);
+        t.len() >= 8 && writers.iter().all(|w| t.contains(w))
+    }) || hints.call_to_accounts().any(|a| {
+        let t = hints.call_to_txs(&a);
+        t.len() >= RAW_FANOUT_FLOOR && writers.iter().all(|w| t.contains(w))
+    })
+}
+
+/// L2: first EffectiveWAW abort → persist consecutive pairs on this ℓ.
+///
+/// Do **not** insert ReadyEdges here. Mid-block insert races A0
+/// `note_producer_done_stamp` (seq≡par / Estimate leftover). The next
+/// begin plants the stored pairs (`admit_seed_promoted_short_edges`).
+pub(crate) fn persist_short_chain_after_abort(
     hints: &AccountHints,
-    policy: Option<&CostPolicy>,
+    policy: &CostPolicy,
     consumer: TxIdx,
     producer: TxIdx,
     location: MemoryLocationHash,
-    from: Address,
-    to: Option<Address>,
 ) {
-    if producer >= consumer {
-        return;
+    if producer < consumer {
+        policy.note_short_pair(location, producer, consumer);
     }
-    ready.note_raw_producer(location, producer);
-    ready.note_location_writer(location, producer);
-    ready.note_location_writer(location, consumer);
-    ready.note_consumer_on(consumer, producer, Some(location));
-    if let Some(p) = policy {
-        p.note_short_pair(location, producer, consumer);
-        p.note_short_edge_admit();
-    }
-    let later = later_hint_successors(hints, from, to, consumer, 0, &[]);
-    if let Some(&succ) = later.first() {
-        ready.note_consumer_on_if_idle(succ, consumer, Some(location));
-        if let Some(p) = policy {
-            p.note_short_pair(location, consumer, succ);
-        }
+    let from = hints.from_of(consumer);
+    let to = hints.to_of(consumer);
+    let later = location_successors(hints, location, consumer, from, to);
+    let mut pred = consumer;
+    for succ in later {
+        policy.note_short_pair(location, pred, succ);
+        pred = succ;
     }
 }
 
@@ -1569,5 +1628,147 @@ mod tests {
         assert_eq!(n, 0, "C5: wide CallWaw stays A0 at thin begin, got {n}");
         assert!(ready.may_execute(31), "wide head stays runnable");
         assert!(ready.may_execute(66), "wide tail stays runnable");
+    }
+
+    #[test]
+    fn wide_envelope_writer_set_skips_empty_to_not_hidden_basic() {
+        let to = Address::repeat_byte(0x20);
+        let writers: Vec<TxIdx> = vec![
+            31, 66, 67, 69, 70, 93, 96, 103, 115, 131, 132, 135, 138, 141, 166, 171,
+        ];
+        let hints = AccountHints::from_to_txs(to, writers.clone());
+        assert!(
+            is_wide_envelope_writer_set(&hints, &writers),
+            "pure 0x209c envelope must not be persisted as a location chain"
+        );
+        let mut with_hot = writers.clone();
+        with_hot.insert(0, 4);
+        assert!(
+            !is_wide_envelope_writer_set(&hints, &with_hot),
+            "Basic(0x32be) writers 4∪0x209c are not a wide envelope"
+        );
+    }
+
+    #[test]
+    fn abort_persists_hidden_basic_chain() {
+        let policy = policy_for(176);
+        let to = Address::repeat_byte(0x20);
+        let loc = 0x32be_u64;
+        let hints = AccountHints::from_to_txs(to, vec![31, 66, 67, 69]);
+        policy.promote_short_edge(loc, 0);
+        persist_short_chain_after_abort(&hints, &policy, 31, 4, loc);
+        let pairs = policy.promoted_short_pairs();
+        assert!(
+            pairs.iter().any(|&(l, a, b)| l == loc && a == 4 && b == 31),
+            "abort must persist the proven 4→31 pair: {pairs:?}"
+        );
+        assert!(
+            !pairs
+                .iter()
+                .any(|&(l, a, b)| l == loc && a == 31 && b == 66),
+            "empty-to envelope must not be cloned onto a hidden ℓ: {pairs:?}"
+        );
+    }
+
+    #[test]
+    fn abort_does_not_chain_wide_callwaw() {
+        let policy = policy_for(176);
+        let token = Address::repeat_byte(0xaa);
+        let loc = 0xabc_u64;
+        let hints = AccountHints::from_call_to_txs(token, (0..16).collect());
+        policy.promote_short_edge(loc, 0);
+        persist_short_chain_after_abort(&hints, &policy, 3, 1, loc);
+        let pairs = policy.promoted_short_pairs();
+        assert!(
+            pairs.iter().any(|&(l, a, b)| l == loc && a == 1 && b == 3),
+            "producer→consumer pair is kept: {pairs:?}"
+        );
+        assert!(
+            !pairs.iter().any(|&(l, a, b)| l == loc && a == 3 && b == 4)
+                && !pairs.iter().any(|&(l, _, s)| l == loc && s == 15),
+            "C5: wide CallWaw must not persist ERC-20 slot stars: {pairs:?}"
+        );
+    }
+
+    #[test]
+    fn thin_begin_reuses_main_chain_pairs() {
+        let ready = ReadyEdgeTable::new();
+        let stages = ProducerStageTable::new();
+        let learner = LiveLearner::new();
+        learner.begin_block(MorphWeights::default());
+        let bayes = BayesMap::new();
+        let prior = InterBlockPrior::new();
+        let policy = policy_for(176);
+        policy.promote_short_edge(0x32be, 40_000);
+        policy.note_short_pair(0x32be, 4, 31);
+        policy.note_short_pair(0x32be, 31, 66);
+        policy.note_short_pair(0x32be, 66, 67);
+        policy.end_block_learn();
+        policy.begin_block(176);
+        let n = admit_seed_begin_block(
+            &ready,
+            &stages,
+            &learner,
+            &bayes,
+            &prior,
+            &AccountHints::default(),
+            Address::ZERO,
+            &policy,
+            &HashSet::new(),
+            None,
+        );
+        assert!(n >= 3, "L4: reuse must plant 4→31→66→67, got {n}");
+        assert_eq!(ready.blocking_producer(31), Some(4));
+        assert_eq!(ready.blocking_producer(66), Some(31));
+        assert_eq!(ready.blocking_producer(67), Some(66));
+        assert!(ready.may_execute(4), "chain head stays runnable");
+    }
+
+    #[test]
+    fn thin_begin_k_caps_promoted_locations() {
+        let ready = ReadyEdgeTable::new();
+        let stages = ProducerStageTable::new();
+        let learner = LiveLearner::new();
+        learner.begin_block(MorphWeights::default());
+        let bayes = BayesMap::new();
+        let prior = InterBlockPrior::new();
+        let policy = policy_for(176);
+        policy.promote_short_edge(0x32be, 40_000);
+        policy.note_short_pair(0x32be, 4, 31);
+        policy.note_short_pair(0x32be, 31, 66);
+        policy.note_short_pair(0x32be, 66, 67);
+        policy.promote_short_edge(0xedba, 20_000);
+        policy.note_short_pair(0xedba, 14, 16);
+        policy.note_short_pair(0xedba, 16, 17);
+        policy.promote_short_edge(0xa1, 10_000);
+        policy.note_short_pair(0xa1, 10, 11);
+        policy.promote_short_edge(0xa2, 10_000);
+        policy.note_short_pair(0xa2, 12, 13);
+        policy.promote_short_edge(0xa3, 10_000);
+        policy.note_short_pair(0xa3, 18, 19);
+        policy.end_block_learn();
+        policy.begin_block(176);
+        let n = admit_seed_begin_block(
+            &ready,
+            &stages,
+            &learner,
+            &bayes,
+            &prior,
+            &AccountHints::default(),
+            Address::ZERO,
+            &policy,
+            &HashSet::new(),
+            None,
+        );
+        assert_eq!(ready.blocking_producer(31), Some(4));
+        assert_eq!(ready.blocking_producer(16), Some(14));
+        let extra_blocked = [11usize, 13, 19]
+            .iter()
+            .filter(|&&t| !ready.may_execute(t))
+            .count();
+        assert!(
+            extra_blocked <= 1 && n <= 3 + 2 + 1,
+            "C5: thin reuse plants ≤K locations (extras_blocked={extra_blocked} edges={n})"
+        );
     }
 }

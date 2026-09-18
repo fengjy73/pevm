@@ -755,6 +755,20 @@ impl CostPolicy {
         }
     }
 
+    /// Post-publish (end-block): persist consecutive D1 pairs on already
+    /// promoted ℓ. Completes 4→31→66→… after the first block without
+    /// inserting ReadyEdges mid-execute.
+    pub(crate) fn note_promoted_writer_orders(&self, orders: &[(MemoryLocationHash, Vec<TxIdx>)]) {
+        for (loc, writers) in orders {
+            if writers.len() < 2 || !self.is_promoted(*loc) {
+                continue;
+            }
+            for pair in writers.windows(2) {
+                self.note_short_pair(*loc, pair[0], pair[1]);
+            }
+        }
+    }
+
     /// L4: stored short-edge pairs whose idx still match this block size.
     pub(crate) fn promoted_short_pairs(&self) -> Vec<(MemoryLocationHash, TxIdx, TxIdx)> {
         let n = self.block_n();
@@ -1372,6 +1386,33 @@ mod tests {
                 .iter()
                 .any(|&(loc, pred, succ)| loc == 0x32be && pred == 4 && succ == 31),
             "L4: stored 4→31 pair must survive begin: {pairs:?}"
+        );
+    }
+
+    #[test]
+    fn end_block_persists_consecutive_writer_order() {
+        let p = CostPolicy::new();
+        p.begin_block(176);
+        p.promote_short_edge(0x32be, 40_000);
+        p.note_promoted_writer_orders(&[(0x32be, vec![4, 31, 66, 67]), (0xabc, vec![1, 2])]);
+        p.end_block_learn();
+        p.begin_block(176);
+        let pairs = p.promoted_short_pairs();
+        assert!(
+            pairs
+                .iter()
+                .any(|&(l, a, b)| l == 0x32be && a == 4 && b == 31)
+                && pairs
+                    .iter()
+                    .any(|&(l, a, b)| l == 0x32be && a == 31 && b == 66)
+                && pairs
+                    .iter()
+                    .any(|&(l, a, b)| l == 0x32be && a == 66 && b == 67),
+            "post-publish D1 must persist the full main-chain short edges: {pairs:?}"
+        );
+        assert!(
+            !pairs.iter().any(|&(l, _, _)| l == 0xabc),
+            "unpromoted ERC-20 slots must not enter short_chain"
         );
     }
 }
