@@ -7,16 +7,16 @@
 ## 机制
 
 ### CC / WAW（C）
-- **C1/C2:** 有效非 lazy 发表后记录 D1，并对立即后继升短 ReadyEdge（4→31、14→16）。冷启动 begin 仍可 A1=0；第一笔有效写后不再整块锁死无序。
-- **C3:** 升边当 `ĉ_reexec(ℓ) > ĉ_ordered`；本块首次冲突 / 已有 earlier writer / hint 后继≥2 视为证明。
-- **C4:** commute/ignore 仍服务 21k；lazy 不升边。
-- **C5:** 不冻信封 A1=3。thin + 已 promote 时 begin 只种存储的 (pred,succ) 短边。`edge_ordered_admit`＝真短边。
+- **C1/C2:** begin 对 CallWaw 信封种**连续短边链**（14→16→17、31→66→…；宽 fan 也链，不当 RAW 星、不当探针星）。空 to 仍 A0。有效非 lazy 发表后 D1 + `if_idle` 立即后继（4→31）。冷启动不再整块无序锁死。
+- **C3:** 升边当 `ĉ_reexec(ℓ) > ĉ_ordered`；本块首次冲突 / 已有 earlier writer / hint 后继≥2 视为证明。`THIN_A1_K` 帽的是 **ℓ 数**，不是边数。
+- **C4:** commute/ignore 仍服务 21k；lazy / empty-to 不升边。
+- **C5:** 不冻信封 A1=3。`edge_ordered_admit`＝真短边数（链上每一对）。
 
 ### 学习（L）
 - **L1:** `promote_short_edge(ℓ, 0)` 用 abort hat / loc EMA 置 `measured=true` 并真正升边。
 - **L2:** 首次 EffectiveWAW abort → 记 ℓ + `admit_seed_next_successor`（本块后续短边）。
 - **L3:** 按 ℓ 更新 `cost_ev_keep_ordered` / `demote`；`end_block_learn` 在 abort_cf>prepaid 时抬升短边 prior。
-- **L4:** `PromotedLoc.{pred,succ}` 跨块保留；同 Pevm 下一块 `should_seed_thin_a1` 可种短边 A1。
+- **L4:** `PromotedLoc.{pred,succ}` + `short_chain` 跨块保留；同 Pevm 下一块 `should_seed_thin_a1` 可种短边 A1。
 - **L5:** A0 热路径仍不走重 HotSet/Bayes 更新。
 
 ### PC（P）

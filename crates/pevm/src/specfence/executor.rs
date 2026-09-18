@@ -215,7 +215,8 @@ fn promote_and_seed_short_edge(
     f: &super::collateral::FirstConflict,
 ) {
     policy.promote_short_edge(f.location, 0);
-    if let Some(w) = f.peer {
+    if let Some(w) = f.peer.filter(|&w| w < tx_idx) {
+        policy.note_short_pair(f.location, w, tx_idx);
         crate::specfence::admit::admit_seed_next_successor(
             specfence.ready_edges,
             specfence.hints,
@@ -237,6 +238,15 @@ fn occ_abort_ungated(
     specfence: SpecFenceCtx<'_>,
     invalid: &[MemoryLocationHash],
 ) -> Option<Task> {
+    let first = specfence.policy.and_then(|_| {
+        classify_first_conflict(
+            specfence.hints,
+            mv_memory,
+            specfence.beneficiary,
+            tx_version.tx_idx,
+            invalid,
+        )
+    });
     let aborted = scheduler.try_validation_abort(tx_version);
     if aborted {
         mv_memory.convert_writes_to_estimates(tx_version.tx_idx);
@@ -244,13 +254,7 @@ fn occ_abort_ungated(
         specfence.metrics.record_full_abort_reexecute();
         if let Some(p) = specfence.policy {
             p.note_wave_off_edge_reexec();
-            if let Some(f) = classify_first_conflict(
-                specfence.hints,
-                mv_memory,
-                specfence.beneficiary,
-                tx_version.tx_idx,
-                invalid,
-            ) {
+            if let Some(f) = first {
                 match f.class {
                     ConflictClass::EffectiveWAW => {
                         promote_and_seed_short_edge(specfence, p, tx_version.tx_idx, &f);
@@ -300,7 +304,7 @@ pub(crate) fn validate_occ_kernel(
         return scheduler.finish_validation(tx_version, false);
     }
     let a0_ungated = specfence.policy.is_some_and(|p| p.is_a0_majority_block())
-        && !specfence.ready_edges.was_queued(tx_version.tx_idx);
+        && !specfence.ready_edges.is_gated(tx_version.tx_idx);
     if a0_ungated {
         return occ_abort_ungated(mv_memory, scheduler, tx_version, specfence, &invalid);
     }
@@ -461,7 +465,7 @@ pub(crate) fn validate_specfence(
     }
     // Thin-shell A0: commute already tried; failed commute ≡ OCC abort.
     let a0_ungated = specfence.policy.is_some_and(|p| p.is_a0_majority_block())
-        && !specfence.ready_edges.was_queued(tx_version.tx_idx);
+        && !specfence.ready_edges.is_gated(tx_version.tx_idx);
     if a0_ungated {
         return occ_abort_ungated(mv_memory, scheduler, tx_version, specfence, &invalid);
     }

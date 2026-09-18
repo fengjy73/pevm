@@ -16,7 +16,7 @@ use super::bayes::BayesMap;
 use super::feeder::{seed_known_stars, top_is_known_star};
 use super::learner::{InterBlockPrior, LiveLearner};
 use super::metrics::MetricsInner;
-use super::policy::{CohortKind, CostPolicy};
+use super::policy::{CohortKind, CostPolicy, THIN_A1_K};
 use super::producer_stage::ProducerStageTable;
 use super::ready_edge::ReadyEdgeTable;
 use super::wave::WaveParkTable;
@@ -121,24 +121,16 @@ pub(crate) fn admit_seed_begin_block(
     contracts: &HashSet<Address>,
     metrics: Option<&MetricsInner>,
 ) -> usize {
-    // L1/C5: thin cold start is A1=0. After a measured promote, seed **short
-    // edges only** (stored pred→succ) — never freeze an envelope A1=3 tax.
+    // L1/C5: thin never plants an envelope A1=3 star. CallWaw spines get a
+    // consecutive short-edge chain (14→16→17, 31→66→…). Empty-to stays A0.
     if policy.is_a0_majority_block() {
-        if !policy.should_seed_thin_a1() {
-            let _ = (
-                ready,
-                stages,
-                learner,
-                bayes,
-                prior,
-                hints,
-                beneficiary,
-                contracts,
-                metrics,
-            );
-            return 0;
+        let mut edges = 0;
+        if policy.should_seed_thin_a1() {
+            edges += admit_seed_promoted_short_edges(ready, policy, metrics);
         }
-        return admit_seed_promoted_short_edges(ready, policy, metrics);
+        edges += admit_seed_hint_short_edges(ready, hints, policy, metrics);
+        let _ = (stages, learner, bayes, prior, beneficiary, contracts);
+        return edges;
     }
     let stars = seed_known_stars(learner, bayes, prior);
     let fan = learner.morph_weights().dominant_fan_out();
@@ -336,6 +328,57 @@ pub(crate) fn admit_seed_begin_block(
         let _ = c.is_contract;
     }
 
+    edges
+}
+
+/// C1/C5: thin begin — consecutive short-edge **chain** per CallWaw ℓ.
+///
+/// Hottest envelopes first (len desc), cap **locations** at `THIN_A1_K`.
+/// Wide calldata fans are chained (not skipped as RAW stars, not a probe
+/// star). Empty-to / lazy payee spines stay A0 (C4).
+fn admit_seed_hint_short_edges(
+    ready: &ReadyEdgeTable,
+    hints: &AccountHints,
+    policy: &CostPolicy,
+    metrics: Option<&MetricsInner>,
+) -> usize {
+    let mut addrs: Vec<(Address, usize)> = hints
+        .call_to_accounts()
+        .map(|a| (a, hints.call_to_txs(&a).len()))
+        .filter(|&(_, n)| n >= 3)
+        .collect();
+    addrs.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut edges = 0;
+    let mut used = 0usize;
+    for (addr, n) in addrs {
+        if used >= THIN_A1_K {
+            break;
+        }
+        let txs = hints.call_to_txs(&addr);
+        let loc = envelope_loc(addr);
+        if !policy.should_gate_short_after_write(loc, false, n.saturating_sub(1)) {
+            continue;
+        }
+        let mut planted = 0usize;
+        for pair in txs.windows(2) {
+            let (pred, succ) = (pair[0], pair[1]);
+            if pred >= succ {
+                continue;
+            }
+            ready.note_consumer_on(succ, pred, Some(loc));
+            policy.note_short_pair(loc, pred, succ);
+            policy.note_short_edge_admit();
+            if let Some(m) = metrics {
+                m.record_edge_ordered_admit();
+            }
+            planted += 1;
+        }
+        if planted > 0 {
+            policy.promote_short_edge(loc, 0);
+            used += 1;
+            edges += planted;
+        }
+    }
     edges
 }
 
@@ -551,16 +594,19 @@ fn seed_short_edges_after_publish(
     if effective_locs.is_empty() {
         return;
     }
-    let later = later_hint_successors(hints, from, to, writer, from_loc, effective_locs);
+    let envelope_later = envelope_successors(hints, to, writer);
+    let from_later = from_successors(hints, from, writer, from_loc, effective_locs);
     for &loc in all_write_locs {
         if !effective_locs.iter().any(|&l| l == loc) {
             continue;
         }
         ready.note_location_writer(loc, writer);
         let has_earlier = ready.writers_of(loc).iter().any(|&w| w < writer);
-        if has_earlier {
-            ready.note_immediate_pred(loc, writer);
-        }
+        let later: &[TxIdx] = if loc == from_loc {
+            &from_later
+        } else {
+            &envelope_later
+        };
         let hint_n = later.len();
         let gate = policy
             .map(|p| p.should_gate_short_after_write(loc, has_earlier, hint_n))
@@ -570,24 +616,65 @@ fn seed_short_edges_after_publish(
         }
         if let Some(p) = policy {
             p.promote_short_edge(loc, 0);
-        }
-        if let Some(&succ) = later.first() {
-            ready.note_consumer_on(succ, writer, Some(loc));
-            if let Some(p) = policy {
+            if let Some(&succ) = later.first() {
                 p.note_short_pair(loc, writer, succ);
-                if has_earlier {
-                    if let Some(pred) = ready
-                        .writers_of(loc)
-                        .into_iter()
-                        .rev()
-                        .find(|&w| w < writer)
-                    {
-                        p.note_short_pair(loc, pred, writer);
-                    }
+            }
+            if has_earlier {
+                if let Some(pred) = ready
+                    .writers_of(loc)
+                    .into_iter()
+                    .rev()
+                    .find(|&w| w < writer)
+                {
+                    p.note_short_pair(loc, pred, writer);
                 }
             }
         }
+        if has_earlier {
+            if let Some(pred) = ready
+                .writers_of(loc)
+                .into_iter()
+                .rev()
+                .find(|&w| w < writer)
+            {
+                let _ = ready.note_consumer_on_if_idle(writer, pred, Some(loc));
+            }
+        }
+        if let Some(&succ) = later.first() {
+            let _ = ready.note_consumer_on_if_idle(succ, writer, Some(loc));
+        }
     }
+}
+
+fn envelope_successors(hints: &AccountHints, to: Option<Address>, writer: TxIdx) -> Vec<TxIdx> {
+    let Some(to) = to else {
+        return Vec::new();
+    };
+    let call = hints.call_to_txs(&to);
+    let payee = hints.to_txs(&to);
+    let src = if call.len() >= CALL_WAW_FLOOR {
+        call
+    } else {
+        payee
+    };
+    src.iter().copied().filter(|&t| t > writer).collect()
+}
+
+fn from_successors(
+    hints: &AccountHints,
+    from: Address,
+    writer: TxIdx,
+    from_loc: MemoryLocationHash,
+    effective_locs: &[MemoryLocationHash],
+) -> Vec<TxIdx> {
+    if !effective_locs.iter().any(|&l| l == from_loc) {
+        return Vec::new();
+    }
+    let from_txs = hints.from_txs(&from);
+    if from_txs.len() < 3 || hints.cohort_all_empty(from_txs) {
+        return Vec::new();
+    }
+    from_txs.iter().copied().filter(|&t| t > writer).collect()
 }
 
 fn later_hint_successors(
@@ -598,25 +685,14 @@ fn later_hint_successors(
     from_loc: MemoryLocationHash,
     effective_locs: &[MemoryLocationHash],
 ) -> Vec<TxIdx> {
-    let mut later = Vec::new();
-    if let Some(to) = to {
-        let call = hints.call_to_txs(&to);
-        let payee = hints.to_txs(&to);
-        let src = if call.len() >= CALL_WAW_FLOOR {
-            call
-        } else {
-            payee
-        };
-        later.extend(src.iter().copied().filter(|&t| t > writer));
-    }
-    // Same-from Data (nonce/balance) — only when the from loc is effective
-    // and the cohort is not a lazy 21k spine (C4).
-    if effective_locs.iter().any(|&l| l == from_loc) {
-        let from_txs = hints.from_txs(&from);
-        if from_txs.len() >= 3 && !hints.cohort_all_empty(from_txs) {
-            later.extend(from_txs.iter().copied().filter(|&t| t > writer));
-        }
-    }
+    let mut later = envelope_successors(hints, to, writer);
+    later.extend(from_successors(
+        hints,
+        from,
+        writer,
+        from_loc,
+        effective_locs,
+    ));
     later.sort_unstable();
     later.dedup();
     later
@@ -646,7 +722,7 @@ pub(crate) fn admit_seed_next_successor(
     }
     let later = later_hint_successors(hints, from, to, consumer, 0, &[]);
     if let Some(&succ) = later.first() {
-        ready.note_consumer_on(succ, consumer, Some(location));
+        ready.note_consumer_on_if_idle(succ, consumer, Some(location));
         if let Some(p) = policy {
             p.note_short_pair(location, consumer, succ);
         }
@@ -1423,8 +1499,75 @@ mod tests {
             &contracts,
             None,
         );
-        assert_eq!(n, 0, "L1: thin cold start must allow A1=0, got {n}");
-        assert!(!ready.has_any_gated(), "no gated txs on thin cold start");
+        assert_eq!(n, 0, "C4: empty-to payee spine stays A0 on thin, got {n}");
+        assert!(ready.may_execute(0), "probe head stays runnable");
         assert!(ready.may_execute(8), "later empty-to stays OCC-runnable");
+    }
+
+    #[test]
+    fn thin_begin_seeds_call_waw_chain() {
+        let ready = ReadyEdgeTable::new();
+        let stages = ProducerStageTable::new();
+        let learner = LiveLearner::new();
+        learner.begin_block(MorphWeights::default());
+        let bayes = BayesMap::new();
+        let prior = InterBlockPrior::new();
+        let storage = Address::repeat_byte(0xed);
+        let hints = AccountHints::from_call_to_txs(storage, vec![14, 16, 17]);
+        let policy = policy_for(176);
+        let n = admit_seed_begin_block(
+            &ready,
+            &stages,
+            &learner,
+            &bayes,
+            &prior,
+            &hints,
+            Address::ZERO,
+            &policy,
+            &HashSet::new(),
+            None,
+        );
+        assert_eq!(n, 2, "C1: 14→16→17 is two short edges, got {n}");
+        assert_eq!(ready.blocking_producer(16), Some(14));
+        assert_eq!(ready.blocking_producer(17), Some(16));
+        assert!(ready.may_execute(14), "storage head stays runnable");
+    }
+
+    #[test]
+    fn thin_begin_call_waw_chain_not_star() {
+        let ready = ReadyEdgeTable::new();
+        let stages = ProducerStageTable::new();
+        let learner = LiveLearner::new();
+        learner.begin_block(MorphWeights::default());
+        let bayes = BayesMap::new();
+        let prior = InterBlockPrior::new();
+        let main = Address::repeat_byte(0x20);
+        let hints = AccountHints::from_call_to_txs(main, vec![31, 66, 67, 69, 70]);
+        let policy = policy_for(176);
+        let n = admit_seed_begin_block(
+            &ready,
+            &stages,
+            &learner,
+            &bayes,
+            &prior,
+            &hints,
+            Address::ZERO,
+            &policy,
+            &HashSet::new(),
+            None,
+        );
+        assert_eq!(
+            n, 4,
+            "C5: consecutive short edges, not a cohort star, got {n}"
+        );
+        assert_eq!(ready.blocking_producer(66), Some(31));
+        assert_eq!(ready.blocking_producer(67), Some(66));
+        assert_eq!(ready.blocking_producer(70), Some(69));
+        assert_ne!(
+            ready.blocking_producer(70),
+            Some(31),
+            "C5: tail waits on its pred, not the envelope head"
+        );
+        assert!(ready.may_execute(31), "main-chain head stays runnable");
     }
 }

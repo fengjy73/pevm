@@ -3289,8 +3289,8 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         .note_incarnation_finish(tx_version.tx_idx, exec_result.tx_gas_used());
                 }
 
-                // L4/P3: A0 ungated records MV. C1: effective non-lazy publishes
-                // may raise a short ReadyEdge; lazy 21k still skips Vecs.
+                // C1: A0 ungated records MV, then if_idle short edges on
+                // effective non-lazy publishes. In-flight succs stay OCC.
                 if a0_ungated {
                     let has_effective = write_set.iter().any(|(loc, val)| {
                         *loc != self.beneficiary_location_hash

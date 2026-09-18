@@ -215,6 +215,8 @@ pub(crate) struct CostPolicy {
     conflicts: DashMap<TxIdx, ConflictNote, FxBuildHasher>,
     /// C4: EffectiveWAW locations eligible for a short-edge A1 (cap-limited).
     promoted: DashMap<MemoryLocationHash, PromotedLoc, FxBuildHasher>,
+    /// L4: consecutive (pred, succ) pairs on a hot ℓ (beyond one stored pair).
+    short_chain: DashMap<MemoryLocationHash, Vec<(TxIdx, TxIdx)>, FxBuildHasher>,
     /// L2: reexec_ns EMA keyed by location (feeds U3 / per-ℓ EV).
     loc_reexec_ns: DashMap<MemoryLocationHash, OnlineStat, FxBuildHasher>,
     /// L2: refuse/prepaid EMA keyed by location.
@@ -266,6 +268,7 @@ impl Default for CostPolicy {
             conflict_ignore: AtomicUsize::new(0),
             conflicts: DashMap::default(),
             promoted: DashMap::default(),
+            short_chain: DashMap::default(),
             loc_reexec_ns: DashMap::default(),
             loc_c_a1: DashMap::default(),
             c_a0_snap_bits: AtomicU64::new(PRIOR_C_A0_NS.to_bits()),
@@ -297,6 +300,7 @@ impl CostPolicy {
         self.cohorts.clear();
         self.conflicts.clear();
         self.promoted.clear();
+        self.short_chain.clear();
         self.loc_reexec_ns.clear();
         self.loc_c_a1.clear();
         self.prepaid_lose_streak.store(0, Ordering::Relaxed);
@@ -740,8 +744,15 @@ impl CostPolicy {
             pred: usize::MAX,
             succ: usize::MAX,
         });
-        e.pred = pred;
-        e.succ = succ;
+        if e.pred == usize::MAX || pred < e.pred {
+            e.pred = pred;
+            e.succ = succ;
+        }
+        drop(e);
+        let mut chain = self.short_chain.entry(location).or_default();
+        if !chain.iter().any(|&(p, s)| p == pred && s == succ) {
+            chain.push((pred, succ));
+        }
     }
 
     /// L4: stored short-edge pairs whose idx still match this block size.
@@ -752,17 +763,27 @@ impl CostPolicy {
         if !same_shape {
             return Vec::new();
         }
-        self.promoted
-            .iter()
-            .filter_map(|e| {
-                let s = *e.value();
-                if s.hits >= 1 && s.measured && s.pred < s.succ && s.succ < n {
-                    Some((*e.key(), s.pred, s.succ))
-                } else {
-                    None
+        let mut out = Vec::new();
+        for e in self.promoted.iter() {
+            let s = *e.value();
+            if s.hits >= 1 && s.measured && s.pred < s.succ && s.succ < n {
+                out.push((*e.key(), s.pred, s.succ));
+            }
+        }
+        for e in self.short_chain.iter() {
+            let loc = *e.key();
+            if !self.is_promoted(loc) {
+                continue;
+            }
+            for &(pred, succ) in e.value() {
+                if pred < succ && succ < n {
+                    out.push((loc, pred, succ));
                 }
-            })
-            .collect()
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
     /// C3: keep a short edge when ĉ_reexec (ℓ EMA) > ĉ_ordered.

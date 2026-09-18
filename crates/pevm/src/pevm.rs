@@ -490,10 +490,14 @@ impl Pevm {
             // Bayes → admit_seed before any Execute (v9.1). Known stars keep
             // PE even on quiet morph (M4). Truly cold seeds nothing.
             self.cost_policy.begin_block(block_size);
-            // L1/P3: thin cold A1=0 skips contract storage walk + admit_seed.
+            // Thin CallWaw chain needs hints only (P2: skip contract walk).
             // PROFILE Instant only (product path must not pay begin Instant).
-            if self.cost_policy.should_seed_thin_a1() {
-                let contracts = collect_contracts(storage, &hints);
+            {
+                let contracts = if self.cost_policy.is_a0_majority_block() {
+                    HashSet::new()
+                } else {
+                    collect_contracts(storage, &hints)
+                };
                 let seed_t0 = crate::specfence::profile_timing_enabled().then(Instant::now);
                 let _ = crate::specfence::admit::admit_seed_begin_block(
                     &ready_edges,
@@ -605,16 +609,16 @@ impl Pevm {
                     while task.is_some() {
                         task = match task.unwrap() {
                             Task::Execution(tx_version) => {
+                                if self.concurrency_mode == ConcurrencyMode::SpecFence {
+                                    specfence.ready_edges.note_started(tx_version.tx_idx);
+                                }
                                 let occ_exec = occ_mode
                                     || (self.concurrency_mode == ConcurrencyMode::SpecFence
-                                        && !specfence.ready_edges.has_any_gated());
+                                        && !specfence.ready_edges.is_gated(tx_version.tx_idx));
                                 if occ_exec {
                                     let done_idx = tx_version.tx_idx;
-                                    // Pass wave so a mid-execute short edge can wake.
-                                    // Fence stays None (A0 ≡ OCC execute wrap).
-                                    let next = self.try_execute(
-                                        &mut vm, &scheduler, tx_version, wave_ref, None,
-                                    );
+                                    let next = self
+                                        .try_execute(&mut vm, &scheduler, tx_version, None, None);
                                     if self.concurrency_mode == ConcurrencyMode::SpecFence {
                                         if specfence.ready_edges.has_any_gated() {
                                             if let Some(w) = wave_ref {
@@ -646,7 +650,7 @@ impl Pevm {
                             Task::Validation(tx_version) => {
                                 let v0 = profile.then(Instant::now);
                                 let a0_ungated = specfence.mode == ConcurrencyMode::SpecFence
-                                    && !specfence.ready_edges.has_any_gated();
+                                    && !specfence.ready_edges.is_gated(tx_version.tx_idx);
                                 let next = if occ_mode {
                                     crate::specfence::validate_occ_stage(
                                         &mv_memory,
@@ -655,7 +659,6 @@ impl Pevm {
                                         Some(&metrics_inner),
                                     )
                                 } else if a0_ungated {
-                                    // P1: no-conflict path ≡ OCC validate; commute only on miss.
                                     crate::specfence::validate_a0_fast(
                                         &mv_memory,
                                         &scheduler,
@@ -769,6 +772,24 @@ impl Pevm {
             let end_t0 = Instant::now();
             // P2: skip A0 full-block HotSet/write-loc flush. Promoted ℓ already
             // persist in CostPolicy; L5 keeps HotSet/Bayes off the A0 hot path.
+            // P2: HotSet only from D1 multi-writer locs (not every A0 write).
+            if self.cost_policy.is_a0_majority_block() {
+                let beneficiary = hash_deterministic(MemoryLocation::Basic(block_env.beneficiary));
+                let orders = if ready_edges.has_any_gated() {
+                    ready_edges.writer_order_snapshot()
+                } else {
+                    mv_writer_order_snapshot(&mv_memory, block_size, beneficiary)
+                };
+                for (loc, writers) in &orders {
+                    if writers.len() < 2 {
+                        continue;
+                    }
+                    for &tx in writers {
+                        self.hotset.note_writer(*loc, tx);
+                    }
+                    self.rw_prior.observe_write_set(&[*loc], None);
+                }
+            }
             self.hotset.end_block();
             // P1: pack InterBlockPrior from live morph hat + top-ℓ (flip → higher α).
             let morph_hat = learner.morph_hat();
@@ -854,14 +875,10 @@ impl Pevm {
             );
             self.last_learn_report = report;
             self.last_incarnations = incs;
-            // A0-majority skipped live D1; snapshot writer order from MV (no DashMap).
-            if self.cost_policy.is_a0_majority_block() && !ready_edges.has_any_gated() {
-                let beneficiary = hash_deterministic(MemoryLocation::Basic(block_env.beneficiary));
-                self.last_location_writers =
-                    mv_writer_order_snapshot(&mv_memory, block_size, beneficiary);
-            } else {
-                self.last_location_writers = ready_edges.writer_order_snapshot();
-            }
+            // D1 compare snapshot from MV (covers A0 writes that skip live DashMap).
+            let beneficiary = hash_deterministic(MemoryLocation::Basic(block_env.beneficiary));
+            self.last_location_writers =
+                mv_writer_order_snapshot(&mv_memory, block_size, beneficiary);
         } else {
             self.last_process = ExecProcessSnapshot::default();
             self.last_learn_report = LearnReport::default();
