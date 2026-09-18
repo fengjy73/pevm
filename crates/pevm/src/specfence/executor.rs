@@ -223,6 +223,9 @@ fn promote_and_seed_short_edge(
         producer,
         f.location,
     );
+    // O3: retry is idle; plant a window only for not-started successors.
+    specfence.ready_edges.clear_started(tx_idx);
+    let _ = crate::specfence::admit::flush_pending_idle_edges(specfence.ready_edges, policy);
 }
 
 /// A0 / ungated: OCC abort after a failed commute. L2 still promotes the ℓ.

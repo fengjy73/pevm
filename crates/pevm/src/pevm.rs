@@ -589,6 +589,12 @@ impl Pevm {
                     let mut task = if occ_mode {
                         crate::specfence::next_occ_task(&scheduler)
                     } else if self.concurrency_mode == ConcurrencyMode::SpecFence {
+                        if let (Some(p), Some(_)) = (specfence.policy, wave_ref) {
+                            let _ = crate::specfence::admit::flush_pending_idle_edges(
+                                specfence.ready_edges,
+                                p,
+                            );
+                        }
                         if let Some(w) = wave_ref {
                             crate::specfence::next_sf_task(
                                 &scheduler,
@@ -698,6 +704,12 @@ impl Pevm {
                             task = if occ_mode {
                                 crate::specfence::next_occ_task(&scheduler)
                             } else if self.concurrency_mode == ConcurrencyMode::SpecFence {
+                                if let (Some(p), Some(_)) = (specfence.policy, wave_ref) {
+                                    let _ = crate::specfence::admit::flush_pending_idle_edges(
+                                        specfence.ready_edges,
+                                        p,
+                                    );
+                                }
                                 if let Some(w) = wave_ref {
                                     crate::specfence::next_sf_task(
                                         &scheduler,
@@ -770,17 +782,12 @@ impl Pevm {
         );
         if self.concurrency_mode == ConcurrencyMode::SpecFence {
             let end_t0 = Instant::now();
-            // P2: skip A0 full-block HotSet/write-loc flush. Promoted ℓ already
-            // persist in CostPolicy; L5 keeps HotSet/Bayes off the A0 hot path.
-            // P2: HotSet only from D1 multi-writer locs (not every A0 write).
-            if self.cost_policy.is_a0_majority_block() {
-                let beneficiary = hash_deterministic(MemoryLocation::Basic(block_env.beneficiary));
-                let orders = if ready_edges.has_any_gated() {
-                    ready_edges.writer_order_snapshot()
-                } else {
-                    mv_writer_order_snapshot(&mv_memory, block_size, beneficiary)
-                };
-                for (loc, writers) in &orders {
+            // P2: one D1 walk. Thin A0 skips HotSet writer storm (persist uses
+            // the same snapshot). Full-shell still records multi-writer ℓ.
+            let beneficiary = hash_deterministic(MemoryLocation::Basic(block_env.beneficiary));
+            let d1_orders = mv_writer_order_snapshot(&mv_memory, block_size, beneficiary);
+            if !self.cost_policy.is_a0_majority_block() {
+                for (loc, writers) in &d1_orders {
                     if writers.len() < 2 {
                         continue;
                     }
@@ -789,13 +796,15 @@ impl Pevm {
                     }
                     self.rw_prior.observe_write_set(&[*loc], None);
                 }
+                self.hotset.end_block();
             }
-            self.hotset.end_block();
             // P1: pack InterBlockPrior from live morph hat + top-ℓ (flip → higher α).
             let morph_hat = learner.morph_hat();
             let top = learner.pack_top_locations();
             let _alpha = self.inter_prior.end_block(morph_hat, top);
-            sketch.decay_warm_failures(|loc| learner.abort_rate_of(loc));
+            if !self.cost_policy.is_a0_majority_block() {
+                sketch.decay_warm_failures(|loc| learner.abort_rate_of(loc));
+            }
             metrics_inner.set_soft_wait_arms(dag.soft_arm_count());
             metrics_inner.set_sketch_hot_size(sketch.hot_size());
             self.last_process = process.snapshot(16);
@@ -837,8 +846,6 @@ impl Pevm {
             // Post-publish: persist consecutive D1 pairs on promoted ℓ
             // (4→31→66→… on Basic(0x32be)). Skip wide empty-to / CallWaw
             // envelopes so 0x209c is not stored as a star. No mid-execute insert.
-            let beneficiary = hash_deterministic(MemoryLocation::Basic(block_env.beneficiary));
-            let d1_orders = mv_writer_order_snapshot(&mv_memory, block_size, beneficiary);
             let persist: Vec<_> = d1_orders
                 .iter()
                 .filter(|(_, w)| !crate::specfence::admit::is_wide_envelope_writer_set(&hints, w))

@@ -5,6 +5,9 @@
 //! to a second OCC runtime. Beta posteriors are **features**, not `decide()`
 //! authority. Decide is measured-ns EMA: keep A1 iff ĉ_A1 + δ < ĉ_A0.
 //!
+//! O1: long WAW is windowed (`ORDER_WINDOW_K` hops), not a full-spine serialize.
+//! O2/L1: if ĉ_ordered_spine loses to abort EMA, demote that ℓ to A0.
+//!
 //! **L1 (thin / a0_majority_block):** default A0. Cold start may be A1=0.
 //! Promote a short edge only when a per-ℓ / address-pair prior or observed
 //! effective-WAW cost proves ordered cheaper. Do not freeze A1=K from the
@@ -30,6 +33,10 @@ const SERIAL_NS_PER_TX: f64 = 2_000.0;
 /// Thin-shell A1 spine **cap** (not “always exactly 3”). Promote/ignore may
 /// change the set; ns-EV may keep fewer. 3356896 proven spines stay under K.
 pub(crate) const THIN_A1_K: usize = 3;
+/// O1: long Basic WAW plants at most this many hops (partial order). Short
+/// chains (storage 14→16→17) stay fully ordered. Never full-serialize a
+/// 16-writer spine — that prepaid wall lost to OCC abort on 3356896.
+pub(crate) const ORDER_WINDOW_K: usize = 2;
 const THIN_N_MAX: usize = 256;
 /// ns-EV hysteresis: keep A1 only if ĉ_A1 + δ < ĉ_A0.
 const NS_DELTA: f64 = 2_000.0;
@@ -167,6 +174,8 @@ struct PromotedLoc {
     pred: TxIdx,
     /// Immediate successor on this ℓ (reuse / mid-block seed).
     succ: TxIdx,
+    /// O2/L1: ĉ_ordered_spine lost to abort EMA — next begin plants 0 hops.
+    demoted: bool,
 }
 
 /// Per-address B2 context: p_effWAW + refuse-cost EMA + per-pair cost-EV.
@@ -234,6 +243,8 @@ pub(crate) struct CostPolicy {
     wave_batch_noted: AtomicBool,
     /// L4: previous block size — reuse may seed stored (pred, succ) idx pairs.
     last_block_n: AtomicUsize,
+    /// O3: (ℓ, pred, succ) recorded during abort — flush only when idle.
+    pending_idle: Mutex<Vec<(MemoryLocationHash, TxIdx, TxIdx)>>,
 }
 
 impl Default for CostPolicy {
@@ -280,6 +291,7 @@ impl Default for CostPolicy {
             wave_off_edge: AtomicUsize::new(0),
             wave_batch_noted: AtomicBool::new(false),
             last_block_n: AtomicUsize::new(0),
+            pending_idle: Mutex::new(Vec::new()),
         }
     }
 }
@@ -303,6 +315,7 @@ impl CostPolicy {
         self.short_chain.clear();
         self.loc_reexec_ns.clear();
         self.loc_c_a1.clear();
+        self.pending_idle.lock().unwrap().clear();
         self.prepaid_lose_streak.store(0, Ordering::Relaxed);
         self.last_block_n.store(0, Ordering::Relaxed);
         self.c_a0_snap_bits
@@ -339,6 +352,7 @@ impl CostPolicy {
         self.abort_cf_ns.store(0, Ordering::Relaxed);
         self.wave_off_edge.store(0, Ordering::Relaxed);
         self.wave_batch_noted.store(false, Ordering::Relaxed);
+        self.pending_idle.lock().unwrap().clear();
     }
 
     pub(crate) fn begin_block(&self, n: usize) {
@@ -396,6 +410,104 @@ impl CostPolicy {
             THIN_A1_K
         } else {
             usize::MAX
+        }
+    }
+
+    /// O1/O2: how many consecutive hops to plant on `ℓ`.
+    ///
+    /// Short chains (≤`ORDER_WINDOW_K`) plant all (storage 14→16→17).
+    /// Long spines never full-serialize on thin — window or demote to A0
+    /// when ĉ_ordered_spine (hops×refuse) loses to abort EMA.
+    pub(crate) fn hops_to_plant(&self, location: MemoryLocationHash, n_pairs: usize) -> usize {
+        if n_pairs == 0 {
+            return 0;
+        }
+        if self.loc_demoted(location) {
+            self.cost_ev_demote_optimistic
+                .fetch_add(1, Ordering::Relaxed);
+            return 0;
+        }
+        if !self.is_promoted(location) {
+            return 0;
+        }
+        if n_pairs <= ORDER_WINDOW_K {
+            return n_pairs;
+        }
+        if !self.is_a0_majority_block() {
+            return n_pairs;
+        }
+        // Long thin spine: never plant the full chain (PR22 PRIMARY miss).
+        // Window unless a prior block marked this ℓ demoted (measured prepaid lose).
+        self.cost_ev_keep_ordered.fetch_add(1, Ordering::Relaxed);
+        ORDER_WINDOW_K
+    }
+
+    /// ĉ_ordered_spine = hops × ĉ_A1 vs loc abort EMA (not hops×abort).
+    /// Full 16-writer prepaid is hops×18µs; one abort sample is tens of µs.
+    pub(crate) fn spine_ordered_loses(&self, location: MemoryLocationHash, hops: usize) -> bool {
+        if hops == 0 {
+            return false;
+        }
+        let c_ord = self
+            .loc_c_a1
+            .get(&location)
+            .map(|s| s.mean)
+            .unwrap_or_else(|| f64::from_bits(self.c_a1_snap_bits.load(Ordering::Relaxed)))
+            .max(1.0);
+        let c_abort = self
+            .promoted
+            .get(&location)
+            .map(|s| s.reexec_ns_ema)
+            .or_else(|| self.loc_reexec_ns.get(&location).map(|s| s.mean))
+            .unwrap_or_else(|| f64::from_bits(self.c_a0_snap_bits.load(Ordering::Relaxed)))
+            .max(1.0);
+        let ordered_spine = hops as f64 * c_ord;
+        ordered_spine + NS_DELTA >= c_abort
+    }
+
+    #[inline]
+    pub(crate) fn loc_demoted(&self, location: MemoryLocationHash) -> bool {
+        self.promoted.get(&location).is_some_and(|s| s.demoted)
+    }
+
+    /// Stored consecutive pairs on `ℓ` (consensus order).
+    pub(crate) fn pairs_of(&self, location: MemoryLocationHash) -> Vec<(TxIdx, TxIdx)> {
+        let mut out = Vec::new();
+        if let Some(s) = self.promoted.get(&location)
+            && s.pred < s.succ
+        {
+            out.push((s.pred, s.succ));
+        }
+        if let Some(e) = self.short_chain.get(&location) {
+            for &(pred, succ) in e.value() {
+                if pred < succ {
+                    out.push((pred, succ));
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// O3: record a pair to plant only if the successor is still idle.
+    pub(crate) fn queue_idle_edge(&self, location: MemoryLocationHash, pred: TxIdx, succ: TxIdx) {
+        if pred >= succ {
+            return;
+        }
+        self.pending_idle
+            .lock()
+            .unwrap()
+            .push((location, pred, succ));
+    }
+
+    pub(crate) fn take_pending_idle(&self) -> Vec<(MemoryLocationHash, TxIdx, TxIdx)> {
+        std::mem::take(&mut *self.pending_idle.lock().unwrap())
+    }
+
+    fn mark_loc_demoted(&self, location: MemoryLocationHash) {
+        if let Some(mut e) = self.promoted.get_mut(&location) {
+            e.demoted = true;
         }
     }
 
@@ -723,6 +835,7 @@ impl CostPolicy {
             measured: false,
             pred: usize::MAX,
             succ: usize::MAX,
+            demoted: false,
         });
         e.hits = e.hits.saturating_add(1);
         e.reexec_ns_ema = (1.0 - EMA_ALPHA) * e.reexec_ns_ema + EMA_ALPHA * measured_ns;
@@ -743,6 +856,7 @@ impl CostPolicy {
             measured: false,
             pred: usize::MAX,
             succ: usize::MAX,
+            demoted: false,
         });
         if e.pred == usize::MAX || pred < e.pred {
             e.pred = pred;
@@ -892,6 +1006,9 @@ impl CostPolicy {
         if s.hits < 1 {
             return false;
         }
+        if s.demoted && self.is_a0_majority_block() {
+            return false;
+        }
         if !self.is_a0_majority_block() {
             return true;
         }
@@ -999,6 +1116,8 @@ impl CostPolicy {
             if n >= PREPAID_LOSE_N as usize {
                 self.decay_ordered_priors();
             }
+            // O2/L1: long spines whose ordered EV lost → next begin plants 0.
+            self.demote_long_spines();
         } else {
             self.prepaid_lose_streak.store(0, Ordering::Relaxed);
         }
@@ -1007,6 +1126,7 @@ impl CostPolicy {
             for mut e in self.promoted.iter_mut() {
                 if e.measured {
                     e.hits = e.hits.saturating_add(1);
+                    e.demoted = false;
                 }
             }
         }
@@ -1036,6 +1156,23 @@ impl CostPolicy {
             if e.hits > 0 {
                 e.hits -= 1;
             }
+        }
+    }
+
+    /// O2: when prepaid lost, demote locations whose stored chain is longer
+    /// than the window (16-writer Basic WAW). Storage trio (2 hops) stays.
+    fn demote_long_spines(&self) {
+        let long: Vec<MemoryLocationHash> = self
+            .short_chain
+            .iter()
+            .filter(|e| e.value().len() > ORDER_WINDOW_K)
+            .filter(|e| self.spine_ordered_loses(*e.key(), e.value().len()))
+            .map(|e| *e.key())
+            .collect();
+        for loc in long {
+            self.mark_loc_demoted(loc);
+            self.cost_ev_demote_optimistic
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1414,5 +1551,60 @@ mod tests {
             !pairs.iter().any(|&(l, _, _)| l == 0xabc),
             "unpromoted ERC-20 slots must not enter short_chain"
         );
+    }
+
+    #[test]
+    fn hops_to_plant_windows_long_spine_keeps_storage() {
+        let p = CostPolicy::new();
+        p.begin_block(176);
+        p.promote_short_edge(0x32be, 40_000);
+        for pair in [(4, 31), (31, 66), (66, 67), (67, 69)] {
+            p.note_short_pair(0x32be, pair.0, pair.1);
+        }
+        p.promote_short_edge(0xedba, 20_000);
+        p.note_short_pair(0xedba, 14, 16);
+        p.note_short_pair(0xedba, 16, 17);
+        assert_eq!(
+            p.hops_to_plant(0x32be, 4),
+            ORDER_WINDOW_K,
+            "O1: long Basic WAW plants a window, not the full chain"
+        );
+        assert_eq!(
+            p.hops_to_plant(0xedba, 2),
+            2,
+            "O1: storage trio stays fully ordered"
+        );
+        assert!(
+            p.spine_ordered_loses(0x32be, 16),
+            "O2: 16-writer prepaid must lose to one abort sample"
+        );
+    }
+
+    #[test]
+    fn prepaid_loss_demotes_long_spine_not_storage() {
+        let p = CostPolicy::new();
+        p.begin_block(176);
+        p.promote_short_edge(0x32be, 40_000);
+        for pair in [(4, 31), (31, 66), (66, 67), (67, 69)] {
+            p.note_short_pair(0x32be, pair.0, pair.1);
+        }
+        p.promote_short_edge(0xedba, 20_000);
+        p.note_short_pair(0xedba, 14, 16);
+        p.note_short_pair(0xedba, 16, 17);
+        p.note_refuse_ns(80_000);
+        p.note_width_loss_ns(20_000);
+        // abort_cf = 0 → prepaid loses
+        p.end_block_learn();
+        p.begin_block(176);
+        assert!(
+            p.loc_demoted(0x32be),
+            "O2: long spine demotes after prepaid lose"
+        );
+        assert_eq!(p.hops_to_plant(0x32be, 4), 0);
+        assert!(
+            !p.loc_demoted(0xedba),
+            "O2: storage trio must not demote with the long spine"
+        );
+        assert_eq!(p.hops_to_plant(0xedba, 2), 2);
     }
 }

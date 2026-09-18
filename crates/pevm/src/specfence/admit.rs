@@ -16,7 +16,7 @@ use super::bayes::BayesMap;
 use super::feeder::{seed_known_stars, top_is_known_star};
 use super::learner::{InterBlockPrior, LiveLearner};
 use super::metrics::MetricsInner;
-use super::policy::{CohortKind, CostPolicy, THIN_A1_K};
+use super::policy::{CohortKind, CostPolicy, ORDER_WINDOW_K, THIN_A1_K};
 use super::producer_stage::ProducerStageTable;
 use super::ready_edge::ReadyEdgeTable;
 use super::wave::WaveParkTable;
@@ -380,9 +380,9 @@ fn admit_seed_hint_short_edges(
     edges
 }
 
-/// L4/C5: reuse / measured prior → one ReadyEdge per promoted ℓ (not a cohort).
-/// Thin blocks keep at most `THIN_A1_K` locations, longest chain first, so
-/// Basic(0x32be) 4→31→66→… and storage 14→16→17 win over 2-writer ERC-20 slots.
+/// L4/C5: reuse / measured prior → ReadyEdges on promoted ℓ (not a cohort).
+/// Thin: ≤`THIN_A1_K` locations, longest first. O1 windows long spines to
+/// `ORDER_WINDOW_K` hops (4→31→66); storage 14→16→17 stays fully ordered.
 fn admit_seed_promoted_short_edges(
     ready: &ReadyEdgeTable,
     hints: &AccountHints,
@@ -408,7 +408,13 @@ fn admit_seed_promoted_short_edges(
         locs.truncate(THIN_A1_K);
     }
     let mut edges = 0;
-    for (loc, pairs) in locs {
+    for (loc, mut pairs) in locs {
+        pairs.sort_unstable_by_key(|(pred, _)| *pred);
+        let keep = policy.hops_to_plant(loc, pairs.len());
+        if keep == 0 {
+            continue;
+        }
+        pairs.truncate(keep);
         for (pred, succ) in pairs {
             ready.note_consumer_on(succ, pred, Some(loc));
             policy.note_short_edge_admit();
@@ -775,9 +781,9 @@ pub(crate) fn is_wide_envelope_writer_set(hints: &AccountHints, writers: &[TxIdx
 
 /// L2: first EffectiveWAW abort → persist consecutive pairs on this ℓ.
 ///
-/// Do **not** insert ReadyEdges here. Mid-block insert races A0
-/// `note_producer_done_stamp` (seq≡par / Estimate leftover). The next
-/// begin plants the stored pairs (`admit_seed_promoted_short_edges`).
+/// Do **not** insert ReadyEdges on in-flight A0 successors (done-stamp race).
+/// O3: queue a window of idle pairs; `flush_pending_idle_edges` plants them
+/// only via `note_consumer_on_if_idle` (started consumers stay A0).
 pub(crate) fn persist_short_chain_after_abort(
     hints: &AccountHints,
     policy: &CostPolicy,
@@ -787,6 +793,7 @@ pub(crate) fn persist_short_chain_after_abort(
 ) {
     if producer < consumer {
         policy.note_short_pair(location, producer, consumer);
+        policy.queue_idle_edge(location, producer, consumer);
     }
     let from = hints.from_of(consumer);
     let to = hints.to_of(consumer);
@@ -796,6 +803,42 @@ pub(crate) fn persist_short_chain_after_abort(
         policy.note_short_pair(location, pred, succ);
         pred = succ;
     }
+}
+
+/// O3: plant at most `ORDER_WINDOW_K` idle hops on `ℓ` (retry + not-started succs).
+/// Never marks a started tx gated — that races A0 done-stamp / validate path.
+pub(crate) fn flush_pending_idle_edges(ready: &ReadyEdgeTable, policy: &CostPolicy) -> usize {
+    let pending = policy.take_pending_idle();
+    if pending.is_empty() {
+        return 0;
+    }
+    let mut by_loc: HashMap<MemoryLocationHash, Vec<(TxIdx, TxIdx)>> = HashMap::new();
+    for (loc, pred, succ) in pending {
+        if pred < succ {
+            by_loc.entry(loc).or_default().push((pred, succ));
+        }
+    }
+    let mut planted = 0;
+    for (loc, mut pairs) in by_loc {
+        for (pred, succ) in policy.pairs_of(loc) {
+            pairs.push((pred, succ));
+        }
+        pairs.sort_unstable();
+        pairs.dedup();
+        let keep = if pairs.len() <= ORDER_WINDOW_K {
+            pairs.len()
+        } else {
+            ORDER_WINDOW_K
+        };
+        pairs.truncate(keep);
+        for (pred, succ) in pairs {
+            if ready.note_consumer_on_if_idle(succ, pred, Some(loc)) {
+                policy.note_short_edge_admit();
+                planted += 1;
+            }
+        }
+    }
+    planted
 }
 
 #[cfg(test)]
@@ -1717,10 +1760,13 @@ mod tests {
             &HashSet::new(),
             None,
         );
-        assert!(n >= 3, "L4: reuse must plant 4→31→66→67, got {n}");
+        assert!(n >= 2, "O1: reuse plants 4→31→66 (window), got {n}");
         assert_eq!(ready.blocking_producer(31), Some(4));
         assert_eq!(ready.blocking_producer(66), Some(31));
-        assert_eq!(ready.blocking_producer(67), Some(66));
+        assert!(
+            ready.may_execute(67),
+            "O1: 67 stays A0 — not the full 16-writer serialize"
+        );
         assert!(ready.may_execute(4), "chain head stays runnable");
     }
 
@@ -1769,6 +1815,24 @@ mod tests {
         assert!(
             extra_blocked <= 1 && n <= 3 + 2 + 1,
             "C5: thin reuse plants ≤K locations (extras_blocked={extra_blocked} edges={n})"
+        );
+    }
+
+    #[test]
+    fn flush_pending_idle_plants_window_not_started() {
+        let ready = ReadyEdgeTable::new();
+        let policy = policy_for(176);
+        policy.promote_short_edge(0x32be, 40_000);
+        persist_short_chain_after_abort(&AccountHints::default(), &policy, 31, 4, 0x32be);
+        policy.note_short_pair(0x32be, 31, 66);
+        policy.note_short_pair(0x32be, 66, 67);
+        ready.note_started(67);
+        let n = flush_pending_idle_edges(&ready, &policy);
+        assert!(n >= 1, "O3: idle 4→31 must plant, got {n}");
+        assert_eq!(ready.blocking_producer(31), Some(4));
+        assert!(
+            ready.may_execute(67),
+            "O3: started 67 must stay A0 this incarnation"
         );
     }
 }
