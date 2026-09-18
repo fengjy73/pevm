@@ -15,8 +15,7 @@ use crate::{
     specfence::{FenceGraph, ReadyEdgeTable, WaveParkTable, profile_timing_enabled},
 };
 
-/// After refuse_admit, probe later txs for an independent Execute.
-/// PC-1: steal any independent in the block — no empty refuse spin.
+/// After refuse, steal one nearby independent. No full-block scan (PRIMARY tax).
 const WAVE_FILL_WINDOW: usize = 32;
 
 // The Pevm collaborative scheduler coordinates execution & validation
@@ -276,7 +275,11 @@ impl Scheduler {
                     if let Some(wave) = wave {
                         if !edges.is_sleeping(execution_idx) {
                             if let Some(w) = edges.blocking_producer(execution_idx) {
-                                self.admit_spine_heat(w, wave, true);
+                                // A0 pred is already on the OCC idx — do not
+                                // bag-spam it (that prepaid thin reuse).
+                                if edges.is_gated(w) {
+                                    self.admit_spine_heat(w, wave, true);
+                                }
                             }
                             edges.defer(execution_idx);
                         }
@@ -295,14 +298,6 @@ impl Scheduler {
                         wave.note_ready_steal_if_after_park();
                     }
                     return Some(Task::Execution(tx_version));
-                }
-                // Wave fill: refused known consumer — steal the next independent
-                // without fighting admit_spine(w) fetch_min. Do not idle on the head.
-                if let Some(wave) = wave
-                    && let Some(task) =
-                        self.try_fill_independent_after_refuse(execution_idx, wave, ready)
-                {
-                    return Some(task);
                 }
             }
 
@@ -324,12 +319,8 @@ impl Scheduler {
                                 edges.defer(tx_idx);
                                 if let Some(wave) = wave {
                                     drop(tx);
-                                    self.admit_spine_heat(w, wave, true);
-                                    // PC-1: same worker steals an independent after A1 refuse.
-                                    if let Some(task) =
-                                        self.try_fill_independent_after_refuse(tx_idx, wave, ready)
-                                    {
-                                        return Some(task);
+                                    if edges.is_gated(w) {
+                                        self.admit_spine_heat(w, wave, true);
                                     }
                                 }
                                 continue;
@@ -426,8 +417,8 @@ impl Scheduler {
     }
 
     /// After `refuse_admit` of `from`, run the next independent.
-    /// PC-W1: bag first (skip sleeping A1 heads). Then a short window and a
-    /// full-block scan so cores stay filled after the bag drains.
+    /// P3: bag first, then a short window. No full-block mutex scan — that
+    /// prepaid the thin A0 path worse than OCC abort. Waiters wake into the bag.
     fn try_fill_independent_after_refuse(
         &self,
         from: TxIdx,
@@ -445,45 +436,25 @@ impl Scheduler {
                 continue;
             }
             if let Some(tx_version) = self.try_execute_ready(tx_idx, Some(wave), ready) {
+                // P3: bag depth only — never the full-block scan count.
                 edges.sample_ready_width(wave.ready_depth().max(1));
                 wave.note_ready_steal_if_after_park();
                 return Some(Task::Execution(tx_version));
             }
         }
-        let mut ready_n = 0usize;
-        let steal = |cand: TxIdx, ready_n: &mut usize| -> Option<Task> {
-            if cand >= self.block_size || self.is_done(cand) {
-                return None;
-            }
-            if edges.is_gated(cand) && (edges.is_sleeping(cand) || !edges.may_execute(cand)) {
-                return None;
-            }
-            *ready_n += 1;
-            let tx_version = self.try_execute_ready(cand, Some(wave), ready)?;
-            edges.sample_ready_width(wave.ready_depth().max(*ready_n).max(1));
-            wave.note_ready_steal_if_after_park();
-            Some(Task::Execution(tx_version))
-        };
         let end = from.saturating_add(WAVE_FILL_WINDOW).min(self.block_size);
         for cand in (from + 1)..end {
-            if let Some(task) = steal(cand, &mut ready_n) {
-                return Some(task);
+            if cand >= self.block_size || self.is_done(cand) {
+                continue;
             }
-        }
-        // Fallback scan so a woken A1 successor is found if the bag missed it.
-        // Skip sleeping heads (PC-W1). Independents are usually bag-first.
-        for cand in end..self.block_size {
-            if let Some(task) = steal(cand, &mut ready_n) {
-                return Some(task);
+            if edges.is_gated(cand) && (edges.is_sleeping(cand) || !edges.may_execute(cand)) {
+                continue;
             }
-        }
-        for cand in 0..from {
-            if let Some(task) = steal(cand, &mut ready_n) {
-                return Some(task);
+            if let Some(tx_version) = self.try_execute_ready(cand, Some(wave), ready) {
+                edges.sample_ready_width(wave.ready_depth().max(1));
+                wave.note_ready_steal_if_after_park();
+                return Some(Task::Execution(tx_version));
             }
-        }
-        if ready_n > 0 || wave.ready_depth() > 0 {
-            edges.sample_ready_width(wave.ready_depth().max(ready_n));
         }
         None
     }

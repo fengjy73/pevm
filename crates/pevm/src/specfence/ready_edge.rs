@@ -36,6 +36,8 @@ pub(crate) struct ReadyEdgeTable {
     /// Predicted RAW producer tip per ℓ (CC OrderedAdmit-rare: tip == this writer).
     tips: DashMap<MemoryLocationHash, AtomicUsize, BuildIdentityHasher>,
     deferred: Mutex<Vec<TxIdx>>,
+    /// P1: skip the deferred mutex when the bag is empty (A0 / no refuse).
+    deferred_n: AtomicUsize,
     refuse: AtomicUsize,
     /// D1: consensus-order writers observed on each location (lazy + Data).
     location_writers: DashMap<MemoryLocationHash, Vec<TxIdx>, BuildIdentityHasher>,
@@ -73,6 +75,7 @@ impl Default for ReadyEdgeTable {
             finished: DashMap::default(),
             tips: DashMap::default(),
             deferred: Mutex::new(Vec::new()),
+            deferred_n: AtomicUsize::new(0),
             refuse: AtomicUsize::new(0),
             location_writers: DashMap::default(),
             queued_on: DashMap::default(),
@@ -303,6 +306,16 @@ impl ReadyEdgeTable {
         }
     }
 
+    /// O3: incarnation retry is idle again — allow `note_consumer_on_if_idle`.
+    #[inline]
+    pub(crate) fn clear_started(&self, tx: TxIdx) {
+        let i = tx / 64;
+        if i < self.started_bits.len() {
+            let bit = 1u64 << (tx % 64);
+            self.started_bits[i].fetch_and(!bit, Ordering::Release);
+        }
+    }
+
     #[inline]
     pub(crate) fn is_started(&self, tx: TxIdx) -> bool {
         let i = tx / 64;
@@ -432,7 +445,10 @@ impl ReadyEdgeTable {
         if !self.has_any_gated() {
             return;
         }
-        if !self.has_known_waiters(writer) && !self.was_queued(writer) {
+        if !self.has_known_waiters(writer)
+            && !self.was_queued(writer)
+            && self.deferred_n.load(Ordering::Relaxed) == 0
+        {
             return;
         }
         let waiters = self.waiters.remove(&writer);
@@ -453,8 +469,12 @@ impl ReadyEdgeTable {
                 }
             }
         }
+        if self.deferred_n.load(Ordering::Relaxed) == 0 {
+            return;
+        }
         let mut d = self.deferred.lock().unwrap();
         if d.is_empty() {
+            self.deferred_n.store(0, Ordering::Relaxed);
             return;
         }
         d.retain(|&t| {
@@ -466,6 +486,7 @@ impl ReadyEdgeTable {
                 true
             }
         });
+        self.deferred_n.store(d.len(), Ordering::Relaxed);
     }
 
     /// Refuse only known consumers still gated by an unpublished producer.
@@ -516,6 +537,7 @@ impl ReadyEdgeTable {
         self.refuse.fetch_add(1, Ordering::Relaxed);
         self.sleeping.insert(tx_idx);
         d.push(tx_idx);
+        self.deferred_n.store(d.len(), Ordering::Relaxed);
         drop(d);
         if let Some(t0) = t0 {
             self.add_refuse_ns(t0.elapsed().as_nanos() as u64);
@@ -552,6 +574,7 @@ impl ReadyEdgeTable {
         let mut d = self.deferred.lock().unwrap();
         let was_deferred = d.iter().any(|&t| t == consumer);
         d.retain(|&t| t != consumer);
+        self.deferred_n.store(d.len(), Ordering::Relaxed);
         drop(d);
         self.sleeping.remove(&consumer);
         if was_deferred || self.may_execute(consumer) {
@@ -740,5 +763,22 @@ mod tests {
             t.may_execute(3),
             "EV A0 override still executes a gated consumer"
         );
+    }
+
+    #[test]
+    fn idle_edge_skips_started_and_plants_after_clear() {
+        let t = ReadyEdgeTable::new();
+        t.note_started(31);
+        assert!(
+            !t.note_consumer_on_if_idle(31, 4, Some(0x32be)),
+            "O3: started consumer must not gain a gate (done-stamp race)"
+        );
+        assert!(t.may_execute(31));
+        t.clear_started(31);
+        assert!(
+            t.note_consumer_on_if_idle(31, 4, Some(0x32be)),
+            "O3: incarnation retry may take the windowed edge"
+        );
+        assert_eq!(t.blocking_producer(31), Some(4));
     }
 }

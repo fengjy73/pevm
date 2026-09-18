@@ -518,10 +518,7 @@ impl Pevm {
             // P3/P4: bag serves gated wake only. A0 never seeds the bag.
             // Do not sample block_size as ready_width when A1=0 (that read as 176).
             self.last_begin_blocked = ready_edges.blocked_consumers();
-            if ready_edges.has_any_gated() {
-                ready_edges
-                    .sample_ready_width(block_size.saturating_sub(self.last_begin_blocked.len()));
-            }
+            // P3: do not sample (n_tx − blocked) as ready_width (reads as 172).
             if quiet && !learner.has_any_predicted() {
                 let n = sketch.revoke_prior_fences_if_quiet(true);
                 metrics_inner.record_quiet_pessimistic_revoke(n);
@@ -620,20 +617,15 @@ impl Pevm {
                                     let next = self
                                         .try_execute(&mut vm, &scheduler, tx_version, None, None);
                                     if self.concurrency_mode == ConcurrencyMode::SpecFence {
-                                        if specfence.ready_edges.has_any_gated() {
+                                        // P1: always stamp. Wake only if this writer
+                                        // has waiters (insert-during-execute still wakes).
+                                        specfence.ready_edges.note_producer_done_stamp(done_idx);
+                                        if specfence.ready_edges.has_known_waiters(done_idx) {
                                             if let Some(w) = wave_ref {
                                                 specfence
                                                     .ready_edges
                                                     .note_producer_done(done_idx, w);
-                                            } else {
-                                                specfence
-                                                    .ready_edges
-                                                    .note_producer_done_stamp(done_idx);
                                             }
-                                        } else {
-                                            specfence
-                                                .ready_edges
-                                                .note_producer_done_stamp(done_idx);
                                         }
                                     }
                                     next
@@ -770,32 +762,60 @@ impl Pevm {
         );
         if self.concurrency_mode == ConcurrencyMode::SpecFence {
             let end_t0 = Instant::now();
-            // P2: skip A0 full-block HotSet/write-loc flush. Promoted ℓ already
-            // persist in CostPolicy; L5 keeps HotSet/Bayes off the A0 hot path.
-            // P2: HotSet only from D1 multi-writer locs (not every A0 write).
-            if self.cost_policy.is_a0_majority_block() {
-                let beneficiary = hash_deterministic(MemoryLocation::Basic(block_env.beneficiary));
-                let orders = if ready_edges.has_any_gated() {
-                    ready_edges.writer_order_snapshot()
-                } else {
-                    mv_writer_order_snapshot(&mv_memory, block_size, beneficiary)
-                };
-                for (loc, writers) in &orders {
-                    if writers.len() < 2 {
-                        continue;
+            // P2: prefer live D1 (write-set already recorded). MV walk only
+            // when the ready table saw no writers. Thin HotSet: ≥3-writer /
+            // promoted ℓ. Skip HotSet decay + sketch on thin (not next-begin).
+            let beneficiary = hash_deterministic(MemoryLocation::Basic(block_env.beneficiary));
+            let ready_d1 = ready_edges.writer_order_snapshot();
+            let mut d1_orders = if ready_d1.iter().any(|(_, w)| w.len() >= 2) {
+                ready_d1
+            } else {
+                mv_writer_order_snapshot(&mv_memory, block_size, beneficiary)
+            };
+            // Promoted-ℓ MV merge only when ready D1 missed 4→31 (lazy tx4).
+            let ready_has_4_31 = d1_orders.iter().any(|(_, w)| {
+                let i4 = w.iter().position(|&t| t == 4);
+                let i31 = w.iter().position(|&t| t == 31);
+                matches!((i4, i31), (Some(a), Some(b)) if a < b)
+            });
+            if !ready_has_4_31 {
+                for (loc, writers) in mv_writers_for_locs(
+                    &mv_memory,
+                    &self.cost_policy.promoted_locations(),
+                    block_size,
+                    beneficiary,
+                ) {
+                    if let Some((_, w)) = d1_orders.iter_mut().find(|(l, _)| *l == loc) {
+                        w.extend(writers);
+                        w.sort_unstable();
+                        w.dedup();
+                    } else {
+                        d1_orders.push((loc, writers));
                     }
+                }
+            }
+            let thin = self.cost_policy.is_a0_majority_block();
+            for (loc, writers) in &d1_orders {
+                if writers.len() < 2 {
+                    continue;
+                }
+                self.rw_prior.observe_write_set(&[*loc], None);
+                if !thin || writers.len() >= 3 || self.cost_policy.is_promoted(*loc) {
                     for &tx in writers {
                         self.hotset.note_writer(*loc, tx);
                     }
-                    self.rw_prior.observe_write_set(&[*loc], None);
                 }
             }
-            self.hotset.end_block();
+            if !thin {
+                self.hotset.end_block();
+            }
             // P1: pack InterBlockPrior from live morph hat + top-ℓ (flip → higher α).
             let morph_hat = learner.morph_hat();
             let top = learner.pack_top_locations();
             let _alpha = self.inter_prior.end_block(morph_hat, top);
-            sketch.decay_warm_failures(|loc| learner.abort_rate_of(loc));
+            if !thin {
+                sketch.decay_warm_failures(|loc| learner.abort_rate_of(loc));
+            }
             metrics_inner.set_soft_wait_arms(dag.soft_arm_count());
             metrics_inner.set_sketch_hot_size(sketch.hot_size());
             self.last_process = process.snapshot(16);
@@ -803,48 +823,62 @@ impl Pevm {
             let inc_gt0 = incs.iter().filter(|&&i| i > 0).count();
             let reexec: usize = incs.iter().sum();
             let mut miss = 0usize;
-            for (tx, &inc) in incs.iter().enumerate() {
-                if inc == 0 || ready_edges.was_queued(tx) {
-                    continue;
+            if thin {
+                for (tx, &inc) in incs.iter().enumerate() {
+                    if inc > 0 && !ready_edges.was_queued(tx) {
+                        miss += 1;
+                        self.cost_policy.bump_unfenced_reexec();
+                    }
                 }
-                // CC-D1: first conflict ℓ — effective non-lazy → learn; lazy → ignore.
-                match self.cost_policy.conflict_of(tx) {
-                    Some(note)
-                        if note.lazy
-                            || matches!(
-                                note.class,
-                                crate::specfence::ConflictClass::LazyNoise
-                                    | crate::specfence::ConflictClass::CommuteCandidate
-                            ) =>
-                    {
-                        // Already counted on the abort path when classified.
-                        // unfenced_reexec must not treat commute/lazy as "must A1".
-                        let _ = note.location;
+            } else {
+                for (tx, &inc) in incs.iter().enumerate() {
+                    if inc == 0 || ready_edges.was_queued(tx) {
+                        continue;
                     }
-                    Some(note) => {
-                        miss += 1;
-                        self.cost_policy.bump_unfenced_reexec();
-                        if !self.cost_policy.is_promoted(note.location) {
-                            self.cost_policy.promote_short_edge(note.location, 1);
+                    match self.cost_policy.conflict_of(tx) {
+                        Some(note)
+                            if note.lazy
+                                || matches!(
+                                    note.class,
+                                    crate::specfence::ConflictClass::LazyNoise
+                                        | crate::specfence::ConflictClass::CommuteCandidate
+                                ) =>
+                        {
+                            let _ = note.location;
                         }
-                    }
-                    None => {
-                        miss += 1;
-                        self.cost_policy.bump_unfenced_reexec();
+                        Some(note) => {
+                            miss += 1;
+                            self.cost_policy.bump_unfenced_reexec();
+                            if !self.cost_policy.is_promoted(note.location) {
+                                self.cost_policy.promote_short_edge(note.location, 1);
+                            }
+                        }
+                        None => {
+                            miss += 1;
+                            self.cost_policy.bump_unfenced_reexec();
+                        }
                     }
                 }
             }
             // Post-publish: persist consecutive D1 pairs on promoted ℓ
             // (4→31→66→… on Basic(0x32be)). Skip wide empty-to / CallWaw
             // envelopes so 0x209c is not stored as a star. No mid-execute insert.
-            let beneficiary = hash_deterministic(MemoryLocation::Basic(block_env.beneficiary));
-            let d1_orders = mv_writer_order_snapshot(&mv_memory, block_size, beneficiary);
             let persist: Vec<_> = d1_orders
                 .iter()
                 .filter(|(_, w)| !crate::specfence::admit::is_wide_envelope_writer_set(&hints, w))
                 .cloned()
                 .collect();
             self.cost_policy.note_promoted_writer_orders(&persist);
+            let mut d1_orders = d1_orders;
+            for (loc, writers) in self.cost_policy.writer_orders_from_pairs() {
+                if let Some((_, w)) = d1_orders.iter_mut().find(|(l, _)| *l == loc) {
+                    w.extend(writers);
+                    w.sort_unstable();
+                    w.dedup();
+                } else {
+                    d1_orders.push((loc, writers));
+                }
+            }
             self.last_location_writers = d1_orders;
             let ready_w = ready_edges.ready_width_mean();
             let idle = ready_edges.idle_core_ns();
@@ -2231,6 +2265,31 @@ pub fn execute_revm_sequential<S: Storage + Debug, C: PevmChain>(
         results.push(execution_result);
     }
     Ok(results)
+}
+
+/// Promoted-ℓ D1 only — cheaper than a full-location map when ready D1 is empty.
+fn mv_writers_for_locs(
+    mv_memory: &MvMemory,
+    locs: &[MemoryLocationHash],
+    block_size: usize,
+    beneficiary: MemoryLocationHash,
+) -> Vec<(MemoryLocationHash, Vec<TxIdx>)> {
+    if locs.is_empty() {
+        return Vec::new();
+    }
+    let want: HashSet<MemoryLocationHash> =
+        locs.iter().copied().filter(|&l| l != beneficiary).collect();
+    let mut map: HashMap<MemoryLocationHash, Vec<TxIdx>> = HashMap::new();
+    for tx in 0..block_size {
+        for loc in mv_memory.write_locations(tx) {
+            if want.contains(&loc) {
+                map.entry(loc).or_default().push(tx);
+            }
+        }
+    }
+    let mut out: Vec<_> = map.into_iter().filter(|(_, w)| w.len() >= 2).collect();
+    out.sort_by_key(|(loc, _)| *loc);
+    out
 }
 
 /// End-block D1 snapshot from MV (A0 skipped live DashMap writer order).
