@@ -1399,7 +1399,9 @@ mod tests {
         p.begin_block(176);
         let pairs = p.promoted_short_pairs();
         assert!(
-            pairs.iter().any(|&(l, a, b)| l == 0x32be && a == 4 && b == 31)
+            pairs
+                .iter()
+                .any(|&(l, a, b)| l == 0x32be && a == 4 && b == 31)
                 && pairs
                     .iter()
                     .any(|&(l, a, b)| l == 0x32be && a == 31 && b == 66)

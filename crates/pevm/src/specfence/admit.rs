@@ -1663,7 +1663,9 @@ mod tests {
             "abort must persist the proven 4→31 pair: {pairs:?}"
         );
         assert!(
-            !pairs.iter().any(|&(l, a, b)| l == loc && a == 31 && b == 66),
+            !pairs
+                .iter()
+                .any(|&(l, a, b)| l == loc && a == 31 && b == 66),
             "empty-to envelope must not be cloned onto a hidden ℓ: {pairs:?}"
         );
     }
@@ -1682,9 +1684,7 @@ mod tests {
             "producer→consumer pair is kept: {pairs:?}"
         );
         assert!(
-            !pairs
-                .iter()
-                .any(|&(l, a, b)| l == loc && a == 3 && b == 4)
+            !pairs.iter().any(|&(l, a, b)| l == loc && a == 3 && b == 4)
                 && !pairs.iter().any(|&(l, _, s)| l == loc && s == 15),
             "C5: wide CallWaw must not persist ERC-20 slot stars: {pairs:?}"
         );

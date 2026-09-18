@@ -841,9 +841,7 @@ impl Pevm {
             let d1_orders = mv_writer_order_snapshot(&mv_memory, block_size, beneficiary);
             let persist: Vec<_> = d1_orders
                 .iter()
-                .filter(|(_, w)| {
-                    !crate::specfence::admit::is_wide_envelope_writer_set(&hints, w)
-                })
+                .filter(|(_, w)| !crate::specfence::admit::is_wide_envelope_writer_set(&hints, w))
                 .cloned()
                 .collect();
             self.cost_policy.note_promoted_writer_orders(&persist);

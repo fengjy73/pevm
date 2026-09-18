@@ -335,7 +335,16 @@ fn main() {
             sf.reset_heat();
             sf.reset_inter_prior();
         }
-        let sf_row = run_once(&mut sf, "specfence", i, &chain, &storage, &block, cores_nz, n);
+        let sf_row = run_once(
+            &mut sf,
+            "specfence",
+            i,
+            &chain,
+            &storage,
+            &block,
+            cores_nz,
+            n,
+        );
         sf_walls.push(sf_row.wall_ms);
         last_sf = Some((
             sf_row.refuse_admit,
