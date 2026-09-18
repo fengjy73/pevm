@@ -168,7 +168,15 @@ impl ReadyEdgeTable {
                 Err(v) => cur = v,
             }
         }
+        drop(e);
         self.waiters.entry(producer).or_default().push(consumer);
+        // Insert raced with pred Done — do not leave a refuse-forever gate.
+        if self.is_writer_done(producer)
+            && let Some(c) = self.consumers.get(&consumer)
+            && c.load(Ordering::Relaxed) == producer
+        {
+            c.store(NONE, Ordering::Relaxed);
+        }
     }
 
     /// D1: record `writer` on location `ℓ` (lazy or Data). Order is consensus.
@@ -367,7 +375,7 @@ impl ReadyEdgeTable {
 
     /// PC-5: force A0 on this consumer (execute anyway).
     #[inline]
-    pub(crate) fn force_a0(&self, tx: TxIdx) {
+    pub(crate) fn force_optimistic(&self, tx: TxIdx) {
         self.a0_force.insert(tx);
     }
 
@@ -681,11 +689,11 @@ mod tests {
     }
 
     #[test]
-    fn pc5_force_a0_allows_execute() {
+    fn pc5_force_optimistic_allows_execute() {
         let t = ReadyEdgeTable::new();
         t.note_consumer(8, 3);
         assert!(!t.may_execute(8));
-        t.force_a0(8);
+        t.force_optimistic(8);
         assert!(t.may_execute(8));
     }
 
@@ -758,7 +766,7 @@ mod tests {
         assert!(t.is_gated(3));
         assert!(t.has_any_gated());
         assert!(!t.may_execute(3));
-        t.force_a0(3);
+        t.force_optimistic(3);
         assert!(
             t.may_execute(3),
             "EV A0 override still executes a gated consumer"

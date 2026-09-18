@@ -493,7 +493,7 @@ impl Pevm {
             // Thin CallWaw chain needs hints only (P2: skip contract walk).
             // PROFILE Instant only (product path must not pay begin Instant).
             {
-                let contracts = if self.cost_policy.is_a0_majority_block() {
+                let contracts = if self.cost_policy.is_optimistic_majority_block() {
                     HashSet::new()
                 } else {
                     collect_contracts(storage, &hints)
@@ -586,6 +586,9 @@ impl Pevm {
                     let mut task = if occ_mode {
                         crate::specfence::next_occ_task(&scheduler)
                     } else if self.concurrency_mode == ConcurrencyMode::SpecFence {
+                        // Persist CC-L1/L2 hops for the next begin. Do not plant
+                        // ReadyEdges mid-block — that races done-stamp / JUMP and
+                        // flakes seq≡par (iter11).
                         if let Some(w) = wave_ref {
                             crate::specfence::next_sf_task(
                                 &scheduler,
@@ -641,7 +644,8 @@ impl Pevm {
                             }
                             Task::Validation(tx_version) => {
                                 let v0 = profile.then(Instant::now);
-                                let a0_ungated = specfence.mode == ConcurrencyMode::SpecFence
+                                let optimistic_ungated = specfence.mode
+                                    == ConcurrencyMode::SpecFence
                                     && !specfence.ready_edges.is_gated(tx_version.tx_idx);
                                 let next = if occ_mode {
                                     crate::specfence::validate_occ_stage(
@@ -650,8 +654,8 @@ impl Pevm {
                                         &tx_version,
                                         Some(&metrics_inner),
                                     )
-                                } else if a0_ungated {
-                                    crate::specfence::validate_a0_fast(
+                                } else if optimistic_ungated {
+                                    crate::specfence::validate_optimistic_fast(
                                         &mv_memory,
                                         &scheduler,
                                         &tx_version,
@@ -794,7 +798,11 @@ impl Pevm {
                     }
                 }
             }
-            let thin = self.cost_policy.is_a0_majority_block();
+            let thin = self.cost_policy.is_optimistic_majority_block();
+            // M2: skip MV merge when D1 already has 4→31 (above). HotSet is
+            // block-end sampling only — still note ≥3-writer / promoted ℓ.
+            // Do not use ready_has_4_31 as a global HotSet off-switch: any
+            // 32+ same-ℓ spine contains idx 4 and 31.
             for (loc, writers) in &d1_orders {
                 if writers.len() < 2 {
                     continue;
@@ -898,19 +906,24 @@ impl Pevm {
             self.cost_policy.end_block_learn();
             let mut report = self.cost_policy.take_report(ready_w, idle);
             report.end_block_ns = end_t0.elapsed().as_nanos() as u64;
+            // M4: OptimisticRead-path tax vs OCC (admit seed + end_block + refuse).
+            report.optimistic_path_tax_ns = report
+                .end_block_ns
+                .saturating_add(metrics_inner.admit_seed_begin_ns())
+                .saturating_add(report.refuse_ns);
             metrics_inner.set_pc_learn_metrics(
                 ready_w,
                 idle,
                 inc_gt0,
                 reexec,
                 miss,
-                report.a1_cohorts,
-                report.a0_cohorts,
+                report.ordered_admit_cohorts,
+                report.optimistic_read_cohorts,
             );
             metrics_inner.set_ns_learn_metrics(
                 report.refuse_ns,
                 report.reexec_ns,
-                report.a0_majority_block,
+                report.optimistic_majority_block,
                 report.cost_ev_keep_ordered,
                 report.cost_ev_demote_optimistic,
                 report.k_cap_demote,
@@ -1127,7 +1140,7 @@ impl Pevm {
             return match vm.execute(&tx_version, result_slot) {
                 Ok(flags) => {
                     if let Some(t0) = exec_t0 {
-                        vm.note_hot_reexec_ns(t0.elapsed().as_nanos() as u64);
+                        vm.note_hot_reexec_ns(tx_version.tx_idx, t0.elapsed().as_nanos() as u64);
                     }
                     // PublishWrite ≈ incarnation finished: wake location waiters + ready.
                     let done_idx = tx_version.tx_idx;

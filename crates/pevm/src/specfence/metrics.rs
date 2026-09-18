@@ -310,25 +310,25 @@ pub struct SpecFenceMetrics {
     pub incarnation_gt0: usize,
     /// D4: sum of final incarnations (= extra EVM entries from reexec).
     pub reexec_entries: usize,
-    /// Incarnation>0 txs that were never dependency-admitted (A0 conflict reexec).
+    /// Incarnation>0 txs that were never dependency-admitted.
     pub unfenced_reexec: usize,
-    /// B3: cohorts that chose A1 this block.
-    pub a1_cohorts: usize,
-    /// PC-5: cohorts forced A0 because E[meta_A1] > E[abort_A0].
-    pub a0_cohorts: usize,
+    /// Cohorts that chose OrderedAdmit this block.
+    pub ordered_admit_cohorts: usize,
+    /// Cohorts that chose OptimisticRead this block.
+    pub optimistic_read_cohorts: usize,
     /// L6: measured refuse-path nanoseconds.
     pub refuse_ns: u64,
     /// L6: measured incarnation>0 execute nanoseconds.
     pub reexec_ns: u64,
-    /// A0-majority / low-meta block (ReadyEdge only on ordered-admit).
-    pub a0_majority_block: bool,
-    /// L1: ns-EV kept A1.
+    /// OptimisticRead-majority / low-meta block (ReadyEdge only on ordered-admit).
+    pub optimistic_majority_block: bool,
+    /// L1: ns-EV kept OrderedAdmit.
     pub cost_ev_keep_ordered: usize,
-    /// L1: ns-EV demoted A1→A0.
+    /// L1: ns-EV demoted to OptimisticRead.
     pub cost_ev_demote_optimistic: usize,
-    /// PC-S1: A1 candidates beyond K.
+    /// PC-S1: OrderedAdmit candidates beyond K.
     pub k_cap_demote: usize,
-    /// CC-X1: A0 commute accepts (empty-input transfer class).
+    /// CC-X1: OptimisticRead commute accepts (empty-input transfer class).
     pub commute_skip: usize,
     /// CC-R3: batch-parked off-edge aborts.
     pub batch_repair: usize,
@@ -481,11 +481,11 @@ pub(crate) struct MetricsInner {
     incarnation_gt0: AtomicUsize,
     reexec_entries: AtomicUsize,
     unfenced_reexec: AtomicUsize,
-    a1_cohorts: AtomicUsize,
-    a0_cohorts: AtomicUsize,
+    ordered_admit_cohorts: AtomicUsize,
+    optimistic_read_cohorts: AtomicUsize,
     refuse_ns: AtomicU64,
     reexec_ns: AtomicU64,
-    a0_majority_block: AtomicUsize,
+    optimistic_majority_block: AtomicUsize,
     cost_ev_keep_ordered: AtomicUsize,
     cost_ev_demote_optimistic: AtomicUsize,
     k_cap_demote: AtomicUsize,
@@ -911,8 +911,8 @@ impl MetricsInner {
         incarnation_gt0: usize,
         reexec_entries: usize,
         unfenced_reexec: usize,
-        a1_cohorts: usize,
-        a0_cohorts: usize,
+        ordered_admit_cohorts: usize,
+        optimistic_read_cohorts: usize,
     ) {
         self.ready_width_sum_bits
             .store(ready_width_mean.to_bits(), Ordering::Relaxed);
@@ -922,15 +922,17 @@ impl MetricsInner {
         self.reexec_entries.store(reexec_entries, Ordering::Relaxed);
         self.unfenced_reexec
             .store(unfenced_reexec, Ordering::Relaxed);
-        self.a1_cohorts.store(a1_cohorts, Ordering::Relaxed);
-        self.a0_cohorts.store(a0_cohorts, Ordering::Relaxed);
+        self.ordered_admit_cohorts
+            .store(ordered_admit_cohorts, Ordering::Relaxed);
+        self.optimistic_read_cohorts
+            .store(optimistic_read_cohorts, Ordering::Relaxed);
     }
 
     pub(crate) fn set_ns_learn_metrics(
         &self,
         refuse_ns: u64,
         reexec_ns: u64,
-        a0_majority_block: bool,
+        optimistic_majority_block: bool,
         cost_ev_keep_ordered: usize,
         cost_ev_demote_optimistic: usize,
         k_cap_demote: usize,
@@ -941,8 +943,8 @@ impl MetricsInner {
     ) {
         self.refuse_ns.store(refuse_ns, Ordering::Relaxed);
         self.reexec_ns.store(reexec_ns, Ordering::Relaxed);
-        self.a0_majority_block
-            .store(usize::from(a0_majority_block), Ordering::Relaxed);
+        self.optimistic_majority_block
+            .store(usize::from(optimistic_majority_block), Ordering::Relaxed);
         self.cost_ev_keep_ordered
             .store(cost_ev_keep_ordered, Ordering::Relaxed);
         self.cost_ev_demote_optimistic
@@ -959,6 +961,11 @@ impl MetricsInner {
     #[inline]
     pub(crate) fn set_admit_seed_begin_ns(&self, ns: u64) {
         self.admit_seed_begin_ns.store(ns, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn admit_seed_begin_ns(&self) -> u64 {
+        self.admit_seed_begin_ns.load(Ordering::Relaxed)
     }
 
     #[inline]
@@ -1380,11 +1387,11 @@ impl MetricsInner {
             incarnation_gt0: self.incarnation_gt0.load(Ordering::Relaxed),
             reexec_entries: self.reexec_entries.load(Ordering::Relaxed),
             unfenced_reexec: self.unfenced_reexec.load(Ordering::Relaxed),
-            a1_cohorts: self.a1_cohorts.load(Ordering::Relaxed),
-            a0_cohorts: self.a0_cohorts.load(Ordering::Relaxed),
+            ordered_admit_cohorts: self.ordered_admit_cohorts.load(Ordering::Relaxed),
+            optimistic_read_cohorts: self.optimistic_read_cohorts.load(Ordering::Relaxed),
             refuse_ns: self.refuse_ns.load(Ordering::Relaxed),
             reexec_ns: self.reexec_ns.load(Ordering::Relaxed),
-            a0_majority_block: self.a0_majority_block.load(Ordering::Relaxed) != 0,
+            optimistic_majority_block: self.optimistic_majority_block.load(Ordering::Relaxed) != 0,
             cost_ev_keep_ordered: self.cost_ev_keep_ordered.load(Ordering::Relaxed),
             cost_ev_demote_optimistic: self.cost_ev_demote_optimistic.load(Ordering::Relaxed),
             k_cap_demote: self.k_cap_demote.load(Ordering::Relaxed),

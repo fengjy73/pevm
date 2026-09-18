@@ -4148,10 +4148,10 @@ fn specfence_waw_chain_ordered_admit_independents_untaxed() {
     );
 }
 
-/// 3356896 collateral shape: 2-tx same-from empty 21k pairs stay A0.
-/// Thin-shell lazy-accumulate = CC-X1 commute; do not A1 the spine.
+/// 3356896 collateral shape: 2-tx same-from empty 21k pairs stay OptimisticRead.
+/// Thin-shell lazy-accumulate = CC-X1 commute; do not OrderedAdmit the spine.
 #[test]
-fn specfence_same_from_21k_pairs_commute_a0() {
+fn specfence_same_from_21k_pairs_commute_optimistic() {
     let mut txs = Vec::new();
     for i in 0..12 {
         let from = Address::from(U160::from(100 + i));
