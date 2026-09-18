@@ -331,11 +331,9 @@ pub(crate) fn admit_seed_begin_block(
     edges
 }
 
-/// C1/C5: thin begin — consecutive short-edge **chain** per CallWaw ℓ.
-///
-/// Hottest envelopes first (len desc), cap **locations** at `THIN_A1_K`.
-/// Wide calldata fans are chained (not skipped as RAW stars, not a probe
-/// star). Empty-to / lazy payee spines stay A0 (C4).
+/// C1/C5: thin begin — storage-trio CallWaw only (`3..=4`).
+/// Wide ERC-20 / RAW fans stay A0 (same `to`, different slots). Empty-to A0.
+/// Cap **locations** at `THIN_A1_K`. Hottest first.
 fn admit_seed_hint_short_edges(
     ready: &ReadyEdgeTable,
     hints: &AccountHints,
@@ -345,7 +343,7 @@ fn admit_seed_hint_short_edges(
     let mut addrs: Vec<(Address, usize)> = hints
         .call_to_accounts()
         .map(|a| (a, hints.call_to_txs(&a).len()))
-        .filter(|&(_, n)| n >= 3)
+        .filter(|&(_, n)| (3..=4).contains(&n))
         .collect();
     addrs.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let mut edges = 0;
@@ -596,6 +594,14 @@ fn seed_short_edges_after_publish(
     }
     let envelope_later = envelope_successors(hints, to, writer);
     let from_later = from_successors(hints, from, writer, from_loc, effective_locs);
+    // Envelope `to` is a same-ℓ proxy only for short CallWaw (storage trio).
+    // Wide ERC-20 / RAW fans write different slots — do not chain them.
+    let envelope_is_loc = to.is_some_and(|t| {
+        let call_n = hints.call_to_txs(&t).len();
+        let pay_n = hints.to_txs(&t).len();
+        (call_n >= CALL_WAW_FLOOR && call_n < 8)
+            || (call_n < CALL_WAW_FLOOR && pay_n >= 2 && pay_n < 8)
+    });
     for &loc in all_write_locs {
         if !effective_locs.iter().any(|&l| l == loc) {
             continue;
@@ -604,8 +610,10 @@ fn seed_short_edges_after_publish(
         let has_earlier = ready.writers_of(loc).iter().any(|&w| w < writer);
         let later: &[TxIdx] = if loc == from_loc {
             &from_later
-        } else {
+        } else if envelope_is_loc {
             &envelope_later
+        } else {
+            &[]
         };
         let hint_n = later.len();
         let gate = policy
@@ -677,6 +685,7 @@ fn from_successors(
     from_txs.iter().copied().filter(|&t| t > writer).collect()
 }
 
+#[allow(dead_code)]
 fn later_hint_successors(
     hints: &AccountHints,
     from: Address,
@@ -699,6 +708,7 @@ fn later_hint_successors(
 }
 
 /// L2: first EffectiveWAW abort → short-edge the immediate remaining successor.
+#[allow(dead_code)]
 pub(crate) fn admit_seed_next_successor(
     ready: &ReadyEdgeTable,
     hints: &AccountHints,
@@ -1542,7 +1552,7 @@ mod tests {
         let bayes = BayesMap::new();
         let prior = InterBlockPrior::new();
         let main = Address::repeat_byte(0x20);
-        let hints = AccountHints::from_call_to_txs(main, vec![31, 66, 67, 69, 70]);
+        let hints = AccountHints::from_call_to_txs(main, vec![31, 66, 67, 69, 70, 93, 96, 103]);
         let policy = policy_for(176);
         let n = admit_seed_begin_block(
             &ready,
@@ -1556,18 +1566,8 @@ mod tests {
             &HashSet::new(),
             None,
         );
-        assert_eq!(
-            n, 4,
-            "C5: consecutive short edges, not a cohort star, got {n}"
-        );
-        assert_eq!(ready.blocking_producer(66), Some(31));
-        assert_eq!(ready.blocking_producer(67), Some(66));
-        assert_eq!(ready.blocking_producer(70), Some(69));
-        assert_ne!(
-            ready.blocking_producer(70),
-            Some(31),
-            "C5: tail waits on its pred, not the envelope head"
-        );
-        assert!(ready.may_execute(31), "main-chain head stays runnable");
+        assert_eq!(n, 0, "C5: wide CallWaw stays A0 at thin begin, got {n}");
+        assert!(ready.may_execute(31), "wide head stays runnable");
+        assert!(ready.may_execute(66), "wide tail stays runnable");
     }
 }

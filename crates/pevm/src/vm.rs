@@ -3289,49 +3289,10 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         .note_incarnation_finish(tx_version.tx_idx, exec_result.tx_gas_used());
                 }
 
-                // C1: A0 ungated records MV, then if_idle short edges on
-                // effective non-lazy publishes. In-flight succs stay OCC.
+                // L4/P3: A0 ungated records MV only. Mid-execute ReadyEdge
+                // insert races seq≡par (iter9 / mixed SIGSEGV). C1/L2 seed
+                // at begin (hint / prior) or on the next block after promote.
                 if a0_ungated {
-                    let has_effective = write_set.iter().any(|(loc, val)| {
-                        *loc != self.beneficiary_location_hash
-                            && !matches!(
-                                val,
-                                MemoryValue::LazyRecipient(_) | MemoryValue::LazySender(_)
-                            )
-                    });
-                    if has_effective {
-                        let all_write_locs: Vec<MemoryLocationHash> = write_set
-                            .iter()
-                            .filter_map(|(loc, _)| {
-                                (*loc != self.beneficiary_location_hash).then_some(*loc)
-                            })
-                            .collect();
-                        let effective_write_locs: Vec<MemoryLocationHash> = write_set
-                            .iter()
-                            .filter_map(|(loc, val)| {
-                                if *loc == self.beneficiary_location_hash {
-                                    return None;
-                                }
-                                match val {
-                                    MemoryValue::LazyRecipient(_) | MemoryValue::LazySender(_) => {
-                                        None
-                                    }
-                                    _ => Some(*loc),
-                                }
-                            })
-                            .collect();
-                        crate::specfence::admit::admit_seed_on_write_set(
-                            self.specfence.ready_edges,
-                            self.specfence.hints,
-                            self.specfence.wave,
-                            self.specfence.policy,
-                            tx_version.tx_idx,
-                            tx.caller,
-                            tx.kind.to().copied(),
-                            &all_write_locs,
-                            &effective_write_locs,
-                        );
-                    }
                     let (wrote_new_location, contended) =
                         self.mv_memory.record(tx_version, read_set, write_set);
                     if wrote_new_location {

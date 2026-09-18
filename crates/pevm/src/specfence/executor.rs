@@ -217,17 +217,8 @@ fn promote_and_seed_short_edge(
     policy.promote_short_edge(f.location, 0);
     if let Some(w) = f.peer.filter(|&w| w < tx_idx) {
         policy.note_short_pair(f.location, w, tx_idx);
-        crate::specfence::admit::admit_seed_next_successor(
-            specfence.ready_edges,
-            specfence.hints,
-            Some(policy),
-            tx_idx,
-            w,
-            f.location,
-            specfence.hints.from_of(tx_idx),
-            specfence.hints.to_of(tx_idx),
-        );
     }
+    let _ = specfence;
 }
 
 /// A0 / ungated: OCC abort after a failed commute. L2 still promotes the ℓ.
