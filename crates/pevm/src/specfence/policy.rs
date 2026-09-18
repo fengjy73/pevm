@@ -195,10 +195,15 @@ pub struct LearnReport {
     pub optimistic_path_tax_ns: u64,
     /// F6/F7: begin-time strategy census (not occ_aborts).
     pub opt_locs: usize,
+    /// Locations that chose WindowedOrdered w=1.
     pub win1_locs: usize,
+    /// Locations that chose WindowedOrdered w=2.
     pub win2_locs: usize,
+    /// Locations that chose WindowedOrdered w=3.
     pub win3_locs: usize,
+    /// Locations that chose segmented short FullChain (T2).
     pub seg_locs: usize,
+    /// Locations that chose FullChain (short storage only on thin blocks).
     pub full_locs: usize,
     /// Dominant learned action label (`Win_3` / `Seg` / `Full` / `Opt`).
     pub chosen_strategy: String,
