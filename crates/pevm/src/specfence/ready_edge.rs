@@ -168,7 +168,15 @@ impl ReadyEdgeTable {
                 Err(v) => cur = v,
             }
         }
+        drop(e);
         self.waiters.entry(producer).or_default().push(consumer);
+        // Insert raced with pred Done — do not leave a refuse-forever gate.
+        if self.is_writer_done(producer)
+            && let Some(c) = self.consumers.get(&consumer)
+            && c.load(Ordering::Relaxed) == producer
+        {
+            c.store(NONE, Ordering::Relaxed);
+        }
     }
 
     /// D1: record `writer` on location `ℓ` (lazy or Data). Order is consensus.

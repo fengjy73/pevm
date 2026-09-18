@@ -881,6 +881,9 @@ pub(crate) fn flush_pending_idle_edges(ready: &ReadyEdgeTable, policy: &CostPoli
             pairs.truncate(2);
         }
         for (pred, succ) in pairs {
+            if pred >= succ || ready.is_started(succ) {
+                continue;
+            }
             if ready.note_consumer_on_if_idle(succ, pred, Some(loc)) {
                 policy.note_short_edge_admit();
                 policy.note_loc_ordered_ns(loc, 1);

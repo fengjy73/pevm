@@ -223,22 +223,25 @@ fn promote_and_seed_short_edge(
         producer,
         f.location,
     );
-    // CC-L2: incarnation≥1 retry is OrderedAdmit even when begin stayed
-    // OptimisticRead (do not discard the pending retry hop).
+    // CC-L1: queue a single-hop successor only when Windowed/FullChain wins.
+    // Do **not** flush here — validate-time plant + same-thread re-exec of
+    // the aborted tx takes the gated path and livelocks (done-stamp race).
+    let n_pairs = policy.pairs_of(f.location).len();
+    if policy.hops_to_plant(f.location, n_pairs) > 0 {
+        let from = specfence.hints.from_of(tx_idx);
+        let to = specfence.hints.to_of(tx_idx);
+        crate::specfence::admit::queue_nearest_unfinished_successor(
+            specfence.ready_edges,
+            policy,
+            specfence.hints,
+            f.location,
+            tx_idx,
+            from,
+            to,
+        );
+    }
+    // CC-L2: incarnation≥1 is idle at the next pick quantum (`flush` there).
     specfence.ready_edges.clear_started(tx_idx);
-    // CC-L1: nearest unfinished successor waits for this published/retrying pred.
-    let from = specfence.hints.from_of(tx_idx);
-    let to = specfence.hints.to_of(tx_idx);
-    crate::specfence::admit::queue_nearest_unfinished_successor(
-        specfence.ready_edges,
-        policy,
-        specfence.hints,
-        f.location,
-        tx_idx,
-        from,
-        to,
-    );
-    let _ = crate::specfence::admit::flush_pending_idle_edges(specfence.ready_edges, policy);
 }
 
 /// A0 / ungated: OCC abort after a failed commute. L2 still promotes the ℓ.
