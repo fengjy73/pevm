@@ -276,7 +276,6 @@ pub(crate) fn admit_seed_begin_block(
 
     let mut edges = 0;
     let mut queued: HashSet<TxIdx> = HashSet::new();
-    let short_edge = policy.is_thin_shell();
     for c in cands {
         if let Some(m) = metrics {
             m.record_edge_ordered_admit();
@@ -307,9 +306,7 @@ pub(crate) fn admit_seed_begin_block(
             }
             CohortKind::EmptyTo => {
                 let loc = envelope_loc(c.addr);
-                // Thin-shell: first successor only. 3356896 4→31 stays A1;
-                // 66…171 stay A0 (no probe-star refuse).
-                edges += note_probe_star(ready, &c.txs, loc, &mut queued, short_edge);
+                edges += note_probe_star(ready, &c.txs, loc, &mut queued, false);
             }
             CohortKind::SameFrom => {
                 let basic = hash_deterministic(MemoryLocation::Basic(c.addr));
