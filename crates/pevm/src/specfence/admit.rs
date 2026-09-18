@@ -121,20 +121,24 @@ pub(crate) fn admit_seed_begin_block(
     contracts: &HashSet<Address>,
     metrics: Option<&MetricsInner>,
 ) -> usize {
-    // L1/P3: thin cold start is A1=0 — no hint walk, no Bayes seed, no ReadyEdge.
-    if !policy.should_seed_thin_a1() {
-        let _ = (
-            ready,
-            stages,
-            learner,
-            bayes,
-            prior,
-            hints,
-            beneficiary,
-            contracts,
-            metrics,
-        );
-        return 0;
+    // L1/C5: thin cold start is A1=0. After a measured promote, seed **short
+    // edges only** (stored pred→succ) — never freeze an envelope A1=3 tax.
+    if policy.is_a0_majority_block() {
+        if !policy.should_seed_thin_a1() {
+            let _ = (
+                ready,
+                stages,
+                learner,
+                bayes,
+                prior,
+                hints,
+                beneficiary,
+                contracts,
+                metrics,
+            );
+            return 0;
+        }
+        return admit_seed_promoted_short_edges(ready, policy, metrics);
     }
     let stars = seed_known_stars(learner, bayes, prior);
     let fan = learner.morph_weights().dominant_fan_out();
@@ -335,6 +339,27 @@ pub(crate) fn admit_seed_begin_block(
     edges
 }
 
+/// L4/C5: reuse / measured prior → one ReadyEdge per promoted ℓ (not a cohort).
+fn admit_seed_promoted_short_edges(
+    ready: &ReadyEdgeTable,
+    policy: &CostPolicy,
+    metrics: Option<&MetricsInner>,
+) -> usize {
+    let mut edges = 0;
+    for (loc, pred, succ) in policy.promoted_short_pairs() {
+        if pred >= succ || !policy.is_promoted(loc) {
+            continue;
+        }
+        ready.note_consumer_on(succ, pred, Some(loc));
+        policy.note_short_edge_admit();
+        if let Some(m) = metrics {
+            m.record_edge_ordered_admit();
+        }
+        edges += 1;
+    }
+    edges
+}
+
 /// Abort strengthen: known consumer ← discovered RAW/WAW producer + ProducerStage.
 #[inline]
 pub(crate) fn admit_seed_on_abort(
@@ -371,23 +396,20 @@ pub(crate) fn admit_seed_on_write_set(
     effective_locs: &[MemoryLocationHash],
 ) {
     let from_loc = hash_deterministic(MemoryLocation::Basic(from));
-    // L4/S: A0-majority with no gated txs — skip D1 DashMap on the execute
-    // hot path. Writer order is reconstructed at block end for compare.
-    if policy.is_some_and(|p| p.is_a0_majority_block()) && !ready.has_any_gated() {
-        return;
-    }
-    // PC-S1: A0-majority — D1 writer order only. No ReadyEdge / B2 / release.
-    // 4→31 still lands when the A1 probe publishes (`note_immediate_pred`).
+    // C1/C2: thin A0 may start ungated, but the first effective non-lazy
+    // publish must be able to raise a short ReadyEdge. Lazy-only stays A0.
     if policy.is_some_and(|p| p.is_a0_majority_block()) && !ready.was_queued(writer) {
-        for &loc in all_write_locs {
-            ready.note_location_writer(loc, writer);
-            // C4: EffectiveWAW short edge only — not a whole lazy same-from spine.
-            if policy.is_some_and(|p| p.is_promoted(loc))
-                && effective_locs.iter().any(|&l| l == loc)
-            {
-                ready.note_immediate_pred(loc, writer);
-            }
-        }
+        seed_short_edges_after_publish(
+            ready,
+            hints,
+            policy,
+            writer,
+            from,
+            to,
+            from_loc,
+            all_write_locs,
+            effective_locs,
+        );
         return;
     }
     // D1: record every writer (lazy included) so 4→31 is visible in order.
@@ -509,6 +531,124 @@ pub(crate) fn admit_seed_on_write_set(
             if t > writer && !queued.contains(&t) {
                 ready.release_consumer(t, wave);
             }
+        }
+    }
+}
+
+/// C1/C2: after an effective publish, record D1 and raise at most one
+/// successor ReadyEdge per ℓ (location total order, not a lazy same-from spine).
+fn seed_short_edges_after_publish(
+    ready: &ReadyEdgeTable,
+    hints: &AccountHints,
+    policy: Option<&CostPolicy>,
+    writer: TxIdx,
+    from: Address,
+    to: Option<Address>,
+    from_loc: MemoryLocationHash,
+    all_write_locs: &[MemoryLocationHash],
+    effective_locs: &[MemoryLocationHash],
+) {
+    if effective_locs.is_empty() {
+        return;
+    }
+    let later = later_hint_successors(hints, from, to, writer, from_loc, effective_locs);
+    for &loc in all_write_locs {
+        if !effective_locs.iter().any(|&l| l == loc) {
+            continue;
+        }
+        ready.note_location_writer(loc, writer);
+        let has_earlier = ready.writers_of(loc).iter().any(|&w| w < writer);
+        if has_earlier {
+            ready.note_immediate_pred(loc, writer);
+        }
+        let hint_n = later.len();
+        let gate = policy
+            .map(|p| p.should_gate_short_after_write(loc, has_earlier, hint_n))
+            .unwrap_or(has_earlier || hint_n >= 2);
+        if !gate {
+            continue;
+        }
+        if let Some(p) = policy {
+            p.promote_short_edge(loc, 0);
+        }
+        if let Some(&succ) = later.first() {
+            ready.note_consumer_on(succ, writer, Some(loc));
+            if let Some(p) = policy {
+                p.note_short_pair(loc, writer, succ);
+                if has_earlier {
+                    if let Some(pred) = ready
+                        .writers_of(loc)
+                        .into_iter()
+                        .rev()
+                        .find(|&w| w < writer)
+                    {
+                        p.note_short_pair(loc, pred, writer);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn later_hint_successors(
+    hints: &AccountHints,
+    from: Address,
+    to: Option<Address>,
+    writer: TxIdx,
+    from_loc: MemoryLocationHash,
+    effective_locs: &[MemoryLocationHash],
+) -> Vec<TxIdx> {
+    let mut later = Vec::new();
+    if let Some(to) = to {
+        let call = hints.call_to_txs(&to);
+        let payee = hints.to_txs(&to);
+        let src = if call.len() >= CALL_WAW_FLOOR {
+            call
+        } else {
+            payee
+        };
+        later.extend(src.iter().copied().filter(|&t| t > writer));
+    }
+    // Same-from Data (nonce/balance) — only when the from loc is effective
+    // and the cohort is not a lazy 21k spine (C4).
+    if effective_locs.iter().any(|&l| l == from_loc) {
+        let from_txs = hints.from_txs(&from);
+        if from_txs.len() >= 3 && !hints.cohort_all_empty(from_txs) {
+            later.extend(from_txs.iter().copied().filter(|&t| t > writer));
+        }
+    }
+    later.sort_unstable();
+    later.dedup();
+    later
+}
+
+/// L2: first EffectiveWAW abort → short-edge the immediate remaining successor.
+pub(crate) fn admit_seed_next_successor(
+    ready: &ReadyEdgeTable,
+    hints: &AccountHints,
+    policy: Option<&CostPolicy>,
+    consumer: TxIdx,
+    producer: TxIdx,
+    location: MemoryLocationHash,
+    from: Address,
+    to: Option<Address>,
+) {
+    if producer >= consumer {
+        return;
+    }
+    ready.note_raw_producer(location, producer);
+    ready.note_location_writer(location, producer);
+    ready.note_location_writer(location, consumer);
+    ready.note_consumer_on(consumer, producer, Some(location));
+    if let Some(p) = policy {
+        p.note_short_pair(location, producer, consumer);
+        p.note_short_edge_admit();
+    }
+    let later = later_hint_successors(hints, from, to, consumer, 0, &[]);
+    if let Some(&succ) = later.first() {
+        ready.note_consumer_on(succ, consumer, Some(location));
+        if let Some(p) = policy {
+            p.note_short_pair(location, consumer, succ);
         }
     }
 }
@@ -961,7 +1101,7 @@ mod tests {
     }
 
     #[test]
-    fn a0_ungated_write_set_records_d1_only() {
+    fn a0_unique_write_records_d1_without_edge() {
         let ready = ReadyEdgeTable::new();
         let wave = WaveParkTable::new();
         let policy = policy_for(176);
@@ -980,13 +1120,94 @@ mod tests {
             &[loc],
             &[loc],
         );
-        assert!(
-            ready.writers_of(loc).is_empty(),
-            "thin A0 defers D1 off the execute hot path (block-end snapshot)"
+        assert_eq!(
+            ready.writers_of(loc),
+            vec![4],
+            "C1: first effective write records D1"
         );
         assert!(
             ready.may_execute(31),
-            "thin A0 must not plant a ReadyEdge on later writers"
+            "unique writer with no hint successor must not refuse 31"
+        );
+    }
+
+    #[test]
+    fn thin_write_set_promotes_14_to_16() {
+        let ready = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        let policy = policy_for(176);
+        let contract = Address::repeat_byte(0xed);
+        let from = Address::repeat_byte(0x14);
+        let loc = 0xedba_u64;
+        let hints = AccountHints::from_call_to_txs(contract, vec![14, 16, 17]);
+        admit_seed_on_write_set(
+            &ready,
+            &hints,
+            &wave,
+            Some(&policy),
+            14,
+            from,
+            Some(contract),
+            &[loc],
+            &[loc],
+        );
+        assert_eq!(
+            ready.blocking_producer(16),
+            Some(14),
+            "C1/L1: first effective storage write must raise 14→16"
+        );
+        assert!(
+            ready.may_execute(17),
+            "C5: short edge only — 17 stays A0 until 16 publishes"
+        );
+    }
+
+    #[test]
+    fn thin_write_set_promotes_4_to_31() {
+        let ready = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        let policy = policy_for(176);
+        let to = Address::repeat_byte(0x20);
+        let hot = Address::repeat_byte(0x32);
+        let other = Address::repeat_byte(0x99);
+        let loc = 0x32be_u64;
+        admit_seed_on_write_set(
+            &ready,
+            &AccountHints::from_to_txs(other, vec![4]),
+            &wave,
+            Some(&policy),
+            4,
+            hot,
+            Some(other),
+            &[loc],
+            &[loc],
+        );
+        assert_eq!(ready.writers_of(loc), vec![4]);
+        let hints = AccountHints::from_to_txs(to, vec![31, 66, 67]);
+        admit_seed_on_write_set(
+            &ready,
+            &hints,
+            &wave,
+            Some(&policy),
+            31,
+            Address::repeat_byte(0x31),
+            Some(to),
+            &[loc],
+            &[loc],
+        );
+        assert_eq!(
+            ready.blocking_producer(31),
+            Some(4),
+            "C1: 4→31 after the second effective write on ℓ"
+        );
+        assert_eq!(
+            ready.blocking_producer(66),
+            Some(31),
+            "C1: immediate successor 31→66"
+        );
+        assert!(
+            ready.may_execute(67),
+            "C5: do not plant the whole 0x209c spine"
         );
     }
 

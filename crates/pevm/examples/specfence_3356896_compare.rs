@@ -110,6 +110,7 @@ struct IterRow {
     abort_cf_ns: u64,
     prior_decay: usize,
     admit_seed_begin_ns: u64,
+    end_block_ns: u64,
     begin_blocked: Vec<usize>,
     taxed_indep_blocked: Vec<usize>,
     main_inc_gt0: Vec<usize>,
@@ -213,7 +214,7 @@ fn main() {
                         .map(|(t, _)| t)
                         .collect();
                     println!(
-                        "  {mode_name}[{i}] ok wall_ms={wall_ms:.3} tps={:.0} occ_aborts={} inc>0={} reexec={} refuse_admit={} wait_for_dependency={} soft_wait_arms={} idle_ns={} ready_width={:.2} a1={} a0_cohorts={} edge_oa={} edge_or={} refuse_ns={} reexec_ns={} prepaid_ns={} abort_cf_ns={} prior_decay={} a0_maj={} ev_keep={} ev_demote={} commute={} batch={} d1_prom={} d1_ign={} taxed_begin={} edge_4_31={} unfenced_reexec={} admit_seed_ns={}",
+                        "  {mode_name}[{i}] ok wall_ms={wall_ms:.3} tps={:.0} occ_aborts={} inc>0={} reexec={} refuse_admit={} wait_for_dependency={} soft_wait_arms={} idle_ns={} ready_width={:.2} a1={} a0_cohorts={} edge_oa={} edge_or={} refuse_ns={} reexec_ns={} prepaid_ns={} abort_cf_ns={} prior_decay={} a0_maj={} ev_keep={} ev_demote={} commute={} batch={} d1_prom={} d1_ign={} taxed_begin={} edge_4_31={} unfenced_reexec={} admit_seed_ns={} end_block_ns={}",
                         n as f64 / (wall_ms / 1000.0),
                         m.occ_aborts,
                         m.incarnation_gt0,
@@ -242,7 +243,8 @@ fn main() {
                         taxed.len(),
                         edge_4_31,
                         m.unfenced_reexec,
-                        m.admit_seed_begin_ns
+                        m.admit_seed_begin_ns,
+                        learn.end_block_ns
                     );
                     let row = IterRow {
                         mode: mode_name.to_string(),
@@ -275,6 +277,7 @@ fn main() {
                         abort_cf_ns: learn.abort_cf_ns,
                         prior_decay: learn.prior_decay,
                         admit_seed_begin_ns: m.admit_seed_begin_ns,
+                        end_block_ns: learn.end_block_ns,
                         begin_blocked: begin,
                         taxed_indep_blocked: taxed,
                         main_inc_gt0: inc_gt0_in(&incs, MAIN_CHAIN),
@@ -331,6 +334,45 @@ fn main() {
             "summary Soft=0 occ_median_ms={occ_med:.3} sf_median_ms={sf_med:.3} sf_le_occ={}",
             sf_med <= occ_med + 1e-9
         );
+    }
+
+    // L4: same-Pevm reuse (prior kept). Default interleaved path resets each iter.
+    if std::env::var("SPECFENCE_REUSE_SF").is_ok() {
+        let reuse_n = std::env::var("SPECFENCE_REUSE_ITERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3)
+            .max(1);
+        let mut pevm = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
+        pevm.reset_heat();
+        pevm.reset_inter_prior();
+        println!("reuse_sf Soft=0 n={reuse_n} (same Pevm, prior kept after iter 0)");
+        for i in 0..reuse_n {
+            let t0 = Instant::now();
+            let result = pevm.execute(&chain, &storage, &block, cores_nz, false);
+            let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            match result {
+                Ok(_) => {
+                    let m = pevm.last_specfence_metrics();
+                    let learn = pevm.last_learn_report();
+                    println!(
+                        "  reuse[{i}] wall_ms={wall_ms:.3} a1={} edge_oa={} unfenced={} ev_keep={} ev_demote={} d1_prom={} commute={} end_block_ns={}",
+                        m.a1_cohorts,
+                        m.edge_ordered_admit,
+                        m.unfenced_reexec,
+                        m.cost_ev_keep_ordered,
+                        m.cost_ev_demote_optimistic,
+                        m.conflict_promote,
+                        m.commute_skip,
+                        learn.end_block_ns
+                    );
+                }
+                Err(e) => {
+                    eprintln!("  reuse[{i}] ERROR {e:?}");
+                    std::process::exit(1);
+                }
+            }
+        }
     }
 
     if let Ok(path) = std::env::var("SPECFENCE_COMPARE_JSON") {

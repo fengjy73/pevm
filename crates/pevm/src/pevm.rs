@@ -511,12 +511,13 @@ impl Pevm {
                     metrics_inner.set_admit_seed_begin_ns(t0.elapsed().as_nanos() as u64);
                 }
             }
-            // P4: bag serves gated wake only. A0 / independents use OCC
-            // `execution_idx` — seeding may_execute txs here mutex-taxed the
-            // A0-majority path (PR19 residual).
+            // P3/P4: bag serves gated wake only. A0 never seeds the bag.
+            // Do not sample block_size as ready_width when A1=0 (that read as 176).
             self.last_begin_blocked = ready_edges.blocked_consumers();
-            ready_edges
-                .sample_ready_width(block_size.saturating_sub(self.last_begin_blocked.len()));
+            if ready_edges.has_any_gated() {
+                ready_edges
+                    .sample_ready_width(block_size.saturating_sub(self.last_begin_blocked.len()));
+            }
             if quiet && !learner.has_any_predicted() {
                 let n = sketch.revoke_prior_fences_if_quiet(true);
                 metrics_inner.record_quiet_pessimistic_revoke(n);
@@ -609,12 +610,27 @@ impl Pevm {
                                         && !specfence.ready_edges.has_any_gated());
                                 if occ_exec {
                                     let done_idx = tx_version.tx_idx;
-                                    let next = self
-                                        .try_execute(&mut vm, &scheduler, tx_version, None, None);
-                                    // Stamp Done so a later short-edge promote cannot
-                                    // refuse forever (bitset, not DashMap).
+                                    // Pass wave so a mid-execute short edge can wake.
+                                    // Fence stays None (A0 ≡ OCC execute wrap).
+                                    let next = self.try_execute(
+                                        &mut vm, &scheduler, tx_version, wave_ref, None,
+                                    );
                                     if self.concurrency_mode == ConcurrencyMode::SpecFence {
-                                        specfence.ready_edges.note_producer_done_stamp(done_idx);
+                                        if specfence.ready_edges.has_any_gated() {
+                                            if let Some(w) = wave_ref {
+                                                specfence
+                                                    .ready_edges
+                                                    .note_producer_done(done_idx, w);
+                                            } else {
+                                                specfence
+                                                    .ready_edges
+                                                    .note_producer_done_stamp(done_idx);
+                                            }
+                                        } else {
+                                            specfence
+                                                .ready_edges
+                                                .note_producer_done_stamp(done_idx);
+                                        }
                                     }
                                     next
                                 } else {
@@ -639,9 +655,8 @@ impl Pevm {
                                         Some(&metrics_inner),
                                     )
                                 } else if a0_ungated {
-                                    // P3: A1=0 validate keeps commute (OCC-effect) but
-                                    // skips certificate / repair branching.
-                                    crate::specfence::validate_occ_kernel(
+                                    // P1: no-conflict path ≡ OCC validate; commute only on miss.
+                                    crate::specfence::validate_a0_fast(
                                         &mv_memory,
                                         &scheduler,
                                         &tx_version,
@@ -751,26 +766,9 @@ impl Pevm {
             wave.park_resume_full_abort_reexecute(),
         );
         if self.concurrency_mode == ConcurrencyMode::SpecFence {
-            // L4: A0 skipped HotSet/Bayes on the execute hot path — flush
-            // write locations here so the next block still sees process prior.
-            if self.cost_policy.is_a0_majority_block() {
-                let beneficiary = hash_deterministic(MemoryLocation::Basic(block_env.beneficiary));
-                let mut deferred = Vec::new();
-                for tx in 0..block_size {
-                    if ready_edges.was_queued(tx) {
-                        continue;
-                    }
-                    for loc in mv_memory.write_locations(tx) {
-                        if loc != beneficiary {
-                            self.hotset.note_writer(loc, tx);
-                            deferred.push(loc);
-                        }
-                    }
-                }
-                if !deferred.is_empty() {
-                    self.rw_prior.observe_write_set(&deferred, None);
-                }
-            }
+            let end_t0 = Instant::now();
+            // P2: skip A0 full-block HotSet/write-loc flush. Promoted ℓ already
+            // persist in CostPolicy; L5 keeps HotSet/Bayes off the A0 hot path.
             self.hotset.end_block();
             // P1: pack InterBlockPrior from live morph hat + top-ℓ (flip → higher α).
             let morph_hat = learner.morph_hat();
@@ -806,7 +804,7 @@ impl Pevm {
                         miss += 1;
                         self.cost_policy.bump_unfenced_reexec();
                         if !self.cost_policy.is_promoted(note.location) {
-                            self.cost_policy.promote_short_edge(note.location, 0);
+                            self.cost_policy.promote_short_edge(note.location, 1);
                         }
                     }
                     None => {
@@ -831,7 +829,8 @@ impl Pevm {
             self.cost_policy
                 .note_cost_sample(refuse_unit, inc_gt0 > 0, idle);
             self.cost_policy.end_block_learn();
-            let report = self.cost_policy.take_report(ready_w, idle);
+            let mut report = self.cost_policy.take_report(ready_w, idle);
+            report.end_block_ns = end_t0.elapsed().as_nanos() as u64;
             metrics_inner.set_pc_learn_metrics(
                 ready_w,
                 idle,
