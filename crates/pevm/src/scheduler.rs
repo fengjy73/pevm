@@ -15,6 +15,9 @@ use crate::{
     specfence::{FenceGraph, ReadyEdgeTable, WaveParkTable, profile_timing_enabled},
 };
 
+/// After refuse, steal one nearby independent. No full-block scan (PRIMARY tax).
+const WAVE_FILL_WINDOW: usize = 32;
+
 // The Pevm collaborative scheduler coordinates execution & validation
 // tasks among work threads.
 //
@@ -280,6 +283,11 @@ impl Scheduler {
                             }
                             edges.defer(execution_idx);
                         }
+                        if let Some(task) =
+                            self.try_fill_independent_after_refuse(execution_idx, wave, ready)
+                        {
+                            return Some(task);
+                        }
                     }
                     continue;
                 }
@@ -429,6 +437,20 @@ impl Scheduler {
             }
             if let Some(tx_version) = self.try_execute_ready(tx_idx, Some(wave), ready) {
                 // P3: bag depth only — never the full-block scan count.
+                edges.sample_ready_width(wave.ready_depth().max(1));
+                wave.note_ready_steal_if_after_park();
+                return Some(Task::Execution(tx_version));
+            }
+        }
+        let end = from.saturating_add(WAVE_FILL_WINDOW).min(self.block_size);
+        for cand in (from + 1)..end {
+            if cand >= self.block_size || self.is_done(cand) {
+                continue;
+            }
+            if edges.is_gated(cand) && (edges.is_sleeping(cand) || !edges.may_execute(cand)) {
+                continue;
+            }
+            if let Some(tx_version) = self.try_execute_ready(cand, Some(wave), ready) {
                 edges.sample_ready_width(wave.ready_depth().max(1));
                 wave.note_ready_steal_if_after_park();
                 return Some(Task::Execution(tx_version));
