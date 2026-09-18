@@ -148,9 +148,9 @@ pub(crate) struct VmDb<'a, S: Storage> {
     // Only applied to raw transfers' senders & recipients at the moment.
     is_lazy: bool,
     /// Thin-shell short same-from/to force-lazy (not the generic first-touch lazy).
-    a0_majority_lazy: bool,
+    optimistic_majority_lazy: bool,
     /// A1=0 ungated: skip access-gate / rem / ReadyEdge (P3 ≡ OCC).
-    a0_skip_gate: bool,
+    optimistic_skip_gate: bool,
     /// PCC overlay armed for the current access (PE ∩ ROI). OptimisticRead = OCC read.
     pcc_armed: Cell<bool>,
     /// OptimisticRead accesses this incarnation (end-tx process flush; no DashMap).
@@ -184,12 +184,12 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.to_code_hash = None;
         self.flush_access_census();
         self.is_lazy = false;
-        self.a0_majority_lazy = false;
-        self.a0_skip_gate = self.specfence.mode == crate::ConcurrencyMode::SpecFence
+        self.optimistic_majority_lazy = false;
+        self.optimistic_skip_gate = self.specfence.mode == crate::ConcurrencyMode::SpecFence
             && self
                 .specfence
                 .policy
-                .is_some_and(|p| p.is_a0_majority_block())
+                .is_some_and(|p| p.is_optimistic_majority_block())
             && !self.specfence.ready_edges.was_queued(tx_idx);
         self.has_nonce = has_nonce;
         self.read_set.clear();
@@ -198,7 +198,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if let Some(fg) = self.specfence.finegrain {
             fg.deep_begin_consumer(tx_idx, incarnation);
         }
-        if self.specfence.mode == crate::ConcurrencyMode::SpecFence && !self.a0_skip_gate {
+        if self.specfence.mode == crate::ConcurrencyMode::SpecFence && !self.optimistic_skip_gate {
             // repair_armed covers_all only with real FF values. WaitForDependency ResumeAtK
             // with empty FF must not pretend sibling optimistic_read is certified (Iter26).
             let repair_armed = (self.specfence.partial_retry.is_rewind_resume(tx_idx)
@@ -235,9 +235,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
             // A0-majority: also lazy-accumulate empty-input EOA that share
             // from/to with another tx (2-tx same-from 21k). Avoids first-touch
             // Basic WAW without a ReadyEdge on the whole spine.
-            let a0_majority_lazy = eoa
+            let optimistic_majority_lazy = eoa
                 && self.specfence.mode == crate::ConcurrencyMode::SpecFence
-                && crate::specfence::a0_majority_hinted_lazy(
+                && crate::specfence::optimistic_majority_hinted_lazy(
                     self.specfence.hints,
                     tx.caller,
                     Some(to),
@@ -245,12 +245,12 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     true,
                     self.specfence
                         .policy
-                        .is_some_and(|p| p.is_a0_majority_block()),
+                        .is_some_and(|p| p.is_optimistic_majority_block()),
                     self.specfence.ready_edges.was_queued(tx_idx),
                 );
-            self.a0_majority_lazy = a0_majority_lazy;
-            self.is_lazy = already || a0_majority_lazy;
-            if a0_majority_lazy && self.specfence.hints.prev(&tx.caller, tx_idx).is_some() {
+            self.optimistic_majority_lazy = optimistic_majority_lazy;
+            self.is_lazy = already || optimistic_majority_lazy;
+            if optimistic_majority_lazy && self.specfence.hints.prev(&tx.caller, tx_idx).is_some() {
                 self.specfence.metrics.record_commute_skip();
                 if let Some(p) = self.specfence.policy {
                     p.note_commute_skip();
@@ -436,7 +436,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
     /// End-tx OptimisticRead census (no per-SLOAD process DashMap).
     fn flush_access_census(&self) {
         let n = self.optimistic_read_this_tx.get();
-        if n > 0 && self.specfence.mode == crate::ConcurrencyMode::SpecFence && !self.a0_skip_gate {
+        if n > 0
+            && self.specfence.mode == crate::ConcurrencyMode::SpecFence
+            && !self.optimistic_skip_gate
+        {
             self.specfence
                 .process
                 .note_optimistic_read_occ(self.tx_idx, n);
@@ -457,7 +460,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
         match self.specfence.mode {
             crate::ConcurrencyMode::Occ => Ok(()),
             crate::ConcurrencyMode::Pcc => self.maybe_wait_pcc(address, location_hash),
-            crate::ConcurrencyMode::SpecFence if self.a0_skip_gate || self.is_lazy => Ok(()),
+            crate::ConcurrencyMode::SpecFence if self.optimistic_skip_gate || self.is_lazy => {
+                Ok(())
+            }
             crate::ConcurrencyMode::SpecFence => {
                 self.specfence_access_gate(address, location_hash, is_program)
             }
@@ -512,7 +517,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if self
             .specfence
             .policy
-            .is_some_and(|p| p.is_a0_majority_block())
+            .is_some_and(|p| p.is_optimistic_majority_block())
             && !self.specfence.ready_edges.was_queued(self.tx_idx)
         {
             return Ok(());
@@ -2133,8 +2138,8 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             to_hash: None,
             to_code_hash: None,
             is_lazy: false,
-            a0_majority_lazy: false,
-            a0_skip_gate: false,
+            optimistic_majority_lazy: false,
+            optimistic_skip_gate: false,
             pcc_armed: Cell::new(false),
             optimistic_read_this_tx: Cell::new(0),
             pcc_this_tx: Cell::new(0),
@@ -2256,13 +2261,14 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         }
     }
 
-    pub(crate) fn note_hot_reexec_ns(&self, ns: u64) {
+    pub(crate) fn note_hot_reexec_ns(&self, tx_idx: crate::TxIdx, ns: u64) {
         if self.specfence.mode != crate::ConcurrencyMode::SpecFence || ns == 0 {
             return;
         }
         self.specfence.metrics.record_reexec_ns(ns);
         if let Some(p) = self.specfence.policy {
-            p.note_reexec_ns(ns);
+            let loc = p.conflict_of(tx_idx).map(|n| n.location);
+            p.note_reexec_ns_at(loc, ns);
         }
     }
 
@@ -2393,16 +2399,16 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         // resume path on Lean too — do NOT gate on `!lean`. Journal FF (`try_ff_*`)
         // already keys off table `is_rewind_resume`; this also seeds read origins,
         // prefers `record_resume`, and may narrow-arm hang-free absolute jump.
-        let a0_ungated_exec = self.specfence.mode == crate::ConcurrencyMode::SpecFence
+        let optimistic_ungated_exec = self.specfence.mode == crate::ConcurrencyMode::SpecFence
             && self
                 .specfence
                 .policy
-                .is_some_and(|p| p.is_a0_majority_block())
+                .is_some_and(|p| p.is_optimistic_majority_block())
             && !self.specfence.ready_edges.was_queued(tx_version.tx_idx);
         let lean = self.specfence.mode == crate::ConcurrencyMode::SpecFence
             && self.specfence.engagement.begin_tx(tx_version.tx_idx);
         let repair_armed = self.specfence.mode == crate::ConcurrencyMode::SpecFence
-            && !a0_ungated_exec
+            && !optimistic_ungated_exec
             && (self
                 .specfence
                 .partial_retry
@@ -3208,12 +3214,12 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     }
                 }
 
-                let (is_lazy, a0_majority_lazy, read_set) = {
+                let (is_lazy, optimistic_majority_lazy, read_set) = {
                     let db = ctx.db_mut();
                     db.flush_access_census();
                     (
                         db.is_lazy,
-                        db.a0_majority_lazy,
+                        db.optimistic_majority_lazy,
                         std::mem::take(&mut db.read_set),
                     )
                 };
@@ -3229,13 +3235,13 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     FinishExecFlags::empty()
                 };
 
-                let a0_ungated = self.specfence.mode == crate::ConcurrencyMode::SpecFence
+                let optimistic_ungated = self.specfence.mode == crate::ConcurrencyMode::SpecFence
                     && self
                         .specfence
                         .policy
-                        .is_some_and(|p| p.is_a0_majority_block())
+                        .is_some_and(|p| p.is_optimistic_majority_block())
                     && !self.specfence.ready_edges.was_queued(tx_version.tx_idx);
-                if !a0_ungated
+                if !optimistic_ungated
                     && self.specfence.mode == crate::ConcurrencyMode::SpecFence
                     && self.specfence.certificates.rem_legal(tx_version.tx_idx)
                 {
@@ -3292,7 +3298,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 // L4/P3: A0 ungated records MV only. Mid-execute ReadyEdge
                 // insert races seq≡par (iter9 / mixed SIGSEGV). C1/L2 seed
                 // at begin (hint / prior) or on the next block after promote.
-                if a0_ungated {
+                if optimistic_ungated {
                     let (wrote_new_location, contended) =
                         self.mv_memory.record(tx_version, read_set, write_set);
                     if wrote_new_location {
@@ -3393,7 +3399,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     self.mv_memory.record(tx_version, read_set, write_set);
                 // M3: learn process WŜ from this incarnation's writes (no residual publish).
                 // R1/R3: feed HotSet writer counts (H_w) from non-lazy writes only.
-                let _ = a0_majority_lazy;
+                let _ = optimistic_majority_lazy;
                 if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
                     crate::specfence::admit::admit_seed_on_write_set(
                         self.specfence.ready_edges,

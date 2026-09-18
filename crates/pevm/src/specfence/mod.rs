@@ -230,8 +230,8 @@ pub(crate) use boundary::{
 pub(crate) use certificate::CertificateTable;
 #[allow(unused_imports)]
 pub(crate) use collateral::{
-    ConflictClass, FirstConflict, a0_majority_hinted_lazy, classify_first_conflict, commute_ok,
-    envelopes_disjoint, is_value_transfer, location_is_lazy,
+    ConflictClass, FirstConflict, classify_first_conflict, commute_ok, envelopes_disjoint,
+    is_value_transfer, location_is_lazy, optimistic_majority_hinted_lazy,
 };
 pub(crate) use computer::next_sf_task;
 pub(crate) use dag::{FenceGraph, SpecDag};
@@ -245,8 +245,8 @@ pub(crate) use engagement::{AdaptiveEngagement, profile_timing_enabled, research
 pub(crate) use executor::{
     fence_for_mode, hinted_wait_enabled, next_occ_task, occ_read_set_valid,
     specfence_access_is_occ, specfence_cost_class_spec, specfence_partial_abort_validate,
-    specfence_plant_is_occ, uses_specfence_resolve, validate_a0_fast, validate_occ_kernel,
-    validate_occ_stage, validate_specfence, wave_for_mode,
+    specfence_plant_is_occ, uses_specfence_resolve, validate_occ_kernel, validate_occ_stage,
+    validate_optimistic_fast, validate_specfence, wave_for_mode,
 };
 pub use finegrain::{
     AbortEvent, AccountGrainObserve, ConsumerFirstCross, DagStats, EffectClass, EffectLogEntry,

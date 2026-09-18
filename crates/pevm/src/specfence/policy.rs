@@ -1,19 +1,15 @@
-//! Cost-aware admit policy — L1 cost-EV + A0-majority block + CC-D1 routing.
+//! Cost-aware admit policy — three-way EV + OptimisticRead-majority + CC-D1.
 //!
-//! Soft=0 actions: **A0** OptimisticRead vs **A1** OrderedAdmit (refuse +
-//! wave-admit pred). A0 is the OCC-effect path on this spine — not a hand-off
-//! to a second OCC runtime. Beta posteriors are **features**, not `decide()`
-//! authority. Decide is measured-ns EMA: keep A1 iff ĉ_A1 + δ < ĉ_A0.
+//! Soft=0 actions: **OptimisticRead** vs **OrderedAdmit** (refuse +
+//! wave-admit pred). OptimisticRead is the OCC-effect path on this spine —
+//! not a hand-off to a second OCC runtime. Beta posteriors are **features**,
+//! not `decide()` authority.
 //!
-//! O1: short WAW (≤`ORDER_WINDOW_K` hops) is fully ordered; long thin spines
-//! stay A0 at begin (leftover-aware EV) — not a prefix-window serialize.
-//! O2/L1: if ĉ_ordered_spine loses to abort EMA, demote that ℓ to A0.
-//!
-//! **L1 (thin / a0_majority_block):** default A0. Cold start may be A1=0.
-//! Promote a short edge only when a per-ℓ / address-pair prior or observed
-//! effective-WAW cost proves ordered cheaper. Do not freeze A1=K from the
-//! optimistic full-shell prior (ĉ_A1=8µs < ĉ_A0=25µs) on a small block.
-//! `THIN_A1_K` is a **cap**, not a frozen set of exactly 3.
+//! CC-L4: per hot ℓ pick min ĉ among {OptimisticRead, WindowedOrdered(k=1),
+//! FullChain}. FullChain is the default only for short storage chains
+//! (14→16→17). Long Basic WAW stays OptimisticRead at begin; incarnation≥1
+//! retries OrderedAdmit (CC-L2); validate queues a single-hop wait-for
+//! (CC-L1/L3). Do not freeze OrderedAdmit=K from the full-shell prior.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -31,33 +27,60 @@ use super::collateral::ConflictClass;
 const META_FLOOR_NS: f64 = 400_000.0;
 /// ~2µs/tx cold serial hat (21k transfer class).
 const SERIAL_NS_PER_TX: f64 = 2_000.0;
-/// Thin-shell A1 spine **cap** (not “always exactly 3”). Promote/ignore may
-/// change the set; ns-EV may keep fewer. 3356896 proven spines stay under K.
-pub(crate) const THIN_A1_K: usize = 3;
-/// O1: long Basic WAW plants at most this many hops (partial order). Short
-/// chains (storage 14→16→17) stay fully ordered. Never full-serialize a
-/// 16-writer spine — that prepaid wall lost to OCC abort on 3356896.
+/// Thin-shell OrderedAdmit spine **cap** (not “always exactly 3”).
+/// Promote/ignore may change the set; ns-EV may keep fewer.
+pub(crate) const THIN_ORDERED_K: usize = 3;
+/// Short-chain hop count (storage 14→16→17). Long spines never FullChain.
 pub(crate) const ORDER_WINDOW_K: usize = 2;
+/// CC-L3: WindowedOrdered plants only the nearest unfinished writer.
+pub(crate) const WINDOWED_K: usize = 1;
 const THIN_N_MAX: usize = 256;
-/// ns-EV hysteresis: keep A1 only if ĉ_A1 + δ < ĉ_A0.
+/// ns-EV hysteresis: keep OrderedAdmit only if ĉ_ord + δ < ĉ_opt.
 const NS_DELTA: f64 = 2_000.0;
-/// Full-shell cold-start EMA priors (ns). Large blocks may keep A1.
-const PRIOR_C_A1_NS: f64 = 8_000.0;
-const PRIOR_C_A0_NS: f64 = 25_000.0;
+/// Full-shell cold-start EMA priors (ns). Large blocks may keep OrderedAdmit.
+const PRIOR_C_ORDERED_NS: f64 = 8_000.0;
+const PRIOR_C_OPT_NS: f64 = 25_000.0;
 /// Thin-block cold priors: OCC abort is cheaper than refuse/wave prepaid.
-const PRIOR_C_A1_THIN_NS: f64 = 18_000.0;
-const PRIOR_C_A0_THIN_NS: f64 = 6_000.0;
-/// Consecutive blocks where prepaid A1 loses to the abort counterfactual.
+const PRIOR_C_ORDERED_THIN_NS: f64 = 18_000.0;
+const PRIOR_C_OPT_THIN_NS: f64 = 6_000.0;
+/// F4: consecutive FullChain losses before demote; min samples before switch.
 const PREPAID_LOSE_N: u32 = 2;
+const MIN_SAMPLES: f64 = 2.0;
 const EMA_ALPHA: f64 = 0.20;
 
 /// Soft=0 action on a candidate edge / cohort.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AdmitAction {
     /// OptimisticRead — execute now; conflict pays reexec.
-    A0OptimisticRead,
+    OptimisticRead,
     /// OrderedAdmit — refuse while pred unfinished; steal independent work.
-    A1OrderedAdmit,
+    OrderedAdmit,
+}
+
+/// CC-L4 three-way location strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocStrategy {
+    OptimisticRead,
+    WindowedOrdered,
+    FullChain,
+}
+
+impl LocStrategy {
+    const fn as_u8(self) -> u8 {
+        match self {
+            Self::OptimisticRead => 0,
+            Self::WindowedOrdered => 1,
+            Self::FullChain => 2,
+        }
+    }
+
+    const fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::WindowedOrdered,
+            2 => Self::FullChain,
+            _ => Self::OptimisticRead,
+        }
+    }
 }
 
 /// Envelope / location cohort used as the B2 context key.
@@ -79,33 +102,35 @@ impl CohortKind {
 /// End-of-block learning report (the four questions in the design note).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LearnReport {
-    /// Cohorts that chose A1 this block.
-    pub a1_cohorts: usize,
-    /// Optimistic-read cohorts (A0 / cost-EV / K-cap / empty-to EOA).
-    pub a0_cohorts: usize,
-    /// Mean estimated cost of A1 decisions (ns EMA).
-    pub mean_c_a1: f64,
-    /// Mean estimated cost of the A0 counterfactual at those decisions (ns EMA).
-    pub mean_c_a0_cf: f64,
-    /// A0 executions that later paid reexec (incarnation>0).
-    pub a0_reexec: usize,
-    /// Incarnation>0 txs that were never dependency-admitted (A0 conflict reexec).
+    /// Cohorts that chose OrderedAdmit this block.
+    pub ordered_admit_cohorts: usize,
+    /// OptimisticRead cohorts (cost-EV / K-cap / empty-to EOA).
+    pub optimistic_read_cohorts: usize,
+    /// Mean estimated cost of OrderedAdmit decisions (ns EMA).
+    pub mean_c_ordered: f64,
+    /// Mean estimated cost of the OptimisticRead counterfactual (ns EMA).
+    pub mean_c_optimistic_cf: f64,
+    /// OptimisticRead executions that later paid reexec (incarnation>0).
+    pub optimistic_reexec: usize,
+    /// Incarnation>0 txs that were never dependency-admitted.
     pub unfenced_reexec: usize,
     /// Sampled ready-set width mean (PC-W4 |Ready| bag).
     pub ready_width_mean: f64,
     /// Idle-core nanoseconds accumulated on yield / empty refuse (PC-4).
     pub idle_core_ns: u64,
-    /// A0-majority / low-meta block (n small; ReadyEdge only on ordered-admit).
-    pub a0_majority_block: bool,
+    /// OptimisticRead-majority / low-meta block (ReadyEdge only on ordered-admit).
+    pub optimistic_majority_block: bool,
     /// Measured refuse-path nanoseconds.
     pub refuse_ns: u64,
     /// Measured incarnation>0 execute nanoseconds.
     pub reexec_ns: u64,
-    /// Cost-EV evaluations that kept ordered admit (ĉ_A1+δ < ĉ_A0).
+    /// F1: refuse + wait attributed to OrderedAdmit locations.
+    pub ordered_ns: u64,
+    /// Cost-EV evaluations that kept OrderedAdmit (ĉ_ord+δ < ĉ_opt).
     pub cost_ev_keep_ordered: usize,
-    /// Cost-EV evaluations that demoted ordered admit → optimistic read.
+    /// Cost-EV evaluations that demoted to OptimisticRead.
     pub cost_ev_demote_optimistic: usize,
-    /// Thin-shell K-cap demotions (eligible A1 beyond K).
+    /// Thin-shell K-cap demotions (eligible OrderedAdmit beyond K).
     pub k_cap_demote: usize,
     /// CC-X1: 21k commute accepts (no abort).
     pub commute_skip: usize,
@@ -113,9 +138,9 @@ pub struct LearnReport {
     pub batch_repair: usize,
     /// CC-D1: effective non-lazy conflict → learn/promote.
     pub conflict_promote: usize,
-    /// CC-D1: lazy-noise conflict → ignorable (not unfenced_reexec→A1).
+    /// CC-D1: lazy-noise conflict → ignorable (not unfenced_reexec→OrderedAdmit).
     pub conflict_ignore: usize,
-    /// L3: A1 prepaid ns this block (refuse + width loss).
+    /// L3: OrderedAdmit prepaid ns this block (refuse + width loss).
     pub prepaid_ns: u64,
     /// L3: counterfactual OCC abort ns (measured reexec).
     pub abort_cf_ns: u64,
@@ -123,6 +148,8 @@ pub struct LearnReport {
     pub prior_decay: usize,
     /// P2: end-block HotSet / prior / D1 / learn wall (one Instant).
     pub end_block_ns: u64,
+    /// M4: OptimisticRead-path tax vs OCC (admit seed + end_block + refuse).
+    pub optimistic_path_tax_ns: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -175,8 +202,46 @@ struct PromotedLoc {
     pred: TxIdx,
     /// Immediate successor on this ℓ (reuse / mid-block seed).
     succ: TxIdx,
-    /// O2/L1: ĉ_ordered_spine lost to abort EMA — next begin plants 0 hops.
+    /// F4: FullChain lost — next begin does not FullChain this long spine.
     demoted: bool,
+    /// F3: strategy chosen at last begin / plant decision.
+    decision: LocStrategy,
+    /// F4: EMA samples on this ℓ.
+    samples: u32,
+    /// F2: three-way ĉ (OptimisticRead / WindowedOrdered / FullChain).
+    c_opt: f64,
+    c_win: f64,
+    c_full: f64,
+    /// F4: consecutive FullChain losses.
+    fullchain_lose: u32,
+    /// F1 this-block attribution (reset at begin).
+    block_reexec_ns: u64,
+    block_ordered_ns: u64,
+    block_reexec_n: u32,
+    block_ordered_n: u32,
+}
+
+impl PromotedLoc {
+    fn new() -> Self {
+        Self {
+            hits: 0,
+            reexec_ns_ema: PRIOR_C_OPT_NS,
+            measured: false,
+            pred: usize::MAX,
+            succ: usize::MAX,
+            demoted: false,
+            decision: LocStrategy::OptimisticRead,
+            samples: 0,
+            c_opt: PRIOR_C_OPT_THIN_NS,
+            c_win: PRIOR_C_ORDERED_THIN_NS,
+            c_full: PRIOR_C_ORDERED_THIN_NS,
+            fullchain_lose: 0,
+            block_reexec_ns: 0,
+            block_ordered_ns: 0,
+            block_reexec_n: 0,
+            block_ordered_n: 0,
+        }
+    }
 }
 
 /// Per-address B2 context: p_effWAW + refuse-cost EMA + per-pair cost-EV.
@@ -184,8 +249,8 @@ struct PromotedLoc {
 struct CohortStat {
     p_eff: OnlineStat,
     refuse: OnlineStat,
-    c_a0: OnlineStat,
-    c_a1: OnlineStat,
+    c_opt: OnlineStat,
+    c_ord: OnlineStat,
     prepaid_lose: u32,
 }
 
@@ -197,20 +262,20 @@ pub(crate) struct CostPolicy {
     reexec_global: Mutex<OnlineStat>,
     idle_global: Mutex<OnlineStat>,
     /// L1: EMA of measured refuse_ns + width_loss_ns.
-    c_a1_ns: Mutex<OnlineStat>,
+    c_ord_ns: Mutex<OnlineStat>,
     /// L1: EMA of measured reexec_ns.
-    c_a0_ns: Mutex<OnlineStat>,
+    c_opt_ns: Mutex<OnlineStat>,
     /// Linear weights for p_eff ≈ σ(w·x) — **feature only**, not decide().
     w_p: Mutex<[f64; 6]>,
     cohorts: DashMap<(u8, Address), CohortStat, FxBuildHasher>,
-    a1_decisions: AtomicUsize,
-    a0_cohorts: AtomicUsize,
-    c_a1_sum_bits: AtomicU64,
-    c_a0_sum_bits: AtomicU64,
+    ordered_decisions: AtomicUsize,
+    optimistic_read_cohorts: AtomicUsize,
+    c_ord_sum_bits: AtomicU64,
+    c_opt_sum_bits: AtomicU64,
     ev_samples: AtomicUsize,
-    a0_reexec: AtomicUsize,
+    optimistic_reexec: AtomicUsize,
     unfenced_reexec: AtomicUsize,
-    a0_majority_block: AtomicBool,
+    optimistic_majority_block: AtomicBool,
     cost_ev_keep_ordered: AtomicUsize,
     cost_ev_demote_optimistic: AtomicUsize,
     k_cap_demote: AtomicUsize,
@@ -230,10 +295,10 @@ pub(crate) struct CostPolicy {
     /// L2: reexec_ns EMA keyed by location (feeds U3 / per-ℓ EV).
     loc_reexec_ns: DashMap<MemoryLocationHash, OnlineStat, FxBuildHasher>,
     /// L2: refuse/prepaid EMA keyed by location.
-    loc_c_a1: DashMap<MemoryLocationHash, OnlineStat, FxBuildHasher>,
+    loc_c_ord: DashMap<MemoryLocationHash, OnlineStat, FxBuildHasher>,
     /// Hot-path read-only EV snapshot (written at begin/end-block).
-    c_a0_snap_bits: AtomicU64,
-    c_a1_snap_bits: AtomicU64,
+    c_opt_snap_bits: AtomicU64,
+    c_ord_snap_bits: AtomicU64,
     /// L3: consecutive blocks where prepaid lost to abort_cf (process-persistent).
     prepaid_lose_streak: AtomicUsize,
     prior_decay: AtomicUsize,
@@ -255,19 +320,19 @@ impl Default for CostPolicy {
             refuse_global: Mutex::new(OnlineStat::new(0.22)),
             reexec_global: Mutex::new(OnlineStat::new(1.0)),
             idle_global: Mutex::new(OnlineStat::new(0.12)),
-            c_a1_ns: Mutex::new(OnlineStat::new(PRIOR_C_A1_NS)),
-            c_a0_ns: Mutex::new(OnlineStat::new(PRIOR_C_A0_NS)),
+            c_ord_ns: Mutex::new(OnlineStat::new(PRIOR_C_ORDERED_NS)),
+            c_opt_ns: Mutex::new(OnlineStat::new(PRIOR_C_OPT_NS)),
             // Cold-start: intercept 0.05, contract +0.9, logn mild, storage +1.1.
             w_p: Mutex::new([0.05, 0.90, 0.12, 1.10, -0.15, 0.80]),
             cohorts: DashMap::default(),
-            a1_decisions: AtomicUsize::new(0),
-            a0_cohorts: AtomicUsize::new(0),
-            c_a1_sum_bits: AtomicU64::new(0.0f64.to_bits()),
-            c_a0_sum_bits: AtomicU64::new(0.0f64.to_bits()),
+            ordered_decisions: AtomicUsize::new(0),
+            optimistic_read_cohorts: AtomicUsize::new(0),
+            c_ord_sum_bits: AtomicU64::new(0.0f64.to_bits()),
+            c_opt_sum_bits: AtomicU64::new(0.0f64.to_bits()),
             ev_samples: AtomicUsize::new(0),
-            a0_reexec: AtomicUsize::new(0),
+            optimistic_reexec: AtomicUsize::new(0),
             unfenced_reexec: AtomicUsize::new(0),
-            a0_majority_block: AtomicBool::new(false),
+            optimistic_majority_block: AtomicBool::new(false),
             cost_ev_keep_ordered: AtomicUsize::new(0),
             cost_ev_demote_optimistic: AtomicUsize::new(0),
             k_cap_demote: AtomicUsize::new(0),
@@ -282,9 +347,9 @@ impl Default for CostPolicy {
             promoted: DashMap::default(),
             short_chain: DashMap::default(),
             loc_reexec_ns: DashMap::default(),
-            loc_c_a1: DashMap::default(),
-            c_a0_snap_bits: AtomicU64::new(PRIOR_C_A0_NS.to_bits()),
-            c_a1_snap_bits: AtomicU64::new(PRIOR_C_A1_NS.to_bits()),
+            loc_c_ord: DashMap::default(),
+            c_opt_snap_bits: AtomicU64::new(PRIOR_C_OPT_NS.to_bits()),
+            c_ord_snap_bits: AtomicU64::new(PRIOR_C_ORDERED_NS.to_bits()),
             prepaid_lose_streak: AtomicUsize::new(0),
             prior_decay: AtomicUsize::new(0),
             prepaid_ns: AtomicU64::new(0),
@@ -307,36 +372,37 @@ impl CostPolicy {
         *self.refuse_global.lock().unwrap() = OnlineStat::new(0.22);
         *self.reexec_global.lock().unwrap() = OnlineStat::new(1.0);
         *self.idle_global.lock().unwrap() = OnlineStat::new(0.12);
-        *self.c_a1_ns.lock().unwrap() = OnlineStat::new(PRIOR_C_A1_NS);
-        *self.c_a0_ns.lock().unwrap() = OnlineStat::new(PRIOR_C_A0_NS);
+        *self.c_ord_ns.lock().unwrap() = OnlineStat::new(PRIOR_C_ORDERED_NS);
+        *self.c_opt_ns.lock().unwrap() = OnlineStat::new(PRIOR_C_OPT_NS);
         *self.w_p.lock().unwrap() = [0.05, 0.90, 0.12, 1.10, -0.15, 0.80];
         self.cohorts.clear();
         self.conflicts.clear();
         self.promoted.clear();
         self.short_chain.clear();
         self.loc_reexec_ns.clear();
-        self.loc_c_a1.clear();
+        self.loc_c_ord.clear();
         self.pending_idle.lock().unwrap().clear();
         self.prepaid_lose_streak.store(0, Ordering::Relaxed);
         self.last_block_n.store(0, Ordering::Relaxed);
-        self.c_a0_snap_bits
-            .store(PRIOR_C_A0_NS.to_bits(), Ordering::Relaxed);
-        self.c_a1_snap_bits
-            .store(PRIOR_C_A1_NS.to_bits(), Ordering::Relaxed);
+        self.c_opt_snap_bits
+            .store(PRIOR_C_OPT_NS.to_bits(), Ordering::Relaxed);
+        self.c_ord_snap_bits
+            .store(PRIOR_C_ORDERED_NS.to_bits(), Ordering::Relaxed);
         self.reset_block_counters();
     }
 
     fn reset_block_counters(&self) {
-        self.a1_decisions.store(0, Ordering::Relaxed);
-        self.a0_cohorts.store(0, Ordering::Relaxed);
-        self.c_a1_sum_bits
+        self.ordered_decisions.store(0, Ordering::Relaxed);
+        self.optimistic_read_cohorts.store(0, Ordering::Relaxed);
+        self.c_ord_sum_bits
             .store(0.0f64.to_bits(), Ordering::Relaxed);
-        self.c_a0_sum_bits
+        self.c_opt_sum_bits
             .store(0.0f64.to_bits(), Ordering::Relaxed);
         self.ev_samples.store(0, Ordering::Relaxed);
-        self.a0_reexec.store(0, Ordering::Relaxed);
+        self.optimistic_reexec.store(0, Ordering::Relaxed);
         self.unfenced_reexec.store(0, Ordering::Relaxed);
-        self.a0_majority_block.store(false, Ordering::Relaxed);
+        self.optimistic_majority_block
+            .store(false, Ordering::Relaxed);
         self.cost_ev_keep_ordered.store(0, Ordering::Relaxed);
         self.cost_ev_demote_optimistic.store(0, Ordering::Relaxed);
         self.k_cap_demote.store(0, Ordering::Relaxed);
@@ -365,29 +431,38 @@ impl CostPolicy {
         self.reset_block_counters();
         let serial_hat = n as f64 * SERIAL_NS_PER_TX;
         let thin = n > 0 && n <= THIN_N_MAX && serial_hat < META_FLOOR_NS;
-        self.a0_majority_block.store(thin, Ordering::Relaxed);
+        self.optimistic_majority_block
+            .store(thin, Ordering::Relaxed);
         // Hot-path snapshot: thin cold defaults A0 (abort cheaper than prepaid).
-        let (c_a0, c_a1) = if thin {
-            (PRIOR_C_A0_THIN_NS, PRIOR_C_A1_THIN_NS)
+        let (c_opt, c_ord) = if thin {
+            (PRIOR_C_OPT_THIN_NS, PRIOR_C_ORDERED_THIN_NS)
         } else {
             (
-                self.c_a0_ns.lock().unwrap().mean.max(1.0),
-                self.c_a1_ns.lock().unwrap().mean.max(1.0),
+                self.c_opt_ns.lock().unwrap().mean.max(1.0),
+                self.c_ord_ns.lock().unwrap().mean.max(1.0),
             )
         };
-        self.c_a0_snap_bits.store(c_a0.to_bits(), Ordering::Relaxed);
-        self.c_a1_snap_bits.store(c_a1.to_bits(), Ordering::Relaxed);
+        self.c_opt_snap_bits
+            .store(c_opt.to_bits(), Ordering::Relaxed);
+        self.c_ord_snap_bits
+            .store(c_ord.to_bits(), Ordering::Relaxed);
+        for mut e in self.promoted.iter_mut() {
+            e.block_reexec_ns = 0;
+            e.block_ordered_ns = 0;
+            e.block_reexec_n = 0;
+            e.block_ordered_n = 0;
+        }
     }
 
     #[inline]
-    pub(crate) fn is_a0_majority_block(&self) -> bool {
-        self.a0_majority_block.load(Ordering::Relaxed)
+    pub(crate) fn is_optimistic_majority_block(&self) -> bool {
+        self.optimistic_majority_block.load(Ordering::Relaxed)
     }
 
-    /// Thin / a0_majority: plant A1 only when a measured pair or ℓ EV says
-    /// prepaid is cheaper. Cold start stays A1=0 (no hint walk / no contracts).
-    pub(crate) fn should_seed_thin_a1(&self) -> bool {
-        if !self.is_a0_majority_block() {
+    /// Thin / optimistic-majority: plant OrderedAdmit only when a measured pair
+    /// or ℓ EV says prepaid is cheaper. Cold start stays OptimisticRead.
+    pub(crate) fn should_seed_thin_ordered(&self) -> bool {
+        if !self.is_optimistic_majority_block() {
             return true;
         }
         for e in self.promoted.iter() {
@@ -397,7 +472,8 @@ impl CostPolicy {
         }
         for e in self.cohorts.iter() {
             let s = e.value();
-            if (s.c_a0.n >= 2.0 || s.c_a1.n >= 2.0) && s.c_a1.mean + NS_DELTA < s.c_a0.mean.max(1.0)
+            if (s.c_opt.n >= 2.0 || s.c_ord.n >= 2.0)
+                && s.c_ord.mean + NS_DELTA < s.c_opt.mean.max(1.0)
             {
                 return true;
             }
@@ -406,45 +482,136 @@ impl CostPolicy {
     }
 
     #[inline]
-    pub(crate) fn thin_a1_k(&self) -> usize {
-        if self.is_a0_majority_block() {
-            THIN_A1_K
+    pub(crate) fn thin_ordered_k(&self) -> usize {
+        if self.is_optimistic_majority_block() {
+            THIN_ORDERED_K
         } else {
             usize::MAX
         }
     }
 
-    /// O1/O2: how many consecutive hops to plant on `ℓ`.
+    /// CC-L3/L4: hops to plant on `ℓ` at begin.
     ///
-    /// Short chains (≤`ORDER_WINDOW_K`) plant all (storage 14→16→17).
-    /// Long thin spines: leftover-aware EV. Prefix-window + tail abort is
-    /// the worst of both worlds (PR22 PRIMARY miss). Plant 0 at begin when
-    /// A0-all wins; O3 may add one idle hop after an abort.
+    /// Short chains (≤`ORDER_WINDOW_K`) stay FullChain (storage 14→16→17).
+    /// Long thin spines pick min ĉ among {OptimisticRead, WindowedOrdered(k=1),
+    /// FullChain}; FullChain is banned after consecutive losses / demote.
     pub(crate) fn hops_to_plant(&self, location: MemoryLocationHash, n_pairs: usize) -> usize {
-        if n_pairs == 0 {
-            return 0;
+        Self::hops_for_strategy(self.loc_strategy(location, n_pairs), n_pairs)
+    }
+
+    #[inline]
+    fn hops_for_strategy(strategy: LocStrategy, n_pairs: usize) -> usize {
+        match strategy {
+            LocStrategy::OptimisticRead => 0,
+            LocStrategy::WindowedOrdered => WINDOWED_K.min(n_pairs),
+            LocStrategy::FullChain => n_pairs,
         }
-        if self.loc_demoted(location) {
-            self.cost_ev_demote_optimistic
-                .fetch_add(1, Ordering::Relaxed);
-            return 0;
+    }
+
+    /// F3: record the begin-time ℓ action (eligibility for later cost).
+    pub(crate) fn note_hops_decision(&self, location: MemoryLocationHash, n_pairs: usize) {
+        let strategy = self.loc_strategy(location, n_pairs);
+        match strategy {
+            LocStrategy::OptimisticRead => {
+                self.cost_ev_demote_optimistic
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            LocStrategy::WindowedOrdered | LocStrategy::FullChain => {
+                self.cost_ev_keep_ordered.fetch_add(1, Ordering::Relaxed);
+            }
         }
-        if !self.is_promoted(location) {
-            return 0;
+        if let Some(mut e) = self.promoted.get_mut(&location) {
+            e.decision = strategy;
         }
-        if n_pairs <= ORDER_WINDOW_K {
-            return n_pairs;
+    }
+
+    /// CC-L4: per-ℓ strategy. Hot path reads only snapshots / promoted EMA.
+    pub(crate) fn loc_strategy(&self, location: MemoryLocationHash, n_pairs: usize) -> LocStrategy {
+        if n_pairs == 0 || !self.is_promoted(location) {
+            return LocStrategy::OptimisticRead;
         }
-        if !self.is_a0_majority_block() {
-            return n_pairs;
+        // CC-L4/L5: short storage-class chain defaults FullChain.
+        if n_pairs <= ORDER_WINDOW_K && !self.loc_demoted(location) {
+            return LocStrategy::FullChain;
         }
-        if self.long_spine_window_loses(location, n_pairs) {
-            self.cost_ev_demote_optimistic
-                .fetch_add(1, Ordering::Relaxed);
-            return 0;
+        if !self.is_optimistic_majority_block() {
+            return LocStrategy::FullChain;
         }
-        self.cost_ev_keep_ordered.fetch_add(1, Ordering::Relaxed);
-        ORDER_WINDOW_K
+        // Long spine: never FullChain (PR22 1.40ms prepaid wall).
+        self.three_way_pick(location, n_pairs)
+    }
+
+    fn three_way_pick(&self, location: MemoryLocationHash, n_pairs: usize) -> LocStrategy {
+        let (c_opt, c_win, c_full) = self.three_way_costs(location, n_pairs);
+        let measured = self.promoted.get(&location).is_some_and(|s| s.measured);
+        let samples = self
+            .promoted
+            .get(&location)
+            .map(|s| s.samples as f64)
+            .unwrap_or(0.0);
+        // F4: stay OptimisticRead until a measured abort or n₀ samples.
+        if !measured && samples < MIN_SAMPLES {
+            return LocStrategy::OptimisticRead;
+        }
+        let full_banned = n_pairs > ORDER_WINDOW_K
+            || self
+                .promoted
+                .get(&location)
+                .is_some_and(|s| s.demoted || s.fullchain_lose >= PREPAID_LOSE_N);
+        // After a measured EffectiveWAW, WindowedOrdered is the sandwich default
+        // unless OptimisticRead is clearly cheaper. FullChain stays banned on
+        // long thin spines (PR22 1.40ms prepaid wall).
+        if measured && n_pairs > ORDER_WINDOW_K {
+            if c_opt + NS_DELTA < c_win {
+                return LocStrategy::OptimisticRead;
+            }
+            return LocStrategy::WindowedOrdered;
+        }
+        let mut best = LocStrategy::OptimisticRead;
+        let mut best_c = c_opt;
+        if c_win + NS_DELTA < best_c {
+            best = LocStrategy::WindowedOrdered;
+            best_c = c_win;
+        }
+        if !full_banned && c_full + NS_DELTA < best_c {
+            best = LocStrategy::FullChain;
+        }
+        best
+    }
+
+    /// F2: three-way ĉ. OptimisticRead = loc abort EMA; Windowed = 1×stall;
+    /// FullChain = hops×stall (never default on long thin spines).
+    fn three_way_costs(&self, location: MemoryLocationHash, n_pairs: usize) -> (f64, f64, f64) {
+        if let Some(s) = self.promoted.get(&location)
+            && s.samples >= 1
+        {
+            let c_opt = s.c_opt.max(s.reexec_ns_ema).max(1.0);
+            let c_win = s.c_win.max(1.0);
+            let c_full = s.c_full.max(1.0);
+            return (c_opt, c_win, c_full);
+        }
+        let abort = self
+            .promoted
+            .get(&location)
+            .map(|s| s.reexec_ns_ema)
+            .or_else(|| self.loc_reexec_ns.get(&location).map(|s| s.mean))
+            .unwrap_or_else(|| f64::from_bits(self.c_opt_snap_bits.load(Ordering::Relaxed)))
+            .max(1.0);
+        let stall = self
+            .loc_c_ord
+            .get(&location)
+            .map(|s| s.mean)
+            .unwrap_or_else(|| f64::from_bits(self.c_ord_snap_bits.load(Ordering::Relaxed)))
+            .max(1.0);
+        let stall = if self.is_optimistic_majority_block() {
+            stall.max(PRIOR_C_ORDERED_THIN_NS)
+        } else {
+            stall
+        };
+        let c_opt = abort;
+        let c_win = stall;
+        let c_full = n_pairs.max(1) as f64 * stall;
+        (c_opt, c_win, c_full)
     }
 
     /// Leftover-aware: cost(W) = W·stall + (n−W)·abort vs cost(A0) = n·abort.
@@ -466,14 +633,14 @@ impl CostPolicy {
             return false;
         }
         let c_ord = self
-            .loc_c_a1
+            .loc_c_ord
             .get(&location)
             .map(|s| s.mean)
-            .unwrap_or_else(|| f64::from_bits(self.c_a1_snap_bits.load(Ordering::Relaxed)))
+            .unwrap_or_else(|| f64::from_bits(self.c_ord_snap_bits.load(Ordering::Relaxed)))
             .max(1.0);
         // Thin: refuse prior understates wait-for-pred stall (31 blocked on 4).
-        let stall = if self.is_a0_majority_block() {
-            c_ord.max(PRIOR_C_A1_THIN_NS)
+        let stall = if self.is_optimistic_majority_block() {
+            c_ord.max(PRIOR_C_ORDERED_THIN_NS)
         } else {
             c_ord
         };
@@ -482,9 +649,9 @@ impl CostPolicy {
             .get(&location)
             .map(|s| s.reexec_ns_ema)
             .or_else(|| self.loc_reexec_ns.get(&location).map(|s| s.mean))
-            .unwrap_or_else(|| f64::from_bits(self.c_a0_snap_bits.load(Ordering::Relaxed)))
+            .unwrap_or_else(|| f64::from_bits(self.c_opt_snap_bits.load(Ordering::Relaxed)))
             .max(1.0);
-        let leftover = hops.saturating_sub(1) as f64 * c_abort.max(PRIOR_C_A0_THIN_NS);
+        let leftover = hops.saturating_sub(1) as f64 * c_abort.max(PRIOR_C_OPT_THIN_NS);
         let ordered_spine = hops as f64 * stall + leftover;
         ordered_spine + NS_DELTA >= c_abort * hops.max(1) as f64
     }
@@ -567,7 +734,7 @@ impl CostPolicy {
     /// L1 ns-EV: keep A1 iff ĉ_A1 + δ < ĉ_A0. Structural vetoes stay (PC-2).
     /// Beta/`p_eff` are features only — not decide() authority.
     ///
-    /// Thin / a0_majority_block: default A0. Cold start may be A1=0. Keep
+    /// Thin / optimistic_majority_block: default A0. Cold start may be A1=0. Keep
     /// ordered only when a **measured** per-pair (or per-ℓ) prior proves
     /// prepaid cheaper than abort — not the full-shell 8µs-vs-25µs prior.
     pub(crate) fn choose(
@@ -579,49 +746,49 @@ impl CostPolicy {
         p_beta: f64,
     ) -> AdmitAction {
         if cohort_len < 2 {
-            return AdmitAction::A0OptimisticRead;
+            return AdmitAction::OptimisticRead;
         }
         // PC-2: envelope empty-to on an EOA is LazyRecipient — never A1.
         if kind == CohortKind::EmptyTo && !is_contract {
-            self.a0_cohorts.fetch_add(1, Ordering::Relaxed);
-            return AdmitAction::A0OptimisticRead;
+            self.optimistic_read_cohorts.fetch_add(1, Ordering::Relaxed);
+            return AdmitAction::OptimisticRead;
         }
         // 2-tx same-from pairs stay A0 (3356896 has ~60; refuse is pure meta).
         if kind == CohortKind::SameFrom && cohort_len < 3 {
-            self.a0_cohorts.fetch_add(1, Ordering::Relaxed);
-            return AdmitAction::A0OptimisticRead;
+            self.optimistic_read_cohorts.fetch_add(1, Ordering::Relaxed);
+            return AdmitAction::OptimisticRead;
         }
         // A0-majority: 2-tx calldata pairs stay A0 (K reserved for ≥3 spines).
-        if self.is_a0_majority_block() && kind == CohortKind::CallWaw && cohort_len < 3 {
-            self.a0_cohorts.fetch_add(1, Ordering::Relaxed);
-            return AdmitAction::A0OptimisticRead;
+        if self.is_optimistic_majority_block() && kind == CohortKind::CallWaw && cohort_len < 3 {
+            self.optimistic_read_cohorts.fetch_add(1, Ordering::Relaxed);
+            return AdmitAction::OptimisticRead;
         }
         let _ = p_beta; // feature only — used in p_eff for reports, not decide().
-        let keep = if self.is_a0_majority_block() {
+        let keep = if self.is_optimistic_majority_block() {
             self.pair_ev_prefers_ordered(kind, addr)
         } else {
-            let (c_a0, c_a1) = self.ns_ev_snap();
-            self.record_ev(c_a0, c_a1);
+            let (c_opt, c_ord) = self.ns_ev_snap();
+            self.record_ev(c_opt, c_ord);
             let proven = self
                 .cohorts
                 .get(&(kind.as_u8(), addr))
                 .is_some_and(|s| s.p_eff.mean >= 0.40 && s.p_eff.n >= 2.0);
-            proven || c_a1 + NS_DELTA < c_a0
+            proven || c_ord + NS_DELTA < c_opt
         };
         if keep {
             self.cost_ev_keep_ordered.fetch_add(1, Ordering::Relaxed);
-            self.a1_decisions.fetch_add(1, Ordering::Relaxed);
-            AdmitAction::A1OrderedAdmit
+            self.ordered_decisions.fetch_add(1, Ordering::Relaxed);
+            AdmitAction::OrderedAdmit
         } else {
             self.cost_ev_demote_optimistic
                 .fetch_add(1, Ordering::Relaxed);
-            self.a0_cohorts.fetch_add(1, Ordering::Relaxed);
-            AdmitAction::A0OptimisticRead
+            self.optimistic_read_cohorts.fetch_add(1, Ordering::Relaxed);
+            AdmitAction::OptimisticRead
         }
     }
 
     #[inline]
-    pub(crate) fn choose_a1(
+    pub(crate) fn choose_ordered(
         &self,
         kind: CohortKind,
         addr: Address,
@@ -629,14 +796,14 @@ impl CostPolicy {
         is_contract: bool,
         p_beta: f64,
     ) -> bool {
-        self.choose(kind, addr, cohort_len, is_contract, p_beta) == AdmitAction::A1OrderedAdmit
+        self.choose(kind, addr, cohort_len, is_contract, p_beta) == AdmitAction::OrderedAdmit
     }
 
     #[inline]
     fn ns_ev_snap(&self) -> (f64, f64) {
-        let c_a0 = f64::from_bits(self.c_a0_snap_bits.load(Ordering::Relaxed)).max(1.0);
-        let c_a1 = f64::from_bits(self.c_a1_snap_bits.load(Ordering::Relaxed)).max(1.0);
-        (c_a0, c_a1)
+        let c_opt = f64::from_bits(self.c_opt_snap_bits.load(Ordering::Relaxed)).max(1.0);
+        let c_ord = f64::from_bits(self.c_ord_snap_bits.load(Ordering::Relaxed)).max(1.0);
+        (c_opt, c_ord)
     }
 
     /// L2: per address-pair EV. Thin cold (no measured samples) → A0.
@@ -645,18 +812,18 @@ impl CostPolicy {
             return false;
         };
         // Need measured abort/prepaid samples — p_eff alone does not freeze A1.
-        let measured = s.c_a0.n >= 2.0 || s.c_a1.n >= 2.0;
+        let measured = s.c_opt.n >= 2.0 || s.c_ord.n >= 2.0;
         if !measured {
             return false;
         }
-        let c_a0 = s.c_a0.mean.max(1.0);
-        let c_a1 = s.c_a1.mean.max(1.0);
-        self.record_ev(c_a0, c_a1);
-        c_a1 + NS_DELTA < c_a0
+        let c_opt = s.c_opt.mean.max(1.0);
+        let c_ord = s.c_ord.mean.max(1.0);
+        self.record_ev(c_opt, c_ord);
+        c_ord + NS_DELTA < c_opt
     }
 
     /// Score for A0-majority K-cap (storage/call WAW > contract empty-to).
-    pub(crate) fn a1_score(kind: CohortKind, cohort_len: usize, is_contract: bool) -> i64 {
+    pub(crate) fn ordered_score(kind: CohortKind, cohort_len: usize, is_contract: bool) -> i64 {
         let class = match kind {
             CohortKind::RawFan => 4000,
             CohortKind::CallWaw => 3000,
@@ -668,11 +835,11 @@ impl CostPolicy {
     }
 
     pub(crate) fn note_k_cap_demote(&self) {
-        let a1 = self.a1_decisions.load(Ordering::Relaxed);
+        let a1 = self.ordered_decisions.load(Ordering::Relaxed);
         if a1 > 0 {
-            self.a1_decisions.fetch_sub(1, Ordering::Relaxed);
+            self.ordered_decisions.fetch_sub(1, Ordering::Relaxed);
         }
-        self.a0_cohorts.fetch_add(1, Ordering::Relaxed);
+        self.optimistic_read_cohorts.fetch_add(1, Ordering::Relaxed);
         self.k_cap_demote.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -739,29 +906,29 @@ impl CostPolicy {
     }
 
     fn record_ev(&self, e_a0: f64, e_a1: f64) {
-        add_f64(&self.c_a0_sum_bits, e_a0);
-        add_f64(&self.c_a1_sum_bits, e_a1);
+        add_f64(&self.c_opt_sum_bits, e_a0);
+        add_f64(&self.c_ord_sum_bits, e_a1);
         self.ev_samples.fetch_add(1, Ordering::Relaxed);
     }
 
     /// B2: observe effective vs lazy WAW on a cohort (write-set Detect).
     pub(crate) fn note_eff_waw(&self, kind: CohortKind, addr: Address, effective: bool) {
-        let thin = self.is_a0_majority_block();
+        let thin = self.is_optimistic_majority_block();
         let mut e = self
             .cohorts
             .entry((kind.as_u8(), addr))
             .or_insert(CohortStat {
                 p_eff: OnlineStat::new(if effective { 0.55 } else { 0.12 }),
                 refuse: OnlineStat::new(0.22),
-                c_a0: OnlineStat::new(if thin {
-                    PRIOR_C_A0_THIN_NS
+                c_opt: OnlineStat::new(if thin {
+                    PRIOR_C_OPT_THIN_NS
                 } else {
-                    PRIOR_C_A0_NS
+                    PRIOR_C_OPT_NS
                 }),
-                c_a1: OnlineStat::new(if thin {
-                    PRIOR_C_A1_THIN_NS
+                c_ord: OnlineStat::new(if thin {
+                    PRIOR_C_ORDERED_THIN_NS
                 } else {
-                    PRIOR_C_A1_NS
+                    PRIOR_C_ORDERED_NS
                 }),
                 prepaid_lose: 0,
             });
@@ -789,13 +956,32 @@ impl CostPolicy {
             return;
         }
         self.reexec_ns.fetch_add(ns, Ordering::Relaxed);
-        self.a0_reexec.fetch_add(1, Ordering::Relaxed);
+        self.optimistic_reexec.fetch_add(1, Ordering::Relaxed);
         if let Some(loc) = loc {
             self.loc_reexec_ns
                 .entry(loc)
-                .or_insert(OnlineStat::new(PRIOR_C_A0_NS))
+                .or_insert(OnlineStat::new(PRIOR_C_OPT_NS))
                 .ema_ns(ns as f64, EMA_ALPHA);
+            if let Some(mut e) = self.promoted.get_mut(&loc) {
+                e.block_reexec_ns = e.block_reexec_ns.saturating_add(ns);
+                e.block_reexec_n = e.block_reexec_n.saturating_add(1);
+            }
         }
+    }
+
+    /// F1/F3: refuse/wait ns attributed to the ℓ that decided OrderedAdmit.
+    pub(crate) fn note_loc_ordered_ns(&self, location: MemoryLocationHash, ns: u64) {
+        if ns == 0 {
+            return;
+        }
+        if let Some(mut e) = self.promoted.get_mut(&location) {
+            e.block_ordered_ns = e.block_ordered_ns.saturating_add(ns);
+            e.block_ordered_n = e.block_ordered_n.saturating_add(1);
+        }
+        self.loc_c_ord
+            .entry(location)
+            .or_insert(OnlineStat::new(PRIOR_C_ORDERED_NS))
+            .ema_ns(ns as f64, EMA_ALPHA);
     }
 
     /// L4: idle-core ns attributed as A1 width loss (atomic; EMA at end-block).
@@ -829,7 +1015,7 @@ impl CostPolicy {
     /// cost-EV demotes remaining EmptyTo ordered-admit waiters.
     #[inline]
     pub(crate) fn should_release_probe_star(&self) -> bool {
-        self.is_a0_majority_block()
+        self.is_optimistic_majority_block()
             && self.commute_skip.load(Ordering::Relaxed) >= 8
             && self.reexec_ns.load(Ordering::Relaxed) == 0
     }
@@ -875,16 +1061,9 @@ impl CostPolicy {
                 .get(&location)
                 .map(|s| s.mean)
                 .filter(|m| *m > 1.0)
-                .unwrap_or(PRIOR_C_A0_NS)
+                .unwrap_or(PRIOR_C_OPT_NS)
         };
-        let mut e = self.promoted.entry(location).or_insert(PromotedLoc {
-            hits: 0,
-            reexec_ns_ema: PRIOR_C_A0_NS,
-            measured: false,
-            pred: usize::MAX,
-            succ: usize::MAX,
-            demoted: false,
-        });
+        let mut e = self.promoted.entry(location).or_insert(PromotedLoc::new());
         e.hits = e.hits.saturating_add(1);
         e.reexec_ns_ema = (1.0 - EMA_ALPHA) * e.reexec_ns_ema + EMA_ALPHA * measured_ns;
         e.measured = true;
@@ -898,14 +1077,7 @@ impl CostPolicy {
         if pred >= succ {
             return;
         }
-        let mut e = self.promoted.entry(location).or_insert(PromotedLoc {
-            hits: 0,
-            reexec_ns_ema: PRIOR_C_A0_NS,
-            measured: false,
-            pred: usize::MAX,
-            succ: usize::MAX,
-            demoted: false,
-        });
+        let mut e = self.promoted.entry(location).or_insert(PromotedLoc::new());
         if e.pred == usize::MAX || pred < e.pred {
             e.pred = pred;
             e.succ = succ;
@@ -970,13 +1142,13 @@ impl CostPolicy {
             .get(&location)
             .map(|s| s.reexec_ns_ema)
             .or_else(|| self.loc_reexec_ns.get(&location).map(|s| s.mean))
-            .unwrap_or(PRIOR_C_A0_NS)
+            .unwrap_or(PRIOR_C_OPT_NS)
             .max(1.0);
         let c_ord = self
-            .loc_c_a1
+            .loc_c_ord
             .get(&location)
             .map(|s| s.mean)
-            .unwrap_or_else(|| f64::from_bits(self.c_a1_snap_bits.load(Ordering::Relaxed)))
+            .unwrap_or_else(|| f64::from_bits(self.c_ord_snap_bits.load(Ordering::Relaxed)))
             .max(1.0);
         c_ord + NS_DELTA < c_reexec
     }
@@ -997,17 +1169,17 @@ impl CostPolicy {
                 .get(&location)
                 .map(|c| c.len())
                 .unwrap_or(0);
-            // Promoted long thin spine: begin already demoted to A0. Do not
-            // re-gate mid-block (that rebuilt the 16-writer prepaid wall).
-            if n_pairs > ORDER_WINDOW_K && self.is_a0_majority_block() {
-                return self.hops_to_plant(location, n_pairs) > 0;
+            // Long thin spine: never mid-execute ReadyEdge (CC-L1 is validate /
+            // next-quantum). Mid-execute plant rebuilt the prepaid wall.
+            if n_pairs > ORDER_WINDOW_K && self.is_optimistic_majority_block() {
+                return false;
             }
             return true;
         }
         if !has_earlier && hint_later < 2 {
             return false;
         }
-        if self.is_a0_majority_block() && !self.can_add_short_loc(location) {
+        if self.is_optimistic_majority_block() && !self.can_add_short_loc(location) {
             self.cost_ev_demote_optimistic
                 .fetch_add(1, Ordering::Relaxed);
             return false;
@@ -1017,7 +1189,7 @@ impl CostPolicy {
         let keep = has_earlier || hint_later >= 2 || self.loc_ev_prefers_ordered(location);
         if keep {
             self.cost_ev_keep_ordered.fetch_add(1, Ordering::Relaxed);
-            self.a1_decisions.fetch_add(1, Ordering::Relaxed);
+            self.ordered_decisions.fetch_add(1, Ordering::Relaxed);
         } else {
             self.cost_ev_demote_optimistic
                 .fetch_add(1, Ordering::Relaxed);
@@ -1034,12 +1206,12 @@ impl CostPolicy {
             .iter()
             .filter(|e| e.measured && e.hits >= 1)
             .count();
-        n < THIN_A1_K
+        n < THIN_ORDERED_K
     }
 
     /// C5: one real short edge (not an envelope cohort).
     pub(crate) fn note_short_edge_admit(&self) {
-        self.a1_decisions.fetch_add(1, Ordering::Relaxed);
+        self.ordered_decisions.fetch_add(1, Ordering::Relaxed);
         self.cost_ev_keep_ordered.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1064,10 +1236,11 @@ impl CostPolicy {
         if s.hits < 1 {
             return false;
         }
-        if s.demoted && self.is_a0_majority_block() {
+        // Demote bans FullChain, not the hot-ℓ identity (WindowedOrdered may win).
+        if s.demoted && self.is_optimistic_majority_block() && !s.measured {
             return false;
         }
-        if !self.is_a0_majority_block() {
+        if !self.is_optimistic_majority_block() {
             return true;
         }
         if !s.measured {
@@ -1075,10 +1248,10 @@ impl CostPolicy {
         }
         // C3: per-ℓ abort EMA vs prepaid snap (not the thin global 6µs A0 prior).
         let c_ord = self
-            .loc_c_a1
+            .loc_c_ord
             .get(&location)
             .map(|e| e.mean)
-            .unwrap_or_else(|| f64::from_bits(self.c_a1_snap_bits.load(Ordering::Relaxed)))
+            .unwrap_or_else(|| f64::from_bits(self.c_ord_snap_bits.load(Ordering::Relaxed)))
             .max(1.0);
         c_ord + NS_DELTA < s.reexec_ns_ema
     }
@@ -1105,8 +1278,8 @@ impl CostPolicy {
         self.unfenced_reexec.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn note_a0_reexec(&self) {
-        self.a0_reexec.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn note_optimistic_reexec(&self) {
+        self.optimistic_reexec.fetch_add(1, Ordering::Relaxed);
         self.reexec_global.lock().unwrap().ema(1.0, 0.20);
     }
 
@@ -1115,35 +1288,35 @@ impl CostPolicy {
         &self,
         kind: CohortKind,
         addr: Address,
-        c_a0: f64,
-        c_a1: f64,
+        c_opt: f64,
+        c_ord: f64,
     ) {
-        let thin = self.is_a0_majority_block();
+        let thin = self.is_optimistic_majority_block();
         let mut e = self
             .cohorts
             .entry((kind.as_u8(), addr))
             .or_insert(CohortStat {
                 p_eff: OnlineStat::new(0.55),
                 refuse: OnlineStat::new(0.22),
-                c_a0: OnlineStat::new(if thin {
-                    PRIOR_C_A0_THIN_NS
+                c_opt: OnlineStat::new(if thin {
+                    PRIOR_C_OPT_THIN_NS
                 } else {
-                    PRIOR_C_A0_NS
+                    PRIOR_C_OPT_NS
                 }),
-                c_a1: OnlineStat::new(if thin {
-                    PRIOR_C_A1_THIN_NS
+                c_ord: OnlineStat::new(if thin {
+                    PRIOR_C_ORDERED_THIN_NS
                 } else {
-                    PRIOR_C_A1_NS
+                    PRIOR_C_ORDERED_NS
                 }),
                 prepaid_lose: 0,
             });
-        e.c_a0 = OnlineStat {
+        e.c_opt = OnlineStat {
             n: 3.0,
-            mean: c_a0.max(1.0),
+            mean: c_opt.max(1.0),
         };
-        e.c_a1 = OnlineStat {
+        e.c_ord = OnlineStat {
             n: 3.0,
-            mean: c_a1.max(1.0),
+            mean: c_ord.max(1.0),
         };
     }
 
@@ -1157,13 +1330,13 @@ impl CostPolicy {
         self.prepaid_ns.store(prepaid, Ordering::Relaxed);
         self.abort_cf_ns.store(abort_cf, Ordering::Relaxed);
         if refuse > 0 {
-            self.c_a1_ns
+            self.c_ord_ns
                 .lock()
                 .unwrap()
                 .ema_ns(refuse as f64, EMA_ALPHA);
         }
         if reexec > 0 {
-            self.c_a0_ns
+            self.c_opt_ns
                 .lock()
                 .unwrap()
                 .ema_ns(reexec as f64, EMA_ALPHA);
@@ -1197,17 +1370,69 @@ impl CostPolicy {
                 }
             }
         }
+        // F1–F4: per-ℓ reward = −(reexec_ns+ordered_ns+refuse_share); update
+        // three-way ĉ; consecutive FullChain losses demote long spines.
+        self.update_loc_counterfactuals(prepaid, abort_cf);
         // L-D: refresh thin snap from flushed EMAs so next begin can seed.
         // Use per-tx abort hat, not the whole-block reexec sum.
-        let c_a0 = if abort_cf > 0 {
-            self.c_a0_ns.lock().unwrap().mean.max(PRIOR_C_A0_NS)
+        let c_opt = if abort_cf > 0 {
+            self.c_opt_ns.lock().unwrap().mean.max(PRIOR_C_OPT_NS)
         } else {
-            self.c_a0_ns.lock().unwrap().mean.max(1.0)
+            self.c_opt_ns.lock().unwrap().mean.max(1.0)
         };
-        let c_a1 = self.c_a1_ns.lock().unwrap().mean.max(1.0);
-        if !self.is_a0_majority_block() || abort_cf > 0 {
-            self.c_a0_snap_bits.store(c_a0.to_bits(), Ordering::Relaxed);
-            self.c_a1_snap_bits.store(c_a1.to_bits(), Ordering::Relaxed);
+        let c_ord = self.c_ord_ns.lock().unwrap().mean.max(1.0);
+        if !self.is_optimistic_majority_block() || abort_cf > 0 {
+            self.c_opt_snap_bits
+                .store(c_opt.to_bits(), Ordering::Relaxed);
+            self.c_ord_snap_bits
+                .store(c_ord.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    fn update_loc_counterfactuals(&self, prepaid: u64, abort_cf: u64) {
+        let n_hot = self.promoted.iter().filter(|e| e.measured).count().max(1) as u64;
+        let refuse_share = prepaid / n_hot;
+        for mut e in self.promoted.iter_mut() {
+            if !e.measured && e.block_reexec_ns == 0 && e.block_ordered_ns == 0 {
+                continue;
+            }
+            let actual = e
+                .block_reexec_ns
+                .saturating_add(e.block_ordered_ns.saturating_add(refuse_share));
+            let x = actual.max(1) as f64;
+            // F3: credit the decision-time action, not the later abort site.
+            match e.decision {
+                LocStrategy::OptimisticRead => {
+                    e.c_opt = (1.0 - EMA_ALPHA) * e.c_opt + EMA_ALPHA * x;
+                }
+                LocStrategy::WindowedOrdered => {
+                    e.c_win = (1.0 - EMA_ALPHA) * e.c_win + EMA_ALPHA * x;
+                }
+                LocStrategy::FullChain => {
+                    e.c_full = (1.0 - EMA_ALPHA) * e.c_full + EMA_ALPHA * x;
+                }
+            }
+            // F2: unused OptimisticRead would have paid at least this abort.
+            if e.decision != LocStrategy::OptimisticRead && abort_cf > 0 {
+                let cf = (abort_cf as f64).max(e.reexec_ns_ema).max(1.0);
+                e.c_opt = e.c_opt.max(cf);
+            }
+            if e.decision != LocStrategy::WindowedOrdered && e.block_ordered_n > 0 {
+                e.c_win =
+                    (1.0 - EMA_ALPHA) * e.c_win + EMA_ALPHA * (e.block_ordered_ns.max(1) as f64);
+            }
+            e.samples = e.samples.saturating_add(1);
+            let n_pairs = self.short_chain.get(e.key()).map(|c| c.len()).unwrap_or(0);
+            if e.decision == LocStrategy::FullChain && n_pairs > ORDER_WINDOW_K {
+                if e.c_full + NS_DELTA >= e.c_opt.min(e.c_win) {
+                    e.fullchain_lose = e.fullchain_lose.saturating_add(1);
+                    if e.fullchain_lose >= PREPAID_LOSE_N {
+                        e.demoted = true;
+                    }
+                } else {
+                    e.fullchain_lose = 0;
+                }
+            }
         }
     }
 
@@ -1215,8 +1440,8 @@ impl CostPolicy {
         self.prior_decay.fetch_add(1, Ordering::Relaxed);
         for mut e in self.cohorts.iter_mut() {
             e.p_eff.ema(0.0, 0.35);
-            let raised = e.c_a1.mean * 1.25 + PRIOR_C_A1_THIN_NS * 0.15;
-            e.c_a1.ema_ns(raised, EMA_ALPHA);
+            let raised = e.c_ord.mean * 1.25 + PRIOR_C_ORDERED_THIN_NS * 0.15;
+            e.c_ord.ema_ns(raised, EMA_ALPHA);
             e.prepaid_lose = e.prepaid_lose.saturating_add(1);
         }
         for mut e in self.promoted.iter_mut() {
@@ -1245,32 +1470,35 @@ impl CostPolicy {
 
     pub(crate) fn take_report(&self, ready_width_mean: f64, idle_core_ns: u64) -> LearnReport {
         let n = self.ev_samples.load(Ordering::Relaxed).max(1) as f64;
+        let refuse = self.refuse_ns.load(Ordering::Relaxed);
+        let ordered: u64 = self.promoted.iter().map(|e| e.block_ordered_ns).sum();
         LearnReport {
-            a1_cohorts: self.a1_decisions.load(Ordering::Relaxed),
-            a0_cohorts: self.a0_cohorts.load(Ordering::Relaxed),
-            mean_c_a1: {
-                let ema = self.c_a1_ns.lock().unwrap().mean;
+            ordered_admit_cohorts: self.ordered_decisions.load(Ordering::Relaxed),
+            optimistic_read_cohorts: self.optimistic_read_cohorts.load(Ordering::Relaxed),
+            mean_c_ordered: {
+                let ema = self.c_ord_ns.lock().unwrap().mean;
                 if ema > 0.0 {
                     ema
                 } else {
-                    f64::from_bits(self.c_a1_sum_bits.load(Ordering::Relaxed)) / n
+                    f64::from_bits(self.c_ord_sum_bits.load(Ordering::Relaxed)) / n
                 }
             },
-            mean_c_a0_cf: {
-                let ema = self.c_a0_ns.lock().unwrap().mean;
+            mean_c_optimistic_cf: {
+                let ema = self.c_opt_ns.lock().unwrap().mean;
                 if ema > 0.0 {
                     ema
                 } else {
-                    f64::from_bits(self.c_a0_sum_bits.load(Ordering::Relaxed)) / n
+                    f64::from_bits(self.c_opt_sum_bits.load(Ordering::Relaxed)) / n
                 }
             },
-            a0_reexec: self.a0_reexec.load(Ordering::Relaxed),
+            optimistic_reexec: self.optimistic_reexec.load(Ordering::Relaxed),
             unfenced_reexec: self.unfenced_reexec.load(Ordering::Relaxed),
             ready_width_mean,
             idle_core_ns,
-            a0_majority_block: self.is_a0_majority_block(),
-            refuse_ns: self.refuse_ns.load(Ordering::Relaxed),
+            optimistic_majority_block: self.is_optimistic_majority_block(),
+            refuse_ns: refuse,
             reexec_ns: self.reexec_ns.load(Ordering::Relaxed),
+            ordered_ns: ordered.max(refuse),
             cost_ev_keep_ordered: self.cost_ev_keep_ordered.load(Ordering::Relaxed),
             cost_ev_demote_optimistic: self.cost_ev_demote_optimistic.load(Ordering::Relaxed),
             k_cap_demote: self.k_cap_demote.load(Ordering::Relaxed),
@@ -1282,6 +1510,7 @@ impl CostPolicy {
             abort_cf_ns: self.abort_cf_ns.load(Ordering::Relaxed),
             prior_decay: self.prior_decay.load(Ordering::Relaxed),
             end_block_ns: 0,
+            optimistic_path_tax_ns: 0,
         }
     }
 
@@ -1316,7 +1545,7 @@ mod tests {
         p.begin_block(176);
         let addr = Address::repeat_byte(0x9e);
         assert!(
-            !p.choose_a1(CohortKind::EmptyTo, addr, 12, false, 0.10),
+            !p.choose_ordered(CohortKind::EmptyTo, addr, 12, false, 0.10),
             "lazy EOA empty-to must be A0 (PC-2/PC-5)"
         );
     }
@@ -1327,12 +1556,12 @@ mod tests {
         p.begin_block(176);
         let addr = Address::repeat_byte(0x20);
         assert!(
-            !p.choose_a1(CohortKind::EmptyTo, addr, 16, true, 0.30),
+            !p.choose_ordered(CohortKind::EmptyTo, addr, 16, true, 0.30),
             "L1: thin cold start must not freeze A1 on contract empty-to"
         );
         let storage = Address::repeat_byte(0xed);
         assert!(
-            !p.choose_a1(CohortKind::CallWaw, storage, 3, true, 0.25),
+            !p.choose_ordered(CohortKind::CallWaw, storage, 3, true, 0.25),
             "L1: thin cold start must not freeze A1 on short calldata WAW"
         );
     }
@@ -1343,7 +1572,7 @@ mod tests {
         p.begin_block(4096);
         let addr = Address::repeat_byte(0x20);
         assert!(
-            p.choose_a1(CohortKind::EmptyTo, addr, 16, true, 0.30),
+            p.choose_ordered(CohortKind::EmptyTo, addr, 16, true, 0.30),
             "full-shell contract empty-to n=16 stays A1"
         );
     }
@@ -1354,7 +1583,7 @@ mod tests {
         p.begin_block(4096);
         let addr = Address::repeat_byte(0xed);
         assert!(
-            p.choose_a1(CohortKind::CallWaw, addr, 3, true, 0.25),
+            p.choose_ordered(CohortKind::CallWaw, addr, 3, true, 0.25),
             "full-shell storage 14-17 class stays A1"
         );
     }
@@ -1365,7 +1594,7 @@ mod tests {
         p.begin_block(176);
         let addr = Address::repeat_byte(0x56);
         assert!(
-            !p.choose_a1(CohortKind::SameFrom, addr, 2, false, 0.20),
+            !p.choose_ordered(CohortKind::SameFrom, addr, 2, false, 0.20),
             "2-tx same-from must stay A0"
         );
     }
@@ -1376,7 +1605,7 @@ mod tests {
         p.begin_block(176);
         let addr = Address::repeat_byte(0xab);
         assert!(
-            !p.choose_a1(CohortKind::CallWaw, addr, 2, true, 0.25),
+            !p.choose_ordered(CohortKind::CallWaw, addr, 2, true, 0.25),
             "thin-shell 2-tx calldata stays A0; K reserved for ≥3 spines"
         );
     }
@@ -1390,7 +1619,7 @@ mod tests {
             p.note_eff_waw(CohortKind::EmptyTo, addr, true);
         }
         assert!(
-            p.choose_a1(CohortKind::EmptyTo, addr, 16, true, 0.20),
+            p.choose_ordered(CohortKind::EmptyTo, addr, 16, true, 0.20),
             "full-shell: after effective WAW observations A1 remains available"
         );
     }
@@ -1404,32 +1633,42 @@ mod tests {
             p.note_eff_waw(CohortKind::EmptyTo, addr, true);
         }
         assert!(
-            !p.choose_a1(CohortKind::EmptyTo, addr, 16, true, 0.20),
+            !p.choose_ordered(CohortKind::EmptyTo, addr, 16, true, 0.20),
             "thin: p_eff alone must not freeze A1"
         );
         p.note_pair_measured_ev(CohortKind::EmptyTo, addr, 80_000.0, 8_000.0);
         assert!(
-            p.choose_a1(CohortKind::EmptyTo, addr, 16, true, 0.20),
+            p.choose_ordered(CohortKind::EmptyTo, addr, 16, true, 0.20),
             "thin: measured ĉ_A1+δ < ĉ_A0 promotes a short edge"
         );
     }
 
     #[test]
-    fn a0_majority_block_on_small_block() {
+    fn optimistic_majority_block_on_small_block() {
         let p = CostPolicy::new();
         p.begin_block(176);
-        assert!(p.is_a0_majority_block(), "n=176 serial_hat < meta floor");
-        assert_eq!(p.thin_a1_k(), THIN_A1_K, "K is a cap on thin-shell");
+        assert!(
+            p.is_optimistic_majority_block(),
+            "n=176 serial_hat < meta floor"
+        );
+        assert_eq!(
+            p.thin_ordered_k(),
+            THIN_ORDERED_K,
+            "K is a cap on thin-shell"
+        );
         p.begin_block(4096);
-        assert!(!p.is_a0_majority_block(), "large n keeps full shell");
-        assert_eq!(p.thin_a1_k(), usize::MAX);
+        assert!(
+            !p.is_optimistic_majority_block(),
+            "large n keeps full shell"
+        );
+        assert_eq!(p.thin_ordered_k(), usize::MAX);
     }
 
     #[test]
-    fn thin_a1_k_is_cap_not_exact_set() {
+    fn thin_ordered_k_is_cap_not_exact_set() {
         let p = CostPolicy::new();
         p.begin_block(176);
-        assert_eq!(p.thin_a1_k(), 3);
+        assert_eq!(p.thin_ordered_k(), 3);
         // Promote does not freeze A1 at exactly 3 — it can add a short edge
         // that later admit ranks under the same cap.
         p.promote_short_edge(0x32be, 4_000);
@@ -1465,7 +1704,7 @@ mod tests {
         }
         let addr = Address::repeat_byte(0x77);
         assert!(
-            !p.choose_a1(CohortKind::EmptyTo, addr, 8, true, 0.10),
+            !p.choose_ordered(CohortKind::EmptyTo, addr, 8, true, 0.10),
             "ĉ_A1+δ >= ĉ_A0 must demote an unproven cohort"
         );
     }
@@ -1496,7 +1735,7 @@ mod tests {
             p.note_refuse_ns(80_000);
         }
         assert!(
-            p.choose_a1(CohortKind::EmptyTo, addr, 16, true, 0.20),
+            p.choose_ordered(CohortKind::EmptyTo, addr, 16, true, 0.20),
             "full-shell proven effective WAW stays A1 (do not drop 0x209c class)"
         );
     }
@@ -1507,7 +1746,7 @@ mod tests {
         p.begin_block(176);
         let addr = Address::repeat_byte(0x20);
         p.note_pair_measured_ev(CohortKind::EmptyTo, addr, 80_000.0, 8_000.0);
-        assert!(p.choose_a1(CohortKind::EmptyTo, addr, 16, true, 0.20));
+        assert!(p.choose_ordered(CohortKind::EmptyTo, addr, 16, true, 0.20));
         p.note_refuse_ns(50_000);
         p.note_width_loss_ns(10_000);
         // abort_cf = 0 → prepaid loses
@@ -1528,12 +1767,12 @@ mod tests {
         let p = CostPolicy::new();
         p.begin_block(176);
         assert!(
-            !p.should_seed_thin_a1(),
+            !p.should_seed_thin_ordered(),
             "L1: thin cold start must not seed A1"
         );
         p.promote_short_edge(0x32be, 80_000);
         assert!(
-            p.should_seed_thin_a1(),
+            p.should_seed_thin_ordered(),
             "L1: measured expensive abort may seed a short edge"
         );
     }
@@ -1581,7 +1820,7 @@ mod tests {
         p.end_block_learn();
         p.begin_block(176);
         assert!(
-            p.should_seed_thin_a1(),
+            p.should_seed_thin_ordered(),
             "L4: reuse must raise short-edge A1"
         );
         let pairs = p.promoted_short_pairs();
@@ -1633,13 +1872,14 @@ mod tests {
         p.note_short_pair(0xedba, 16, 17);
         assert_eq!(
             p.hops_to_plant(0x32be, 4),
-            0,
-            "O1/O2: leftover-aware EV demotes long thin spine to A0"
+            WINDOWED_K,
+            "CC-L3/L4: long thin spine plants WindowedOrdered k=1, not FullChain"
         );
+        assert_eq!(p.loc_strategy(0x32be, 4), LocStrategy::WindowedOrdered);
         assert_eq!(
             p.hops_to_plant(0xedba, 2),
             2,
-            "O1: storage trio stays fully ordered"
+            "CC-L5: storage trio stays FullChain"
         );
         assert!(
             p.spine_ordered_loses(0x32be, 16),
@@ -1647,11 +1887,11 @@ mod tests {
         );
         assert!(
             !p.should_gate_short_after_write(0x32be, true, 0),
-            "O2: write-set must not re-gate a leftover-lose long spine"
+            "CC-L1: write-set must not mid-execute gate a long spine"
         );
         assert!(
             p.should_gate_short_after_write(0xedba, true, 0),
-            "O1: storage write-set still raises the short edge"
+            "CC-L5: storage write-set still raises the short edge"
         );
     }
 
@@ -1673,13 +1913,36 @@ mod tests {
         p.begin_block(176);
         assert!(
             p.loc_demoted(0x32be),
-            "O2: long spine demotes after prepaid lose"
+            "F4: long spine FullChain-demotes after prepaid lose"
         );
-        assert_eq!(p.hops_to_plant(0x32be, 4), 0);
+        assert!(
+            p.hops_to_plant(0x32be, 4) <= WINDOWED_K,
+            "F4: demote bans FullChain; WindowedOrdered k≤1 is still allowed"
+        );
         assert!(
             !p.loc_demoted(0xedba),
-            "O2: storage trio must not demote with the long spine"
+            "CC-L5: storage trio must not demote with the long spine"
         );
         assert_eq!(p.hops_to_plant(0xedba, 2), 2);
+    }
+
+    #[test]
+    fn three_way_ev_prefers_windowed_after_measured_abort() {
+        let p = CostPolicy::new();
+        p.begin_block(176);
+        p.promote_short_edge(0x32be, 40_000);
+        for pair in [(4, 31), (31, 66), (66, 67)] {
+            p.note_short_pair(0x32be, pair.0, pair.1);
+        }
+        assert_eq!(p.loc_strategy(0x32be, 3), LocStrategy::WindowedOrdered);
+        p.note_hops_decision(0x32be, 3);
+        p.note_reexec_ns_at(Some(0x32be), 40_000);
+        p.end_block_learn();
+        p.begin_block(176);
+        assert_eq!(
+            p.loc_strategy(0x32be, 3),
+            LocStrategy::WindowedOrdered,
+            "F2: reuse keeps WindowedOrdered when ĉ_win < ĉ_opt"
+        );
     }
 }

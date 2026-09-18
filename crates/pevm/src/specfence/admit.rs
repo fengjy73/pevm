@@ -16,7 +16,7 @@ use super::bayes::BayesMap;
 use super::feeder::{seed_known_stars, top_is_known_star};
 use super::learner::{InterBlockPrior, LiveLearner};
 use super::metrics::MetricsInner;
-use super::policy::{CohortKind, CostPolicy, ORDER_WINDOW_K, THIN_A1_K};
+use super::policy::{CohortKind, CostPolicy, ORDER_WINDOW_K, THIN_ORDERED_K};
 use super::producer_stage::ProducerStageTable;
 use super::ready_edge::ReadyEdgeTable;
 use super::wave::WaveParkTable;
@@ -123,9 +123,9 @@ pub(crate) fn admit_seed_begin_block(
 ) -> usize {
     // L1/C5: thin never plants an envelope A1=3 star. CallWaw spines get a
     // consecutive short-edge chain (14→16→17, 31→66→…). Empty-to stays A0.
-    if policy.is_a0_majority_block() {
+    if policy.is_optimistic_majority_block() {
         let mut edges = 0;
-        if policy.should_seed_thin_a1() {
+        if policy.should_seed_thin_ordered() {
             edges += admit_seed_promoted_short_edges(ready, hints, policy, metrics);
         }
         edges += admit_seed_hint_short_edges(ready, hints, policy, metrics);
@@ -173,7 +173,7 @@ pub(crate) fn admit_seed_begin_block(
             continue;
         }
         let p_beta = bayes.account_wait_probability(&addr);
-        if !policy.choose_a1(CohortKind::RawFan, addr, txs.len(), true, p_beta) {
+        if !policy.choose_ordered(CohortKind::RawFan, addr, txs.len(), true, p_beta) {
             if let Some(m) = metrics {
                 m.record_edge_optimistic_read();
             }
@@ -183,7 +183,7 @@ pub(crate) fn admit_seed_begin_block(
             kind: CohortKind::RawFan,
             addr,
             is_contract: true,
-            score: CostPolicy::a1_score(CohortKind::RawFan, txs.len(), true),
+            score: CostPolicy::ordered_score(CohortKind::RawFan, txs.len(), true),
             txs: txs.to_vec(),
         });
     }
@@ -199,7 +199,7 @@ pub(crate) fn admit_seed_begin_block(
             continue;
         }
         let p_beta = bayes.account_wait_probability(&addr);
-        if !policy.choose_a1(CohortKind::CallWaw, addr, txs.len(), true, p_beta) {
+        if !policy.choose_ordered(CohortKind::CallWaw, addr, txs.len(), true, p_beta) {
             if let Some(m) = metrics {
                 m.record_edge_optimistic_read();
             }
@@ -209,7 +209,7 @@ pub(crate) fn admit_seed_begin_block(
             kind: CohortKind::CallWaw,
             addr,
             is_contract: true,
-            score: CostPolicy::a1_score(CohortKind::CallWaw, txs.len(), true),
+            score: CostPolicy::ordered_score(CohortKind::CallWaw, txs.len(), true),
             txs: txs.to_vec(),
         });
     }
@@ -229,7 +229,7 @@ pub(crate) fn admit_seed_begin_block(
         }
         let is_contract = contracts.contains(&addr);
         let p_beta = bayes.account_wait_probability(&addr);
-        if !policy.choose_a1(CohortKind::EmptyTo, addr, txs.len(), is_contract, p_beta) {
+        if !policy.choose_ordered(CohortKind::EmptyTo, addr, txs.len(), is_contract, p_beta) {
             if let Some(m) = metrics {
                 m.record_edge_optimistic_read();
             }
@@ -239,7 +239,7 @@ pub(crate) fn admit_seed_begin_block(
             kind: CohortKind::EmptyTo,
             addr,
             is_contract,
-            score: CostPolicy::a1_score(CohortKind::EmptyTo, txs.len(), is_contract),
+            score: CostPolicy::ordered_score(CohortKind::EmptyTo, txs.len(), is_contract),
             txs: txs.to_vec(),
         });
     }
@@ -258,7 +258,7 @@ pub(crate) fn admit_seed_begin_block(
             continue;
         }
         let p_beta = bayes.account_wait_probability(&addr);
-        if !policy.choose_a1(CohortKind::SameFrom, addr, txs.len(), false, p_beta) {
+        if !policy.choose_ordered(CohortKind::SameFrom, addr, txs.len(), false, p_beta) {
             if let Some(m) = metrics {
                 m.record_edge_optimistic_read();
             }
@@ -268,13 +268,13 @@ pub(crate) fn admit_seed_begin_block(
             kind: CohortKind::SameFrom,
             addr,
             is_contract: false,
-            score: CostPolicy::a1_score(CohortKind::SameFrom, txs.len(), false),
+            score: CostPolicy::ordered_score(CohortKind::SameFrom, txs.len(), false),
             txs: txs.to_vec(),
         });
     }
 
     cands.sort_by(|a, b| b.score.cmp(&a.score));
-    let cap = policy.thin_a1_k();
+    let cap = policy.thin_ordered_k();
     if cands.len() > cap {
         for extra in cands.drain(cap..) {
             policy.note_k_cap_demote();
@@ -333,7 +333,7 @@ pub(crate) fn admit_seed_begin_block(
 
 /// C1/C5: thin begin — storage-trio CallWaw only (`3..=4`).
 /// Wide ERC-20 / RAW fans stay A0 (same `to`, different slots). Empty-to A0.
-/// Cap **locations** at `THIN_A1_K`. Hottest first.
+/// Cap **locations** at `THIN_ORDERED_K`. Hottest first.
 fn admit_seed_hint_short_edges(
     ready: &ReadyEdgeTable,
     hints: &AccountHints,
@@ -349,7 +349,7 @@ fn admit_seed_hint_short_edges(
     let mut edges = 0;
     let mut used = 0usize;
     for (addr, n) in addrs {
-        if used >= THIN_A1_K {
+        if used >= THIN_ORDERED_K {
             break;
         }
         let txs = hints.call_to_txs(&addr);
@@ -381,7 +381,7 @@ fn admit_seed_hint_short_edges(
 }
 
 /// L4/C5: reuse / measured prior → ReadyEdges on promoted ℓ (not a cohort).
-/// Thin: ≤`THIN_A1_K` locations, longest first. O1: storage 14→16→17 stays
+/// Thin: ≤`THIN_ORDERED_K` locations, longest first. O1: storage 14→16→17 stays
 /// fully ordered. Long Basic WAW is A0 at begin when leftover-aware EV
 /// loses (prefix-window + tail abort lost PRIMARY); O3 strengthens one hop.
 fn admit_seed_promoted_short_edges(
@@ -408,8 +408,8 @@ fn admit_seed_promoted_short_edges(
     // Drop zero-hop (demoted / leftover-lose) locs *before* the K-cap so a
     // 16-writer Basic spine cannot evict storage 14→16→17.
     locs.retain(|(loc, pairs)| policy.hops_to_plant(*loc, pairs.len()) > 0);
-    if policy.is_a0_majority_block() && locs.len() > THIN_A1_K {
-        locs.truncate(THIN_A1_K);
+    if policy.is_optimistic_majority_block() && locs.len() > THIN_ORDERED_K {
+        locs.truncate(THIN_ORDERED_K);
     }
     let mut edges = 0;
     for (loc, mut pairs) in locs {
@@ -418,6 +418,7 @@ fn admit_seed_promoted_short_edges(
         if keep == 0 {
             continue;
         }
+        policy.note_hops_decision(loc, pairs.len());
         pairs.truncate(keep);
         for (pred, succ) in pairs {
             ready.note_consumer_on(succ, pred, Some(loc));
@@ -470,7 +471,7 @@ pub(crate) fn admit_seed_on_write_set(
     // C1/C2: thin A0 publish is OCC-identical unless this is a short
     // storage-shaped CallWaw (14→16→17). Long Basic WAW (0x32be) is A0 —
     // write-set plant rebuilt the prepaid wall and lost PRIMARY.
-    if policy.is_some_and(|p| p.is_a0_majority_block()) && !ready.was_queued(writer) {
+    if policy.is_some_and(|p| p.is_optimistic_majority_block()) && !ready.was_queued(writer) {
         let storage_like = to.is_some_and(|t| {
             let n = hints.call_to_txs(&t).len();
             (3..=4).contains(&n)
@@ -802,9 +803,9 @@ pub(crate) fn is_wide_envelope_writer_set(hints: &AccountHints, writers: &[TxIdx
 
 /// L2: first EffectiveWAW abort → persist consecutive pairs on this ℓ.
 ///
-/// Do **not** insert ReadyEdges on in-flight A0 successors (done-stamp race).
-/// O3: queue a window of idle pairs; `flush_pending_idle_edges` plants them
-/// only via `note_consumer_on_if_idle` (started consumers stay A0).
+/// Do **not** insert ReadyEdges on in-flight OptimisticRead successors
+/// (done-stamp race). CC-L1/L2 queue idle pairs; `flush_pending_idle_edges`
+/// plants them only via `note_consumer_on_if_idle`.
 pub(crate) fn persist_short_chain_after_abort(
     hints: &AccountHints,
     policy: &CostPolicy,
@@ -814,7 +815,7 @@ pub(crate) fn persist_short_chain_after_abort(
 ) {
     if producer < consumer {
         policy.note_short_pair(location, producer, consumer);
-        // O3: only the aborted consumer — not a mid-block full-window plant.
+        // CC-L2: OrderedAdmit retry for the aborted consumer.
         policy.queue_idle_edge(location, producer, consumer);
     }
     // Long spine already persisted — skip envelope walk on the abort path.
@@ -831,8 +832,35 @@ pub(crate) fn persist_short_chain_after_abort(
     }
 }
 
-/// O3: plant the aborted consumer if still idle. Never marks a started tx
-/// gated — that races A0 done-stamp / validate path.
+/// CC-L1: nearest unfinished (not started) successor on `ℓ` after a published pred.
+pub(crate) fn queue_nearest_unfinished_successor(
+    ready: &ReadyEdgeTable,
+    policy: &CostPolicy,
+    hints: &AccountHints,
+    location: MemoryLocationHash,
+    published: TxIdx,
+    from: Address,
+    to: Option<Address>,
+) {
+    let mut succs: Vec<TxIdx> = policy
+        .pairs_of(location)
+        .into_iter()
+        .filter(|&(pred, succ)| pred >= published && pred < succ)
+        .map(|(_, succ)| succ)
+        .collect();
+    succs.extend(location_successors(hints, location, published, from, to));
+    succs.sort_unstable();
+    succs.dedup();
+    if let Some(&succ) = succs
+        .iter()
+        .find(|&&s| s > published && !ready.is_started(s))
+    {
+        policy.queue_idle_edge(location, published, succ);
+    }
+}
+
+/// CC-L1/L2: plant queued idle hops. Started successors stay OptimisticRead.
+/// At most the retry consumer plus one successor hop per ℓ (CC-L3).
 pub(crate) fn flush_pending_idle_edges(ready: &ReadyEdgeTable, policy: &CostPolicy) -> usize {
     let pending = policy.take_pending_idle();
     if pending.is_empty() {
@@ -848,16 +876,17 @@ pub(crate) fn flush_pending_idle_edges(ready: &ReadyEdgeTable, policy: &CostPoli
     for (loc, mut pairs) in by_loc {
         pairs.sort_unstable();
         pairs.dedup();
-        // One idle hop (the aborting consumer). Do not mark the rest of the
-        // spine gated mid-block — that switches every A0 completion onto wake.
-        pairs.truncate(1);
+        // CC-L3: retry + one successor hop. Never a full-spine prepaid list.
+        if pairs.len() > 2 {
+            pairs.truncate(2);
+        }
         for (pred, succ) in pairs {
             if ready.note_consumer_on_if_idle(succ, pred, Some(loc)) {
                 policy.note_short_edge_admit();
+                policy.note_loc_ordered_ns(loc, 1);
                 planted += 1;
             }
         }
-        let _ = loc;
     }
     planted
 }
@@ -1314,7 +1343,7 @@ mod tests {
         let ready = ReadyEdgeTable::new();
         let wave = WaveParkTable::new();
         let policy = policy_for(176);
-        assert!(policy.is_a0_majority_block());
+        assert!(policy.is_optimistic_majority_block());
         let to = Address::repeat_byte(0x99);
         let hot = Address::repeat_byte(0x32);
         let loc = 0x32be_u64;
@@ -1609,7 +1638,7 @@ mod tests {
         let mut contracts = HashSet::new();
         contracts.insert(payee);
         let policy = policy_for(176);
-        assert!(policy.is_a0_majority_block());
+        assert!(policy.is_optimistic_majority_block());
         let n = admit_seed_begin_block(
             &ready,
             &stages,
@@ -1771,10 +1800,15 @@ mod tests {
             &HashSet::new(),
             None,
         );
-        assert_eq!(n, 0, "O1/O2: long thin spine stays A0 at begin, got {n}");
+        assert_eq!(n, 1, "CC-L3: reuse plants WindowedOrdered k=1, got {n}");
+        assert_eq!(
+            ready.blocking_producer(31),
+            Some(4),
+            "CC-L3: only nearest unfinished writer (4→31)"
+        );
         assert!(
-            ready.may_execute(31) && ready.may_execute(66) && ready.may_execute(67),
-            "O1: no prepaid 4→31→66 — OCC abort is cheaper than prefix order"
+            ready.may_execute(66) && ready.may_execute(67),
+            "CC-L3: no prepaid 31→66→67 full-spine list"
         );
         assert!(ready.may_execute(4), "chain head stays runnable");
     }
@@ -1815,9 +1849,14 @@ mod tests {
             &HashSet::new(),
             None,
         );
+        assert_eq!(
+            ready.blocking_producer(31),
+            Some(4),
+            "CC-L3: long Basic spine plants only 4→31"
+        );
         assert!(
-            ready.may_execute(31),
-            "O1/O2: long Basic spine must not consume a thin K slot"
+            ready.may_execute(66),
+            "CC-L3: tail of the long spine stays OptimisticRead at begin"
         );
         assert_eq!(ready.blocking_producer(16), Some(14));
         let extra_blocked = [11usize, 13, 19]

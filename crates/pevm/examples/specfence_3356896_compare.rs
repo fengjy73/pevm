@@ -1,4 +1,4 @@
-//! SpecFence (A0/A1 adaptive OCC on one Block-STM spine) vs harness OCC
+//! SpecFence (OptimisticRead / OrderedAdmit on one Block-STM spine) vs harness OCC
 //! baseline on Ethereum mainnet block 3356896 (Soft=0). Compare is measurement
 //! only — not a protocol fork.
 //!
@@ -100,13 +100,13 @@ struct IterRow {
     unfenced_reexec: usize,
     ready_width_mean: f64,
     idle_core_ns: u64,
-    a1_cohorts: usize,
-    a0_cohorts: usize,
+    ordered_admit_cohorts: usize,
+    optimistic_read_cohorts: usize,
     edge_ordered_admit: usize,
     edge_optimistic_read: usize,
     refuse_ns: u64,
     reexec_ns: u64,
-    a0_majority_block: bool,
+    optimistic_majority_block: bool,
     cost_ev_keep_ordered: usize,
     cost_ev_demote_optimistic: usize,
     commute_skip: usize,
@@ -118,6 +118,7 @@ struct IterRow {
     prior_decay: usize,
     admit_seed_begin_ns: u64,
     end_block_ns: u64,
+    optimistic_path_tax_ns: u64,
     begin_blocked: Vec<usize>,
     taxed_indep_blocked: Vec<usize>,
     main_inc_gt0: Vec<usize>,
@@ -193,7 +194,7 @@ fn run_once(
                 .map(|(t, _)| t)
                 .collect();
             println!(
-                "  {mode_name}[{i}] ok wall_ms={wall_ms:.3} tps={:.0} occ_aborts={} inc>0={} reexec={} refuse_admit={} wait_for_dependency={} soft_wait_arms={} idle_ns={} ready_width={:.2} a1={} a0_cohorts={} edge_oa={} edge_or={} refuse_ns={} reexec_ns={} prepaid_ns={} abort_cf_ns={} prior_decay={} a0_maj={} ev_keep={} ev_demote={} commute={} batch={} d1_prom={} d1_ign={} taxed_begin={} edge_4_31={} unfenced_reexec={} main_inc={:?} storage_inc={:?} admit_seed_ns={} end_block_ns={}",
+                "  {mode_name}[{i}] ok wall_ms={wall_ms:.3} tps={:.0} occ_aborts={} inc>0={} reexec={} refuse_admit={} wait_for_dependency={} soft_wait_arms={} idle_ns={} ready_width={:.2} ordered_admit={} optimistic_read={} edge_oa={} edge_or={} refuse_ns={} reexec_ns={} prepaid_ns={} abort_cf_ns={} prior_decay={} opt_maj={} ev_keep={} ev_demote={} commute={} batch={} d1_prom={} d1_ign={} taxed_begin={} edge_4_31={} unfenced_reexec={} main_inc={:?} storage_inc={:?} admit_seed_ns={} end_block_ns={} opt_path_tax_ns={}",
                 n as f64 / (wall_ms / 1000.0),
                 m.occ_aborts,
                 m.incarnation_gt0,
@@ -203,8 +204,8 @@ fn run_once(
                 m.soft_wait_arms,
                 m.idle_core_ns,
                 m.ready_width_mean,
-                m.a1_cohorts,
-                m.a0_cohorts,
+                m.ordered_admit_cohorts,
+                m.optimistic_read_cohorts,
                 m.edge_ordered_admit,
                 m.edge_optimistic_read,
                 m.refuse_ns,
@@ -212,7 +213,7 @@ fn run_once(
                 learn.prepaid_ns,
                 learn.abort_cf_ns,
                 learn.prior_decay,
-                m.a0_majority_block,
+                m.optimistic_majority_block,
                 m.cost_ev_keep_ordered,
                 m.cost_ev_demote_optimistic,
                 m.commute_skip,
@@ -225,7 +226,8 @@ fn run_once(
                 inc_gt0_in(&incs, MAIN_CHAIN),
                 inc_gt0_in(&incs, STORAGE_141617),
                 m.admit_seed_begin_ns,
-                learn.end_block_ns
+                learn.end_block_ns,
+                learn.optimistic_path_tax_ns
             );
             IterRow {
                 mode: mode_name.to_string(),
@@ -241,13 +243,13 @@ fn run_once(
                 unfenced_reexec: m.unfenced_reexec,
                 ready_width_mean: m.ready_width_mean,
                 idle_core_ns: m.idle_core_ns,
-                a1_cohorts: m.a1_cohorts,
-                a0_cohorts: m.a0_cohorts,
+                ordered_admit_cohorts: m.ordered_admit_cohorts,
+                optimistic_read_cohorts: m.optimistic_read_cohorts,
                 edge_ordered_admit: m.edge_ordered_admit,
                 edge_optimistic_read: m.edge_optimistic_read,
                 refuse_ns: m.refuse_ns,
                 reexec_ns: m.reexec_ns,
-                a0_majority_block: m.a0_majority_block,
+                optimistic_majority_block: m.optimistic_majority_block,
                 cost_ev_keep_ordered: m.cost_ev_keep_ordered,
                 cost_ev_demote_optimistic: m.cost_ev_demote_optimistic,
                 commute_skip: m.commute_skip,
@@ -259,6 +261,7 @@ fn run_once(
                 prior_decay: learn.prior_decay,
                 admit_seed_begin_ns: m.admit_seed_begin_ns,
                 end_block_ns: learn.end_block_ns,
+                optimistic_path_tax_ns: learn.optimistic_path_tax_ns,
                 begin_blocked: begin,
                 taxed_indep_blocked: taxed,
                 main_inc_gt0: inc_gt0_in(&incs, MAIN_CHAIN),
@@ -357,12 +360,12 @@ fn main() {
             sf_row.ready_width_mean,
             sf_row.edge_ordered_admit,
             sf_row.edge_optimistic_read,
-            sf_row.a0_majority_block,
+            sf_row.optimistic_majority_block,
             sf_row.commute_skip,
             sf_row.batch_repair,
             sf_row.admit_seed_begin_ns,
             sf_row.unfenced_reexec,
-            sf_row.a1_cohorts,
+            sf_row.ordered_admit_cohorts,
         ));
         rows.push(sf_row);
     }
@@ -388,7 +391,7 @@ fn main() {
     }
     if let Some(m) = last_sf {
         println!(
-            "  specfence all_median_ms={sf_all_med:.3} cold_ms={:.3} reuse_median_ms={} last refuse_admit={} inc>0={} reexec={} wait_for_dependency={} occ_aborts={} soft_wait_arms={} idle_ns={} ready_width={:.2} edge_oa={} edge_or={} a0_maj={} commute={} batch={} admit_seed_ns={} unfenced={} a1={}",
+            "  specfence all_median_ms={sf_all_med:.3} cold_ms={:.3} reuse_median_ms={} last refuse_admit={} inc>0={} reexec={} wait_for_dependency={} occ_aborts={} soft_wait_arms={} idle_ns={} ready_width={:.2} edge_oa={} edge_or={} opt_maj={} commute={} batch={} admit_seed_ns={} unfenced={} ordered_admit={}",
             sf_cold.unwrap_or(0.0),
             sf_reuse_med
                 .map(|v| format!("{v:.3}"))

@@ -207,7 +207,7 @@ fn batch_park_abort(
     scheduler.finish_validation(tx_version, true)
 }
 
-/// L2: first EffectiveWAW abort → record ℓ and persist consecutive pairs.
+/// CC-L1/L2: first EffectiveWAW abort → OrderedAdmit retry + one successor hop.
 fn promote_and_seed_short_edge(
     specfence: SpecFenceCtx<'_>,
     policy: &super::policy::CostPolicy,
@@ -223,14 +223,21 @@ fn promote_and_seed_short_edge(
         producer,
         f.location,
     );
-    // O3: plant one idle hop only when leftover-aware EV still wants order.
-    // Long thin spines already lost to OCC abort — planting here rebuilds prepaid.
-    let n_pairs = policy.pairs_of(f.location).len();
-    if n_pairs > super::policy::ORDER_WINDOW_K && policy.hops_to_plant(f.location, n_pairs) == 0 {
-        let _ = policy.take_pending_idle();
-        return;
-    }
+    // CC-L2: incarnation≥1 retry is OrderedAdmit even when begin stayed
+    // OptimisticRead (do not discard the pending retry hop).
     specfence.ready_edges.clear_started(tx_idx);
+    // CC-L1: nearest unfinished successor waits for this published/retrying pred.
+    let from = specfence.hints.from_of(tx_idx);
+    let to = specfence.hints.to_of(tx_idx);
+    crate::specfence::admit::queue_nearest_unfinished_successor(
+        specfence.ready_edges,
+        policy,
+        specfence.hints,
+        f.location,
+        tx_idx,
+        from,
+        to,
+    );
     let _ = crate::specfence::admit::flush_pending_idle_edges(specfence.ready_edges, policy);
 }
 
@@ -274,7 +281,7 @@ fn occ_abort_ungated(
 }
 
 /// P1: A0 validate — OCC-identical on the no-conflict path; commute only on miss.
-pub(crate) fn validate_a0_fast(
+pub(crate) fn validate_optimistic_fast(
     mv_memory: &MvMemory,
     scheduler: &Scheduler,
     tx_version: &TxVersion,
@@ -307,9 +314,11 @@ pub(crate) fn validate_occ_kernel(
     if note_and_try_commute(specfence, mv_memory, tx_version.tx_idx, &invalid) {
         return scheduler.finish_validation(tx_version, false);
     }
-    let a0_ungated = specfence.policy.is_some_and(|p| p.is_a0_majority_block())
+    let optimistic_ungated = specfence
+        .policy
+        .is_some_and(|p| p.is_optimistic_majority_block())
         && !specfence.ready_edges.is_gated(tx_version.tx_idx);
-    if a0_ungated {
+    if optimistic_ungated {
         return occ_abort_ungated(mv_memory, scheduler, tx_version, specfence, &invalid);
     }
     let aborted = scheduler.try_validation_abort(tx_version);
@@ -468,9 +477,11 @@ pub(crate) fn validate_specfence(
         return scheduler.finish_validation(tx_version, false);
     }
     // Thin-shell A0: commute already tried; failed commute ≡ OCC abort.
-    let a0_ungated = specfence.policy.is_some_and(|p| p.is_a0_majority_block())
+    let optimistic_ungated = specfence
+        .policy
+        .is_some_and(|p| p.is_optimistic_majority_block())
         && !specfence.ready_edges.is_gated(tx_version.tx_idx);
-    if a0_ungated {
+    if optimistic_ungated {
         return occ_abort_ungated(mv_memory, scheduler, tx_version, specfence, &invalid);
     }
     if !invalid.is_empty() {
