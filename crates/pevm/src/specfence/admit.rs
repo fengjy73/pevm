@@ -9,7 +9,7 @@
 //! No Basic→Storage PE clone.
 
 use alloy_primitives::Address;
-use hashbrown::HashSet;
+use hashbrown::{HashMap, HashSet};
 
 use super::AccountHints;
 use super::bayes::BayesMap;
@@ -381,22 +381,35 @@ fn admit_seed_hint_short_edges(
 }
 
 /// L4/C5: reuse / measured prior → one ReadyEdge per promoted ℓ (not a cohort).
+/// Thin blocks keep at most `THIN_A1_K` locations, longest chain first, so
+/// Basic(0x32be) 4→31→66→… and storage 14→16→17 win over 2-writer ERC-20 slots.
 fn admit_seed_promoted_short_edges(
     ready: &ReadyEdgeTable,
     policy: &CostPolicy,
     metrics: Option<&MetricsInner>,
 ) -> usize {
-    let mut edges = 0;
+    let mut by_loc: HashMap<MemoryLocationHash, Vec<(TxIdx, TxIdx)>> = HashMap::new();
     for (loc, pred, succ) in policy.promoted_short_pairs() {
         if pred >= succ || !policy.is_promoted(loc) {
             continue;
         }
-        ready.note_consumer_on(succ, pred, Some(loc));
-        policy.note_short_edge_admit();
-        if let Some(m) = metrics {
-            m.record_edge_ordered_admit();
+        by_loc.entry(loc).or_default().push((pred, succ));
+    }
+    let mut locs: Vec<(MemoryLocationHash, Vec<(TxIdx, TxIdx)>)> = by_loc.into_iter().collect();
+    locs.sort_unstable_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+    if policy.is_a0_majority_block() && locs.len() > THIN_A1_K {
+        locs.truncate(THIN_A1_K);
+    }
+    let mut edges = 0;
+    for (loc, pairs) in locs {
+        for (pred, succ) in pairs {
+            ready.note_consumer_on(succ, pred, Some(loc));
+            policy.note_short_edge_admit();
+            if let Some(m) = metrics {
+                m.record_edge_ordered_admit();
+            }
+            edges += 1;
         }
-        edges += 1;
     }
     edges
 }
@@ -1676,5 +1689,53 @@ mod tests {
         assert_eq!(ready.blocking_producer(66), Some(31));
         assert_eq!(ready.blocking_producer(67), Some(66));
         assert!(ready.may_execute(4), "chain head stays runnable");
+    }
+
+    #[test]
+    fn thin_begin_k_caps_promoted_locations() {
+        let ready = ReadyEdgeTable::new();
+        let stages = ProducerStageTable::new();
+        let learner = LiveLearner::new();
+        learner.begin_block(MorphWeights::default());
+        let bayes = BayesMap::new();
+        let prior = InterBlockPrior::new();
+        let policy = policy_for(176);
+        policy.promote_short_edge(0x32be, 40_000);
+        policy.note_short_pair(0x32be, 4, 31);
+        policy.note_short_pair(0x32be, 31, 66);
+        policy.note_short_pair(0x32be, 66, 67);
+        policy.promote_short_edge(0xedba, 20_000);
+        policy.note_short_pair(0xedba, 14, 16);
+        policy.note_short_pair(0xedba, 16, 17);
+        policy.promote_short_edge(0xa1, 10_000);
+        policy.note_short_pair(0xa1, 10, 11);
+        policy.promote_short_edge(0xa2, 10_000);
+        policy.note_short_pair(0xa2, 12, 13);
+        policy.promote_short_edge(0xa3, 10_000);
+        policy.note_short_pair(0xa3, 18, 19);
+        policy.end_block_learn();
+        policy.begin_block(176);
+        let n = admit_seed_begin_block(
+            &ready,
+            &stages,
+            &learner,
+            &bayes,
+            &prior,
+            &AccountHints::default(),
+            Address::ZERO,
+            &policy,
+            &HashSet::new(),
+            None,
+        );
+        assert_eq!(ready.blocking_producer(31), Some(4));
+        assert_eq!(ready.blocking_producer(16), Some(14));
+        let extra_blocked = [11usize, 13, 19]
+            .iter()
+            .filter(|&&t| !ready.may_execute(t))
+            .count();
+        assert!(
+            extra_blocked <= 1 && n <= 3 + 2 + 1,
+            "C5: thin reuse plants ≤K locations (extras_blocked={extra_blocked} edges={n})"
+        );
     }
 }
