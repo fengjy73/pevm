@@ -147,6 +147,8 @@ pub(crate) struct VmDb<'a, S: Storage> {
     // Indicates if we lazy update this transaction.
     // Only applied to raw transfers' senders & recipients at the moment.
     is_lazy: bool,
+    /// Thin-shell short same-from/to force-lazy (not the generic first-touch lazy).
+    thin_a0_lazy: bool,
     /// PCC overlay armed for the current access (PE ∩ ROI). OptimisticRead = OCC read.
     pcc_armed: Cell<bool>,
     /// OptimisticRead accesses this incarnation (end-tx process flush; no DashMap).
@@ -180,6 +182,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.to_code_hash = None;
         self.flush_access_census();
         self.is_lazy = false;
+        self.thin_a0_lazy = false;
         self.has_nonce = has_nonce;
         self.read_set.clear();
         self.read_accounts.clear();
@@ -235,6 +238,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     self.specfence.policy.is_some_and(|p| p.is_thin_shell()),
                     self.specfence.ready_edges.was_queued(tx_idx),
                 );
+            self.thin_a0_lazy = thin_a0_lazy;
             self.is_lazy = already || thin_a0_lazy;
             if thin_a0_lazy && self.specfence.hints.prev(&tx.caller, tx_idx).is_some() {
                 self.specfence.metrics.record_commute_skip();
@@ -2113,6 +2117,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             to_hash: None,
             to_code_hash: None,
             is_lazy: false,
+            thin_a0_lazy: false,
             pcc_armed: Cell::new(false),
             optimistic_read_this_tx: Cell::new(0),
             pcc_this_tx: Cell::new(0),
@@ -3179,10 +3184,14 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     }
                 }
 
-                let (is_lazy, read_set) = {
+                let (is_lazy, thin_a0_lazy, read_set) = {
                     let db = ctx.db_mut();
                     db.flush_access_census();
-                    (db.is_lazy, std::mem::take(&mut db.read_set))
+                    (
+                        db.is_lazy,
+                        db.thin_a0_lazy,
+                        std::mem::take(&mut db.read_set),
+                    )
                 };
 
                 if is_lazy {
@@ -3313,11 +3322,16 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 let thin_a0 = self.specfence.mode == crate::ConcurrencyMode::SpecFence
                     && self.specfence.policy.is_some_and(|p| p.is_thin_shell())
                     && !self.specfence.ready_edges.was_queued(tx_version.tx_idx);
-                // U2: unique 21k / short lazy same-from stay OCC-cost. Long eager
-                // spines still train HotSet / Bayes. D1 writer order is already
-                // recorded; wake only when a consumer is already gated.
-                let skip_a0_learn =
-                    thin_a0 && (is_lazy || self.specfence.hints.from_txs(&tx.caller).len() < 2);
+                // U2: short force-lazy pairs + unique 21k stay OCC-cost. Do not
+                // treat generic first-touch lazy on long same-from spines as skip
+                // (HotSet / Bayes tests need those writes).
+                let unique_empty = tx.data.is_empty()
+                    && self.specfence.hints.from_txs(&tx.caller).len() < 2
+                    && tx
+                        .kind
+                        .to()
+                        .is_none_or(|to| self.specfence.hints.to_txs(to).len() < 2);
+                let skip_a0_learn = thin_a0 && (thin_a0_lazy || unique_empty);
                 if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
                     crate::specfence::admit::admit_seed_on_write_set(
                         self.specfence.ready_edges,
@@ -3383,7 +3397,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 if wrote_new_location {
                     flags |= FinishExecFlags::WroteNewLocation;
                 }
-                if self.specfence.mode.uses_regions() && !skip_a0_learn {
+                if self.specfence.mode.uses_regions() {
                     let from_wait = self
                         .specfence
                         .should_wait_account(&self.mv_memory.regions, &tx.caller);
