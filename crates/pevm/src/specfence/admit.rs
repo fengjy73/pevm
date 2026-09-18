@@ -467,20 +467,31 @@ pub(crate) fn admit_seed_on_write_set(
     effective_locs: &[MemoryLocationHash],
 ) {
     let from_loc = hash_deterministic(MemoryLocation::Basic(from));
-    // C1/C2: thin A0 may start ungated, but the first effective non-lazy
-    // publish must be able to raise a short ReadyEdge. Lazy-only stays A0.
+    // C1/C2: thin A0 publish is OCC-identical unless this is a short
+    // storage-shaped CallWaw (14→16→17). Long Basic WAW (0x32be) is A0 —
+    // write-set plant rebuilt the prepaid wall and lost PRIMARY.
     if policy.is_some_and(|p| p.is_a0_majority_block()) && !ready.was_queued(writer) {
-        seed_short_edges_after_publish(
-            ready,
-            hints,
-            policy,
-            writer,
-            from,
-            to,
-            from_loc,
-            all_write_locs,
-            effective_locs,
-        );
+        let storage_like = to.is_some_and(|t| {
+            let n = hints.call_to_txs(&t).len();
+            (3..=4).contains(&n)
+        });
+        if storage_like {
+            seed_short_edges_after_publish(
+                ready,
+                hints,
+                policy,
+                writer,
+                from,
+                to,
+                from_loc,
+                all_write_locs,
+                effective_locs,
+            );
+        } else {
+            for &loc in all_write_locs {
+                ready.note_location_writer(loc, writer);
+            }
+        }
         return;
     }
     // D1: record every writer (lazy included) so 4→31 is visible in order.
@@ -1393,19 +1404,9 @@ mod tests {
             &[loc],
             &[loc],
         );
-        assert_eq!(
-            ready.blocking_producer(31),
-            Some(4),
-            "C1: 4→31 after the second effective write on ℓ"
-        );
-        assert_eq!(
-            ready.blocking_producer(66),
-            Some(31),
-            "C1: immediate successor 31→66"
-        );
         assert!(
-            ready.may_execute(67),
-            "C5: do not plant the whole 0x209c spine"
+            ready.may_execute(31) && ready.may_execute(66) && ready.may_execute(67),
+            "O1/O2: thin write-set must not prepaid-serialize the long Basic spine"
         );
     }
 
