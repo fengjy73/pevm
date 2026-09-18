@@ -445,45 +445,44 @@ impl Scheduler {
                 continue;
             }
             if let Some(tx_version) = self.try_execute_ready(tx_idx, Some(wave), ready) {
+                // P3: bag depth only — never the full-block scan count.
                 edges.sample_ready_width(wave.ready_depth().max(1));
                 wave.note_ready_steal_if_after_park();
                 return Some(Task::Execution(tx_version));
             }
         }
-        let mut ready_n = 0usize;
-        let steal = |cand: TxIdx, ready_n: &mut usize| -> Option<Task> {
+        let steal = |cand: TxIdx| -> Option<Task> {
             if cand >= self.block_size || self.is_done(cand) {
                 return None;
             }
             if edges.is_gated(cand) && (edges.is_sleeping(cand) || !edges.may_execute(cand)) {
                 return None;
             }
-            *ready_n += 1;
             let tx_version = self.try_execute_ready(cand, Some(wave), ready)?;
-            edges.sample_ready_width(wave.ready_depth().max(*ready_n).max(1));
+            edges.sample_ready_width(wave.ready_depth().max(1));
             wave.note_ready_steal_if_after_park();
             Some(Task::Execution(tx_version))
         };
         let end = from.saturating_add(WAVE_FILL_WINDOW).min(self.block_size);
         for cand in (from + 1)..end {
-            if let Some(task) = steal(cand, &mut ready_n) {
+            if let Some(task) = steal(cand) {
                 return Some(task);
             }
         }
         // Fallback scan so a woken A1 successor is found if the bag missed it.
         // Skip sleeping heads (PC-W1). Independents are usually bag-first.
         for cand in end..self.block_size {
-            if let Some(task) = steal(cand, &mut ready_n) {
+            if let Some(task) = steal(cand) {
                 return Some(task);
             }
         }
         for cand in 0..from {
-            if let Some(task) = steal(cand, &mut ready_n) {
+            if let Some(task) = steal(cand) {
                 return Some(task);
             }
         }
-        if ready_n > 0 || wave.ready_depth() > 0 {
-            edges.sample_ready_width(wave.ready_depth().max(ready_n));
+        if wave.ready_depth() > 0 {
+            edges.sample_ready_width(wave.ready_depth());
         }
         None
     }

@@ -16,7 +16,7 @@ use super::bayes::BayesMap;
 use super::feeder::{seed_known_stars, top_is_known_star};
 use super::learner::{InterBlockPrior, LiveLearner};
 use super::metrics::MetricsInner;
-use super::policy::{CohortKind, CostPolicy, ORDER_WINDOW_K, THIN_A1_K};
+use super::policy::{CohortKind, CostPolicy, THIN_A1_K};
 use super::producer_stage::ProducerStageTable;
 use super::ready_edge::ReadyEdgeTable;
 use super::wave::WaveParkTable;
@@ -793,6 +793,7 @@ pub(crate) fn persist_short_chain_after_abort(
 ) {
     if producer < consumer {
         policy.note_short_pair(location, producer, consumer);
+        // O3: only the aborted consumer — not a mid-block full-window plant.
         policy.queue_idle_edge(location, producer, consumer);
     }
     let from = hints.from_of(consumer);
@@ -805,8 +806,8 @@ pub(crate) fn persist_short_chain_after_abort(
     }
 }
 
-/// O3: plant at most `ORDER_WINDOW_K` idle hops on `ℓ` (retry + not-started succs).
-/// Never marks a started tx gated — that races A0 done-stamp / validate path.
+/// O3: plant the aborted consumer if still idle. Never marks a started tx
+/// gated — that races A0 done-stamp / validate path.
 pub(crate) fn flush_pending_idle_edges(ready: &ReadyEdgeTable, policy: &CostPolicy) -> usize {
     let pending = policy.take_pending_idle();
     if pending.is_empty() {
@@ -820,23 +821,18 @@ pub(crate) fn flush_pending_idle_edges(ready: &ReadyEdgeTable, policy: &CostPoli
     }
     let mut planted = 0;
     for (loc, mut pairs) in by_loc {
-        for (pred, succ) in policy.pairs_of(loc) {
-            pairs.push((pred, succ));
-        }
         pairs.sort_unstable();
         pairs.dedup();
-        let keep = if pairs.len() <= ORDER_WINDOW_K {
-            pairs.len()
-        } else {
-            ORDER_WINDOW_K
-        };
-        pairs.truncate(keep);
+        // One idle hop (the aborting consumer). Do not mark the rest of the
+        // spine gated mid-block — that switches every A0 completion onto wake.
+        pairs.truncate(1);
         for (pred, succ) in pairs {
             if ready.note_consumer_on_if_idle(succ, pred, Some(loc)) {
                 policy.note_short_edge_admit();
                 planted += 1;
             }
         }
+        let _ = loc;
     }
     planted
 }

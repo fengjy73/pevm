@@ -730,6 +730,16 @@ impl CostPolicy {
         self.refuse_ns.fetch_add(ns, Ordering::Relaxed);
     }
 
+    /// Product path: PROFILE Instant is off — hat prepaid from refuse count
+    /// so O2 can demote a long spine when abort_cf is 0.
+    pub(crate) fn note_refuse_count(&self, n: usize) {
+        if n == 0 || self.refuse_ns.load(Ordering::Relaxed) > 0 {
+            return;
+        }
+        let hat = (n as f64 * PRIOR_C_A1_THIN_NS) as u64;
+        self.refuse_ns.store(hat, Ordering::Relaxed);
+    }
+
     /// L1: measured incarnation>0 execute ns (atomic; EMA at end-block / loc).
     pub(crate) fn note_reexec_ns(&self, ns: u64) {
         self.note_reexec_ns_at(None, ns);

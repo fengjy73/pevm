@@ -589,12 +589,6 @@ impl Pevm {
                     let mut task = if occ_mode {
                         crate::specfence::next_occ_task(&scheduler)
                     } else if self.concurrency_mode == ConcurrencyMode::SpecFence {
-                        if let (Some(p), Some(_)) = (specfence.policy, wave_ref) {
-                            let _ = crate::specfence::admit::flush_pending_idle_edges(
-                                specfence.ready_edges,
-                                p,
-                            );
-                        }
                         if let Some(w) = wave_ref {
                             crate::specfence::next_sf_task(
                                 &scheduler,
@@ -626,7 +620,9 @@ impl Pevm {
                                     let next = self
                                         .try_execute(&mut vm, &scheduler, tx_version, None, None);
                                     if self.concurrency_mode == ConcurrencyMode::SpecFence {
-                                        if specfence.ready_edges.has_any_gated() {
+                                        // P1: A0 completions stamp. Wake only if this
+                                        // writer has a waiter (not "any gated in block").
+                                        if specfence.ready_edges.has_known_waiters(done_idx) {
                                             if let Some(w) = wave_ref {
                                                 specfence
                                                     .ready_edges
@@ -704,12 +700,6 @@ impl Pevm {
                             task = if occ_mode {
                                 crate::specfence::next_occ_task(&scheduler)
                             } else if self.concurrency_mode == ConcurrencyMode::SpecFence {
-                                if let (Some(p), Some(_)) = (specfence.policy, wave_ref) {
-                                    let _ = crate::specfence::admit::flush_pending_idle_edges(
-                                        specfence.ready_edges,
-                                        p,
-                                    );
-                                }
                                 if let Some(w) = wave_ref {
                                     crate::specfence::next_sf_task(
                                         &scheduler,
@@ -782,29 +772,28 @@ impl Pevm {
         );
         if self.concurrency_mode == ConcurrencyMode::SpecFence {
             let end_t0 = Instant::now();
-            // P2: one D1 walk. Thin A0 skips HotSet writer storm (persist uses
-            // the same snapshot). Full-shell still records multi-writer ℓ.
+            // P2: one D1 walk (PR22 did two). Thin HotSet only on ≥3-writer /
+            // promoted ℓ — 2-writer ERC-20 slots stay off the storm.
             let beneficiary = hash_deterministic(MemoryLocation::Basic(block_env.beneficiary));
             let d1_orders = mv_writer_order_snapshot(&mv_memory, block_size, beneficiary);
-            if !self.cost_policy.is_a0_majority_block() {
-                for (loc, writers) in &d1_orders {
-                    if writers.len() < 2 {
-                        continue;
-                    }
+            let thin = self.cost_policy.is_a0_majority_block();
+            for (loc, writers) in &d1_orders {
+                if writers.len() < 2 {
+                    continue;
+                }
+                self.rw_prior.observe_write_set(&[*loc], None);
+                if !thin || writers.len() >= 3 || self.cost_policy.is_promoted(*loc) {
                     for &tx in writers {
                         self.hotset.note_writer(*loc, tx);
                     }
-                    self.rw_prior.observe_write_set(&[*loc], None);
                 }
-                self.hotset.end_block();
             }
+            self.hotset.end_block();
             // P1: pack InterBlockPrior from live morph hat + top-ℓ (flip → higher α).
             let morph_hat = learner.morph_hat();
             let top = learner.pack_top_locations();
             let _alpha = self.inter_prior.end_block(morph_hat, top);
-            if !self.cost_policy.is_a0_majority_block() {
-                sketch.decay_warm_failures(|loc| learner.abort_rate_of(loc));
-            }
+            sketch.decay_warm_failures(|loc| learner.abort_rate_of(loc));
             metrics_inner.set_soft_wait_arms(dag.soft_arm_count());
             metrics_inner.set_sketch_hot_size(sketch.hot_size());
             self.last_process = process.snapshot(16);
@@ -860,6 +849,9 @@ impl Pevm {
             if refuse_ns > 0 {
                 self.cost_policy.note_refuse_ns(refuse_ns);
                 metrics_inner.record_refuse_ns(refuse_ns);
+            } else if refuse > 0 {
+                // PROFILE Instant is off on the product path — still feed EV.
+                self.cost_policy.note_refuse_count(refuse);
             }
             let refuse_unit = if refuse == 0 {
                 0.0

@@ -9,11 +9,11 @@
 |----|--------|
 | **O1** | Long Basic WAW plants at most `ORDER_WINDOW_K=2` hops (4→31→66). Storage 14→16→17 stays fully ordered. Persist still stores the full D1 chain. |
 | **O2/L1** | `ĉ_ordered_spine = hops × ĉ_A1` vs loc abort EMA. Full 16-writer prepaid loses. After a measured prepaid-lose block, long spines **demote to A0**; storage trio does not. |
-| **O3** | EffectiveWAW abort records pairs, `clear_started` on the consumer, then `note_consumer_on_if_idle` for a window. Started successors stay A0 (no done-stamp race). Flush also runs before the next `next_sf_task`. |
+| **O3** | EffectiveWAW abort records pairs, `clear_started` on the consumer, then one idle hop for the retry. Started successors stay A0 (no done-stamp race). |
 | **O4** | Storage short edges unchanged; wide 0x209c envelope pairs still skipped at begin. |
-| **P1** | `note_producer_done` skips the deferred mutex when `deferred_n==0`. |
-| **P2** | One D1 MV snapshot (was two). Thin A0 skips HotSet writer storm + sketch decay. |
-| **P3** | Ready-bag still gated-wake only; empty `pop_ready` stays lock-free. |
+| **P1** | A0 completions stamp unless *this* writer has waiters. `note_producer_done` skips the deferred mutex when `deferred_n==0`. |
+| **P2** | One D1 MV snapshot (was two). Thin HotSet only ≥3-writer / promoted ℓ. |
+| **P3** | Ready-width samples bag depth only (never the full-block scan count). |
 
 ## Kept
 
