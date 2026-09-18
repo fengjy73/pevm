@@ -207,7 +207,7 @@ fn batch_park_abort(
     scheduler.finish_validation(tx_version, true)
 }
 
-/// L2: first EffectiveWAW abort → record ℓ and OrderedAdmit idle successors.
+/// L2: first EffectiveWAW abort → record ℓ and persist consecutive pairs.
 fn promote_and_seed_short_edge(
     specfence: SpecFenceCtx<'_>,
     policy: &super::policy::CostPolicy,
@@ -216,10 +216,9 @@ fn promote_and_seed_short_edge(
 ) {
     policy.promote_short_edge(f.location, 0);
     let producer = f.peer.filter(|&w| w < tx_idx).unwrap_or(tx_idx);
-    crate::specfence::admit::admit_seed_after_effective_abort(
-        specfence.ready_edges,
+    crate::specfence::admit::persist_short_chain_after_abort(
         specfence.hints,
-        Some(policy),
+        policy,
         tx_idx,
         producer,
         f.location,

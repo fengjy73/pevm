@@ -7,13 +7,13 @@
 
 ### Main-chain OrderedAdmit (Basic(0x32be) / 0x209c writers 4→31→66→…→171)
 
-- A0 execute still does **not** insert ReadyEdges (mid-execute insert raced seq≡par).
-- After the first **EffectiveWAW abort** on a location: `clear_started` on the aborting tx, then consecutive short edges on that **account location** for idle successors.
+- A0 execute and abort still do **not** insert ReadyEdges (mid-block insert races A0 done-stamp → Estimate leftover / seq≡par).
+- After the first **EffectiveWAW abort**: persist consecutive pairs on that **account location** (not an envelope star).
   - Hidden Basic + empty-to `to` → later empty-to of that `to` (0x209c → Basic(0x32be)).
   - Short CallWaw (3..=7) → later calldata (storage 14→16→17).
   - Wide CallWaw / RAW fan → no envelope successors (ERC-20 slots stay A0).
-- In-flight successors stay OCC this incarnation (`note_consumer_on_if_idle`).
-- End-block: persist consecutive D1 pairs on **already promoted** ℓ into `short_chain` (full 4→31→66→… after the first block).
+- End-block: persist consecutive D1 pairs on **already promoted** ℓ into `short_chain`.
+- Next same-`Pevm` begin plants the stored pairs (`4→31→66→…→171`).
 
 ### Reuse harness
 

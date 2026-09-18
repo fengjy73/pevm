@@ -314,17 +314,6 @@ impl ReadyEdgeTable {
         }
     }
 
-    /// Between incarnations: the aborting tx is no longer in-flight.
-    /// Next Execute will `note_started` again. Do not clear an executing tx.
-    #[inline]
-    pub(crate) fn clear_started(&self, tx: TxIdx) {
-        let i = tx / 64;
-        if i < self.started_bits.len() {
-            let bit = 1u64 << (tx % 64);
-            self.started_bits[i].fetch_and(!bit, Ordering::Release);
-        }
-    }
-
     /// C1: raise a short edge only when the successor has not started (idle).
     /// In-flight successors stay OCC this incarnation; L2 abort seeds reexec.
     #[inline]

@@ -747,45 +747,28 @@ fn location_successors(
     Vec::new()
 }
 
-/// L2: first EffectiveWAW abort → OrderedAdmit on this ℓ.
+/// L2: first EffectiveWAW abort → persist consecutive pairs on this ℓ.
 ///
-/// The aborting tx is between incarnations (`clear_started`). Idle later
-/// writers of the **same location** get consecutive short edges. In-flight
-/// successors stay OCC this incarnation (no mid-execute ReadyEdge insert).
-pub(crate) fn admit_seed_after_effective_abort(
-    ready: &ReadyEdgeTable,
+/// Do **not** insert ReadyEdges here. Mid-block insert races A0
+/// `note_producer_done_stamp` (seq≡par / Estimate leftover). The next
+/// begin plants the stored pairs (`admit_seed_promoted_short_edges`).
+pub(crate) fn persist_short_chain_after_abort(
     hints: &AccountHints,
-    policy: Option<&CostPolicy>,
+    policy: &CostPolicy,
     consumer: TxIdx,
     producer: TxIdx,
     location: MemoryLocationHash,
 ) {
+    if producer < consumer {
+        policy.note_short_pair(location, producer, consumer);
+    }
     let from = hints.from_of(consumer);
     let to = hints.to_of(consumer);
-    ready.note_raw_producer(location, producer.min(consumer));
-    ready.note_location_writer(location, producer.min(consumer));
-    ready.note_location_writer(location, consumer);
-    if producer < consumer {
-        ready.clear_started(consumer);
-        ready.note_consumer_on(consumer, producer, Some(location));
-        if let Some(p) = policy {
-            p.note_short_pair(location, producer, consumer);
-            p.note_short_edge_admit();
-        }
-    }
     let later = location_successors(hints, location, consumer, from, to);
     let mut pred = consumer;
     for succ in later {
-        if ready.is_started(succ) {
-            continue;
-        }
-        if ready.note_consumer_on_if_idle(succ, pred, Some(location)) {
-            if let Some(p) = policy {
-                p.note_short_pair(location, pred, succ);
-                p.note_short_edge_admit();
-            }
-            pred = succ;
-        }
+        policy.note_short_pair(location, pred, succ);
+        pred = succ;
     }
 }
 
@@ -1622,65 +1605,42 @@ mod tests {
     }
 
     #[test]
-    fn abort_seeds_idle_hidden_basic_chain() {
-        let ready = ReadyEdgeTable::new();
+    fn abort_persists_hidden_basic_chain() {
         let policy = policy_for(176);
         let to = Address::repeat_byte(0x20);
         let loc = 0x32be_u64;
         let hints = AccountHints::from_to_txs(to, vec![31, 66, 67, 69]);
         policy.promote_short_edge(loc, 0);
-        admit_seed_after_effective_abort(&ready, &hints, Some(&policy), 31, 4, loc);
-        assert_eq!(
-            ready.blocking_producer(31),
-            Some(4),
-            "C1: aborting 31 waits on 4 for reexec"
-        );
-        assert_eq!(
-            ready.blocking_producer(66),
-            Some(31),
-            "C1: idle 31→66 on Basic(0x32be), not envelope star"
-        );
-        assert_eq!(ready.blocking_producer(67), Some(66));
-        assert_eq!(ready.blocking_producer(69), Some(67));
+        persist_short_chain_after_abort(&hints, &policy, 31, 4, loc);
+        let pairs = policy.promoted_short_pairs();
         assert!(
-            policy
-                .promoted_short_pairs()
-                .iter()
-                .any(|&(l, p, s)| l == loc && p == 4 && s == 31),
-            "abort must persist 4→31"
-        );
-    }
-
-    #[test]
-    fn abort_skips_started_successor() {
-        let ready = ReadyEdgeTable::new();
-        let to = Address::repeat_byte(0x20);
-        let loc = 0x32be_u64;
-        let hints = AccountHints::from_to_txs(to, vec![31, 66, 67]);
-        ready.note_started(66);
-        admit_seed_after_effective_abort(&ready, &hints, None, 31, 4, loc);
-        assert!(
-            ready.may_execute(66),
-            "in-flight 66 stays OCC this incarnation"
-        );
-        assert_eq!(
-            ready.blocking_producer(67),
-            Some(31),
-            "idle tail still consecutive-admitted"
+            pairs.iter().any(|&(l, a, b)| l == loc && a == 4 && b == 31)
+                && pairs.iter().any(|&(l, a, b)| l == loc && a == 31 && b == 66)
+                && pairs.iter().any(|&(l, a, b)| l == loc && a == 66 && b == 67)
+                && pairs.iter().any(|&(l, a, b)| l == loc && a == 67 && b == 69),
+            "abort must persist 4→31→66→67→69 on the account location: {pairs:?}"
         );
     }
 
     #[test]
     fn abort_does_not_chain_wide_callwaw() {
-        let ready = ReadyEdgeTable::new();
+        let policy = policy_for(176);
         let token = Address::repeat_byte(0xaa);
         let loc = 0xabc_u64;
         let hints = AccountHints::from_call_to_txs(token, (0..16).collect());
-        admit_seed_after_effective_abort(&ready, &hints, None, 3, 1, loc);
-        assert_eq!(ready.blocking_producer(3), Some(1));
+        policy.promote_short_edge(loc, 0);
+        persist_short_chain_after_abort(&hints, &policy, 3, 1, loc);
+        let pairs = policy.promoted_short_pairs();
         assert!(
-            ready.may_execute(4) && ready.may_execute(15),
-            "C5: wide CallWaw must not serialize ERC-20 slots"
+            pairs.iter().any(|&(l, a, b)| l == loc && a == 1 && b == 3),
+            "producer→consumer pair is kept: {pairs:?}"
+        );
+        assert!(
+            !pairs
+                .iter()
+                .any(|&(l, a, b)| l == loc && a == 3 && b == 4)
+                && !pairs.iter().any(|&(l, _, s)| l == loc && s == 15),
+            "C5: wide CallWaw must not persist ERC-20 slot stars: {pairs:?}"
         );
     }
 
