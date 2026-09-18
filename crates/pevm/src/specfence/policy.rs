@@ -39,6 +39,8 @@ pub(crate) const WINDOWED_K: usize = 1;
 pub(crate) const WINDOWED_W_MAX: usize = 3;
 /// T2: txs per segment; intra-segment FullChain, inter-segment OptimisticRead.
 pub(crate) const SEG_TX: usize = 4;
+/// Cap planted segments so Seg cannot rebuild the PR22 prepaid wall.
+const SEG_CAP: usize = 2;
 /// F7: leftover hops / reexecs that force Win_1→Win_2/3 or Seg.
 const LEFTOVER_WIN3: u32 = 3;
 const LEFTOVER_SEG: u32 = 8;
@@ -116,8 +118,7 @@ impl LocStrategy {
             Self::Windowed2 => 2,
             Self::Windowed3 => 3,
             Self::Segmented => SEG_TX.saturating_sub(1),
-            Self::FullChain => usize::MAX,
-            Self::OptimisticRead => 0,
+            Self::FullChain | Self::OptimisticRead => 0,
         }
     }
 
@@ -587,7 +588,7 @@ impl CostPolicy {
         if n_pairs == 0 {
             return 0;
         }
-        let n_tx = n_pairs + 1;
+        let n_tx = (n_pairs + 1).min(SEG_CAP * SEG_TX);
         let full_segs = n_tx / SEG_TX;
         let rem = n_tx % SEG_TX;
         full_segs * SEG_TX.saturating_sub(1) + rem.saturating_sub(1)
@@ -673,9 +674,11 @@ impl CostPolicy {
         {
             return LocStrategy::OptimisticRead;
         }
-        // F7: leftover tail after Win_1 → try Win_2/3 or Seg, never Full.
+        // F7: leftover tail after Opt/Win_1 → Win_2/3 first. Seg only after
+        // Win_3 was tried (escalate_n≥2) — full-spine Seg prepaid lost PRIMARY
+        // (reuse ~1.28 vs OCC ~0.86) even though unfenced dropped to 0.
         let escalate = leftover >= LEFTOVER_WIN3 || escalate_n >= 1;
-        let want_seg = leftover >= LEFTOVER_SEG || escalate_n >= 2;
+        let want_seg = escalate_n >= 2 && leftover >= LEFTOVER_SEG;
         let candidates: &[LocStrategy] = if want_seg {
             &[
                 LocStrategy::Windowed3,
@@ -683,18 +686,13 @@ impl CostPolicy {
                 LocStrategy::Windowed2,
             ]
         } else if escalate {
-            &[
-                LocStrategy::Windowed2,
-                LocStrategy::Windowed3,
-                LocStrategy::Segmented,
-            ]
+            &[LocStrategy::Windowed3, LocStrategy::Windowed2]
         } else {
             &[
                 LocStrategy::OptimisticRead,
                 LocStrategy::Windowed1,
                 LocStrategy::Windowed2,
                 LocStrategy::Windowed3,
-                LocStrategy::Segmented,
             ]
         };
         let mut best = candidates[0];
@@ -1663,19 +1661,20 @@ impl CostPolicy {
                 census[i] += 1;
             }
         }
-        let dominant = [
-            (census[4], LocStrategy::Segmented),
-            (census[3], LocStrategy::Windowed3),
-            (census[2], LocStrategy::Windowed2),
-            (census[1], LocStrategy::Windowed1),
-            (census[5], LocStrategy::FullChain),
-            (census[0], LocStrategy::OptimisticRead),
-        ]
-        .into_iter()
-        .max_by_key(|(n, _)| *n)
-        .map(|(_, s)| s)
-        .filter(|_| census.iter().sum::<usize>() > 0)
-        .unwrap_or(LocStrategy::OptimisticRead);
+        // Long-spine action is the F7 story; storage Full must not hide Win_w/Seg.
+        let dominant = if census[4] > 0 {
+            LocStrategy::Segmented
+        } else if census[3] > 0 {
+            LocStrategy::Windowed3
+        } else if census[2] > 0 {
+            LocStrategy::Windowed2
+        } else if census[1] > 0 {
+            LocStrategy::Windowed1
+        } else if census[5] > 0 {
+            LocStrategy::FullChain
+        } else {
+            LocStrategy::OptimisticRead
+        };
         LearnReport {
             ordered_admit_cohorts: self.ordered_decisions.load(Ordering::Relaxed),
             optimistic_read_cohorts: self.optimistic_read_cohorts.load(Ordering::Relaxed),
@@ -1745,7 +1744,9 @@ fn intra_segment_pairs(pairs: &[(TxIdx, TxIdx)]) -> Vec<(TxIdx, TxIdx)> {
         .iter()
         .copied()
         .filter(|&(pred, succ)| match (idx(pred), idx(succ)) {
-            (Some(a), Some(b)) => a / SEG_TX == b / SEG_TX,
+            (Some(a), Some(b)) => {
+                a / SEG_TX == b / SEG_TX && a / SEG_TX < SEG_CAP && b / SEG_TX < SEG_CAP
+            }
             _ => false,
         })
         .collect()
