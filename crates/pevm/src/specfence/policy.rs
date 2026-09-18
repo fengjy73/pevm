@@ -1387,6 +1387,16 @@ impl CostPolicy {
         let Some(s) = self.promoted.get(&location) else {
             return false;
         };
+        let n_pairs = self
+            .short_chain
+            .get(&location)
+            .map(|c| c.len())
+            .unwrap_or(0);
+        // Commute/ignore must not evict a measured long Basic spine (F7).
+        // F4 demote bans FullChain only — Win_w / Seg may still plant.
+        if s.measured && n_pairs > ORDER_WINDOW_K {
+            return true;
+        }
         if s.hits < 1 {
             return false;
         }
