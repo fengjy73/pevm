@@ -123,18 +123,7 @@ fn note_and_try_commute(
     tx_idx: TxIdx,
     invalid: &[MemoryLocationHash],
 ) -> bool {
-    let first = classify_first_conflict(
-        specfence.hints,
-        mv_memory,
-        specfence.beneficiary,
-        tx_idx,
-        invalid,
-    );
-    if let Some(f) = first
-        && let Some(p) = specfence.policy
-    {
-        p.note_conflict_ell(tx_idx, f.location, f.peer, f.class, f.lazy);
-    }
+    // Commute first — classify/DashMap only when the accept path misses.
     if commute_ok(
         specfence.hints,
         mv_memory,
@@ -147,9 +136,21 @@ fn note_and_try_commute(
         specfence.metrics.record_commute_skip();
         if let Some(p) = specfence.policy {
             p.note_commute_skip();
-            p.ignore_conflict(first.map(|f| f.location));
+            p.ignore_conflict(None);
         }
         return true;
+    }
+    let first = classify_first_conflict(
+        specfence.hints,
+        mv_memory,
+        specfence.beneficiary,
+        tx_idx,
+        invalid,
+    );
+    if let Some(f) = first
+        && let Some(p) = specfence.policy
+    {
+        p.note_conflict_ell(tx_idx, f.location, f.peer, f.class, f.lazy);
     }
     false
 }
