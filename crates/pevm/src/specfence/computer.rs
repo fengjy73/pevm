@@ -25,7 +25,13 @@ pub(crate) fn next_sf_task(
     metrics: Option<&MetricsInner>,
 ) -> Option<Task> {
     let refuse_before = ready.refuse_count();
+    // P1/P3: no gated txs and no ProducerStage → byte-class OCC pick.
+    // ReadyEdge / wave bag stay off the A0 path.
+    if !stages.has_reserved() && !ready.has_any_gated() {
+        return scheduler.next_task();
+    }
     // A0-majority / no RAW-fan reservation: OCC-class pick (no empty DashMap scan).
+    // Gated txs still need refuse / wave-admit / wake (P2).
     if !stages.has_reserved() {
         let task = scheduler.next_task_with_wave_ready(Some(wave), Some(ready));
         if let Some(m) = metrics {

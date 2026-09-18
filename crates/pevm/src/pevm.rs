@@ -505,14 +505,12 @@ impl Pevm {
                 Some(&metrics_inner),
             );
             metrics_inner.set_admit_seed_begin_ns(seed_t0.elapsed().as_nanos() as u64);
-            // Seed independents into the ready bag.
-            for t in 0..block_size {
-                if ready_edges.may_execute(t) {
-                    wave.push_ready(t);
-                }
-            }
-            ready_edges.sample_ready_width(wave.ready_depth());
+            // P4: bag serves gated wake only. A0 / independents use OCC
+            // `execution_idx` — seeding may_execute txs here mutex-taxed the
+            // A0-majority path (PR19 residual).
             self.last_begin_blocked = ready_edges.blocked_consumers();
+            ready_edges
+                .sample_ready_width(block_size.saturating_sub(self.last_begin_blocked.len()));
             if quiet && !learner.has_any_predicted() {
                 let n = sketch.revoke_prior_fences_if_quiet(true);
                 metrics_inner.record_quiet_pessimistic_revoke(n);
@@ -726,6 +724,21 @@ impl Pevm {
             wave.park_resume_full_abort_reexecute(),
         );
         if self.concurrency_mode == ConcurrencyMode::SpecFence {
+            // L4: A0 skipped HotSet/Bayes on the execute hot path — flush
+            // write locations here so the next block still sees process prior.
+            if self.cost_policy.is_a0_majority_block() {
+                let beneficiary = hash_deterministic(MemoryLocation::Basic(block_env.beneficiary));
+                for tx in 0..block_size {
+                    if ready_edges.was_queued(tx) {
+                        continue;
+                    }
+                    for loc in mv_memory.write_locations(tx) {
+                        if loc != beneficiary {
+                            self.hotset.note_writer(loc, tx);
+                        }
+                    }
+                }
+            }
             self.hotset.end_block();
             // P1: pack InterBlockPrior from live morph hat + top-ℓ (flip → higher α).
             let morph_hat = learner.morph_hat();
@@ -785,6 +798,7 @@ impl Pevm {
             };
             self.cost_policy
                 .note_cost_sample(refuse_unit, inc_gt0 > 0, idle);
+            self.cost_policy.end_block_learn();
             let report = self.cost_policy.take_report(ready_w, idle);
             metrics_inner.set_pc_learn_metrics(
                 ready_w,

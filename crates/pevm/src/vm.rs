@@ -3332,16 +3332,10 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         .policy
                         .is_some_and(|p| p.is_a0_majority_block())
                     && !self.specfence.ready_edges.was_queued(tx_version.tx_idx);
-                // U2: short force-lazy pairs + unique 21k stay OCC-cost. Do not
-                // treat generic first-touch lazy on long same-from spines as skip
-                // (HotSet / Bayes tests need those writes).
-                let unique_empty = tx.data.is_empty()
-                    && self.specfence.hints.from_txs(&tx.caller).len() < 2
-                    && tx
-                        .kind
-                        .to()
-                        .is_none_or(|to| self.specfence.hints.to_txs(to).len() < 2);
-                let skip_a0_learn = a0_ungated && (a0_majority_lazy || unique_empty);
+                // L4: A0 ungated skips HotSet/Bayes on the execute hot path.
+                // Process prior is flushed at block end (pevm::execute).
+                let skip_a0_learn = a0_ungated;
+                let _ = a0_majority_lazy;
                 if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
                     crate::specfence::admit::admit_seed_on_write_set(
                         self.specfence.ready_edges,

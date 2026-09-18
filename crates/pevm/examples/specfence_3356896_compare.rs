@@ -106,6 +106,9 @@ struct IterRow {
     batch_repair: usize,
     conflict_promote: usize,
     conflict_ignore: usize,
+    prepaid_ns: u64,
+    abort_cf_ns: u64,
+    prior_decay: usize,
     admit_seed_begin_ns: u64,
     begin_blocked: Vec<usize>,
     taxed_indep_blocked: Vec<usize>,
@@ -197,6 +200,7 @@ fn main() {
                         .filter(|t| TAXED_INDEP.contains(t))
                         .collect();
                     let edge_4_31 = writers_have_4_31(pevm.last_location_writers());
+                    let learn = pevm.last_learn_report().clone();
                     let off_edge: Vec<usize> = incs
                         .iter()
                         .enumerate()
@@ -209,7 +213,7 @@ fn main() {
                         .map(|(t, _)| t)
                         .collect();
                     println!(
-                        "  {mode_name}[{i}] ok wall_ms={wall_ms:.3} tps={:.0} occ_aborts={} inc>0={} reexec={} refuse_admit={} wait_for_dependency={} soft_wait_arms={} idle_ns={} ready_width={:.2} a1={} a0_cohorts={} edge_oa={} edge_or={} refuse_ns={} reexec_ns={} a0_maj={} ev_keep={} ev_demote={} commute={} batch={} d1_prom={} d1_ign={} taxed_begin={} edge_4_31={} unfenced_reexec={} admit_seed_ns={}",
+                        "  {mode_name}[{i}] ok wall_ms={wall_ms:.3} tps={:.0} occ_aborts={} inc>0={} reexec={} refuse_admit={} wait_for_dependency={} soft_wait_arms={} idle_ns={} ready_width={:.2} a1={} a0_cohorts={} edge_oa={} edge_or={} refuse_ns={} reexec_ns={} prepaid_ns={} abort_cf_ns={} prior_decay={} a0_maj={} ev_keep={} ev_demote={} commute={} batch={} d1_prom={} d1_ign={} taxed_begin={} edge_4_31={} unfenced_reexec={} admit_seed_ns={}",
                         n as f64 / (wall_ms / 1000.0),
                         m.occ_aborts,
                         m.incarnation_gt0,
@@ -225,6 +229,9 @@ fn main() {
                         m.edge_optimistic_read,
                         m.refuse_ns,
                         m.reexec_ns,
+                        learn.prepaid_ns,
+                        learn.abort_cf_ns,
+                        learn.prior_decay,
                         m.a0_majority_block,
                         m.cost_ev_keep_ordered,
                         m.cost_ev_demote_optimistic,
@@ -264,6 +271,9 @@ fn main() {
                         batch_repair: m.batch_repair,
                         conflict_promote: m.conflict_promote,
                         conflict_ignore: m.conflict_ignore,
+                        prepaid_ns: learn.prepaid_ns,
+                        abort_cf_ns: learn.abort_cf_ns,
+                        prior_decay: learn.prior_decay,
                         admit_seed_begin_ns: m.admit_seed_begin_ns,
                         begin_blocked: begin,
                         taxed_indep_blocked: taxed,

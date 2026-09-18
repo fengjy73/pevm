@@ -57,6 +57,10 @@ pub(crate) struct ReadyEdgeTable {
     /// Ordered-admit gated txs. Marked **before** the consumer map insert so
     /// an ungated steal cannot race past a newly created wait-for edge.
     gated_bits: [AtomicU64; GATED_WORDS],
+    /// Live gated-tx count (P1/P3: A1=0 → OCC-class pick, no ReadyEdge walk).
+    gated_n: AtomicUsize,
+    /// Done writers (bitset). A0 finish is an atomic or — no `finished` DashMap.
+    done_bits: [AtomicU64; GATED_WORDS],
 }
 
 impl Default for ReadyEdgeTable {
@@ -78,6 +82,8 @@ impl Default for ReadyEdgeTable {
             refuse_ns: AtomicU64::new(0),
             waiters: DashMap::default(),
             gated_bits: std::array::from_fn(|_| AtomicU64::new(0)),
+            gated_n: AtomicUsize::new(0),
+            done_bits: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 }
@@ -122,7 +128,7 @@ impl ReadyEdgeTable {
         producer: TxIdx,
         location: Option<MemoryLocationHash>,
     ) {
-        if producer >= consumer || self.finished.contains_key(&producer) {
+        if producer >= consumer || self.is_writer_done(producer) {
             return;
         }
         // Mark first: ungated `may_execute` must not observe a missing bit
@@ -250,7 +256,12 @@ impl ReadyEdgeTable {
         let i = tx / 64;
         if i < self.gated_bits.len() {
             let bit = 1u64 << (tx % 64);
-            self.gated_bits[i].fetch_or(bit, Ordering::Release);
+            let prev = self.gated_bits[i].fetch_or(bit, Ordering::Release);
+            if prev & bit == 0 {
+                self.gated_n.fetch_add(1, Ordering::Relaxed);
+            }
+        } else if !self.consumers.contains_key(&tx) {
+            self.gated_n.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -264,6 +275,34 @@ impl ReadyEdgeTable {
             self.gated_bits[i].load(Ordering::Acquire) & bit != 0
         } else {
             self.consumers.contains_key(&tx)
+        }
+    }
+
+    /// Any live A1 / gated tx in this block (P1: if false, pick ≡ OCC).
+    #[inline]
+    pub(crate) fn has_any_gated(&self) -> bool {
+        self.gated_n.load(Ordering::Relaxed) > 0
+    }
+
+    #[inline]
+    fn mark_done(&self, writer: TxIdx) {
+        let i = writer / 64;
+        if i < self.done_bits.len() {
+            let bit = 1u64 << (writer % 64);
+            self.done_bits[i].fetch_or(bit, Ordering::Release);
+        } else {
+            self.finished.insert(writer, ());
+        }
+    }
+
+    #[inline]
+    fn is_writer_done(&self, writer: TxIdx) -> bool {
+        let i = writer / 64;
+        if i < self.done_bits.len() {
+            let bit = 1u64 << (writer % 64);
+            self.done_bits[i].load(Ordering::Acquire) & bit != 0
+        } else {
+            self.finished.contains_key(&writer)
         }
     }
 
@@ -341,12 +380,16 @@ impl ReadyEdgeTable {
     ///
     /// Independents (never gated anyone, never queued) skip the deferred lock
     /// and the producer/consumer DashMap scans — those were the A0-majority tax.
+    /// A1=0 / no gated txs: no `finished` DashMap insert.
     pub(crate) fn note_producer_done(&self, writer: TxIdx, wave: &WaveParkTable) {
-        self.finished.insert(writer, ());
-        let waiters = self.waiters.remove(&writer);
-        if waiters.is_none() && !self.was_queued(writer) {
+        self.mark_done(writer);
+        if !self.has_any_gated() {
             return;
         }
+        if !self.has_known_waiters(writer) && !self.was_queued(writer) {
+            return;
+        }
+        let waiters = self.waiters.remove(&writer);
         if let Some((_, cs)) = waiters {
             for c in cs {
                 // Only the consumers still gated on *this* writer. Probe-star
@@ -397,7 +440,7 @@ impl ReadyEdgeTable {
         match self.consumers.get(&tx_idx) {
             Some(e) => {
                 let w = e.load(Ordering::Relaxed);
-                w == NONE || w >= tx_idx || self.finished.contains_key(&w)
+                w == NONE || w >= tx_idx || self.is_writer_done(w)
             }
             // Gated bit is stored *before* the consumer-map insert. Treat the
             // window as not-ready so an OCC-class steal cannot pass the edge.
@@ -410,7 +453,7 @@ impl ReadyEdgeTable {
         self.consumers
             .get(&tx_idx)
             .map(|e| e.load(Ordering::Relaxed))
-            .filter(|&w| w < tx_idx && !self.finished.contains_key(&w))
+            .filter(|&w| w < tx_idx && !self.is_writer_done(w))
     }
 
     /// Defer a known consumer. Count once until the producer finishes —
@@ -644,6 +687,7 @@ mod tests {
         );
         t.note_consumer(3, 1);
         assert!(t.is_gated(3));
+        assert!(t.has_any_gated());
         assert!(!t.may_execute(3));
         t.force_a0(3);
         assert!(

@@ -516,8 +516,8 @@ mod tests {
         hints: &AccountHints,
         contracts: &HashSet<Address>,
     ) -> usize {
-        let n = hints.n_txs().max(32);
-        let policy = policy_for(n);
+        // Structural A1 tests use a full shell. Thin / a0_majority defaults A0 (L1).
+        let policy = policy_for(4096);
         admit_seed_begin_block(
             ready,
             stages,
@@ -1151,5 +1151,36 @@ mod tests {
             "PC-3: no dual same-from + empty-to tax"
         );
         let _ = n;
+    }
+
+    #[test]
+    fn thin_cold_start_seeds_no_a1() {
+        let ready = ReadyEdgeTable::new();
+        let stages = ProducerStageTable::new();
+        let learner = LiveLearner::new();
+        learner.begin_block(MorphWeights::default());
+        let bayes = BayesMap::new();
+        let prior = InterBlockPrior::new();
+        let payee = Address::repeat_byte(0x20);
+        let hints = AccountHints::from_to_txs(payee, (0..16).collect());
+        let mut contracts = HashSet::new();
+        contracts.insert(payee);
+        let policy = policy_for(176);
+        assert!(policy.is_a0_majority_block());
+        let n = admit_seed_begin_block(
+            &ready,
+            &stages,
+            &learner,
+            &bayes,
+            &prior,
+            &hints,
+            Address::ZERO,
+            &policy,
+            &contracts,
+            None,
+        );
+        assert_eq!(n, 0, "L1: thin cold start must allow A1=0, got {n}");
+        assert!(!ready.has_any_gated(), "no gated txs on thin cold start");
+        assert!(ready.may_execute(8), "later empty-to stays OCC-runnable");
     }
 }
