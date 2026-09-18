@@ -41,3 +41,20 @@ ReadyEdge stays dependency-aware admission. Compare / metrics / LearnReport use 
 - F4: EMA + n₀; consecutive FullChain losses demote long spines
 - F5: hot path reads snapshots / promoted EMA only; writeback at end_block
 - F6: loop uses incarnation / reexec_ns / ordered_ns (not `occ_aborts`)
+
+## Same-block plant
+
+Validate-time / pick-quantum ReadyEdge flush livelocked ERC-20 and flaked iter11 seq≡par. CC-L1/L2 pairs are persisted for the **next begin** (WindowedOrdered k=1 / FullChain storage). No mid-block abort plant.
+
+## 3356896 @8 Soft=0 (this machine)
+
+PR23 land note (other machine) N=7: OCC 0.863 / SF cold 1.355 / reuse **1.137** / unfenced 14.
+
+This PR:
+
+| N | OCC med | SF cold | SF reuse | unfenced last | PRIMARY |
+|---|---------|---------|----------|---------------|---------|
+| 7 | 1.084 | 1.356 | **1.092** | 15 | false (gap 8µs; OCC noisy 0.75–1.73) |
+| 9 | 0.791 | 1.220 | **1.076** | **13** | false (gap 0.285ms) |
+
+Reuse wall is below PR23’s 1.137 and far below PR22’s 1.40 full-order. Unfenced 13–15 (N=9 last 13, not 14). Soft=0, commute 77, ignore 77, taxed_indep 0, storage_inc=[], edge_4_31, seq≡par suite green.
