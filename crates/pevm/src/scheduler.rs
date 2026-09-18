@@ -272,14 +272,13 @@ impl Scheduler {
                     if let Some(wave) = wave {
                         if !edges.is_sleeping(execution_idx) {
                             if let Some(w) = edges.blocking_producer(execution_idx) {
-                                self.admit_spine_heat(w, wave, true);
+                                // A0 pred is already on the OCC idx — do not
+                                // bag-spam it (that prepaid thin reuse).
+                                if edges.is_gated(w) {
+                                    self.admit_spine_heat(w, wave, true);
+                                }
                             }
                             edges.defer(execution_idx);
-                        }
-                        if let Some(task) =
-                            self.try_fill_independent_after_refuse(execution_idx, wave, ready)
-                        {
-                            return Some(task);
                         }
                     }
                     continue;
@@ -291,14 +290,6 @@ impl Scheduler {
                         wave.note_ready_steal_if_after_park();
                     }
                     return Some(Task::Execution(tx_version));
-                }
-                // Wave fill: refused known consumer — steal the next independent
-                // without fighting admit_spine(w) fetch_min. Do not idle on the head.
-                if let Some(wave) = wave
-                    && let Some(task) =
-                        self.try_fill_independent_after_refuse(execution_idx, wave, ready)
-                {
-                    return Some(task);
                 }
             }
 
@@ -320,12 +311,8 @@ impl Scheduler {
                                 edges.defer(tx_idx);
                                 if let Some(wave) = wave {
                                     drop(tx);
-                                    self.admit_spine_heat(w, wave, true);
-                                    // PC-1: same worker steals an independent after A1 refuse.
-                                    if let Some(task) =
-                                        self.try_fill_independent_after_refuse(tx_idx, wave, ready)
-                                    {
-                                        return Some(task);
+                                    if edges.is_gated(w) {
+                                        self.admit_spine_heat(w, wave, true);
                                     }
                                 }
                                 continue;

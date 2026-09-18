@@ -518,10 +518,7 @@ impl Pevm {
             // P3/P4: bag serves gated wake only. A0 never seeds the bag.
             // Do not sample block_size as ready_width when A1=0 (that read as 176).
             self.last_begin_blocked = ready_edges.blocked_consumers();
-            if ready_edges.has_any_gated() {
-                ready_edges
-                    .sample_ready_width(block_size.saturating_sub(self.last_begin_blocked.len()));
-            }
+            // P3: do not sample (n_tx − blocked) as ready_width (reads as 172).
             if quiet && !learner.has_any_predicted() {
                 let n = sketch.revoke_prior_fences_if_quiet(true);
                 metrics_inner.record_quiet_pessimistic_revoke(n);
