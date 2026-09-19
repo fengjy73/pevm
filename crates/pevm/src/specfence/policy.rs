@@ -6,9 +6,12 @@
 //! are **features**, not `decide()` authority.
 //!
 //! Begin plant / hops / short-edge hints read **only** `select_arm(ℓ)`:
-//! Opt | Win(w) | Seg | Full (short only) | DeferPlant. Reward is
-//! −(gate_stall_wall + reexec_ns + measurable shell). Instant idle never
-//! enters ĉ. Long spines never FullChain. Never mid-execute ReadyEdge.
+//! Opt | OrderedWindow(w) | Seg(seg_len) | Full (short only) | DeferPlant.
+//! Candidates are **generated** from the posterior (`w*`, `s*`, `w±1`
+//! neighborhood) — not a frozen 7-slot enum. Cold explores; hot is greedy
+//! min-ĉ. Reward is −(gate_stall_wall + reexec_ns + measurable shell).
+//! Instant idle never enters ĉ. Long spines never FullChain. Never
+//! mid-execute ReadyEdge.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -31,14 +34,18 @@ const SERIAL_NS_PER_TX: f64 = 2_000.0;
 pub(crate) const THIN_ORDERED_K: usize = 3;
 /// Short-chain Full safety bound. Long spines never FullChain.
 pub(crate) const ORDER_WINDOW_K: usize = 2;
-/// T1: WindowedOrdered w∈[1, WINDOWED_W_MAX]. w is chosen by ĉ, not leftover.
-pub(crate) const WINDOWED_K: usize = 1;
-/// Safety: max window width (not a leftover escalate target).
-pub(crate) const WINDOWED_W_MAX: usize = 3;
-/// T2: txs per segment; intra-segment hops, inter-segment OptimisticRead.
-pub(crate) const SEG_TX: usize = 4;
-/// Cap planted segments so Seg cannot rebuild the PR22 prepaid wall.
-const SEG_CAP: usize = 2;
+/// Runaway-plant hat (safety, not a strategy nail like WINDOWED_W_MAX=3).
+const WINDOW_SAFETY_HAT: usize = 32;
+/// Seg length hat (safety, not SEG_TX=4).
+const SEG_LEN_SAFETY_HAT: usize = 16;
+/// Planted-segment hat (safety; online `seg_cap` is the effective bound).
+const SEG_CAP_SAFETY_HAT: usize = 4;
+/// Samples on the last arm before a loc can go hot (E1).
+const HOT_ARM_N: f64 = 3.0;
+/// Blocks observed before a loc can go hot (E1).
+const HOT_LOC_N: u32 = 3;
+/// Relative SE above this stays cold (ĉ confidence still wide).
+const HOT_REL_SE: f64 = 0.45;
 const THIN_N_MAX: usize = 256;
 /// ns-EV hysteresis for cohort choose() (not the loc arm mouth).
 const NS_DELTA: f64 = 2_000.0;
@@ -55,11 +62,12 @@ const PRIOR_C_OPT_COLD_NS: f64 = 9_000.0;
 const PRIOR_C_FULL_SHORT_NS: f64 = 8_000.0;
 /// L6: α = 1/(n + LEARN_OFFSET). Not a global EMA_ALPHA.
 const LEARN_OFFSET: f64 = 2.0;
-/// UCB1 bonus scale (ns). Explores under-sampled arms without leftover ifs.
-const UCB_SCALE_NS: f64 = 5_000.0;
 /// Process-level prior decay only after a confident prepaid+unfenced loss.
 const PREPAID_LOSE_CONF: u32 = 3;
-const ARM_N: usize = 7;
+/// Default cores when `begin_block` is used without an explicit concurrency level.
+const DEFAULT_CORES: usize = 8;
+/// Telemetry census bins (Opt / Win1 / Win2 / Win≥3 / Seg / Full / Defer).
+const CENSUS_N: usize = 7;
 
 /// Soft=0 action on a candidate edge / cohort.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,85 +78,111 @@ pub(crate) enum AdmitAction {
     OrderedAdmit,
 }
 
-/// Per-ℓ arm (L2): Opt | Win(w) | Seg | Full(short) | DeferPlant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Per-ℓ arm (G1–G3): Opt | OrderedWindow(w) | Seg(seg_len) | Full(short) | Defer.
+///
+/// `w` / `seg_len` are structural parameters, not a frozen {Win_1,2,3} / SEG_TX=4
+/// table. The generator proposes `w*` / `s*` from the posterior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum LocStrategy {
     OptimisticRead,
-    Windowed1,
-    Windowed2,
-    Windowed3,
-    Segmented,
+    /// Prefix window of `w` consecutive hops (`w ∈ [1, w_cap(ℓ)]`).
+    OrderedWindow {
+        w: u8,
+    },
+    /// Intra-segment hops of `seg_len` writers; inter-segment OptimisticRead.
+    Segmented {
+        seg_len: u8,
+    },
     FullChain,
     /// Do not begin-plant; rely on Resolve. Independent of leftover ifs.
     DeferPlant,
 }
 
 impl LocStrategy {
-    const fn as_u8(self) -> u8 {
+    #[inline]
+    pub(crate) const fn win(w: usize) -> Self {
+        let w = if w == 0 {
+            1
+        } else if w > 255 {
+            255
+        } else {
+            w
+        };
+        Self::OrderedWindow { w: w as u8 }
+    }
+
+    #[inline]
+    pub(crate) const fn seg(seg_len: usize) -> Self {
+        let s = if seg_len < 2 {
+            2
+        } else if seg_len > 255 {
+            255
+        } else {
+            seg_len
+        };
+        Self::Segmented { seg_len: s as u8 }
+    }
+
+    fn census_bin(self) -> usize {
         match self {
             Self::OptimisticRead => 0,
-            Self::Windowed1 => 1,
-            Self::Windowed2 => 2,
-            Self::Windowed3 => 3,
-            Self::Segmented => 4,
+            Self::OrderedWindow { w: 1 } => 1,
+            Self::OrderedWindow { w: 2 } => 2,
+            Self::OrderedWindow { .. } => 3,
+            Self::Segmented { .. } => 4,
             Self::FullChain => 5,
             Self::DeferPlant => 6,
         }
     }
 
-    const fn from_u8(v: u8) -> Self {
-        match v {
-            1 => Self::Windowed1,
-            2 => Self::Windowed2,
-            3 => Self::Windowed3,
-            4 => Self::Segmented,
-            5 => Self::FullChain,
-            6 => Self::DeferPlant,
-            _ => Self::OptimisticRead,
-        }
-    }
-
-    const fn idx(self) -> usize {
-        self.as_u8() as usize
-    }
-
     /// Tie-break: fewer prepaid hops first (ĉ-equal Win_1 beats Win_3).
-    const fn tie_key(self) -> u8 {
+    const fn tie_key(self) -> u16 {
         match self {
             Self::OptimisticRead => 0,
             Self::DeferPlant => 1,
-            Self::Windowed1 => 2,
-            Self::Windowed2 => 3,
-            Self::Windowed3 => 4,
-            Self::Segmented => 5,
-            Self::FullChain => 6,
+            Self::OrderedWindow { w } => 10 + w as u16,
+            Self::Segmented { seg_len } => 300 + seg_len as u16,
+            Self::FullChain => 500,
         }
     }
 
-    pub(crate) const fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> String {
         match self {
-            Self::OptimisticRead => "Opt",
-            Self::Windowed1 => "Win_1",
-            Self::Windowed2 => "Win_2",
-            Self::Windowed3 => "Win_3",
-            Self::Segmented => "Seg",
-            Self::FullChain => "Full",
-            Self::DeferPlant => "Defer",
+            Self::OptimisticRead => "Opt".to_string(),
+            Self::OrderedWindow { w } => format!("Win_{w}"),
+            Self::Segmented { seg_len } => format!("Seg_{seg_len}"),
+            Self::FullChain => "Full".to_string(),
+            Self::DeferPlant => "Defer".to_string(),
         }
     }
 
     pub(crate) const fn window_w(self) -> usize {
         match self {
-            Self::Windowed1 => 1,
-            Self::Windowed2 => 2,
-            Self::Windowed3 => 3,
-            Self::Segmented => SEG_TX.saturating_sub(1),
+            Self::OrderedWindow { w } => w as usize,
+            Self::Segmented { seg_len } => (seg_len as usize).saturating_sub(1),
             Self::FullChain | Self::OptimisticRead | Self::DeferPlant => 0,
+        }
+    }
+
+    pub(crate) const fn seg_len(self) -> usize {
+        match self {
+            Self::Segmented { seg_len } => seg_len as usize,
+            _ => 0,
         }
     }
 
     pub(crate) const fn is_ordered(self) -> bool {
         !matches!(self, Self::OptimisticRead | Self::DeferPlant)
+    }
+
+    /// E3: Seg / Full / wide windows are high-prepaid — only cold or crisis.
+    const fn is_high_prepaid(self, n_pairs: usize) -> bool {
+        match self {
+            Self::FullChain => n_pairs > 1,
+            Self::Segmented { .. } => true,
+            Self::OrderedWindow { w } => (w as usize) > 2 && n_pairs > ORDER_WINDOW_K,
+            _ => false,
+        }
     }
 }
 
@@ -233,10 +267,20 @@ pub struct LearnReport {
     pub full_locs: usize,
     /// Locations that chose DeferPlant (no begin plant).
     pub defer_locs: usize,
-    /// Dominant learned action label (`Win_2` / `Defer` / `Full` / `Opt`).
+    /// Dominant learned action label (`Win_2` / `Seg_5` / `Defer` / `Full` / `Opt`).
     pub chosen_strategy: String,
-    /// T1 window width of the dominant Win_w (0 if not windowed).
+    /// T1 window width of the dominant OrderedWindow (0 if not windowed).
     pub chosen_win_w: u8,
+    /// Online `w_cap(ℓ)` of the telemetry loc (G1 evidence).
+    pub chosen_w_cap: u8,
+    /// Posterior `seg_len*` of the telemetry loc (0 if Seg unused; G2).
+    pub chosen_seg_len: u8,
+    /// Distinct OrderedWindow `w` values selected this block.
+    pub unique_win_w: u8,
+    /// Distinct Seg `seg_len` values selected this block.
+    pub unique_seg_len: u8,
+    /// E2: remaining hot-ℓ explore slots at end-block (0 = all hot exploited).
+    pub explore_budget: u8,
     /// Dual-path pick: ungated OCC-class issues.
     pub pick_occ_n: usize,
     /// Dual-path pick: gated (OrderedAdmit) issues.
@@ -314,8 +358,61 @@ pub(crate) struct ConflictNote {
     pub lazy: bool,
 }
 
-/// Cross-block short-edge promote (location, not a whole lazy spine).
+/// Sparse per-arm ĉ / n (G3: not a fixed ARM_N=7 table).
 #[derive(Debug, Clone, Copy)]
+struct ArmStat {
+    arm: LocStrategy,
+    c: f64,
+    n: f64,
+}
+
+/// Migratable morph bucket (G4): n_pairs band + long vs short spine.
+/// Bayes/morph are **features** that seed priors — not a second decide() mouth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct MorphKey {
+    band: u8,
+    long: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MorphPrior {
+    w_star: u8,
+    seg_star: u8,
+    c_opt: f64,
+    n_opt: f64,
+    c_win: f64,
+    n_win: f64,
+    c_seg: f64,
+    n_seg: f64,
+    c_defer: f64,
+    n_defer: f64,
+    c_full: f64,
+    n_full: f64,
+    seen: u32,
+}
+
+impl MorphPrior {
+    fn new() -> Self {
+        Self {
+            w_star: 1,
+            seg_star: 0,
+            c_opt: PRIOR_C_WIDE_NS,
+            n_opt: 1.0,
+            c_win: PRIOR_C_WIDE_NS,
+            n_win: 1.0,
+            c_seg: PRIOR_C_WIDE_NS,
+            n_seg: 1.0,
+            c_defer: PRIOR_C_WIDE_NS,
+            n_defer: 1.0,
+            c_full: PRIOR_C_WIDE_NS,
+            n_full: 1.0,
+            seen: 0,
+        }
+    }
+}
+
+/// Cross-block short-edge promote (location, not a whole lazy spine).
+#[derive(Debug, Clone)]
 struct PromotedLoc {
     hits: u32,
     reexec_ns_ema: f64,
@@ -333,10 +430,16 @@ struct PromotedLoc {
     prev_decision: LocStrategy,
     /// Per-arm sample counts (L6 α = 1/(n+c)).
     samples: u32,
-    /// Per-arm ĉ (Opt, Win1, Win2, Win3, Seg, Full, Defer).
-    arm_c: [f64; ARM_N],
-    /// Per-arm n (priors start at 1 so UCB is defined).
-    arm_n: [f64; ARM_N],
+    /// Generated-arm stats (Opt / Defer / Full / tried w / tried s).
+    arms: Vec<ArmStat>,
+    /// Posterior best window (G1). 0 = unset (cold starts at 1).
+    w_star: u8,
+    /// Posterior best seg_len (G2). 0 = unset.
+    seg_star: u8,
+    /// E1: leftover / unfenced crisis — allow high-prepaid again.
+    last_crisis: bool,
+    /// G4 morph bucket this loc last contributed to.
+    morph: MorphKey,
     /// Telemetry only — leftover hops after the chosen arm (not a pick driver).
     leftover_reexec: u32,
     /// F1 this-block attribution (reset at begin).
@@ -358,8 +461,11 @@ impl PromotedLoc {
             decision: LocStrategy::OptimisticRead,
             prev_decision: LocStrategy::OptimisticRead,
             samples: 0,
-            arm_c: wide_arm_priors(0),
-            arm_n: [1.0; ARM_N],
+            arms: Vec::new(),
+            w_star: 1,
+            seg_star: 0,
+            last_crisis: false,
+            morph: morph_key(0),
             leftover_reexec: 0,
             block_reexec_ns: 0,
             block_ordered_ns: 0,
@@ -368,11 +474,117 @@ impl PromotedLoc {
         }
     }
 
+    fn stat(&self, arm: LocStrategy) -> Option<(f64, f64)> {
+        self.arms.iter().find(|s| s.arm == arm).map(|s| (s.c, s.n))
+    }
+
+    fn upsert_stat(&mut self, arm: LocStrategy, c: f64, n: f64) {
+        if let Some(s) = self.arms.iter_mut().find(|s| s.arm == arm) {
+            s.c = c.max(1.0);
+            s.n = n.max(1.0);
+        } else {
+            self.arms.push(ArmStat {
+                arm,
+                c: c.max(1.0),
+                n: n.max(1.0),
+            });
+        }
+    }
+
+    fn bump_c_floor(&mut self, arm: LocStrategy, floor: f64) {
+        if let Some(s) = self.arms.iter_mut().find(|s| s.arm == arm) {
+            s.c = s.c.max(floor).max(1.0);
+        } else {
+            self.arms.push(ArmStat {
+                arm,
+                c: floor.max(1.0),
+                n: 1.0,
+            });
+        }
+    }
+
     fn update_arm(&mut self, arm: LocStrategy, x: f64) {
-        let i = arm.idx();
-        let alpha = learn_alpha(self.arm_n[i]);
-        self.arm_c[i] = (1.0 - alpha) * self.arm_c[i] + alpha * x.clamp(1.0, 10_000_000.0);
-        self.arm_n[i] += 1.0;
+        if let Some(s) = self.arms.iter_mut().find(|s| s.arm == arm) {
+            let alpha = learn_alpha(s.n);
+            s.c = (1.0 - alpha) * s.c + alpha * x.clamp(1.0, 10_000_000.0);
+            s.n += 1.0;
+        } else {
+            self.arms.push(ArmStat {
+                arm,
+                c: x.clamp(1.0, 10_000_000.0),
+                n: 2.0,
+            });
+        }
+        self.refresh_stars();
+    }
+
+    fn refresh_stars(&mut self) {
+        let mut best_w: Option<(u8, f64)> = None;
+        let mut best_s: Option<(u8, f64)> = None;
+        for s in &self.arms {
+            if s.n <= 1.0 {
+                continue;
+            }
+            match s.arm {
+                LocStrategy::OrderedWindow { w } => {
+                    if best_w.map(|(_, c)| s.c + 1e-9 < c).unwrap_or(true) {
+                        best_w = Some((w, s.c));
+                    }
+                }
+                LocStrategy::Segmented { seg_len } => {
+                    if best_s.map(|(_, c)| s.c + 1e-9 < c).unwrap_or(true) {
+                        best_s = Some((seg_len, s.c));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some((w, _)) = best_w {
+            self.w_star = w;
+        } else if let LocStrategy::OrderedWindow { w } = self.decision {
+            self.w_star = w;
+        }
+        if let Some((s, _)) = best_s {
+            self.seg_star = s;
+        } else if let LocStrategy::Segmented { seg_len } = self.decision {
+            self.seg_star = seg_len;
+        }
+    }
+
+    fn seed_from_morph(&mut self, prior: &MorphPrior, n_pairs: usize) {
+        self.morph = morph_key(n_pairs);
+        if prior.seen == 0 {
+            return;
+        }
+        if prior.w_star >= 1 {
+            self.w_star = prior.w_star;
+        }
+        if prior.seg_star >= 2 {
+            self.seg_star = prior.seg_star;
+        }
+        if prior.n_opt > 1.0 {
+            self.upsert_stat(LocStrategy::OptimisticRead, prior.c_opt, prior.n_opt);
+        }
+        if prior.n_defer > 1.0 {
+            self.upsert_stat(LocStrategy::DeferPlant, prior.c_defer, prior.n_defer);
+        }
+        if prior.n_full > 1.0 {
+            self.upsert_stat(LocStrategy::FullChain, prior.c_full, prior.n_full);
+        }
+        if prior.n_win > 1.0 && self.w_star >= 1 {
+            self.upsert_stat(
+                LocStrategy::win(self.w_star as usize),
+                prior.c_win,
+                prior.n_win,
+            );
+        }
+        if prior.n_seg > 1.0 && self.seg_star >= 2 {
+            self.upsert_stat(
+                LocStrategy::seg(self.seg_star as usize),
+                prior.c_seg,
+                prior.n_seg,
+            );
+        }
     }
 }
 
@@ -380,15 +592,32 @@ fn learn_alpha(n: f64) -> f64 {
     1.0 / (n.max(0.0) + LEARN_OFFSET)
 }
 
-fn wide_arm_priors(n_pairs: usize) -> [f64; ARM_N] {
-    let mut c = [PRIOR_C_WIDE_NS; ARM_N];
-    if n_pairs > ORDER_WINDOW_K {
-        c[LocStrategy::OptimisticRead.idx()] = PRIOR_C_OPT_COLD_NS;
-        c[LocStrategy::DeferPlant.idx()] = PRIOR_C_OPT_COLD_NS;
-    } else if n_pairs > 0 {
-        c[LocStrategy::FullChain.idx()] = PRIOR_C_FULL_SHORT_NS;
+fn morph_band(n_pairs: usize) -> u8 {
+    match n_pairs {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        3..=4 => 3,
+        5..=8 => 4,
+        _ => 5,
     }
-    c
+}
+
+fn morph_key(n_pairs: usize) -> MorphKey {
+    MorphKey {
+        band: morph_band(n_pairs),
+        long: n_pairs > ORDER_WINDOW_K,
+    }
+}
+
+fn arm_prior(arm: LocStrategy, n_pairs: usize) -> f64 {
+    match arm {
+        LocStrategy::OptimisticRead | LocStrategy::DeferPlant if n_pairs > ORDER_WINDOW_K => {
+            PRIOR_C_OPT_COLD_NS
+        }
+        LocStrategy::FullChain if n_pairs > 0 && n_pairs <= ORDER_WINDOW_K => PRIOR_C_FULL_SHORT_NS,
+        _ => PRIOR_C_WIDE_NS,
+    }
 }
 
 /// Per-address B2 context: p_effWAW + refuse-cost EMA + per-pair cost-EV.
@@ -460,11 +689,17 @@ pub(crate) struct CostPolicy {
     pending_idle: Mutex<Vec<(MemoryLocationHash, TxIdx, TxIdx)>>,
     /// L1: committed arm for this block (select once; hops/hint share it).
     block_arm: DashMap<MemoryLocationHash, LocStrategy, FxBuildHasher>,
+    /// G4: morph-bucket priors shared across new ℓs (features only).
+    morphs: DashMap<MorphKey, MorphPrior, FxBuildHasher>,
     /// Process-persistent begin count (reuse iters). Not tx-count `block_n`.
     block_seq: AtomicUsize,
     arm_switch_n: AtomicUsize,
     explore_n: AtomicUsize,
     win2_deviate_n: AtomicUsize,
+    /// Online core count (E2 / w_cap / seg_cap). Not a frozen strategy.
+    cores: AtomicUsize,
+    /// E2: remaining hot-ℓ explore slots this block.
+    explore_budget_left: AtomicUsize,
 }
 
 impl Default for CostPolicy {
@@ -513,10 +748,13 @@ impl Default for CostPolicy {
             last_block_n: AtomicUsize::new(0),
             pending_idle: Mutex::new(Vec::new()),
             block_arm: DashMap::default(),
+            morphs: DashMap::default(),
             block_seq: AtomicUsize::new(0),
             arm_switch_n: AtomicUsize::new(0),
             explore_n: AtomicUsize::new(0),
             win2_deviate_n: AtomicUsize::new(0),
+            cores: AtomicUsize::new(DEFAULT_CORES),
+            explore_budget_left: AtomicUsize::new(0),
         }
     }
 }
@@ -542,9 +780,12 @@ impl CostPolicy {
         self.loc_c_ord.clear();
         self.pending_idle.lock().unwrap().clear();
         self.block_arm.clear();
+        self.morphs.clear();
         self.prepaid_lose_streak.store(0, Ordering::Relaxed);
         self.last_block_n.store(0, Ordering::Relaxed);
         self.block_seq.store(0, Ordering::Relaxed);
+        self.cores.store(DEFAULT_CORES, Ordering::Relaxed);
+        self.explore_budget_left.store(0, Ordering::Relaxed);
         self.c_opt_snap_bits
             .store(PRIOR_C_OPT_NS.to_bits(), Ordering::Relaxed);
         self.c_ord_snap_bits
@@ -585,9 +826,15 @@ impl CostPolicy {
         self.arm_switch_n.store(0, Ordering::Relaxed);
         self.explore_n.store(0, Ordering::Relaxed);
         self.win2_deviate_n.store(0, Ordering::Relaxed);
+        self.explore_budget_left.store(0, Ordering::Relaxed);
     }
 
     pub(crate) fn begin_block(&self, n: usize) {
+        self.begin_block_with_cores(n, DEFAULT_CORES);
+    }
+
+    pub(crate) fn begin_block_with_cores(&self, n: usize, cores: usize) {
+        self.cores.store(cores.max(1), Ordering::Relaxed);
         let prev = self.block_n.load(Ordering::Relaxed);
         if prev > 0 {
             self.last_block_n.store(prev, Ordering::Relaxed);
@@ -612,6 +859,8 @@ impl CostPolicy {
             .store(c_opt.to_bits(), Ordering::Relaxed);
         self.c_ord_snap_bits
             .store(c_ord.to_bits(), Ordering::Relaxed);
+        self.explore_budget_left
+            .store(self.explore_budget(), Ordering::Relaxed);
         for mut e in self.promoted.iter_mut() {
             e.prev_decision = e.decision;
             e.block_reexec_ns = 0;
@@ -657,58 +906,114 @@ impl CostPolicy {
         }
     }
 
+    #[inline]
+    pub(crate) fn cores(&self) -> usize {
+        self.cores.load(Ordering::Relaxed).max(1)
+    }
+
+    /// G1: online window cap. Grows with `n_pairs` / cores; never Full-spine
+    /// on long chains. Not a global `WINDOWED_W_MAX=3` nail.
+    pub(crate) fn w_cap_of(&self, n_pairs: usize) -> usize {
+        if n_pairs == 0 {
+            return 0;
+        }
+        let cores = self.cores();
+        let n_tx = self.block_n().max(1);
+        let oversub = n_tx / cores;
+        // Oversubscribed blocks: smaller useful windows (protect prepaid wall).
+        let core_hat = if oversub >= 8 {
+            (cores / 2).max(2)
+        } else {
+            cores.max(2)
+        };
+        let full_ban = if n_pairs > ORDER_WINDOW_K {
+            n_pairs.saturating_sub(1)
+        } else {
+            n_pairs
+        };
+        full_ban
+            .min(core_hat)
+            .min(WINDOW_SAFETY_HAT)
+            .max(1)
+            .min(n_pairs)
+    }
+
+    /// G2: planted-segment safety bound from block width / cores (not SEG_CAP=2).
+    pub(crate) fn seg_cap(&self) -> usize {
+        let cores = self.cores();
+        let n = self.block_n().max(1);
+        let from_cores = (cores / 2).max(1);
+        let from_block = (n / 64).max(1);
+        from_cores.min(from_block).min(SEG_CAP_SAFETY_HAT).max(1)
+    }
+
+    /// E2: hot-ℓ explore slots this block. Oversubscribed → 0 (exploit).
+    fn explore_budget(&self) -> usize {
+        let n = self.block_n().max(1);
+        let cores = self.cores();
+        let oversub = n / cores;
+        if oversub >= 16 {
+            0
+        } else if oversub >= 8 {
+            1
+        } else {
+            (cores / 4).max(1)
+        }
+    }
+
+    fn try_consume_explore_budget(&self) -> bool {
+        let mut left = self.explore_budget_left.load(Ordering::Relaxed);
+        loop {
+            if left == 0 {
+                return false;
+            }
+            match self.explore_budget_left.compare_exchange_weak(
+                left,
+                left - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(v) => left = v,
+            }
+        }
+    }
+
     /// T1/T2: hops to plant on `ℓ` at begin (Seg returns intra-segment count).
     ///
     /// Sole mouth: `select_arm`. Full only when n_pairs ≤ `ORDER_WINDOW_K`.
     /// Long spines never FullChain (PR22 1.40ms prepaid wall — safety).
     pub(crate) fn hops_to_plant(&self, location: MemoryLocationHash, n_pairs: usize) -> usize {
-        Self::hops_for_strategy(self.loc_strategy(location, n_pairs), n_pairs)
+        self.hops_for_arm(self.loc_strategy(location, n_pairs), n_pairs)
     }
 
     #[inline]
-    fn hops_for_strategy(strategy: LocStrategy, n_pairs: usize) -> usize {
-        match strategy {
-            LocStrategy::OptimisticRead | LocStrategy::DeferPlant => 0,
-            LocStrategy::Windowed1 => WINDOWED_K.min(n_pairs),
-            LocStrategy::Windowed2 => 2.min(n_pairs),
-            LocStrategy::Windowed3 => WINDOWED_W_MAX.min(n_pairs),
-            LocStrategy::Segmented => Self::segmented_hop_count(n_pairs),
-            LocStrategy::FullChain => n_pairs,
-        }
+    fn hops_for_arm(&self, strategy: LocStrategy, n_pairs: usize) -> usize {
+        hops_for_strategy(strategy, n_pairs, self.seg_cap())
     }
 
-    /// Intra-segment hops for `n_pairs` consecutive edges (SEG_TX writers / seg).
-    fn segmented_hop_count(n_pairs: usize) -> usize {
-        if n_pairs == 0 {
-            return 0;
-        }
-        let n_tx = (n_pairs + 1).min(SEG_CAP * SEG_TX);
-        let full_segs = n_tx / SEG_TX;
-        let rem = n_tx % SEG_TX;
-        full_segs * SEG_TX.saturating_sub(1) + rem.saturating_sub(1)
+    /// T1/T2: which stored pairs to plant for `strategy` (uses online seg_cap).
+    pub(crate) fn plant_pairs(
+        &self,
+        strategy: LocStrategy,
+        pairs: &[(TxIdx, TxIdx)],
+    ) -> Vec<(TxIdx, TxIdx)> {
+        select_pairs_capped(strategy, pairs, self.seg_cap())
     }
 
-    /// T1/T2: which stored pairs to plant for `strategy`.
+    /// Associated helper for tests / callers without a live policy.
     pub(crate) fn select_pairs_for_strategy(
         strategy: LocStrategy,
         pairs: &[(TxIdx, TxIdx)],
     ) -> Vec<(TxIdx, TxIdx)> {
-        let mut pairs = pairs.to_vec();
-        pairs.sort_unstable_by_key(|(pred, _)| *pred);
-        pairs.dedup();
-        match strategy {
-            LocStrategy::OptimisticRead | LocStrategy::DeferPlant => Vec::new(),
-            LocStrategy::Windowed1 => pairs.into_iter().take(1).collect(),
-            LocStrategy::Windowed2 => pairs.into_iter().take(2).collect(),
-            LocStrategy::Windowed3 => pairs.into_iter().take(WINDOWED_W_MAX).collect(),
-            LocStrategy::FullChain => pairs,
-            LocStrategy::Segmented => intra_segment_pairs(&pairs),
-        }
+        select_pairs_capped(strategy, pairs, 2)
     }
 
     /// T1 window width for next-quantum hops on `ℓ`.
     pub(crate) fn window_w_of(&self, location: MemoryLocationHash, n_pairs: usize) -> usize {
-        self.loc_strategy(location, n_pairs).window_w()
+        self.loc_strategy(location, n_pairs)
+            .window_w()
+            .min(self.w_cap_of(n_pairs).max(1))
     }
 
     /// F3: record the begin-time ℓ action (eligibility for later cost).
@@ -726,9 +1031,26 @@ impl CostPolicy {
     /// Persist the committed arm so DeferPlant survives the next begin.
     pub(crate) fn remember_arm(&self, location: MemoryLocationHash, arm: LocStrategy) {
         self.block_arm.insert(location, arm);
-        let mut e = self.promoted.entry(location).or_insert(PromotedLoc::new());
+        let n_pairs = self
+            .short_chain
+            .get(&location)
+            .map(|c| c.len())
+            .unwrap_or(0);
+        let mut e = self.promoted.entry(location).or_insert_with(|| {
+            let mut loc = PromotedLoc::new();
+            if let Some(p) = self.morphs.get(&morph_key(n_pairs)) {
+                loc.seed_from_morph(&p, n_pairs);
+            }
+            loc
+        });
         e.decision = arm;
         e.hits = e.hits.max(1);
+        if let LocStrategy::OrderedWindow { w } = arm {
+            e.w_star = w;
+        }
+        if let LocStrategy::Segmented { seg_len } = arm {
+            e.seg_star = seg_len;
+        }
     }
 
     /// L1: per-ℓ arm. Cached for the block so hops / hint / flush share one mouth.
@@ -771,87 +1093,199 @@ impl CostPolicy {
         if explore || arm != greedy {
             self.explore_n.fetch_add(1, Ordering::Relaxed);
         }
-        if n_pairs > ORDER_WINDOW_K && arm != LocStrategy::Windowed2 {
+        if n_pairs > ORDER_WINDOW_K && arm != LocStrategy::win(2) {
             self.win2_deviate_n.fetch_add(1, Ordering::Relaxed);
         }
         arm
     }
 
-    /// L2/L4: UCB1 on eligible arms. Win(w) compared by ĉ, not leftover ifs.
-    /// Full is ineligible on long spines (safety bound, not “cannot learn”).
+    /// Sole mouth (E1–E3 + G1–G5): generate candidates from posterior, then
+    /// hot → greedy min-ĉ; cold / crisis → σ(ĉ)-scaled UCB.
     fn select_arm(
         &self,
         location: MemoryLocationHash,
         n_pairs: usize,
     ) -> (LocStrategy, bool, LocStrategy) {
-        let eligible = eligible_arms(n_pairs, self.loc_demoted(location));
-        let (c, n) = self.arm_stats(location, n_pairs);
-        let n_tot: f64 = eligible.iter().map(|a| n[a.idx()].max(1.0)).sum();
+        self.ensure_promoted_seeded(location, n_pairs);
+        let demoted = self.loc_demoted(location);
+        let (hot, crisis) = self.phase_of(location);
+        let explore_ok = if crisis || !hot {
+            true
+        } else {
+            self.try_consume_explore_budget()
+        };
+        let eligible = self.generate_arms(location, n_pairs, demoted, !hot || crisis, crisis);
+        let stats = self.arm_c_n(location, n_pairs, &eligible);
+        let n_tot: f64 = stats.iter().map(|&(_, _, n)| n.max(1.0)).sum();
+        let sigma = explore_sigma(&stats);
         let mut greedy = eligible[0];
-        let mut greedy_c = c[greedy.idx()];
+        let mut greedy_c = stats[0].1;
         let mut best = greedy;
-        let mut best_s = ucb_score(c[best.idx()], n[best.idx()], n_tot);
-        for &a in &eligible[1..] {
-            let ca = c[a.idx()];
+        let mut best_s = explore_score(stats[0].1, stats[0].2, n_tot, sigma);
+        for (i, &a) in eligible.iter().enumerate().skip(1) {
+            let ca = stats[i].1;
             if ca + 1e-9 < greedy_c
                 || ((ca - greedy_c).abs() <= 1e-9 && a.tie_key() < greedy.tie_key())
             {
                 greedy = a;
                 greedy_c = ca;
             }
-            let s = ucb_score(ca, n[a.idx()], n_tot);
+            let s = explore_score(ca, stats[i].2, n_tot, sigma);
             if s + 1e-9 < best_s || ((s - best_s).abs() <= 1e-9 && a.tie_key() < best.tie_key()) {
                 best = a;
                 best_s = s;
             }
         }
+        if !explore_ok {
+            return (greedy, false, greedy);
+        }
         (best, best != greedy, greedy)
     }
 
-    fn arm_stats(
+    fn ensure_promoted_seeded(&self, location: MemoryLocationHash, n_pairs: usize) {
+        if self.promoted.contains_key(&location) {
+            return;
+        }
+        let mut loc = PromotedLoc::new();
+        if let Some(p) = self.morphs.get(&morph_key(n_pairs)) {
+            loc.seed_from_morph(&p, n_pairs);
+        }
+        self.promoted.entry(location).or_insert(loc);
+    }
+
+    fn phase_of(&self, location: MemoryLocationHash) -> (bool, bool) {
+        let Some(s) = self.promoted.get(&location) else {
+            return (false, false);
+        };
+        let crisis = s.last_crisis || s.leftover_reexec >= 3;
+        if crisis {
+            return (false, true);
+        }
+        let (c, n) = s.stat(s.decision).unwrap_or((PRIOR_C_WIDE_NS, 1.0));
+        if s.samples < HOT_LOC_N || n < HOT_ARM_N {
+            return (false, false);
+        }
+        let se = c.max(1.0) / n.sqrt();
+        if se / c.max(1.0) > HOT_REL_SE {
+            return (false, false);
+        }
+        (true, false)
+    }
+
+    fn generate_arms(
         &self,
         location: MemoryLocationHash,
         n_pairs: usize,
-    ) -> ([f64; ARM_N], [f64; ARM_N]) {
-        let priors = wide_arm_priors(n_pairs);
-        if let Some(s) = self.promoted.get(&location) {
-            let mut c = s.arm_c;
-            let n = s.arm_n;
-            for i in 0..ARM_N {
-                if n[i] <= 1.0 {
-                    c[i] = priors[i];
+        demoted: bool,
+        cold: bool,
+        crisis: bool,
+    ) -> Vec<LocStrategy> {
+        let mut out = vec![LocStrategy::OptimisticRead, LocStrategy::DeferPlant];
+        let w_cap = self.w_cap_of(n_pairs);
+        let (w_star, s_star) = self
+            .promoted
+            .get(&location)
+            .map(|s| {
+                let w = if s.w_star >= 1 { s.w_star as usize } else { 1 };
+                let sl = if s.seg_star >= 2 {
+                    s.seg_star as usize
+                } else {
+                    default_seg_len(n_pairs, self.cores())
+                };
+                (w.min(w_cap).max(1), sl)
+            })
+            .unwrap_or((1.min(w_cap.max(1)), default_seg_len(n_pairs, self.cores())));
+        if n_pairs >= 1 && w_cap >= 1 {
+            out.push(LocStrategy::win(w_star.min(n_pairs).min(w_cap)));
+            if cold || crisis {
+                if w_star > 1 {
+                    out.push(LocStrategy::win((w_star - 1).min(n_pairs)));
+                }
+                if w_star < w_cap && w_star + 1 <= n_pairs {
+                    out.push(LocStrategy::win(w_star + 1));
                 }
             }
-            if s.measured {
-                let abort = s.reexec_ns_ema.max(1.0);
-                // DeferPlant ≡ Opt on leftover aborts — do not keep a cheap unused prior.
-                c[LocStrategy::OptimisticRead.idx()] =
-                    c[LocStrategy::OptimisticRead.idx()].max(abort);
-                c[LocStrategy::DeferPlant.idx()] = c[LocStrategy::DeferPlant.idx()].max(abort);
-            }
-            // Conservative UCB (L3): do not invent a cheaper unused wider window
-            // after a successful narrower OrderedAdmit (prepaid already measured).
-            if s.leftover_reexec == 0 && s.decision.is_ordered() && n[s.decision.idx()] > 1.0 {
-                let paid = c[s.decision.idx()];
-                let planted = CostPolicy::hops_for_strategy(s.decision, n_pairs);
-                for &a in &[
-                    LocStrategy::Windowed1,
-                    LocStrategy::Windowed2,
-                    LocStrategy::Windowed3,
-                    LocStrategy::Segmented,
-                    LocStrategy::FullChain,
-                ] {
-                    if n[a.idx()] <= 1.0 && CostPolicy::hops_for_strategy(a, n_pairs) > planted {
-                        c[a.idx()] = c[a.idx()].max(paid);
-                    }
-                }
-            }
-            for v in &mut c {
-                *v = v.max(1.0);
-            }
-            return (c, n);
         }
-        (priors, [1.0; ARM_N])
+        if n_pairs >= 3 && (cold || crisis) {
+            let sl = s_star.clamp(2, (n_pairs + 1).min(SEG_LEN_SAFETY_HAT));
+            out.push(LocStrategy::seg(sl));
+            if sl > 2 {
+                out.push(LocStrategy::seg(sl - 1));
+            }
+        }
+        if n_pairs > 0 && n_pairs <= ORDER_WINDOW_K && !demoted && (cold || crisis || n_pairs <= 2)
+        {
+            out.push(LocStrategy::FullChain);
+        }
+        if !cold && !crisis {
+            let keep = self.promoted.get(&location).map(|s| s.decision);
+            out.retain(|a| {
+                !a.is_high_prepaid(n_pairs)
+                    || keep == Some(*a)
+                    || *a == LocStrategy::win(w_star.min(n_pairs).min(w_cap.max(1)))
+            });
+        }
+        out.sort_by_key(|a| a.tie_key());
+        out.dedup();
+        if out.is_empty() {
+            out.push(LocStrategy::OptimisticRead);
+        }
+        out
+    }
+
+    fn arm_c_n(
+        &self,
+        location: MemoryLocationHash,
+        n_pairs: usize,
+        eligible: &[LocStrategy],
+    ) -> Vec<(LocStrategy, f64, f64)> {
+        let loc = self.promoted.get(&location);
+        let measured = loc.as_ref().is_some_and(|s| s.measured);
+        let abort = loc
+            .as_ref()
+            .map(|s| s.reexec_ns_ema.max(1.0))
+            .unwrap_or(1.0);
+        let leftover0 = loc
+            .as_ref()
+            .is_some_and(|s| s.leftover_reexec == 0 && s.decision.is_ordered());
+        let paid = loc
+            .as_ref()
+            .and_then(|s| s.stat(s.decision).filter(|(_, n)| *n > 1.0).map(|(c, _)| c));
+        let planted = loc
+            .as_ref()
+            .map(|s| hops_for_strategy(s.decision, n_pairs, self.seg_cap()))
+            .unwrap_or(0);
+        eligible
+            .iter()
+            .map(|&a| {
+                let (mut c, n) = loc
+                    .as_ref()
+                    .and_then(|s| s.stat(a))
+                    .unwrap_or((arm_prior(a, n_pairs), 1.0));
+                if n <= 1.0 {
+                    c = arm_prior(a, n_pairs);
+                }
+                if measured && matches!(a, LocStrategy::OptimisticRead | LocStrategy::DeferPlant) {
+                    c = c.max(abort);
+                }
+                if leftover0
+                    && let Some(paid) = paid
+                    && n <= 1.0
+                    && hops_for_strategy(a, n_pairs, self.seg_cap()) > planted
+                {
+                    c = c.max(paid);
+                }
+                (a, c.max(1.0), n.max(1.0))
+            })
+            .collect()
+    }
+
+    fn arm_c_of(&self, location: MemoryLocationHash, n_pairs: usize, arm: LocStrategy) -> f64 {
+        let eligible = [arm];
+        self.arm_c_n(location, n_pairs, &eligible)
+            .first()
+            .map(|(_, c, _)| *c)
+            .unwrap_or_else(|| arm_prior(arm, n_pairs))
     }
 
     /// Leftover-aware: cost(W) = W·stall + (n−W)·abort vs cost(A0) = n·abort.
@@ -1155,8 +1589,8 @@ impl CostPolicy {
 
     fn width_loss(&self, cohort_len: usize) -> f64 {
         let idle = self.idle_global.lock().unwrap().mean;
-        let cores = 8.0;
-        idle * ((cohort_len.saturating_sub(1) as f64) / cores).min(1.0)
+        let cores = self.cores() as f64;
+        idle * ((cohort_len.saturating_sub(1) as f64) / cores.max(1.0)).min(1.0)
     }
 
     fn record_ev(&self, e_a0: f64, e_a1: f64) {
@@ -1322,13 +1756,22 @@ impl CostPolicy {
                 .filter(|m| *m > 1.0)
                 .unwrap_or(PRIOR_C_OPT_NS)
         };
-        let mut e = self.promoted.entry(location).or_insert(PromotedLoc::new());
+        let n_pairs = self
+            .short_chain
+            .get(&location)
+            .map(|c| c.len())
+            .unwrap_or(0);
+        let mut e = self.promoted.entry(location).or_insert_with(|| {
+            let mut loc = PromotedLoc::new();
+            if let Some(p) = self.morphs.get(&morph_key(n_pairs)) {
+                loc.seed_from_morph(&p, n_pairs);
+            }
+            loc
+        });
         e.hits = e.hits.saturating_add(1);
         let a = learn_alpha(e.samples as f64);
         e.reexec_ns_ema = (1.0 - a) * e.reexec_ns_ema + a * measured_ns;
-        e.arm_c[LocStrategy::OptimisticRead.idx()] = e.arm_c[LocStrategy::OptimisticRead.idx()]
-            .max(measured_ns)
-            .max(1.0);
+        e.bump_c_floor(LocStrategy::OptimisticRead, measured_ns);
         e.measured = true;
         drop(e);
         self.note_conflict_promote();
@@ -1340,7 +1783,18 @@ impl CostPolicy {
         if pred >= succ {
             return;
         }
-        let mut e = self.promoted.entry(location).or_insert(PromotedLoc::new());
+        let n_pairs = self
+            .short_chain
+            .get(&location)
+            .map(|c| c.len() + 1)
+            .unwrap_or(1);
+        let mut e = self.promoted.entry(location).or_insert_with(|| {
+            let mut loc = PromotedLoc::new();
+            if let Some(p) = self.morphs.get(&morph_key(n_pairs)) {
+                loc.seed_from_morph(&p, n_pairs);
+            }
+            loc
+        });
         if e.pred == usize::MAX || pred < e.pred {
             e.pred = pred;
             e.succ = succ;
@@ -1376,7 +1830,7 @@ impl CostPolicy {
         }
         let mut out = Vec::new();
         for e in self.promoted.iter() {
-            let s = *e.value();
+            let s = e.value();
             if s.hits >= 1 && s.measured && s.pred < s.succ && s.succ < n {
                 out.push((*e.key(), s.pred, s.succ));
             }
@@ -1642,6 +2096,7 @@ impl CostPolicy {
         // L3: per-ℓ reward = −(reexec_ns + ordered_ns + refuse_share).
         // Instant idle / occ_aborts / ready_width never enter ĉ.
         self.update_loc_counterfactuals(prepaid, abort_cf);
+        self.flush_morph_priors();
         // L-D: refresh thin snap from flushed EMAs so next begin can seed.
         // Use per-tx abort hat, not the whole-block reexec sum.
         let c_opt = if abort_cf > 0 {
@@ -1683,22 +2138,76 @@ impl CostPolicy {
             e.update_arm(arm, x);
             if e.decision != LocStrategy::OptimisticRead && abort_cf > 0 {
                 let cf = (abort_cf as f64).max(e.reexec_ns_ema).max(1.0);
-                let i = LocStrategy::OptimisticRead.idx();
-                e.arm_c[i] = e.arm_c[i].max(cf);
+                e.bump_c_floor(LocStrategy::OptimisticRead, cf);
             }
             e.samples = e.samples.saturating_add(1);
             let n_pairs = self.short_chain.get(e.key()).map(|c| c.len()).unwrap_or(0);
-            let planted = Self::hops_for_strategy(e.decision, n_pairs);
+            let planted = hops_for_strategy(e.decision, n_pairs, self.seg_cap());
             e.leftover_reexec = n_pairs.saturating_sub(planted) as u32;
             if e.block_reexec_n > 0 {
                 e.leftover_reexec = e.leftover_reexec.max(e.block_reexec_n);
             } else if e.decision.is_ordered() {
                 e.leftover_reexec = 0;
             }
+            e.last_crisis = e.leftover_reexec >= 3
+                || (e.decision.is_ordered() && e.block_reexec_n >= 2)
+                || (e.decision == LocStrategy::OptimisticRead
+                    && e.block_reexec_n >= 2
+                    && e.samples >= 2);
+            e.morph = morph_key(n_pairs);
             // Safety: Full on a long spine (should be ineligible) stays demoted.
             if e.decision == LocStrategy::FullChain && n_pairs > ORDER_WINDOW_K {
                 e.demoted = true;
             }
+        }
+    }
+
+    /// G4: share ĉ / w* / s* with the morph bucket (features only).
+    fn flush_morph_priors(&self) {
+        for e in self.promoted.iter() {
+            if e.samples == 0 && e.arms.is_empty() {
+                continue;
+            }
+            let n_pairs = self.short_chain.get(e.key()).map(|c| c.len()).unwrap_or(0);
+            let key = morph_key(n_pairs);
+            let mut prior = self
+                .morphs
+                .get(&key)
+                .map(|p| *p)
+                .unwrap_or_else(MorphPrior::new);
+            let alpha = 0.25;
+            if e.w_star >= 1 {
+                prior.w_star = e.w_star;
+            }
+            if e.seg_star >= 2 {
+                prior.seg_star = e.seg_star;
+            }
+            if let Some((c, n)) = e.stat(LocStrategy::OptimisticRead) {
+                prior.c_opt = (1.0 - alpha) * prior.c_opt + alpha * c;
+                prior.n_opt = (prior.n_opt + n) * 0.5;
+            }
+            if let Some((c, n)) = e.stat(LocStrategy::DeferPlant) {
+                prior.c_defer = (1.0 - alpha) * prior.c_defer + alpha * c;
+                prior.n_defer = (prior.n_defer + n) * 0.5;
+            }
+            if let Some((c, n)) = e.stat(LocStrategy::FullChain) {
+                prior.c_full = (1.0 - alpha) * prior.c_full + alpha * c;
+                prior.n_full = (prior.n_full + n) * 0.5;
+            }
+            if e.w_star >= 1
+                && let Some((c, n)) = e.stat(LocStrategy::win(e.w_star as usize))
+            {
+                prior.c_win = (1.0 - alpha) * prior.c_win + alpha * c;
+                prior.n_win = (prior.n_win + n) * 0.5;
+            }
+            if e.seg_star >= 2
+                && let Some((c, n)) = e.stat(LocStrategy::seg(e.seg_star as usize))
+            {
+                prior.c_seg = (1.0 - alpha) * prior.c_seg + alpha * c;
+                prior.n_seg = (prior.n_seg + n) * 0.5;
+            }
+            prior.seen = prior.seen.saturating_add(1);
+            self.morphs.insert(key, prior);
         }
     }
 
@@ -1739,15 +2248,23 @@ impl CostPolicy {
         let n = self.ev_samples.load(Ordering::Relaxed).max(1) as f64;
         let refuse = self.refuse_ns.load(Ordering::Relaxed);
         let ordered: u64 = self.promoted.iter().map(|e| e.block_ordered_ns).sum();
-        let mut census = [0usize; ARM_N];
+        let mut census = [0usize; CENSUS_N];
         let mut arms: Vec<(MemoryLocationHash, LocStrategy, usize)> = Vec::new();
+        let mut win_ws = hashbrown::HashSet::new();
+        let mut seg_ls = hashbrown::HashSet::new();
         for e in self.promoted.iter() {
             if e.hits < 1 {
                 continue;
             }
-            let i = e.decision.idx();
+            let i = e.decision.census_bin();
             if i < census.len() {
                 census[i] += 1;
+            }
+            if let LocStrategy::OrderedWindow { w } = e.decision {
+                win_ws.insert(w);
+            }
+            if let LocStrategy::Segmented { seg_len } = e.decision {
+                seg_ls.insert(seg_len);
             }
             let n_pairs = self.short_chain.get(e.key()).map(|c| c.len()).unwrap_or(0);
             arms.push((*e.key(), e.decision, n_pairs));
@@ -1755,13 +2272,19 @@ impl CostPolicy {
         arms.sort_unstable_by_key(|(loc, _, n)| (std::cmp::Reverse(*n), *loc));
         // Long-spine action is the story; storage Full must not hide Win_w/Defer.
         let dominant = if census[4] > 0 {
-            LocStrategy::Segmented
+            arms.iter()
+                .find(|(_, a, _)| matches!(a, LocStrategy::Segmented { .. }))
+                .map(|(_, a, _)| *a)
+                .unwrap_or(LocStrategy::seg(2))
         } else if census[3] > 0 {
-            LocStrategy::Windowed3
+            arms.iter()
+                .find(|(_, a, _)| matches!(a, LocStrategy::OrderedWindow { w } if *w >= 3))
+                .map(|(_, a, _)| *a)
+                .unwrap_or(LocStrategy::win(3))
         } else if census[2] > 0 {
-            LocStrategy::Windowed2
+            LocStrategy::win(2)
         } else if census[1] > 0 {
-            LocStrategy::Windowed1
+            LocStrategy::win(1)
         } else if census[5] > 0 {
             LocStrategy::FullChain
         } else if census[6] > 0 {
@@ -1769,12 +2292,13 @@ impl CostPolicy {
         } else {
             LocStrategy::OptimisticRead
         };
-        let (bandit_c, tel_n) = arms
+        let tel = arms
             .iter()
             .find(|(loc, _, n)| *n > ORDER_WINDOW_K || self.is_promoted(*loc))
-            .map(|(loc, _, n)| self.arm_stats(*loc, *n))
-            .unwrap_or((wide_arm_priors(0), [1.0; ARM_N]));
-        let _ = tel_n;
+            .map(|(loc, _, n)| (*loc, *n));
+        let (tel_loc, tel_n) = tel.unwrap_or((0, 0));
+        let tel_w_cap = self.w_cap_of(tel_n.max(1)) as u8;
+        let tel_seg = self.promoted.get(&tel_loc).map(|s| s.seg_star).unwrap_or(0);
         let selected_arms = arms
             .iter()
             .map(|(loc, arm, n)| format!("{loc:x}:{}/{n}", arm.label()))
@@ -1826,8 +2350,13 @@ impl CostPolicy {
             seg_locs: census[4],
             full_locs: census[5],
             defer_locs: census[6],
-            chosen_strategy: dominant.label().to_string(),
+            chosen_strategy: dominant.label(),
             chosen_win_w: dominant.window_w().min(255) as u8,
+            chosen_w_cap: tel_w_cap,
+            chosen_seg_len: tel_seg,
+            unique_win_w: win_ws.len().min(255) as u8,
+            unique_seg_len: seg_ls.len().min(255) as u8,
+            explore_budget: self.explore_budget_left.load(Ordering::Relaxed).min(255) as u8,
             pick_occ_n: 0,
             pick_gate_n: 0,
             skip_gate_n: 0,
@@ -1838,13 +2367,21 @@ impl CostPolicy {
             arm_switch_n: self.arm_switch_n.load(Ordering::Relaxed),
             explore_n: self.explore_n.load(Ordering::Relaxed),
             win2_deviate_n: self.win2_deviate_n.load(Ordering::Relaxed),
-            bandit_c_opt: bandit_c[0],
-            bandit_c_win1: bandit_c[1],
-            bandit_c_win2: bandit_c[2],
-            bandit_c_win3: bandit_c[3],
-            bandit_c_seg: bandit_c[4],
-            bandit_c_full: bandit_c[5],
-            bandit_c_defer: bandit_c[6],
+            bandit_c_opt: self.arm_c_of(tel_loc, tel_n, LocStrategy::OptimisticRead),
+            bandit_c_win1: self.arm_c_of(tel_loc, tel_n, LocStrategy::win(1)),
+            bandit_c_win2: self.arm_c_of(tel_loc, tel_n, LocStrategy::win(2)),
+            bandit_c_win3: self.arm_c_of(tel_loc, tel_n, LocStrategy::win(3)),
+            bandit_c_seg: self.arm_c_of(
+                tel_loc,
+                tel_n,
+                if tel_seg >= 2 {
+                    LocStrategy::seg(tel_seg as usize)
+                } else {
+                    LocStrategy::seg(default_seg_len(tel_n, self.cores()))
+                },
+            ),
+            bandit_c_full: self.arm_c_of(tel_loc, tel_n, LocStrategy::FullChain),
+            bandit_c_defer: self.arm_c_of(tel_loc, tel_n, LocStrategy::DeferPlant),
             selected_arms,
         }
     }
@@ -1854,31 +2391,84 @@ impl CostPolicy {
     }
 }
 
-fn eligible_arms(n_pairs: usize, demoted: bool) -> Vec<LocStrategy> {
-    let mut out = vec![LocStrategy::OptimisticRead, LocStrategy::DeferPlant];
-    if n_pairs >= 1 {
-        out.push(LocStrategy::Windowed1);
+/// G5: shared σ(ĉ) scale so equal-n arms keep ĉ order. Not `UCB_SCALE_NS`.
+fn explore_sigma(stats: &[(LocStrategy, f64, f64)]) -> f64 {
+    let mut min_c = f64::MAX;
+    let mut max_c = 0.0f64;
+    let mut measured = false;
+    for &(_, c, n) in stats {
+        if n > 1.0 {
+            measured = true;
+            min_c = min_c.min(c);
+            max_c = max_c.max(c);
+        }
     }
-    if n_pairs >= 2 {
-        out.push(LocStrategy::Windowed2);
+    if measured && max_c > min_c {
+        (max_c - min_c).clamp(1.0, PRIOR_C_WIDE_NS * 2.0)
+    } else {
+        PRIOR_C_WIDE_NS
     }
-    if n_pairs >= 3 {
-        out.push(LocStrategy::Windowed3);
-        out.push(LocStrategy::Segmented);
-    }
-    if n_pairs > 0 && n_pairs <= ORDER_WINDOW_K && !demoted {
-        out.push(LocStrategy::FullChain);
-    }
-    out
 }
 
-fn ucb_score(c: f64, n_a: f64, n_tot: f64) -> f64 {
-    let bonus = UCB_SCALE_NS * ((n_tot.max(1.0).ln().max(0.0) / n_a.max(1.0)).sqrt());
+fn explore_score(c: f64, n_a: f64, n_tot: f64, sigma: f64) -> f64 {
+    let n_a = n_a.max(1.0);
+    let bonus = sigma.max(1.0) * ((n_tot.max(1.0).ln().max(0.0) / n_a).sqrt());
     c.max(1.0) - bonus
 }
 
-/// T2: keep hops whose endpoints share a SEG_TX writer-bucket.
-fn intra_segment_pairs(pairs: &[(TxIdx, TxIdx)]) -> Vec<(TxIdx, TxIdx)> {
+fn hops_for_strategy(strategy: LocStrategy, n_pairs: usize, seg_cap: usize) -> usize {
+    match strategy {
+        LocStrategy::OptimisticRead | LocStrategy::DeferPlant => 0,
+        LocStrategy::OrderedWindow { w } => (w as usize).min(n_pairs),
+        LocStrategy::Segmented { seg_len } => {
+            segmented_hop_count(n_pairs, seg_len as usize, seg_cap)
+        }
+        LocStrategy::FullChain => n_pairs,
+    }
+}
+
+fn segmented_hop_count(n_pairs: usize, seg_len: usize, seg_cap: usize) -> usize {
+    if n_pairs == 0 || seg_len < 2 {
+        return 0;
+    }
+    let n_tx = (n_pairs + 1).min(seg_cap.saturating_mul(seg_len));
+    let full_segs = n_tx / seg_len;
+    let rem = n_tx % seg_len;
+    full_segs * seg_len.saturating_sub(1) + rem.saturating_sub(1)
+}
+
+fn default_seg_len(n_pairs: usize, cores: usize) -> usize {
+    let n_tx = n_pairs.saturating_add(1);
+    (n_tx / 2).clamp(2, cores.max(2).min(SEG_LEN_SAFETY_HAT))
+}
+
+fn select_pairs_capped(
+    strategy: LocStrategy,
+    pairs: &[(TxIdx, TxIdx)],
+    seg_cap: usize,
+) -> Vec<(TxIdx, TxIdx)> {
+    let mut pairs = pairs.to_vec();
+    pairs.sort_unstable_by_key(|(pred, _)| *pred);
+    pairs.dedup();
+    match strategy {
+        LocStrategy::OptimisticRead | LocStrategy::DeferPlant => Vec::new(),
+        LocStrategy::OrderedWindow { w } => pairs.into_iter().take(w as usize).collect(),
+        LocStrategy::FullChain => pairs,
+        LocStrategy::Segmented { seg_len } => {
+            intra_segment_pairs(&pairs, seg_len as usize, seg_cap)
+        }
+    }
+}
+
+/// T2: keep hops whose endpoints share a `seg_len` writer-bucket.
+fn intra_segment_pairs(
+    pairs: &[(TxIdx, TxIdx)],
+    seg_len: usize,
+    seg_cap: usize,
+) -> Vec<(TxIdx, TxIdx)> {
+    if seg_len < 2 {
+        return Vec::new();
+    }
     let mut writers: Vec<TxIdx> = pairs.iter().flat_map(|(a, b)| [*a, *b]).collect();
     writers.sort_unstable();
     writers.dedup();
@@ -1888,7 +2478,7 @@ fn intra_segment_pairs(pairs: &[(TxIdx, TxIdx)]) -> Vec<(TxIdx, TxIdx)> {
         .copied()
         .filter(|&(pred, succ)| match (idx(pred), idx(succ)) {
             (Some(a), Some(b)) => {
-                a / SEG_TX == b / SEG_TX && a / SEG_TX < SEG_CAP && b / SEG_TX < SEG_CAP
+                a / seg_len == b / seg_len && a / seg_len < seg_cap && b / seg_len < seg_cap
             }
             _ => false,
         })
@@ -2435,7 +3025,7 @@ mod tests {
             p.note_short_pair(0x32be, pair.0, pair.1);
         }
         // Force a Win_3 decision identity, then pay a fat prepaid wall.
-        p.remember_arm(0x32be, LocStrategy::Windowed3);
+        p.remember_arm(0x32be, LocStrategy::win(3));
         p.note_refuse_ns(200_000);
         p.note_loc_ordered_ns(0x32be, 200_000);
         p.end_block_learn();
@@ -2444,14 +3034,14 @@ mod tests {
         assert_ne!(next, LocStrategy::FullChain);
         assert_ne!(
             next,
-            LocStrategy::Windowed3,
+            LocStrategy::win(3),
             "L3/L4: high prepaid wall must raise ĉ_Win3 so another arm can win: {next:?}"
         );
         let r = p.take_report(0.0, 0);
         assert!(
             r.bandit_c_win3 > r.bandit_c_win1
                 || r.win2_deviate_n > 0
-                || next != LocStrategy::Windowed3,
+                || next != LocStrategy::win(3),
             "L7: ĉ or arm must move off hard Win_3: {r:?} next={next:?}"
         );
     }
@@ -2480,7 +3070,7 @@ mod tests {
             LocStrategy::FullChain,
             "L5: DeferPlant / Opt / Win_w can beat Full after prepaid: {next:?}"
         );
-        assert_ne!(next, LocStrategy::Windowed3);
+        assert_ne!(next, LocStrategy::win(3));
     }
 
     #[test]
@@ -2494,7 +3084,7 @@ mod tests {
             (70, 93),
             (93, 96),
         ];
-        let got = CostPolicy::select_pairs_for_strategy(LocStrategy::Segmented, &pairs);
+        let got = CostPolicy::select_pairs_for_strategy(LocStrategy::seg(4), &pairs);
         assert!(
             got.contains(&(4, 31)) && got.contains(&(31, 66)) && got.contains(&(66, 67)),
             "T2: first segment is fully ordered: {got:?}"
@@ -2506,6 +3096,231 @@ mod tests {
         assert!(
             got.contains(&(69, 70)),
             "T2: next segment still plants intra hops: {got:?}"
+        );
+    }
+
+    #[test]
+    fn w_cap_varies_with_n_pairs_and_cores() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(176, 8);
+        let thin_long = p.w_cap_of(16);
+        let thin_short = p.w_cap_of(2);
+        let mid = p.w_cap_of(4);
+        assert!(
+            thin_short < thin_long || thin_short != mid,
+            "G1: w_cap must move with n_pairs (short={thin_short} mid={mid} long={thin_long})"
+        );
+        assert_ne!(
+            thin_short, thin_long,
+            "G1: short spine w_cap != long spine w_cap"
+        );
+        p.begin_block_with_cores(32, 16);
+        let wide = p.w_cap_of(16);
+        assert!(
+            wide != thin_long || wide > 3,
+            "G1: roomier block/cores must raise w_cap above the retired WINDOWED_W_MAX=3 nail (wide={wide} thin_long={thin_long})"
+        );
+        p.begin_block_with_cores(4096, 8);
+        let fat = p.w_cap_of(16);
+        assert!(
+            fat >= 2,
+            "G1: fat block still has a usable window cap, got {fat}"
+        );
+        assert_ne!(
+            [thin_short, thin_long, wide],
+            [3, 3, 3],
+            "G1: w_cap is not a frozen Win_1..3 enum"
+        );
+    }
+
+    #[test]
+    fn generate_arms_not_fixed_seven_slot_table() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(176, 8);
+        p.promote_short_edge(0x32be, 40_000);
+        for pair in [(4, 31), (31, 66), (66, 67), (67, 69)] {
+            p.note_short_pair(0x32be, pair.0, pair.1);
+        }
+        let cold = p.generate_arms(0x32be, 4, false, true, false);
+        assert!(
+            cold.iter()
+                .any(|a| matches!(a, LocStrategy::OrderedWindow { .. })),
+            "G3: generator must propose OrderedWindow(w*), got {cold:?}"
+        );
+        assert!(
+            !cold.iter().any(|a| matches!(a, LocStrategy::FullChain)),
+            "G3: long spine never generates Full: {cold:?}"
+        );
+        assert!(
+            cold.len() != 7
+                || cold.iter().any(|a| matches!(a, LocStrategy::OrderedWindow { w } if *w != 1 && *w != 2 && *w != 3)),
+            "G3: candidate set is generated, not ARM_N=7 {{Win1,2,3}}: {cold:?}"
+        );
+        // Make the loc hot: enough samples + successful last arm.
+        {
+            let mut e = p.promoted.get_mut(&0x32be).unwrap();
+            e.samples = 4;
+            e.decision = LocStrategy::win(2);
+            e.w_star = 2;
+            e.last_crisis = false;
+            e.leftover_reexec = 0;
+            e.upsert_stat(LocStrategy::win(2), 12_000.0, 4.0);
+        }
+        let hot = p.generate_arms(0x32be, 4, false, false, false);
+        assert!(
+            !hot.iter()
+                .any(|a| a.is_high_prepaid(4) || matches!(a, LocStrategy::Segmented { .. })),
+            "E3: hot path must not generate Seg/Full/wide windows: {hot:?}"
+        );
+        assert!(
+            hot.iter().any(|a| *a == LocStrategy::win(2)),
+            "E1: hot generator keeps posterior w*: {hot:?}"
+        );
+        assert!(
+            !hot.iter().any(|a| *a == LocStrategy::win(3)),
+            "E3: hot must not grow w+1 for fun: {hot:?}"
+        );
+    }
+
+    #[test]
+    fn hot_phase_is_greedy_zero_explore() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(176, 8);
+        p.promote_short_edge(0x32be, 40_000);
+        for pair in [(4, 31), (31, 66), (66, 67), (67, 69)] {
+            p.note_short_pair(0x32be, pair.0, pair.1);
+        }
+        {
+            let mut e = p.promoted.get_mut(&0x32be).unwrap();
+            e.samples = 5;
+            e.decision = LocStrategy::win(2);
+            e.prev_decision = LocStrategy::win(2);
+            e.w_star = 2;
+            e.last_crisis = false;
+            e.leftover_reexec = 0;
+            e.upsert_stat(LocStrategy::win(1), 40_000.0, 3.0);
+            e.upsert_stat(LocStrategy::win(2), 10_000.0, 5.0);
+            e.upsert_stat(LocStrategy::OptimisticRead, 80_000.0, 3.0);
+            e.upsert_stat(LocStrategy::DeferPlant, 80_000.0, 3.0);
+        }
+        let (hot, crisis) = p.phase_of(0x32be);
+        assert!(hot && !crisis, "E1: enough samples + last arm OK is hot");
+        let (arm, explore, greedy) = p.select_arm(0x32be, 4);
+        assert!(!explore, "E1: hot explore → 0, got explore arm={arm:?}");
+        assert_eq!(arm, greedy);
+        assert_eq!(
+            arm,
+            LocStrategy::win(2),
+            "E1: hot greedy min-ĉ sticks at proven Win_2, got {arm:?}"
+        );
+        p.remember_arm(0x32be, arm);
+        let r = p.take_report(0.0, 0);
+        assert_eq!(
+            r.explore_budget, 0,
+            "E2: 176 txs / 8 cores is oversubscribed → hot budget 0"
+        );
+    }
+
+    #[test]
+    fn seg_len_and_candidates_change_with_spine() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(176, 8);
+        let short_s = default_seg_len(3, 8);
+        let long_s = default_seg_len(16, 8);
+        assert_ne!(
+            short_s, long_s,
+            "G2: seg_len prior is not SEG_TX=4 for every spine (short={short_s} long={long_s})"
+        );
+        p.promote_short_edge(0xaaaa, 20_000);
+        for pair in [(1, 2), (2, 3), (3, 4)] {
+            p.note_short_pair(0xaaaa, pair.0, pair.1);
+        }
+        p.promote_short_edge(0xbbbb, 20_000);
+        for i in 0..12 {
+            p.note_short_pair(0xbbbb, 10 + i, 11 + i);
+        }
+        let short_cands = p.generate_arms(0xaaaa, 3, false, true, false);
+        let long_cands = p.generate_arms(0xbbbb, 12, false, true, false);
+        let short_ws: Vec<u8> = short_cands
+            .iter()
+            .filter_map(|a| match a {
+                LocStrategy::OrderedWindow { w } => Some(*w),
+                _ => None,
+            })
+            .collect();
+        let long_ws: Vec<u8> = long_cands
+            .iter()
+            .filter_map(|a| match a {
+                LocStrategy::OrderedWindow { w } => Some(*w),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            short_ws != long_ws || p.w_cap_of(3) != p.w_cap_of(12),
+            "G1/G3: shorter vs longer spine changes w_cap or window candidates (short={short_ws:?} long={long_ws:?})"
+        );
+        let short_segs: Vec<u8> = short_cands
+            .iter()
+            .filter_map(|a| match a {
+                LocStrategy::Segmented { seg_len } => Some(*seg_len),
+                _ => None,
+            })
+            .collect();
+        let long_segs: Vec<u8> = long_cands
+            .iter()
+            .filter_map(|a| match a {
+                LocStrategy::Segmented { seg_len } => Some(*seg_len),
+                _ => None,
+            })
+            .collect();
+        assert_ne!(
+            short_segs, long_segs,
+            "G2: Seg(seg_len) candidates move with spine length (short={short_segs:?} long={long_segs:?})"
+        );
+    }
+
+    #[test]
+    fn morph_prior_seeds_new_location() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(176, 8);
+        p.promote_short_edge(0x32be, 40_000);
+        for pair in [(4, 31), (31, 66), (66, 67), (67, 69)] {
+            p.note_short_pair(0x32be, pair.0, pair.1);
+        }
+        p.remember_arm(0x32be, LocStrategy::win(2));
+        {
+            let mut e = p.promoted.get_mut(&0x32be).unwrap();
+            e.samples = 4;
+            e.w_star = 2;
+            e.upsert_stat(LocStrategy::win(2), 11_000.0, 4.0);
+            e.upsert_stat(LocStrategy::OptimisticRead, 90_000.0, 3.0);
+        }
+        p.end_block_learn();
+        // New long-spine ℓ inherits the morph prior — not a from-zero table.
+        p.ensure_promoted_seeded(0xfeed, 4);
+        let seeded = p.promoted.get(&0xfeed).unwrap();
+        assert_eq!(
+            seeded.w_star, 2,
+            "G4: new ℓ inherits morph w*, got {}",
+            seeded.w_star
+        );
+        let (c, n) = seeded.stat(LocStrategy::win(2)).expect("inherited Win_2");
+        assert!(
+            n > 1.0 && c < 20_000.0,
+            "G4: inherited Win_2 ĉ/n from morph (c={c} n={n})"
+        );
+    }
+
+    #[test]
+    fn explore_budget_zero_when_oversubscribed() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(176, 8);
+        assert_eq!(p.explore_budget(), 0, "E2: 176/8 oversub → B=0");
+        p.begin_block_with_cores(32, 16);
+        assert!(
+            p.explore_budget() >= 1,
+            "E2: roomier cores/block may explore, got {}",
+            p.explore_budget()
         );
     }
 }

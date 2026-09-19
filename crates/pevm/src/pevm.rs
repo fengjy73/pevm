@@ -489,7 +489,8 @@ impl Pevm {
             sketch.seed_from_prior_morph(&self.inter_prior.top_locations(), flipped, quiet);
             // Bayes → admit_seed before any Execute (v9.1). Known stars keep
             // PE even on quiet morph (M4). Truly cold seeds nothing.
-            self.cost_policy.begin_block(block_size);
+            self.cost_policy
+                .begin_block_with_cores(block_size, concurrency_level.get());
             // Thin CallWaw chain needs hints only (P2: skip contract walk).
             // PROFILE Instant only (product path must not pay begin Instant).
             {

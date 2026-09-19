@@ -16,7 +16,7 @@ use super::bayes::BayesMap;
 use super::feeder::{seed_known_stars, top_is_known_star};
 use super::learner::{InterBlockPrior, LiveLearner};
 use super::metrics::MetricsInner;
-use super::policy::{CohortKind, CostPolicy, ORDER_WINDOW_K, THIN_ORDERED_K, WINDOWED_W_MAX};
+use super::policy::{CohortKind, CostPolicy, ORDER_WINDOW_K, THIN_ORDERED_K};
 use super::producer_stage::ProducerStageTable;
 use super::ready_edge::ReadyEdgeTable;
 use super::wave::WaveParkTable;
@@ -377,7 +377,7 @@ fn admit_seed_hint_short_edges(
         if !policy.should_gate_short_after_write(loc, false, n.saturating_sub(1)) {
             continue;
         }
-        let plant = CostPolicy::select_pairs_for_strategy(arm, &pairs);
+        let plant = policy.plant_pairs(arm, &pairs);
         let mut planted = 0usize;
         for (pred, succ) in plant {
             ready.note_consumer_on(succ, pred, Some(loc));
@@ -436,7 +436,7 @@ fn admit_seed_promoted_short_edges(
         }
         policy.note_hops_decision(loc, n_pairs);
         let strategy = policy.loc_strategy(loc, n_pairs);
-        let plant = CostPolicy::select_pairs_for_strategy(strategy, &pairs);
+        let plant = policy.plant_pairs(strategy, &pairs);
         for (pred, succ) in plant {
             ready.note_consumer_on(succ, pred, Some(loc));
             policy.note_short_edge_admit();
@@ -871,7 +871,7 @@ pub(crate) fn queue_nearest_unfinished_successor(
     }
     let w = policy
         .window_w_of(location, n_pairs)
-        .clamp(1, WINDOWED_W_MAX);
+        .clamp(1, policy.w_cap_of(n_pairs).max(1));
     let mut hops: Vec<(TxIdx, TxIdx)> = policy
         .pairs_of(location)
         .into_iter()
@@ -920,7 +920,9 @@ pub(crate) fn flush_pending_idle_edges(ready: &ReadyEdgeTable, policy: &CostPoli
         if policy.hops_to_plant(loc, n_pairs) == 0 {
             continue;
         }
-        let cap = policy.window_w_of(loc, n_pairs).clamp(1, WINDOWED_W_MAX);
+        let cap = policy
+            .window_w_of(loc, n_pairs)
+            .clamp(1, policy.w_cap_of(n_pairs).max(1));
         if pairs.len() > cap {
             pairs.truncate(cap);
         }
@@ -1885,8 +1887,8 @@ mod tests {
             None,
         );
         assert!(
-            n >= 1 && n <= WINDOWED_W_MAX,
-            "T1: reuse plants Win_w hops (1..3), got {n}"
+            n >= 1 && n < 4,
+            "T1: reuse plants OrderedWindow hops, not the full 4-pair list, got {n}"
         );
         assert_eq!(
             ready.blocking_producer(31),
@@ -1949,7 +1951,7 @@ mod tests {
             .filter(|&&t| !ready.may_execute(t))
             .count();
         assert!(
-            extra_blocked <= 2 && n <= WINDOWED_W_MAX + 2 + 1,
+            extra_blocked <= 2 && n <= policy.w_cap_of(3) + 2 + 1,
             "C5: thin reuse plants ≤K locations; long spine is Win_w (extras_blocked={extra_blocked} edges={n})"
         );
     }
