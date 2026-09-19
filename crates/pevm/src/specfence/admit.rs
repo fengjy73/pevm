@@ -301,12 +301,14 @@ pub(crate) fn admit_seed_begin_block(
                 }
                 ready.note_raw_producer(basic, producer);
                 queued.insert(producer);
-                for &t in &c.txs[1..] {
-                    if queued.contains(&t) {
-                        continue;
-                    }
-                    ready.note_consumer_on(t, producer, Some(basic));
-                    queued.insert(t);
+                // Probe the first successor only. A full-envelope star
+                // (ERC-20 independent) serializes the block and livelocks
+                // dual-path skip — OrderedAdmit is an edge, not a fan.
+                if let Some(&succ) = c.txs.get(1)
+                    && !queued.contains(&succ)
+                {
+                    ready.note_consumer_on(succ, producer, Some(basic));
+                    queued.insert(succ);
                     edges += 1;
                 }
             }
@@ -1073,7 +1075,7 @@ mod tests {
     }
 
     #[test]
-    fn calldata_fanout_star_keeps_raw_cover() {
+    fn calldata_fanout_stays_optimistic_read() {
         let ready = ReadyEdgeTable::new();
         let stages = ProducerStageTable::new();
         let learner = LiveLearner::new();
@@ -1096,17 +1098,16 @@ mod tests {
             &hints,
             &HashSet::new(),
         );
-        assert!(n >= 15);
-        assert_eq!(
-            ready.blocking_producer(15),
-            Some(0),
-            "RAW fan-out stays a star on the first producer"
-        );
-        let basic = hash_deterministic(MemoryLocation::Basic(token));
+        assert_eq!(n, 0, "wide RAW fan stays OptimisticRead (ERC-20 / P1): {n}");
         assert!(
-            learner.predicted_essential(basic, FAN_STAR_K),
-            "RAW star still plants Basic PE (not a storage clone)"
+            ready.may_execute(15),
+            "same-to calldata independents must not wait on tx 0"
         );
+        assert!(
+            ready.blocking_producer(15).is_none(),
+            "must not plant a 16-wide probe star"
+        );
+        let _ = (learner, token);
     }
 
     #[test]
@@ -1344,7 +1345,7 @@ mod tests {
             &hints_star,
             &HashSet::new(),
         );
-        assert!(n >= 15);
+        assert_eq!(n, 0, "wide RAW calldata fan stays OptimisticRead, got {n}");
         let ready_side = ReadyEdgeTable::new();
         let stages_side = ProducerStageTable::new();
         let side_hints = AccountHints::from_account_txs(side, vec![1, 5, 8]);

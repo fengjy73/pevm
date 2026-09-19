@@ -18,6 +18,13 @@ use crate::{
 /// After refuse, steal one nearby independent. No full-block scan (PRIMARY tax).
 const WAVE_FILL_WINDOW: usize = 32;
 
+/// Result of the exhausted-idx Ready scan.
+enum MinRun {
+    Hit(TxIdx),
+    Empty,
+    Busy,
+}
+
 // The Pevm collaborative scheduler coordinates execution & validation
 // tasks among work threads.
 //
@@ -75,6 +82,11 @@ pub(crate) struct Scheduler {
     // True if the scheduler has been aborted, likely due to fatal execution
     // errors.
     aborted: AtomicBool,
+    /// Cursor for the exhausted-idx Ready scan (skip already-done txs).
+    ready_hint: AtomicUsize,
+    /// Single-flight the O(n) Ready scan so 8 workers cannot mutex-walk
+    /// a 37k ERC-20 block on every yield.
+    ready_scan: AtomicBool,
 }
 
 // TODO: Better error handling.
@@ -102,6 +114,8 @@ impl Scheduler {
             min_validation_idx: AtomicUsize::new(block_size),
             num_validated: AtomicUsize::new(0),
             aborted: AtomicBool::new(false),
+            ready_hint: AtomicUsize::new(0),
+            ready_scan: AtomicBool::new(false),
         }
     }
 
@@ -277,15 +291,17 @@ impl Scheduler {
                 let validated_done = self.num_validated.load(Ordering::Relaxed)
                     >= self.block_size - self.min_validation_idx.load(Ordering::Relaxed);
                 if !waiting {
-                    if let Some(idx) = self.min_runnable(ready) {
-                        self.execution_idx.fetch_min(idx, Ordering::Relaxed);
-                        if let Some(wave) = wave {
-                            wave.push_ready(idx);
+                    match self.min_runnable(ready) {
+                        MinRun::Hit(idx) => {
+                            self.execution_idx.fetch_min(idx, Ordering::Relaxed);
+                            if let Some(wave) = wave {
+                                wave.push_ready(idx);
+                            }
+                            continue;
                         }
-                        continue;
-                    }
-                    if validated_done {
-                        break;
+                        MinRun::Busy => {}
+                        MinRun::Empty if validated_done => break,
+                        MinRun::Empty => {}
                     }
                 }
                 // Waiting on an OrderedAdmit producer: spin first so 7
@@ -680,8 +696,38 @@ impl Scheduler {
     /// Lowest runnable ReadyToExecute index. Exhausted-idx safety net so a
     /// skipped-but-open gate or aborted incarnation cannot leave ESTIMATE.
     /// Gated-not-ready holes stay sleeping (not a livelock rewind).
-    fn min_runnable(&self, ready: Option<&ReadyEdgeTable>) -> Option<TxIdx> {
-        (0..self.block_size).find(|&i| self.is_ready(i) && ready.is_none_or(|e| e.may_execute(i)))
+    ///
+    /// Single-flight + lock-free done skip: a 37k ERC-20 block must not pay
+    /// 8× full mutex walks on every yield.
+    fn min_runnable(&self, ready: Option<&ReadyEdgeTable>) -> MinRun {
+        if self.ready_scan.swap(true, Ordering::AcqRel) {
+            return MinRun::Busy;
+        }
+        let start = self.ready_hint.load(Ordering::Relaxed);
+        let start = if start < self.block_size { start } else { 0 };
+        let mut found = None;
+        for off in 0..self.block_size {
+            let i = start + off;
+            let i = if i >= self.block_size {
+                i - self.block_size
+            } else {
+                i
+            };
+            if self.is_done(i) || self.is_validated(i) {
+                continue;
+            }
+            if self.is_ready(i) && ready.is_none_or(|e| e.may_execute(i)) {
+                found = Some(i);
+                self.ready_hint
+                    .store(i.saturating_add(1), Ordering::Relaxed);
+                break;
+            }
+        }
+        self.ready_scan.store(false, Ordering::Release);
+        match found {
+            Some(i) => MinRun::Hit(i),
+            None => MinRun::Empty,
+        }
     }
 
     /// True when the incarnation is queued `ReadyToExecute` (S1 prefer-admit).

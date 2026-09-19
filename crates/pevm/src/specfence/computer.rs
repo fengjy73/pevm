@@ -25,10 +25,9 @@ pub(crate) fn next_sf_task(
     metrics: Option<&MetricsInner>,
 ) -> Option<Task> {
     let refuse_before = ready.refuse_count();
-    // S1: no gated txs → OCC idx pick. When gates exist, `next_task_with_wave_ready`
-    // is still the **same spine**: ungated txs keep the OCC collaborative pick;
-    // wave/refuse applies only to `is_gated` holes (not a global mode switch).
-    if !stages.has_reserved() && !ready.has_any_gated() {
+    // S1/P1: no *pending* holes → OCC idx pick. Finished gates are not a
+    // global mode switch — independents return to `next_occ_task`.
+    if !stages.has_reserved() && !ready.has_pending_gated() {
         return scheduler.next_task();
     }
     // A0-majority / no RAW-fan reservation: OCC-class pick (no empty DashMap scan).

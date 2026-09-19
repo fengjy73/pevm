@@ -928,6 +928,13 @@ impl CostPolicy {
         if cohort_len < 2 {
             return AdmitAction::OptimisticRead;
         }
+        // Wide RAW fans (ERC-20 independent / same-`to` calldata) stay
+        // OptimisticRead. A probe star of thousands serializes the block and
+        // livelocks dual-path skip — do not "fill cores" by widening OrderedAdmit.
+        if kind == CohortKind::RawFan {
+            self.optimistic_read_cohorts.fetch_add(1, Ordering::Relaxed);
+            return AdmitAction::OptimisticRead;
+        }
         // PC-2: envelope empty-to on an EOA is LazyRecipient — never A1.
         if kind == CohortKind::EmptyTo && !is_contract {
             self.optimistic_read_cohorts.fetch_add(1, Ordering::Relaxed);
@@ -1855,6 +1862,21 @@ mod tests {
         assert!(
             p.choose_ordered(CohortKind::EmptyTo, addr, 16, true, 0.30),
             "full-shell contract empty-to n=16 stays A1"
+        );
+    }
+
+    #[test]
+    fn wide_raw_fan_stays_optimistic() {
+        let p = CostPolicy::new();
+        p.begin_block(4096);
+        let addr = Address::repeat_byte(0x32);
+        assert!(
+            !p.choose_ordered(CohortKind::RawFan, addr, 16, true, 0.50),
+            "wide RAW fan (ERC-20 independent class) must stay OptimisticRead"
+        );
+        assert!(
+            !p.choose_ordered(CohortKind::RawFan, addr, 37123, true, 0.90),
+            "37k same-to calldata must not plant a probe star"
         );
     }
 

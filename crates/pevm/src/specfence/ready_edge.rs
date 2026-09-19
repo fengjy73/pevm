@@ -21,6 +21,9 @@ const NONE: usize = usize::MAX;
 /// Bitset words for ordered-admit gated txs (64×64 = 4096). Beyond this,
 /// `is_gated` falls back to the consumer map.
 const GATED_WORDS: usize = 64;
+/// Cap the skip-sleeping set. Dual-path fetch_max must not park a
+/// thousands-wide RAW fan into an O(n) wake scan (ERC-20 livelock).
+const SLEEP_CAP: usize = 64;
 
 /// `(consumer_t) ← producer_t` on PE / RAW class.
 #[derive(Debug)]
@@ -69,6 +72,9 @@ pub(crate) struct ReadyEdgeTable {
     gated_bits: [AtomicU64; GATED_WORDS],
     /// Live gated-tx count (P1/P3: A1=0 → OCC-class pick, no ReadyEdge walk).
     gated_n: AtomicUsize,
+    /// Gated txs that have not yet `mark_done`. Gates are edge constraints:
+    /// when this hits 0, pick returns to `next_occ_task` even if bits remain.
+    pending_gated: AtomicUsize,
     /// Done writers (bitset). A0 finish is an atomic or — no `finished` DashMap.
     done_bits: [AtomicU64; GATED_WORDS],
     /// Execute started (bitset). Write-set must not refuse an in-flight succ.
@@ -102,6 +108,7 @@ impl Default for ReadyEdgeTable {
             waiters: DashMap::default(),
             gated_bits: std::array::from_fn(|_| AtomicU64::new(0)),
             gated_n: AtomicUsize::new(0),
+            pending_gated: AtomicUsize::new(0),
             done_bits: std::array::from_fn(|_| AtomicU64::new(0)),
             started_bits: std::array::from_fn(|_| AtomicU64::new(0)),
         }
@@ -287,9 +294,11 @@ impl ReadyEdgeTable {
             let prev = self.gated_bits[i].fetch_or(bit, Ordering::Release);
             if prev & bit == 0 {
                 self.gated_n.fetch_add(1, Ordering::Relaxed);
+                self.pending_gated.fetch_add(1, Ordering::Relaxed);
             }
         } else if !self.consumers.contains_key(&tx) {
             self.gated_n.fetch_add(1, Ordering::Relaxed);
+            self.pending_gated.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -310,6 +319,13 @@ impl ReadyEdgeTable {
     #[inline]
     pub(crate) fn has_any_gated(&self) -> bool {
         self.gated_n.load(Ordering::Relaxed) > 0
+    }
+
+    /// Unfinished OrderedAdmit holes. Cleared as each gated tx `mark_done`s
+    /// so independents return to `next_occ_task` (S1/P1 — not a mode switch).
+    #[inline]
+    pub(crate) fn has_pending_gated(&self) -> bool {
+        self.pending_gated.load(Ordering::Relaxed) > 0
     }
 
     /// Stamp Done without waiter wake (A0 OCC wrap / P3).
@@ -376,12 +392,29 @@ impl ReadyEdgeTable {
 
     #[inline]
     fn mark_done(&self, writer: TxIdx) {
-        let i = writer / 64;
-        if i < self.done_bits.len() {
-            let bit = 1u64 << (writer % 64);
-            self.done_bits[i].fetch_or(bit, Ordering::Release);
-        } else {
-            self.finished.insert(writer, ());
+        let newly = {
+            let i = writer / 64;
+            if i < self.done_bits.len() {
+                let bit = 1u64 << (writer % 64);
+                let prev = self.done_bits[i].fetch_or(bit, Ordering::Release);
+                prev & bit == 0
+            } else {
+                self.finished.insert(writer, ()).is_none()
+            }
+        };
+        if newly && self.is_gated(writer) {
+            let mut cur = self.pending_gated.load(Ordering::Relaxed);
+            while cur > 0 {
+                match self.pending_gated.compare_exchange_weak(
+                    cur,
+                    cur - 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(v) => cur = v,
+                }
+            }
         }
     }
 
@@ -435,7 +468,11 @@ impl ReadyEdgeTable {
         if self.sleeping.contains(&tx_idx) {
             return;
         }
-        self.sleeping.insert(tx_idx);
+        // Bound the sleeper set so a slipped-through RAW fan cannot turn
+        // every yield into an O(n) DashMap walk.
+        if self.sleeping.len() < SLEEP_CAP {
+            self.sleeping.insert(tx_idx);
+        }
         self.refuse.fetch_add(1, Ordering::Relaxed);
         self.skip_gate_n.fetch_add(1, Ordering::Relaxed);
         self.stall_start.entry(tx_idx).or_insert_with(Instant::now);
@@ -452,9 +489,12 @@ impl ReadyEdgeTable {
         if self.sleeping.is_empty() {
             return 0;
         }
+        // Producer waiters are the real wake path. This scan is a self-heal
+        // for a small hole set — never a full-envelope walk.
         let ready: Vec<TxIdx> = self
             .sleeping
             .iter()
+            .take(SLEEP_CAP)
             .filter_map(|t| {
                 let t = *t;
                 self.may_execute(t).then_some(t)
@@ -876,7 +916,13 @@ mod tests {
         t.note_consumer(3, 1);
         assert!(t.is_gated(3));
         assert!(t.has_any_gated());
+        assert!(t.has_pending_gated());
         assert!(!t.may_execute(3));
+        t.note_producer_done_stamp(3);
+        assert!(
+            !t.has_pending_gated(),
+            "S1: finished hole returns pick to OCC"
+        );
         t.force_optimistic(3);
         assert!(
             t.may_execute(3),
