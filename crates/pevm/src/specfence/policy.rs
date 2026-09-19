@@ -945,6 +945,13 @@ impl CostPolicy {
             self.optimistic_read_cohorts.fetch_add(1, Ordering::Relaxed);
             return AdmitAction::OptimisticRead;
         }
+        // Wide nonce chains (ERC-20 clusters: 15 transfers/person) stay
+        // OptimisticRead. Full-shell priors would otherwise plant tens of
+        // thousands of predecessor edges and livelock dual-path skip.
+        if kind == CohortKind::SameFrom && cohort_len >= 8 {
+            self.optimistic_read_cohorts.fetch_add(1, Ordering::Relaxed);
+            return AdmitAction::OptimisticRead;
+        }
         // A0-majority: 2-tx calldata pairs stay A0 (K reserved for ≥3 spines).
         if self.is_optimistic_majority_block() && kind == CohortKind::CallWaw && cohort_len < 3 {
             self.optimistic_read_cohorts.fetch_add(1, Ordering::Relaxed);
@@ -1877,6 +1884,10 @@ mod tests {
         assert!(
             !p.choose_ordered(CohortKind::RawFan, addr, 37123, true, 0.90),
             "37k same-to calldata must not plant a probe star"
+        );
+        assert!(
+            !p.choose_ordered(CohortKind::SameFrom, addr, 15, false, 0.50),
+            "wide same-from (ERC-20 clusters) must stay OptimisticRead"
         );
     }
 

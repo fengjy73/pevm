@@ -300,7 +300,9 @@ impl Scheduler {
                             continue;
                         }
                         MinRun::Busy => {}
-                        MinRun::Empty if validated_done => break,
+                        MinRun::Empty if validated_done && !self.has_undone() => {
+                            break;
+                        }
                         MinRun::Empty => {}
                     }
                 }
@@ -728,6 +730,13 @@ impl Scheduler {
             Some(i) => MinRun::Hit(i),
             None => MinRun::Empty,
         }
+    }
+
+    /// Lock-free: any tx still Ready / Executing / Aborting.
+    /// Do not exit pick while an incarnation is unfinished (ERC-20 OCC).
+    #[inline]
+    fn has_undone(&self) -> bool {
+        (0..self.block_size).any(|i| !self.is_done(i) && !self.is_validated(i))
     }
 
     /// True when the incarnation is queued `ReadyToExecute` (S1 prefer-admit).

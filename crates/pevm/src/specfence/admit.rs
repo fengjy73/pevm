@@ -324,7 +324,8 @@ pub(crate) fn admit_seed_begin_block(
             CohortKind::SameFrom => {
                 let basic = hash_deterministic(MemoryLocation::Basic(c.addr));
                 ready.note_raw_producer(basic, c.txs[0]);
-                edges += note_predecessor_chain(ready, &c.txs, basic, &mut queued, false);
+                // Short hop only — never a full nonce spine (ERC-20 clusters).
+                edges += note_predecessor_chain(ready, &c.txs, basic, &mut queued, true);
             }
         }
         let _ = c.is_contract;
@@ -456,8 +457,10 @@ pub(crate) fn admit_seed_on_abort(
         return;
     }
     ready.note_raw_producer(location, producer);
-    ready.note_consumer(consumer, producer);
-    stages.reserve(producer);
+    // D1 tip only. `note_consumer` + ProducerStage reserve here is a
+    // mid-execute ReadyEdge plant — banned (ERC-20 / iter11 livelock).
+    // The aborted consumer OCC-reexecs; persist/queue is next-begin.
+    let _ = (stages, consumer);
 }
 
 /// Intra-block Detect from a published write-set.
@@ -512,7 +515,8 @@ pub(crate) fn admit_seed_on_write_set(
         // PC-2 / PC-5: 2-tx pairs and empty-calldata same-from stay A0 even
         // when nonce/balance is Data — refuse meta loses to one OCC abort.
         let from_txs = hints.from_txs(&from);
-        if from_txs.len() >= 3 && !hints.cohort_all_empty(from_txs) {
+        // Wide nonce chains stay OptimisticRead (ERC-20 clusters).
+        if (3..8).contains(&from_txs.len()) && !hints.cohort_all_empty(from_txs) {
             ready.note_immediate_pred(from_loc, writer);
         }
     }
@@ -533,12 +537,12 @@ pub(crate) fn admit_seed_on_write_set(
         .filter(|&l| l != from_loc)
         .collect();
 
-    // RAW fan-out star: keep all consumers behind the first producer.
+    // Wide RAW fan (ERC-20): D1 only. Mid-execute ReadyEdge on a
+    // thousands-wide same-`to` livelocks dual-path skip (P1 ban).
     if hints.call_to_txs(&to).len() >= RAW_FANOUT_FLOOR {
         for loc in hidden_eff {
             ready.note_raw_producer(loc, writer);
             ready.note_location_writer(loc, writer);
-            ready.note_immediate_pred(loc, writer);
         }
         if let Some(p) = policy {
             p.note_eff_waw(CohortKind::RawFan, to, true);

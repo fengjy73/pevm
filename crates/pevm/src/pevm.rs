@@ -620,16 +620,17 @@ impl Pevm {
                                     let done_idx = tx_version.tx_idx;
                                     let next = self
                                         .try_execute(&mut vm, &scheduler, tx_version, None, None);
-                                    if self.concurrency_mode == ConcurrencyMode::SpecFence {
-                                        // P1: always stamp. Wake only if this writer
-                                        // has waiters (insert-during-execute still wakes).
+                                    if self.concurrency_mode == ConcurrencyMode::SpecFence
+                                        && scheduler.is_done(done_idx)
+                                    {
+                                        // Wake only after a successful incarnation.
+                                        // Stamping Done on abort lets dependents
+                                        // OCC-steal against ESTIMATE → seq≠par.
                                         specfence.ready_edges.note_producer_done_stamp(done_idx);
-                                        if specfence.ready_edges.has_known_waiters(done_idx) {
-                                            if let Some(w) = wave_ref {
-                                                specfence
-                                                    .ready_edges
-                                                    .note_producer_done(done_idx, w);
-                                            }
+                                        if specfence.ready_edges.has_known_waiters(done_idx)
+                                            && let Some(w) = wave_ref
+                                        {
+                                            specfence.ready_edges.note_producer_done(done_idx, w);
                                         }
                                     }
                                     next
@@ -642,13 +643,13 @@ impl Pevm {
                                     let next = self.try_execute(
                                         &mut vm, &scheduler, tx_version, wave_ref, fence_ref,
                                     );
-                                    // Gated producer must still wake dependents
-                                    // (dual-path may have fetch_max'd past them).
-                                    specfence.ready_edges.note_producer_done_stamp(done_idx);
-                                    if specfence.ready_edges.has_known_waiters(done_idx)
-                                        && let Some(w) = wave_ref
-                                    {
-                                        specfence.ready_edges.note_producer_done(done_idx, w);
+                                    if scheduler.is_done(done_idx) {
+                                        specfence.ready_edges.note_producer_done_stamp(done_idx);
+                                        if specfence.ready_edges.has_known_waiters(done_idx)
+                                            && let Some(w) = wave_ref
+                                        {
+                                            specfence.ready_edges.note_producer_done(done_idx, w);
+                                        }
                                     }
                                     next
                                 }
