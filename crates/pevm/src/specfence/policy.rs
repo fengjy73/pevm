@@ -921,7 +921,10 @@ impl CostPolicy {
         let n_tx = self.block_n().max(1);
         let oversub = n_tx / cores;
         // Oversubscribed blocks: smaller useful windows (protect prepaid wall).
-        let core_hat = if oversub >= 8 {
+        // 176/8≈22 → hat 2 (PR27 Win_2 class), not a frozen WINDOWED_W_MAX.
+        let core_hat = if oversub >= 16 {
+            2
+        } else if oversub >= 8 {
             (cores / 2).max(2)
         } else {
             cores.max(2)
@@ -1248,8 +1251,8 @@ impl CostPolicy {
             .map(|s| s.reexec_ns_ema.max(1.0))
             .unwrap_or(1.0);
         // Floor unused wider/high-prepaid arms to the last paid ĉ unless a
-        // leftover-*abort* crisis says the window is too narrow. Structural
-        // leftover hops on a long spine are not a license to invent cheap Win_3.
+        // confidence crisis says the window is too narrow. Leftover OCC on a
+        // proven window (w≥2) is expected and must not invent cheap Win_3.
         let leftover0 = loc
             .as_ref()
             .is_some_and(|s| s.decision.is_ordered() && !s.last_crisis && s.block_reexec_n < 2);
@@ -2148,17 +2151,26 @@ impl CostPolicy {
             e.samples = e.samples.saturating_add(1);
             let n_pairs = self.short_chain.get(e.key()).map(|c| c.len()).unwrap_or(0);
             let planted = hops_for_strategy(e.decision, n_pairs, self.seg_cap());
-            e.leftover_reexec = n_pairs.saturating_sub(planted) as u32;
+            let leftover_hops = n_pairs.saturating_sub(planted);
+            e.leftover_reexec = leftover_hops as u32;
             if e.block_reexec_n > 0 {
                 e.leftover_reexec = e.leftover_reexec.max(e.block_reexec_n);
             } else if e.decision.is_ordered() {
                 e.leftover_reexec = 0;
             }
-            // Crisis = leftover *aborts* after OrderedAdmit, not leftover hops.
-            e.last_crisis = (e.decision.is_ordered() && e.block_reexec_n >= 2)
-                || (e.decision == LocStrategy::OptimisticRead
-                    && e.block_reexec_n >= 2
-                    && e.samples >= 2);
+            // E1: leftover OCC on an ordered tail is expected (prefix fence).
+            // Crisis = last arm not OK: Opt still aborting, unfenced train
+            // (window too short), or a still-narrow w=1 leaking leftover OCC.
+            let unfenced = self.unfenced_reexec.load(Ordering::Relaxed);
+            e.last_crisis = match e.decision {
+                LocStrategy::OptimisticRead | LocStrategy::DeferPlant => {
+                    e.block_reexec_n >= 2 && e.samples >= 2
+                }
+                LocStrategy::OrderedWindow { w } => {
+                    unfenced >= 4 || (w <= 1 && e.block_reexec_n >= 2 && leftover_hops >= 2)
+                }
+                LocStrategy::Segmented { .. } | LocStrategy::FullChain => unfenced >= 4,
+            };
             e.morph = morph_key(n_pairs);
             // Safety: Full on a long spine (should be ineligible) stays demoted.
             if e.decision == LocStrategy::FullChain && n_pairs > ORDER_WINDOW_K {
@@ -3109,32 +3121,26 @@ mod tests {
         let p = CostPolicy::new();
         p.begin_block_with_cores(176, 8);
         let thin_long = p.w_cap_of(16);
-        let thin_short = p.w_cap_of(2);
-        let mid = p.w_cap_of(4);
-        assert!(
-            thin_short < thin_long || thin_short != mid,
-            "G1: w_cap must move with n_pairs (short={thin_short} mid={mid} long={thin_long})"
+        let thin_one = p.w_cap_of(1);
+        assert_eq!(
+            thin_long, 2,
+            "G1: 176/8 oversub hat is 2 (not frozen WINDOWED_W_MAX=3), got {thin_long}"
         );
         assert_ne!(
-            thin_short, thin_long,
-            "G1: short spine w_cap != long spine w_cap"
+            thin_one, thin_long,
+            "G1: 1-pair w_cap != long-spine w_cap ({thin_one} vs {thin_long})"
         );
         p.begin_block_with_cores(32, 16);
         let wide = p.w_cap_of(16);
         assert!(
-            wide != thin_long || wide > 3,
-            "G1: roomier block/cores must raise w_cap above the retired WINDOWED_W_MAX=3 nail (wide={wide} thin_long={thin_long})"
+            wide > thin_long && wide > 3,
+            "G1: roomier block/cores must raise w_cap above oversub hat and the retired WINDOWED_W_MAX=3 (wide={wide} thin_long={thin_long})"
         );
         p.begin_block_with_cores(4096, 8);
         let fat = p.w_cap_of(16);
         assert!(
-            fat >= 2,
-            "G1: fat block still has a usable window cap, got {fat}"
-        );
-        assert_ne!(
-            [thin_short, thin_long, wide],
-            [3, 3, 3],
-            "G1: w_cap is not a frozen Win_1..3 enum"
+            fat >= 2 && fat != wide,
+            "G1: fat/oversub vs roomy w_cap differ (fat={fat} wide={wide})"
         );
     }
 
@@ -3229,9 +3235,9 @@ mod tests {
     #[test]
     fn seg_len_and_candidates_change_with_spine() {
         let p = CostPolicy::new();
-        p.begin_block_with_cores(176, 8);
-        let short_s = default_seg_len(3, 8);
-        let long_s = default_seg_len(16, 8);
+        p.begin_block_with_cores(32, 16);
+        let short_s = default_seg_len(3, 16);
+        let long_s = default_seg_len(16, 16);
         assert_ne!(
             short_s, long_s,
             "G2: seg_len prior is not SEG_TX=4 for every spine (short={short_s} long={long_s})"
@@ -3325,6 +3331,52 @@ mod tests {
             n > 1.0 && c < 20_000.0,
             "G4: inherited Win_2 ĉ/n from morph (c={c} n={n})"
         );
+    }
+
+    #[test]
+    fn leftover_occ_on_proven_window_is_not_crisis() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(176, 8);
+        p.promote_short_edge(0x32be, 40_000);
+        for pair in [(4, 31), (31, 66), (66, 67), (67, 69)] {
+            p.note_short_pair(0x32be, pair.0, pair.1);
+        }
+        p.remember_arm(0x32be, LocStrategy::win(2));
+        p.note_reexec_ns_at(Some(0x32be), 8_000);
+        p.note_reexec_ns_at(Some(0x32be), 8_000);
+        p.end_block_learn();
+        {
+            let e = p.promoted.get(&0x32be).unwrap();
+            assert!(
+                !e.last_crisis,
+                "E1: leftover OCC on Win_2 + unfenced=0 is not a climb crisis"
+            );
+        }
+        p.remember_arm(0x32be, LocStrategy::win(1));
+        p.note_reexec_ns_at(Some(0x32be), 8_000);
+        p.note_reexec_ns_at(Some(0x32be), 8_000);
+        p.end_block_learn();
+        {
+            let e = p.promoted.get(&0x32be).unwrap();
+            assert!(
+                e.last_crisis,
+                "E1: narrow Win_1 still leaking leftover OCC may grow once"
+            );
+        }
+        p.begin_block_with_cores(176, 8);
+        p.remember_arm(0x32be, LocStrategy::win(2));
+        for _ in 0..4 {
+            p.bump_unfenced_reexec();
+        }
+        p.note_reexec_ns_at(Some(0x32be), 8_000);
+        p.end_block_learn();
+        {
+            let e = p.promoted.get(&0x32be).unwrap();
+            assert!(
+                e.last_crisis,
+                "E1: unfenced train after OrderedAdmit is a confidence crisis"
+            );
+        }
     }
 
     #[test]

@@ -53,8 +53,16 @@
 | PR27 最佳 | 0.838 | **1.079** | 硬 Win_2 | — | false |
 | PR28 run1/2 | 0.97/0.90 | **1.218 / 1.214** | Opt→Win_1→2→3(→Seg) | 热 UCB 每块 | false |
 | 本 PR run1 (pre-crisis-fix) | 0.906 | **1.185** | Opt→Win_1→Win_2→Win_3→Seg_7 | 0 then 2 | false |
+| 本 PR run2 (abort-crisis) | 0.918 | **1.262** | Opt→Win_1→Win_2→Win_3→Win_4 | 2 | false |
 
-run1 已优于 PR28、≪PR22 1.40；仍被 leftover-hop 误当危机推上 Win_3/Seg。随后把危机改成 leftover-*abort*，并禁止未证实宽窗的廉价 prior。
+run1 已优于 PR28、≪PR22 1.40。run2 把危机改成 leftover-*abort* 后仍爬到 Win_4：16-writer 脊上 Win_2 的尾 OCC abort 是预期的，却被当成危机；当时 `w_cap(176@8)=4`（oversub≥8 → cores/2）。
+
+随后两处一起收：
+
+1. **G1 在线 oversub hat** — `n_tx/cores ≥ 16` → `w_cap=2`（PR27 Win_2 类，不是 `WINDOWED_W_MAX=3`）。32@16 仍 `w_cap>3`。
+2. **E1 危机不是 leftover OCC** — 已证实窗（w≥2）的尾 OCC 不进危机。危机 = Opt 仍 abort / unfenced 列车 / 仍窄的 w=1 在漏 leftover OCC。热路径才能 greedy 粘 Win_2。
+
+Compare 复跑中（N=7 @8 Soft=0）。
 
 Compare:
 
