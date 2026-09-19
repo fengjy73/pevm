@@ -1,16 +1,14 @@
-//! Cost-aware admit policy — multi-way EV + OptimisticRead-majority + CC-D1.
+//! Cost-aware admit policy — one per-ℓ arm mouth + wall-consequence learn.
 //!
 //! Soft=0 actions: **OptimisticRead** vs **OrderedAdmit** (refuse +
 //! wave-admit pred). OptimisticRead is the OCC-effect path on this spine —
-//! not a hand-off to a second OCC runtime. Beta posteriors are **features**,
-//! not `decide()` authority.
+//! not a hand-off to a second OCC runtime. Beta / morph / leftover counts
+//! are **features**, not `decide()` authority.
 //!
-//! Per hot ℓ pick min ĉ among {OptimisticRead, Win_1/2/3, Seg, FullChain}.
-//! FullChain is the default only for short storage chains (14→16→17).
-//! Long Basic WAW: begin plants a learned window or segmented short-hops
-//! (T1/T2); next-quantum flush plants idle tail hops only (T3). Never
-//! mid-execute ReadyEdge on in-flight txs. Do not freeze OrderedAdmit=K
-//! from the full-shell prior.
+//! Begin plant / hops / short-edge hints read **only** `select_arm(ℓ)`:
+//! Opt | Win(w) | Seg | Full (short only) | DeferPlant. Reward is
+//! −(gate_stall_wall + reexec_ns + measurable shell). Instant idle never
+//! enters ĉ. Long spines never FullChain. Never mid-execute ReadyEdge.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -25,38 +23,43 @@ use crate::{MemoryLocationHash, TxIdx};
 use super::collateral::ConflictClass;
 
 /// Small-block serial estimate below this → thin SpecFence shell (PC-S1).
+/// Safety classification, not an arm pick.
 const META_FLOOR_NS: f64 = 400_000.0;
 /// ~2µs/tx cold serial hat (21k transfer class).
 const SERIAL_NS_PER_TX: f64 = 2_000.0;
-/// Thin-shell OrderedAdmit spine **cap** (not “always exactly 3”).
-/// Promote/ignore may change the set; ns-EV may keep fewer.
+/// Thin-shell plant-location **safety cap** (not “always exactly 3”).
 pub(crate) const THIN_ORDERED_K: usize = 3;
-/// Short-chain hop count (storage 14→16→17). Long spines never FullChain.
+/// Short-chain Full safety bound. Long spines never FullChain.
 pub(crate) const ORDER_WINDOW_K: usize = 2;
-/// T1: WindowedOrdered w∈[1, WINDOWED_W_MAX]. Win_1 is the cheap head hop.
+/// T1: WindowedOrdered w∈[1, WINDOWED_W_MAX]. w is chosen by ĉ, not leftover.
 pub(crate) const WINDOWED_K: usize = 1;
-/// T1 learnable sliding window (F7 escalates 1→2→3).
+/// Safety: max window width (not a leftover escalate target).
 pub(crate) const WINDOWED_W_MAX: usize = 3;
-/// T2: txs per segment; intra-segment FullChain, inter-segment OptimisticRead.
+/// T2: txs per segment; intra-segment hops, inter-segment OptimisticRead.
 pub(crate) const SEG_TX: usize = 4;
 /// Cap planted segments so Seg cannot rebuild the PR22 prepaid wall.
 const SEG_CAP: usize = 2;
-/// F7: leftover hops / reexecs that force Win_1→Win_2/3 or Seg.
-const LEFTOVER_WIN3: u32 = 3;
-const LEFTOVER_SEG: u32 = 8;
 const THIN_N_MAX: usize = 256;
-/// ns-EV hysteresis: keep OrderedAdmit only if ĉ_ord + δ < ĉ_opt.
+/// ns-EV hysteresis for cohort choose() (not the loc arm mouth).
 const NS_DELTA: f64 = 2_000.0;
-/// Full-shell cold-start EMA priors (ns). Large blocks may keep OrderedAdmit.
+/// Cohort / snap cold priors (learnable; not a loc-arm nail).
 const PRIOR_C_ORDERED_NS: f64 = 8_000.0;
 const PRIOR_C_OPT_NS: f64 = 25_000.0;
-/// Thin-block cold priors: OCC abort is cheaper than refuse/wave prepaid.
 const PRIOR_C_ORDERED_THIN_NS: f64 = 18_000.0;
 const PRIOR_C_OPT_THIN_NS: f64 = 6_000.0;
-/// F4: consecutive FullChain losses before demote; min samples before switch.
-const PREPAID_LOSE_N: u32 = 2;
-const MIN_SAMPLES: f64 = 2.0;
-const EMA_ALPHA: f64 = 0.20;
+/// Wide loc-arm prior — UCB / samples walk this; not a frozen 8k nail.
+const PRIOR_C_WIDE_NS: f64 = 12_000.0;
+/// Long-spine cold: Opt slightly cheaper so first begin stays overlap.
+const PRIOR_C_OPT_COLD_NS: f64 = 9_000.0;
+/// Short-chain cold: Full slightly cheaper (storage 14→16→17 class).
+const PRIOR_C_FULL_SHORT_NS: f64 = 8_000.0;
+/// L6: α = 1/(n + LEARN_OFFSET). Not a global EMA_ALPHA.
+const LEARN_OFFSET: f64 = 2.0;
+/// UCB1 bonus scale (ns). Explores under-sampled arms without leftover ifs.
+const UCB_SCALE_NS: f64 = 5_000.0;
+/// Process-level prior decay only after a confident prepaid+unfenced loss.
+const PREPAID_LOSE_CONF: u32 = 3;
+const ARM_N: usize = 7;
 
 /// Soft=0 action on a candidate edge / cohort.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,7 +70,7 @@ pub(crate) enum AdmitAction {
     OrderedAdmit,
 }
 
-/// Per-ℓ OrderedAdmit strategy (T1 Win_w / T2 Seg / Full / Opt).
+/// Per-ℓ arm (L2): Opt | Win(w) | Seg | Full(short) | DeferPlant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocStrategy {
     OptimisticRead,
@@ -76,6 +79,8 @@ pub(crate) enum LocStrategy {
     Windowed3,
     Segmented,
     FullChain,
+    /// Do not begin-plant; rely on Resolve. Independent of leftover ifs.
+    DeferPlant,
 }
 
 impl LocStrategy {
@@ -87,6 +92,7 @@ impl LocStrategy {
             Self::Windowed3 => 3,
             Self::Segmented => 4,
             Self::FullChain => 5,
+            Self::DeferPlant => 6,
         }
     }
 
@@ -97,7 +103,25 @@ impl LocStrategy {
             3 => Self::Windowed3,
             4 => Self::Segmented,
             5 => Self::FullChain,
+            6 => Self::DeferPlant,
             _ => Self::OptimisticRead,
+        }
+    }
+
+    const fn idx(self) -> usize {
+        self.as_u8() as usize
+    }
+
+    /// Tie-break: fewer prepaid hops first (ĉ-equal Win_1 beats Win_3).
+    const fn tie_key(self) -> u8 {
+        match self {
+            Self::OptimisticRead => 0,
+            Self::DeferPlant => 1,
+            Self::Windowed1 => 2,
+            Self::Windowed2 => 3,
+            Self::Windowed3 => 4,
+            Self::Segmented => 5,
+            Self::FullChain => 6,
         }
     }
 
@@ -109,6 +133,7 @@ impl LocStrategy {
             Self::Windowed3 => "Win_3",
             Self::Segmented => "Seg",
             Self::FullChain => "Full",
+            Self::DeferPlant => "Defer",
         }
     }
 
@@ -118,12 +143,12 @@ impl LocStrategy {
             Self::Windowed2 => 2,
             Self::Windowed3 => 3,
             Self::Segmented => SEG_TX.saturating_sub(1),
-            Self::FullChain | Self::OptimisticRead => 0,
+            Self::FullChain | Self::OptimisticRead | Self::DeferPlant => 0,
         }
     }
 
     pub(crate) const fn is_ordered(self) -> bool {
-        !matches!(self, Self::OptimisticRead)
+        !matches!(self, Self::OptimisticRead | Self::DeferPlant)
     }
 }
 
@@ -206,7 +231,9 @@ pub struct LearnReport {
     pub seg_locs: usize,
     /// Locations that chose FullChain (short storage only on thin blocks).
     pub full_locs: usize,
-    /// Dominant learned action label (`Win_3` / `Seg` / `Full` / `Opt`).
+    /// Locations that chose DeferPlant (no begin plant).
+    pub defer_locs: usize,
+    /// Dominant learned action label (`Win_2` / `Defer` / `Full` / `Opt`).
     pub chosen_strategy: String,
     /// T1 window width of the dominant Win_w (0 if not windowed).
     pub chosen_win_w: u8,
@@ -224,6 +251,28 @@ pub struct LearnReport {
     pub gate_stall_ns: u64,
     /// Worker execute+validate busy ns (sum). Instant-tax; not in ĉ.
     pub worker_busy_ns: u64,
+    /// L7: ℓ whose selected arm ≠ last block (reuse adaptivity).
+    pub arm_switch_n: usize,
+    /// L7: selections that were UCB-explore, not greedy min-ĉ.
+    pub explore_n: usize,
+    /// L7: long-spine picks that were not PR27-hard Win_2.
+    pub win2_deviate_n: usize,
+    /// L7: mean ĉ of the dominant long-spine / first measured ℓ.
+    pub bandit_c_opt: f64,
+    /// Win_1 ĉ of the telemetry loc.
+    pub bandit_c_win1: f64,
+    /// Win_2 ĉ of the telemetry loc.
+    pub bandit_c_win2: f64,
+    /// Win_3 ĉ of the telemetry loc.
+    pub bandit_c_win3: f64,
+    /// Seg ĉ of the telemetry loc.
+    pub bandit_c_seg: f64,
+    /// Full ĉ of the telemetry loc.
+    pub bandit_c_full: f64,
+    /// DeferPlant ĉ of the telemetry loc.
+    pub bandit_c_defer: f64,
+    /// L7: `loc:arm` census (proves arms move across reuse).
+    pub selected_arms: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -278,23 +327,18 @@ struct PromotedLoc {
     succ: TxIdx,
     /// F4: FullChain lost — next begin does not FullChain this long spine.
     demoted: bool,
-    /// F3: strategy chosen at last begin / plant decision.
+    /// F3: arm chosen at last begin / plant decision.
     decision: LocStrategy,
-    /// F4: EMA samples on this ℓ.
+    /// Previous-block arm (L7 switch telemetry).
+    prev_decision: LocStrategy,
+    /// Per-arm sample counts (L6 α = 1/(n+c)).
     samples: u32,
-    /// F2: three-way ĉ (OptimisticRead / WindowedOrdered / FullChain).
-    c_opt: f64,
-    c_win: f64,
-    c_full: f64,
-    /// F4: consecutive FullChain losses.
-    fullchain_lose: u32,
-    /// F2: ĉ for Win_2 / Win_3 / Seg (Win_1 is `c_win`).
-    c_win2: f64,
-    c_win3: f64,
-    c_seg: f64,
-    /// F7: leftover reexec / unfenced hops after last decision (cross-block).
+    /// Per-arm ĉ (Opt, Win1, Win2, Win3, Seg, Full, Defer).
+    arm_c: [f64; ARM_N],
+    /// Per-arm n (priors start at 1 so UCB is defined).
+    arm_n: [f64; ARM_N],
+    /// Telemetry only — leftover hops after the chosen arm (not a pick driver).
     leftover_reexec: u32,
-    escalate_n: u32,
     /// F1 this-block attribution (reset at begin).
     block_reexec_ns: u64,
     block_ordered_ns: u64,
@@ -312,22 +356,39 @@ impl PromotedLoc {
             succ: usize::MAX,
             demoted: false,
             decision: LocStrategy::OptimisticRead,
+            prev_decision: LocStrategy::OptimisticRead,
             samples: 0,
-            c_opt: PRIOR_C_OPT_THIN_NS,
-            c_win: PRIOR_C_ORDERED_THIN_NS,
-            c_full: PRIOR_C_ORDERED_THIN_NS,
-            fullchain_lose: 0,
-            c_win2: PRIOR_C_ORDERED_THIN_NS,
-            c_win3: PRIOR_C_ORDERED_THIN_NS,
-            c_seg: PRIOR_C_ORDERED_THIN_NS,
+            arm_c: wide_arm_priors(0),
+            arm_n: [1.0; ARM_N],
             leftover_reexec: 0,
-            escalate_n: 0,
             block_reexec_ns: 0,
             block_ordered_ns: 0,
             block_reexec_n: 0,
             block_ordered_n: 0,
         }
     }
+
+    fn update_arm(&mut self, arm: LocStrategy, x: f64) {
+        let i = arm.idx();
+        let alpha = learn_alpha(self.arm_n[i]);
+        self.arm_c[i] = (1.0 - alpha) * self.arm_c[i] + alpha * x.clamp(1.0, 10_000_000.0);
+        self.arm_n[i] += 1.0;
+    }
+}
+
+fn learn_alpha(n: f64) -> f64 {
+    1.0 / (n.max(0.0) + LEARN_OFFSET)
+}
+
+fn wide_arm_priors(n_pairs: usize) -> [f64; ARM_N] {
+    let mut c = [PRIOR_C_WIDE_NS; ARM_N];
+    if n_pairs > ORDER_WINDOW_K {
+        c[LocStrategy::OptimisticRead.idx()] = PRIOR_C_OPT_COLD_NS;
+        c[LocStrategy::DeferPlant.idx()] = PRIOR_C_OPT_COLD_NS;
+    } else if n_pairs > 0 {
+        c[LocStrategy::FullChain.idx()] = PRIOR_C_FULL_SHORT_NS;
+    }
+    c
 }
 
 /// Per-address B2 context: p_effWAW + refuse-cost EMA + per-pair cost-EV.
@@ -397,6 +458,13 @@ pub(crate) struct CostPolicy {
     last_block_n: AtomicUsize,
     /// O3: (ℓ, pred, succ) recorded during abort — flush only when idle.
     pending_idle: Mutex<Vec<(MemoryLocationHash, TxIdx, TxIdx)>>,
+    /// L1: committed arm for this block (select once; hops/hint share it).
+    block_arm: DashMap<MemoryLocationHash, LocStrategy, FxBuildHasher>,
+    /// Process-persistent begin count (reuse iters). Not tx-count `block_n`.
+    block_seq: AtomicUsize,
+    arm_switch_n: AtomicUsize,
+    explore_n: AtomicUsize,
+    win2_deviate_n: AtomicUsize,
 }
 
 impl Default for CostPolicy {
@@ -444,6 +512,11 @@ impl Default for CostPolicy {
             wave_batch_noted: AtomicBool::new(false),
             last_block_n: AtomicUsize::new(0),
             pending_idle: Mutex::new(Vec::new()),
+            block_arm: DashMap::default(),
+            block_seq: AtomicUsize::new(0),
+            arm_switch_n: AtomicUsize::new(0),
+            explore_n: AtomicUsize::new(0),
+            win2_deviate_n: AtomicUsize::new(0),
         }
     }
 }
@@ -468,8 +541,10 @@ impl CostPolicy {
         self.loc_reexec_ns.clear();
         self.loc_c_ord.clear();
         self.pending_idle.lock().unwrap().clear();
+        self.block_arm.clear();
         self.prepaid_lose_streak.store(0, Ordering::Relaxed);
         self.last_block_n.store(0, Ordering::Relaxed);
+        self.block_seq.store(0, Ordering::Relaxed);
         self.c_opt_snap_bits
             .store(PRIOR_C_OPT_NS.to_bits(), Ordering::Relaxed);
         self.c_ord_snap_bits
@@ -506,6 +581,10 @@ impl CostPolicy {
         self.wave_off_edge.store(0, Ordering::Relaxed);
         self.wave_batch_noted.store(false, Ordering::Relaxed);
         self.pending_idle.lock().unwrap().clear();
+        self.block_arm.clear();
+        self.arm_switch_n.store(0, Ordering::Relaxed);
+        self.explore_n.store(0, Ordering::Relaxed);
+        self.win2_deviate_n.store(0, Ordering::Relaxed);
     }
 
     pub(crate) fn begin_block(&self, n: usize) {
@@ -514,6 +593,7 @@ impl CostPolicy {
             self.last_block_n.store(prev, Ordering::Relaxed);
         }
         self.block_n.store(n, Ordering::Relaxed);
+        self.block_seq.fetch_add(1, Ordering::Relaxed);
         self.reset_block_counters();
         let serial_hat = n as f64 * SERIAL_NS_PER_TX;
         let thin = n > 0 && n <= THIN_N_MAX && serial_hat < META_FLOOR_NS;
@@ -533,6 +613,7 @@ impl CostPolicy {
         self.c_ord_snap_bits
             .store(c_ord.to_bits(), Ordering::Relaxed);
         for mut e in self.promoted.iter_mut() {
+            e.prev_decision = e.decision;
             e.block_reexec_ns = 0;
             e.block_ordered_ns = 0;
             e.block_reexec_n = 0;
@@ -578,9 +659,8 @@ impl CostPolicy {
 
     /// T1/T2: hops to plant on `ℓ` at begin (Seg returns intra-segment count).
     ///
-    /// Short chains (≤`ORDER_WINDOW_K`) stay FullChain (storage 14→16→17).
-    /// Long thin spines pick min ĉ among {Opt, Win_1/2/3, Seg}; FullChain is
-    /// banned after consecutive losses / demote (PR22 1.40ms prepaid wall).
+    /// Sole mouth: `select_arm`. Full only when n_pairs ≤ `ORDER_WINDOW_K`.
+    /// Long spines never FullChain (PR22 1.40ms prepaid wall — safety).
     pub(crate) fn hops_to_plant(&self, location: MemoryLocationHash, n_pairs: usize) -> usize {
         Self::hops_for_strategy(self.loc_strategy(location, n_pairs), n_pairs)
     }
@@ -588,7 +668,7 @@ impl CostPolicy {
     #[inline]
     fn hops_for_strategy(strategy: LocStrategy, n_pairs: usize) -> usize {
         match strategy {
-            LocStrategy::OptimisticRead => 0,
+            LocStrategy::OptimisticRead | LocStrategy::DeferPlant => 0,
             LocStrategy::Windowed1 => WINDOWED_K.min(n_pairs),
             LocStrategy::Windowed2 => 2.min(n_pairs),
             LocStrategy::Windowed3 => WINDOWED_W_MAX.min(n_pairs),
@@ -617,7 +697,7 @@ impl CostPolicy {
         pairs.sort_unstable_by_key(|(pred, _)| *pred);
         pairs.dedup();
         match strategy {
-            LocStrategy::OptimisticRead => Vec::new(),
+            LocStrategy::OptimisticRead | LocStrategy::DeferPlant => Vec::new(),
             LocStrategy::Windowed1 => pairs.into_iter().take(1).collect(),
             LocStrategy::Windowed2 => pairs.into_iter().take(2).collect(),
             LocStrategy::Windowed3 => pairs.into_iter().take(WINDOWED_W_MAX).collect(),
@@ -640,158 +720,138 @@ impl CostPolicy {
             self.cost_ev_demote_optimistic
                 .fetch_add(1, Ordering::Relaxed);
         }
-        if let Some(mut e) = self.promoted.get_mut(&location) {
-            e.decision = strategy;
-        }
+        self.remember_arm(location, strategy);
     }
 
-    /// CC-L4: per-ℓ strategy. Hot path reads only snapshots / promoted EMA.
+    /// Persist the committed arm so DeferPlant survives the next begin.
+    pub(crate) fn remember_arm(&self, location: MemoryLocationHash, arm: LocStrategy) {
+        self.block_arm.insert(location, arm);
+        let mut e = self.promoted.entry(location).or_insert(PromotedLoc::new());
+        e.decision = arm;
+        e.hits = e.hits.max(1);
+    }
+
+    /// L1: per-ℓ arm. Cached for the block so hops / hint / flush share one mouth.
     pub(crate) fn loc_strategy(&self, location: MemoryLocationHash, n_pairs: usize) -> LocStrategy {
-        if n_pairs == 0 || !self.is_promoted(location) {
+        if n_pairs == 0 {
             return LocStrategy::OptimisticRead;
         }
-        // CC-L4/L5: short storage-class chain defaults FullChain.
-        if n_pairs <= ORDER_WINDOW_K && !self.loc_demoted(location) {
-            return LocStrategy::FullChain;
+        if let Some(a) = self.block_arm.get(&location) {
+            return *a;
         }
-        if !self.is_optimistic_majority_block() {
-            return LocStrategy::FullChain;
+        if !self.is_promoted(location) {
+            return LocStrategy::OptimisticRead;
         }
-        // Long spine: never FullChain (PR22 1.40ms prepaid wall).
-        self.f7_pick(location, n_pairs)
+        self.commit_arm(location, n_pairs)
     }
 
-    /// F2/F7: min-EV among Opt / Win_w / Seg. Full banned on long thin spines.
-    fn f7_pick(&self, location: MemoryLocationHash, n_pairs: usize) -> LocStrategy {
-        let costs = self.six_way_costs(location, n_pairs);
-        let (measured, samples, leftover, escalate_n, last) = self.promoted.get(&location).map_or(
-            (false, 0.0, 0, 0, LocStrategy::OptimisticRead),
-            |s| {
-                (
-                    s.measured,
-                    s.samples as f64,
-                    s.leftover_reexec,
-                    s.escalate_n,
-                    s.decision,
-                )
-            },
-        );
-        // F4: stay OptimisticRead until a measured abort or n₀ samples.
-        if !measured && samples < MIN_SAMPLES {
+    /// L1/L5: hint path may select before `is_promoted` (each short CallWaw ℓ).
+    pub(crate) fn select_hint_arm(
+        &self,
+        location: MemoryLocationHash,
+        n_pairs: usize,
+    ) -> LocStrategy {
+        if n_pairs == 0 {
             return LocStrategy::OptimisticRead;
         }
-        // S3: a winning OrderedAdmit hop (leftover/reexec cleared) sticks.
-        // Do not drop to Opt just because prepaid wall > 0 and abort_cf = 0.
-        if measured && leftover == 0 && last.is_ordered() {
-            return last;
+        if let Some(a) = self.block_arm.get(&location) {
+            return *a;
         }
-        let c_opt = costs[0];
-        // After a measured EffectiveWAW, OrderedAdmit is the sandwich default
-        // unless OptimisticRead is clearly cheaper.
-        if measured
-            && n_pairs > ORDER_WINDOW_K
-            && leftover < LEFTOVER_WIN3
-            && escalate_n == 0
-            && c_opt + NS_DELTA < costs[1].min(costs[2]).min(costs[3]).min(costs[4])
-        {
-            return LocStrategy::OptimisticRead;
+        self.commit_arm(location, n_pairs)
+    }
+
+    fn commit_arm(&self, location: MemoryLocationHash, n_pairs: usize) -> LocStrategy {
+        let (arm, explore, greedy) = self.select_arm(location, n_pairs);
+        self.block_arm.insert(location, arm);
+        if let Some(e) = self.promoted.get(&location) {
+            if e.prev_decision != arm && self.block_seq.load(Ordering::Relaxed) > 1 {
+                self.arm_switch_n.fetch_add(1, Ordering::Relaxed);
+            }
         }
-        // S3: leftover after Opt/Win_1 prefers the lower hop (Win_2).
-        // Win_3 only after Win_2 was tried and leftover reexec remains
-        // (escalate_n≥2). Seg only after that (escalate_n≥2 ∧ leftover≥SEG).
-        let escalate = leftover >= LEFTOVER_WIN3 || escalate_n >= 1;
-        let want_seg = escalate_n >= 2 && leftover >= LEFTOVER_SEG;
-        let want_win3 = escalate_n >= 2;
-        let candidates: &[LocStrategy] = if want_seg {
-            &[
-                LocStrategy::Windowed2,
-                LocStrategy::Windowed3,
-                LocStrategy::Segmented,
-            ]
-        } else if escalate && want_win3 {
-            &[LocStrategy::Windowed3, LocStrategy::Windowed2]
-        } else if escalate {
-            &[LocStrategy::Windowed2, LocStrategy::Windowed3]
-        } else {
-            &[
-                LocStrategy::OptimisticRead,
-                LocStrategy::Windowed1,
-                LocStrategy::Windowed2,
-                LocStrategy::Windowed3,
-            ]
-        };
-        let mut best = candidates[0];
-        let mut best_c = cost_of(&costs, best);
-        for &a in &candidates[1..] {
-            let c = cost_of(&costs, a);
-            if c + NS_DELTA < best_c {
+        if explore || arm != greedy {
+            self.explore_n.fetch_add(1, Ordering::Relaxed);
+        }
+        if n_pairs > ORDER_WINDOW_K && arm != LocStrategy::Windowed2 {
+            self.win2_deviate_n.fetch_add(1, Ordering::Relaxed);
+        }
+        arm
+    }
+
+    /// L2/L4: UCB1 on eligible arms. Win(w) compared by ĉ, not leftover ifs.
+    /// Full is ineligible on long spines (safety bound, not “cannot learn”).
+    fn select_arm(
+        &self,
+        location: MemoryLocationHash,
+        n_pairs: usize,
+    ) -> (LocStrategy, bool, LocStrategy) {
+        let eligible = eligible_arms(n_pairs, self.loc_demoted(location));
+        let (c, n) = self.arm_stats(location, n_pairs);
+        let n_tot: f64 = eligible.iter().map(|a| n[a.idx()].max(1.0)).sum();
+        let mut greedy = eligible[0];
+        let mut greedy_c = c[greedy.idx()];
+        let mut best = greedy;
+        let mut best_s = ucb_score(c[best.idx()], n[best.idx()], n_tot);
+        for &a in &eligible[1..] {
+            let ca = c[a.idx()];
+            if ca + 1e-9 < greedy_c
+                || ((ca - greedy_c).abs() <= 1e-9 && a.tie_key() < greedy.tie_key())
+            {
+                greedy = a;
+                greedy_c = ca;
+            }
+            let s = ucb_score(ca, n[a.idx()], n_tot);
+            if s + 1e-9 < best_s || ((s - best_s).abs() <= 1e-9 && a.tie_key() < best.tie_key()) {
                 best = a;
-                best_c = c;
+                best_s = s;
             }
         }
-        // Tie: leftover tail prefers lower hop unless Win_2 already failed.
-        if escalate {
-            let near: Vec<LocStrategy> = candidates
-                .iter()
-                .copied()
-                .filter(|&a| cost_of(&costs, a) <= best_c + NS_DELTA)
-                .collect();
-            if want_seg && near.contains(&LocStrategy::Segmented) {
-                return LocStrategy::Segmented;
-            }
-            if want_win3 && near.contains(&LocStrategy::Windowed3) {
-                return LocStrategy::Windowed3;
-            }
-            if near.contains(&LocStrategy::Windowed2) {
-                return LocStrategy::Windowed2;
-            }
-            if near.contains(&LocStrategy::Windowed3) {
-                return LocStrategy::Windowed3;
-            }
-        }
-        best
+        (best, best != greedy, greedy)
     }
 
-    /// F2: ĉ for Opt / Win_1 / Win_2 / Win_3 / Seg / Full.
-    fn six_way_costs(&self, location: MemoryLocationHash, n_pairs: usize) -> [f64; 6] {
-        if let Some(s) = self.promoted.get(&location)
-            && s.samples >= 1
-        {
-            return [
-                s.c_opt.max(s.reexec_ns_ema).max(1.0),
-                s.c_win.max(1.0),
-                s.c_win2.max(1.0),
-                s.c_win3.max(1.0),
-                s.c_seg.max(1.0),
-                s.c_full.max(1.0),
-            ];
+    fn arm_stats(
+        &self,
+        location: MemoryLocationHash,
+        n_pairs: usize,
+    ) -> ([f64; ARM_N], [f64; ARM_N]) {
+        let priors = wide_arm_priors(n_pairs);
+        if let Some(s) = self.promoted.get(&location) {
+            let mut c = s.arm_c;
+            let n = s.arm_n;
+            for i in 0..ARM_N {
+                if n[i] <= 1.0 {
+                    c[i] = priors[i];
+                }
+            }
+            if s.measured {
+                let abort = s.reexec_ns_ema.max(1.0);
+                // DeferPlant ≡ Opt on leftover aborts — do not keep a cheap unused prior.
+                c[LocStrategy::OptimisticRead.idx()] =
+                    c[LocStrategy::OptimisticRead.idx()].max(abort);
+                c[LocStrategy::DeferPlant.idx()] = c[LocStrategy::DeferPlant.idx()].max(abort);
+            }
+            // Conservative UCB (L3): do not invent a cheaper unused wider window
+            // after a successful narrower OrderedAdmit (prepaid already measured).
+            if s.leftover_reexec == 0 && s.decision.is_ordered() && n[s.decision.idx()] > 1.0 {
+                let paid = c[s.decision.idx()];
+                let planted = CostPolicy::hops_for_strategy(s.decision, n_pairs);
+                for &a in &[
+                    LocStrategy::Windowed1,
+                    LocStrategy::Windowed2,
+                    LocStrategy::Windowed3,
+                    LocStrategy::Segmented,
+                    LocStrategy::FullChain,
+                ] {
+                    if n[a.idx()] <= 1.0 && CostPolicy::hops_for_strategy(a, n_pairs) > planted {
+                        c[a.idx()] = c[a.idx()].max(paid);
+                    }
+                }
+            }
+            for v in &mut c {
+                *v = v.max(1.0);
+            }
+            return (c, n);
         }
-        let abort = self
-            .promoted
-            .get(&location)
-            .map(|s| s.reexec_ns_ema)
-            .or_else(|| self.loc_reexec_ns.get(&location).map(|s| s.mean))
-            .unwrap_or_else(|| f64::from_bits(self.c_opt_snap_bits.load(Ordering::Relaxed)))
-            .max(1.0);
-        let stall = self
-            .loc_c_ord
-            .get(&location)
-            .map(|s| s.mean)
-            .unwrap_or_else(|| f64::from_bits(self.c_ord_snap_bits.load(Ordering::Relaxed)))
-            .max(1.0);
-        let stall = if self.is_optimistic_majority_block() {
-            stall.max(PRIOR_C_ORDERED_THIN_NS)
-        } else {
-            stall
-        };
-        [
-            abort,
-            stall,
-            stall,
-            stall,
-            stall,
-            n_pairs.max(1) as f64 * stall,
-        ]
+        (priors, [1.0; ARM_N])
     }
 
     /// Leftover-aware: cost(W) = W·stall + (n−W)·abort vs cost(A0) = n·abort.
@@ -1152,10 +1212,14 @@ impl CostPolicy {
         self.reexec_ns.fetch_add(ns, Ordering::Relaxed);
         self.optimistic_reexec.fetch_add(1, Ordering::Relaxed);
         if let Some(loc) = loc {
-            self.loc_reexec_ns
-                .entry(loc)
-                .or_insert(OnlineStat::new(PRIOR_C_OPT_NS))
-                .ema_ns(ns as f64, EMA_ALPHA);
+            {
+                let mut e = self
+                    .loc_reexec_ns
+                    .entry(loc)
+                    .or_insert(OnlineStat::new(PRIOR_C_OPT_NS));
+                let a = learn_alpha(e.n);
+                e.ema_ns(ns as f64, a);
+            }
             if let Some(mut e) = self.promoted.get_mut(&loc) {
                 e.block_reexec_ns = e.block_reexec_ns.saturating_add(ns);
                 e.block_reexec_n = e.block_reexec_n.saturating_add(1);
@@ -1172,10 +1236,14 @@ impl CostPolicy {
             e.block_ordered_ns = e.block_ordered_ns.saturating_add(ns);
             e.block_ordered_n = e.block_ordered_n.saturating_add(1);
         }
-        self.loc_c_ord
-            .entry(location)
-            .or_insert(OnlineStat::new(PRIOR_C_ORDERED_NS))
-            .ema_ns(ns as f64, EMA_ALPHA);
+        {
+            let mut e = self
+                .loc_c_ord
+                .entry(location)
+                .or_insert(OnlineStat::new(PRIOR_C_ORDERED_NS));
+            let a = learn_alpha(e.n);
+            e.ema_ns(ns as f64, a);
+        }
     }
 
     /// L4: idle-core ns attributed as A1 width loss (atomic; EMA at end-block).
@@ -1256,7 +1324,11 @@ impl CostPolicy {
         };
         let mut e = self.promoted.entry(location).or_insert(PromotedLoc::new());
         e.hits = e.hits.saturating_add(1);
-        e.reexec_ns_ema = (1.0 - EMA_ALPHA) * e.reexec_ns_ema + EMA_ALPHA * measured_ns;
+        let a = learn_alpha(e.samples as f64);
+        e.reexec_ns_ema = (1.0 - a) * e.reexec_ns_ema + a * measured_ns;
+        e.arm_c[LocStrategy::OptimisticRead.idx()] = e.arm_c[LocStrategy::OptimisticRead.idx()]
+            .max(measured_ns)
+            .max(1.0);
         e.measured = true;
         drop(e);
         self.note_conflict_promote();
@@ -1365,6 +1437,9 @@ impl CostPolicy {
             if n_pairs > ORDER_WINDOW_K && self.is_optimistic_majority_block() {
                 return false;
             }
+            if !self.loc_strategy(location, n_pairs.max(1)).is_ordered() {
+                return false;
+            }
             return true;
         }
         if !has_earlier && hint_later < 2 {
@@ -1444,17 +1519,9 @@ impl CostPolicy {
         if !self.is_optimistic_majority_block() {
             return true;
         }
-        if !s.measured {
-            return false;
-        }
-        // C3: per-ℓ abort EMA vs prepaid snap (not the thin global 6µs A0 prior).
-        let c_ord = self
-            .loc_c_ord
-            .get(&location)
-            .map(|e| e.mean)
-            .unwrap_or_else(|| f64::from_bits(self.c_ord_snap_bits.load(Ordering::Relaxed)))
-            .max(1.0);
-        c_ord + NS_DELTA < s.reexec_ns_ema
+        // Bandit identity: measured or remembered Defer stays in the mouth.
+        // Arm pick (not this boolean) decides Opt / Win_w / Defer / Full.
+        s.hits >= 1 && (s.measured || s.decision == LocStrategy::DeferPlant)
     }
 
     pub(crate) fn conflict_of(&self, tx: TxIdx) -> Option<ConflictNote> {
@@ -1532,27 +1599,24 @@ impl CostPolicy {
         self.prepaid_ns.store(prepaid, Ordering::Relaxed);
         self.abort_cf_ns.store(abort_cf, Ordering::Relaxed);
         if refuse > 0 {
-            self.c_ord_ns
-                .lock()
-                .unwrap()
-                .ema_ns(refuse as f64, EMA_ALPHA);
+            let mut s = self.c_ord_ns.lock().unwrap();
+            let a = learn_alpha(s.n);
+            s.ema_ns(refuse as f64, a);
         }
         if reexec > 0 {
-            self.c_opt_ns
-                .lock()
-                .unwrap()
-                .ema_ns(reexec as f64, EMA_ALPHA);
+            let mut s = self.c_opt_ns.lock().unwrap();
+            let a = learn_alpha(s.n);
+            s.ema_ns(reexec as f64, a);
         }
-        // Successful Detect / a single leftover miss must not decay to Win_1.
-        // Only an abort *train* plus prepaid wall is a real Detect loss.
+        // Instant idle never enters prepaid. Decay only with a confident
+        // unfenced train — not a PREPAID_LOSE_N arm demote ladder.
         let unfenced = self.unfenced_reexec.load(Ordering::Relaxed);
         let prepaid_lost = prepaid > abort_cf && prepaid > 0 && unfenced >= 4;
         if prepaid_lost {
             let n = self.prepaid_lose_streak.fetch_add(1, Ordering::Relaxed) + 1;
-            if n >= PREPAID_LOSE_N as usize {
+            if n >= PREPAID_LOSE_CONF as usize {
                 self.decay_ordered_priors();
             }
-            // O2/L1: long spines whose ordered EV lost → next begin plants 0.
             self.demote_long_spines();
         } else {
             self.prepaid_lose_streak.store(0, Ordering::Relaxed);
@@ -1575,8 +1639,8 @@ impl CostPolicy {
                 }
             }
         }
-        // F1–F7: per-ℓ reward = −(reexec_ns+ordered_ns+refuse_share); update
-        // Opt/Win_w/Seg/Full ĉ; leftover tail escalates Win_1→Win_2/3 or Seg.
+        // L3: per-ℓ reward = −(reexec_ns + ordered_ns + refuse_share).
+        // Instant idle / occ_aborts / ready_width never enter ĉ.
         self.update_loc_counterfactuals(prepaid, abort_cf);
         // L-D: refresh thin snap from flushed EMAs so next begin can seed.
         // Use per-tx abort hat, not the whole-block reexec sum.
@@ -1595,77 +1659,45 @@ impl CostPolicy {
     }
 
     fn update_loc_counterfactuals(&self, prepaid: u64, abort_cf: u64) {
-        let n_hot = self.promoted.iter().filter(|e| e.measured).count().max(1) as u64;
+        let n_hot = self
+            .promoted
+            .iter()
+            .filter(|e| e.measured || e.decision == LocStrategy::DeferPlant)
+            .count()
+            .max(1) as u64;
         let refuse_share = prepaid / n_hot;
         for mut e in self.promoted.iter_mut() {
-            if !e.measured && e.block_reexec_ns == 0 && e.block_ordered_ns == 0 {
+            if !e.measured
+                && e.decision != LocStrategy::DeferPlant
+                && e.block_reexec_ns == 0
+                && e.block_ordered_ns == 0
+            {
                 continue;
             }
             let actual = e
                 .block_reexec_ns
                 .saturating_add(e.block_ordered_ns.saturating_add(refuse_share));
             let x = actual.max(1) as f64;
-            // F3: credit the decision-time action, not the later abort site.
-            match e.decision {
-                LocStrategy::OptimisticRead => {
-                    e.c_opt = (1.0 - EMA_ALPHA) * e.c_opt + EMA_ALPHA * x;
-                }
-                LocStrategy::Windowed1 => {
-                    e.c_win = (1.0 - EMA_ALPHA) * e.c_win + EMA_ALPHA * x;
-                }
-                LocStrategy::Windowed2 => {
-                    e.c_win2 = (1.0 - EMA_ALPHA) * e.c_win2 + EMA_ALPHA * x;
-                }
-                LocStrategy::Windowed3 => {
-                    e.c_win3 = (1.0 - EMA_ALPHA) * e.c_win3 + EMA_ALPHA * x;
-                }
-                LocStrategy::Segmented => {
-                    e.c_seg = (1.0 - EMA_ALPHA) * e.c_seg + EMA_ALPHA * x;
-                }
-                LocStrategy::FullChain => {
-                    e.c_full = (1.0 - EMA_ALPHA) * e.c_full + EMA_ALPHA * x;
-                }
-            }
-            // F2: unused OptimisticRead would have paid at least this abort.
+            // F3: credit the begin-selected arm only. No invented ns on others.
+            let arm = e.decision;
+            e.update_arm(arm, x);
             if e.decision != LocStrategy::OptimisticRead && abort_cf > 0 {
                 let cf = (abort_cf as f64).max(e.reexec_ns_ema).max(1.0);
-                e.c_opt = e.c_opt.max(cf);
-            }
-            if !matches!(
-                e.decision,
-                LocStrategy::Windowed1 | LocStrategy::Windowed2 | LocStrategy::Windowed3
-            ) && e.block_ordered_n > 0
-            {
-                e.c_win =
-                    (1.0 - EMA_ALPHA) * e.c_win + EMA_ALPHA * (e.block_ordered_ns.max(1) as f64);
+                let i = LocStrategy::OptimisticRead.idx();
+                e.arm_c[i] = e.arm_c[i].max(cf);
             }
             e.samples = e.samples.saturating_add(1);
             let n_pairs = self.short_chain.get(e.key()).map(|c| c.len()).unwrap_or(0);
             let planted = Self::hops_for_strategy(e.decision, n_pairs);
-            let leftover_hops = n_pairs.saturating_sub(planted) as u32;
-            // Opt + a long unplanted spine must escalate (cold 4→31…171).
-            // After OrderedAdmit, leftover is measured reexec only.
-            if e.decision == LocStrategy::OptimisticRead && leftover_hops >= LEFTOVER_WIN3 {
-                e.leftover_reexec = leftover_hops.max(e.block_reexec_n);
-                e.escalate_n = e.escalate_n.saturating_add(1);
-            } else if e.block_reexec_n >= 2 {
-                e.leftover_reexec = e.block_reexec_n;
-                e.escalate_n = e.escalate_n.saturating_add(1);
-            } else if e.block_reexec_n == 0 && e.decision.is_ordered() {
+            e.leftover_reexec = n_pairs.saturating_sub(planted) as u32;
+            if e.block_reexec_n > 0 {
+                e.leftover_reexec = e.leftover_reexec.max(e.block_reexec_n);
+            } else if e.decision.is_ordered() {
                 e.leftover_reexec = 0;
-                e.escalate_n = 0;
-            } else {
-                e.leftover_reexec = e.block_reexec_n;
             }
+            // Safety: Full on a long spine (should be ineligible) stays demoted.
             if e.decision == LocStrategy::FullChain && n_pairs > ORDER_WINDOW_K {
-                if e.c_full + NS_DELTA >= e.c_opt.min(e.c_win) {
-                    e.fullchain_lose = e.fullchain_lose.saturating_add(1);
-                    if e.fullchain_lose >= PREPAID_LOSE_N {
-                        e.demoted = true;
-                    }
-                } else {
-                    e.fullchain_lose = 0;
-                }
+                e.demoted = true;
             }
         }
     }
@@ -1675,7 +1707,8 @@ impl CostPolicy {
         for mut e in self.cohorts.iter_mut() {
             e.p_eff.ema(0.0, 0.35);
             let raised = e.c_ord.mean * 1.25 + PRIOR_C_ORDERED_THIN_NS * 0.15;
-            e.c_ord.ema_ns(raised, EMA_ALPHA);
+            let a = learn_alpha(e.c_ord.n);
+            e.c_ord.ema_ns(raised, a);
             e.prepaid_lose = e.prepaid_lose.saturating_add(1);
         }
         for mut e in self.promoted.iter_mut() {
@@ -1706,17 +1739,21 @@ impl CostPolicy {
         let n = self.ev_samples.load(Ordering::Relaxed).max(1) as f64;
         let refuse = self.refuse_ns.load(Ordering::Relaxed);
         let ordered: u64 = self.promoted.iter().map(|e| e.block_ordered_ns).sum();
-        let mut census = [0usize; 6];
+        let mut census = [0usize; ARM_N];
+        let mut arms: Vec<(MemoryLocationHash, LocStrategy, usize)> = Vec::new();
         for e in self.promoted.iter() {
             if e.hits < 1 {
                 continue;
             }
-            let i = e.decision.as_u8() as usize;
+            let i = e.decision.idx();
             if i < census.len() {
                 census[i] += 1;
             }
+            let n_pairs = self.short_chain.get(e.key()).map(|c| c.len()).unwrap_or(0);
+            arms.push((*e.key(), e.decision, n_pairs));
         }
-        // Long-spine action is the F7 story; storage Full must not hide Win_w/Seg.
+        arms.sort_unstable_by_key(|(loc, _, n)| (std::cmp::Reverse(*n), *loc));
+        // Long-spine action is the story; storage Full must not hide Win_w/Defer.
         let dominant = if census[4] > 0 {
             LocStrategy::Segmented
         } else if census[3] > 0 {
@@ -1727,9 +1764,22 @@ impl CostPolicy {
             LocStrategy::Windowed1
         } else if census[5] > 0 {
             LocStrategy::FullChain
+        } else if census[6] > 0 {
+            LocStrategy::DeferPlant
         } else {
             LocStrategy::OptimisticRead
         };
+        let (bandit_c, tel_n) = arms
+            .iter()
+            .find(|(loc, _, n)| *n > ORDER_WINDOW_K || self.is_promoted(*loc))
+            .map(|(loc, _, n)| self.arm_stats(*loc, *n))
+            .unwrap_or((wide_arm_priors(0), [1.0; ARM_N]));
+        let _ = tel_n;
+        let selected_arms = arms
+            .iter()
+            .map(|(loc, arm, n)| format!("{loc:x}:{}/{n}", arm.label()))
+            .collect::<Vec<_>>()
+            .join(",");
         LearnReport {
             ordered_admit_cohorts: self.ordered_decisions.load(Ordering::Relaxed),
             optimistic_read_cohorts: self.optimistic_read_cohorts.load(Ordering::Relaxed),
@@ -1775,6 +1825,7 @@ impl CostPolicy {
             win3_locs: census[3],
             seg_locs: census[4],
             full_locs: census[5],
+            defer_locs: census[6],
             chosen_strategy: dominant.label().to_string(),
             chosen_win_w: dominant.window_w().min(255) as u8,
             pick_occ_n: 0,
@@ -1784,6 +1835,17 @@ impl CostPolicy {
             yield_ns: 0,
             gate_stall_ns: 0,
             worker_busy_ns: 0,
+            arm_switch_n: self.arm_switch_n.load(Ordering::Relaxed),
+            explore_n: self.explore_n.load(Ordering::Relaxed),
+            win2_deviate_n: self.win2_deviate_n.load(Ordering::Relaxed),
+            bandit_c_opt: bandit_c[0],
+            bandit_c_win1: bandit_c[1],
+            bandit_c_win2: bandit_c[2],
+            bandit_c_win3: bandit_c[3],
+            bandit_c_seg: bandit_c[4],
+            bandit_c_full: bandit_c[5],
+            bandit_c_defer: bandit_c[6],
+            selected_arms,
         }
     }
 
@@ -1792,8 +1854,27 @@ impl CostPolicy {
     }
 }
 
-fn cost_of(costs: &[f64; 6], strategy: LocStrategy) -> f64 {
-    costs[strategy.as_u8() as usize]
+fn eligible_arms(n_pairs: usize, demoted: bool) -> Vec<LocStrategy> {
+    let mut out = vec![LocStrategy::OptimisticRead, LocStrategy::DeferPlant];
+    if n_pairs >= 1 {
+        out.push(LocStrategy::Windowed1);
+    }
+    if n_pairs >= 2 {
+        out.push(LocStrategy::Windowed2);
+    }
+    if n_pairs >= 3 {
+        out.push(LocStrategy::Windowed3);
+        out.push(LocStrategy::Segmented);
+    }
+    if n_pairs > 0 && n_pairs <= ORDER_WINDOW_K && !demoted {
+        out.push(LocStrategy::FullChain);
+    }
+    out
+}
+
+fn ucb_score(c: f64, n_a: f64, n_tot: f64) -> f64 {
+    let bonus = UCB_SCALE_NS * ((n_tot.max(1.0).ln().max(0.0) / n_a.max(1.0)).sqrt());
+    c.max(1.0) - bonus
 }
 
 /// T2: keep hops whose endpoints share a SEG_TX writer-bucket.
@@ -2066,7 +2147,12 @@ mod tests {
         for _ in 0..4 {
             p.bump_unfenced_reexec();
         }
-        // abort_cf = 0 and unfenced train → prepaid loses
+        p.end_block_learn();
+        p.begin_block(176);
+        p.note_refuse_ns(50_000);
+        for _ in 0..4 {
+            p.bump_unfenced_reexec();
+        }
         p.end_block_learn();
         p.begin_block(176);
         p.note_refuse_ns(50_000);
@@ -2077,7 +2163,7 @@ mod tests {
         let r = p.take_report(0.0, 0);
         assert!(
             r.prior_decay >= 1,
-            "L3: two prepaid-losing blocks with unfenced must decay prior: {r:?}"
+            "L6: confident prepaid+unfenced streak decays prior (not a 2-step arm ladder): {r:?}"
         );
         assert!(r.prepaid_ns > r.abort_cf_ns);
     }
@@ -2211,8 +2297,8 @@ mod tests {
         p.note_short_pair(0xedba, 16, 17);
         let first = p.loc_strategy(0x32be, 4);
         assert!(
-            first == LocStrategy::Windowed1 || first == LocStrategy::Windowed2,
-            "CC-L3/L4: long thin spine plants Win_w, not FullChain: {first:?}"
+            first.is_ordered() && first != LocStrategy::FullChain,
+            "CC-L3/L4: long thin spine plants Win_w/Seg, not FullChain: {first:?}"
         );
         assert!(
             p.hops_to_plant(0x32be, 4) < 4,
@@ -2279,7 +2365,11 @@ mod tests {
         for pair in [(4, 31), (31, 66), (66, 67)] {
             p.note_short_pair(0x32be, pair.0, pair.1);
         }
-        assert_eq!(p.loc_strategy(0x32be, 3), LocStrategy::Windowed1);
+        let first = p.loc_strategy(0x32be, 3);
+        assert!(
+            first.is_ordered() && first != LocStrategy::FullChain,
+            "F2: measured abort makes an OrderedAdmit window cheaper than Opt/Defer: {first:?}"
+        );
         p.note_hops_decision(0x32be, 3);
         p.note_reexec_ns_at(Some(0x32be), 40_000);
         p.end_block_learn();
@@ -2292,7 +2382,7 @@ mod tests {
     }
 
     #[test]
-    fn f7_leftover_prefers_win2_first() {
+    fn bandit_picks_by_c_hat_not_leftover_ladder() {
         let p = CostPolicy::new();
         p.begin_block(176);
         p.promote_short_edge(0x32be, 40_000);
@@ -2308,58 +2398,89 @@ mod tests {
         ] {
             p.note_short_pair(0x32be, pair.0, pair.1);
         }
+        let cold = p.loc_strategy(0x32be, 8);
+        assert_ne!(
+            cold,
+            LocStrategy::FullChain,
+            "L4: long spine never Full, got {cold:?}"
+        );
         p.note_hops_decision(0x32be, 8);
-        p.note_reexec_ns_at(Some(0x32be), 20_000);
-        p.note_reexec_ns_at(Some(0x32be), 20_000);
+        p.note_reexec_ns_at(Some(0x32be), 80_000);
+        p.note_reexec_ns_at(Some(0x32be), 80_000);
         p.end_block_learn();
         p.begin_block(176);
-        assert_eq!(
-            p.loc_strategy(0x32be, 8),
-            LocStrategy::Windowed2,
-            "S3: first leftover escalate is Win_2, not Win_3"
+        let reuse = p.loc_strategy(0x32be, 8);
+        assert_ne!(
+            reuse,
+            LocStrategy::FullChain,
+            "L4: Full stays banned on long spine"
+        );
+        assert!(
+            reuse != cold || reuse.is_ordered(),
+            "L4: reexec raises ĉ of the chosen arm so UCB can leave it: cold={cold:?} reuse={reuse:?}"
+        );
+        let hops = p.hops_to_plant(0x32be, 8);
+        assert!(
+            hops < 8,
+            "L4: bandit must not FullChain the long spine ({hops})"
         );
     }
 
     #[test]
-    fn f7_escalates_win1_leftover_to_win3_or_seg() {
+    fn bandit_prepaid_wall_can_leave_wider_window() {
         let p = CostPolicy::new();
         p.begin_block(176);
         p.promote_short_edge(0x32be, 40_000);
-        for pair in [
-            (4, 31),
-            (31, 66),
-            (66, 67),
-            (67, 69),
-            (69, 70),
-            (70, 93),
-            (93, 96),
-            (96, 103),
-        ] {
+        for pair in [(4, 31), (31, 66), (66, 67), (67, 69)] {
             p.note_short_pair(0x32be, pair.0, pair.1);
         }
-        p.note_hops_decision(0x32be, 8);
-        p.note_reexec_ns_at(Some(0x32be), 20_000);
-        p.note_reexec_ns_at(Some(0x32be), 20_000);
+        // Force a Win_3 decision identity, then pay a fat prepaid wall.
+        p.remember_arm(0x32be, LocStrategy::Windowed3);
+        p.note_refuse_ns(200_000);
+        p.note_loc_ordered_ns(0x32be, 200_000);
         p.end_block_learn();
         p.begin_block(176);
-        let s = p.loc_strategy(0x32be, 8);
-        assert!(
-            matches!(
-                s,
-                LocStrategy::Windowed2 | LocStrategy::Windowed3 | LocStrategy::Segmented
-            ),
-            "F7: leftover tail after Opt/Win_1 must escalate, got {s:?}"
-        );
+        let next = p.loc_strategy(0x32be, 4);
+        assert_ne!(next, LocStrategy::FullChain);
         assert_ne!(
-            s,
-            LocStrategy::FullChain,
-            "F7: Full stays banned on long spine"
+            next,
+            LocStrategy::Windowed3,
+            "L3/L4: high prepaid wall must raise ĉ_Win3 so another arm can win: {next:?}"
         );
-        let hops = p.hops_to_plant(0x32be, 8);
+        let r = p.take_report(0.0, 0);
         assert!(
-            hops >= 2 && hops < 8,
-            "T1/T2: escalate plants a window or segments, not full-spine ({hops})"
+            r.bandit_c_win3 > r.bandit_c_win1
+                || r.win2_deviate_n > 0
+                || next != LocStrategy::Windowed3,
+            "L7: ĉ or arm must move off hard Win_3: {r:?} next={next:?}"
         );
+    }
+
+    #[test]
+    fn bandit_short_defer_can_win() {
+        let p = CostPolicy::new();
+        p.begin_block(176);
+        p.promote_short_edge(0xedba, 8_000);
+        p.note_short_pair(0xedba, 14, 16);
+        p.note_short_pair(0xedba, 16, 17);
+        let cold = p.select_hint_arm(0xedba, 2);
+        assert_eq!(
+            cold,
+            LocStrategy::FullChain,
+            "L5: short cold prior prefers Full, got {cold:?}"
+        );
+        p.remember_arm(0xedba, LocStrategy::FullChain);
+        p.note_refuse_ns(180_000);
+        p.note_loc_ordered_ns(0xedba, 180_000);
+        p.end_block_learn();
+        p.begin_block(176);
+        let next = p.select_hint_arm(0xedba, 2);
+        assert_ne!(
+            next,
+            LocStrategy::FullChain,
+            "L5: DeferPlant / Opt / Win_w can beat Full after prepaid: {next:?}"
+        );
+        assert_ne!(next, LocStrategy::Windowed3);
     }
 
     #[test]

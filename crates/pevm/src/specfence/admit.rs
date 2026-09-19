@@ -336,9 +336,8 @@ pub(crate) fn admit_seed_begin_block(
 
 /// C1/C5: thin begin — storage-trio CallWaw only (`3..=4`).
 /// Wide ERC-20 / RAW fans stay A0 (same `to`, different slots). Empty-to A0.
-/// S6: thin plants **at most one** hint location (earliest producer first)
-/// so 14→16→17 stays and 15→19→20 is deferred until promoted. Extra
-/// CallWaw locations plant only when already measured.
+/// L5: each short CallWaw ℓ picks independently via `select_hint_arm`.
+/// DeferPlant / Opt plant nothing; Full / Win_w plant that arm's pairs.
 fn admit_seed_hint_short_edges(
     ready: &ReadyEdgeTable,
     hints: &AccountHints,
@@ -353,29 +352,35 @@ fn admit_seed_hint_short_edges(
         })
         .filter(|&(_, n, _)| (3..=4).contains(&n))
         .collect();
-    // Earliest producer first (storage 14 before the second trio 15).
     addrs.sort_unstable_by(|a, b| a.2.cmp(&b.2).then_with(|| b.1.cmp(&a.1)));
     let mut edges = 0;
-    let mut used = 0usize;
-    let thin = policy.is_optimistic_majority_block();
     for (addr, n, _) in addrs {
         let loc = envelope_loc(addr);
-        let cap = if thin { 1 } else { THIN_ORDERED_K };
-        if used >= cap && !policy.is_promoted(loc) {
+        if policy.is_promoted(loc) {
             continue;
         }
+        let n_pairs = n.saturating_sub(1);
         let txs = hints.call_to_txs(&addr);
+        let mut pairs: Vec<(TxIdx, TxIdx)> = Vec::new();
+        for pair in txs.windows(2) {
+            let (pred, succ) = (pair[0], pair[1]);
+            if pred < succ {
+                pairs.push((pred, succ));
+                policy.note_short_pair(loc, pred, succ);
+            }
+        }
+        let arm = policy.select_hint_arm(loc, n_pairs.max(pairs.len()));
+        policy.remember_arm(loc, arm);
+        if !arm.is_ordered() {
+            continue;
+        }
         if !policy.should_gate_short_after_write(loc, false, n.saturating_sub(1)) {
             continue;
         }
+        let plant = CostPolicy::select_pairs_for_strategy(arm, &pairs);
         let mut planted = 0usize;
-        for pair in txs.windows(2) {
-            let (pred, succ) = (pair[0], pair[1]);
-            if pred >= succ {
-                continue;
-            }
+        for (pred, succ) in plant {
             ready.note_consumer_on(succ, pred, Some(loc));
-            policy.note_short_pair(loc, pred, succ);
             policy.note_short_edge_admit();
             if let Some(m) = metrics {
                 m.record_edge_ordered_admit();
@@ -384,7 +389,7 @@ fn admit_seed_hint_short_edges(
         }
         if planted > 0 {
             policy.promote_short_edge(loc, 0);
-            used += 1;
+            policy.note_hops_decision(loc, n_pairs.max(pairs.len()));
             edges += planted;
         }
     }
@@ -861,6 +866,9 @@ pub(crate) fn queue_nearest_unfinished_successor(
     to: Option<Address>,
 ) {
     let n_pairs = policy.pairs_of(location).len();
+    if policy.hops_to_plant(location, n_pairs) == 0 {
+        return;
+    }
     let w = policy
         .window_w_of(location, n_pairs)
         .clamp(1, WINDOWED_W_MAX);
@@ -909,6 +917,9 @@ pub(crate) fn flush_pending_idle_edges(ready: &ReadyEdgeTable, policy: &CostPoli
         pairs.sort_unstable();
         pairs.dedup();
         let n_pairs = policy.pairs_of(loc).len().max(pairs.len());
+        if policy.hops_to_plant(loc, n_pairs) == 0 {
+            continue;
+        }
         let cap = policy.window_w_of(loc, n_pairs).clamp(1, WINDOWED_W_MAX);
         if pairs.len() > cap {
             pairs.truncate(cap);
@@ -1721,7 +1732,7 @@ mod tests {
     }
 
     #[test]
-    fn thin_begin_defers_second_call_waw() {
+    fn thin_begin_each_call_waw_picks_independently() {
         let ready = ReadyEdgeTable::new();
         let stages = ProducerStageTable::new();
         let learner = LiveLearner::new();
@@ -1745,13 +1756,17 @@ mod tests {
             &HashSet::new(),
             None,
         );
-        assert_eq!(n, 2, "S6: only storage 14→16→17 at thin begin, got {n}");
+        // L5: no "at most one CallWaw" cap. Cold Full prior may plant both.
+        assert!(
+            n == 2 || n == 4,
+            "L5: each trio independently Full or Defer, got {n}"
+        );
         assert_eq!(ready.blocking_producer(16), Some(14));
         assert_eq!(ready.blocking_producer(17), Some(16));
-        assert!(
-            ready.may_execute(19) && ready.may_execute(20),
-            "S6: second CallWaw stays OptimisticRead until promoted"
-        );
+        if n == 4 {
+            assert_eq!(ready.blocking_producer(19), Some(15));
+            assert_eq!(ready.blocking_producer(20), Some(19));
+        }
     }
 
     #[test]
