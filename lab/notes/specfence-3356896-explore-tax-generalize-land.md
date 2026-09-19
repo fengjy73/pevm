@@ -44,27 +44,34 @@
 - `hot_phase_is_greedy_zero_explore` — 热 greedy Win_2，`explore=0`；超订预算 0。
 - `morph_prior_seeds_new_location` — 新 ℓ 继承同形态 `w*` / ĉ。
 - `explore_budget_zero_when_oversubscribed` — E2 在线。
+- `leftover_occ_on_proven_window_is_not_crisis` — 尾 OCC ≠ 危机。
 - Instant idle 不进 ĉ：既有 `successful_detect_prepaid_does_not_decay`。
 
-## 3356896 墙（对照）
+## 3356896 墙（对照）@8 Soft=0 N=7 · 4 物理核超订
 
-| | OCC med | SF reuse | learn | explore_n (reuse) | PRIMARY |
-|---|---|---|---|---|---|
-| PR27 最佳 | 0.838 | **1.079** | 硬 Win_2 | — | false |
-| PR28 run1/2 | 0.97/0.90 | **1.218 / 1.214** | Opt→Win_1→2→3(→Seg) | 热 UCB 每块 | false |
-| 本 PR run1 (pre-crisis-fix) | 0.906 | **1.185** | Opt→Win_1→Win_2→Win_3→Seg_7 | 0 then 2 | false |
-| 本 PR run2 (abort-crisis) | 0.918 | **1.262** | Opt→Win_1→Win_2→Win_3→Win_4 | 2 | false |
+| | OCC med | SF reuse | learn | explore_n | w_cap | PRIMARY |
+|---|---|---|---|---|---|---|
+| PR27 最佳 | 0.838 | **1.079** | 硬 Win_2 | — | 钉 2 | false |
+| PR28 run1/2 | 0.97/0.90 | **1.218 / 1.214** | Opt→Win_1→2→3(→Seg) | 热 UCB/块 | 钉 ≤3 | false |
+| run1 leftover-hop 危机 | 0.906 | **1.185** | …→Win_3→Seg_7 | 0 then 2 | 4 | false |
+| run2 leftover-abort 危机 | 0.918 | **1.262** | …→Win_4 | 2 | 4 | false |
+| run3 oversub hat + OCC≠危机 | 0.975 | **1.185** | Full→Win_1→**Win_2** | 0 then 2 | **2** | false |
+| **run4 hot 不选未测 Defer** | 1.010 | **1.345** | Full→Win_1→**Win_2** | 0–3 | **2** | false |
 
-run1 已优于 PR28、≪PR22 1.40。run2 把危机改成 leftover-*abort* 后仍爬到 Win_4：16-writer 脊上 Win_2 的尾 OCC abort 是预期的，却被当成危机；当时 `w_cap(176@8)=4`（oversub≥8 → cores/2）。
+本盒噪声大（OCC 0.83–1.67）。结构结果比单次墙更稳：
 
-随后两处一起收：
+- 嘴粘 `OrderedWindow(2)`，不再爬 Win_3/Seg/Full 长脊。`c_win3` 停在 prior 12k（run2 曾发明 2439）。
+- **G1:** 176@8 `w_cap=2`；单元测试 32@16 `w_cap>3`。run4 热块 `unique_win_w` 1–2（主脊 2，短链 1/Full），不是死 {Win_1..3} 枚举。
+- **E1/E2:** 热 `explore_n` 0–3 ≪ PR28 每块 UCB；176/8 `explore_budget=0`。
+- run4 `[2]` Win_2：`refuse=25µs`、`unfenced=0`、墙 **0.984** vs 同 iter OCC 0.951 — Detect 完整时自适应 Win_2 可贴 OCC。其后 leftover 尾 `unfenced=14` + 预付，墙抬到 1.25–1.38（Detect+OCC 双付；PRIMARY 仍 false，与 PR27/28 同因）。
+- Soft=0；`occ_pick_while_gated` 156–206；晚 unfenced 0（好 Detect）或 14（Win_2 尾，不是 PR24 级满脊）。墙 ≪ PR22 ~1.40。
+- iter11 seq≡par pass；`erc20_independent` 0.47s release。
 
-1. **G1 在线 oversub hat** — `n_tx/cores ≥ 16` → `w_cap=2`（PR27 Win_2 类，不是 `WINDOWED_W_MAX=3`）。32@16 仍 `w_cap>3`。
-2. **E1 危机不是 leftover OCC** — 已证实窗（w≥2）的尾 OCC 不进危机。危机 = Opt 仍 abort / unfenced 列车 / 仍窄的 w=1 在漏 leftover OCC。热路径才能 greedy 粘 Win_2。
+机制（run2/3 之后）：
 
-| 本 PR run3 (w_cap=2 + leftover-OCC≠危机) | 0.975 | **1.185** | Full→Win_1→Win_2… | 0 then 2 | false |
-
-run3 粘在 Win_2、`w_cap=2`、`c_win3` 停在 prior 12k（不再发明 2439）。热 reuse 仍有 `refuse=0` 块：成功 Win_2 预付把 ĉ 抬到 85k 后，未测 Defer prior ~16k 被 hot greedy 选中 → hops=0 → 遥测仍写 Win_2。随后把热候选收成 **上轮臂 / w* / 已测 ĉ**，未测 Opt/Defer 不得拆工作窗。
+1. **G1 在线 oversub hat** — `n_tx/cores ≥ 16` → `w_cap=2`（不是 `WINDOWED_W_MAX=3`）。
+2. **E1 危机不是 leftover OCC** — 已证实窗（w≥2）的尾 OCC 不进危机。
+3. **热候选 = 上轮臂 / w* / 已测 ĉ** — 未测 Opt/Defer 不得拆工作窗（run3 hops=0 漏种）。
 
 Compare:
 
