@@ -276,8 +276,17 @@ impl Scheduler {
                 let waiting = ready.is_some_and(|e| e.has_sleeping_waiters());
                 let validated_done = self.num_validated.load(Ordering::Relaxed)
                     >= self.block_size - self.min_validation_idx.load(Ordering::Relaxed);
-                if validated_done && !waiting {
-                    break;
+                if !waiting {
+                    if let Some(idx) = self.min_runnable(ready) {
+                        self.execution_idx.fetch_min(idx, Ordering::Relaxed);
+                        if let Some(wave) = wave {
+                            wave.push_ready(idx);
+                        }
+                        continue;
+                    }
+                    if validated_done {
+                        break;
+                    }
                 }
                 // Waiting on an OrderedAdmit producer: spin first so 7
                 // yield_now() cores do not preempt the remaining writer.
@@ -666,6 +675,13 @@ impl Scheduler {
         for &w in writers {
             self.admit_spine_heat(w, wave, park_heat);
         }
+    }
+
+    /// Lowest runnable ReadyToExecute index. Exhausted-idx safety net so a
+    /// skipped-but-open gate or aborted incarnation cannot leave ESTIMATE.
+    /// Gated-not-ready holes stay sleeping (not a livelock rewind).
+    fn min_runnable(&self, ready: Option<&ReadyEdgeTable>) -> Option<TxIdx> {
+        (0..self.block_size).find(|&i| self.is_ready(i) && ready.is_none_or(|e| e.may_execute(i)))
     }
 
     /// True when the incarnation is queued `ReadyToExecute` (S1 prefer-admit).
