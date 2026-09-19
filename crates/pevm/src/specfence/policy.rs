@@ -1157,7 +1157,7 @@ impl CostPolicy {
         let Some(s) = self.promoted.get(&location) else {
             return (false, false);
         };
-        let crisis = s.last_crisis || s.leftover_reexec >= 3;
+        let crisis = s.last_crisis;
         if crisis {
             return (false, true);
         }
@@ -1206,7 +1206,9 @@ impl CostPolicy {
                 }
             }
         }
-        if n_pairs >= 3 && (cold || crisis) {
+        // E3: Seg is high-prepaid. Only after the window neighborhood is
+        // exhausted (w* at cap) *and* we are still cold/crisis.
+        if n_pairs >= 3 && (cold || crisis) && w_star >= w_cap && w_cap >= 3 {
             let sl = s_star.clamp(2, (n_pairs + 1).min(SEG_LEN_SAFETY_HAT));
             out.push(LocStrategy::seg(sl));
             if sl > 2 {
@@ -1245,9 +1247,12 @@ impl CostPolicy {
             .as_ref()
             .map(|s| s.reexec_ns_ema.max(1.0))
             .unwrap_or(1.0);
+        // Floor unused wider/high-prepaid arms to the last paid ĉ unless a
+        // leftover-*abort* crisis says the window is too narrow. Structural
+        // leftover hops on a long spine are not a license to invent cheap Win_3.
         let leftover0 = loc
             .as_ref()
-            .is_some_and(|s| s.leftover_reexec == 0 && s.decision.is_ordered());
+            .is_some_and(|s| s.decision.is_ordered() && !s.last_crisis && s.block_reexec_n < 2);
         let paid = loc
             .as_ref()
             .and_then(|s| s.stat(s.decision).filter(|(_, n)| *n > 1.0).map(|(c, _)| c));
@@ -2149,8 +2154,8 @@ impl CostPolicy {
             } else if e.decision.is_ordered() {
                 e.leftover_reexec = 0;
             }
-            e.last_crisis = e.leftover_reexec >= 3
-                || (e.decision.is_ordered() && e.block_reexec_n >= 2)
+            // Crisis = leftover *aborts* after OrderedAdmit, not leftover hops.
+            e.last_crisis = (e.decision.is_ordered() && e.block_reexec_n >= 2)
                 || (e.decision == LocStrategy::OptimisticRead
                     && e.block_reexec_n >= 2
                     && e.samples >= 2);
@@ -3238,6 +3243,17 @@ mod tests {
         p.promote_short_edge(0xbbbb, 20_000);
         for i in 0..12 {
             p.note_short_pair(0xbbbb, 10 + i, 11 + i);
+        }
+        // Exhaust the window neighborhood so Seg enters the generator (E3).
+        {
+            let cap_s = p.w_cap_of(3).max(1) as u8;
+            let mut e = p.promoted.get_mut(&0xaaaa).unwrap();
+            e.w_star = cap_s;
+        }
+        {
+            let cap_l = p.w_cap_of(12).max(1) as u8;
+            let mut e = p.promoted.get_mut(&0xbbbb).unwrap();
+            e.w_star = cap_l;
         }
         let short_cands = p.generate_arms(0xaaaa, 3, false, true, false);
         let long_cands = p.generate_arms(0xbbbb, 12, false, true, false);

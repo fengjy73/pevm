@@ -48,11 +48,13 @@
 
 ## 3356896 墙（对照）
 
-| | OCC med | SF reuse | learn | explore_n | PRIMARY |
+| | OCC med | SF reuse | learn | explore_n (reuse) | PRIMARY |
 |---|---|---|---|---|---|
 | PR27 最佳 | 0.838 | **1.079** | 硬 Win_2 | — | false |
-| PR28 run1/2 | 0.97/0.90 | **1.218 / 1.214** | Opt→Win_1→2→3(→Seg) | 高（UCB 热探） | false |
-| 本 PR | （compare 例跑后填） | 目标 ≤PR27 方向、≪PR22 1.40 | 热 greedy；`w`/`seg_len` 按 ℓ | ≪PR28 | 目标 reuse SF≤OCC |
+| PR28 run1/2 | 0.97/0.90 | **1.218 / 1.214** | Opt→Win_1→2→3(→Seg) | 热 UCB 每块 | false |
+| 本 PR run1 (pre-crisis-fix) | 0.906 | **1.185** | Opt→Win_1→Win_2→Win_3→Seg_7 | 0 then 2 | false |
+
+run1 已优于 PR28、≪PR22 1.40；仍被 leftover-hop 误当危机推上 Win_3/Seg。随后把危机改成 leftover-*abort*，并禁止未证实宽窗的廉价 prior。
 
 Compare:
 
