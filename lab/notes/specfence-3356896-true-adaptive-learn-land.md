@@ -32,3 +32,17 @@ Soft=0；禁 mid-execute ReadyEdge；禁全脊 Full；禁空 to / 宽 0x209c 星
 ## 双系统
 
 `AdaptiveParams` / Bayes / morph **只作特征**。种边口不再另开 Wait/Ordered 闸。
+
+## 本盒 3356896 @8 Soft=0 Instant-off N=7
+
+4 物理核超订 8。`profile.release.lto=false`。
+
+| | OCC med | SF cold | SF reuse | unfenced reuse | learn path | PRIMARY |
+|---|---|---|---|---|---|---|
+| PR27 land 最佳 | 0.838 | 1.172 | **1.079** | 0–3 | hard Win_2 | false |
+| **本 PR run1** | 0.969 | 2.076 | **1.218** | 0 after Win_2 | Opt→Win_1→Win_2→Win_3 | **false** |
+| **本 PR run2** | 0.898 | 1.719 | **1.214** | 0–2 late | Opt→Win_1→Win_2→Win_3→Seg | **false** |
+
+Adaptivity (run2): `c_opt` 67k→270k；`c_win2` 12k→25k→89k（prepaid 墙时钟）；`arm_switch_n` 2–4；`win2_deviate_n`>0。不是永远硬 Win_2。
+
+Soft=0；`occ_pick_while_gated` 156–202；iter11 pass；erc20_independent 0.47s；墙 ≪ PR22 ~1.40。
