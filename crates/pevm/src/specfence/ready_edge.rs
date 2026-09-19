@@ -326,9 +326,15 @@ impl ReadyEdgeTable {
             let bit = 1u64 << (tx % 64);
             self.started_bits[i].fetch_or(bit, Ordering::Release);
         }
-        // S2: close the wall-clock gate stall when the consumer actually runs.
-        self.note_stall_end(tx);
-        self.note_pick(tx);
+        if self.is_gated(tx) {
+            self.note_stall_end(tx);
+            self.pick_gate_n.fetch_add(1, Ordering::Relaxed);
+        } else if self.has_any_gated() {
+            self.pick_occ_n.fetch_add(1, Ordering::Relaxed);
+            self.occ_pick_while_gated.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.pick_occ_n.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// O3: incarnation retry is idle again — allow `note_consumer_on_if_idle`.
@@ -440,23 +446,46 @@ impl ReadyEdgeTable {
         !self.sleeping.is_empty()
     }
 
+    /// Self-heal: producer already Done but wave miss — push sleepers that
+    /// `may_execute` so dual-path pick cannot hang on a stale hole.
+    pub(crate) fn wake_ready_sleepers(&self, wave: &WaveParkTable) -> usize {
+        if self.sleeping.is_empty() {
+            return 0;
+        }
+        let ready: Vec<TxIdx> = self
+            .sleeping
+            .iter()
+            .filter_map(|t| {
+                let t = *t;
+                self.may_execute(t).then_some(t)
+            })
+            .collect();
+        for &t in &ready {
+            self.sleeping.remove(&t);
+            self.note_stall_end(t);
+            wave.push_ready(t);
+        }
+        ready.len()
+    }
+
     fn note_stall_end(&self, tx_idx: TxIdx) {
         if let Some((_, t0)) = self.stall_start.remove(&tx_idx) {
             let ns = t0.elapsed().as_nanos() as u64;
             if ns > 0 {
-                self.refuse_ns.fetch_add(ns, Ordering::Relaxed);
-            }
-        }
-    }
-
-    #[inline]
-    pub(crate) fn note_pick(&self, tx_idx: TxIdx) {
-        if self.is_gated(tx_idx) {
-            self.pick_gate_n.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.pick_occ_n.fetch_add(1, Ordering::Relaxed);
-            if self.has_any_gated() {
-                self.occ_pick_while_gated.fetch_add(1, Ordering::Relaxed);
+                // Wall prepaid is the **max** hole stall (makespan), not the
+                // sum of overlapping Instants from block-start (S2).
+                let mut cur = self.refuse_ns.load(Ordering::Relaxed);
+                while ns > cur {
+                    match self.refuse_ns.compare_exchange_weak(
+                        cur,
+                        ns,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(v) => cur = v,
+                    }
+                }
             }
         }
     }

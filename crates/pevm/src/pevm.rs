@@ -610,14 +610,13 @@ impl Pevm {
                     while task.is_some() {
                         task = match task.unwrap() {
                             Task::Execution(tx_version) => {
-                                let busy_t0 = (!occ_mode).then(Instant::now);
                                 if self.concurrency_mode == ConcurrencyMode::SpecFence {
                                     specfence.ready_edges.note_started(tx_version.tx_idx);
                                 }
                                 let occ_exec = occ_mode
                                     || (self.concurrency_mode == ConcurrencyMode::SpecFence
                                         && !specfence.ready_edges.is_gated(tx_version.tx_idx));
-                                let next = if occ_exec {
+                                if occ_exec {
                                     let done_idx = tx_version.tx_idx;
                                     let next = self
                                         .try_execute(&mut vm, &scheduler, tx_version, None, None);
@@ -635,23 +634,27 @@ impl Pevm {
                                     }
                                     next
                                 } else {
+                                    let done_idx = tx_version.tx_idx;
                                     let fence_ref = crate::specfence::fence_for_mode(
                                         self.concurrency_mode,
                                         &dag,
                                     );
-                                    self.try_execute(
+                                    let next = self.try_execute(
                                         &mut vm, &scheduler, tx_version, wave_ref, fence_ref,
-                                    )
-                                };
-                                if let Some(t0) = busy_t0 {
-                                    metrics_inner
-                                        .add_worker_busy_ns(t0.elapsed().as_nanos() as u64);
+                                    );
+                                    // Gated producer must still wake dependents
+                                    // (dual-path may have fetch_max'd past them).
+                                    specfence.ready_edges.note_producer_done_stamp(done_idx);
+                                    if specfence.ready_edges.has_known_waiters(done_idx)
+                                        && let Some(w) = wave_ref
+                                    {
+                                        specfence.ready_edges.note_producer_done(done_idx, w);
+                                    }
+                                    next
                                 }
-                                next
                             }
                             Task::Validation(tx_version) => {
                                 let v0 = profile.then(Instant::now);
-                                let busy_t0 = (!occ_mode).then(Instant::now);
                                 let optimistic_ungated = specfence.mode
                                     == ConcurrencyMode::SpecFence
                                     && !specfence.ready_edges.is_gated(tx_version.tx_idx);
@@ -682,10 +685,6 @@ impl Pevm {
                                 if let Some(t0) = v0 {
                                     metrics_inner
                                         .add_profile_validate_ns(t0.elapsed().as_nanos() as u64);
-                                }
-                                if let Some(t0) = busy_t0 {
-                                    metrics_inner
-                                        .add_worker_busy_ns(t0.elapsed().as_nanos() as u64);
                                 }
                                 next
                             }

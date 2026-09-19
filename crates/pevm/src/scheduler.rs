@@ -263,6 +263,9 @@ impl Scheduler {
             if execution_idx >= self.block_size && validation_idx >= self.block_size {
                 // Re-check wave ready before yield — a producer may have just pushed.
                 if let Some(wave) = wave {
+                    if let Some(edges) = ready {
+                        let _ = edges.wake_ready_sleepers(wave);
+                    }
                     while let Some(tx_idx) = wave.pop_ready() {
                         if let Some(tx_version) = self.try_occ_or_skip_gate(tx_idx, ready) {
                             wave.note_ready_steal_if_after_park();
@@ -276,9 +279,15 @@ impl Scheduler {
                 if validated_done && !waiting {
                     break;
                 }
-                // Product-path yield meter (P1). PROFILE idle Instant is
-                // separate and must not enter ĉ (S2).
+                // Waiting on an OrderedAdmit producer: spin first so 7
+                // yield_now() cores do not preempt the remaining writer.
+                // Product-path yield meter (P1). Instant idle ≠ ĉ (S2).
                 let idle_t0 = Instant::now();
+                if waiting {
+                    for _ in 0..64 {
+                        std::hint::spin_loop();
+                    }
+                }
                 thread::yield_now();
                 let ns = idle_t0.elapsed().as_nanos() as u64;
                 if let Some(edges) = ready {

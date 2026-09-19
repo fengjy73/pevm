@@ -1529,9 +1529,10 @@ impl CostPolicy {
                 .unwrap()
                 .ema_ns(reexec as f64, EMA_ALPHA);
         }
-        // Successful Detect (unfenced=0) must not look like a prepaid loss.
+        // Successful Detect / a single leftover miss must not decay to Win_1.
+        // Only an abort *train* plus prepaid wall is a real Detect loss.
         let unfenced = self.unfenced_reexec.load(Ordering::Relaxed);
-        let prepaid_lost = prepaid > abort_cf && prepaid > 0 && unfenced > 0;
+        let prepaid_lost = prepaid > abort_cf && prepaid > 0 && unfenced >= 4;
         if prepaid_lost {
             let n = self.prepaid_lose_streak.fetch_add(1, Ordering::Relaxed) + 1;
             if n >= PREPAID_LOSE_N as usize {
@@ -2029,12 +2030,16 @@ mod tests {
         assert!(p.choose_ordered(CohortKind::EmptyTo, addr, 16, true, 0.20));
         p.note_refuse_ns(50_000);
         p.note_width_loss_ns(10_000);
-        p.bump_unfenced_reexec();
-        // abort_cf = 0 and unfenced>0 → prepaid loses
+        for _ in 0..4 {
+            p.bump_unfenced_reexec();
+        }
+        // abort_cf = 0 and unfenced train → prepaid loses
         p.end_block_learn();
         p.begin_block(176);
         p.note_refuse_ns(50_000);
-        p.bump_unfenced_reexec();
+        for _ in 0..4 {
+            p.bump_unfenced_reexec();
+        }
         p.end_block_learn();
         let r = p.take_report(0.0, 0);
         assert!(
@@ -2212,8 +2217,10 @@ mod tests {
         p.note_short_pair(0xedba, 16, 17);
         p.note_refuse_ns(80_000);
         p.note_width_loss_ns(20_000);
-        p.bump_unfenced_reexec();
-        // abort_cf = 0 and unfenced>0 → prepaid loses
+        for _ in 0..4 {
+            p.bump_unfenced_reexec();
+        }
+        // abort_cf = 0 and unfenced train → prepaid loses
         p.end_block_learn();
         p.begin_block(176);
         assert!(
