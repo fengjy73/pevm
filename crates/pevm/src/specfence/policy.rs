@@ -1223,11 +1223,17 @@ impl CostPolicy {
             out.push(LocStrategy::FullChain);
         }
         if !cold && !crisis {
-            let keep = self.promoted.get(&location).map(|s| s.decision);
+            // E1: hot exploit is last arm / w* / measured ĉ only.
+            // Unmeasured Defer/Opt priors must not undercut a working window.
+            let loc = self.promoted.get(&location);
+            let keep = loc.as_ref().map(|s| s.decision);
             out.retain(|a| {
-                !a.is_high_prepaid(n_pairs)
-                    || keep == Some(*a)
+                keep == Some(*a)
                     || *a == LocStrategy::win(w_star.min(n_pairs).min(w_cap.max(1)))
+                    || loc
+                        .as_ref()
+                        .and_then(|s| s.stat(*a).map(|(_, n)| n > 1.5))
+                        .unwrap_or(false)
             });
         }
         out.sort_by_key(|a| a.tie_key());
@@ -3191,6 +3197,11 @@ mod tests {
             !hot.iter().any(|a| *a == LocStrategy::win(3)),
             "E3: hot must not grow w+1 for fun: {hot:?}"
         );
+        assert!(
+            !hot.iter()
+                .any(|a| matches!(a, LocStrategy::OptimisticRead | LocStrategy::DeferPlant)),
+            "E1: unmeasured Opt/Defer must not stay on a hot working window: {hot:?}"
+        );
     }
 
     #[test]
@@ -3229,6 +3240,21 @@ mod tests {
         assert_eq!(
             r.explore_budget, 0,
             "E2: 176 txs / 8 cores is oversubscribed → hot budget 0"
+        );
+        // Cheap unmeasured Defer prior must not steal a working Win_2 (run3
+        // plant-miss: hops=0, refuse=0, unfenced OCC + SF shell).
+        {
+            let mut e = p.promoted.get_mut(&0x32be).unwrap();
+            e.arms.retain(|s| {
+                !matches!(s.arm, LocStrategy::OptimisticRead | LocStrategy::DeferPlant)
+            });
+            e.decision = LocStrategy::win(2);
+            e.last_crisis = false;
+        }
+        let (stuck, explore2, _) = p.select_arm(0x32be, 4);
+        assert!(
+            !explore2 && stuck == LocStrategy::win(2),
+            "E1: hot exploit stays on measured Win_2, not cheap Defer prior: {stuck:?}"
         );
     }
 

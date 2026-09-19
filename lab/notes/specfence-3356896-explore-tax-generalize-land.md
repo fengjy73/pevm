@@ -62,7 +62,9 @@ run1 已优于 PR28、≪PR22 1.40。run2 把危机改成 leftover-*abort* 后�
 1. **G1 在线 oversub hat** — `n_tx/cores ≥ 16` → `w_cap=2`（PR27 Win_2 类，不是 `WINDOWED_W_MAX=3`）。32@16 仍 `w_cap>3`。
 2. **E1 危机不是 leftover OCC** — 已证实窗（w≥2）的尾 OCC 不进危机。危机 = Opt 仍 abort / unfenced 列车 / 仍窄的 w=1 在漏 leftover OCC。热路径才能 greedy 粘 Win_2。
 
-Compare 复跑中（N=7 @8 Soft=0）。
+| 本 PR run3 (w_cap=2 + leftover-OCC≠危机) | 0.975 | **1.185** | Full→Win_1→Win_2… | 0 then 2 | false |
+
+run3 粘在 Win_2、`w_cap=2`、`c_win3` 停在 prior 12k（不再发明 2439）。热 reuse 仍有 `refuse=0` 块：成功 Win_2 预付把 ĉ 抬到 85k 后，未测 Defer prior ~16k 被 hot greedy 选中 → hops=0 → 遥测仍写 Win_2。随后把热候选收成 **上轮臂 / w* / 已测 ĉ**，未测 Opt/Defer 不得拆工作窗。
 
 Compare:
 
