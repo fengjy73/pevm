@@ -333,27 +333,35 @@ pub(crate) fn admit_seed_begin_block(
 
 /// C1/C5: thin begin — storage-trio CallWaw only (`3..=4`).
 /// Wide ERC-20 / RAW fans stay A0 (same `to`, different slots). Empty-to A0.
-/// Cap **locations** at `THIN_ORDERED_K`. Hottest first.
+/// S6: thin plants **at most one** hint location (earliest producer first)
+/// so 14→16→17 stays and 15→19→20 is deferred until promoted. Extra
+/// CallWaw locations plant only when already measured.
 fn admit_seed_hint_short_edges(
     ready: &ReadyEdgeTable,
     hints: &AccountHints,
     policy: &CostPolicy,
     metrics: Option<&MetricsInner>,
 ) -> usize {
-    let mut addrs: Vec<(Address, usize)> = hints
+    let mut addrs: Vec<(Address, usize, TxIdx)> = hints
         .call_to_accounts()
-        .map(|a| (a, hints.call_to_txs(&a).len()))
-        .filter(|&(_, n)| (3..=4).contains(&n))
+        .map(|a| {
+            let txs = hints.call_to_txs(&a);
+            (a, txs.len(), txs.first().copied().unwrap_or(TxIdx::MAX))
+        })
+        .filter(|&(_, n, _)| (3..=4).contains(&n))
         .collect();
-    addrs.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    // Earliest producer first (storage 14 before the second trio 15).
+    addrs.sort_unstable_by(|a, b| a.2.cmp(&b.2).then_with(|| b.1.cmp(&a.1)));
     let mut edges = 0;
     let mut used = 0usize;
-    for (addr, n) in addrs {
-        if used >= THIN_ORDERED_K {
-            break;
+    let thin = policy.is_optimistic_majority_block();
+    for (addr, n, _) in addrs {
+        let loc = envelope_loc(addr);
+        let cap = if thin { 1 } else { THIN_ORDERED_K };
+        if used >= cap && !policy.is_promoted(loc) {
+            continue;
         }
         let txs = hints.call_to_txs(&addr);
-        let loc = envelope_loc(addr);
         if !policy.should_gate_short_after_write(loc, false, n.saturating_sub(1)) {
             continue;
         }
@@ -1705,6 +1713,40 @@ mod tests {
         assert_eq!(ready.blocking_producer(16), Some(14));
         assert_eq!(ready.blocking_producer(17), Some(16));
         assert!(ready.may_execute(14), "storage head stays runnable");
+    }
+
+    #[test]
+    fn thin_begin_defers_second_call_waw() {
+        let ready = ReadyEdgeTable::new();
+        let stages = ProducerStageTable::new();
+        let learner = LiveLearner::new();
+        learner.begin_block(MorphWeights::default());
+        let bayes = BayesMap::new();
+        let prior = InterBlockPrior::new();
+        let storage = Address::repeat_byte(0xed);
+        let second = Address::repeat_byte(0xe9);
+        let hints =
+            AccountHints::from_two_call_to(storage, vec![14, 16, 17], second, vec![15, 19, 20]);
+        let policy = policy_for(176);
+        let n = admit_seed_begin_block(
+            &ready,
+            &stages,
+            &learner,
+            &bayes,
+            &prior,
+            &hints,
+            Address::ZERO,
+            &policy,
+            &HashSet::new(),
+            None,
+        );
+        assert_eq!(n, 2, "S6: only storage 14→16→17 at thin begin, got {n}");
+        assert_eq!(ready.blocking_producer(16), Some(14));
+        assert_eq!(ready.blocking_producer(17), Some(16));
+        assert!(
+            ready.may_execute(19) && ready.may_execute(20),
+            "S6: second CallWaw stays OptimisticRead until promoted"
+        );
     }
 
     #[test]

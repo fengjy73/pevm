@@ -15,7 +15,6 @@ use dashmap::{DashMap, DashSet};
 
 use crate::{BuildIdentityHasher, MemoryLocationHash, TxIdx};
 
-use super::engagement::profile_timing_enabled;
 use super::wave::WaveParkTable;
 
 const NONE: usize = usize::MAX;
@@ -54,6 +53,15 @@ pub(crate) struct ReadyEdgeTable {
     sleeping: DashSet<TxIdx, BuildIdentityHasher>,
     /// L6: ns spent in refuse / defer path.
     refuse_ns: AtomicU64,
+    /// Product-path wall-clock stall start per gated hole (S2).
+    stall_start: DashMap<TxIdx, Instant, BuildIdentityHasher>,
+    /// Product-path scheduler yield ns (P1). Not written into ĉ.
+    yield_ns: AtomicU64,
+    /// Dual-path pick census (P1).
+    pick_occ_n: AtomicUsize,
+    pick_gate_n: AtomicUsize,
+    skip_gate_n: AtomicUsize,
+    occ_pick_while_gated: AtomicUsize,
     /// Producer → known consumers (completion event → bag; no DashMap scan).
     waiters: DashMap<TxIdx, Vec<TxIdx>, BuildIdentityHasher>,
     /// Ordered-admit gated txs. Marked **before** the consumer map insert so
@@ -85,6 +93,12 @@ impl Default for ReadyEdgeTable {
             idle_core_ns: AtomicU64::new(0),
             sleeping: DashSet::default(),
             refuse_ns: AtomicU64::new(0),
+            stall_start: DashMap::default(),
+            yield_ns: AtomicU64::new(0),
+            pick_occ_n: AtomicUsize::new(0),
+            pick_gate_n: AtomicUsize::new(0),
+            skip_gate_n: AtomicUsize::new(0),
+            occ_pick_while_gated: AtomicUsize::new(0),
             waiters: DashMap::default(),
             gated_bits: std::array::from_fn(|_| AtomicU64::new(0)),
             gated_n: AtomicUsize::new(0),
@@ -312,6 +326,9 @@ impl ReadyEdgeTable {
             let bit = 1u64 << (tx % 64);
             self.started_bits[i].fetch_or(bit, Ordering::Release);
         }
+        // S2: close the wall-clock gate stall when the consumer actually runs.
+        self.note_stall_end(tx);
+        self.note_pick(tx);
     }
 
     /// O3: incarnation retry is idle again — allow `note_consumer_on_if_idle`.
@@ -391,6 +408,77 @@ impl ReadyEdgeTable {
         if ns > 0 {
             self.idle_core_ns.fetch_add(ns, Ordering::Relaxed);
         }
+    }
+
+    /// Product-path yield ns (P1 busy/idle). Never written into ĉ.
+    #[inline]
+    pub(crate) fn add_yield_ns(&self, ns: u64) {
+        if ns > 0 {
+            self.yield_ns.fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn yield_ns(&self) -> u64 {
+        self.yield_ns.load(Ordering::Relaxed)
+    }
+
+    /// Skip a gated-not-ready hole once: lock-free sleeping + wall-clock stall start.
+    /// No deferred mutex — wake is the waiter map on producer Done.
+    pub(crate) fn note_skip_gate(&self, tx_idx: TxIdx) {
+        if self.sleeping.contains(&tx_idx) {
+            return;
+        }
+        self.sleeping.insert(tx_idx);
+        self.refuse.fetch_add(1, Ordering::Relaxed);
+        self.skip_gate_n.fetch_add(1, Ordering::Relaxed);
+        self.stall_start.entry(tx_idx).or_insert_with(Instant::now);
+    }
+
+    #[inline]
+    pub(crate) fn has_sleeping_waiters(&self) -> bool {
+        !self.sleeping.is_empty()
+    }
+
+    fn note_stall_end(&self, tx_idx: TxIdx) {
+        if let Some((_, t0)) = self.stall_start.remove(&tx_idx) {
+            let ns = t0.elapsed().as_nanos() as u64;
+            if ns > 0 {
+                self.refuse_ns.fetch_add(ns, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn note_pick(&self, tx_idx: TxIdx) {
+        if self.is_gated(tx_idx) {
+            self.pick_gate_n.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.pick_occ_n.fetch_add(1, Ordering::Relaxed);
+            if self.has_any_gated() {
+                self.occ_pick_while_gated.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn pick_occ_n(&self) -> usize {
+        self.pick_occ_n.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn pick_gate_n(&self) -> usize {
+        self.pick_gate_n.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn skip_gate_n(&self) -> usize {
+        self.skip_gate_n.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn occ_pick_while_gated(&self) -> usize {
+        self.occ_pick_while_gated.load(Ordering::Relaxed)
     }
 
     #[inline]
@@ -534,22 +622,16 @@ impl ReadyEdgeTable {
     /// Defer a known consumer. Count once until the producer finishes —
     /// re-probing the same head must not spin `refuse_admit` (19606599 31k).
     /// PC-W1: mark sleeping so steal/index skip this head until pred Done.
+    /// Instant-in-defer is **not** refuse_ns (S2: wall-clock stall only).
     #[inline]
     pub(crate) fn defer(&self, tx_idx: TxIdx) {
-        let t0 = profile_timing_enabled().then(Instant::now);
+        self.note_skip_gate(tx_idx);
         let mut d = self.deferred.lock().unwrap();
         if d.iter().any(|&t| t == tx_idx) {
-            self.sleeping.insert(tx_idx);
             return;
         }
-        self.refuse.fetch_add(1, Ordering::Relaxed);
-        self.sleeping.insert(tx_idx);
         d.push(tx_idx);
         self.deferred_n.store(d.len(), Ordering::Relaxed);
-        drop(d);
-        if let Some(t0) = t0 {
-            self.add_refuse_ns(t0.elapsed().as_nanos() as u64);
-        }
     }
 
     #[inline]

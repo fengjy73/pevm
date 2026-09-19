@@ -25,9 +25,9 @@ pub(crate) fn next_sf_task(
     metrics: Option<&MetricsInner>,
 ) -> Option<Task> {
     let refuse_before = ready.refuse_count();
-    // P3/P4: no gated txs → OCC idx pick (bag stays off the A0 path).
-    // After a short edge exists, wave/refuse applies only to `is_gated` txs;
-    // independents still steal via execution_idx.
+    // S1: no gated txs → OCC idx pick. When gates exist, `next_task_with_wave_ready`
+    // is still the **same spine**: ungated txs keep the OCC collaborative pick;
+    // wave/refuse applies only to `is_gated` holes (not a global mode switch).
     if !stages.has_reserved() && !ready.has_any_gated() {
         return scheduler.next_task();
     }
