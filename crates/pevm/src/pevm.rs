@@ -620,27 +620,38 @@ impl Pevm {
                                     let done_idx = tx_version.tx_idx;
                                     let next = self
                                         .try_execute(&mut vm, &scheduler, tx_version, None, None);
-                                    if self.concurrency_mode == ConcurrencyMode::SpecFence {
-                                        // P1: always stamp. Wake only if this writer
-                                        // has waiters (insert-during-execute still wakes).
+                                    if self.concurrency_mode == ConcurrencyMode::SpecFence
+                                        && scheduler.is_done(done_idx)
+                                    {
+                                        // Wake only after a successful incarnation.
+                                        // Stamping Done on abort lets dependents
+                                        // OCC-steal against ESTIMATE → seq≠par.
                                         specfence.ready_edges.note_producer_done_stamp(done_idx);
-                                        if specfence.ready_edges.has_known_waiters(done_idx) {
-                                            if let Some(w) = wave_ref {
-                                                specfence
-                                                    .ready_edges
-                                                    .note_producer_done(done_idx, w);
-                                            }
+                                        if specfence.ready_edges.has_known_waiters(done_idx)
+                                            && let Some(w) = wave_ref
+                                        {
+                                            specfence.ready_edges.note_producer_done(done_idx, w);
                                         }
                                     }
                                     next
                                 } else {
+                                    let done_idx = tx_version.tx_idx;
                                     let fence_ref = crate::specfence::fence_for_mode(
                                         self.concurrency_mode,
                                         &dag,
                                     );
-                                    self.try_execute(
+                                    let next = self.try_execute(
                                         &mut vm, &scheduler, tx_version, wave_ref, fence_ref,
-                                    )
+                                    );
+                                    if scheduler.is_done(done_idx) {
+                                        specfence.ready_edges.note_producer_done_stamp(done_idx);
+                                        if specfence.ready_edges.has_known_waiters(done_idx)
+                                            && let Some(w) = wave_ref
+                                        {
+                                            specfence.ready_edges.note_producer_done(done_idx, w);
+                                        }
+                                    }
+                                    next
                                 }
                             }
                             Task::Validation(tx_version) => {
@@ -783,6 +794,8 @@ impl Pevm {
                 let i31 = w.iter().position(|&t| t == 31);
                 matches!((i4, i31), (Some(a), Some(b)) if a < b)
             });
+            let thin = self.cost_policy.is_optimistic_majority_block();
+            // S5: edge_4_31 already true → skip MV merge and HotSet walk.
             if !ready_has_4_31 {
                 for (loc, writers) in mv_writers_for_locs(
                     &mv_memory,
@@ -799,24 +812,21 @@ impl Pevm {
                     }
                 }
             }
-            let thin = self.cost_policy.is_optimistic_majority_block();
-            // M2: skip MV merge when D1 already has 4→31 (above). HotSet is
-            // block-end sampling only — still note ≥3-writer / promoted ℓ.
-            // Do not use ready_has_4_31 as a global HotSet off-switch: any
-            // 32+ same-ℓ spine contains idx 4 and 31.
-            for (loc, writers) in &d1_orders {
-                if writers.len() < 2 {
-                    continue;
-                }
-                self.rw_prior.observe_write_set(&[*loc], None);
-                if !thin || writers.len() >= 3 || self.cost_policy.is_promoted(*loc) {
-                    for &tx in writers {
-                        self.hotset.note_writer(*loc, tx);
+            if !(ready_has_4_31 && thin) {
+                for (loc, writers) in &d1_orders {
+                    if writers.len() < 2 {
+                        continue;
+                    }
+                    self.rw_prior.observe_write_set(&[*loc], None);
+                    if !thin || writers.len() >= 3 || self.cost_policy.is_promoted(*loc) {
+                        for &tx in writers {
+                            self.hotset.note_writer(*loc, tx);
+                        }
                     }
                 }
-            }
-            if !thin {
-                self.hotset.end_block();
+                if !thin {
+                    self.hotset.end_block();
+                }
             }
             // P1: pack InterBlockPrior from live morph hat + top-ℓ (flip → higher α).
             let morph_hat = learner.morph_hat();
@@ -879,13 +889,15 @@ impl Pevm {
                 .collect();
             self.cost_policy.note_promoted_writer_orders(&persist);
             let mut d1_orders = d1_orders;
-            for (loc, writers) in self.cost_policy.writer_orders_from_pairs() {
-                if let Some((_, w)) = d1_orders.iter_mut().find(|(l, _)| *l == loc) {
-                    w.extend(writers);
-                    w.sort_unstable();
-                    w.dedup();
-                } else {
-                    d1_orders.push((loc, writers));
+            if !(ready_has_4_31 && thin) {
+                for (loc, writers) in self.cost_policy.writer_orders_from_pairs() {
+                    if let Some((_, w)) = d1_orders.iter_mut().find(|(l, _)| *l == loc) {
+                        w.extend(writers);
+                        w.sort_unstable();
+                        w.dedup();
+                    } else {
+                        d1_orders.push((loc, writers));
+                    }
                 }
             }
             self.last_location_writers = d1_orders;
@@ -907,6 +919,13 @@ impl Pevm {
             self.cost_policy.end_block_learn();
             let mut report = self.cost_policy.take_report(ready_w, idle);
             report.end_block_ns = end_t0.elapsed().as_nanos() as u64;
+            report.pick_occ_n = ready_edges.pick_occ_n();
+            report.pick_gate_n = ready_edges.pick_gate_n();
+            report.skip_gate_n = ready_edges.skip_gate_n();
+            report.occ_pick_while_gated = ready_edges.occ_pick_while_gated();
+            report.yield_ns = ready_edges.yield_ns();
+            report.gate_stall_ns = refuse_ns;
+            report.worker_busy_ns = metrics_inner.worker_busy_ns();
             // M4: OptimisticRead-path tax vs OCC (admit seed + end_block + refuse).
             report.optimistic_path_tax_ns = report
                 .end_block_ns

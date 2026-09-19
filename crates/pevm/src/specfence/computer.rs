@@ -25,10 +25,9 @@ pub(crate) fn next_sf_task(
     metrics: Option<&MetricsInner>,
 ) -> Option<Task> {
     let refuse_before = ready.refuse_count();
-    // P3/P4: no gated txs → OCC idx pick (bag stays off the A0 path).
-    // After a short edge exists, wave/refuse applies only to `is_gated` txs;
-    // independents still steal via execution_idx.
-    if !stages.has_reserved() && !ready.has_any_gated() {
+    // S1/P1: no *pending* holes → OCC idx pick. Finished gates are not a
+    // global mode switch — independents return to `next_occ_task`.
+    if !stages.has_reserved() && !ready.has_pending_gated() {
         return scheduler.next_task();
     }
     // A0-majority / no RAW-fan reservation: OCC-class pick (no empty DashMap scan).

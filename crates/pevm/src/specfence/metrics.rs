@@ -494,6 +494,7 @@ pub(crate) struct MetricsInner {
     conflict_promote: AtomicUsize,
     conflict_ignore: AtomicUsize,
     admit_seed_begin_ns: AtomicU64,
+    worker_busy_ns: AtomicU64,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -966,6 +967,18 @@ impl MetricsInner {
     #[inline]
     pub(crate) fn admit_seed_begin_ns(&self) -> u64 {
         self.admit_seed_begin_ns.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn add_worker_busy_ns(&self, ns: u64) {
+        if ns > 0 {
+            self.worker_busy_ns.fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn worker_busy_ns(&self) -> u64 {
+        self.worker_busy_ns.load(Ordering::Relaxed)
     }
 
     #[inline]

@@ -10,7 +10,9 @@ use super::ConcurrencyMode;
 use super::LeanAbortRepair;
 use super::SpecFenceCtx;
 use super::certificate::CertificateTable;
-use super::collateral::{ConflictClass, classify_first_conflict, commute_ok, location_is_lazy};
+use super::collateral::{
+    ConflictClass, classify_first_conflict, commute_ok, is_value_transfer, location_is_lazy,
+};
 use super::dag::FenceGraph;
 use super::learner::LiveLearner;
 use super::repair::{RepairGrain, repair_grain};
@@ -282,7 +284,8 @@ fn occ_abort_ungated(
     scheduler.finish_validation(tx_version, aborted)
 }
 
-/// P1: A0 validate — OCC-identical on the no-conflict path; commute only on miss.
+/// S4: success path ≡ `validate_occ_stage` (bool walk + finish). Commute
+/// only for necessary lazy value-transfer; other misses are OCC abort.
 pub(crate) fn validate_optimistic_fast(
     mv_memory: &MvMemory,
     scheduler: &Scheduler,
@@ -291,6 +294,9 @@ pub(crate) fn validate_optimistic_fast(
 ) -> Option<Task> {
     if occ_read_set_valid(mv_memory, tx_version.tx_idx) {
         return scheduler.finish_validation(tx_version, false);
+    }
+    if !is_value_transfer(specfence.hints, tx_version.tx_idx) {
+        return validate_occ_stage(mv_memory, scheduler, tx_version, Some(specfence.metrics));
     }
     let invalid = mv_memory.collect_invalid_reads(tx_version.tx_idx);
     if note_and_try_commute(specfence, mv_memory, tx_version.tx_idx, &invalid) {

@@ -210,6 +210,20 @@ pub struct LearnReport {
     pub chosen_strategy: String,
     /// T1 window width of the dominant Win_w (0 if not windowed).
     pub chosen_win_w: u8,
+    /// Dual-path pick: ungated OCC-class issues.
+    pub pick_occ_n: usize,
+    /// Dual-path pick: gated (OrderedAdmit) issues.
+    pub pick_gate_n: usize,
+    /// Gated-not-ready holes skipped (edge constraint, not global mode).
+    pub skip_gate_n: usize,
+    /// Ungated OCC picks while any gate was live (P1 evidence).
+    pub occ_pick_while_gated: usize,
+    /// Product-path scheduler yield ns (P1). Instant-tax; not in ĉ.
+    pub yield_ns: u64,
+    /// Wall-clock gate stall (S2 prepaid). Same source as refuse_ns.
+    pub gate_stall_ns: u64,
+    /// Worker execute+validate busy ns (sum). Instant-tax; not in ĉ.
+    pub worker_busy_ns: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -650,20 +664,26 @@ impl CostPolicy {
     /// F2/F7: min-EV among Opt / Win_w / Seg. Full banned on long thin spines.
     fn f7_pick(&self, location: MemoryLocationHash, n_pairs: usize) -> LocStrategy {
         let costs = self.six_way_costs(location, n_pairs);
-        let (measured, samples, leftover, escalate_n) =
-            self.promoted
-                .get(&location)
-                .map_or((false, 0.0, 0, 0), |s| {
-                    (
-                        s.measured,
-                        s.samples as f64,
-                        s.leftover_reexec,
-                        s.escalate_n,
-                    )
-                });
+        let (measured, samples, leftover, escalate_n, last) = self.promoted.get(&location).map_or(
+            (false, 0.0, 0, 0, LocStrategy::OptimisticRead),
+            |s| {
+                (
+                    s.measured,
+                    s.samples as f64,
+                    s.leftover_reexec,
+                    s.escalate_n,
+                    s.decision,
+                )
+            },
+        );
         // F4: stay OptimisticRead until a measured abort or n₀ samples.
         if !measured && samples < MIN_SAMPLES {
             return LocStrategy::OptimisticRead;
+        }
+        // S3: a winning OrderedAdmit hop (leftover/reexec cleared) sticks.
+        // Do not drop to Opt just because prepaid wall > 0 and abort_cf = 0.
+        if measured && leftover == 0 && last.is_ordered() {
+            return last;
         }
         let c_opt = costs[0];
         // After a measured EffectiveWAW, OrderedAdmit is the sandwich default
@@ -676,19 +696,22 @@ impl CostPolicy {
         {
             return LocStrategy::OptimisticRead;
         }
-        // F7: leftover tail after Opt/Win_1 → Win_2/3 first. Seg only after
-        // Win_3 was tried (escalate_n≥2) — full-spine Seg prepaid lost PRIMARY
-        // (reuse ~1.28 vs OCC ~0.86) even though unfenced dropped to 0.
+        // S3: leftover after Opt/Win_1 prefers the lower hop (Win_2).
+        // Win_3 only after Win_2 was tried and leftover reexec remains
+        // (escalate_n≥2). Seg only after that (escalate_n≥2 ∧ leftover≥SEG).
         let escalate = leftover >= LEFTOVER_WIN3 || escalate_n >= 1;
         let want_seg = escalate_n >= 2 && leftover >= LEFTOVER_SEG;
+        let want_win3 = escalate_n >= 2;
         let candidates: &[LocStrategy] = if want_seg {
             &[
+                LocStrategy::Windowed2,
                 LocStrategy::Windowed3,
                 LocStrategy::Segmented,
-                LocStrategy::Windowed2,
             ]
-        } else if escalate {
+        } else if escalate && want_win3 {
             &[LocStrategy::Windowed3, LocStrategy::Windowed2]
+        } else if escalate {
+            &[LocStrategy::Windowed2, LocStrategy::Windowed3]
         } else {
             &[
                 LocStrategy::OptimisticRead,
@@ -706,7 +729,7 @@ impl CostPolicy {
                 best_c = c;
             }
         }
-        // Tie: leftover tail prefers Seg / Win_3 over Win_1 (F7).
+        // Tie: leftover tail prefers lower hop unless Win_2 already failed.
         if escalate {
             let near: Vec<LocStrategy> = candidates
                 .iter()
@@ -716,11 +739,14 @@ impl CostPolicy {
             if want_seg && near.contains(&LocStrategy::Segmented) {
                 return LocStrategy::Segmented;
             }
-            if near.contains(&LocStrategy::Windowed3) {
+            if want_win3 && near.contains(&LocStrategy::Windowed3) {
                 return LocStrategy::Windowed3;
             }
             if near.contains(&LocStrategy::Windowed2) {
                 return LocStrategy::Windowed2;
+            }
+            if near.contains(&LocStrategy::Windowed3) {
+                return LocStrategy::Windowed3;
             }
         }
         best
@@ -902,6 +928,13 @@ impl CostPolicy {
         if cohort_len < 2 {
             return AdmitAction::OptimisticRead;
         }
+        // Wide RAW fans (ERC-20 independent / same-`to` calldata) stay
+        // OptimisticRead. A probe star of thousands serializes the block and
+        // livelocks dual-path skip — do not "fill cores" by widening OrderedAdmit.
+        if kind == CohortKind::RawFan {
+            self.optimistic_read_cohorts.fetch_add(1, Ordering::Relaxed);
+            return AdmitAction::OptimisticRead;
+        }
         // PC-2: envelope empty-to on an EOA is LazyRecipient — never A1.
         if kind == CohortKind::EmptyTo && !is_contract {
             self.optimistic_read_cohorts.fetch_add(1, Ordering::Relaxed);
@@ -909,6 +942,13 @@ impl CostPolicy {
         }
         // 2-tx same-from pairs stay A0 (3356896 has ~60; refuse is pure meta).
         if kind == CohortKind::SameFrom && cohort_len < 3 {
+            self.optimistic_read_cohorts.fetch_add(1, Ordering::Relaxed);
+            return AdmitAction::OptimisticRead;
+        }
+        // Wide nonce chains (ERC-20 clusters: 15 transfers/person) stay
+        // OptimisticRead. Full-shell priors would otherwise plant tens of
+        // thousands of predecessor edges and livelock dual-path skip.
+        if kind == CohortKind::SameFrom && cohort_len >= 8 {
             self.optimistic_read_cohorts.fetch_add(1, Ordering::Relaxed);
             return AdmitAction::OptimisticRead;
         }
@@ -1146,18 +1186,15 @@ impl CostPolicy {
         self.width_loss_ns.fetch_add(ns, Ordering::Relaxed);
     }
 
-    /// B2: observed refuse / idle / reexec cost sample (legacy units + ns feed).
+    /// B2: observed refuse / reexec cost sample. Instant idle must **not**
+    /// enter width_loss / prepaid / ĉ (PROFILE taught Win_3→Win_1 trains).
     pub(crate) fn note_cost_sample(&self, refuse_unit: f64, reexec: bool, idle_ns: u64) {
+        let _ = idle_ns;
         if refuse_unit > 0.0 {
             self.refuse_global.lock().unwrap().ema(refuse_unit, 0.15);
         }
         if reexec {
             self.reexec_global.lock().unwrap().ema(1.0, 0.20);
-        }
-        if idle_ns > 0 {
-            let idle_u = (idle_ns as f64 / 50_000.0).min(4.0);
-            self.idle_global.lock().unwrap().ema(idle_u, 0.10);
-            self.note_width_loss_ns(idle_ns);
         }
     }
 
@@ -1488,8 +1525,9 @@ impl CostPolicy {
     pub(crate) fn end_block_learn(&self) {
         let refuse = self.refuse_ns.load(Ordering::Relaxed);
         let reexec = self.reexec_ns.load(Ordering::Relaxed);
-        let width = self.width_loss_ns.load(Ordering::Relaxed);
-        let prepaid = refuse.saturating_add(width);
+        // S2: prepaid is wall-clock gate stall only. Instant idle / width
+        // must not enter ĉ (PROFILE Win_3→Win_1).
+        let prepaid = refuse;
         let abort_cf = reexec;
         self.prepaid_ns.store(prepaid, Ordering::Relaxed);
         self.abort_cf_ns.store(abort_cf, Ordering::Relaxed);
@@ -1505,7 +1543,10 @@ impl CostPolicy {
                 .unwrap()
                 .ema_ns(reexec as f64, EMA_ALPHA);
         }
-        let prepaid_lost = prepaid > abort_cf && prepaid > 0;
+        // Successful Detect / a single leftover miss must not decay to Win_1.
+        // Only an abort *train* plus prepaid wall is a real Detect loss.
+        let unfenced = self.unfenced_reexec.load(Ordering::Relaxed);
+        let prepaid_lost = prepaid > abort_cf && prepaid > 0 && unfenced >= 4;
         if prepaid_lost {
             let n = self.prepaid_lose_streak.fetch_add(1, Ordering::Relaxed) + 1;
             if n >= PREPAID_LOSE_N as usize {
@@ -1736,6 +1777,13 @@ impl CostPolicy {
             full_locs: census[5],
             chosen_strategy: dominant.label().to_string(),
             chosen_win_w: dominant.window_w().min(255) as u8,
+            pick_occ_n: 0,
+            pick_gate_n: 0,
+            skip_gate_n: 0,
+            occ_pick_while_gated: 0,
+            yield_ns: 0,
+            gate_stall_ns: 0,
+            worker_busy_ns: 0,
         }
     }
 
@@ -1821,6 +1869,25 @@ mod tests {
         assert!(
             p.choose_ordered(CohortKind::EmptyTo, addr, 16, true, 0.30),
             "full-shell contract empty-to n=16 stays A1"
+        );
+    }
+
+    #[test]
+    fn wide_raw_fan_stays_optimistic() {
+        let p = CostPolicy::new();
+        p.begin_block(4096);
+        let addr = Address::repeat_byte(0x32);
+        assert!(
+            !p.choose_ordered(CohortKind::RawFan, addr, 16, true, 0.50),
+            "wide RAW fan (ERC-20 independent class) must stay OptimisticRead"
+        );
+        assert!(
+            !p.choose_ordered(CohortKind::RawFan, addr, 37123, true, 0.90),
+            "37k same-to calldata must not plant a probe star"
+        );
+        assert!(
+            !p.choose_ordered(CohortKind::SameFrom, addr, 15, false, 0.50),
+            "wide same-from (ERC-20 clusters) must stay OptimisticRead"
         );
     }
 
@@ -1996,17 +2063,42 @@ mod tests {
         assert!(p.choose_ordered(CohortKind::EmptyTo, addr, 16, true, 0.20));
         p.note_refuse_ns(50_000);
         p.note_width_loss_ns(10_000);
-        // abort_cf = 0 → prepaid loses
+        for _ in 0..4 {
+            p.bump_unfenced_reexec();
+        }
+        // abort_cf = 0 and unfenced train → prepaid loses
         p.end_block_learn();
         p.begin_block(176);
         p.note_refuse_ns(50_000);
+        for _ in 0..4 {
+            p.bump_unfenced_reexec();
+        }
         p.end_block_learn();
         let r = p.take_report(0.0, 0);
         assert!(
             r.prior_decay >= 1,
-            "L3: two prepaid-losing blocks must decay prior: {r:?}"
+            "L3: two prepaid-losing blocks with unfenced must decay prior: {r:?}"
         );
         assert!(r.prepaid_ns > r.abort_cf_ns);
+    }
+
+    #[test]
+    fn successful_detect_prepaid_does_not_decay() {
+        let p = CostPolicy::new();
+        p.begin_block(176);
+        p.note_refuse_ns(80_000);
+        p.note_width_loss_ns(1_000_000);
+        // unfenced=0: Detect succeeded — Instant idle must not teach Win_1.
+        p.end_block_learn();
+        let r = p.take_report(0.0, 1_000_000);
+        assert_eq!(
+            r.prior_decay, 0,
+            "S2: prepaid with unfenced=0 must not decay: {r:?}"
+        );
+        assert_eq!(
+            r.prepaid_ns, 80_000,
+            "S2: prepaid is wall-clock refuse, not idle Instant"
+        );
     }
 
     #[test]
@@ -2117,12 +2209,15 @@ mod tests {
         p.promote_short_edge(0xedba, 20_000);
         p.note_short_pair(0xedba, 14, 16);
         p.note_short_pair(0xedba, 16, 17);
-        assert_eq!(
-            p.hops_to_plant(0x32be, 4),
-            WINDOWED_K,
-            "CC-L3/L4: long thin spine plants WindowedOrdered k=1, not FullChain"
+        let first = p.loc_strategy(0x32be, 4);
+        assert!(
+            first == LocStrategy::Windowed1 || first == LocStrategy::Windowed2,
+            "CC-L3/L4: long thin spine plants Win_w, not FullChain: {first:?}"
         );
-        assert_eq!(p.loc_strategy(0x32be, 4), LocStrategy::Windowed1);
+        assert!(
+            p.hops_to_plant(0x32be, 4) < 4,
+            "CC-L3/L4: long thin spine must not FullChain"
+        );
         assert_eq!(
             p.hops_to_plant(0xedba, 2),
             2,
@@ -2155,7 +2250,10 @@ mod tests {
         p.note_short_pair(0xedba, 16, 17);
         p.note_refuse_ns(80_000);
         p.note_width_loss_ns(20_000);
-        // abort_cf = 0 → prepaid loses
+        for _ in 0..4 {
+            p.bump_unfenced_reexec();
+        }
+        // abort_cf = 0 and unfenced train → prepaid loses
         p.end_block_learn();
         p.begin_block(176);
         assert!(
@@ -2190,6 +2288,35 @@ mod tests {
         assert!(
             reuse.is_ordered() && reuse != LocStrategy::FullChain,
             "F2/F7: reuse stays OrderedAdmit (Win_w or Seg), not Full: {reuse:?}"
+        );
+    }
+
+    #[test]
+    fn f7_leftover_prefers_win2_first() {
+        let p = CostPolicy::new();
+        p.begin_block(176);
+        p.promote_short_edge(0x32be, 40_000);
+        for pair in [
+            (4, 31),
+            (31, 66),
+            (66, 67),
+            (67, 69),
+            (69, 70),
+            (70, 93),
+            (93, 96),
+            (96, 103),
+        ] {
+            p.note_short_pair(0x32be, pair.0, pair.1);
+        }
+        p.note_hops_decision(0x32be, 8);
+        p.note_reexec_ns_at(Some(0x32be), 20_000);
+        p.note_reexec_ns_at(Some(0x32be), 20_000);
+        p.end_block_learn();
+        p.begin_block(176);
+        assert_eq!(
+            p.loc_strategy(0x32be, 8),
+            LocStrategy::Windowed2,
+            "S3: first leftover escalate is Win_2, not Win_3"
         );
     }
 

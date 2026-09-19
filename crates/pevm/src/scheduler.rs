@@ -18,6 +18,13 @@ use crate::{
 /// After refuse, steal one nearby independent. No full-block scan (PRIMARY tax).
 const WAVE_FILL_WINDOW: usize = 32;
 
+/// Result of the exhausted-idx Ready scan.
+enum MinRun {
+    Hit(TxIdx),
+    Empty,
+    Busy,
+}
+
 // The Pevm collaborative scheduler coordinates execution & validation
 // tasks among work threads.
 //
@@ -75,6 +82,11 @@ pub(crate) struct Scheduler {
     // True if the scheduler has been aborted, likely due to fatal execution
     // errors.
     aborted: AtomicBool,
+    /// Cursor for the exhausted-idx Ready scan (skip already-done txs).
+    ready_hint: AtomicUsize,
+    /// Single-flight the O(n) Ready scan so 8 workers cannot mutex-walk
+    /// a 37k ERC-20 block on every yield.
+    ready_scan: AtomicBool,
 }
 
 // TODO: Better error handling.
@@ -102,6 +114,8 @@ impl Scheduler {
             min_validation_idx: AtomicUsize::new(block_size),
             num_validated: AtomicUsize::new(0),
             aborted: AtomicBool::new(false),
+            ready_hint: AtomicUsize::new(0),
+            ready_scan: AtomicBool::new(false),
         }
     }
 
@@ -140,6 +154,31 @@ impl Scheduler {
             || self.is_ready(writer)
             || self.is_executing(writer)
             || self.is_validated(writer)
+    }
+
+    /// OCC-class execute: no ReadyEdge probe. Used for ungated txs and for
+    /// gated txs whose edge is already open (`may_execute`).
+    #[inline]
+    fn try_occ_execute(&self, tx_idx: TxIdx) -> Option<TxVersion> {
+        self.try_execute_ready(tx_idx, None, None)
+    }
+
+    /// Dual-path pick helper: ungated ≡ OCC `try_execute`. Gated-not-ready
+    /// is an edge skip (not a global mode switch) — no admit-spine bag spam.
+    #[inline]
+    fn try_occ_or_skip_gate(
+        &self,
+        tx_idx: TxIdx,
+        ready: Option<&ReadyEdgeTable>,
+    ) -> Option<TxVersion> {
+        if let Some(edges) = ready
+            && edges.is_gated(tx_idx)
+            && !edges.may_execute(tx_idx)
+        {
+            edges.note_skip_gate(tx_idx);
+            return None;
+        }
+        self.try_occ_execute(tx_idx)
     }
 
     /// Refuse Execute when CC ReadyEdge is live **and** PC ProducerStage(w)
@@ -208,7 +247,10 @@ impl Scheduler {
         self.next_task_with_wave_ready(wave, None)
     }
 
-    /// SpecFence ready-set: PE unpublished-RAW refuses Execute(t) (v6 §2.1).
+    /// SpecFence ready-set: gates are **edge constraints**, not a global
+    /// mode switch. Ungated txs use the OCC collaborative-index pick;
+    /// wave/refuse applies only to `is_gated` holes. Independents keep
+    /// issuing while OrderedAdmit waiters sleep (P1).
     pub(crate) fn next_task_with_wave_ready(
         &self,
         wave: Option<&WaveParkTable>,
@@ -223,7 +265,7 @@ impl Scheduler {
                 }
             }
             while let Some(tx_idx) = wave.pop_ready() {
-                if let Some(tx_version) = self.try_execute_ready(tx_idx, Some(wave), ready) {
+                if let Some(tx_version) = self.try_occ_or_skip_gate(tx_idx, ready) {
                     wave.note_ready_steal_if_after_park();
                     return Some(Task::Execution(tx_version));
                 }
@@ -233,65 +275,71 @@ impl Scheduler {
             let execution_idx = self.execution_idx.load(Ordering::Relaxed);
             let validation_idx = self.validation_idx.load(Ordering::Relaxed);
             if execution_idx >= self.block_size && validation_idx >= self.block_size {
-                if self.num_validated.load(Ordering::Relaxed)
-                    >= self.block_size - self.min_validation_idx.load(Ordering::Relaxed)
-                {
-                    break;
-                }
                 // Re-check wave ready before yield — a producer may have just pushed.
                 if let Some(wave) = wave {
+                    if let Some(edges) = ready {
+                        let _ = edges.wake_ready_sleepers(wave);
+                    }
                     while let Some(tx_idx) = wave.pop_ready() {
-                        if let Some(tx_version) = self.try_execute_ready(tx_idx, Some(wave), ready)
-                        {
+                        if let Some(tx_version) = self.try_occ_or_skip_gate(tx_idx, ready) {
                             wave.note_ready_steal_if_after_park();
                             return Some(Task::Execution(tx_version));
                         }
                     }
                 }
-                if profile_timing_enabled() {
-                    let idle_t0 = Instant::now();
-                    thread::yield_now();
-                    if let Some(edges) = ready {
-                        edges.add_idle_ns(idle_t0.elapsed().as_nanos() as u64);
+                let waiting = ready.is_some_and(|e| e.has_sleeping_waiters());
+                let validated_done = self.num_validated.load(Ordering::Relaxed)
+                    >= self.block_size - self.min_validation_idx.load(Ordering::Relaxed);
+                if !waiting {
+                    match self.min_runnable(ready) {
+                        MinRun::Hit(idx) => {
+                            self.execution_idx.fetch_min(idx, Ordering::Relaxed);
+                            if let Some(wave) = wave {
+                                wave.push_ready(idx);
+                            }
+                            continue;
+                        }
+                        MinRun::Busy => {}
+                        MinRun::Empty if validated_done && !self.has_undone() => {
+                            break;
+                        }
+                        MinRun::Empty => {}
                     }
-                } else {
-                    thread::yield_now();
+                }
+                // Waiting on an OrderedAdmit producer: spin first so 7
+                // yield_now() cores do not preempt the remaining writer.
+                // Product-path yield meter (P1). Instant idle ≠ ĉ (S2).
+                let idle_t0 = Instant::now();
+                if waiting {
+                    for _ in 0..64 {
+                        std::hint::spin_loop();
+                    }
+                }
+                thread::yield_now();
+                let ns = idle_t0.elapsed().as_nanos() as u64;
+                if let Some(edges) = ready {
+                    edges.add_yield_ns(ns);
+                    if profile_timing_enabled() {
+                        edges.add_idle_ns(ns);
+                    }
                 }
                 continue;
             }
 
-            // SpecFence (wave Some): if the next Execute is Ready, take it
-            // (v5 §2.1 — do not validation-first-stampede useful_EVM).
-            // A1-blocked consumers are skipped on the collaborative index
-            // (fetch_max past the hole) so 8 cores do not mutex-spin the head.
-            // Producer is wave-admitted with park_heat (no fetch_min).
-            if wave.is_some() && execution_idx < self.block_size {
+            // OCC-class collaborative execute. Gated-not-ready is a hole:
+            // fetch_max past it and keep issuing independents. Do **not**
+            // mutex-defer / admit-spine / 32-wide fill on every skip.
+            if execution_idx < self.block_size {
                 if let Some(edges) = ready
                     && edges.is_gated(execution_idx)
                     && !edges.may_execute(execution_idx)
                 {
+                    edges.note_skip_gate(execution_idx);
                     self.execution_idx
                         .fetch_max(execution_idx + 1, Ordering::Relaxed);
-                    if let Some(wave) = wave {
-                        if !edges.is_sleeping(execution_idx) {
-                            if let Some(w) = edges.blocking_producer(execution_idx) {
-                                // A0 pred is already on the OCC idx — do not
-                                // bag-spam it (that prepaid thin reuse).
-                                if edges.is_gated(w) {
-                                    self.admit_spine_heat(w, wave, true);
-                                }
-                            }
-                            edges.defer(execution_idx);
-                        }
-                        if let Some(task) =
-                            self.try_fill_independent_after_refuse(execution_idx, wave, ready)
-                        {
-                            return Some(task);
-                        }
-                    }
                     continue;
                 }
-                if let Some(tx_version) = self.try_execute_ready(execution_idx, wave, ready) {
+                if let Some(tx_version) = self.try_occ_execute(execution_idx) {
                     self.execution_idx
                         .fetch_max(execution_idx + 1, Ordering::Relaxed);
                     if let Some(wave) = wave {
@@ -305,27 +353,17 @@ impl Scheduler {
             if validation_idx < execution_idx {
                 let tx_idx = self.validation_idx.fetch_add(1, Ordering::Relaxed);
                 if tx_idx < self.block_size {
+                    // Steal execution only when the edge is open. Gated holes
+                    // stay skipped so validation-first cannot serialize the block.
+                    if let Some(edges) = ready
+                        && edges.is_gated(tx_idx)
+                        && !edges.may_execute(tx_idx)
+                    {
+                        edges.note_skip_gate(tx_idx);
+                        continue;
+                    }
                     let mut tx = index_mutex!(self.transactions_status, tx_idx);
-                    // "Steal" execution job while holding the lock
                     if tx.status == IncarnationStatus::ReadyToExecute {
-                        if let Some(edges) = ready
-                            && edges.is_gated(tx_idx)
-                            && !edges.may_execute(tx_idx)
-                        {
-                            let Some(w) = edges.blocking_producer(tx_idx) else {
-                                continue;
-                            };
-                            if self.is_executing(w) || self.is_ready(w) {
-                                edges.defer(tx_idx);
-                                if let Some(wave) = wave {
-                                    drop(tx);
-                                    if edges.is_gated(w) {
-                                        self.admit_spine_heat(w, wave, true);
-                                    }
-                                }
-                                continue;
-                            }
-                        }
                         tx.status = IncarnationStatus::Executing;
                         self.set_done_flag(tx_idx, false);
                         if let Some(wave) = wave {
@@ -358,12 +396,9 @@ impl Scheduler {
                 }
             }
 
-            // Prioritize execution task
-            if let Some(tx_version) = self.try_execute_ready(
-                self.execution_idx.fetch_add(1, Ordering::Relaxed),
-                wave,
-                ready,
-            ) {
+            // Prioritize execution task (OCC fetch_add; skip gated holes).
+            let next_exec = self.execution_idx.fetch_add(1, Ordering::Relaxed);
+            if let Some(tx_version) = self.try_occ_or_skip_gate(next_exec, ready) {
                 if let Some(wave) = wave {
                     wave.note_ready_steal_if_after_park();
                 }
@@ -397,19 +432,19 @@ impl Scheduler {
         ready: Option<&ReadyEdgeTable>,
     ) -> Option<Task> {
         if let Some(idx) = prefer
-            && let Some(tx_version) = self.try_execute_ready(idx, Some(wave), ready)
+            && let Some(tx_version) = self.try_occ_or_skip_gate(idx, ready)
         {
             wave.note_ready_steal_if_after_park();
             return Some(Task::Execution(tx_version));
         }
         while let Some(tx_idx) = wave.pop_ready() {
-            if let Some(tx_version) = self.try_execute_ready(tx_idx, Some(wave), ready) {
+            if let Some(tx_version) = self.try_occ_or_skip_gate(tx_idx, ready) {
                 wave.note_ready_steal_if_after_park();
                 return Some(Task::Execution(tx_version));
             }
         }
         let idx = self.execution_idx.fetch_add(1, Ordering::Relaxed);
-        if let Some(tx_version) = self.try_execute_ready(idx, Some(wave), ready) {
+        if let Some(tx_version) = self.try_occ_or_skip_gate(idx, ready) {
             wave.note_ready_steal_if_after_park();
             return Some(Task::Execution(tx_version));
         }
@@ -658,6 +693,50 @@ impl Scheduler {
         for &w in writers {
             self.admit_spine_heat(w, wave, park_heat);
         }
+    }
+
+    /// Lowest runnable ReadyToExecute index. Exhausted-idx safety net so a
+    /// skipped-but-open gate or aborted incarnation cannot leave ESTIMATE.
+    /// Gated-not-ready holes stay sleeping (not a livelock rewind).
+    ///
+    /// Single-flight + lock-free done skip: a 37k ERC-20 block must not pay
+    /// 8× full mutex walks on every yield.
+    fn min_runnable(&self, ready: Option<&ReadyEdgeTable>) -> MinRun {
+        if self.ready_scan.swap(true, Ordering::AcqRel) {
+            return MinRun::Busy;
+        }
+        let start = self.ready_hint.load(Ordering::Relaxed);
+        let start = if start < self.block_size { start } else { 0 };
+        let mut found = None;
+        for off in 0..self.block_size {
+            let i = start + off;
+            let i = if i >= self.block_size {
+                i - self.block_size
+            } else {
+                i
+            };
+            if self.is_done(i) || self.is_validated(i) {
+                continue;
+            }
+            if self.is_ready(i) && ready.is_none_or(|e| e.may_execute(i)) {
+                found = Some(i);
+                self.ready_hint
+                    .store(i.saturating_add(1), Ordering::Relaxed);
+                break;
+            }
+        }
+        self.ready_scan.store(false, Ordering::Release);
+        match found {
+            Some(i) => MinRun::Hit(i),
+            None => MinRun::Empty,
+        }
+    }
+
+    /// Lock-free: any tx still Ready / Executing / Aborting.
+    /// Do not exit pick while an incarnation is unfinished (ERC-20 OCC).
+    #[inline]
+    fn has_undone(&self) -> bool {
+        (0..self.block_size).any(|i| !self.is_done(i) && !self.is_validated(i))
     }
 
     /// True when the incarnation is queued `ReadyToExecute` (S1 prefer-admit).
@@ -1044,6 +1123,30 @@ mod tests {
             "first-wave (inc==0) must refuse while ProducerStage(w) Executing"
         );
         assert!(ready.refuse_count() >= 1);
+    }
+
+    #[test]
+    fn dual_path_occ_pick_while_gated_hole() {
+        let s = Scheduler::new(6);
+        let ready = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        ready.note_consumer(1, 0);
+        let first = s
+            .next_task_with_wave_ready(Some(&wave), Some(&ready))
+            .expect("producer");
+        let Task::Execution(v0) = first else {
+            panic!("expected Execution");
+        };
+        assert_eq!(v0.tx_idx, 0);
+        let second = s
+            .next_task_with_wave_ready(Some(&wave), Some(&ready))
+            .expect("S1: ungated 2 must issue while 1 is gated");
+        let Task::Execution(v) = second else {
+            panic!("expected Execution, got {second:?}");
+        };
+        assert_eq!(v.tx_idx, 2, "gated hole must not stall independent pick");
+        assert!(ready.skip_gate_n() >= 1);
+        assert!(s.try_execute_ready(1, Some(&wave), Some(&ready)).is_none());
     }
 
     #[test]

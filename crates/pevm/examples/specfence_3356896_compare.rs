@@ -122,6 +122,13 @@ struct IterRow {
     ordered_ns: u64,
     chosen_strategy: String,
     chosen_win_w: u8,
+    pick_occ_n: usize,
+    pick_gate_n: usize,
+    skip_gate_n: usize,
+    occ_pick_while_gated: usize,
+    yield_ns: u64,
+    gate_stall_ns: u64,
+    worker_busy_ns: u64,
     win1_locs: usize,
     win2_locs: usize,
     win3_locs: usize,
@@ -202,7 +209,7 @@ fn run_once(
                 .map(|(t, _)| t)
                 .collect();
             println!(
-                "  {mode_name}[{i}] ok wall_ms={wall_ms:.3} tps={:.0} occ_aborts={} inc>0={} reexec={} refuse_admit={} wait_for_dependency={} soft_wait_arms={} idle_ns={} ready_width={:.2} ordered_admit={} optimistic_read={} edge_oa={} edge_or={} refuse_ns={} reexec_ns={} ordered_ns={} prepaid_ns={} abort_cf_ns={} prior_decay={} opt_maj={} ev_keep={} ev_demote={} commute={} batch={} d1_prom={} d1_ign={} taxed_begin={} edge_4_31={} unfenced_reexec={} learn={} win_w={} win1/2/3/seg/full={}/{}/{}/{}/{} main_inc={:?} storage_inc={:?} admit_seed_ns={} end_block_ns={} opt_path_tax_ns={}",
+                "  {mode_name}[{i}] ok wall_ms={wall_ms:.3} tps={:.0} occ_aborts={} inc>0={} reexec={} refuse_admit={} wait_for_dependency={} soft_wait_arms={} idle_ns={} ready_width={:.2} ordered_admit={} optimistic_read={} edge_oa={} edge_or={} refuse_ns={} reexec_ns={} ordered_ns={} prepaid_ns={} abort_cf_ns={} prior_decay={} opt_maj={} ev_keep={} ev_demote={} commute={} batch={} d1_prom={} d1_ign={} taxed_begin={} edge_4_31={} unfenced_reexec={} learn={} win_w={} win1/2/3/seg/full={}/{}/{}/{}/{} main_inc={:?} storage_inc={:?} admit_seed_ns={} end_block_ns={} opt_path_tax_ns={} pick_occ={} pick_gate={} skip_gate={} occ_while_gated={} yield_ns={} gate_stall_ns={} busy_ns={}",
                 n as f64 / (wall_ms / 1000.0),
                 m.occ_aborts,
                 m.incarnation_gt0,
@@ -243,7 +250,14 @@ fn run_once(
                 inc_gt0_in(&incs, STORAGE_141617),
                 m.admit_seed_begin_ns,
                 learn.end_block_ns,
-                learn.optimistic_path_tax_ns
+                learn.optimistic_path_tax_ns,
+                learn.pick_occ_n,
+                learn.pick_gate_n,
+                learn.skip_gate_n,
+                learn.occ_pick_while_gated,
+                learn.yield_ns,
+                learn.gate_stall_ns,
+                learn.worker_busy_ns
             );
             IterRow {
                 mode: mode_name.to_string(),
@@ -281,6 +295,13 @@ fn run_once(
                 ordered_ns: learn.ordered_ns,
                 chosen_strategy: learn.chosen_strategy,
                 chosen_win_w: learn.chosen_win_w,
+                pick_occ_n: learn.pick_occ_n,
+                pick_gate_n: learn.pick_gate_n,
+                skip_gate_n: learn.skip_gate_n,
+                occ_pick_while_gated: learn.occ_pick_while_gated,
+                yield_ns: learn.yield_ns,
+                gate_stall_ns: learn.gate_stall_ns,
+                worker_busy_ns: learn.worker_busy_ns,
                 win1_locs: learn.win1_locs,
                 win2_locs: learn.win2_locs,
                 win3_locs: learn.win3_locs,

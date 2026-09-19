@@ -15,13 +15,15 @@ use dashmap::{DashMap, DashSet};
 
 use crate::{BuildIdentityHasher, MemoryLocationHash, TxIdx};
 
-use super::engagement::profile_timing_enabled;
 use super::wave::WaveParkTable;
 
 const NONE: usize = usize::MAX;
 /// Bitset words for ordered-admit gated txs (64×64 = 4096). Beyond this,
 /// `is_gated` falls back to the consumer map.
 const GATED_WORDS: usize = 64;
+/// Cap the skip-sleeping set. Dual-path fetch_max must not park a
+/// thousands-wide RAW fan into an O(n) wake scan (ERC-20 livelock).
+const SLEEP_CAP: usize = 64;
 
 /// `(consumer_t) ← producer_t` on PE / RAW class.
 #[derive(Debug)]
@@ -54,6 +56,15 @@ pub(crate) struct ReadyEdgeTable {
     sleeping: DashSet<TxIdx, BuildIdentityHasher>,
     /// L6: ns spent in refuse / defer path.
     refuse_ns: AtomicU64,
+    /// Product-path wall-clock stall start per gated hole (S2).
+    stall_start: DashMap<TxIdx, Instant, BuildIdentityHasher>,
+    /// Product-path scheduler yield ns (P1). Not written into ĉ.
+    yield_ns: AtomicU64,
+    /// Dual-path pick census (P1).
+    pick_occ_n: AtomicUsize,
+    pick_gate_n: AtomicUsize,
+    skip_gate_n: AtomicUsize,
+    occ_pick_while_gated: AtomicUsize,
     /// Producer → known consumers (completion event → bag; no DashMap scan).
     waiters: DashMap<TxIdx, Vec<TxIdx>, BuildIdentityHasher>,
     /// Ordered-admit gated txs. Marked **before** the consumer map insert so
@@ -61,6 +72,9 @@ pub(crate) struct ReadyEdgeTable {
     gated_bits: [AtomicU64; GATED_WORDS],
     /// Live gated-tx count (P1/P3: A1=0 → OCC-class pick, no ReadyEdge walk).
     gated_n: AtomicUsize,
+    /// Gated txs that have not yet `mark_done`. Gates are edge constraints:
+    /// when this hits 0, pick returns to `next_occ_task` even if bits remain.
+    pending_gated: AtomicUsize,
     /// Done writers (bitset). A0 finish is an atomic or — no `finished` DashMap.
     done_bits: [AtomicU64; GATED_WORDS],
     /// Execute started (bitset). Write-set must not refuse an in-flight succ.
@@ -85,9 +99,16 @@ impl Default for ReadyEdgeTable {
             idle_core_ns: AtomicU64::new(0),
             sleeping: DashSet::default(),
             refuse_ns: AtomicU64::new(0),
+            stall_start: DashMap::default(),
+            yield_ns: AtomicU64::new(0),
+            pick_occ_n: AtomicUsize::new(0),
+            pick_gate_n: AtomicUsize::new(0),
+            skip_gate_n: AtomicUsize::new(0),
+            occ_pick_while_gated: AtomicUsize::new(0),
             waiters: DashMap::default(),
             gated_bits: std::array::from_fn(|_| AtomicU64::new(0)),
             gated_n: AtomicUsize::new(0),
+            pending_gated: AtomicUsize::new(0),
             done_bits: std::array::from_fn(|_| AtomicU64::new(0)),
             started_bits: std::array::from_fn(|_| AtomicU64::new(0)),
         }
@@ -273,9 +294,11 @@ impl ReadyEdgeTable {
             let prev = self.gated_bits[i].fetch_or(bit, Ordering::Release);
             if prev & bit == 0 {
                 self.gated_n.fetch_add(1, Ordering::Relaxed);
+                self.pending_gated.fetch_add(1, Ordering::Relaxed);
             }
         } else if !self.consumers.contains_key(&tx) {
             self.gated_n.fetch_add(1, Ordering::Relaxed);
+            self.pending_gated.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -298,6 +321,13 @@ impl ReadyEdgeTable {
         self.gated_n.load(Ordering::Relaxed) > 0
     }
 
+    /// Unfinished OrderedAdmit holes. Cleared as each gated tx `mark_done`s
+    /// so independents return to `next_occ_task` (S1/P1 — not a mode switch).
+    #[inline]
+    pub(crate) fn has_pending_gated(&self) -> bool {
+        self.pending_gated.load(Ordering::Relaxed) > 0
+    }
+
     /// Stamp Done without waiter wake (A0 OCC wrap / P3).
     #[inline]
     pub(crate) fn note_producer_done_stamp(&self, writer: TxIdx) {
@@ -311,6 +341,15 @@ impl ReadyEdgeTable {
         if i < self.started_bits.len() {
             let bit = 1u64 << (tx % 64);
             self.started_bits[i].fetch_or(bit, Ordering::Release);
+        }
+        if self.is_gated(tx) {
+            self.note_stall_end(tx);
+            self.pick_gate_n.fetch_add(1, Ordering::Relaxed);
+        } else if self.has_any_gated() {
+            self.pick_occ_n.fetch_add(1, Ordering::Relaxed);
+            self.occ_pick_while_gated.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.pick_occ_n.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -353,12 +392,29 @@ impl ReadyEdgeTable {
 
     #[inline]
     fn mark_done(&self, writer: TxIdx) {
-        let i = writer / 64;
-        if i < self.done_bits.len() {
-            let bit = 1u64 << (writer % 64);
-            self.done_bits[i].fetch_or(bit, Ordering::Release);
-        } else {
-            self.finished.insert(writer, ());
+        let newly = {
+            let i = writer / 64;
+            if i < self.done_bits.len() {
+                let bit = 1u64 << (writer % 64);
+                let prev = self.done_bits[i].fetch_or(bit, Ordering::Release);
+                prev & bit == 0
+            } else {
+                self.finished.insert(writer, ()).is_none()
+            }
+        };
+        if newly && self.is_gated(writer) {
+            let mut cur = self.pending_gated.load(Ordering::Relaxed);
+            while cur > 0 {
+                match self.pending_gated.compare_exchange_weak(
+                    cur,
+                    cur - 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(v) => cur = v,
+                }
+            }
         }
     }
 
@@ -391,6 +447,107 @@ impl ReadyEdgeTable {
         if ns > 0 {
             self.idle_core_ns.fetch_add(ns, Ordering::Relaxed);
         }
+    }
+
+    /// Product-path yield ns (P1 busy/idle). Never written into ĉ.
+    #[inline]
+    pub(crate) fn add_yield_ns(&self, ns: u64) {
+        if ns > 0 {
+            self.yield_ns.fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn yield_ns(&self) -> u64 {
+        self.yield_ns.load(Ordering::Relaxed)
+    }
+
+    /// Skip a gated-not-ready hole once: lock-free sleeping + wall-clock stall start.
+    /// No deferred mutex — wake is the waiter map on producer Done.
+    pub(crate) fn note_skip_gate(&self, tx_idx: TxIdx) {
+        if self.sleeping.contains(&tx_idx) {
+            return;
+        }
+        // Bound the sleeper set so a slipped-through RAW fan cannot turn
+        // every yield into an O(n) DashMap walk.
+        if self.sleeping.len() < SLEEP_CAP {
+            self.sleeping.insert(tx_idx);
+        }
+        self.refuse.fetch_add(1, Ordering::Relaxed);
+        self.skip_gate_n.fetch_add(1, Ordering::Relaxed);
+        self.stall_start.entry(tx_idx).or_insert_with(Instant::now);
+    }
+
+    #[inline]
+    pub(crate) fn has_sleeping_waiters(&self) -> bool {
+        !self.sleeping.is_empty()
+    }
+
+    /// Self-heal: producer already Done but wave miss — push sleepers that
+    /// `may_execute` so dual-path pick cannot hang on a stale hole.
+    pub(crate) fn wake_ready_sleepers(&self, wave: &WaveParkTable) -> usize {
+        if self.sleeping.is_empty() {
+            return 0;
+        }
+        // Producer waiters are the real wake path. This scan is a self-heal
+        // for a small hole set — never a full-envelope walk.
+        let ready: Vec<TxIdx> = self
+            .sleeping
+            .iter()
+            .take(SLEEP_CAP)
+            .filter_map(|t| {
+                let t = *t;
+                self.may_execute(t).then_some(t)
+            })
+            .collect();
+        for &t in &ready {
+            self.sleeping.remove(&t);
+            self.note_stall_end(t);
+            wave.push_ready(t);
+        }
+        ready.len()
+    }
+
+    fn note_stall_end(&self, tx_idx: TxIdx) {
+        if let Some((_, t0)) = self.stall_start.remove(&tx_idx) {
+            let ns = t0.elapsed().as_nanos() as u64;
+            if ns > 0 {
+                // Wall prepaid is the **max** hole stall (makespan), not the
+                // sum of overlapping Instants from block-start (S2).
+                let mut cur = self.refuse_ns.load(Ordering::Relaxed);
+                while ns > cur {
+                    match self.refuse_ns.compare_exchange_weak(
+                        cur,
+                        ns,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(v) => cur = v,
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn pick_occ_n(&self) -> usize {
+        self.pick_occ_n.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn pick_gate_n(&self) -> usize {
+        self.pick_gate_n.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn skip_gate_n(&self) -> usize {
+        self.skip_gate_n.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn occ_pick_while_gated(&self) -> usize {
+        self.occ_pick_while_gated.load(Ordering::Relaxed)
     }
 
     #[inline]
@@ -534,22 +691,16 @@ impl ReadyEdgeTable {
     /// Defer a known consumer. Count once until the producer finishes —
     /// re-probing the same head must not spin `refuse_admit` (19606599 31k).
     /// PC-W1: mark sleeping so steal/index skip this head until pred Done.
+    /// Instant-in-defer is **not** refuse_ns (S2: wall-clock stall only).
     #[inline]
     pub(crate) fn defer(&self, tx_idx: TxIdx) {
-        let t0 = profile_timing_enabled().then(Instant::now);
+        self.note_skip_gate(tx_idx);
         let mut d = self.deferred.lock().unwrap();
         if d.iter().any(|&t| t == tx_idx) {
-            self.sleeping.insert(tx_idx);
             return;
         }
-        self.refuse.fetch_add(1, Ordering::Relaxed);
-        self.sleeping.insert(tx_idx);
         d.push(tx_idx);
         self.deferred_n.store(d.len(), Ordering::Relaxed);
-        drop(d);
-        if let Some(t0) = t0 {
-            self.add_refuse_ns(t0.elapsed().as_nanos() as u64);
-        }
     }
 
     #[inline]
@@ -765,7 +916,13 @@ mod tests {
         t.note_consumer(3, 1);
         assert!(t.is_gated(3));
         assert!(t.has_any_gated());
+        assert!(t.has_pending_gated());
         assert!(!t.may_execute(3));
+        t.note_producer_done_stamp(3);
+        assert!(
+            !t.has_pending_gated(),
+            "S1: finished hole returns pick to OCC"
+        );
         t.force_optimistic(3);
         assert!(
             t.may_execute(3),

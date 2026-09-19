@@ -628,6 +628,33 @@ impl AccountHints {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_two_call_to(
+        a: Address,
+        a_txs: Vec<TxIdx>,
+        b: Address,
+        b_txs: Vec<TxIdx>,
+    ) -> Self {
+        let mut h = Self::from_call_to_txs(a, a_txs);
+        let max = b_txs.iter().copied().max().unwrap_or(0);
+        if h.empty_calldata.len() <= max {
+            let n = max + 1;
+            h.empty_calldata.resize(n, false);
+            h.gas_limit.resize(n, 100_000);
+            h.from_of.resize(n, Address::ZERO);
+            h.to_of.resize(n, None);
+        }
+        h.call_to_by_account.insert(b, b_txs.clone());
+        h.to_by_account.insert(b, b_txs.clone());
+        h.by_account.insert(b, b_txs.clone());
+        for &t in &b_txs {
+            if t < h.to_of.len() {
+                h.to_of[t] = Some(b);
+            }
+        }
+        h
+    }
+
     /// Last transaction before `tx_idx` that hinted this account.
     pub(crate) fn prev(&self, address: &Address, tx_idx: TxIdx) -> Option<TxIdx> {
         let list = self.by_account.get(address)?;
