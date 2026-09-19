@@ -829,6 +829,23 @@ impl CostPolicy {
                     c[LocStrategy::OptimisticRead.idx()].max(abort);
                 c[LocStrategy::DeferPlant.idx()] = c[LocStrategy::DeferPlant.idx()].max(abort);
             }
+            // Conservative UCB (L3): do not invent a cheaper unused wider window
+            // after a successful narrower OrderedAdmit (prepaid already measured).
+            if s.leftover_reexec == 0 && s.decision.is_ordered() && n[s.decision.idx()] > 1.0 {
+                let paid = c[s.decision.idx()];
+                let planted = CostPolicy::hops_for_strategy(s.decision, n_pairs);
+                for &a in &[
+                    LocStrategy::Windowed1,
+                    LocStrategy::Windowed2,
+                    LocStrategy::Windowed3,
+                    LocStrategy::Segmented,
+                    LocStrategy::FullChain,
+                ] {
+                    if n[a.idx()] <= 1.0 && CostPolicy::hops_for_strategy(a, n_pairs) > planted {
+                        c[a.idx()] = c[a.idx()].max(paid);
+                    }
+                }
+            }
             for v in &mut c {
                 *v = v.max(1.0);
             }
