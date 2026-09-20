@@ -1710,7 +1710,15 @@ impl CostPolicy {
         {
             return false;
         }
-        if self.block_n() >= LARGE_BLOCK_N && s.decision.is_ordered() {
+        // Planted OrderedAdmit prefix — no same-block T3 slide. Mid-band
+        // covering probe is the same hang class as large leftover-long
+        // (19469101 plant → refuse → flush). C4 deepens at end_block.
+        if s.decision.is_ordered()
+            && (self.block_n() >= LARGE_BLOCK_N || self.is_midband_coverable(location, n_pairs))
+        {
+            return false;
+        }
+        if self.wait_set_at_cap.load(Ordering::Relaxed) {
             return false;
         }
         true
