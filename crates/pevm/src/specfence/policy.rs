@@ -1374,33 +1374,14 @@ impl CostPolicy {
 
     /// Begin-seed mouth: skip OrderedAdmit wait-set when the spine yields
     /// to OptimisticRead / OCC abort. Unpromoted short chains still seed.
-    /// Cold EmptyTo probe-stars are not leftover-long real spines — skip
-    /// them only on forbid / under-covered / prepaid-lose / wait-set-cap.
+    /// Leftover-long EmptyTo on mid/large is the same yield — planting a
+    /// probe-star with hops=0 livelocks the wait-set (iter29).
     pub(crate) fn should_skip_ordered_admit_seed(
         &self,
         location: MemoryLocationHash,
         n_pairs: usize,
     ) -> bool {
-        self.should_skip_cohort_seed(location, n_pairs, None)
-    }
-
-    pub(crate) fn should_skip_cohort_seed(
-        &self,
-        location: MemoryLocationHash,
-        n_pairs: usize,
-        kind: Option<CohortKind>,
-    ) -> bool {
-        if self.loc_forbids_n(location, n_pairs) {
-            return true;
-        }
-        if matches!(kind, Some(CohortKind::EmptyTo))
-            && !self.is_under_covered_spine(location, n_pairs)
-            && !self.wait_set_capped_losing()
-            && !self.ordered_prepaid_ge_abort()
-        {
-            return false;
-        }
-        self.yield_to_occ_abort(location, n_pairs)
+        self.loc_forbids_n(location, n_pairs) || self.yield_to_occ_abort(location, n_pairs)
     }
 
     /// Seed a new `PromotedLoc`. Must not touch `self.promoted` — callers

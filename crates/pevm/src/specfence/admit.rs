@@ -304,7 +304,7 @@ pub(crate) fn admit_seed_begin_block(
         // E2/M1: under-covered / prepaid not cheaper / leftover-long
         // mid-band — do not plant a wait-set the mouth will not cover.
         let n_pairs = c.txs.len().saturating_sub(1);
-        if policy.should_skip_cohort_seed(loc, n_pairs, Some(c.kind)) {
+        if policy.should_skip_ordered_admit_seed(loc, n_pairs) {
             continue;
         }
         policy.note_ordered_seed(n_pairs);
@@ -1122,13 +1122,14 @@ mod tests {
         let n = seed(
             &ready, &stages, &learner, &bayes, &prior, &hints, &contracts,
         );
-        assert!(n >= 15, "hot empty-to must probe-star, got {n}");
-        assert!(ready.may_execute(0), "probe head of empty-to must run");
-        assert!(!ready.may_execute(8), "empty-to later waits on the probe");
         assert_eq!(
-            ready.blocking_producer(8),
-            Some(0),
-            "probe-star: later empty-to wait on the first, not a full begin-block chain"
+            n, 0,
+            "M1: leftover-long EmptyTo on mid-band is sticky OptimisticRead, got {n}"
+        );
+        assert!(ready.may_execute(0), "probe head of empty-to must run");
+        assert!(
+            ready.may_execute(8),
+            "leftover-long EmptyTo must not plant a wait-set"
         );
         let basic = hash_deterministic(MemoryLocation::Basic(payee));
         assert!(
@@ -1248,15 +1249,18 @@ mod tests {
         let n = seed(
             &ready, &stages, &learner, &bayes, &prior, &hints, &contracts,
         );
-        assert_eq!(n, 8, "probe-star: later empty-to wait on tx 31");
-        assert!(ready.may_execute(31));
-        assert_eq!(ready.blocking_producer(66), Some(31));
-        assert_eq!(ready.blocking_producer(67), Some(31));
-        assert_eq!(ready.blocking_producer(115), Some(31));
-        assert!(
-            !stages.is_reserved(31) && !stages.is_reserved(66),
-            "WAW probe must not ProducerStage-reserve the spine"
+        assert_eq!(
+            n, 0,
+            "M1: leftover-long EmptyTo on mid-band is sticky OptimisticRead, got {n}"
         );
+        assert!(ready.may_execute(31));
+        assert!(
+            ready.blocking_producer(66).is_none(),
+            "leftover-long EmptyTo must not plant a begin wait-set"
+        );
+        // D1 write-set still chains a hidden Basic spine when Detect sees it.
+        let mut queued = HashSet::new();
+        let _ = note_probe_star(&ready, &[31, 66, 67, 69, 70, 93, 96, 103, 115], 0x20, &mut queued, true);
         let hidden = 0x32be_u64;
         let wave = WaveParkTable::new();
         admit_seed_on_write_set(
