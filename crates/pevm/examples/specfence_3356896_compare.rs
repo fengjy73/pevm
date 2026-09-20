@@ -9,6 +9,8 @@
 //! ```
 //! SPECFENCE_COMPARE_ITERS=5 cargo run -p pevm --release \
 //!   --config 'profile.release.lto=false' --example specfence_3356896_compare
+//!
+//! Optional: SPECFENCE_COMPARE_BLOCK=19716145 (default 3356896).
 //! ```
 
 #![allow(missing_docs)]
@@ -32,7 +34,7 @@ use pevm::{
 };
 use serde::Serialize;
 
-const BLOCK: u64 = 3_356_896;
+const DEFAULT_BLOCK: u64 = 3_356_896;
 const DEFAULT_CORES: usize = 8;
 const DEFAULT_ITERS: usize = 5;
 
@@ -153,6 +155,7 @@ struct IterRow {
     sys_reexec_n: usize,
     covering_n: usize,
     chosen_cover_window: u8,
+    wait_set_n: usize,
     begin_blocked: Vec<usize>,
     taxed_indep_blocked: Vec<usize>,
     main_inc_gt0: Vec<usize>,
@@ -364,6 +367,7 @@ fn run_once(
                 sys_reexec_n: learn.sys_reexec_n,
                 covering_n: learn.covering_n,
                 chosen_cover_window: learn.chosen_cover_window,
+                wait_set_n: begin.len(),
                 begin_blocked: begin,
                 taxed_indep_blocked: taxed,
                 main_inc_gt0: inc_gt0_in(&incs, MAIN_CHAIN),
@@ -380,8 +384,12 @@ fn run_once(
 }
 
 fn main() {
+    let block_number = std::env::var("SPECFENCE_COMPARE_BLOCK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_BLOCK);
     let data_dir = repo_root().join("data/ethereum");
-    let dir = data_dir.join("blocks").join(BLOCK.to_string());
+    let dir = data_dir.join("blocks").join(block_number.to_string());
     if !dir.join("block.json").exists() {
         eprintln!("missing {dir:?}/block.json — cannot compare");
         std::process::exit(2);
@@ -411,7 +419,7 @@ fn main() {
     let cores_nz = NonZeroUsize::new(cores.max(1)).unwrap();
     let n = n_tx(&block);
     println!(
-        "block={BLOCK} n={n} cores={cores} iters={iters} Soft=0 reuse_sf={} (PRIMARY=learned)",
+        "block={block_number} n={n} cores={cores} iters={iters} Soft=0 Instant-off reuse_sf={} (PRIMARY=learned)",
         !cold_each
     );
 
