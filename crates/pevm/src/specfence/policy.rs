@@ -1197,6 +1197,10 @@ impl CostPolicy {
         let demoted = self.loc_demoted(location);
         let (hot, crisis) = self.phase_of(location);
         let reopen = self.reopen_ordered(location);
+        let upgrading = self
+            .promoted
+            .get(&location)
+            .is_some_and(|s| s.last_sys_reexec && !s.decision.is_ordered());
         // Unused Win prior must not undercut measured Opt on a leftover-long
         // spine *until* systematic reexec / leftover double-pay re-opens CC.
         let leftover_pay_once = n_pairs.saturating_sub(self.w_cap_of(n_pairs)) >= 2
@@ -1204,8 +1208,8 @@ impl CostPolicy {
                 s.measured && s.samples >= 2 && !s.decision.is_ordered() && !reopen
             });
         // R3: cold / crisis explores covering w±1. Hot proven ordered is
-        // sticky. Pin-Opt (no signal) does not UCB onto a half-window.
-        let explore_ok = if leftover_pay_once {
+        // sticky. Sys-reexec upgrade is greedy covering (no Defer UCB).
+        let explore_ok = if leftover_pay_once || upgrading {
             false
         } else if reopen && hot {
             false
@@ -1447,10 +1451,12 @@ impl CostPolicy {
                         if n <= 1.0 || left >= 2 {
                             c = wall.max(c);
                         }
-                    } else if sys_reexec {
+                    } else if sys_reexec && loc.as_ref().is_some_and(|s| !s.decision.is_ordered()) {
                         // Upgrade: stale cheap Defer/Opt must not nail OCC
-                        // after a systematic reexec train.
-                        c = c.max(abort);
+                        // after a systematic reexec train. Floor above the
+                        // covering hat so the CC mouth actually switches.
+                        let cover_hat = covering_w(n_pairs) as f64 * stall;
+                        c = c.max(abort).max(cover_hat + NS_DELTA);
                     }
                 } else {
                     if measured
@@ -2579,28 +2585,14 @@ impl CostPolicy {
             arms.push((*e.key(), e.decision, n_pairs));
         }
         arms.sort_unstable_by_key(|(loc, _, n)| (std::cmp::Reverse(*n), *loc));
-        // Long-spine action is the story; storage Full must not hide Win_w/Defer.
-        let dominant = if census[4] > 0 {
-            arms.iter()
-                .find(|(_, a, _)| matches!(a, LocStrategy::Segmented { .. }))
-                .map(|(_, a, _)| *a)
-                .unwrap_or(LocStrategy::seg(2))
-        } else if census[3] > 0 {
-            arms.iter()
-                .find(|(_, a, _)| matches!(a, LocStrategy::OrderedWindow { w } if *w >= 3))
-                .map(|(_, a, _)| *a)
-                .unwrap_or(LocStrategy::win(3))
-        } else if census[2] > 0 {
-            LocStrategy::win(2)
-        } else if census[1] > 0 {
-            LocStrategy::win(1)
-        } else if census[5] > 0 {
-            LocStrategy::FullChain
-        } else if census[6] > 0 {
-            LocStrategy::DeferPlant
-        } else {
-            LocStrategy::OptimisticRead
-        };
+        // Long-spine action is the story; storage Full/Win_2 must not hide
+        // the leftover-long arm (R5).
+        let dominant = arms
+            .iter()
+            .find(|(_, _, n)| *n > ORDER_WINDOW_K)
+            .or_else(|| arms.first())
+            .map(|(_, a, _)| *a)
+            .unwrap_or(LocStrategy::OptimisticRead);
         let tel = arms
             .iter()
             .find(|(loc, _, n)| *n > ORDER_WINDOW_K || self.is_promoted(*loc))
