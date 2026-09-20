@@ -456,6 +456,8 @@ struct PromotedLoc {
     /// R1: Opt/Defer (or leftover) paid a systematic reexec train. Next begin
     /// must re-open OrderedWindow/Seg — not nail Opt/Defer-only forever.
     last_sys_reexec: bool,
+    /// R3: last covering arm absorbed leftover OCC (unfenced down).
+    last_cover_ok: bool,
     /// G4 morph bucket this loc last contributed to.
     morph: MorphKey,
     /// Telemetry only — leftover hops after the chosen arm (not a pick driver).
@@ -485,6 +487,7 @@ impl PromotedLoc {
             last_crisis: false,
             last_double_pay: false,
             last_sys_reexec: false,
+            last_cover_ok: false,
             morph: morph_key(0),
             leftover_reexec: 0,
             block_reexec_ns: 0,
@@ -992,6 +995,16 @@ impl CostPolicy {
             .is_some_and(|s| s.last_sys_reexec || s.last_double_pay)
     }
 
+    /// R3: a covering arm that already absorbed leftover OCC stays sticky.
+    fn covering_sticky(&self, location: MemoryLocationHash, n_pairs: usize) -> bool {
+        n_pairs > ORDER_WINDOW_K
+            && self.promoted.get(&location).is_some_and(|s| {
+                s.last_cover_ok
+                    && !s.last_crisis
+                    && is_covering(s.decision, n_pairs, self.seg_cap())
+            })
+    }
+
     /// G2: planted-segment safety bound from block width / cores (not SEG_CAP=2).
     pub(crate) fn seg_cap(&self) -> usize {
         let cores = self.cores();
@@ -1100,12 +1113,17 @@ impl CostPolicy {
 
     /// Persist the committed arm so DeferPlant survives the next begin.
     pub(crate) fn remember_arm(&self, location: MemoryLocationHash, arm: LocStrategy) {
-        self.block_arm.insert(location, arm);
         let n_pairs = self
             .short_chain
             .get(&location)
             .map(|c| c.len())
             .unwrap_or(0);
+        let arm = if n_pairs > ORDER_WINDOW_K && arm == LocStrategy::FullChain {
+            LocStrategy::OptimisticRead
+        } else {
+            arm
+        };
+        self.block_arm.insert(location, arm);
         let mut e = self.promoted.entry(location).or_insert_with(|| {
             let mut loc = PromotedLoc::new();
             if let Some(p) = self.morphs.get(&morph_key(n_pairs)) {
@@ -1167,7 +1185,11 @@ impl CostPolicy {
         let (mut arm, explore, greedy) = self.select_arm(location, n_pairs);
         // Safety: never persist FullChain on a long spine (short-n cache).
         if n_pairs > ORDER_WINDOW_K && arm == LocStrategy::FullChain {
-            arm = LocStrategy::OptimisticRead;
+            arm = if self.reopen_ordered(location) {
+                LocStrategy::win(covering_w(n_pairs))
+            } else {
+                LocStrategy::OptimisticRead
+            };
         }
         if let Some(e) = self.promoted.get(&location) {
             if e.prev_decision != arm && self.block_seq.load(Ordering::Relaxed) > 1 {
@@ -1209,7 +1231,8 @@ impl CostPolicy {
             });
         // R3: cold / crisis explores covering w±1. Hot proven ordered is
         // sticky. Sys-reexec upgrade is greedy covering (no Defer UCB).
-        let explore_ok = if leftover_pay_once || upgrading {
+        let sticky = self.covering_sticky(location, n_pairs);
+        let explore_ok = if leftover_pay_once || upgrading || sticky {
             false
         } else if reopen && hot {
             false
@@ -1264,6 +1287,14 @@ impl CostPolicy {
         let crisis = s.last_crisis;
         if crisis {
             return (false, true);
+        }
+        let n_pairs = self
+            .short_chain
+            .get(&location)
+            .map(|c| c.len())
+            .unwrap_or(0);
+        if self.covering_sticky(location, n_pairs) {
+            return (true, false);
         }
         let (c, n) = s.stat(s.decision).unwrap_or((PRIOR_C_WIDE_NS, 1.0));
         if s.samples < HOT_LOC_N || n < HOT_ARM_N {
@@ -1378,6 +1409,16 @@ impl CostPolicy {
                         .unwrap_or(false)
             });
         }
+        // R3: proven covering does not walk w−1 back into an OCC tail.
+        if self.covering_sticky(location, n_pairs) {
+            let keep = self.promoted.get(&location).map(|s| s.decision);
+            let w_cover = covering_w(n_pairs).min(w_cap).max(1);
+            out.retain(|a| {
+                keep == Some(*a)
+                    || *a == LocStrategy::win(w_cover)
+                    || matches!(a, LocStrategy::OptimisticRead | LocStrategy::DeferPlant)
+            });
+        }
         // R2: never schedule half-window + OCC tail once CC owns the ℓ.
         if reopen {
             let seg_cap = self.seg_cap();
@@ -1486,6 +1527,14 @@ impl CostPolicy {
                             c = c.max(paid);
                         }
                     }
+                }
+                if loc.as_ref().is_some_and(|s| s.last_cover_ok)
+                    && !a.is_ordered()
+                    && let Some(paid) = paid
+                {
+                    // R3: proven covering hysteresis — Opt/Defer must beat
+                    // the absorbed wall by NS_DELTA, not win a tie.
+                    c = c.max(paid + NS_DELTA);
                 }
                 (a, c.max(1.0), n.max(1.0))
             })
@@ -2427,6 +2476,16 @@ impl CostPolicy {
             };
             if e.decision.is_ordered() && leftover_hops < 2 && e.block_reexec_n < 2 {
                 e.last_crisis = false;
+            }
+            if n_pairs > ORDER_WINDOW_K
+                && is_covering(e.decision, n_pairs, self.seg_cap())
+                && leftover_hops < 2
+                && e.block_reexec_n < 2
+                && unfenced < 4
+            {
+                e.last_cover_ok = true;
+            } else if leftover_hops >= 2 || e.block_reexec_n >= 2 || unfenced >= 4 {
+                e.last_cover_ok = false;
             }
             if !e.measured
                 && e.decision != LocStrategy::DeferPlant
@@ -3387,16 +3446,25 @@ mod tests {
         let p = CostPolicy::new();
         p.begin_block(176);
         p.promote_short_edge(0x32be, 40_000);
-        for pair in [(4, 31), (31, 66), (66, 67), (67, 69)] {
+        for pair in [
+            (4, 31),
+            (31, 66),
+            (66, 67),
+            (67, 69),
+            (69, 70),
+            (70, 93),
+            (93, 96),
+            (96, 103),
+        ] {
             p.note_short_pair(0x32be, pair.0, pair.1);
         }
-        // Force a Win_3 decision identity, then pay a fat prepaid wall.
+        // Half-window Win_3 on an 8-pair spine, then a fat prepaid wall.
         p.remember_arm(0x32be, LocStrategy::win(3));
         p.note_refuse_ns(200_000);
         p.note_loc_ordered_ns(0x32be, 200_000);
         p.end_block_learn();
         p.begin_block(176);
-        let next = p.loc_strategy(0x32be, 4);
+        let next = p.loc_strategy(0x32be, 8);
         assert_ne!(next, LocStrategy::FullChain);
         assert_ne!(
             next,
