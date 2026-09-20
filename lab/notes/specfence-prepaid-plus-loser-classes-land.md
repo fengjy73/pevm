@@ -14,21 +14,58 @@
 | **P1** | `note_started` 只在本 tx 有闸或 leftover flush 排队时打点。兄弟闸不再税独立集。 |
 | **P2** | Detect 洞打开（未闸，或有闸但 pred 已 Done）走 `validate_optimistic_fast` ≡ OCC。 |
 | **P3** | ĉ 重叠感知：薄块 Detect 墙是 stall 工期，不是 hops×stall。U 欠覆盖才加 leftover OCC 尾。 |
-| **U** | `train_hat`（cores 标度，176@8 → 7/8）允许 `w_need` 越过 oversub hat=2。`loc_w_need` 不再把已学 need 钳回 2。 |
-| **O** | 已 cover_ok 不再 T3 滑 leftover Detect。肥块 sticky 可留 Win_1 / Opt。 |
-| **D** | 欠覆盖列车（unf≥8 或 loc reexec≥4 且 leftover>planted）记 double_pay 并升 `w_need`；`hops < w_need` + OCC 尾仍禁。 |
-| **L4** | sys-reexec 后即使先验 cover 贵，也抬 Opt/Defer 到 cover+δ，禁止钉 Opt。无 sys 的预付爆破仍可回 OCC。 |
+| **U** | `train_hat` 允许 `w_need` 越过 oversub hat=2，**仅当 Win_2+ 仍漏**（unf≥8）。首跳 Win_1 leftover 不爬 train_hat（否则 3356896 预付 Win_8）。 |
+| **O** | 已 cover_ok **或已种 covering 前缀** 不再 T3 滑 leftover Detect。安静轻 Win_2+ 即使 leftover hops 也记 cover_ok。 |
+| **D** | Win_2+ 欠覆盖列车才 `double_pay` 并升 `w_need`。`hops < w_need` + OCC 尾仍禁。 |
+| **L4** | sys-reexec 后抬 Opt/Defer 到 cover+δ。**cover_ok + 未测 Opt prior 不得撤**。Opt 自身测得更便宜才允许 prepaid blowout 回 OCC。 |
 | **S** | n≥512 复用且 D1 已存 → 跳 HotSet / inter-prior / sketch。`train_hat` 肥块 ≤4。 |
 
-半截窗 = 短于 `w_need` 的前缀。轻窗 leftover 仅当 loc 仍漏列车才 T3 滑。
+## Compare 3356896 @8 Soft=0 N=7 interleaved
 
-## 验收证据（代码）
+| rev | OCC med | SF reuse | long ℓ | cover unf | dp | PRIMARY |
+|-----|---------|----------|--------|-----------|----|---------|
+| PR33 | 0.992 | 1.184 | Win_2 / Seg_2 | 0–2 | 0 | false (gap ~0.19) |
+| `8be2caa` | **0.914** | **1.240** | Win_2 / Seg_2 (Opt retreat i=4/6) | **0** on cover | **0** | **false** |
 
-- `under_cover_train_grows_w_need_past_oversub_hat`
-- `sys_reexec_after_blowout_does_not_nail_opt`
-- `leftover_slide_off_when_cover_ok` / `cover_ok_does_not_queue_leftover_slide`
-- `train_hat_exceeds_oversub_light_hat`
-- 既有 light cover / double_pay / prepaid blowout / sys-reexec / leftover / Full 禁长脊
+Covering path after leftover-slide knife: i=1 `Win_2` refuse=0 unf=0 wall=1.399; i=5 `Seg_2` refuse=0 unf=0 wall=**1.003**. Reuse median still includes Opt retreats after a noisy Win_2. Soft=0. No Full-spine nail. `w_need=2`.
+
+3-iter reuse sweep on the same block: OCC reuse **1.503** / SF reuse **1.344** / ratio **0.89** — **SF reuse ≤ OCC** on that harness (same as PR33). Last arm Opt unf=15 (3-iter did not stick cover).
+
+## Multiblock reuse sweep (`SPECFENCE_ALL_REUSE=1` N=3 @8)
+
+52/52 loaded (19469097 no longer OOM). Soft=0 every row.
+
+| | PR33 | this |
+|---|------|------|
+| loaded | 51/52 | **52/52** |
+| SF≤OCC wall | 7/51 | **11/52** |
+| SF≤OCC reuse | 13/51 | **16/52** |
+| sys_reexec blocks | 26 | 1 |
+| Win_2 last | 20 | 2 |
+| Opt last | 13 quiet + others | 19 |
+| dp>0 | many | **2** |
+| policy / admit | 50 / 33 | **56 / 34** |
+
+Reuse SF≤OCC **gained** 14689598, 15752489, 19737292, 19917570, 19929064, 19932148, 19934116; **lost** 11114732, 15537394, 16257471, 19933597; kept 9.
+
+### Class deltas (same heuristic as the design table)
+
+| class | PR33 | this | note |
+|-------|------|------|------|
+| **U** Win_2 + unf≥8 | 19 | **2** | 18988207 unf 50→26 need=8; most former U left Win_2 |
+| **O** cover + ratio≥1.5 + unf<8 | 2 | **0** | leftover slide off on planted cover |
+| **D** dp>0 | 6 | **2** | 18988207, 19469098 |
+| **L4** sys+Opt+unf≥20 | 3 | **0** | 14689597 unf **336→139**, ratio **2.40→1.09** (last Full) |
+| **S** n≥512 ratio≥4 | ~6 | **5** | 15274915 21.2→18.5; 13217637 7.31→7.15 — still fat |
+
+`arm_last=Full` on fat n is the **chosen** loc telemetry (short Full still legal; long spine still cannot persist FullChain).
+
+## Safety
+
+- Soft=0 every compare/sweep row
+- iter11 **0.02s**; erc20_independent **0.52s**
+- policy **56** + admit **34**
+- no mid-plant; Instant idle ↛ ĉ
 
 ```
 SPECFENCE_COMPARE_ITERS=7 cargo run -p pevm --release \
