@@ -1097,12 +1097,14 @@ impl CostPolicy {
 
     fn commit_arm(&self, location: MemoryLocationHash, n_pairs: usize) -> LocStrategy {
         let (arm, explore, greedy) = self.select_arm(location, n_pairs);
-        self.block_arm.insert(location, arm);
         if let Some(e) = self.promoted.get(&location) {
             if e.prev_decision != arm && self.block_seq.load(Ordering::Relaxed) > 1 {
                 self.arm_switch_n.fetch_add(1, Ordering::Relaxed);
             }
         }
+        // Persist even when hops=0 (Defer/Opt). Otherwise census / learn
+        // keep the prior Win_w and the next begin replants the half-window.
+        self.remember_arm(location, arm);
         if explore || arm != greedy {
             self.explore_n.fetch_add(1, Ordering::Relaxed);
         }
@@ -1122,7 +1124,15 @@ impl CostPolicy {
         self.ensure_promoted_seeded(location, n_pairs);
         let demoted = self.loc_demoted(location);
         let (hot, crisis) = self.phase_of(location);
-        let explore_ok = if crisis || !hot {
+        // O1: leftover Detect+OCC already lost. Do not UCB-explore the
+        // half-window again — greedy Opt/Defer (pay OCC once).
+        let double_pay = self
+            .promoted
+            .get(&location)
+            .is_some_and(|s| s.last_double_pay);
+        let explore_ok = if double_pay {
+            false
+        } else if crisis || !hot {
             true
         } else {
             self.try_consume_explore_budget()
@@ -1212,10 +1222,12 @@ impl CostPolicy {
             .promoted
             .get(&location)
             .is_some_and(|s| s.last_double_pay);
-        if n_pairs >= 1 && w_cap >= 1 {
+        // O1: after Detect-prefix + leftover OCC, ordered arms are the
+        // half-window that already lost. Eligible set is Opt/Defer only.
+        if n_pairs >= 1 && w_cap >= 1 && !double_pay {
             out.push(LocStrategy::win(w_star.min(n_pairs).min(w_cap)));
-            // O1/O7: double-pay must not grow the window neighborhood.
-            if (cold || crisis) && !double_pay {
+            // O1/O7: leftover OCC must not grow the window neighborhood.
+            if cold || crisis {
                 if w_star > 1 {
                     out.push(LocStrategy::win((w_star - 1).min(n_pairs)));
                 }
@@ -1233,7 +1245,11 @@ impl CostPolicy {
                 out.push(LocStrategy::seg(sl - 1));
             }
         }
-        if n_pairs > 0 && n_pairs <= ORDER_WINDOW_K && !demoted && (cold || crisis || n_pairs <= 2)
+        if n_pairs > 0
+            && n_pairs <= ORDER_WINDOW_K
+            && !demoted
+            && !double_pay
+            && (cold || crisis || n_pairs <= 2)
         {
             out.push(LocStrategy::FullChain);
         }
@@ -1324,6 +1340,22 @@ impl CostPolicy {
                         && hops_for_strategy(a, n_pairs, self.seg_cap()) > planted
                     {
                         c = c.max(paid);
+                    }
+                    // O1: unused Win prior (12k) must not undercut a measured
+                    // Opt/Defer when that window would leave leftover ≥2
+                    // (half-ordered + OCC tail = double-pay).
+                    let hop_a = hops_for_strategy(a, n_pairs, self.seg_cap());
+                    if a.is_ordered()
+                        && n <= 1.0
+                        && n_pairs.saturating_sub(hop_a) >= 2
+                        && loc
+                            .as_ref()
+                            .is_some_and(|s| s.measured && !s.decision.is_ordered())
+                    {
+                        c = c.max(abort);
+                        if let Some(paid) = paid {
+                            c = c.max(paid);
+                        }
                     }
                 }
                 (a, c.max(1.0), n.max(1.0))
@@ -2231,6 +2263,10 @@ impl CostPolicy {
                     unfenced >= 4 && !e.last_double_pay
                 }
             };
+            // O7: leftover OCC of a double-pay window is not a climb crisis.
+            if e.last_double_pay {
+                e.last_crisis = false;
+            }
             if !e.measured
                 && e.decision != LocStrategy::DeferPlant
                 && e.block_reexec_ns == 0
@@ -3017,9 +3053,15 @@ mod tests {
         p.note_short_pair(0xedba, 14, 16);
         p.note_short_pair(0xedba, 16, 17);
         let first = p.loc_strategy(0x32be, 4);
+        assert_ne!(
+            first,
+            LocStrategy::FullChain,
+            "CC-L3/L4: long thin spine never FullChain: {first:?}"
+        );
         assert!(
-            first.is_ordered() && first != LocStrategy::FullChain,
-            "CC-L3/L4: long thin spine plants Win_w/Seg, not FullChain: {first:?}"
+            first.is_ordered()
+                || matches!(first, LocStrategy::OptimisticRead | LocStrategy::DeferPlant),
+            "O1: leftover-long spine is Win_w/Seg or pay-once Opt/Defer, got {first:?}"
         );
         assert!(
             p.hops_to_plant(0x32be, 4) < 4,
@@ -3486,6 +3528,7 @@ mod tests {
                 "E1: leftover OCC on Win_2 + unfenced=0 is not a climb crisis"
             );
         }
+        p.begin_block_with_cores(176, 8);
         p.remember_arm(0x32be, LocStrategy::win(1));
         p.note_reexec_ns_at(Some(0x32be), 8_000);
         p.note_reexec_ns_at(Some(0x32be), 8_000);
@@ -3543,9 +3586,13 @@ mod tests {
             "O1: double-pay hot set keeps Opt/Defer: {hot:?}"
         );
         assert!(
-            !hot.iter()
-                .any(|a| a.is_high_prepaid(4) || *a == LocStrategy::win(3)),
-            "O1/O7: double-pay must not generate Win_3/Seg: {hot:?}"
+            !hot.iter().any(|a| a.is_ordered()),
+            "O1: double-pay eligible set is Opt/Defer only, got {hot:?}"
+        );
+        let cold_dp = p.generate_arms(0x32be, 4, false, true, true);
+        assert!(
+            !cold_dp.iter().any(|a| a.is_ordered()),
+            "O1: crisis/cold after double-pay must not re-offer Win_w: {cold_dp:?}"
         );
         let (arm, explore, _) = p.select_arm(0x32be, 4);
         assert!(
@@ -3569,6 +3616,81 @@ mod tests {
             matches!(arm2, LocStrategy::OptimisticRead | LocStrategy::DeferPlant),
             "O1: unused Win_2 prior must not beat Defer/Opt after double-pay, got {arm2:?}"
         );
+    }
+
+    #[test]
+    fn unused_win_prior_does_not_undercut_measured_opt_on_leftover_spine() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(176, 8);
+        p.promote_short_edge(0x32be, 180_000);
+        for pair in [
+            (4, 31),
+            (31, 66),
+            (66, 67),
+            (67, 69),
+            (69, 70),
+            (70, 93),
+            (93, 96),
+            (96, 103),
+        ] {
+            p.note_short_pair(0x32be, pair.0, pair.1);
+        }
+        {
+            let mut e = p.promoted.get_mut(&0x32be).unwrap();
+            e.samples = 2;
+            e.measured = true;
+            e.decision = LocStrategy::OptimisticRead;
+            e.last_crisis = false;
+            e.last_double_pay = false;
+            e.reexec_ns_ema = 180_000.0;
+            e.upsert_stat(LocStrategy::OptimisticRead, 62_716.0, 2.0);
+        }
+        p.block_arm.clear();
+        let (arm, _, _) = p.select_arm(0x32be, 8);
+        assert!(
+            matches!(arm, LocStrategy::OptimisticRead | LocStrategy::DeferPlant),
+            "O1: unused Win_1/2 prior 12k must not replace measured Opt on a leftover spine, got {arm:?}"
+        );
+    }
+
+    #[test]
+    fn commit_arm_persists_defer_decision() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(176, 8);
+        p.promote_short_edge(0x32be, 40_000);
+        for pair in [(4, 31), (31, 66), (66, 67), (67, 69)] {
+            p.note_short_pair(0x32be, pair.0, pair.1);
+        }
+        {
+            let mut e = p.promoted.get_mut(&0x32be).unwrap();
+            e.samples = 4;
+            e.decision = LocStrategy::win(1);
+            e.w_star = 1;
+            e.last_crisis = true;
+            e.last_double_pay = true;
+            e.reexec_ns_ema = 180_000.0;
+            e.upsert_stat(LocStrategy::win(1), 270_000.0, 3.0);
+            e.upsert_stat(LocStrategy::OptimisticRead, 62_000.0, 2.0);
+            e.upsert_stat(LocStrategy::DeferPlant, 9_000.0, 2.0);
+        }
+        p.block_arm.clear();
+        let arm = p.loc_strategy(0x32be, 4);
+        assert!(
+            matches!(arm, LocStrategy::OptimisticRead | LocStrategy::DeferPlant),
+            "O1: after double-pay loc_strategy is Defer/Opt, got {arm:?}"
+        );
+        assert_eq!(
+            p.hops_to_plant(0x32be, 4),
+            0,
+            "O1: Defer/Opt plants no begin prefix"
+        );
+        {
+            let e = p.promoted.get(&0x32be).unwrap();
+            assert_eq!(
+                e.decision, arm,
+                "O1: hops=0 Defer/Opt must still write e.decision (census/learn)"
+            );
+        }
     }
 
     #[test]
