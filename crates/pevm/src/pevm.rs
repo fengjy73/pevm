@@ -815,18 +815,15 @@ impl Pevm {
             // those still need HotSet / inter-prior (m3/m4/r1).
             const STABLE_D1_N_MIN: usize = 64;
             let stable_d1 = ready_has_4_31 && thin && block_size >= STABLE_D1_N_MIN;
-            // S: fat reuse with stored D1 skips HotSet / inter-prior / sketch
-            // (same lean as 3356896 stable D1). First fat block still persists.
-            let fat_reuse =
-                block_size >= 512 && self.cost_policy.d1_pairs_already_stored(&d1_orders);
-            // P3: fat + lazy already classified → skip HotSet / inter-prior /
+            // Mid-band / large reuse with stored D1 skips HotSet / inter-prior /
+            // sketch (same lean as 3356896 stable D1). First block still persists.
+            let d1_reuse = self.cost_policy.d1_pairs_already_stored(&d1_orders);
+            // Large + lazy-update already classified → skip HotSet / inter-prior /
             // sketch. Real-spine D1 persist is filtered below.
-            let lean_end = stable_d1
-                || fat_reuse
-                || (block_size >= 512 && self.cost_policy.lazy_already_seen());
-            // S5: edge_4_31 already true → skip MV merge and HotSet walk.
+            let lean_end = stable_d1 || self.cost_policy.should_lean_end_block(d1_reuse);
+            // edge_4_31 already true → skip MV merge and HotSet walk.
             // lean_end still skips HotSet below.
-            if !ready_has_4_31 && !fat_reuse {
+            if !ready_has_4_31 && !d1_reuse {
                 for (loc, writers) in mv_writers_for_locs(
                     &mv_memory,
                     &self.cost_policy.promoted_locations(),
@@ -858,8 +855,8 @@ impl Pevm {
                     self.hotset.end_block();
                 }
             }
-            // O4/C3/S: stable 3356896 D1 or fat reuse — skip HotSet (above),
-            // inter-prior pack, and sketch decay.
+            // Stable 3356896 D1 or mid-band/large D1 reuse — skip HotSet
+            // (above), inter-prior pack, and sketch decay.
             if !lean_end {
                 let morph_hat = learner.morph_hat();
                 let top = learner.pack_top_locations();
@@ -967,10 +964,10 @@ impl Pevm {
             }
             let mut report = self.cost_policy.take_report(ready_w, idle);
             report.end_block_ns = end_t0.elapsed().as_nanos() as u64;
-            report.pick_occ_n = ready_edges.pick_occ_n();
+            report.ungated_occ_n = ready_edges.pick_occ_n();
             report.pick_gate_n = ready_edges.pick_gate_n();
             report.skip_gate_n = ready_edges.skip_gate_n();
-            report.occ_pick_while_gated = ready_edges.occ_pick_while_gated();
+            report.ungated_occ_while_gated = ready_edges.ungated_occ_while_gated();
             report.yield_ns = ready_edges.yield_ns();
             report.gate_stall_ns = refuse_ns;
             report.worker_busy_ns = metrics_inner.worker_busy_ns();

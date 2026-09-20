@@ -16,7 +16,7 @@ use super::bayes::BayesMap;
 use super::feeder::{seed_known_stars, top_is_known_star};
 use super::learner::{InterBlockPrior, LiveLearner};
 use super::metrics::MetricsInner;
-use super::policy::{CohortKind, CostPolicy, FAT_N, ORDER_WINDOW_K, THIN_ORDERED_K};
+use super::policy::{CohortKind, CostPolicy, LARGE_BLOCK_N, ORDER_WINDOW_K, THIN_ORDERED_K};
 use super::producer_stage::ProducerStageTable;
 use super::ready_edge::ReadyEdgeTable;
 use super::wave::WaveParkTable;
@@ -324,7 +324,7 @@ pub(crate) fn admit_seed_begin_block(
             }
             CohortKind::CallWaw => {
                 // C2: fat CallWaw is light-cover (short hop), not a full chain.
-                let short = policy.block_n() >= FAT_N;
+                let short = policy.block_n() >= LARGE_BLOCK_N;
                 edges += note_predecessor_chain(ready, &c.txs, loc, &mut queued, short);
             }
             CohortKind::EmptyTo => {
@@ -340,16 +340,16 @@ pub(crate) fn admit_seed_begin_block(
         let _ = c.is_contract;
     }
 
-    soft_cap_begin_blocked(ready, policy);
+    soft_cap_wait_set(ready, policy);
     edges
 }
 
-/// P2: fat n≥512 soft-cap begin holes. Keep earliest (real-spine prefix).
-fn soft_cap_begin_blocked(ready: &ReadyEdgeTable, policy: &CostPolicy) {
-    let cap = policy.fat_begin_hole_cap();
-    if cap == usize::MAX {
+/// Soft-cap the OrderedAdmit wait-set on over-admission (mid-band and large).
+/// Keep earliest wait-for deps (real-spine prefix).
+fn soft_cap_wait_set(ready: &ReadyEdgeTable, policy: &CostPolicy) {
+    let Some(cap) = policy.wait_set_soft_cap() else {
         return;
-    }
+    };
     let mut blocked = ready.blocked_consumers();
     if blocked.len() <= cap {
         return;
@@ -403,7 +403,7 @@ fn admit_seed_hint_short_edges(
         if !policy.should_gate_short_after_write(loc, false, n.saturating_sub(1)) {
             continue;
         }
-        let plant = policy.plant_pairs(arm, &pairs);
+        let plant = policy.admit_pairs(arm, &pairs);
         let mut planted = 0usize;
         for (pred, succ) in plant {
             ready.note_consumer_on(succ, pred, Some(loc));
@@ -418,8 +418,8 @@ fn admit_seed_hint_short_edges(
             policy.note_hops_decision(loc, n_pairs.max(pairs.len()));
             edges += planted;
             // O2: cold begin plants one CallWaw trio (14→16→17). The second
-            // (15→19→20) waits for a measured abort — two extra holes are
-            // prepaid width with no Detect win on 3356896.
+            // (15→19→20) waits for a measured abort — two extra wait-for
+            // deps are prepaid width with no Detect win on 3356896.
             if policy.is_optimistic_majority_block() {
                 break;
             }
@@ -455,7 +455,7 @@ fn admit_seed_promoted_short_edges(
     locs.sort_unstable_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
     // Drop zero-hop (demoted / leftover-lose) locs *before* the K-cap so a
     // 16-writer Basic spine cannot evict storage 14→16→17.
-    locs.retain(|(loc, pairs)| policy.hops_to_plant(*loc, pairs.len()) > 0);
+    locs.retain(|(loc, pairs)| policy.hops_to_admit(*loc, pairs.len()) > 0);
     if policy.is_optimistic_majority_block() && locs.len() > THIN_ORDERED_K {
         locs.truncate(THIN_ORDERED_K);
     }
@@ -463,12 +463,12 @@ fn admit_seed_promoted_short_edges(
     for (loc, mut pairs) in locs {
         pairs.sort_unstable_by_key(|(pred, _)| *pred);
         let n_pairs = pairs.len();
-        if policy.hops_to_plant(loc, n_pairs) == 0 {
+        if policy.hops_to_admit(loc, n_pairs) == 0 {
             continue;
         }
         policy.note_hops_decision(loc, n_pairs);
         let strategy = policy.loc_strategy(loc, n_pairs);
-        let plant = policy.plant_pairs(strategy, &pairs);
+        let plant = policy.admit_pairs(strategy, &pairs);
         for (pred, succ) in plant {
             ready.note_consumer_on(succ, pred, Some(loc));
             policy.note_short_edge_admit();
@@ -552,7 +552,7 @@ pub(crate) fn admit_seed_on_write_set(
         }
     }
     // C1/P3: fat lazy block — D1 record only. No envelope walk / plant.
-    if policy.is_some_and(|p| p.block_n() >= FAT_N && p.lazy_already_seen()) {
+    if policy.is_some_and(|p| p.block_n() >= LARGE_BLOCK_N && p.lazy_already_seen()) {
         return;
     }
     if effective_locs.iter().any(|&l| l == from_loc)
@@ -572,7 +572,7 @@ pub(crate) fn admit_seed_on_write_set(
         for &loc in effective_locs {
             if loc != from_loc && !policy.is_some_and(|p| p.loc_forbids_ordered(loc)) {
                 ready.note_raw_producer(loc, writer);
-                if policy.is_none_or(|p| p.hops_to_plant(loc, p.pairs_of(loc).len().max(1)) > 0) {
+                if policy.is_none_or(|p| p.hops_to_admit(loc, p.pairs_of(loc).len().max(1)) > 0) {
                     ready.note_immediate_pred(loc, writer);
                 }
             }
@@ -658,7 +658,7 @@ pub(crate) fn admit_seed_on_write_set(
             continue;
         }
         // C2: real spine only. hops=0 (Opt/Defer / lazy) leaves OCC.
-        let plant = policy.is_none_or(|p| p.hops_to_plant(loc, n_pairs.max(1)) > 0);
+        let plant = policy.is_none_or(|p| p.hops_to_admit(loc, n_pairs.max(1)) > 0);
         if plant {
             // D1: 4→31 when 4 already published this ℓ (any envelope).
             ready.note_immediate_pred(loc, writer);
@@ -675,8 +675,8 @@ pub(crate) fn admit_seed_on_write_set(
         let mut ordered = Vec::with_capacity(later.len() + 1);
         ordered.push(pred);
         ordered.extend(later.iter().copied());
-        // C2: production plants a light hop, not the full envelope (K8
-        // 47-hole stars). Tests pass policy=None and still expect D1 chain.
+        // C2: production admits a light hop, not the full envelope (K8
+        // over-admission wait-set). Tests pass policy=None and still expect D1 chain.
         let short = policy.is_some();
         let _ = note_predecessor_chain(ready, &ordered, loc, &mut queued, short);
     }
@@ -691,7 +691,7 @@ pub(crate) fn admit_seed_on_write_set(
         }
     }
     if let Some(p) = policy {
-        soft_cap_begin_blocked(ready, p);
+        soft_cap_wait_set(ready, p);
     }
 }
 
@@ -751,7 +751,7 @@ fn seed_short_edges_after_publish(
         // O1/O2: do not plant a long-spine hop the leftover EV already lost.
         if let Some(p) = policy {
             let n_pairs = p.pairs_of(loc).len().max(1);
-            if p.hops_to_plant(loc, n_pairs) == 0 && n_pairs > ORDER_WINDOW_K {
+            if p.hops_to_admit(loc, n_pairs) == 0 && n_pairs > ORDER_WINDOW_K {
                 continue;
             }
         }
@@ -903,7 +903,7 @@ pub(crate) fn persist_short_chain_after_abort(
         // C1: hops=0 (Opt/Defer) must not queue idle. Covering ordered after
         // systematic reexec has hops>0 and plants via the same mouth.
         let n_pairs = policy.pairs_of(location).len();
-        if policy.hops_to_plant(location, n_pairs) > 0 {
+        if policy.hops_to_admit(location, n_pairs) > 0 {
             policy.queue_idle_edge(location, producer, consumer);
         }
     }
@@ -935,7 +935,7 @@ pub(crate) fn queue_nearest_unfinished_successor(
     to: Option<Address>,
 ) {
     let n_pairs = policy.pairs_of(location).len();
-    if policy.hops_to_plant(location, n_pairs) == 0 {
+    if policy.hops_to_admit(location, n_pairs) == 0 {
         return;
     }
     let w = policy
@@ -999,7 +999,7 @@ pub(crate) fn flush_pending_idle_edges(ready: &ReadyEdgeTable, policy: &CostPoli
         pairs.sort_unstable();
         pairs.dedup();
         let n_pairs = policy.pairs_of(loc).len().max(pairs.len());
-        if policy.hops_to_plant(loc, n_pairs) == 0 {
+        if policy.hops_to_admit(loc, n_pairs) == 0 {
             continue;
         }
         // O1: next-quantum flush is leftover continuation — 1 hop, never
@@ -1044,8 +1044,8 @@ mod tests {
         hints: &AccountHints,
         contracts: &HashSet<Address>,
     ) -> usize {
-        // Structural A1 tests use a full shell (n > THIN_N_MAX) that is
-        // still below FAT_N — fat EmptyTo is A0 (C1/P2).
+        // Structural tests use a full shell (n > THIN_N_MAX) that is
+        // still below LARGE_BLOCK_N — large EmptyTo is A0.
         let policy = policy_for(400);
         admit_seed_begin_block(
             ready,
@@ -1840,9 +1840,9 @@ mod tests {
             &HashSet::new(),
             None,
         );
-        // O2: cold begin plants the first trio only (14→16→17). 15→19→20
-        // waits for a measured abort so we do not pay two extra holes.
-        assert_eq!(n, 2, "O2: cold hint plants one CallWaw trio, got {n}");
+        // O2: cold begin admits the first trio only (14→16→17). 15→19→20
+        // waits for a measured abort so we do not pay two extra wait-for deps.
+        assert_eq!(n, 2, "O2: cold hint admits one CallWaw trio, got {n}");
         assert_eq!(ready.blocking_producer(16), Some(14));
         assert_eq!(ready.blocking_producer(17), Some(16));
         assert!(
@@ -2076,7 +2076,7 @@ mod tests {
         );
         persist_short_chain_after_abort(&AccountHints::default(), &policy, 166, 141, 0x32be);
         assert_eq!(
-            policy.hops_to_plant(0x32be, 8),
+            policy.hops_to_admit(0x32be, 8),
             0,
             "C1: leftover Opt plants zero hops"
         );

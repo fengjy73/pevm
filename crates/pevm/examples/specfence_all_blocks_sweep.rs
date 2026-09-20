@@ -480,11 +480,11 @@ fn run_mode(
         row["learn"] = serde_json::json!({
             "chosen_strategy": learn.chosen_strategy,
             "chosen_win_w": learn.chosen_win_w,
-            "chosen_w_need": learn.chosen_w_need,
+            "chosen_cover_window": learn.chosen_cover_window,
             "chosen_w_cap": learn.chosen_w_cap,
             "selected_arms": learn.selected_arms,
             "unfenced_reexec": learn.unfenced_reexec,
-            "double_pay_n": learn.double_pay_n,
+            "detect_resolve_double_charge_n": learn.detect_resolve_double_charge_n,
             "sys_reexec_n": learn.sys_reexec_n,
             "covering_n": learn.covering_n,
             "win1_locs": learn.win1_locs,
@@ -494,7 +494,7 @@ fn run_mode(
             "full_locs": learn.full_locs,
             "defer_locs": learn.defer_locs,
             "opt_locs": learn.opt_locs,
-            "occ_pick_while_gated": learn.occ_pick_while_gated,
+            "ungated_occ_while_gated": learn.ungated_occ_while_gated,
         });
     }
     if let Some(proc) = last_process {
@@ -578,7 +578,7 @@ fn main() {
                 for mode in ["occ", "specfence"] {
                     let row = run_mode(&chain, &loaded, mode, 8, iters, false, reuse);
                     eprintln!(
-                        "  {mode:10} ok={} tps={:.0} wall_ms={:.1} reuse_med={} arm={}→{} unf={} dp={} sys={} cover={} w={} need={} soft={} aborts={} ordered_admit={} wait={} rewind={} rebind={} full={}",
+                        "  {mode:10} ok={} tps={:.0} wall_ms={:.1} reuse_med={} arm={}→{} unf={} double_charge={} sys={} cover={} w={} cover_window={} soft={} aborts={} ordered_admit={} wait={} rewind={} rebind={} full={}",
                         row["ok"],
                         row["tps"].as_f64().unwrap_or(0.0),
                         row["wall_ms"].as_f64().unwrap_or(0.0),
@@ -589,11 +589,13 @@ fn main() {
                         row["arm_cold"].as_str().unwrap_or("-"),
                         row["arm_last"].as_str().unwrap_or("-"),
                         row["learn"]["unfenced_reexec"].as_u64().unwrap_or(0),
-                        row["learn"]["double_pay_n"].as_u64().unwrap_or(0),
+                        row["learn"]["detect_resolve_double_charge_n"]
+                            .as_u64()
+                            .unwrap_or(0),
                         row["learn"]["sys_reexec_n"].as_u64().unwrap_or(0),
                         row["learn"]["covering_n"].as_u64().unwrap_or(0),
                         row["learn"]["chosen_win_w"].as_u64().unwrap_or(0),
-                        row["learn"]["chosen_w_need"].as_u64().unwrap_or(0),
+                        row["learn"]["chosen_cover_window"].as_u64().unwrap_or(0),
                         row["metrics"]["soft_wait_arms"].as_u64().unwrap_or(0),
                         row["metrics"]["occ_aborts"].as_u64().unwrap_or(0),
                         row["metrics"]["edge_ordered_admit"].as_u64().unwrap_or(0),
@@ -692,11 +694,11 @@ fn main() {
                     "arm_cold": sf["arm_cold"],
                     "arm_last": sf["arm_last"],
                     "unfenced_reexec": sf["learn"]["unfenced_reexec"],
-                    "double_pay_n": sf["learn"]["double_pay_n"],
+                    "detect_resolve_double_charge_n": sf["learn"]["detect_resolve_double_charge_n"],
                     "sys_reexec_n": sf["learn"]["sys_reexec_n"],
                     "covering_n": sf["learn"]["covering_n"],
                     "chosen_win_w": sf["learn"]["chosen_win_w"],
-                    "chosen_w_need": sf["learn"]["chosen_w_need"],
+                    "chosen_cover_window": sf["learn"]["chosen_cover_window"],
                     "selected_arms": sf["learn"]["selected_arms"],
                     "sf_reuse_wall_ms": sf["wall_ms_reuse_median"],
                 }));

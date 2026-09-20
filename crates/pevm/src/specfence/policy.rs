@@ -5,7 +5,7 @@
 //! not a hand-off to a second OCC runtime. Beta / morph / leftover counts
 //! are **features**, not `decide()` authority.
 //!
-//! Begin plant / hops / short-edge hints read **only** `select_arm(ℓ)`:
+//! Begin admit / hops / short-edge hints read **only** `select_arm(ℓ)`:
 //! Opt | OrderedWindow(w) | Seg(seg_len) | Full (short only) | DeferPlant.
 //! Candidates are **generated** from the posterior (`w*`, `s*`, `w±1`
 //! neighborhood) — not a frozen 7-slot enum. Cold explores; hot is greedy
@@ -20,11 +20,14 @@
 //! while the loc still leaks; proven cover leaves leftover OCC (S1).
 //! Leftover is not “OCC forever,” and covering is not a default
 //! `w = n_pairs−1` nail. A leftover train on a hat-width window grows
-//! `w_need` (U) up to a cores-scaled train hat — still not full-spine.
+//! `cover_window` (U) up to a cores-scaled train hat — still not full-spine.
 //! ĉ is overlap-aware (Detect makespan, not hops×stall) vs OCC
-//! whole-spine; a prefix shorter than `w_need` plus OCC tail is
-//! double-pay. Systematic reexec must not nail Opt (L4). Independent
-//! holes stay ungated (S1).
+//! whole-spine; a prefix shorter than `cover_window` plus leftover OCC is
+//! Detect+Resolve double charge. Systematic reexec must not nail Opt (L4).
+//! Independent txs stay ungated (S1). Under-covered conflict spines
+//! (cover_window cannot absorb leftover) yield to OptimisticRead — never
+//! Full/Seg hard-order, never learn-uphill. Wait-set soft-cap is an
+//! over-admission OrderedAdmit predicate, not `n≥512` alone.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -38,7 +41,7 @@ use crate::{MemoryLocationHash, TxIdx};
 
 use super::collateral::ConflictClass;
 
-/// Thin-shell plant-location **safety cap** (not “always exactly 3”).
+/// Thin-shell admit-location **safety cap** (not “always exactly 3”).
 ///
 /// O8: `META_FLOOR_NS` / `SERIAL_NS_PER_TX` used to classify thin via a
 /// serial-hat vs 400µs floor. That nail distorted EV (176·2µs=352µs always
@@ -46,10 +49,16 @@ use super::collateral::ConflictClass;
 pub(crate) const THIN_ORDERED_K: usize = 3;
 /// Short-chain Full safety bound. Long spines never FullChain.
 pub(crate) const ORDER_WINDOW_K: usize = 2;
-/// Fat-block n (S-lazy / S-mixed). Soft-cap begin holes; skip EmptyTo plant.
-pub(crate) const FAT_N: usize = 512;
-/// Unknown long chain on a fat block with no EffectiveWAW → treat as lazy.
+/// Large-block n (lazy-update chain / mixed spine). Soft-cap wait-set;
+/// skip EmptyTo wait-for admit.
+pub(crate) const LARGE_BLOCK_N: usize = 512;
+/// Thin vs mid-band cut. Mid-band (`THIN_N_MAX < n < LARGE_BLOCK_N`) still
+/// pays over-admission OrderedAdmit unless the wait-set is soft-capped.
+pub(crate) const THIN_N_MAX: usize = 256;
+/// Unknown long chain on a large block with no EffectiveWAW → lazy-update.
 const LAZY_CHAIN_PAIR_FLOOR: usize = 32;
+/// Storage spine whose cover_window cannot absorb leftover (19807137-class).
+const UNDER_COVERED_SPINE_PAIRS: usize = 64;
 /// Runaway-plant hat (safety, not a strategy nail like WINDOWED_W_MAX=3).
 const WINDOW_SAFETY_HAT: usize = 32;
 /// Seg length hat (safety, not SEG_TX=4).
@@ -62,7 +71,6 @@ const HOT_ARM_N: f64 = 3.0;
 const HOT_LOC_N: u32 = 3;
 /// Relative SE above this stays cold (ĉ confidence still wide).
 const HOT_REL_SE: f64 = 0.45;
-const THIN_N_MAX: usize = 256;
 /// ns-EV hysteresis for cohort choose() (not the loc arm mouth).
 const NS_DELTA: f64 = 2_000.0;
 /// Cohort / snap cold priors (learnable; not a loc-arm nail).
@@ -311,14 +319,14 @@ pub struct LearnReport {
     pub unique_seg_len: u8,
     /// E2: remaining hot-ℓ explore slots at end-block (0 = all hot exploited).
     pub explore_budget: u8,
-    /// Dual-path pick: ungated OCC-class issues.
-    pub pick_occ_n: usize,
+    /// Ungated OCC task selection count.
+    pub ungated_occ_n: usize,
     /// Dual-path pick: gated (OrderedAdmit) issues.
     pub pick_gate_n: usize,
-    /// Gated-not-ready holes skipped (edge constraint, not global mode).
+    /// Gated-not-ready wait-set entries skipped (edge constraint, not global mode).
     pub skip_gate_n: usize,
-    /// Ungated OCC picks while any gate was live (P1 evidence).
-    pub occ_pick_while_gated: usize,
+    /// Ungated OCC task selection while any wait-for dependency was live.
+    pub ungated_occ_while_gated: usize,
     /// Product-path scheduler yield ns (P1). Instant-tax; not in ĉ.
     pub yield_ns: u64,
     /// Wall-clock gate stall (S2 prepaid). Same source as refuse_ns.
@@ -347,14 +355,14 @@ pub struct LearnReport {
     pub bandit_c_defer: f64,
     /// L7: `loc:arm` census (proves arms move across reuse).
     pub selected_arms: String,
-    /// O1: locations that paid Detect prefix + leftover OCC in the same block.
-    pub double_pay_n: usize,
+    /// Detect+Resolve double charge: OrderedAdmit prefix + leftover OCC abort.
+    pub detect_resolve_double_charge_n: usize,
     /// R1: locations whose Opt/Defer leftover paid a systematic reexec train.
     pub sys_reexec_n: usize,
-    /// L1: long-spine locations whose chosen arm meets light `w_need`.
+    /// L1: long-spine locations whose chosen arm meets light `cover_window`.
     pub covering_n: usize,
-    /// L1: telemetry loc `w_need` (minimal cover; 0 = unset).
-    pub chosen_w_need: u8,
+    /// Telemetry loc `cover_window` / ordered_window_width (0 = unset).
+    pub chosen_cover_window: u8,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -478,18 +486,18 @@ struct PromotedLoc {
     seg_star: u8,
     /// E1: leftover / unfenced crisis — allow high-prepaid again.
     last_crisis: bool,
-    /// O1: ordered prefix + leftover OCC train (half-window). Not a climb to
-    /// another half-window. Re-opens a **covering** ordered arm; ĉ may still
-    /// trial Defer/Opt. Persists until covering succeeds or sys-reexec upgrades.
-    last_double_pay: bool,
+    /// Detect+Resolve double charge: ordered prefix + leftover OCC train.
+    /// Re-opens a **covering** ordered arm; ĉ may still trial Defer/Opt.
+    last_double_charge: bool,
     /// R1: Opt/Defer (or leftover) paid a systematic reexec train. Next begin
     /// must re-open OrderedWindow/Seg — not nail Opt/Defer-only forever.
     last_sys_reexec: bool,
     /// L1/R3: last light covering arm absorbed the systematic train.
     last_cover_ok: bool,
-    /// L1: minimal `w` that absorbs the last systematic reexec / leftover
-    /// train. 0 = unset (cold uses `light_cover_w`, never `n_pairs−1`).
-    w_need: u8,
+    /// Minimal cover_window / ordered_window_width that absorbs the last
+    /// systematic reexec / leftover train. 0 = unset (cold uses
+    /// `light_cover_w`, never `n_pairs−1`).
+    cover_window: u8,
     /// C1/C2: lazy vs real Basic/storage. Sticky once observed.
     object: LocObject,
     /// True after an EffectiveWAW / non-lazy Data write on this ℓ.
@@ -521,10 +529,10 @@ impl PromotedLoc {
             w_star: 1,
             seg_star: 0,
             last_crisis: false,
-            last_double_pay: false,
+            last_double_charge: false,
             last_sys_reexec: false,
             last_cover_ok: false,
-            w_need: 0,
+            cover_window: 0,
             object: LocObject::Unknown,
             saw_effective: false,
             morph: morph_key(0, false),
@@ -763,7 +771,7 @@ pub(crate) struct CostPolicy {
     morphs: DashMap<MorphKey, MorphPrior, FxBuildHasher>,
     /// C1: observed object class (lazy vs Basic/storage), even before promote.
     loc_object: DashMap<MemoryLocationHash, LocObject, FxBuildHasher>,
-    /// P3: this process has seen a lazy writer chain (skip fat end_block walks).
+    /// This process has seen a lazy-update chain (skip large-block end_block walks).
     lazy_seen: AtomicBool,
     /// Process-persistent begin count (reuse iters). Not tx-count `block_n`.
     block_seq: AtomicUsize,
@@ -1028,7 +1036,7 @@ impl CostPolicy {
     }
 
     fn unknown_looks_lazy(&self, n_pairs: usize, saw_effective: bool) -> bool {
-        self.block_n() >= FAT_N && n_pairs >= LAZY_CHAIN_PAIR_FLOOR && !saw_effective
+        self.block_n() >= LARGE_BLOCK_N && n_pairs >= LAZY_CHAIN_PAIR_FLOOR && !saw_effective
     }
 
     fn promoted_saw_effective(&self, location: MemoryLocationHash) -> bool {
@@ -1094,12 +1102,46 @@ impl CostPolicy {
         self.lazy_seen.load(Ordering::Relaxed)
     }
 
-    /// P2: fat begin hole cap — keep a light real-spine prefix, not 95-hole prepaid.
-    pub(crate) fn fat_begin_hole_cap(&self) -> usize {
-        if self.block_n() < FAT_N {
-            return usize::MAX;
+    /// Soft-cap the OrderedAdmit wait-set under **over-admission** risk.
+    ///
+    /// Predicate is wait-set / cover_window inflation — not `n≥512` alone.
+    /// Thin short-chain (3356896) stays uncapped unless cover_window already
+    /// inflated. Mid-band real spines (19716145 begin~108, 19860366 begin~76)
+    /// take the same light prefix as large blocks.
+    pub(crate) fn wait_set_soft_cap(&self) -> Option<usize> {
+        let n = self.block_n();
+        if n == 0 {
+            return None;
         }
-        self.cores().max(8).min(16)
+        if n <= THIN_N_MAX && !self.cover_window_inflated() {
+            return None;
+        }
+        Some(self.cores().max(8).min(16))
+    }
+
+    /// cover_window climbing while leftover / crisis is still live.
+    fn cover_window_inflated(&self) -> bool {
+        self.promoted.iter().any(|e| {
+            (e.cover_window as usize) >= 4
+                && (e.last_double_charge || e.last_crisis || e.last_sys_reexec)
+        })
+    }
+
+    /// Lean end_block: skip HotSet / inter-prior / sketch.
+    /// Mid-band reuse with stored D1 is the same lean as large+lazy-seen.
+    pub(crate) fn should_lean_end_block(&self, d1_stored: bool) -> bool {
+        let n = self.block_n();
+        (n > THIN_N_MAX && d1_stored) || (n >= LARGE_BLOCK_N && self.lazy_already_seen())
+    }
+
+    /// Under-covered conflict spine: cover_window cannot absorb leftover.
+    /// Storage ≥64 (19807137-class) or any real spine ≥128. ĉ prefers
+    /// OptimisticRead over ever-costlier cover. Never Full/Seg hard-order.
+    fn is_under_covered_spine(&self, location: MemoryLocationHash, n_pairs: usize) -> bool {
+        if self.loc_forbids_n(location, n_pairs) {
+            return false;
+        }
+        under_covered_object(self.loc_object(location), n_pairs)
     }
 
     /// Seed a new `PromotedLoc`. Must not touch `self.promoted` — callers
@@ -1148,7 +1190,7 @@ impl CostPolicy {
 
     /// Per-ℓ window cap. Oversub hat stays 2 until a **light** covering
     /// arm is the CC mouth (systematic reexec / leftover double-pay /
-    /// proven cover). Raises to `w_need`, never nails `n_pairs−1`.
+    /// proven cover). Raises to `cover_window`, never nails `n_pairs−1`.
     pub(crate) fn w_cap_for(&self, location: MemoryLocationHash, n_pairs: usize) -> usize {
         let base = self.w_cap_of(n_pairs);
         if n_pairs <= ORDER_WINDOW_K {
@@ -1157,10 +1199,10 @@ impl CostPolicy {
         let Some(s) = self.promoted.get(&location) else {
             return base;
         };
-        let need = self.loc_w_need(location, n_pairs);
+        let need = self.loc_cover_window(location, n_pairs);
         let proven_cover =
             (s.w_star as usize) >= need && is_covering(s.decision, n_pairs, self.seg_cap(), need);
-        if s.last_sys_reexec || s.last_double_pay || proven_cover {
+        if s.last_sys_reexec || s.last_double_charge || proven_cover {
             need.max(base).min(full_cover_w(n_pairs))
         } else {
             base
@@ -1186,7 +1228,7 @@ impl CostPolicy {
         }
         let n = self.block_n();
         let cores = self.cores();
-        let cap = if n >= 512 {
+        let cap = if n >= LARGE_BLOCK_N {
             light.max(2).min(4)
         } else {
             cores.max(4).min(8)
@@ -1195,15 +1237,15 @@ impl CostPolicy {
     }
 
     /// L1/U: minimal cover width for `ℓ`. Unset + reopen → light first
-    /// cover. Stored `w_need` may exceed the oversub hat after a leftover
+    /// cover. Stored `cover_window` may exceed the oversub hat after a leftover
     /// train (U); still capped by `train_hat`, never a full-spine nail.
-    fn loc_w_need(&self, location: MemoryLocationHash, n_pairs: usize) -> usize {
+    fn loc_cover_window(&self, location: MemoryLocationHash, n_pairs: usize) -> usize {
         let full = full_cover_w(n_pairs);
         let light = self.light_hat(n_pairs);
         let stored = self
             .promoted
             .get(&location)
-            .map(|s| s.w_need as usize)
+            .map(|s| s.cover_window as usize)
             .unwrap_or(0);
         if stored >= 1 {
             return stored.min(full).min(self.train_hat(n_pairs)).max(1);
@@ -1225,7 +1267,7 @@ impl CostPolicy {
         }
         self.promoted
             .get(&location)
-            .is_some_and(|s| s.last_sys_reexec || s.last_double_pay)
+            .is_some_and(|s| s.last_sys_reexec || s.last_double_charge)
     }
 
     /// T3 leftover slide is only for a still-leaking loc. Proven cover
@@ -1236,7 +1278,7 @@ impl CostPolicy {
         let Some(s) = self.promoted.get(&location) else {
             return true;
         };
-        if s.last_sys_reexec || s.last_double_pay || s.last_crisis {
+        if s.last_sys_reexec || s.last_double_charge || s.last_crisis {
             return true;
         }
         if s.last_cover_ok {
@@ -1252,19 +1294,19 @@ impl CostPolicy {
                 s.decision,
                 n_pairs,
                 self.seg_cap(),
-                self.loc_w_need(location, n_pairs),
+                self.loc_cover_window(location, n_pairs),
             )
         {
             return false;
         }
-        if self.block_n() >= 512 && s.decision.is_ordered() {
+        if self.block_n() >= LARGE_BLOCK_N && s.decision.is_ordered() {
             return false;
         }
         true
     }
 
     /// L3: a proven **light** covering arm stays sticky. Cold may walk
-    /// `w_need±1`; hot does not default-widen to full cover.
+    /// `cover_window±1`; hot does not default-widen to full cover.
     fn covering_sticky(&self, location: MemoryLocationHash, n_pairs: usize) -> bool {
         n_pairs > ORDER_WINDOW_K
             && self.promoted.get(&location).is_some_and(|s| {
@@ -1274,7 +1316,7 @@ impl CostPolicy {
                         s.decision,
                         n_pairs,
                         self.seg_cap(),
-                        self.loc_w_need(location, n_pairs),
+                        self.loc_cover_window(location, n_pairs),
                     )
             })
     }
@@ -1324,7 +1366,7 @@ impl CostPolicy {
     ///
     /// Sole mouth: `select_arm`. Full only when n_pairs ≤ `ORDER_WINDOW_K`.
     /// Long spines never FullChain (PR22 1.40ms prepaid wall — safety).
-    pub(crate) fn hops_to_plant(&self, location: MemoryLocationHash, n_pairs: usize) -> usize {
+    pub(crate) fn hops_to_admit(&self, location: MemoryLocationHash, n_pairs: usize) -> usize {
         if self.loc_forbids_n(location, n_pairs) {
             return 0;
         }
@@ -1353,7 +1395,7 @@ impl CostPolicy {
     }
 
     /// T1/T2: which stored pairs to plant for `strategy` (uses online seg_cap).
-    pub(crate) fn plant_pairs(
+    pub(crate) fn admit_pairs(
         &self,
         strategy: LocStrategy,
         pairs: &[(TxIdx, TxIdx)],
@@ -1463,15 +1505,21 @@ impl CostPolicy {
     fn commit_arm(&self, location: MemoryLocationHash, n_pairs: usize) -> LocStrategy {
         let n_pairs = self.loc_n_pairs(location, n_pairs);
         let (mut arm, explore, greedy) = self.select_arm(location, n_pairs);
-        // C1/L1: lazy / near_independent never persist an ordered arm.
+        // C1/L1: lazy-update chain never persist an ordered arm.
         if self.loc_forbids_ordered(location) && arm.is_ordered() {
             arm = LocStrategy::OptimisticRead;
         }
+        // Under-covered conflict spine: never persist OrderedAdmit / Full / Seg.
+        if self.is_under_covered_spine(location, n_pairs) && arm.is_ordered() {
+            arm = LocStrategy::OptimisticRead;
+        }
         // Safety: never persist FullChain on a long spine (short-n cache).
-        // C3: ultra-long storage is the same ban — never Full(n_pairs).
+        // Ultra-long storage is the same ban — never Full(n_pairs).
         if n_pairs > ORDER_WINDOW_K && arm == LocStrategy::FullChain {
-            arm = if self.reopen_ordered(location) {
-                LocStrategy::win(self.loc_w_need(location, n_pairs))
+            arm = if self.is_under_covered_spine(location, n_pairs) {
+                LocStrategy::OptimisticRead
+            } else if self.reopen_ordered(location) {
+                LocStrategy::win(self.loc_cover_window(location, n_pairs))
             } else {
                 LocStrategy::OptimisticRead
             };
@@ -1514,7 +1562,7 @@ impl CostPolicy {
             && self.promoted.get(&location).is_some_and(|s| {
                 s.measured && s.samples >= 2 && !s.decision.is_ordered() && !reopen
             });
-        // L3: cold / crisis explores light `w_need±1` / Seg. Hot proven
+        // L3: cold / crisis explores light `cover_window±1` / Seg. Hot proven
         // light cover is sticky. Sys-reexec upgrade is greedy light cover.
         let sticky = self.covering_sticky(location, n_pairs);
         // L4: a proven cover must not UCB-explore unused Opt (3356896
@@ -1524,7 +1572,7 @@ impl CostPolicy {
             .promoted
             .get(&location)
             .is_some_and(|s| s.last_cover_ok);
-        // L3: cold generate still offers w_need±1 / Seg; reopen itself is
+        // L3: cold generate still offers cover_window±1 / Seg; reopen itself is
         // greedy min-ĉ (no UCB inventing an unmeasured cover over Defer).
         let explore_ok = if leftover_pay_once || upgrading || sticky || reopen || cover_ok {
             false
@@ -1605,9 +1653,14 @@ impl CostPolicy {
         cold: bool,
         crisis: bool,
     ) -> Vec<LocStrategy> {
-        // C1/L1/L3: lazy / near_independent — Opt/Defer only. Cold must
-        // not explore Win/Full on that ℓ. Hot sticky is no-order.
+        // Lazy-update chain — Opt/Defer only. Cold must not explore
+        // Win/Full on that ℓ. Hot sticky is no-order.
         if self.loc_forbids_ordered(location) {
+            return vec![LocStrategy::OptimisticRead, LocStrategy::DeferPlant];
+        }
+        // Under-covered conflict spine: ĉ prefers OptimisticRead / OCC abort
+        // over ever-costlier cover. No Full/Seg hard-order; no learn-uphill.
+        if self.is_under_covered_spine(location, n_pairs) {
             return vec![LocStrategy::OptimisticRead, LocStrategy::DeferPlant];
         }
         let mut out = vec![LocStrategy::OptimisticRead, LocStrategy::DeferPlant];
@@ -1633,10 +1686,10 @@ impl CostPolicy {
         // L1: leftover / sys-reexec re-opens **light** OrderedWindow/Seg.
         // Pin-Opt is only unused-Win-prior protection (no signal yet).
         let pin_opt = leftover_pay_once && !reopen;
-        let w_need = self.loc_w_need(location, n_pairs);
+        let cover_window = self.loc_cover_window(location, n_pairs);
         if n_pairs >= 1 && w_cap >= 1 && !pin_opt {
             if reopen {
-                let w_cover = w_need.min(w_cap).max(1);
+                let w_cover = cover_window.min(w_cap).max(1);
                 out.push(LocStrategy::win(w_cover));
                 // L3: cold explores light w±1 / Seg. Never FullChain.
                 if cold || crisis {
@@ -1666,7 +1719,7 @@ impl CostPolicy {
             && (reopen || ((cold || crisis) && w_star >= w_cap && w_cap >= 3));
         if want_seg {
             let sl = if reopen {
-                covering_seg_len(n_pairs, self.cores(), w_need)
+                covering_seg_len(n_pairs, self.cores(), cover_window)
             } else {
                 s_star.clamp(2, (n_pairs + 1).min(SEG_LEN_SAFETY_HAT))
             };
@@ -1691,7 +1744,7 @@ impl CostPolicy {
             let loc = self.promoted.get(&location);
             let keep = loc.as_ref().map(|s| s.decision);
             let w_keep = if reopen {
-                w_need.min(w_cap).max(1)
+                cover_window.min(w_cap).max(1)
             } else {
                 w_star.min(n_pairs).min(w_cap.max(1))
             };
@@ -1706,25 +1759,25 @@ impl CostPolicy {
                         .unwrap_or(false)
             });
         }
-        // L3: proven light cover does not walk below w_need (OCC tail).
-        // O/S: fat cover_ok may keep Win_1 — leftover T3 is off.
+        // Proven light cover does not walk below cover_window (OCC tail).
+        // Large-block cover_ok may keep Win_1 — leftover T3 is off.
         if self.covering_sticky(location, n_pairs) {
             let keep = self.promoted.get(&location).map(|s| s.decision);
-            let w_cover = w_need.min(w_cap).max(1);
-            let fat = self.block_n() >= 512;
+            let w_cover = cover_window.min(w_cap).max(1);
+            let large = self.block_n() >= LARGE_BLOCK_N;
             out.retain(|a| {
                 keep == Some(*a)
                     || *a == LocStrategy::win(w_cover)
-                    || (fat && *a == LocStrategy::win(1))
+                    || (large && *a == LocStrategy::win(1))
                     || matches!(a, LocStrategy::OptimisticRead | LocStrategy::DeferPlant)
             });
         }
-        // L1: never schedule a prefix shorter than w_need + OCC tail.
+        // L1: never schedule a prefix shorter than cover_window + OCC tail.
         if reopen {
             let seg_cap = self.seg_cap();
             out.retain(|a| {
                 matches!(a, LocStrategy::OptimisticRead | LocStrategy::DeferPlant)
-                    || is_covering(*a, n_pairs, seg_cap, w_need)
+                    || is_covering(*a, n_pairs, seg_cap, cover_window)
             });
         }
         out.sort_by_key(|a| a.tie_key());
@@ -1754,8 +1807,8 @@ impl CostPolicy {
             .as_ref()
             .is_some_and(|s| s.decision.is_ordered() && !s.last_crisis && s.block_reexec_n < 2);
         let sys_reexec = loc.as_ref().is_some_and(|s| s.last_sys_reexec);
-        let double_pay = loc.as_ref().is_some_and(|s| s.last_double_pay);
-        let reopen = sys_reexec || double_pay;
+        let double_charge = loc.as_ref().is_some_and(|s| s.last_double_charge);
+        let reopen = sys_reexec || double_charge;
         let paid = loc
             .as_ref()
             .and_then(|s| s.stat(s.decision).filter(|(_, n)| *n > 1.0).map(|(c, _)| c));
@@ -1782,7 +1835,7 @@ impl CostPolicy {
                 }
                 if reopen {
                     // P3: ĉ is **overlap-aware prepaid** vs OCC whole-spine.
-                    // Prefix shorter than w_need = prepaid + leftover OCC.
+                    // Prefix shorter than cover_window = prepaid + leftover OCC.
                     // U: leftover train past a hat-width window is still tail.
                     let hops = hops_for_strategy(a, n_pairs, seg_cap);
                     let light = self.light_hat(n_pairs);
@@ -1795,8 +1848,8 @@ impl CostPolicy {
                     let need = loc
                         .as_ref()
                         .map(|s| {
-                            if s.w_need >= 1 {
-                                s.w_need as usize
+                            if s.cover_window >= 1 {
+                                s.cover_window as usize
                             } else {
                                 light_cover_w(n_pairs, light, (s.block_reexec_n as usize).max(2))
                             }
@@ -1819,7 +1872,7 @@ impl CostPolicy {
                         // Detect wait is stall makespan (S1 independents overlap),
                         // not hops×stall serial. Fat / wide hops stay serial (S).
                         let n_tx = self.block_n();
-                        let wall = if n_tx >= 512 || hops > 4 {
+                        let wall = if n_tx >= LARGE_BLOCK_N || hops > 4 {
                             hops as f64 * stall + tail
                         } else {
                             stall + tail
@@ -2076,8 +2129,8 @@ impl CostPolicy {
             self.optimistic_read_cohorts.fetch_add(1, Ordering::Relaxed);
             return AdmitAction::OptimisticRead;
         }
-        // C1/P2: fat EmptyTo is a lazy-payee star (95-hole prepaid). Never A1.
-        if kind == CohortKind::EmptyTo && self.block_n() >= FAT_N {
+        // Large EmptyTo is a lazy-update payee star (over-admission). Never A1.
+        if kind == CohortKind::EmptyTo && self.block_n() >= LARGE_BLOCK_N {
             self.optimistic_read_cohorts.fetch_add(1, Ordering::Relaxed);
             return AdmitAction::OptimisticRead;
         }
@@ -2807,15 +2860,16 @@ impl CostPolicy {
             let full = full_cover_w(n_pairs);
             let light = self.light_hat(n_pairs);
             let train = self.train_hat(n_pairs);
-            // C1/L2/L3: lazy / near_independent never raise Win from
-            // unfenced or sys-reexec. Reward stays OCC-comparable wall.
+            // Lazy-update chain never raise Win from unfenced or sys-reexec.
+            // Reward stays OCC-comparable wall.
             let lazy_obj = e.object == LocObject::Lazy
-                || (self.block_n() >= FAT_N
+                || (self.block_n() >= LARGE_BLOCK_N
                     && n_pairs >= LAZY_CHAIN_PAIR_FLOOR
                     && !e.saw_effective);
+            let under_covered = !lazy_obj && under_covered_object(e.object, n_pairs);
             if lazy_obj {
                 e.last_sys_reexec = false;
-                e.last_double_pay = false;
+                e.last_double_charge = false;
                 e.last_crisis = false;
                 e.last_cover_ok = false;
                 e.object = LocObject::Lazy;
@@ -2847,13 +2901,13 @@ impl CostPolicy {
                 && planted >= 2
                 && leftover_hops >= 2
                 && (unfenced >= 8 || (e.block_reexec_n >= 4 && leftover_hops > planted));
-            let double_pay_now = under_cover;
+            let detect_resolve_double_charge_now = under_cover;
             let had_sys = e.last_sys_reexec;
-            let had_dp = e.last_double_pay;
-            if double_pay_now {
-                e.last_double_pay = true;
+            let had_dp = e.last_double_charge;
+            if detect_resolve_double_charge_now {
+                e.last_double_charge = true;
             } else if e.decision.is_ordered() && unfenced < 4 && e.block_reexec_n < 2 {
-                e.last_double_pay = false;
+                e.last_double_charge = false;
             }
             // R1: systematic reexec on Opt/Defer leftover — CC mouth owns it.
             let long_leftover = n_pairs > ORDER_WINDOW_K && leftover_hops >= 2;
@@ -2864,33 +2918,48 @@ impl CostPolicy {
                     || (unfenced >= 4 && (e.measured || e.samples >= 2)));
             if sys_now {
                 e.last_sys_reexec = true;
-                e.last_double_pay = false;
+                e.last_double_charge = false;
             } else if e.decision.is_ordered() && e.block_reexec_n < 2 && unfenced < 4 {
                 e.last_sys_reexec = false;
             }
-            // L1/U: learn minimal w_need. First sys-reexec opens a light
+            // Learn minimal cover_window. First sys-reexec opens a light
             // cover (not n_pairs−1). Leftover OCC train grows it up to
-            // train_hat. Absorb shrinks it to the proven planted width.
-            if sys_now {
+            // train_hat — unless the spine is under-covered or cover is
+            // already futile (unfenced stays high at/above the light hat).
+            // Absorb shrinks it to the proven planted width.
+            // Futile only when leftover still exceeds a useful cover_window
+            // (n_pairs ≫ train_hat). Short Basic WAW (3356896, 8 pairs) may
+            // still grow cover_window past the oversub hat.
+            let futile_cover = e.decision.is_ordered()
+                && leftover_hops >= 2
+                && unfenced >= 8
+                && (e.cover_window as usize) >= light
+                && n_pairs > train.saturating_mul(2);
+            if under_covered {
+                e.last_sys_reexec = false;
+                if e.decision.is_ordered() && (leftover_hops >= 2 || unfenced >= 8) {
+                    e.last_double_charge = true;
+                }
+            } else if sys_now {
                 let obs = (e.block_reexec_n as usize).max(2);
                 let first = light_cover_w(n_pairs, light, obs);
-                e.w_need = if e.w_need == 0 {
+                e.cover_window = if e.cover_window == 0 {
                     first as u8
                 } else {
-                    (e.w_need as usize).max(first).min(train).min(full) as u8
+                    (e.cover_window as usize).max(first).min(train).min(full) as u8
                 };
-            } else if double_pay_now || under_cover {
-                let cur = if e.w_need >= 1 {
-                    e.w_need as usize
+            } else if (detect_resolve_double_charge_now || under_cover) && !futile_cover {
+                let cur = if e.cover_window >= 1 {
+                    e.cover_window as usize
                 } else {
                     planted.max(1)
                 };
                 let grow = leftover_hops.min(train).max(cur.max(planted) + 1);
-                e.w_need = grow.min(train).min(full) as u8;
+                e.cover_window = grow.min(train).min(full) as u8;
             } else if e.decision.is_ordered() && e.block_reexec_n < 2 && unfenced < 4 {
                 let proven = planted.max(1).min(train).min(full);
-                if e.w_need == 0 || (e.w_need as usize) > proven {
-                    e.w_need = proven as u8;
+                if e.cover_window == 0 || (e.cover_window as usize) > proven {
+                    e.cover_window = proven as u8;
                 }
             }
             e.last_crisis = match e.decision {
@@ -2907,8 +2976,12 @@ impl CostPolicy {
             if e.decision.is_ordered() && e.block_reexec_n < 2 && unfenced < 4 {
                 e.last_crisis = false;
             }
-            let need_now = if e.w_need >= 1 {
-                e.w_need as usize
+            // Under-covered / futile cover: do not invite Full/Seg via crisis.
+            if under_covered || futile_cover {
+                e.last_crisis = false;
+            }
+            let need_now = if e.cover_window >= 1 {
+                e.cover_window as usize
             } else {
                 planted.max(1)
             };
@@ -2918,8 +2991,12 @@ impl CostPolicy {
             // light) must not sticky a wide Win.
             let light_quiet =
                 planted >= 2 && planted <= light.max(2) && unfenced < 4 && e.block_reexec_n < 2;
-            let absorbed_train =
-                leftover_hops < 2 || had_sys || had_dp || sys_now || double_pay_now || light_quiet;
+            let absorbed_train = leftover_hops < 2
+                || had_sys
+                || had_dp
+                || sys_now
+                || detect_resolve_double_charge_now
+                || light_quiet;
             if n_pairs > ORDER_WINDOW_K
                 && is_covering(e.decision, n_pairs, self.seg_cap(), need_now)
                 && e.block_reexec_n < 2
@@ -2946,11 +3023,11 @@ impl CostPolicy {
             e.update_arm(arm, x);
             // O1: do not paint Opt with leftover abort after double-pay —
             // Opt/Defer is the pay-once counterfactual.
-            if e.decision != LocStrategy::OptimisticRead && abort_cf > 0 && !e.last_double_pay {
+            if e.decision != LocStrategy::OptimisticRead && abort_cf > 0 && !e.last_double_charge {
                 let cf = (abort_cf as f64).max(e.reexec_ns_ema).max(1.0);
                 e.bump_c_floor(LocStrategy::OptimisticRead, cf);
             }
-            if e.last_double_pay && e.decision.is_ordered() {
+            if e.last_double_charge && e.decision.is_ordered() {
                 let tax = (abort_cf as f64)
                     .max(e.reexec_ns_ema)
                     .max(e.block_reexec_ns as f64)
@@ -3064,12 +3141,12 @@ impl CostPolicy {
         let mut arms: Vec<(MemoryLocationHash, LocStrategy, usize)> = Vec::new();
         let mut win_ws = hashbrown::HashSet::new();
         let mut seg_ls = hashbrown::HashSet::new();
-        let mut double_pay_n = 0usize;
+        let mut detect_resolve_double_charge_n = 0usize;
         let mut sys_reexec_n = 0usize;
         let mut covering_n = 0usize;
         for e in self.promoted.iter() {
-            if e.last_double_pay {
-                double_pay_n += 1;
+            if e.last_double_charge {
+                detect_resolve_double_charge_n += 1;
             }
             if e.last_sys_reexec {
                 sys_reexec_n += 1;
@@ -3088,7 +3165,11 @@ impl CostPolicy {
                 seg_ls.insert(seg_len);
             }
             let n_pairs = self.short_chain.get(e.key()).map(|c| c.len()).unwrap_or(0);
-            let need = if e.w_need >= 1 { e.w_need as usize } else { 1 };
+            let need = if e.cover_window >= 1 {
+                e.cover_window as usize
+            } else {
+                1
+            };
             if n_pairs > ORDER_WINDOW_K && is_covering(e.decision, n_pairs, self.seg_cap(), need) {
                 covering_n += 1;
             }
@@ -3168,10 +3249,10 @@ impl CostPolicy {
             unique_win_w: win_ws.len().min(255) as u8,
             unique_seg_len: seg_ls.len().min(255) as u8,
             explore_budget: self.explore_budget_left.load(Ordering::Relaxed).min(255) as u8,
-            pick_occ_n: 0,
+            ungated_occ_n: 0,
             pick_gate_n: 0,
             skip_gate_n: 0,
-            occ_pick_while_gated: 0,
+            ungated_occ_while_gated: 0,
             yield_ns: 0,
             gate_stall_ns: 0,
             worker_busy_ns: 0,
@@ -3194,10 +3275,14 @@ impl CostPolicy {
             bandit_c_full: self.arm_c_of(tel_loc, tel_n, LocStrategy::FullChain),
             bandit_c_defer: self.arm_c_of(tel_loc, tel_n, LocStrategy::DeferPlant),
             selected_arms,
-            double_pay_n,
+            detect_resolve_double_charge_n,
             sys_reexec_n,
             covering_n,
-            chosen_w_need: self.promoted.get(&tel_loc).map(|s| s.w_need).unwrap_or(0),
+            chosen_cover_window: self
+                .promoted
+                .get(&tel_loc)
+                .map(|s| s.cover_window)
+                .unwrap_or(0),
         }
     }
 
@@ -3211,13 +3296,13 @@ impl CostPolicy {
         location: MemoryLocationHash,
         cover_ok: bool,
         sys_reexec: bool,
-        double_pay: bool,
+        double_charge: bool,
         crisis: bool,
     ) {
         if let Some(mut e) = self.promoted.get_mut(&location) {
             e.last_cover_ok = cover_ok;
             e.last_sys_reexec = sys_reexec;
-            e.last_double_pay = double_pay;
+            e.last_double_charge = double_charge;
             e.last_crisis = crisis;
         }
     }
@@ -3274,8 +3359,8 @@ fn light_cover_w(n_pairs: usize, hat: usize, observed: usize) -> usize {
     observed.max(2).min(hat.max(2)).min(full)
 }
 
-fn leaves_occ_tail(arm: LocStrategy, n_pairs: usize, seg_cap: usize, w_need: usize) -> bool {
-    arm.is_ordered() && hops_for_strategy(arm, n_pairs, seg_cap) < w_need.max(1)
+fn leaves_occ_tail(arm: LocStrategy, n_pairs: usize, seg_cap: usize, cover_window: usize) -> bool {
+    arm.is_ordered() && hops_for_strategy(arm, n_pairs, seg_cap) < cover_window.max(1)
 }
 
 /// Long-spine hops == n_pairs is FullChain by another name (R4).
@@ -3283,15 +3368,23 @@ fn is_full_equiv(arm: LocStrategy, n_pairs: usize, seg_cap: usize) -> bool {
     n_pairs > ORDER_WINDOW_K && hops_for_strategy(arm, n_pairs, seg_cap) >= n_pairs
 }
 
-/// Light covering: hops meet `w_need`, not a full-spine nail.
-fn is_covering(arm: LocStrategy, n_pairs: usize, seg_cap: usize, w_need: usize) -> bool {
+fn under_covered_object(object: LocObject, n_pairs: usize) -> bool {
+    match object {
+        LocObject::Storage => n_pairs >= UNDER_COVERED_SPINE_PAIRS,
+        LocObject::Basic | LocObject::Unknown => n_pairs >= UNDER_COVERED_SPINE_PAIRS * 2,
+        LocObject::Lazy => false,
+    }
+}
+
+/// Light covering: hops meet `cover_window`, not a full-spine nail.
+fn is_covering(arm: LocStrategy, n_pairs: usize, seg_cap: usize, cover_window: usize) -> bool {
     arm.is_ordered()
-        && hops_for_strategy(arm, n_pairs, seg_cap) >= w_need.max(1)
+        && hops_for_strategy(arm, n_pairs, seg_cap) >= cover_window.max(1)
         && !is_full_equiv(arm, n_pairs, seg_cap)
 }
 
-fn covering_seg_len(n_pairs: usize, cores: usize, w_need: usize) -> usize {
-    (w_need + 1).clamp(
+fn covering_seg_len(n_pairs: usize, cores: usize, cover_window: usize) -> usize {
+    (cover_window + 1).clamp(
         2,
         default_seg_len(n_pairs, cores)
             .max(2)
@@ -3418,7 +3511,7 @@ mod tests {
     #[test]
     fn full_shell_contract_empty_to_hot_payee_is_a1() {
         let p = CostPolicy::new();
-        // Full shell but not fat (THIN_N_MAX < n < FAT_N). Fat EmptyTo is A0.
+        // Full shell but not large (THIN_N_MAX < n < LARGE_BLOCK_N). Large EmptyTo is A0.
         p.begin_block(400);
         let addr = Address::repeat_byte(0x20);
         assert!(
@@ -3438,7 +3531,7 @@ mod tests {
         );
         assert!(
             !p.choose_ordered(CohortKind::RawFan, addr, 37123, true, 0.90),
-            "37k same-to calldata must not plant a probe star"
+            "37k same-to calldata must not seed a probe star"
         );
         assert!(
             !p.choose_ordered(CohortKind::SameFrom, addr, 15, false, 0.50),
@@ -3779,7 +3872,7 @@ mod tests {
     }
 
     #[test]
-    fn hops_to_plant_windows_long_spine_keeps_storage() {
+    fn hops_to_admit_windows_long_spine_keeps_storage() {
         let p = CostPolicy::new();
         p.begin_block(176);
         p.promote_short_edge(0x32be, 40_000);
@@ -3801,11 +3894,11 @@ mod tests {
             "O1: leftover-long spine is Win_w/Seg or pay-once Opt/Defer, got {first:?}"
         );
         assert!(
-            p.hops_to_plant(0x32be, 4) < 4,
+            p.hops_to_admit(0x32be, 4) < 4,
             "CC-L3/L4: long thin spine must not FullChain"
         );
         assert_eq!(
-            p.hops_to_plant(0xedba, 2),
+            p.hops_to_admit(0xedba, 2),
             2,
             "CC-L5: storage trio stays FullChain"
         );
@@ -3847,14 +3940,14 @@ mod tests {
             "F4: long spine FullChain-demotes after prepaid lose"
         );
         assert!(
-            p.hops_to_plant(0x32be, 4) < 4 && p.loc_strategy(0x32be, 4) != LocStrategy::FullChain,
+            p.hops_to_admit(0x32be, 4) < 4 && p.loc_strategy(0x32be, 4) != LocStrategy::FullChain,
             "F4: demote bans FullChain; Win_w / Seg may still plant a window"
         );
         assert!(
             !p.loc_demoted(0xedba),
             "CC-L5: storage trio must not demote with the long spine"
         );
-        assert_eq!(p.hops_to_plant(0xedba, 2), 2);
+        assert_eq!(p.hops_to_admit(0xedba, 2), 2);
     }
 
     #[test]
@@ -3919,7 +4012,7 @@ mod tests {
             reuse != cold || reuse.is_ordered(),
             "L4: reexec raises ĉ of the chosen arm so UCB can leave it: cold={cold:?} reuse={reuse:?}"
         );
-        let hops = p.hops_to_plant(0x32be, 8);
+        let hops = p.hops_to_admit(0x32be, 8);
         assert!(
             hops < 8,
             "L4: bandit must not FullChain the long spine ({hops})"
@@ -4300,14 +4393,14 @@ mod tests {
                 "O7: leftover OCC train on proven Win_2 is not a widen-window crisis"
             );
             assert!(
-                !e.last_double_pay,
+                !e.last_double_charge,
                 "L1: Win_2 meeting the oversub hat is T3-slide, not a climb"
             );
         }
     }
 
     #[test]
-    fn double_pay_reopens_covering_not_half_window() {
+    fn double_charge_reopens_covering_not_half_window() {
         let p = CostPolicy::new();
         p.begin_block_with_cores(32, 16);
         p.promote_short_edge(0x32be, 40_000);
@@ -4320,9 +4413,9 @@ mod tests {
             e.decision = LocStrategy::win(2);
             e.w_star = 2;
             e.last_crisis = false;
-            e.last_double_pay = true;
+            e.last_double_charge = true;
             e.last_sys_reexec = false;
-            e.w_need = 3;
+            e.cover_window = 3;
             e.upsert_stat(LocStrategy::win(2), 80_000.0, 4.0);
             e.upsert_stat(LocStrategy::OptimisticRead, 20_000.0, 3.0);
             e.upsert_stat(LocStrategy::DeferPlant, 18_000.0, 3.0);
@@ -4335,11 +4428,11 @@ mod tests {
         );
         assert!(
             hot.iter().any(|a| is_covering(*a, 4, p.seg_cap(), 3)),
-            "L1: leftover re-opens a light covering arm (w_need=3), got {hot:?}"
+            "L1: leftover re-opens a light covering arm (cover_window=3), got {hot:?}"
         );
         assert!(
             !hot.iter().any(|a| leaves_occ_tail(*a, 4, p.seg_cap(), 3)),
-            "L1: prefix shorter than w_need + OCC tail is not eligible, got {hot:?}"
+            "L1: prefix shorter than cover_window + OCC tail is not eligible, got {hot:?}"
         );
         let cold_dp = p.generate_arms(0x32be, 4, false, true, true);
         assert!(
@@ -4352,16 +4445,16 @@ mod tests {
             e.arms
                 .retain(|s| !matches!(s.arm, LocStrategy::OrderedWindow { w: 2 }));
             e.reexec_ns_ema = 90_000.0;
-            e.last_double_pay = true;
+            e.last_double_charge = true;
             e.decision = LocStrategy::win(2);
             e.w_star = 2;
-            e.w_need = 3;
+            e.cover_window = 3;
         }
         p.block_arm.clear();
         let (arm2, _, _) = p.select_arm(0x32be, 4);
         assert!(
             !leaves_occ_tail(arm2, 4, p.seg_cap(), 3),
-            "L1: select_arm must not schedule prefix < w_need + OCC tail, got {arm2:?}"
+            "L1: select_arm must not schedule prefix < cover_window + OCC tail, got {arm2:?}"
         );
     }
 
@@ -4388,7 +4481,7 @@ mod tests {
             e.measured = true;
             e.decision = LocStrategy::OptimisticRead;
             e.last_crisis = false;
-            e.last_double_pay = false;
+            e.last_double_charge = false;
             e.reexec_ns_ema = 180_000.0;
             e.upsert_stat(LocStrategy::OptimisticRead, 62_716.0, 2.0);
         }
@@ -4414,7 +4507,7 @@ mod tests {
             e.decision = LocStrategy::win(1);
             e.w_star = 1;
             e.last_crisis = true;
-            e.last_double_pay = true;
+            e.last_double_charge = true;
             e.last_sys_reexec = false;
             e.reexec_ns_ema = 180_000.0;
             e.upsert_stat(LocStrategy::win(1), 270_000.0, 3.0);
@@ -4428,7 +4521,7 @@ mod tests {
             "O1: after double-pay loc_strategy is Defer/Opt, got {arm:?}"
         );
         assert_eq!(
-            p.hops_to_plant(0x32be, 4),
+            p.hops_to_admit(0x32be, 4),
             0,
             "O1: Defer/Opt plants no begin prefix"
         );
@@ -4466,9 +4559,9 @@ mod tests {
             "O1: short-n Full cache must not FullChain n=8, got {long:?}"
         );
         assert!(
-            p.hops_to_plant(0x32be, 8) < 8,
+            p.hops_to_admit(0x32be, 8) < 8,
             "O1: long spine hops < n_pairs, got {}",
-            p.hops_to_plant(0x32be, 8)
+            p.hops_to_admit(0x32be, 8)
         );
     }
 
@@ -4495,7 +4588,7 @@ mod tests {
             e.measured = true;
             e.decision = LocStrategy::DeferPlant;
             e.last_crisis = false;
-            e.last_double_pay = false;
+            e.last_double_charge = false;
             e.last_sys_reexec = false;
             e.upsert_stat(LocStrategy::DeferPlant, 8_096.0, 2.0);
             e.upsert_stat(LocStrategy::OptimisticRead, 47_962.0, 2.0);
@@ -4548,7 +4641,7 @@ mod tests {
             e.samples = 4;
             e.measured = true;
             e.decision = LocStrategy::OptimisticRead;
-            e.last_double_pay = true;
+            e.last_double_charge = true;
             e.last_sys_reexec = false;
             e.last_crisis = false;
             e.reexec_ns_ema = 180_000.0;
@@ -4570,10 +4663,10 @@ mod tests {
         }
         p.begin_block_with_cores(176, 8);
         p.block_arm.clear();
-        let need = p.loc_w_need(0x32be, 8);
+        let need = p.loc_cover_window(0x32be, 8);
         assert!(
             need >= 2 && need < 8,
-            "L1: first sys-reexec opens light w_need, not full spine, need={need}"
+            "L1: first sys-reexec opens light cover_window, not full spine, need={need}"
         );
         let (arm, _, _) = p.select_arm(0x32be, 8);
         assert!(
@@ -4585,10 +4678,10 @@ mod tests {
             LocStrategy::FullChain,
             "R4: long spine never FullChain"
         );
-        let hops = p.hops_to_plant(0x32be, 8);
+        let hops = p.hops_to_admit(0x32be, 8);
         assert!(
             hops == need && hops < 8,
-            "L1: light cover plants w_need not n_pairs−1, hops={hops} need={need}"
+            "L1: light cover plants cover_window not n_pairs−1, hops={hops} need={need}"
         );
     }
 
@@ -4615,7 +4708,7 @@ mod tests {
             e.samples = 4;
             e.measured = true;
             e.decision = LocStrategy::DeferPlant;
-            e.last_double_pay = true;
+            e.last_double_charge = true;
             e.last_sys_reexec = false;
             e.reexec_ns_ema = 160_000.0;
             e.upsert_stat(LocStrategy::DeferPlant, 8_096.0, 3.0);
@@ -4629,10 +4722,10 @@ mod tests {
         p.end_block_learn();
         p.begin_block_with_cores(176, 8);
         p.block_arm.clear();
-        let need = p.loc_w_need(0x32be, 8);
+        let need = p.loc_cover_window(0x32be, 8);
         assert!(
             need >= 2 && need < 8,
-            "L1: sys-reexec w_need is light, not n_pairs−1, need={need}"
+            "L1: sys-reexec cover_window is light, not n_pairs−1, need={need}"
         );
         let arms = p.generate_arms(0x32be, 8, false, true, true);
         assert!(
@@ -4643,7 +4736,7 @@ mod tests {
             !arms
                 .iter()
                 .any(|a| leaves_occ_tail(*a, 8, p.seg_cap(), need)),
-            "L1: sys-reexec must not offer prefix < w_need, got {arms:?}"
+            "L1: sys-reexec must not offer prefix < cover_window, got {arms:?}"
         );
         let (arm, _, _) = p.select_arm(0x32be, 8);
         assert!(
@@ -4683,8 +4776,8 @@ mod tests {
             e.measured = true;
             e.decision = LocStrategy::OptimisticRead;
             e.last_sys_reexec = true;
-            e.last_double_pay = false;
-            e.w_need = 4;
+            e.last_double_charge = false;
+            e.cover_window = 4;
             e.reexec_ns_ema = 150_000.0;
             e.upsert_stat(LocStrategy::OptimisticRead, 80_000.0, 3.0);
             e.upsert_stat(LocStrategy::win(2), 12_000.0, 1.0);
@@ -4694,11 +4787,11 @@ mod tests {
         assert_ne!(
             arm,
             LocStrategy::win(2),
-            "L1: unused cheap Win_2 prior is shorter than w_need=4, got {arm:?}"
+            "L1: unused cheap Win_2 prior is shorter than cover_window=4, got {arm:?}"
         );
         assert!(
             !leaves_occ_tail(arm, 8, p.seg_cap(), 4),
-            "L1: ĉ must not pick prefix < w_need, got {arm:?}"
+            "L1: ĉ must not pick prefix < cover_window, got {arm:?}"
         );
     }
 
@@ -4727,9 +4820,9 @@ mod tests {
             e.decision = cover;
             e.prev_decision = cover;
             e.w_star = 4;
-            e.w_need = 4;
+            e.cover_window = 4;
             e.last_crisis = false;
-            e.last_double_pay = false;
+            e.last_double_charge = false;
             e.last_sys_reexec = false;
             e.last_cover_ok = true;
             e.leftover_reexec = 0;
@@ -4784,9 +4877,9 @@ mod tests {
             let e = p.promoted.get(&0x32be).unwrap();
             assert!(e.last_sys_reexec, "R1: Opt leftover train is sys-reexec");
             assert!(
-                e.w_need >= 2 && (e.w_need as usize) < 7,
-                "L1: first need is light, not n_pairs−1, w_need={}",
-                e.w_need
+                e.cover_window >= 2 && (e.cover_window as usize) < 7,
+                "L1: first need is light, not n_pairs−1, cover_window={}",
+                e.cover_window
             );
         }
         p.begin_block_with_cores(176, 8);
@@ -4800,7 +4893,7 @@ mod tests {
     }
 
     #[test]
-    fn double_pay_grows_w_need_not_occ_tail() {
+    fn double_charge_grows_cover_window_not_occ_tail() {
         let p = CostPolicy::new();
         p.begin_block_with_cores(32, 16);
         p.promote_short_edge(0x32be, 40_000);
@@ -4823,7 +4916,7 @@ mod tests {
             e.measured = true;
             e.decision = LocStrategy::win(2);
             e.w_star = 2;
-            e.w_need = 2;
+            e.cover_window = 2;
             e.last_sys_reexec = false;
             e.upsert_stat(LocStrategy::win(2), 40_000.0, 3.0);
         }
@@ -4837,21 +4930,24 @@ mod tests {
         p.end_block_learn();
         {
             let e = p.promoted.get(&0x32be).unwrap();
-            assert!(e.last_double_pay, "L1: leftover OCC on Win_2 is double-pay");
             assert!(
-                (e.w_need as usize) > 2,
-                "L1: leftover train grows w_need above 2, got {}",
-                e.w_need
+                e.last_double_charge,
+                "L1: leftover OCC on Win_2 is double-pay"
             );
             assert!(
-                (e.w_need as usize) <= 7,
+                (e.cover_window as usize) > 2,
+                "L1: leftover train grows cover_window above 2, got {}",
+                e.cover_window
+            );
+            assert!(
+                (e.cover_window as usize) <= 7,
                 "L1: grow is capped at n_pairs−1, got {}",
-                e.w_need
+                e.cover_window
             );
         }
         p.begin_block_with_cores(32, 16);
         p.block_arm.clear();
-        let need = p.loc_w_need(0x32be, 8);
+        let need = p.loc_cover_window(0x32be, 8);
         let (arm, _, _) = p.select_arm(0x32be, 8);
         assert!(
             !leaves_occ_tail(arm, 8, p.seg_cap(), need),
@@ -4883,7 +4979,7 @@ mod tests {
             e.measured = true;
             e.decision = LocStrategy::win(4);
             e.w_star = 4;
-            e.w_need = 4;
+            e.cover_window = 4;
             e.last_sys_reexec = true;
             e.block_reexec_n = 0;
             e.block_reexec_ns = 0;
@@ -4897,13 +4993,13 @@ mod tests {
                 "L1: light Win_4 with unfenced=0 is cover_ok even if leftover_hops≥2"
             );
             assert!(
-                !e.last_double_pay,
+                !e.last_double_charge,
                 "L1: no leftover OCC train → no double-pay"
             );
             assert!(
-                e.w_need >= 2 && e.w_need <= 4,
-                "L1: absorbed light w stays at/under the hat, w_need={}",
-                e.w_need
+                e.cover_window >= 2 && e.cover_window <= 4,
+                "L1: absorbed light w stays at/under the hat, cover_window={}",
+                e.cover_window
             );
         }
     }
@@ -4931,10 +5027,10 @@ mod tests {
             e.measured = true;
             e.decision = LocStrategy::win(4);
             e.w_star = 4;
-            e.w_need = 4;
+            e.cover_window = 4;
             e.last_cover_ok = true;
             e.last_sys_reexec = false;
-            e.last_double_pay = false;
+            e.last_double_charge = false;
             e.last_crisis = false;
             e.reexec_ns_ema = 40_000.0;
             e.upsert_stat(LocStrategy::win(4), 200_000.0, 4.0);
@@ -4950,7 +5046,7 @@ mod tests {
     }
 
     #[test]
-    fn under_cover_train_grows_w_need_past_oversub_hat() {
+    fn under_cover_train_grows_cover_window_past_oversub_hat() {
         let p = CostPolicy::new();
         p.begin_block_with_cores(176, 8);
         p.promote_short_edge(0x32be, 40_000);
@@ -4973,7 +5069,7 @@ mod tests {
             e.measured = true;
             e.decision = LocStrategy::win(2);
             e.w_star = 2;
-            e.w_need = 2;
+            e.cover_window = 2;
             e.last_sys_reexec = false;
             e.upsert_stat(LocStrategy::win(2), 40_000.0, 3.0);
         }
@@ -4988,26 +5084,26 @@ mod tests {
         {
             let e = p.promoted.get(&0x32be).unwrap();
             assert!(
-                e.last_double_pay,
+                e.last_double_charge,
                 "U: leftover train on hat-width Win_2 is under-cover, not T3-only"
             );
             assert!(
-                (e.w_need as usize) > 2,
-                "U: leftover train grows w_need past oversub hat 2, got {}",
-                e.w_need
+                (e.cover_window as usize) > 2,
+                "U: leftover train grows cover_window past oversub hat 2, got {}",
+                e.cover_window
             );
             assert!(
-                (e.w_need as usize) <= 8,
+                (e.cover_window as usize) <= 8,
                 "U: grow is train_hat (cores-scaled), not n_pairs−1, got {}",
-                e.w_need
+                e.cover_window
             );
         }
         p.begin_block_with_cores(176, 8);
         p.block_arm.clear();
-        let need = p.loc_w_need(0x32be, 8);
+        let need = p.loc_cover_window(0x32be, 8);
         assert!(
             need > 2 && need <= 8,
-            "U: loc_w_need must not re-clamp stored need to light_hat=2, need={need}"
+            "U: loc_cover_window must not re-clamp stored need to light_hat=2, need={need}"
         );
         let (arm, _, _) = p.select_arm(0x32be, 8);
         assert!(
@@ -5043,10 +5139,10 @@ mod tests {
             e.measured = true;
             e.decision = LocStrategy::OptimisticRead;
             e.w_star = 4;
-            e.w_need = 4;
+            e.cover_window = 4;
             e.last_cover_ok = false;
             e.last_sys_reexec = true;
-            e.last_double_pay = false;
+            e.last_double_charge = false;
             e.last_crisis = false;
             e.reexec_ns_ema = 180_000.0;
             e.leftover_reexec = 8;
@@ -5097,10 +5193,10 @@ mod tests {
             e.measured = true;
             e.decision = LocStrategy::win(2);
             e.w_star = 2;
-            e.w_need = 2;
+            e.cover_window = 2;
             e.last_cover_ok = true;
             e.last_sys_reexec = false;
-            e.last_double_pay = false;
+            e.last_double_charge = false;
             e.last_crisis = false;
             // Quiet cover: abort EMA has dropped below measured Win_2.
             e.reexec_ns_ema = 8_000.0;
@@ -5152,7 +5248,7 @@ mod tests {
             e.measured = true;
             e.decision = LocStrategy::win(1);
             e.w_star = 1;
-            e.w_need = 0;
+            e.cover_window = 0;
             e.last_sys_reexec = false;
             e.upsert_stat(LocStrategy::win(1), 40_000.0, 2.0);
         }
@@ -5164,13 +5260,13 @@ mod tests {
         {
             let e = p.promoted.get(&0x32be).unwrap();
             assert!(
-                !e.last_double_pay,
+                !e.last_double_charge,
                 "O: first Win_1 leftover is not train_hat double-pay"
             );
             assert!(
-                (e.w_need as usize) <= 2,
+                (e.cover_window as usize) <= 2,
                 "O: Win_1 leftover must not climb to train_hat, got {}",
-                e.w_need
+                e.cover_window
             );
         }
     }
@@ -5186,10 +5282,10 @@ mod tests {
         {
             let mut e = p.promoted.get_mut(&0x32be).unwrap();
             e.decision = LocStrategy::win(2);
-            e.w_need = 2;
+            e.cover_window = 2;
             e.last_cover_ok = true;
             e.last_sys_reexec = false;
-            e.last_double_pay = false;
+            e.last_double_charge = false;
             e.last_crisis = false;
         }
         assert!(
@@ -5202,7 +5298,7 @@ mod tests {
             e.last_sys_reexec = false;
             e.last_crisis = false;
             e.decision = LocStrategy::win(2);
-            e.w_need = 2;
+            e.cover_window = 2;
         }
         assert!(
             !p.leftover_slide_ok(0x32be),
@@ -5243,7 +5339,7 @@ mod tests {
     }
 
     #[test]
-    fn lazy_loc_never_plants_ordered_admit() {
+    fn lazy_loc_never_admits_ordered() {
         let p = CostPolicy::new();
         p.begin_block_with_cores(800, 8);
         p.note_loc_write(0x1a2e, true);
@@ -5256,9 +5352,9 @@ mod tests {
             "C1: basic_lazy is not an OrderedAdmit object"
         );
         assert_eq!(
-            p.hops_to_plant(0x1a2e, 40),
+            p.hops_to_admit(0x1a2e, 40),
             0,
-            "C1: lazy hops_to_plant is 0"
+            "C1: lazy hops_to_admit is 0"
         );
         let cands = p.generate_arms(0x1a2e, 40, false, true, true);
         assert!(
@@ -5341,7 +5437,7 @@ mod tests {
             LocStrategy::win(2),
             "C2: 3356896-class Basic keeps light cover, got {arm:?}"
         );
-        assert!(p.hops_to_plant(0x32be, 4) >= 2);
+        assert!(p.hops_to_admit(0x32be, 4) >= 2);
     }
 
     #[test]
@@ -5359,16 +5455,18 @@ mod tests {
             e.saw_effective = true;
             e.last_sys_reexec = true;
         }
+        p.note_loc_storage(0x571);
         let cands = p.generate_arms(0x571, 80, false, true, true);
         assert!(
-            !cands.iter().any(|a| *a == LocStrategy::FullChain),
-            "C3: ultra-long storage must not offer Full, got {cands:?}"
+            cands
+                .iter()
+                .all(|a| matches!(a, LocStrategy::OptimisticRead | LocStrategy::DeferPlant)),
+            "under-covered storage must be Opt/Defer only, got {cands:?}"
         );
         let (arm, _, _) = p.select_arm(0x571, 80);
-        assert_ne!(
-            arm,
-            LocStrategy::FullChain,
-            "C3: select_arm must not Full(571)-class, got {arm:?}"
+        assert!(
+            !arm.is_ordered(),
+            "under-covered storage must yield to OptimisticRead, got {arm:?}"
         );
     }
 
@@ -5407,7 +5505,7 @@ mod tests {
     }
 
     #[test]
-    fn fat_long_basic_is_lazy_equivalent() {
+    fn large_long_basic_is_lazy_equivalent() {
         let p = CostPolicy::new();
         p.begin_block_with_cores(800, 8);
         p.note_loc_write(0xca19, false);
@@ -5417,18 +5515,18 @@ mod tests {
         }
         assert!(
             p.loc_forbids_ordered(0xca19),
-            "C1: fat long Basic (mis-labeled lazy) is not an OrderedAdmit object"
+            "large long Basic (mis-labeled lazy-update) is not an OrderedAdmit object"
         );
-        assert_eq!(p.hops_to_plant(0xca19, 40), 0);
+        assert_eq!(p.hops_to_admit(0xca19, 40), 0);
         let (arm, _, _) = p.select_arm(0xca19, 40);
         assert!(
             !arm.is_ordered(),
-            "C1: fat long Basic must not pick Win/Full, got {arm:?}"
+            "large long Basic must not pick Win/Full, got {arm:?}"
         );
     }
 
     #[test]
-    fn fat_storage_spine_still_covers() {
+    fn large_storage_spine_still_covers() {
         let p = CostPolicy::new();
         p.begin_block_with_cores(800, 8);
         p.note_loc_storage(0x571);
@@ -5443,43 +5541,127 @@ mod tests {
         }
         assert!(
             !p.loc_forbids_ordered(0x571),
-            "C2: fat storage is still an OrderedAdmit object"
+            "large storage below under-covered floor is still an OrderedAdmit object"
         );
         let cands = p.generate_arms(0x571, 40, false, true, true);
         assert!(
             !cands.iter().any(|a| *a == LocStrategy::FullChain),
-            "C3: fat storage must not offer Full, got {cands:?}"
+            "large storage must not offer Full, got {cands:?}"
         );
     }
 
     #[test]
-    fn fat_empty_to_is_a0() {
+    fn large_empty_to_is_a0() {
         let p = CostPolicy::new();
         p.begin_block_with_cores(800, 8);
         let addr = Address::repeat_byte(0x20);
         assert!(
             !p.choose_ordered(CohortKind::EmptyTo, addr, 64, true, 0.5),
-            "C1/P2: fat EmptyTo contract payee is A0 (lazy star)"
+            "large EmptyTo contract payee is A0 (lazy-update star)"
         );
         for _ in 0..4 {
             p.note_eff_waw(CohortKind::EmptyTo, addr, true);
         }
         assert!(
             !p.choose_ordered(CohortKind::EmptyTo, addr, 64, true, 0.5),
-            "C1: fat EmptyTo stays A0 even after envelope eff-WAW (real spine is C2)"
+            "large EmptyTo stays A0 even after envelope eff-WAW (real spine is C2)"
         );
     }
 
     #[test]
-    fn fat_begin_hole_cap_is_light() {
+    fn wait_set_soft_cap_is_over_admission_predicate() {
         let p = CostPolicy::new();
         p.begin_block_with_cores(176, 8);
-        assert_eq!(p.fat_begin_hole_cap(), usize::MAX, "thin has no hole cap");
-        p.begin_block_with_cores(800, 8);
-        let cap = p.fat_begin_hole_cap();
+        assert_eq!(
+            p.wait_set_soft_cap(),
+            None,
+            "thin short-chain stays uncapped"
+        );
+        p.begin_block_with_cores(341, 8);
+        let cap = p
+            .wait_set_soft_cap()
+            .expect("mid-band over-admission OrderedAdmit cap");
         assert!(
             (8..=16).contains(&cap),
-            "P2: fat begin hole cap is soft 8–16, got {cap}"
+            "mid-band wait-set cap is 8–16, got {cap}"
+        );
+        p.begin_block_with_cores(430, 8);
+        let cap = p.wait_set_soft_cap().expect("19860366-class wait-set cap");
+        assert!((8..=16).contains(&cap));
+        p.begin_block_with_cores(800, 8);
+        let cap = p.wait_set_soft_cap().expect("large-block wait-set cap");
+        assert!(
+            (8..=16).contains(&cap),
+            "large-block wait-set cap is 8–16, got {cap}"
+        );
+    }
+
+    #[test]
+    fn midband_stable_d1_leans_end_block() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(176, 8);
+        assert!(
+            !p.should_lean_end_block(true),
+            "thin reuse is not mid-band lean"
+        );
+        p.begin_block_with_cores(341, 8);
+        assert!(
+            !p.should_lean_end_block(false),
+            "first mid-band still persists D1"
+        );
+        assert!(
+            p.should_lean_end_block(true),
+            "mid-band stored D1 leans end_block"
+        );
+        p.begin_block_with_cores(800, 8);
+        assert!(
+            p.should_lean_end_block(true),
+            "large-block stored D1 leans end_block"
+        );
+    }
+
+    #[test]
+    fn under_covered_storage_does_not_learn_uphill() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(800, 8);
+        p.note_loc_storage(0x571);
+        p.promote_short_edge(0x571, 40_000);
+        for i in 0..80 {
+            p.note_short_pair(0x571, 10 + i, 11 + i);
+        }
+        {
+            let mut e = p.promoted.get_mut(&0x571).unwrap();
+            e.decision = LocStrategy::win(2);
+            e.cover_window = 2;
+            e.block_reexec_n = 4;
+            e.block_reexec_ns = 80_000;
+            e.measured = true;
+            e.samples = 3;
+            e.object = LocObject::Storage;
+            e.saw_effective = true;
+        }
+        for _ in 0..8 {
+            p.bump_unfenced_reexec();
+        }
+        p.end_block_learn();
+        {
+            let e = p.promoted.get(&0x571).unwrap();
+            assert!(
+                (e.cover_window as usize) <= 2,
+                "under-covered must not raise cover_window, got {}",
+                e.cover_window
+            );
+            assert!(
+                !e.last_crisis,
+                "under-covered must not invite Full/Seg via crisis"
+            );
+        }
+        p.begin_block_with_cores(800, 8);
+        p.note_loc_storage(0x571);
+        let (arm, _, _) = p.select_arm(0x571, 80);
+        assert!(
+            !arm.is_ordered(),
+            "under-covered conflict spine yields to OptimisticRead, got {arm:?}"
         );
     }
 }

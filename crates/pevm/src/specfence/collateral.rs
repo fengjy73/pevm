@@ -151,7 +151,7 @@ pub(crate) fn classify_first_conflict(
             Some(MemoryValue::LazyRecipient(_)) | Some(MemoryValue::LazySender(_))
         )
     {
-        // C1: evaluated Lazy→Basic must not become EffectiveWAW (K8 S-lazy).
+        // Evaluated Lazy→Basic must not become EffectiveWAW (lazy-update chain).
         ConflictClass::LazyNoise
     } else if is_value_transfer(hints, tx_idx)
         && peer.is_some_and(|p| {

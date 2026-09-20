@@ -64,7 +64,7 @@ pub(crate) struct ReadyEdgeTable {
     pick_occ_n: AtomicUsize,
     pick_gate_n: AtomicUsize,
     skip_gate_n: AtomicUsize,
-    occ_pick_while_gated: AtomicUsize,
+    ungated_occ_while_gated: AtomicUsize,
     /// Producer → known consumers (completion event → bag; no DashMap scan).
     waiters: DashMap<TxIdx, Vec<TxIdx>, BuildIdentityHasher>,
     /// Ordered-admit gated txs. Marked **before** the consumer map insert so
@@ -104,7 +104,7 @@ impl Default for ReadyEdgeTable {
             pick_occ_n: AtomicUsize::new(0),
             pick_gate_n: AtomicUsize::new(0),
             skip_gate_n: AtomicUsize::new(0),
-            occ_pick_while_gated: AtomicUsize::new(0),
+            ungated_occ_while_gated: AtomicUsize::new(0),
             waiters: DashMap::default(),
             gated_bits: std::array::from_fn(|_| AtomicU64::new(0)),
             gated_n: AtomicUsize::new(0),
@@ -321,8 +321,8 @@ impl ReadyEdgeTable {
         self.gated_n.load(Ordering::Relaxed) > 0
     }
 
-    /// Unfinished OrderedAdmit holes. Cleared as each gated tx `mark_done`s
-    /// so independents return to `next_occ_task` (S1/P1 — not a mode switch).
+    /// Unfinished OrderedAdmit wait-set. Cleared as each gated tx `mark_done`s
+    /// so independents return to `next_occ_task` (S1 — not a mode switch).
     #[inline]
     pub(crate) fn has_pending_gated(&self) -> bool {
         self.pending_gated.load(Ordering::Relaxed) > 0
@@ -347,7 +347,7 @@ impl ReadyEdgeTable {
             self.pick_gate_n.fetch_add(1, Ordering::Relaxed);
         } else if self.has_any_gated() {
             self.pick_occ_n.fetch_add(1, Ordering::Relaxed);
-            self.occ_pick_while_gated.fetch_add(1, Ordering::Relaxed);
+            self.ungated_occ_while_gated.fetch_add(1, Ordering::Relaxed);
         } else {
             self.pick_occ_n.fetch_add(1, Ordering::Relaxed);
         }
@@ -546,8 +546,8 @@ impl ReadyEdgeTable {
     }
 
     #[inline]
-    pub(crate) fn occ_pick_while_gated(&self) -> usize {
-        self.occ_pick_while_gated.load(Ordering::Relaxed)
+    pub(crate) fn ungated_occ_while_gated(&self) -> usize {
+        self.ungated_occ_while_gated.load(Ordering::Relaxed)
     }
 
     #[inline]
@@ -753,7 +753,7 @@ impl ReadyEdgeTable {
         self.refuse.load(Ordering::Relaxed)
     }
 
-    /// P2: drop a begin hole without a wave (pre-worker soft-cap).
+    /// Drop a wait-set entry without a wave (pre-worker soft-cap).
     /// Clears the gated bit so pick does not treat this tx as a global mode.
     pub(crate) fn ungate(&self, tx: TxIdx) {
         let i = tx / 64;
@@ -1052,17 +1052,17 @@ mod tests {
     }
 
     #[test]
-    fn ungate_clears_begin_hole() {
+    fn ungate_clears_wait_set_entry() {
         let t = ReadyEdgeTable::new();
         t.note_consumer(9, 1);
         assert!(t.is_gated(9));
         assert!(t.has_pending_gated());
         t.ungate(9);
-        assert!(!t.is_gated(9), "P2: ungate drops the edge constraint");
+        assert!(!t.is_gated(9), "ungate drops the wait-for constraint");
         assert!(t.may_execute(9));
         assert!(
             !t.has_pending_gated(),
-            "P2: ungate returns pick to OCC for that hole"
+            "ungate returns pick to ungated OCC task selection"
         );
     }
 }

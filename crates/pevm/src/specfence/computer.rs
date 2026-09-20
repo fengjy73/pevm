@@ -34,15 +34,15 @@ pub(crate) fn next_sf_task(
         let _ = crate::specfence::admit::flush_pending_idle_edges(ready, p);
     }
     let refuse_before = ready.refuse_count();
-    // P1: gates ≠ global mode. Ungated txs keep the OCC collaborative
-    // index; a closed hole is skip-only (`next_task_with_wave_ready`).
-    // Fat + lazy already seen → ignore leftover reservations (K8 shell).
-    // Sub-fat real spines (CallWaw / Win_2, e.g. 19469101 n=469) still
+    // Gates ≠ global mode. Ungated txs keep OCC collaborative task
+    // selection; a closed wait-for is skip-only (`next_task_with_wave_ready`).
+    // Large + lazy-update already seen → ignore leftover reservations.
+    // Mid-band real spines (CallWaw / Win_2, e.g. 19469101 n=469) still
     // have pending gates without ProducerStage reserve — must not OCC-steal
-    // through those holes (PR24 abort-train hang).
-    let fat_lazy =
-        policy.is_some_and(|p| p.block_n() >= super::policy::FAT_N && p.lazy_already_seen());
-    if fat_lazy || (!stages.has_reserved() && !ready.has_pending_gated()) {
+    // through those wait-for deps (PR24 abort-train hang).
+    let large_lazy = policy
+        .is_some_and(|p| p.block_n() >= super::policy::LARGE_BLOCK_N && p.lazy_already_seen());
+    if large_lazy || (!stages.has_reserved() && !ready.has_pending_gated()) {
         return scheduler.next_task();
     }
     if !stages.has_reserved() {

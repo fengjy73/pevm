@@ -249,7 +249,7 @@ fn promote_and_seed_short_edge(
     // T3: queue the next Win_w idle hops. Do **not** flush here —
     // validate-time plant + same-thread re-exec livelocks (done-stamp race).
     let n_pairs = policy.pairs_of(f.location).len();
-    if policy.hops_to_plant(f.location, n_pairs) > 0 {
+    if policy.hops_to_admit(f.location, n_pairs) > 0 {
         let from = specfence.hints.from_of(tx_idx);
         let to = specfence.hints.to_of(tx_idx);
         crate::specfence::admit::queue_nearest_unfinished_successor(
