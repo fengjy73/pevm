@@ -364,6 +364,7 @@ fn run_mode(
     let mut last_metrics = None;
     let mut last_process = None;
     let mut last_learn = None;
+    let mut last_wait_set_n = 0usize;
     let mut first_arm: Option<String> = None;
     let mut last_arm: Option<String> = None;
     let mut ok_all = true;
@@ -417,6 +418,7 @@ fn run_mode(
                     last_arm = Some(learn.chosen_strategy.clone());
                     if i + 1 == iters {
                         last_process = Some(pevm.last_exec_process().clone());
+                        last_wait_set_n = pevm.last_begin_blocked().len();
                         last_learn = Some(learn);
                     }
                 }
@@ -495,6 +497,8 @@ fn run_mode(
             "defer_locs": learn.defer_locs,
             "opt_locs": learn.opt_locs,
             "ungated_occ_while_gated": learn.ungated_occ_while_gated,
+            "end_block_ns": learn.end_block_ns,
+            "wait_set_n": last_wait_set_n,
         });
     }
     if let Some(proc) = last_process {
@@ -578,7 +582,7 @@ fn main() {
                 for mode in ["occ", "specfence"] {
                     let row = run_mode(&chain, &loaded, mode, 8, iters, false, reuse);
                     eprintln!(
-                        "  {mode:10} ok={} tps={:.0} wall_ms={:.1} reuse_med={} arm={}→{} unf={} double_charge={} sys={} cover={} w={} cover_window={} soft={} aborts={} ordered_admit={} wait={} rewind={} rebind={} full={}",
+                        "  {mode:10} ok={} tps={:.0} wall_ms={:.1} reuse_med={} arm={}→{} unf={} double_charge={} sys={} cover={} w={} cover_window={} wait_set={} end_block_us={} soft={} aborts={} ordered_admit={} wait={} rewind={} rebind={} full={}",
                         row["ok"],
                         row["tps"].as_f64().unwrap_or(0.0),
                         row["wall_ms"].as_f64().unwrap_or(0.0),
@@ -596,6 +600,8 @@ fn main() {
                         row["learn"]["covering_n"].as_u64().unwrap_or(0),
                         row["learn"]["chosen_win_w"].as_u64().unwrap_or(0),
                         row["learn"]["chosen_cover_window"].as_u64().unwrap_or(0),
+                        row["learn"]["wait_set_n"].as_u64().unwrap_or(0),
+                        row["learn"]["end_block_ns"].as_u64().unwrap_or(0) as f64 / 1000.0,
                         row["metrics"]["soft_wait_arms"].as_u64().unwrap_or(0),
                         row["metrics"]["occ_aborts"].as_u64().unwrap_or(0),
                         row["metrics"]["edge_ordered_admit"].as_u64().unwrap_or(0),
@@ -699,6 +705,8 @@ fn main() {
                     "covering_n": sf["learn"]["covering_n"],
                     "chosen_win_w": sf["learn"]["chosen_win_w"],
                     "chosen_cover_window": sf["learn"]["chosen_cover_window"],
+                    "wait_set_n": sf["learn"]["wait_set_n"],
+                    "end_block_ns": sf["learn"]["end_block_ns"],
                     "selected_arms": sf["learn"]["selected_arms"],
                     "sf_reuse_wall_ms": sf["wall_ms_reuse_median"],
                 }));

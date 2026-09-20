@@ -45,14 +45,26 @@ Done-on-success / iter11; no mid-execute ReadyEdge; Soft=0; Instant idle ↛ ĉ;
 - `is_under_covered_spine` is Storage ≥64 or Basic/Unknown ≥128. 40-pair storage still light-covers; 80-pair storage yields to OptimisticRead.
 - Futile cover (ordered leftover ≥2, unfenced ≥8, `cover_window` already at the light hat) freezes `cover_window` and clears crisis so Seg/Full are not invited back.
 
-## Safety
+## Metrics (Soft=0, N=3 reuse @8 unless noted)
 
-- Soft=0
-- lib specfence policy/admit/ready_edge
-- specfence integration including **iter11**
-- erc20_independent
-- no return of 4×+ lazy-update large-block tail
-- 3356896 must not severely regress
+PR36 Instant-off / sweep walls from `specfence-pr36-k8-pc-cc-learn-analysis.md`.
+
+| block | n | PR36 × | this wall × | wait-set | end_block | arm | note |
+|------:|--:|-------:|------------:|---------:|----------:|-----|------|
+| **19716145** | 341 | 2.22 sweep / 2.00 Instant-off (wait-set 102–108) | **1.62** (16.0 / 9.9) | **8** | 2.29 ms | Win_1→Opt | A1: wait-set 108→8 |
+| **19860366** | 430 | 2.26 / 2.30 (wait-set 76–78, end 3.85–4.29, Win_7) | 2.27 (21.6 / 9.5) | **8** | 3.92 ms | Win_1→Opt | A1: wait-set 76→8; not Win_7 |
+| **19807137** | 712 | 3.10 / 4.11 Instant-off (Full…Seg_3) | 3.66 (52.3 / 14.3) | 8 | 0.64 ms | Opt→Win_1 | no Seg learn-uphill; cover_window=0 |
+| **3356896** | 176 | 1.34 N=7 | **1.20** compare N=7: 1.170 / 0.951 | 3 | 0.08 ms | Win / Opt | no severe regress |
+| **14396881** | 1346 | 3.61 | 3.33 (14.0 / 4.2) | 0 | 0.31 ms | Opt→Full | not a 4×+ lazy-update tail |
+
+OCC reuse on `19807137` spiked (~2.3 s); wall uses OCC median 14.3 ms, not the spike.
+
+### Safety
+
+- Soft=0 on every compare / sweep row
+- lib specfence policy **67** passed; admit+ready_edge **52** passed
+- specfence integration **44** passed / 20 ignored including **iter11**
+- erc20_independent **ok**
 
 ## Commands
 
