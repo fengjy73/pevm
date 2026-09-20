@@ -52,4 +52,5 @@ SPECFENCE_COMPARE_ITERS=7 cargo run -p pevm --release \
   --config 'profile.release.lto=false' --example specfence_3356896_compare
 ```
 
-Lib `specfence` 298 passed；policy 42 passed；`erc20_independent` 0.45s release。
+Lib `specfence` 298 passed；policy 42 passed；`erc20_independent` 0.45s release。  
+`specfence_iter11_…seq_eq_par` 未确认（release 跑 ~12 min @~400% CPU 后杀掉，像自旋不是 DashMap 死锁）。
