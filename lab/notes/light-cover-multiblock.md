@@ -1,6 +1,6 @@
 # Light cover × multi-block reexec→CC
 
-**Head:** `0274bb9` off PR32 `fd6d128`  
+**Head:** `5d5265d` off PR32 `fd6d128`  
 **Soft=0 · @8 · `SPECFENCE_ALL_REUSE=1` · 3 iters**
 
 ## PRIMARY 3356896 N=7 interleaved compare
@@ -18,13 +18,11 @@ Gap vs OCC ≈0.19ms (same order as PR32) **without** `n_pairs−1` prepaid. Wal
 
 3-iter reuse sweep on the same block: OCC reuse 1.329 / SF reuse **1.273** / arm `Win_1→Win_2` / unf=1 / dp=0 / cover=1 / Soft=0 — SF reuse ≤ OCC reuse on that harness.
 
-`lab/results/light-cover-3356896-n7.json` (local, gitignored) · tracked copy of the multi-block table below.
+## Multi-block (52 OCC-gap set, 51 loaded)
 
-## Multi-block (52 OCC-gap set)
-
-Loaded **33/52** before 19469097 OOM (`memory allocation of ~140TB failed`). Soft=0 on every row.  
-SF≤OCC wall **4/33**; SF≤OCC reuse **9/33**.  
-sys_reexec blocks **15**; last arm Win_2 **9**; rare/quiet stay Opt **9**.
+Loaded **51/52** (skip 19469097 OOM). Soft=0 on every row.  
+SF≤OCC wall **7/51**; SF≤OCC reuse **13/51**.  
+sys_reexec blocks **26**; last arm Win_2 **20**; rare/quiet stay Opt **13**.
 
 | block | n | OCC | SF reuse | r_reuse | arm | unf | dp | sys | cover | w_need | class |
 |------|---|-----|----------|---------|-----|-----|----|-------|--------|-------|-------|
@@ -61,14 +59,31 @@ sys_reexec blocks **15**; last arm Win_2 **9**; rare/quiet stay Opt **9**.
 | 18426253 | 147 | 5.469 | 5.702 | 0.78 | Opt→Opt | 35 | 0 | 0 | 0 | 0 | rare/quiet |
 | 18988207 | 186 | 4.636 | 7.053 | 1.29 | Win_1→Win_2 | 50 | 0 | 2 | 1 | 2 | reexec→CC Win_2 |
 | 19426587 | 37 | 2.106 | 2.007 | 0.90 | -→- | 0 | 0 | 0 | 0 | 0 | rare/quiet |
+| 19469098 | 268 | 11.681 | 23.388 | 1.57 | Win_1→Win_2 | 21 | 1 | 1 | 1 | 2 | reexec→CC Win_2 |
+| 19469099 | 257 | 10.656 | 25.106 | 2.10 | Win_1→Win_2 | 9 | 0 | 3 | 2 | 2 | reexec→CC Win_2 |
+| 19469101 | 469 | 16.333 | 44.673 | 2.54 | Win_1→Win_2 | 40 | 0 | 2 | 1 | 2 | reexec→CC Win_2 |
+| 19505152 | 417 | 20.856 | 34.266 | 1.62 | Win_1→Win_2 | 18 | 0 | 1 | 1 | 2 | reexec→CC Win_2 |
+| 19606598 | 91 | 8.016 | 4.182 | 0.43 | Full→Full | 0 | 0 | 0 | 0 | 2 | ordered last |
+| 19606599 | 367 | 23.803 | 78.707 | 3.29 | Win_1→Win_2 | 41 | 2 | 1 | 1 | 2 | reexec→CC Win_2 |
+| 19638737 | 381 | 11.781 | 28.175 | 1.42 | Win_1→Win_2 | 8 | 0 | 1 | 1 | 2 | reexec→CC Win_2 |
+| 19716145 | 341 | 23.418 | 77.471 | 3.25 | Win_1→Win_2 | 14 | 3 | 3 | 2 | 2 | reexec→CC Win_2 |
+| 19737292 | 195 | 12.123 | 19.645 | 1.11 | Full→Win_1 | 6 | 1 | 0 | 0 | 2 | ordered last |
+| 19860366 | 430 | 19.325 | 55.644 | 2.74 | Win_1→Win_2 | 8 | 1 | 1 | 1 | 2 | reexec→CC Win_2 |
+| 19917570 | 116 | 11.490 | 19.973 | 1.72 | Opt→Opt | 9 | 0 | 0 | 0 | 0 | rare/quiet |
+| 19929064 | 103 | 7.951 | 13.521 | 1.58 | Win_1→Win_2 | 12 | 1 | 1 | 0 | 3 | reexec→CC Win_2 |
+| 19932148 | 227 | 10.727 | 23.671 | 1.92 | Win_1→Win_2 | 41 | 0 | 1 | 1 | 2 | reexec→CC Win_2 |
+| 19932703 | 143 | 9.282 | 13.283 | 0.00 | Full→Win_1 | 0 | 0 | 0 | 0 | 1 | ordered last |
+| 19932810 | 270 | 15.866 | 39.962 | 1.68 | Win_1→Win_2 | 29 | 0 | 1 | 1 | 2 | reexec→CC Win_2 |
+| 19933122 | 45 | 0.511 | 0.594 | 0.95 | -→- | 0 | 0 | 0 | 0 | 0 | rare/quiet |
+| 19933597 | 154 | 11.842 | 10.163 | 0.46 | Opt→Opt | 18 | 0 | 0 | 0 | 0 | rare/quiet |
+| 19934116 | 58 | 1.437 | 2.799 | 1.84 | -→- | 0 | 0 | 0 | 0 | 0 | rare/quiet |
 
 **M2:** systematic-reexec / leftover-long blocks open a light ordered arm (`Win_2` / `w_need=2`, never `n_pairs−1`). Rare-conflict stays Opt.  
-Six sys-reexec rows later yield to Opt (L4 prepaid blowout), including 14689597 (`unf=336`, need=2, never stuck a cover).  
+Later mainnet ids (19469098–19932810) repeat the same Opt→Win_2 loop. Six early sys-reexec rows yield to Opt (L4 prepaid), including 14689597 (`unf=336`, need=2).  
 Fat `n_tx>700` Win_1 rows (13217637, 15274915) stay prepaid-heavy — hat keeps `w≤2`; not a FullChain climb.
 
-OOM caveat: skip 19469097 on later sweeps. 18 later ids not yet run.
+OOM caveat: 19469097 (`memory allocation of ~140TB failed`) skipped.
 
 ## Safety
 
-iter11 **0.03s**; `erc20_independent` **0.48s**; policy 50 + admit 33; Soft=0; no mid-plant; Instant idle ↛ ĉ.
-
+iter11 **0.01s**; `erc20_independent` **0.44s**; policy 50 + admit 33; Soft=0; no mid-plant; Instant idle ↛ ĉ.
