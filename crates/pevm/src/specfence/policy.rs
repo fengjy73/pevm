@@ -1284,6 +1284,7 @@ impl CostPolicy {
         let leftover0 = loc
             .as_ref()
             .is_some_and(|s| s.decision.is_ordered() && !s.last_crisis && s.block_reexec_n < 2);
+        let double_pay = loc.as_ref().is_some_and(|s| s.last_double_pay);
         let paid = loc
             .as_ref()
             .and_then(|s| s.stat(s.decision).filter(|(_, n)| *n > 1.0).map(|(c, _)| c));
@@ -1301,15 +1302,29 @@ impl CostPolicy {
                 if n <= 1.0 {
                     c = arm_prior(a, n_pairs);
                 }
-                if measured && matches!(a, LocStrategy::OptimisticRead | LocStrategy::DeferPlant) {
-                    c = c.max(abort);
-                }
-                if leftover0
-                    && let Some(paid) = paid
-                    && n <= 1.0
-                    && hops_for_strategy(a, n_pairs, self.seg_cap()) > planted
-                {
-                    c = c.max(paid);
+                if double_pay {
+                    // O1: half-window already paid leftover OCC. Ordered arms
+                    // carry that abort; Opt/Defer are the pay-once alternative
+                    // and must not inherit the leftover floor.
+                    if a.is_ordered() {
+                        c = c.max(abort);
+                        if let Some(paid) = paid {
+                            c = c.max(paid);
+                        }
+                    }
+                } else {
+                    if measured
+                        && matches!(a, LocStrategy::OptimisticRead | LocStrategy::DeferPlant)
+                    {
+                        c = c.max(abort);
+                    }
+                    if leftover0
+                        && let Some(paid) = paid
+                        && n <= 1.0
+                        && hops_for_strategy(a, n_pairs, self.seg_cap()) > planted
+                    {
+                        c = c.max(paid);
+                    }
                 }
                 (a, c.max(1.0), n.max(1.0))
             })
@@ -2182,25 +2197,6 @@ impl CostPolicy {
             .max(1) as u64;
         let refuse_share = prepaid / n_hot;
         for mut e in self.promoted.iter_mut() {
-            if !e.measured
-                && e.decision != LocStrategy::DeferPlant
-                && e.block_reexec_ns == 0
-                && e.block_ordered_ns == 0
-            {
-                continue;
-            }
-            let actual = e
-                .block_reexec_ns
-                .saturating_add(e.block_ordered_ns.saturating_add(refuse_share));
-            let x = actual.max(1) as f64;
-            // F3: credit the begin-selected arm only. No invented ns on others.
-            let arm = e.decision;
-            e.update_arm(arm, x);
-            if e.decision != LocStrategy::OptimisticRead && abort_cf > 0 {
-                let cf = (abort_cf as f64).max(e.reexec_ns_ema).max(1.0);
-                e.bump_c_floor(LocStrategy::OptimisticRead, cf);
-            }
-            e.samples = e.samples.saturating_add(1);
             let n_pairs = self.short_chain.get(e.key()).map(|c| c.len()).unwrap_or(0);
             let planted = hops_for_strategy(e.decision, n_pairs, self.seg_cap());
             let leftover_hops = n_pairs.saturating_sub(planted);
@@ -2235,6 +2231,35 @@ impl CostPolicy {
                     unfenced >= 4 && !e.last_double_pay
                 }
             };
+            if !e.measured
+                && e.decision != LocStrategy::DeferPlant
+                && e.block_reexec_ns == 0
+                && e.block_ordered_ns == 0
+            {
+                continue;
+            }
+            let actual = e
+                .block_reexec_ns
+                .saturating_add(e.block_ordered_ns.saturating_add(refuse_share));
+            let x = actual.max(1) as f64;
+            // F3: credit the begin-selected arm only. No invented ns on others.
+            let arm = e.decision;
+            e.update_arm(arm, x);
+            // O1: do not paint Opt with leftover abort after double-pay —
+            // Opt/Defer is the pay-once counterfactual.
+            if e.decision != LocStrategy::OptimisticRead && abort_cf > 0 && !e.last_double_pay {
+                let cf = (abort_cf as f64).max(e.reexec_ns_ema).max(1.0);
+                e.bump_c_floor(LocStrategy::OptimisticRead, cf);
+            }
+            if e.last_double_pay && e.decision.is_ordered() {
+                let tax = (abort_cf as f64)
+                    .max(e.reexec_ns_ema)
+                    .max(e.block_reexec_ns as f64)
+                    .max(1.0);
+                let ordered = e.decision;
+                e.bump_c_floor(ordered, tax);
+            }
+            e.samples = e.samples.saturating_add(1);
             e.morph = morph_key(n_pairs);
             // Safety: Full on a long spine (should be ineligible) stays demoted.
             if e.decision == LocStrategy::FullChain && n_pairs > ORDER_WINDOW_K {
@@ -3526,6 +3551,23 @@ mod tests {
         assert!(
             !explore && matches!(arm, LocStrategy::OptimisticRead | LocStrategy::DeferPlant),
             "O1: greedy ĉ after double-pay is Defer/Opt, got {arm:?}"
+        );
+        // Unmeasured Win_2 prior 12k must not undercut Defer after leftover OCC
+        // (compare N=7 stuck on Win_2 @ 12k vs Opt 220k).
+        {
+            let mut e = p.promoted.get_mut(&0x32be).unwrap();
+            e.arms
+                .retain(|s| !matches!(s.arm, LocStrategy::OrderedWindow { w: 2 }));
+            e.reexec_ns_ema = 90_000.0;
+            e.last_double_pay = true;
+            e.decision = LocStrategy::win(2);
+            e.w_star = 2;
+        }
+        p.block_arm.clear();
+        let (arm2, _, _) = p.select_arm(0x32be, 4);
+        assert!(
+            matches!(arm2, LocStrategy::OptimisticRead | LocStrategy::DeferPlant),
+            "O1: unused Win_2 prior must not beat Defer/Opt after double-pay, got {arm2:?}"
         );
     }
 
