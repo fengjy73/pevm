@@ -2588,15 +2588,15 @@ impl CostPolicy {
             let light = self.light_hat(n_pairs);
             let train = self.train_hat(n_pairs);
             // O1: prefix shorter than the light hat + leftover OCC train.
-            // U: hat-width window still leaking a leftover train (unf≥8
-            // or loc reexec≥4 past planted) grows w_need — not T3-only.
-            // unf=0–2 leftover hops stay T3 (3356896).
-            let leftover_train = leftover_hops >= 2 && (unfenced >= 4 || e.block_reexec_n >= 4);
+            // U: grow only after Win_2+ still leaks (unf≥8 or loc reexec≥4
+            // past planted). First Win_1 leftover (3356896 cold) is T3 /
+            // next-iter light-open, not train_hat climb — that prepaid
+            // Win_8 and lost PRIMARY. unf=0–2 leftover hops stay T3.
             let under_cover = e.decision.is_ordered()
+                && planted >= 2
                 && leftover_hops >= 2
                 && (unfenced >= 8 || (e.block_reexec_n >= 4 && leftover_hops > planted));
-            let double_pay_now =
-                e.decision.is_ordered() && leftover_train && (planted < light || under_cover);
+            let double_pay_now = under_cover;
             let had_sys = e.last_sys_reexec;
             let had_dp = e.last_double_pay;
             if double_pay_now {
@@ -4859,6 +4859,61 @@ mod tests {
             !matches!(arm, LocStrategy::OptimisticRead | LocStrategy::DeferPlant),
             "L4: cover_ok + unused Opt prior stays ordered, got {arm:?}"
         );
+    }
+
+    #[test]
+    fn win1_leftover_does_not_grow_train_hat() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(176, 8);
+        p.promote_short_edge(0x32be, 12_000);
+        for pair in [
+            (4, 31),
+            (31, 66),
+            (66, 67),
+            (67, 69),
+            (69, 70),
+            (70, 93),
+            (93, 96),
+            (96, 103),
+            (103, 115),
+            (115, 131),
+            (131, 132),
+            (132, 135),
+            (135, 138),
+            (138, 141),
+            (141, 166),
+            (166, 171),
+        ] {
+            p.note_short_pair(0x32be, pair.0, pair.1);
+        }
+        p.remember_arm(0x32be, LocStrategy::win(1));
+        {
+            let mut e = p.promoted.get_mut(&0x32be).unwrap();
+            e.samples = 2;
+            e.measured = true;
+            e.decision = LocStrategy::win(1);
+            e.w_star = 1;
+            e.w_need = 0;
+            e.last_sys_reexec = false;
+            e.upsert_stat(LocStrategy::win(1), 40_000.0, 2.0);
+        }
+        for _ in 0..14 {
+            p.bump_unfenced_reexec();
+        }
+        p.note_reexec_ns_at(Some(0x32be), 20_000);
+        p.end_block_learn();
+        {
+            let e = p.promoted.get(&0x32be).unwrap();
+            assert!(
+                !e.last_double_pay,
+                "O: first Win_1 leftover is not train_hat double-pay"
+            );
+            assert!(
+                (e.w_need as usize) <= 2,
+                "O: Win_1 leftover must not climb to train_hat, got {}",
+                e.w_need
+            );
+        }
     }
 
     #[test]
