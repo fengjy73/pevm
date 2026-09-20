@@ -1,7 +1,7 @@
 # Learn × CC fine-grain × PC utilization — full-package land
 
-**PR:** (draft, this branch)  
-**Branch:** `cursor/specfence-pc-cc-learn-complete-2cd0`  
+**PR:** https://github.com/fengjy73/pevm/pull/42 (draft)  
+**Branch:** `cursor/specfence-pc-cc-learn-complete-2cd0` @ `6627911`  
 **Base:** PR #40 `cursor/specfence-midband-spine-tps-041c` @ `a756267`  
 **Design:** `lab/notes/specfence-pc-cc-learn-complete-land-v1.md`  
 **Evidence:** `lab/notes/specfence-pr40-tps-losers-optimal-vs-overhead.md`  
@@ -31,18 +31,27 @@ Lazy-update chains stay **not** OrderedAdmit objects. Ungated OCC task selection
 
 - `yield_to_occ_abort` is under-covered **or** failed wall probe **or** leftover-long without remaining probe budget. Mid-band `can_probe_cover` does **not** yield.
 - `select_arm` forces a covering probe arm so the unused Opt prior cannot skip never-tried cover.
-- `probe_cover_w` is one cores-scaled segment (8@8), not the oversub hat 2.
+- `probe_cover_w` starts at Win_2. An 8-wide first plant livelocks ERC-20 mid-band (iter23). C4 deepens `cover_window` at `end_block`.
 - `train_hat` on mid-band real spines allows a second segment (C4).
-- `leftover_slide_ok` slides the next segment while a mid-band probe is live.
+- `leftover_slide_ok` never T3-slides a mid-band coverable spine or a large planted OrderedAdmit prefix, including after crisis / sys-reexec (19469101 N=3 reuse). Thin leaking short-chain may still slide. C4 deepens at `end_block`.
 - `skip_ungated_path_tax` stays block-level (empty / short-chain wait-set) for lean `end_block` and after-publish D1 skip.
 - After-publish D1 walk stays on for a **live** wait-set.
 - Soft=0. No SoftWait Soft arm.
 
 ## Metrics (Soft=0, N=3 reuse @8, n>0)
 
-Sweep pending — see `specfence-pc-cc-learn-complete-sweep.md` after the 99-block run.
+| metric | this | PR #40 |
+|--------|-----:|-------:|
+| SF TPS ≥ OCC | **26 / 98** | 23 / 98 |
+| SF/OCC median | **0.919** | 0.832 |
+| wall max | **1.72** | 3.220 |
+| 4–27× lazy tail | **none** | none |
+| Soft=0 | yes | yes |
 
-PR40 baseline: SF TPS≥OCC **23/98**, median TPS ratio **0.832**, wall max **3.220** (near-indep line, not a 4–27× lazy tail).
+FAR: 19716145 0.660→0.993; 19860366 0.677→0.950; 8889776 0.445→0.724; 16146267 0.362→1.038.  
+NEAR: 14396881 0.311→0.789; 13217637 0.360→0.871.  
+15274915: Opt/69 + short Full/1, wait-set 0 — no lazy Full/996.  
+19469101 leftover-slide hang class completes (N=3 reuse).
 
 ## Commands
 

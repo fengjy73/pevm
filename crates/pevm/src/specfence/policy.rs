@@ -1423,20 +1423,19 @@ impl CostPolicy {
         s.cover_probe_n == 0 || s.last_crisis || s.samples < HOT_LOC_N
     }
 
-    /// First / next probe width: one cores-scaled segment, not oversub hat 2.
+    /// First probe is the light covering window (Win_2), not an
+    /// 8-wide plant. An 8-hop OrderedAdmit prefix livelocks ERC-20
+    /// mid-band clusters (iter23). C4 deepens `cover_window` at
+    /// `end_block`.
     fn probe_cover_w(&self, location: MemoryLocationHash, n_pairs: usize) -> usize {
         let full = full_cover_w(n_pairs);
-        let seg = self.cores().max(4).min(8);
         let stored = self
             .promoted
             .get(&location)
             .map(|s| s.cover_window as usize)
             .unwrap_or(0);
-        stored
-            .max(seg)
-            .min(self.train_hat(n_pairs))
-            .min(full)
-            .max(2)
+        let w = if stored >= 2 { stored } else { 2 };
+        w.min(self.train_hat(n_pairs)).min(full).max(2)
     }
 
     /// Cover is proven cheaper than OCC abort: measured covering arm,
@@ -6317,9 +6316,9 @@ mod tests {
             "L1: mid-band probe plants a short cover_window"
         );
         let hops = p.hops_to_admit(0xabc, 20);
-        assert!(
-            hops >= 2 && hops < 20,
-            "C1: probe is a short segment, not full-spine, hops={hops}"
+        assert_eq!(
+            hops, 2,
+            "L1: first probe is Win_2, not an 8-wide ERC-20 plant, hops={hops}"
         );
         let (arm, _, _) = p.select_arm(0xabc, 20);
         assert!(
