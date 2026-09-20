@@ -805,6 +805,11 @@ impl Pevm {
                 matches!((i4, i31), (Some(a), Some(b)) if a < b)
             });
             let thin = self.cost_policy.is_optimistic_majority_block();
+            // C3: 4→31 on a *mainnet-sized* thin block (3356896 n=176).
+            // 32–48-tx seq≡par fixtures can also list writers 4 and 31 —
+            // those still need HotSet / inter-prior (m3/m4/r1).
+            const STABLE_D1_N_MIN: usize = 64;
+            let stable_d1 = ready_has_4_31 && thin && block_size >= STABLE_D1_N_MIN;
             // S5: edge_4_31 already true → skip MV merge and HotSet walk.
             if !ready_has_4_31 {
                 for (loc, writers) in mv_writers_for_locs(
@@ -822,7 +827,7 @@ impl Pevm {
                     }
                 }
             }
-            if !(ready_has_4_31 && thin) {
+            if !stable_d1 {
                 for (loc, writers) in &d1_orders {
                     if writers.len() < 2 {
                         continue;
@@ -838,9 +843,9 @@ impl Pevm {
                     self.hotset.end_block();
                 }
             }
-            // O4: edge_4_31 + thin D1 is stable — skip HotSet (above),
+            // O4/C3: stable 3356896 D1 — skip HotSet (above),
             // inter-prior pack, and sketch decay.
-            if !(ready_has_4_31 && thin) {
+            if !stable_d1 {
                 let morph_hat = learner.morph_hat();
                 let top = learner.pack_top_locations();
                 let _alpha = self.inter_prior.end_block(morph_hat, top);
@@ -905,7 +910,7 @@ impl Pevm {
                 self.cost_policy.note_promoted_writer_orders(&persist);
             }
             let mut d1_orders = d1_orders;
-            if !(ready_has_4_31 && thin) {
+            if !stable_d1 {
                 for (loc, writers) in self.cost_policy.writer_orders_from_pairs() {
                     if let Some((_, w)) = d1_orders.iter_mut().find(|(l, _)| *l == loc) {
                         w.extend(writers);
@@ -932,8 +937,8 @@ impl Pevm {
             };
             self.cost_policy
                 .note_cost_sample(refuse_unit, inc_gt0 > 0, idle);
-            // C3: edge_4_31 + thin D1 — skip morph flush / re-widen.
-            if ready_has_4_31 && thin {
+            // C3: stable 3356896 D1 — skip morph flush / re-widen.
+            if stable_d1 {
                 self.cost_policy.end_block_learn_stable_d1();
             } else {
                 self.cost_policy.end_block_learn();
