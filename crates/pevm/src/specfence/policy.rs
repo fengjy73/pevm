@@ -1001,16 +1001,21 @@ impl CostPolicy {
     /// when nonce/evaluated `Basic` mis-labeled the loc (K8 58-pair Win).
     /// Thin real Basic (3356896) stays C2.
     pub(crate) fn loc_forbids_ordered(&self, location: MemoryLocationHash) -> bool {
+        self.loc_forbids_n(location, 0)
+    }
+
+    /// C1 with a live writer/pair count (write-set D1 may outrun `short_chain`).
+    pub(crate) fn loc_forbids_n(&self, location: MemoryLocationHash, n_pairs: usize) -> bool {
         match self.loc_object_map(location) {
             LocObject::Lazy => true,
             LocObject::Storage => false,
             LocObject::Basic | LocObject::Unknown => {
-                let n_pairs = self
+                let stored = self
                     .short_chain
                     .get(&location)
                     .map(|c| c.len())
                     .unwrap_or(0);
-                self.unknown_looks_lazy(n_pairs, false)
+                self.unknown_looks_lazy(n_pairs.max(stored), false)
             }
         }
     }
@@ -1320,7 +1325,7 @@ impl CostPolicy {
     /// Sole mouth: `select_arm`. Full only when n_pairs ≤ `ORDER_WINDOW_K`.
     /// Long spines never FullChain (PR22 1.40ms prepaid wall — safety).
     pub(crate) fn hops_to_plant(&self, location: MemoryLocationHash, n_pairs: usize) -> usize {
-        if self.loc_forbids_ordered(location) {
+        if self.loc_forbids_n(location, n_pairs) {
             return 0;
         }
         let n_pairs = self.loc_n_pairs(location, n_pairs);
@@ -1412,7 +1417,7 @@ impl CostPolicy {
 
     /// L1: per-ℓ arm. Cached for the block so hops / hint / flush share one mouth.
     pub(crate) fn loc_strategy(&self, location: MemoryLocationHash, n_pairs: usize) -> LocStrategy {
-        if self.loc_forbids_ordered(location) {
+        if self.loc_forbids_n(location, n_pairs) {
             return LocStrategy::OptimisticRead;
         }
         let n_pairs = self.loc_n_pairs(location, n_pairs);
@@ -1438,7 +1443,7 @@ impl CostPolicy {
         location: MemoryLocationHash,
         n_pairs: usize,
     ) -> LocStrategy {
-        if self.loc_forbids_ordered(location) {
+        if self.loc_forbids_n(location, n_pairs) {
             return LocStrategy::OptimisticRead;
         }
         let n_pairs = self.loc_n_pairs(location, n_pairs);

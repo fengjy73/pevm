@@ -34,21 +34,12 @@ pub(crate) fn next_sf_task(
         let _ = crate::specfence::admit::flush_pending_idle_edges(ready, p);
     }
     let refuse_before = ready.refuse_count();
-    // S1/P1: no *pending* holes → OCC idx pick. Finished gates are not a
-    // global mode switch — independents return to `next_occ_task`.
-    if !stages.has_reserved() && !ready.has_pending_gated() {
-        return scheduler.next_task();
-    }
-    // P1: gates are edge constraints, not a global SF mode. Ungated txs
-    // use the OCC collaborative pick (`wave=None`); closed gates are
-    // skip-only. ProducerStage reservations still take the wave path.
+    // P1: ProducerStage reservations are the only global SF schedule.
+    // Holes are execute-time edge constraints — not a pick-mode switch.
+    // Fat S-lazy with 6–9 leftover gates used to walk wave_ready and
+    // pay the 4–25× shell (`pick_occ≈0`). Ungated txs stay on OCC idx.
     if !stages.has_reserved() {
-        let task = scheduler.next_task_with_wave_ready(None, Some(ready));
-        if let Some(m) = metrics {
-            let n = ready.refuse_count().saturating_sub(refuse_before);
-            m.record_refuse_admit_n(n);
-        }
-        return task;
+        return scheduler.next_task();
     }
     // Drop Aborting / Done reservations so a dead writer cannot wait_for_dependency the
     // ProducerStage min and starve the rest of the ready-set.

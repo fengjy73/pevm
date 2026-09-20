@@ -646,11 +646,15 @@ pub(crate) fn admit_seed_on_write_set(
     for &loc in &hidden_eff {
         ready.note_raw_producer(loc, writer);
         ready.note_location_writer(loc, writer);
-        if policy.is_some_and(|p| p.loc_forbids_ordered(loc)) {
+        let n_writers = ready.writers_of(loc).len();
+        let n_pairs = n_writers
+            .saturating_sub(1)
+            .max(policy.map(|p| p.pairs_of(loc).len()).unwrap_or(0));
+        if policy.is_some_and(|p| p.loc_forbids_n(loc, n_pairs)) {
             continue;
         }
         // C2: real spine only. hops=0 (Opt/Defer / lazy) leaves OCC.
-        let plant = policy.is_none_or(|p| p.hops_to_plant(loc, p.pairs_of(loc).len().max(1)) > 0);
+        let plant = policy.is_none_or(|p| p.hops_to_plant(loc, n_pairs.max(1)) > 0);
         if plant {
             // D1: 4→31 when 4 already published this ℓ (any envelope).
             ready.note_immediate_pred(loc, writer);
@@ -681,6 +685,9 @@ pub(crate) fn admit_seed_on_write_set(
                 ready.release_consumer(t, wave);
             }
         }
+    }
+    if let Some(p) = policy {
+        soft_cap_begin_blocked(ready, p);
     }
 }
 
