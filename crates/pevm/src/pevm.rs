@@ -613,12 +613,12 @@ impl Pevm {
                         task = match task.unwrap() {
                             Task::Execution(tx_version) => {
                                 let sf = self.concurrency_mode == ConcurrencyMode::SpecFence;
-                                // O5: ungated + no live gates ≡ OCC (no started meta).
-                                // Still mark started when a leftover hop is queued
-                                // so pick-quantum flush cannot mid-plant an in-flight succ.
+                                // O5/P1: ungated + no leftover flush ≡ OCC (no started
+                                // meta). Sibling gates must not tax independents —
+                                // flush only plants pending idle pairs, so mark
+                                // started when this tx is gated or a hop is queued.
                                 if sf
                                     && (specfence.ready_edges.is_gated(tx_version.tx_idx)
-                                        || specfence.ready_edges.has_any_gated()
                                         || specfence.policy.is_some_and(|p| p.has_pending_idle()))
                                 {
                                     specfence.ready_edges.note_started(tx_version.tx_idx);
@@ -665,9 +665,13 @@ impl Pevm {
                             }
                             Task::Validation(tx_version) => {
                                 let v0 = profile.then(Instant::now);
-                                let optimistic_ungated = specfence.mode
+                                // P2: success path ≡ OCC once the Detect hole is
+                                // open (ungated, or gated + pred done). SpecFence
+                                // validate is only for a still-closed gate.
+                                let occ_like_validate = specfence.mode
                                     == ConcurrencyMode::SpecFence
-                                    && !specfence.ready_edges.is_gated(tx_version.tx_idx);
+                                    && (!specfence.ready_edges.is_gated(tx_version.tx_idx)
+                                        || specfence.ready_edges.may_execute(tx_version.tx_idx));
                                 let next = if occ_mode {
                                     crate::specfence::validate_occ_stage(
                                         &mv_memory,
@@ -675,7 +679,7 @@ impl Pevm {
                                         &tx_version,
                                         Some(&metrics_inner),
                                     )
-                                } else if optimistic_ungated {
+                                } else if occ_like_validate {
                                     crate::specfence::validate_optimistic_fast(
                                         &mv_memory,
                                         &scheduler,
@@ -810,8 +814,14 @@ impl Pevm {
             // those still need HotSet / inter-prior (m3/m4/r1).
             const STABLE_D1_N_MIN: usize = 64;
             let stable_d1 = ready_has_4_31 && thin && block_size >= STABLE_D1_N_MIN;
+            // S: fat reuse with stored D1 skips HotSet / inter-prior / sketch
+            // (same lean as 3356896 stable D1). First fat block still persists.
+            let fat_reuse =
+                block_size >= 512 && self.cost_policy.d1_pairs_already_stored(&d1_orders);
+            let lean_end = stable_d1 || fat_reuse;
             // S5: edge_4_31 already true → skip MV merge and HotSet walk.
-            if !ready_has_4_31 {
+            // lean_end still skips HotSet below.
+            if !ready_has_4_31 && !fat_reuse {
                 for (loc, writers) in mv_writers_for_locs(
                     &mv_memory,
                     &self.cost_policy.promoted_locations(),
@@ -827,7 +837,7 @@ impl Pevm {
                     }
                 }
             }
-            if !stable_d1 {
+            if !lean_end {
                 for (loc, writers) in &d1_orders {
                     if writers.len() < 2 {
                         continue;
@@ -843,9 +853,9 @@ impl Pevm {
                     self.hotset.end_block();
                 }
             }
-            // O4/C3: stable 3356896 D1 — skip HotSet (above),
+            // O4/C3/S: stable 3356896 D1 or fat reuse — skip HotSet (above),
             // inter-prior pack, and sketch decay.
-            if !stable_d1 {
+            if !lean_end {
                 let morph_hat = learner.morph_hat();
                 let top = learner.pack_top_locations();
                 let _alpha = self.inter_prior.end_block(morph_hat, top);

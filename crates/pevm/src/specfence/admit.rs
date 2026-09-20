@@ -899,7 +899,8 @@ pub(crate) fn queue_nearest_unfinished_successor(
     hops.sort_unstable();
     hops.dedup();
     // O1: leftover past the begin prefix is one cheap continuation hop,
-    // not a w-wide (or full-spine) plant.
+    // not a w-wide (or full-spine) plant. Proven cover (O/S) leaves
+    // leftover OCC — do not T3-slide extra Detect hops.
     let prefix_end = policy
         .pairs_of(location)
         .into_iter()
@@ -907,6 +908,9 @@ pub(crate) fn queue_nearest_unfinished_successor(
         .last()
         .map(|(_, succ)| succ);
     let leftover = prefix_end.is_some_and(|end| published >= end);
+    if leftover && !policy.leftover_slide_ok(location) {
+        return;
+    }
     hops.truncate(if leftover { 1 } else { w });
     for (pred, succ) in hops {
         if succ > published && !ready.is_started(succ) && !ready.is_writer_done(pred) {
@@ -2052,6 +2056,33 @@ mod tests {
             n <= 1,
             "O1: leftover continuation past Win_2 prefix is ≤1 hop, got {n}"
         );
+    }
+
+    #[test]
+    fn cover_ok_does_not_queue_leftover_slide() {
+        let ready = ReadyEdgeTable::new();
+        let policy = policy_for(176);
+        policy.promote_short_edge(0x32be, 40_000);
+        for pair in [(4, 31), (31, 66), (66, 67), (67, 69)] {
+            policy.note_short_pair(0x32be, pair.0, pair.1);
+        }
+        policy.remember_arm(0x32be, crate::specfence::policy::LocStrategy::win(2));
+        policy.test_set_cover_flags(0x32be, true, false, false, false);
+        queue_nearest_unfinished_successor(
+            &ready,
+            &policy,
+            &AccountHints::default(),
+            0x32be,
+            66,
+            Address::ZERO,
+            None,
+        );
+        assert!(
+            !policy.has_pending_idle(),
+            "O: proven cover must not queue leftover Detect hops"
+        );
+        let n = flush_pending_idle_edges(&ready, &policy);
+        assert_eq!(n, 0, "O: no leftover slide after cover_ok, got {n}");
     }
 
     #[test]
