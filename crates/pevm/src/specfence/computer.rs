@@ -34,13 +34,24 @@ pub(crate) fn next_sf_task(
         let _ = crate::specfence::admit::flush_pending_idle_edges(ready, p);
     }
     let refuse_before = ready.refuse_count();
-    // P1: gates ≠ global mode. Fat + lazy already seen → OCC idx pick
-    // even if a leftover reservation exists (K8 S-lazy 4–25× shell).
-    // Thin real spines keep the ProducerStage / wave path (3356896 C2).
+    // P1: gates ≠ global mode. Ungated txs keep the OCC collaborative
+    // index; a closed hole is skip-only (`next_task_with_wave_ready`).
+    // Fat + lazy already seen → ignore leftover reservations (K8 shell).
+    // Sub-fat real spines (CallWaw / Win_2, e.g. 19469101 n=469) still
+    // have pending gates without ProducerStage reserve — must not OCC-steal
+    // through those holes (PR24 abort-train hang).
     let fat_lazy =
         policy.is_some_and(|p| p.block_n() >= super::policy::FAT_N && p.lazy_already_seen());
-    if !stages.has_reserved() || fat_lazy {
+    if fat_lazy || (!stages.has_reserved() && !ready.has_pending_gated()) {
         return scheduler.next_task();
+    }
+    if !stages.has_reserved() {
+        let task = scheduler.next_task_with_wave_ready(Some(wave), Some(ready));
+        if let Some(m) = metrics {
+            let n = ready.refuse_count().saturating_sub(refuse_before);
+            m.record_refuse_admit_n(n);
+        }
+        return task;
     }
     // Drop Aborting / Done reservations so a dead writer cannot wait_for_dependency the
     // ProducerStage min and starve the rest of the ready-set.
