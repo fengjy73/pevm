@@ -597,6 +597,7 @@ impl Pevm {
                                 w,
                                 specfence.ready_edges,
                                 specfence.producer_stages,
+                                specfence.policy,
                                 Some(&metrics_inner),
                             )
                         } else {
@@ -611,27 +612,38 @@ impl Pevm {
                     while task.is_some() {
                         task = match task.unwrap() {
                             Task::Execution(tx_version) => {
-                                if self.concurrency_mode == ConcurrencyMode::SpecFence {
+                                let sf = self.concurrency_mode == ConcurrencyMode::SpecFence;
+                                // O5: ungated + no live gates ≡ OCC (no started/done meta).
+                                if sf
+                                    && (specfence.ready_edges.is_gated(tx_version.tx_idx)
+                                        || specfence.ready_edges.has_any_gated())
+                                {
                                     specfence.ready_edges.note_started(tx_version.tx_idx);
                                 }
                                 let occ_exec = occ_mode
-                                    || (self.concurrency_mode == ConcurrencyMode::SpecFence
-                                        && !specfence.ready_edges.is_gated(tx_version.tx_idx));
+                                    || (sf && !specfence.ready_edges.is_gated(tx_version.tx_idx));
                                 if occ_exec {
                                     let done_idx = tx_version.tx_idx;
                                     let next = self
                                         .try_execute(&mut vm, &scheduler, tx_version, None, None);
-                                    if self.concurrency_mode == ConcurrencyMode::SpecFence
-                                        && scheduler.is_done(done_idx)
-                                    {
+                                    if sf && scheduler.is_done(done_idx) {
                                         // Wake only after a successful incarnation.
                                         // Stamping Done on abort lets dependents
                                         // OCC-steal against ESTIMATE → seq≠par.
-                                        specfence.ready_edges.note_producer_done_stamp(done_idx);
-                                        if specfence.ready_edges.has_known_waiters(done_idx)
-                                            && let Some(w) = wave_ref
+                                        // O5: skip stamp when the block has no gates.
+                                        if specfence.ready_edges.has_any_gated()
+                                            || specfence.ready_edges.has_known_waiters(done_idx)
                                         {
-                                            specfence.ready_edges.note_producer_done(done_idx, w);
+                                            specfence
+                                                .ready_edges
+                                                .note_producer_done_stamp(done_idx);
+                                            if specfence.ready_edges.has_known_waiters(done_idx)
+                                                && let Some(w) = wave_ref
+                                            {
+                                                specfence
+                                                    .ready_edges
+                                                    .note_producer_done(done_idx, w);
+                                            }
                                         }
                                     }
                                     next
@@ -713,6 +725,7 @@ impl Pevm {
                                         w,
                                         specfence.ready_edges,
                                         specfence.producer_stages,
+                                        specfence.policy,
                                         Some(&metrics_inner),
                                     )
                                 } else {
@@ -829,12 +842,15 @@ impl Pevm {
                     self.hotset.end_block();
                 }
             }
-            // P1: pack InterBlockPrior from live morph hat + top-ℓ (flip → higher α).
-            let morph_hat = learner.morph_hat();
-            let top = learner.pack_top_locations();
-            let _alpha = self.inter_prior.end_block(morph_hat, top);
-            if !thin {
-                sketch.decay_warm_failures(|loc| learner.abort_rate_of(loc));
+            // O4: edge_4_31 + thin D1 is stable — skip HotSet (above),
+            // inter-prior pack, and sketch decay.
+            if !(ready_has_4_31 && thin) {
+                let morph_hat = learner.morph_hat();
+                let top = learner.pack_top_locations();
+                let _alpha = self.inter_prior.end_block(morph_hat, top);
+                if !thin {
+                    sketch.decay_warm_failures(|loc| learner.abort_rate_of(loc));
+                }
             }
             metrics_inner.set_soft_wait_arms(dag.soft_arm_count());
             metrics_inner.set_sketch_hot_size(sketch.hot_size());
@@ -888,7 +904,10 @@ impl Pevm {
                 .filter(|(_, w)| !crate::specfence::admit::is_wide_envelope_writer_set(&hints, w))
                 .cloned()
                 .collect();
-            self.cost_policy.note_promoted_writer_orders(&persist);
+            // O4: reuse D1 already has 4→31… — skip the persist walk.
+            if !self.cost_policy.d1_pairs_already_stored(&persist) {
+                self.cost_policy.note_promoted_writer_orders(&persist);
+            }
             let mut d1_orders = d1_orders;
             if !(ready_has_4_31 && thin) {
                 for (loc, writers) in self.cost_policy.writer_orders_from_pairs() {

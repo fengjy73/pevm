@@ -391,6 +391,12 @@ fn admit_seed_hint_short_edges(
             policy.promote_short_edge(loc, 0);
             policy.note_hops_decision(loc, n_pairs.max(pairs.len()));
             edges += planted;
+            // O2: cold begin plants one CallWaw trio (14→16→17). The second
+            // (15→19→20) waits for a measured abort — two extra holes are
+            // prepaid width with no Detect win on 3356896.
+            if policy.is_optimistic_majority_block() {
+                break;
+            }
         }
     }
     edges
@@ -888,7 +894,16 @@ pub(crate) fn queue_nearest_unfinished_successor(
     }
     hops.sort_unstable();
     hops.dedup();
-    hops.truncate(w);
+    // O1: leftover past the begin prefix is one cheap continuation hop,
+    // not a w-wide (or full-spine) plant.
+    let prefix_end = policy
+        .pairs_of(location)
+        .into_iter()
+        .take(w)
+        .last()
+        .map(|(_, succ)| succ);
+    let leftover = prefix_end.is_some_and(|end| published >= end);
+    hops.truncate(if leftover { 1 } else { w });
     for (pred, succ) in hops {
         if succ > published && !ready.is_started(succ) && !ready.is_writer_done(pred) {
             policy.queue_idle_edge(location, pred, succ);
@@ -920,11 +935,10 @@ pub(crate) fn flush_pending_idle_edges(ready: &ReadyEdgeTable, policy: &CostPoli
         if policy.hops_to_plant(loc, n_pairs) == 0 {
             continue;
         }
-        let cap = policy
-            .window_w_of(loc, n_pairs)
-            .clamp(1, policy.w_cap_of(n_pairs).max(1));
-        if pairs.len() > cap {
-            pairs.truncate(cap);
+        // O1: next-quantum flush is leftover continuation — 1 hop, never
+        // a begin-width or full-spine prepaid list.
+        if pairs.len() > 1 {
+            pairs.truncate(1);
         }
         for (pred, succ) in pairs {
             if pred >= succ || ready.is_started(succ) || ready.is_writer_done(pred) {
@@ -1758,17 +1772,15 @@ mod tests {
             &HashSet::new(),
             None,
         );
-        // L5: no "at most one CallWaw" cap. Cold Full prior may plant both.
-        assert!(
-            n == 2 || n == 4,
-            "L5: each trio independently Full or Defer, got {n}"
-        );
+        // O2: cold begin plants the first trio only (14→16→17). 15→19→20
+        // waits for a measured abort so we do not pay two extra holes.
+        assert_eq!(n, 2, "O2: cold hint plants one CallWaw trio, got {n}");
         assert_eq!(ready.blocking_producer(16), Some(14));
         assert_eq!(ready.blocking_producer(17), Some(16));
-        if n == 4 {
-            assert_eq!(ready.blocking_producer(19), Some(15));
-            assert_eq!(ready.blocking_producer(20), Some(19));
-        }
+        assert!(
+            ready.may_execute(19) && ready.may_execute(20),
+            "O2: second trio stays unfenced at cold begin"
+        );
     }
 
     #[test]
@@ -1971,6 +1983,31 @@ mod tests {
         assert!(
             ready.may_execute(67),
             "O3: started 67 must stay A0 this incarnation"
+        );
+    }
+
+    #[test]
+    fn leftover_continuation_is_one_hop() {
+        let ready = ReadyEdgeTable::new();
+        let policy = policy_for(176);
+        policy.promote_short_edge(0x32be, 40_000);
+        for pair in [(4, 31), (31, 66), (66, 67), (67, 69)] {
+            policy.note_short_pair(0x32be, pair.0, pair.1);
+        }
+        policy.remember_arm(0x32be, crate::specfence::policy::LocStrategy::win(2));
+        queue_nearest_unfinished_successor(
+            &ready,
+            &policy,
+            &AccountHints::default(),
+            0x32be,
+            66,
+            Address::ZERO,
+            None,
+        );
+        let n = flush_pending_idle_edges(&ready, &policy);
+        assert!(
+            n <= 1,
+            "O1: leftover continuation past Win_2 prefix is ≤1 hop, got {n}"
         );
     }
 
