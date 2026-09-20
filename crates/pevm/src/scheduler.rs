@@ -306,13 +306,16 @@ impl Scheduler {
                         MinRun::Empty => {}
                     }
                 }
-                // Waiting on an OrderedAdmit producer: spin first so 7
-                // yield_now() cores do not preempt the remaining writer.
-                // Product-path yield meter (P1). Instant idle ≠ ĉ (S2).
+                // O6: spin only while a sleeper's pred is actually Executing.
+                // Sleeping on a not-yet-started hole is skip, not busy-wait.
+                // Instant idle ≠ ĉ (S2).
                 let idle_t0 = Instant::now();
                 if waiting {
-                    for _ in 0..64 {
-                        std::hint::spin_loop();
+                    let busy = ready.is_some_and(|e| e.sleeper_pred_busy(|w| self.is_executing(w)));
+                    if busy {
+                        for _ in 0..16 {
+                            std::hint::spin_loop();
+                        }
                     }
                 }
                 thread::yield_now();

@@ -708,6 +708,15 @@ impl ReadyEdgeTable {
         self.sleeping.contains(&tx_idx) && !self.may_execute(tx_idx)
     }
 
+    /// O6: true when some sleeper is blocked on a producer that is Executing.
+    #[inline]
+    pub(crate) fn sleeper_pred_busy(&self, mut is_executing: impl FnMut(TxIdx) -> bool) -> bool {
+        self.sleeping
+            .iter()
+            .take(8)
+            .any(|t| self.blocking_producer(*t).is_some_and(|w| is_executing(w)))
+    }
+
     #[inline]
     pub(crate) fn add_refuse_ns(&self, ns: u64) {
         if ns > 0 {

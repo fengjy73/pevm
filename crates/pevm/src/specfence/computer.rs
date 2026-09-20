@@ -9,6 +9,7 @@
 //! A0 / ungated majority: skip empty ProducerStage scan; ReadyEdge tax only on gated txs.
 
 use super::metrics::MetricsInner;
+use super::policy::CostPolicy;
 use super::producer_stage::ProducerStageTable;
 use super::ready_edge::ReadyEdgeTable;
 use super::wave::WaveParkTable;
@@ -22,8 +23,16 @@ pub(crate) fn next_sf_task(
     wave: &WaveParkTable,
     ready: &ReadyEdgeTable,
     stages: &ProducerStageTable,
+    policy: Option<&CostPolicy>,
     metrics: Option<&MetricsInner>,
 ) -> Option<Task> {
+    // O1: plant queued leftover continuation hops at this pick quantum
+    // (not mid-execute). One hop, never full-spine.
+    if let Some(p) = policy
+        && p.has_pending_idle()
+    {
+        let _ = crate::specfence::admit::flush_pending_idle_edges(ready, p);
+    }
     let refuse_before = ready.refuse_count();
     // S1/P1: no *pending* holes → OCC idx pick. Finished gates are not a
     // global mode switch — independents return to `next_occ_task`.

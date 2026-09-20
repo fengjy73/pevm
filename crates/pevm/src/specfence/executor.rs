@@ -133,12 +133,13 @@ fn note_and_try_commute(
         tx_idx,
         invalid,
     ) {
+        // O3: commute accept is lazy value-stable first; skip ignore_conflict
+        // DashMap on the success path (count only).
         let _ = mv_memory.try_rebind_invalid_reads_value_stable(tx_idx, invalid)
             || mv_memory.try_rebind_invalid_reads(tx_idx, invalid);
         specfence.metrics.record_commute_skip();
         if let Some(p) = specfence.policy {
             p.note_commute_skip();
-            p.ignore_conflict(None);
         }
         return true;
     }
