@@ -29,7 +29,18 @@
 - `leftover_long_measured_opt_does_not_explore_window`（无信号仍挡未测 Win）
 - 既有 iter11 / Done-stamp / leftover hops=0 / Full 禁长脊
 
-## Compare
+## Compare 3356896 @8 Soft=0 N=7
+
+| | OCC med | SF reuse | long ℓ | unfenced | double_pay | PRIMARY |
+|---|---|---|---|---|---|---|
+| PR31 | 0.916 | **1.147** | Opt/Defer/16–18 | 14 | 0 (pay-once OCC) | false |
+| **this** | **0.908** | **1.100** | **Win_16/17** (from reuse[2]) | **0–1** | 0 after covering | **false** |
+
+Reuse SF walls: 1.112, 1.100, 1.331, 1.047, **0.978**, **0.962** (med 1.100).  
+Covering iters: `dff71d59:Win_16/17`, `covering=1`, `main_inc=[]`, occ_aborts 0–1, refuse 6–104µs.  
+Cold still Win_2 leftover then Opt trial; `last_sys_reexec` upgrades; `last_cover_ok` sticks.  
+Soft=0; iter11 **0.02s**; `erc20_independent` 0.44s; wall ≪ PR22 ~1.40.  
+PRIMARY miss is remaining Detect prepaid vs OCC overlap (~0.19ms), not leftover OCC train.
 
 ```
 SPECFENCE_COMPARE_ITERS=7 cargo run -p pevm --release \
