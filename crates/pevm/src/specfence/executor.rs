@@ -321,7 +321,7 @@ pub(crate) fn validate_occ_kernel(
     let invalid = mv_memory.collect_invalid_reads(tx_version.tx_idx);
     let optimistic_ungated = specfence
         .policy
-        .is_some_and(|p| p.is_optimistic_majority_block())
+        .is_some_and(|p| p.skip_ungated_tx_path_tax())
         && !specfence.ready_edges.is_gated(tx_version.tx_idx);
     if optimistic_ungated {
         return occ_abort_ungated(mv_memory, scheduler, tx_version, specfence, &invalid);
@@ -484,7 +484,7 @@ pub(crate) fn validate_specfence(
     // Thin-shell A0: commute already tried; failed commute ≡ OCC abort.
     let optimistic_ungated = specfence
         .policy
-        .is_some_and(|p| p.is_optimistic_majority_block())
+        .is_some_and(|p| p.skip_ungated_tx_path_tax())
         && !specfence.ready_edges.is_gated(tx_version.tx_idx);
     if optimistic_ungated {
         return occ_abort_ungated(mv_memory, scheduler, tx_version, specfence, &invalid);

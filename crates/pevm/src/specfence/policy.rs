@@ -25,19 +25,20 @@
 //! whole-spine; a prefix shorter than `cover_window` plus leftover OCC is
 //! Detect+Resolve double charge. Systematic reexec must not nail Opt (L4).
 //! Independent txs stay ungated (S1). Under-covered conflict spines
-//! (cover_window cannot absorb leftover, or ordered prepaid is not
-//! cheaper than OCC abort) stay sticky OptimisticRead — never Full/Seg
-//! hard-order, never empty Win_1 churn, never learn-uphill. Mid-band
-//! leftover-long real spines yield the whole spine unless cover is
-//! proven cheaper; a wait-set already at the soft-cap that still loses
-//! drops `cover_window` and withdraws order. Wait-set soft-cap is an
-//! over-admission OrderedAdmit predicate, not `n≥512` alone. Mid-band
-//! lean `end_block` skips HotSet / inter-prior / sketch / MV merge once
-//! D1 or conflict structure is already seen. OCC-aligned Opt path tax
-//! skip covers large lazy-update / near-independent **and** mid/large
-//! blocks whose wait-set is empty or only short-chain. Ungated OCC
-//! task selection is unchanged. Lazy-update chains are never
-//! OrderedAdmit objects.
+//! (L≫64: cover_window cannot absorb leftover) stay sticky
+//! OptimisticRead — never Full/Seg hard-order, never empty Win_1
+//! churn, never learn-uphill. Mid-band real Basic/storage
+//! (L∈[20,64], plus real Basic up to the under-covered floor) may
+//! **probe** a short segmented/sliding `cover_window` on cold/crisis;
+//! sticky only on wall success vs the OCC abort counterfactual, else
+//! OptimisticRead. Wait-set soft-cap is an over-admission predicate
+//! decoupled from cover depth: at-cap leftover deepens the next
+//! segment instead of total withdraw. Near-independent large blocks
+//! drop non-critical wait-set slots. Ungated execute+validate is
+//! OCC-equivalent (`skip_ungated_tx_path_tax`); gates are edge
+//! constraints (ungated_occ ≈ n − wait_set). Lazy-update /
+//! thousand-writer chains are never OrderedAdmit objects. Instant
+//! idle never enters ĉ.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -68,7 +69,17 @@ pub(crate) const THIN_N_MAX: usize = 256;
 /// Unknown long chain on a large block with no EffectiveWAW → lazy-update.
 const LAZY_CHAIN_PAIR_FLOOR: usize = 32;
 /// Storage spine whose cover_window cannot absorb leftover (19807137-class).
+/// C2: L≫64 prefers OptimisticRead / OCC abort.
 const UNDER_COVERED_SPINE_PAIRS: usize = 64;
+/// C1: mid-band real Basic/storage cover band (L∈[20,64]).
+const MIDBAND_COVER_MIN: usize = 20;
+/// C3: thousand-writer chain on a large block is never OrderedAdmit
+/// unless Storage (15274915 Full/996). Real Basic-77 stays below this.
+const THOUSAND_WRITER_PAIRS: usize = 128;
+/// L1: controlled cover probes before sticky OptimisticRead.
+const COVER_PROBE_BUDGET: u8 = 2;
+/// C4: deepen `cover_window` by one segment when the wait-set is at cap.
+const COVER_SEGMENT_GROW: usize = 8;
 /// Runaway-plant hat (safety, not a strategy nail like WINDOWED_W_MAX=3).
 const WINDOW_SAFETY_HAT: usize = 32;
 /// Seg length hat (safety, not SEG_TX=4).
@@ -508,6 +519,10 @@ struct PromotedLoc {
     /// systematic reexec / leftover train. 0 = unset (cold uses
     /// `light_cover_w`, never `n_pairs−1`).
     cover_window: u8,
+    /// L1: cover probes already spent (cold/crisis). Sticky only on wall ok.
+    cover_probe_n: u8,
+    /// L2: last ordered probe lost on wall vs OCC abort counterfactual.
+    cover_wall_lost: bool,
     /// C1/C2: lazy vs real Basic/storage. Sticky once observed.
     object: LocObject,
     /// True after an EffectiveWAW / non-lazy Data write on this ℓ.
@@ -543,6 +558,8 @@ impl PromotedLoc {
             last_sys_reexec: false,
             last_cover_ok: false,
             cover_window: 0,
+            cover_probe_n: 0,
+            cover_wall_lost: false,
             object: LocObject::Unknown,
             saw_effective: false,
             morph: morph_key(0, false),
@@ -1079,16 +1096,23 @@ impl CostPolicy {
 
     /// C1 with a live writer/pair count (write-set D1 may outrun `short_chain`).
     pub(crate) fn loc_forbids_n(&self, location: MemoryLocationHash, n_pairs: usize) -> bool {
+        let stored = self
+            .short_chain
+            .get(&location)
+            .map(|c| c.len())
+            .unwrap_or(0);
+        let n = n_pairs.max(stored);
         match self.loc_object_map(location) {
             LocObject::Lazy => true,
             LocObject::Storage => false,
-            LocObject::Basic | LocObject::Unknown => {
-                let stored = self
-                    .short_chain
-                    .get(&location)
-                    .map(|c| c.len())
-                    .unwrap_or(0);
-                self.unknown_looks_lazy(n_pairs.max(stored), false)
+            LocObject::Basic => {
+                // C3: thousand-writer on a large block is never OA (996-class).
+                // Real Basic-77 (15274915) stays an OrderedAdmit object.
+                self.block_n() >= LARGE_BLOCK_N && n >= THOUSAND_WRITER_PAIRS
+            }
+            LocObject::Unknown => {
+                self.unknown_looks_lazy(n, false)
+                    || (self.block_n() >= LARGE_BLOCK_N && n >= THOUSAND_WRITER_PAIRS)
             }
         }
     }
@@ -1170,9 +1194,20 @@ impl CostPolicy {
     /// Large lazy-update / near-independent: drop ungated execute+validate
     /// path tax. Same-block reuse uses the process-persistent structure flag
     /// because `lazy_seen` is per-block. Must not disable ungated OCC pick.
+    /// Block-level: empty / short-chain wait-set only (lean `end_block`,
+    /// after-publish D1 skip). Per-tx ungated skip is
+    /// [`skip_ungated_tx_path_tax`].
     #[inline]
     pub(crate) fn skip_ungated_path_tax(&self) -> bool {
         self.large_lazy_path_tax() || self.opt_aligned_path_tax()
+    }
+
+    /// P1: ungated execute+validate is OCC-equivalent. Gated txs
+    /// (`was_queued` / `is_gated`) still take the SpecFence path.
+    /// Mid/large ungated txs skip even when a leftover-long wait-set exists.
+    #[inline]
+    pub(crate) fn skip_ungated_tx_path_tax(&self) -> bool {
+        self.is_optimistic_majority_block() || self.block_n() > THIN_N_MAX
     }
 
     /// Large + lazy-update may ignore leftover reservations at pick.
@@ -1228,10 +1263,12 @@ impl CostPolicy {
 
     /// Soft-cap the OrderedAdmit wait-set under **over-admission** risk.
     ///
-    /// Predicate is wait-set / cover_window inflation — not `n≥512` alone.
+    /// C4: cap is decoupled from cover depth — at-cap leftover deepens
+    /// `cover_window` by a segment instead of total withdraw.
+    /// P3: near-independent large blocks (and large blocks with no
+    /// mid-band coverable spine) drop non-critical wait-set slots.
     /// Thin short-chain (3356896) stays uncapped unless cover_window already
-    /// inflated. Mid-band real spines (19716145 begin~108, 19860366 begin~76)
-    /// take the same light prefix as large blocks.
+    /// inflated. Mid-band real spines keep the light prefix.
     pub(crate) fn wait_set_soft_cap(&self) -> Option<usize> {
         let n = self.block_n();
         if n == 0 {
@@ -1240,7 +1277,70 @@ impl CostPolicy {
         if n <= THIN_N_MAX && !self.cover_window_inflated() {
             return None;
         }
+        if self.should_drop_noncritical_wait_set() {
+            return Some(0);
+        }
         Some(self.cores().max(8).min(16))
+    }
+
+    /// P3 / C2: no mid-band coverable spine → do not keep 4–8 leftover
+    /// holes on a near-independent or ultra-long-only large block.
+    fn should_drop_noncritical_wait_set(&self) -> bool {
+        if self.has_midband_coverable_spine() {
+            return false;
+        }
+        let n = self.block_n();
+        if n >= LARGE_BLOCK_N {
+            return true;
+        }
+        n > THIN_N_MAX && self.has_only_short_real_spines()
+    }
+
+    fn has_midband_coverable_spine(&self) -> bool {
+        self.short_chain.iter().any(|e| {
+            let n_pairs = e.value().len();
+            self.is_midband_coverable(*e.key(), n_pairs)
+        })
+    }
+
+    fn has_only_short_real_spines(&self) -> bool {
+        let mut saw = false;
+        for e in self.short_chain.iter() {
+            let n_pairs = e.value().len();
+            if self.loc_forbids_n(*e.key(), n_pairs) {
+                continue;
+            }
+            saw = true;
+            if n_pairs >= MIDBAND_COVER_MIN {
+                return false;
+            }
+        }
+        saw
+    }
+
+    /// C1: real Basic/storage leftover-long in the probeable cover band.
+    /// Storage L≥64 and Basic L≥128 stay under-covered (C2).
+    fn is_midband_coverable(&self, location: MemoryLocationHash, n_pairs: usize) -> bool {
+        if self.loc_forbids_n(location, n_pairs) {
+            return false;
+        }
+        let n_pairs = self.loc_n_pairs(location, n_pairs);
+        if n_pairs < MIDBAND_COVER_MIN {
+            return false;
+        }
+        if self.is_under_covered_spine(location, n_pairs) {
+            return false;
+        }
+        !matches!(self.loc_object(location), LocObject::Lazy)
+    }
+
+    /// L3: leftover-long below the mid-band cover floor — Opt/Defer only.
+    fn loc_is_near_independent(&self, location: MemoryLocationHash, n_pairs: usize) -> bool {
+        let n_pairs = self.loc_n_pairs(location, n_pairs);
+        n_pairs > ORDER_WINDOW_K
+            && n_pairs < MIDBAND_COVER_MIN
+            && self.block_n() > THIN_N_MAX
+            && !matches!(self.loc_object(location), LocObject::Storage)
     }
 
     /// cover_window climbing while leftover / crisis is still live.
@@ -1293,17 +1393,46 @@ impl CostPolicy {
         (prepaid > 0 && prepaid >= abort) || self.prepaid_lose_streak.load(Ordering::Relaxed) >= 1
     }
 
-    /// Wait-set already at the over-admission cap and the last ordered
-    /// prepaid still lost (or leftover/unfenced still leak).
-    fn wait_set_capped_losing(&self) -> bool {
-        let at_cap = self.wait_set_at_cap.load(Ordering::Relaxed)
-            || self.last_wait_set_at_cap.load(Ordering::Relaxed);
-        if !at_cap {
+    /// L1: cold/crisis may probe a short cover_window. Sticky only on
+    /// wall success (`cover_proven_cheaper`). Failed probe → OptimisticRead.
+    /// Never-tried is not a reason to refuse cover.
+    fn can_probe_cover(&self, location: MemoryLocationHash, n_pairs: usize) -> bool {
+        if self.loc_forbids_n(location, n_pairs) {
             return false;
         }
-        self.ordered_prepaid_ge_abort()
-            || self.unfenced_reexec.load(Ordering::Relaxed) >= 4
-            || self.prepaid_lose_streak.load(Ordering::Relaxed) >= 1
+        let n_pairs = self.loc_n_pairs(location, n_pairs);
+        if !self.is_midband_coverable(location, n_pairs) {
+            return false;
+        }
+        if self.block_n() <= THIN_N_MAX {
+            return false;
+        }
+        if self.cover_proven_cheaper(location, n_pairs) {
+            return false;
+        }
+        let Some(s) = self.promoted.get(&location) else {
+            return true;
+        };
+        if s.cover_wall_lost {
+            return false;
+        }
+        if s.cover_probe_n >= COVER_PROBE_BUDGET {
+            return false;
+        }
+        // Do not call phase_of here — it → covering_sticky → yield → here.
+        s.cover_probe_n == 0 || s.last_crisis || s.samples < HOT_LOC_N
+    }
+
+    /// First / next probe width: one cores-scaled segment, not oversub hat 2.
+    fn probe_cover_w(&self, location: MemoryLocationHash, n_pairs: usize) -> usize {
+        let full = full_cover_w(n_pairs);
+        let seg = self.cores().max(4).min(8);
+        let stored = self
+            .promoted
+            .get(&location)
+            .map(|s| s.cover_window as usize)
+            .unwrap_or(0);
+        stored.max(seg).min(self.train_hat(n_pairs)).min(full).max(2)
     }
 
     /// Cover is proven cheaper than OCC abort: measured covering arm,
@@ -1345,10 +1474,10 @@ impl CostPolicy {
 
     /// Whole-spine yield to OptimisticRead / OCC abort.
     ///
-    /// M1/M3: mid/large leftover-long real spines stay sticky OptimisticRead
-    /// unless cover is proven cheaper. Under-covered, prepaid ≱ abort, or
-    /// wait-set already at cap and still losing also yield. Empty Win_1 is
-    /// not an eligible arm — no cover_window climb, no costly Seg/Full.
+    /// C2: under-covered (L≫64) stays sticky OptimisticRead.
+    /// L1: mid-band real spines may probe a short cover_window until
+    /// wall success or a failed probe. C4: wait-set at the soft-cap
+    /// does **not** total-withdraw — deepen by a segment instead.
     /// Thin short-chain (3356896) keeps light-cover Win_2.
     fn yield_to_occ_abort(&self, location: MemoryLocationHash, n_pairs: usize) -> bool {
         if self.loc_forbids_n(location, n_pairs) {
@@ -1368,17 +1497,27 @@ impl CostPolicy {
         if self.cover_proven_cheaper(location, n_pairs) {
             return false;
         }
-        // M1: wait-set already soft-capped and still losing → withdraw order.
-        if self.wait_set_capped_losing() {
+        // L1: controlled cold/crisis probe — never "never tried ⇒ never cover".
+        if self.can_probe_cover(location, n_pairs) {
+            return false;
+        }
+        // C4: wait-set at cap is not a yield. Failed wall / exhausted probe is.
+        if self
+            .promoted
+            .get(&location)
+            .is_some_and(|s| s.cover_wall_lost)
+        {
             return true;
         }
-        // M1: ordered prepaid is not cheaper than OCC abort.
-        if self.ordered_prepaid_ge_abort() {
+        if self.ordered_prepaid_ge_abort()
+            && self
+                .promoted
+                .get(&location)
+                .is_some_and(|s| s.cover_probe_n > 0 || s.decision.is_ordered())
+        {
             return true;
         }
-        // M1/M3: leftover-long mid/large without proven cheaper cover.
-        // Empty Win_1 / light prefix cannot close a real spine.
-        self.ban_empty_win1(location, n_pairs)
+        n_pairs > ORDER_WINDOW_K
     }
 
     /// Begin-seed mouth: skip OrderedAdmit wait-set when the spine yields
@@ -1445,6 +1584,12 @@ impl CostPolicy {
         if n_pairs <= ORDER_WINDOW_K {
             return base;
         }
+        if self.can_probe_cover(location, n_pairs) {
+            return self
+                .probe_cover_w(location, n_pairs)
+                .max(base)
+                .min(self.train_hat(n_pairs));
+        }
         let Some(s) = self.promoted.get(&location) else {
             return base;
         };
@@ -1477,7 +1622,10 @@ impl CostPolicy {
         }
         let n = self.block_n();
         let cores = self.cores();
-        let cap = if n >= LARGE_BLOCK_N {
+        let cap = if n_pairs >= MIDBAND_COVER_MIN && n < LARGE_BLOCK_N {
+            // C4: one segment first, room to deepen a second segment.
+            cores.max(8).saturating_mul(2).min(16)
+        } else if n >= LARGE_BLOCK_N {
             light.max(2).min(4)
         } else {
             cores.max(4).min(8)
@@ -1537,10 +1685,15 @@ impl CostPolicy {
             .get(&location)
             .map(|c| c.len())
             .unwrap_or(0);
-        // M1: leftover-long mid/large that yields to OCC abort must not
-        // T3-slide extra Detect hops (19716145 wait-set + hops=0 hang).
+        // Yield must not T3-slide extra Detect hops (19716145 hops=0 hang).
         if self.yield_to_occ_abort(location, n_pairs) {
             return false;
+        }
+        // C1/C4: mid-band probe slides the next segment while leftover remains.
+        if self.is_midband_coverable(location, n_pairs)
+            && !self.cover_proven_cheaper(location, n_pairs)
+        {
+            return true;
         }
         let Some(s) = self.promoted.get(&location) else {
             return true;
@@ -1803,12 +1956,15 @@ impl CostPolicy {
         if n_pairs > ORDER_WINDOW_K && arm == LocStrategy::FullChain {
             arm = if self.yield_to_occ_abort(location, n_pairs) {
                 LocStrategy::OptimisticRead
+            } else if self.can_probe_cover(location, n_pairs) {
+                LocStrategy::win(self.probe_cover_w(location, n_pairs))
             } else if self.reopen_ordered(location) {
                 LocStrategy::win(self.loc_cover_window(location, n_pairs))
             } else {
                 LocStrategy::OptimisticRead
             };
         }
+        let probing = arm.is_ordered() && self.can_probe_cover(location, n_pairs);
         if let Some(e) = self.promoted.get(&location) {
             if e.prev_decision != arm && self.block_seq.load(Ordering::Relaxed) > 1 {
                 self.arm_switch_n.fetch_add(1, Ordering::Relaxed);
@@ -1817,6 +1973,9 @@ impl CostPolicy {
         // Persist even when hops=0 (Defer/Opt). Otherwise census / learn
         // keep the prior Win_w and the next begin replants the half-window.
         self.remember_arm(location, arm);
+        if probing && let Some(mut e) = self.promoted.get_mut(&location) {
+            e.cover_probe_n = e.cover_probe_n.saturating_add(1);
+        }
         if explore || arm != greedy {
             self.explore_n.fetch_add(1, Ordering::Relaxed);
         }
@@ -1867,6 +2026,14 @@ impl CostPolicy {
             self.try_consume_explore_budget()
         };
         let eligible = self.generate_arms(location, n_pairs, demoted, !hot || crisis, crisis);
+        // L1: force a covering probe — unused Opt prior must not skip never-tried cover.
+        if self.can_probe_cover(location, n_pairs) {
+            if let Some(&probe) = eligible.iter().find(|a| {
+                matches!(a, LocStrategy::OrderedWindow { .. } | LocStrategy::Segmented { .. })
+            }) {
+                return (probe, true, probe);
+            }
+        }
         let stats = self.arm_c_n(location, n_pairs, &eligible);
         let n_tot: f64 = stats.iter().map(|&(_, _, n)| n.max(1.0)).sum();
         let sigma = explore_sigma(&stats);
@@ -1943,10 +2110,31 @@ impl CostPolicy {
         if self.loc_forbids_ordered(location) {
             return vec![LocStrategy::OptimisticRead, LocStrategy::DeferPlant];
         }
-        // Under-covered / prepaid not cheaper / wait-set-capped lose:
-        // sticky OptimisticRead / OCC abort. No Full/Seg; no empty Win_1.
+        // L3: near-independent leftover-long below the mid-band floor.
+        if self.loc_is_near_independent(location, n_pairs) {
+            return vec![LocStrategy::OptimisticRead, LocStrategy::DeferPlant];
+        }
+        // C2: under-covered / failed probe: sticky OptimisticRead.
+        // L1: mid-band probe is not a yield — covering arms stay eligible.
         if self.yield_to_occ_abort(location, n_pairs) {
             return vec![LocStrategy::OptimisticRead, LocStrategy::DeferPlant];
+        }
+        // L1/C1: controlled probe of a short segmented/sliding cover_window.
+        if self.can_probe_cover(location, n_pairs) {
+            let w = self.probe_cover_w(location, n_pairs);
+            let mut probe = vec![
+                LocStrategy::OptimisticRead,
+                LocStrategy::DeferPlant,
+                LocStrategy::win(w),
+            ];
+            if n_pairs >= 3 {
+                probe.push(LocStrategy::seg(covering_seg_len(
+                    n_pairs,
+                    self.cores(),
+                    w,
+                )));
+            }
+            return probe;
         }
         let mut out = vec![LocStrategy::OptimisticRead, LocStrategy::DeferPlant];
         let w_cap = self.w_cap_for(location, n_pairs);
@@ -3154,25 +3342,33 @@ impl CostPolicy {
             let full = full_cover_w(n_pairs);
             let light = self.light_hat(n_pairs);
             let train = self.train_hat(n_pairs);
-            // Lazy-update chain never raise Win from unfenced or sys-reexec.
-            // Reward stays OCC-comparable wall.
+            // Lazy-update / thousand-writer never raise Win from unfenced.
+            // L2: reward is loc wall vs OCC abort counterfactual — not
+            // unfenced-only. Instant idle never enters loc_wall.
+            let loc_wall = e
+                .block_reexec_ns
+                .saturating_add(e.block_ordered_ns.saturating_add(refuse_share));
+            let abort_hat = abort_cf.max(e.reexec_ns_ema as u64).max(1);
+            let wall_cover_cheaper =
+                loc_wall > 0 && loc_wall.saturating_add(NS_DELTA as u64) < abort_hat;
             let lazy_obj = e.object == LocObject::Lazy
                 || (self.block_n() >= LARGE_BLOCK_N
                     && n_pairs >= LAZY_CHAIN_PAIR_FLOOR
-                    && !e.saw_effective);
-            let under_covered = !lazy_obj
-                && (under_covered_object(e.object, n_pairs)
-                    || (self.block_n() > THIN_N_MAX
-                        && n_pairs >= 3
-                        && leftover_hops >= 2
-                        && self.ordered_prepaid_ge_abort()));
-            // M1: wait-set already at the soft-cap and the ordered prefix
-            // still leaks → drop cover_window / withdraw order next begin.
+                    && !e.saw_effective)
+                || (self.block_n() >= LARGE_BLOCK_N
+                    && n_pairs >= THOUSAND_WRITER_PAIRS
+                    && e.object != LocObject::Storage);
+            // C2: ultra-long object only — prepaid≥abort is L2 wall, not under-cover.
+            let under_covered = !lazy_obj && under_covered_object(e.object, n_pairs);
+            let midband = !lazy_obj
+                && n_pairs >= MIDBAND_COVER_MIN
+                && !under_covered_object(e.object, n_pairs)
+                && self.block_n() > THIN_N_MAX;
+            // C4: at-cap leftover is a deepen signal, not a withdraw.
             let capped_lose = !lazy_obj
                 && self.wait_set_at_cap.load(Ordering::Relaxed)
                 && e.decision.is_ordered()
-                && leftover_hops >= 2
-                && (unfenced >= 4 || (prepaid > 0 && prepaid >= abort_cf));
+                && leftover_hops >= 2;
             if lazy_obj {
                 e.last_sys_reexec = false;
                 e.last_double_charge = false;
@@ -3241,17 +3437,20 @@ impl CostPolicy {
                 && unfenced >= 8
                 && (e.cover_window as usize) >= light
                 && n_pairs > train.saturating_mul(2);
-            if under_covered || capped_lose {
+            if under_covered {
                 e.last_sys_reexec = false;
-                if e.decision.is_ordered() && (leftover_hops >= 2 || unfenced >= 8) {
-                    e.last_double_charge = true;
-                }
-                if capped_lose {
-                    // M1: further drop cover_window / withdraw order.
-                    e.cover_window = 0;
-                    e.last_cover_ok = false;
-                    e.last_crisis = false;
-                }
+                e.last_crisis = false;
+            } else if capped_lose && midband {
+                // C4: deepen cover by a segment; do not zero cover_window.
+                let cur = (e.cover_window as usize)
+                    .max(light)
+                    .max(self.cores().max(4));
+                e.cover_window = (cur + COVER_SEGMENT_GROW).min(train).min(full) as u8;
+                e.last_cover_ok = false;
+            } else if capped_lose {
+                e.cover_window = 0;
+                e.last_cover_ok = false;
+                e.last_crisis = false;
             } else if sys_now {
                 let obs = (e.block_reexec_n as usize).max(2);
                 let first = light_cover_w(n_pairs, light, obs);
@@ -3260,13 +3459,21 @@ impl CostPolicy {
                 } else {
                     (e.cover_window as usize).max(first).min(train).min(full) as u8
                 };
-            } else if (detect_resolve_double_charge_now || under_cover) && !futile_cover {
+            } else if (detect_resolve_double_charge_now || under_cover)
+                && !futile_cover
+                && (!midband || wall_cover_cheaper || loc_wall == 0)
+            {
+                // L2: mid-band grow only when wall still beats abort CF.
                 let cur = if e.cover_window >= 1 {
                     e.cover_window as usize
                 } else {
                     planted.max(1)
                 };
-                let grow = leftover_hops.min(train).max(cur.max(planted) + 1);
+                let grow = if midband {
+                    (cur + COVER_SEGMENT_GROW).max(cur.max(planted) + 1)
+                } else {
+                    leftover_hops.min(train).max(cur.max(planted) + 1)
+                };
                 e.cover_window = grow.min(train).min(full) as u8;
             } else if e.decision.is_ordered() && e.block_reexec_n < 2 && unfenced < 4 {
                 let proven = planted.max(1).min(train).min(full);
@@ -3288,9 +3495,18 @@ impl CostPolicy {
             if e.decision.is_ordered() && e.block_reexec_n < 2 && unfenced < 4 {
                 e.last_crisis = false;
             }
-            // Under-covered / futile / wait-set-capped lose: no Full/Seg.
-            if under_covered || futile_cover || capped_lose {
+            // C2 / futile: no Full/Seg. C4 mid-band at-cap may keep crisis
+            // so the next begin can probe the deeper segment.
+            if under_covered || futile_cover || (capped_lose && !midband) {
                 e.last_crisis = false;
+            }
+            if e.decision.is_ordered() && loc_wall >= abort_hat && loc_wall > 0 && prepaid >= abort_cf
+            {
+                e.cover_wall_lost = true;
+                e.last_cover_ok = false;
+                e.last_crisis = false;
+            } else if e.decision.is_ordered() && wall_cover_cheaper {
+                e.cover_wall_lost = false;
             }
             let need_now = if e.cover_window >= 1 {
                 e.cover_window as usize
@@ -3314,9 +3530,10 @@ impl CostPolicy {
                 && e.block_reexec_n < 2
                 && unfenced < 4
                 && absorbed_train
+                && !e.cover_wall_lost
             {
                 e.last_cover_ok = true;
-            } else if e.block_reexec_n >= 2 || unfenced >= 4 {
+            } else if e.block_reexec_n >= 2 || unfenced >= 4 || e.cover_wall_lost {
                 e.last_cover_ok = false;
             }
             if !e.measured
@@ -5817,23 +6034,23 @@ mod tests {
     }
 
     #[test]
-    fn large_long_basic_is_lazy_equivalent() {
+    fn thousand_writer_basic_is_not_ordered() {
         let p = CostPolicy::new();
         p.begin_block_with_cores(800, 8);
         p.note_loc_write(0xca19, false);
         p.promote_short_edge(0xca19, 40_000);
-        for i in 0..40 {
+        for i in 0..130 {
             p.note_short_pair(0xca19, 100 + i, 101 + i);
         }
         assert!(
-            p.loc_forbids_ordered(0xca19),
-            "large long Basic (mis-labeled lazy-update) is not an OrderedAdmit object"
+            p.loc_forbids_n(0xca19, 130),
+            "C3: thousand-writer Basic on a large block is not an OrderedAdmit object"
         );
-        assert_eq!(p.hops_to_admit(0xca19, 40), 0);
-        let (arm, _, _) = p.select_arm(0xca19, 40);
+        assert_eq!(p.hops_to_admit(0xca19, 130), 0);
+        let (arm, _, _) = p.select_arm(0xca19, 130);
         assert!(
             !arm.is_ordered(),
-            "large long Basic must not pick Win/Full, got {arm:?}"
+            "C3: thousand-writer must not pick Win/Full, got {arm:?}"
         );
     }
 
@@ -5901,10 +6118,21 @@ mod tests {
         let cap = p.wait_set_soft_cap().expect("19860366-class wait-set cap");
         assert!((8..=16).contains(&cap));
         p.begin_block_with_cores(800, 8);
-        let cap = p.wait_set_soft_cap().expect("large-block wait-set cap");
+        assert_eq!(
+            p.wait_set_soft_cap(),
+            Some(0),
+            "P3: large block with no mid-band coverable spine drops wait-set"
+        );
+        p.note_loc_write(0xabc, false);
+        for i in 0..30 {
+            p.note_short_pair(0xabc, 10 + i, 11 + i);
+        }
+        let cap = p
+            .wait_set_soft_cap()
+            .expect("large + mid-band Basic spine keeps a light cap");
         assert!(
             (8..=16).contains(&cap),
-            "large-block wait-set cap is 8–16, got {cap}"
+            "large-block with a coverable Basic spine keeps 8–16, got {cap}"
         );
     }
 
@@ -6056,10 +6284,14 @@ mod tests {
             !p.skip_ungated_path_tax(),
             "mid-band leftover-long wait-set keeps the gated execute path"
         );
+        assert!(
+            p.skip_ungated_tx_path_tax(),
+            "P1: ungated txs still skip execute+validate path tax"
+        );
     }
 
     #[test]
-    fn midband_leftover_long_is_sticky_optimistic_read() {
+    fn midband_real_spine_probes_short_cover() {
         let p = CostPolicy::new();
         p.begin_block_with_cores(341, 8);
         p.note_loc_write(0xabc, false);
@@ -6068,36 +6300,50 @@ mod tests {
             p.note_short_pair(0xabc, 10 + i, 11 + i);
         }
         assert!(
-            p.should_skip_ordered_admit_seed(0xabc, 20),
-            "M1: mid-band leftover-long skips OrderedAdmit seed"
+            p.can_probe_cover(0xabc, 20),
+            "L1: mid-band leftover-long is probeable (never-tried is not a refuse)"
         );
-        assert_eq!(
-            p.hops_to_admit(0xabc, 20),
-            0,
-            "M1: mid-band leftover-long admits no wait-for hops"
+        assert!(
+            !p.should_skip_ordered_admit_seed(0xabc, 20),
+            "L1: mid-band probe plants a short cover_window"
+        );
+        let hops = p.hops_to_admit(0xabc, 20);
+        assert!(
+            hops >= 2 && hops < 20,
+            "C1: probe is a short segment, not full-spine, hops={hops}"
         );
         let (arm, _, _) = p.select_arm(0xabc, 20);
         assert!(
-            !arm.is_ordered(),
-            "M1: mid-band leftover-long is sticky OptimisticRead, got {arm:?}"
+            arm.is_ordered(),
+            "L1: cold probe picks a covering arm, got {arm:?}"
+        );
+        assert_ne!(arm, LocStrategy::FullChain, "C1: never whole-spine Full");
+        assert_ne!(
+            arm,
+            LocStrategy::win(1),
+            "C2: empty Win_1 is not a mid-band probe"
         );
         let cands = p.generate_arms(0xabc, 20, false, true, true);
         assert!(
-            !cands.iter().any(|a| a.is_ordered()),
-            "M3: must not invite empty Win_1 / costly arms, got {cands:?}"
+            cands.iter().any(|a| a.is_ordered() && *a != LocStrategy::win(1)),
+            "C1: probe eligible set includes segmented/sliding cover, got {cands:?}"
+        );
+        assert!(
+            !cands.iter().any(|a| *a == LocStrategy::FullChain),
+            "C1: probe must not offer Full, got {cands:?}"
         );
         assert!(
             p.skip_ungated_path_tax(),
-            "M2: empty wait-set on mid-band skips Opt path tax"
+            "P1: empty wait-set on mid-band skips block-level path tax"
         );
         assert!(
-            !p.leftover_slide_ok(0xabc),
-            "M1: leftover-long mid-band yield must not T3-slide"
+            p.leftover_slide_ok(0xabc),
+            "C4: mid-band probe slides the next segment"
         );
     }
 
     #[test]
-    fn wait_set_at_cap_drops_cover_window() {
+    fn wait_set_at_cap_deepens_cover_window() {
         let p = CostPolicy::new();
         p.begin_block_with_cores(430, 8);
         p.note_loc_write(0xabc, false);
@@ -6109,11 +6355,13 @@ mod tests {
         p.note_wait_set(8);
         {
             let mut e = p.promoted.get_mut(&0xabc).unwrap();
-            e.decision = LocStrategy::win(1);
+            e.decision = LocStrategy::win(4);
             e.cover_window = 4;
             e.last_cover_ok = true;
+            e.cover_wall_lost = false;
             e.block_reexec_n = 4;
-            e.block_reexec_ns = 80_000;
+            e.block_reexec_ns = 8_000;
+            e.block_ordered_ns = 4_000;
             e.measured = true;
             e.samples = 3;
             e.object = LocObject::Basic;
@@ -6122,23 +6370,27 @@ mod tests {
         for _ in 0..8 {
             p.bump_unfenced_reexec();
         }
-        p.note_refuse_ns(50_000);
-        p.note_reexec_ns(10_000);
+        // L2: abort CF still worse than loc wall → deepen, do not withdraw.
+        p.note_refuse_ns(10_000);
+        p.note_reexec_ns(80_000);
         p.end_block_learn();
         {
             let e = p.promoted.get(&0xabc).unwrap();
-            assert_eq!(
-                e.cover_window, 0,
-                "M1: wait-set at cap and still losing drops cover_window, got {}",
+            assert!(
+                (e.cover_window as usize) > 4,
+                "C4: wait-set at cap deepens cover_window by a segment, got {}",
                 e.cover_window
             );
-            assert!(!e.last_cover_ok, "M1: withdraw cover_ok after capped lose");
+            assert!(
+                !e.cover_wall_lost,
+                "L2: wall still cheaper than abort CF — not a failed probe"
+            );
         }
         p.begin_block_with_cores(430, 8);
         p.note_loc_write(0xabc, false);
         assert!(
-            p.should_skip_ordered_admit_seed(0xabc, 20),
-            "M1: next begin stays withdrawn after wait-set-capped lose"
+            !p.should_skip_ordered_admit_seed(0xabc, 20),
+            "C4: next begin still probes the deeper segment"
         );
     }
 
@@ -6194,6 +6446,117 @@ mod tests {
         assert!(
             !cands.iter().any(|a| a.is_ordered()),
             "under-covered must not invite Win_1 / Seg / Full, got {cands:?}"
+        );
+    }
+
+    #[test]
+    fn midband_failed_probe_returns_optimistic_read() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(430, 8);
+        p.note_loc_write(0xabc, false);
+        p.promote_short_edge(0xabc, 20);
+        for i in 0..20 {
+            p.note_short_pair(0xabc, 10 + i, 11 + i);
+        }
+        let (arm, _, _) = p.select_arm(0xabc, 20);
+        assert!(arm.is_ordered(), "L1: first begin probes, got {arm:?}");
+        p.remember_arm(0xabc, arm);
+        p.note_refuse_ns(200_000);
+        p.note_reexec_ns(10_000);
+        for _ in 0..4 {
+            p.bump_unfenced_reexec();
+        }
+        p.end_block_learn();
+        {
+            let e = p.promoted.get(&0xabc).unwrap();
+            assert!(
+                e.cover_wall_lost,
+                "L2: prepaid wall > abort CF marks a failed probe"
+            );
+        }
+        p.begin_block_with_cores(430, 8);
+        p.note_loc_write(0xabc, false);
+        assert!(
+            !p.can_probe_cover(0xabc, 20),
+            "L1: failed probe does not retry"
+        );
+        let (arm, _, _) = p.select_arm(0xabc, 20);
+        assert!(
+            !arm.is_ordered(),
+            "L1: failed probe returns OptimisticRead, got {arm:?}"
+        );
+        assert_eq!(p.hops_to_admit(0xabc, 20), 0);
+    }
+
+    #[test]
+    fn real_basic_77_on_large_is_coverable() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(1226, 8);
+        p.note_loc_write(0x4d, false);
+        p.promote_short_edge(0x4d, 77);
+        for i in 0..77 {
+            p.note_short_pair(0x4d, 10 + i, 11 + i);
+        }
+        assert!(
+            !p.loc_forbids_n(0x4d, 77),
+            "C3: 15274915-class real Basic-77 stays an OrderedAdmit object"
+        );
+        assert!(
+            p.can_probe_cover(0x4d, 77),
+            "C3: real Basic-77 is in the probeable cover band"
+        );
+        let cands = p.generate_arms(0x4d, 77, false, true, true);
+        assert!(
+            cands.iter().any(|a| a.is_ordered()),
+            "C3: gate only the real Basic spine, got {cands:?}"
+        );
+        assert!(
+            !cands.iter().any(|a| *a == LocStrategy::FullChain),
+            "C1: Basic-77 must not be whole-spine Full"
+        );
+    }
+
+    #[test]
+    fn lazy_thousand_writer_never_full() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(1226, 8);
+        p.note_loc_write(0x996, true);
+        p.promote_short_edge(0x996, 40_000);
+        for i in 0..200 {
+            p.note_short_pair(0x996, 100 + i, 101 + i);
+        }
+        assert!(
+            p.loc_forbids_n(0x996, 200),
+            "C3: lazy thousand-writer is not an OrderedAdmit object"
+        );
+        let cands = p.generate_arms(0x996, 200, false, true, true);
+        assert!(
+            cands.iter().all(|a| !a.is_ordered()),
+            "C3: never Full/Win on lazy thousand-writers, got {cands:?}"
+        );
+        let (arm, _, _) = p.select_arm(0x996, 200);
+        assert!(
+            !arm.is_ordered(),
+            "C3: select_arm stays Opt/Defer on lazy 996-class, got {arm:?}"
+        );
+    }
+
+    #[test]
+    fn near_independent_large_drops_wait_set() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(1346, 8);
+        p.note_loc_write(0x1, true);
+        for i in 0..5 {
+            p.note_short_pair(0x1a, 10 + i, 11 + i);
+        }
+        assert_eq!(
+            p.wait_set_soft_cap(),
+            Some(0),
+            "P3: near-independent large block drops non-critical wait-set slots"
+        );
+        assert!(
+            p.skip_ungated_tx_path_tax(),
+            "P1: NEAR ungated execute+validate is OCC-equivalent"
         );
     }
 }
