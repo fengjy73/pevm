@@ -1423,19 +1423,12 @@ impl CostPolicy {
         s.cover_probe_n == 0 || s.last_crisis || s.samples < HOT_LOC_N
     }
 
-    /// First probe is the light covering window (Win_2), not an
-    /// 8-wide plant. An 8-hop OrderedAdmit prefix livelocks ERC-20
-    /// mid-band clusters (iter23). C4 deepens `cover_window` at
-    /// `end_block`.
-    fn probe_cover_w(&self, location: MemoryLocationHash, n_pairs: usize) -> usize {
-        let full = full_cover_w(n_pairs);
-        let stored = self
-            .promoted
-            .get(&location)
-            .map(|s| s.cover_window as usize)
-            .unwrap_or(0);
-        let w = if stored >= 2 { stored } else { 2 };
-        w.min(self.train_hat(n_pairs)).min(full).max(2)
+    /// Unproven probe is always the light covering window (Win_2).
+    /// Reusing a C4-grown `cover_window` on the next probe replants
+    /// 8 hops and livelocks ERC-20 mid-band reuse (p4 / iter23).
+    /// Proven cover uses `loc_cover_window`, not this helper.
+    fn probe_cover_w(&self, _location: MemoryLocationHash, n_pairs: usize) -> usize {
+        2.min(full_cover_w(n_pairs)).max(2)
     }
 
     /// Cover is proven cheaper than OCC abort: measured covering arm,
@@ -6319,6 +6312,22 @@ mod tests {
         assert_eq!(
             hops, 2,
             "L1: first probe is Win_2, not an 8-wide ERC-20 plant, hops={hops}"
+        );
+        {
+            let mut e = p.promoted.get_mut(&0xabc).unwrap();
+            e.cover_window = 8;
+            e.last_cover_ok = false;
+            e.last_crisis = true;
+            e.cover_probe_n = 1;
+        }
+        let reuse_cands = p.generate_arms(0xabc, 20, false, true, true);
+        assert!(
+            reuse_cands.contains(&LocStrategy::win(2)),
+            "L1: unproven reuse probe stays Win_2 after C4 deepen, got {reuse_cands:?}"
+        );
+        assert!(
+            !reuse_cands.contains(&LocStrategy::win(8)),
+            "L1: C4-grown window must not become the next probe plant, got {reuse_cands:?}"
         );
         let (arm, _, _) = p.select_arm(0xabc, 20);
         assert!(
