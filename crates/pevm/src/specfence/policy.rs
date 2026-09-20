@@ -1063,14 +1063,30 @@ impl CostPolicy {
 
     /// T3 leftover slide is only for a still-leaking loc. Proven cover
     /// leaves leftover OCC (S1 / O). Fat reuse with cover_ok never slides (S).
+    /// A planted covering prefix (Win_2+) must not slide on the same
+    /// block — 3356896 i=1 otherwise prepaid-blows ĉ and retreats to Opt.
     pub(crate) fn leftover_slide_ok(&self, location: MemoryLocationHash) -> bool {
         let Some(s) = self.promoted.get(&location) else {
             return true;
         };
-        if s.last_cover_ok && !s.last_sys_reexec && !s.last_double_pay && !s.last_crisis {
+        if s.last_sys_reexec || s.last_double_pay || s.last_crisis {
+            return true;
+        }
+        if s.last_cover_ok {
             return false;
         }
-        if self.block_n() >= 512 && s.last_cover_ok {
+        let n_pairs = self.short_chain.get(&location).map(|c| c.len()).unwrap_or(0);
+        if n_pairs > ORDER_WINDOW_K
+            && is_covering(
+                s.decision,
+                n_pairs,
+                self.seg_cap(),
+                self.loc_w_need(location, n_pairs),
+            )
+        {
+            return false;
+        }
+        if self.block_n() >= 512 && s.decision.is_ordered() {
             return false;
         }
         true
@@ -2661,11 +2677,20 @@ impl CostPolicy {
             } else {
                 planted.max(1)
             };
-            // Light leftover_hops≥2 is cover_ok only after a real train was
-            // the reason we opened the window (sys-reexec / double-pay).
-            // Vacuous unfenced=0 + fat prepaid must not sticky a wide Win.
-            let absorbed_train =
-                leftover_hops < 2 || had_sys || had_dp || sys_now || double_pay_now;
+            // Light leftover_hops≥2 is cover_ok after a real train (sys /
+            // double-pay) *or* a quiet light Win_2+ (3356896: leftover is
+            // expected S1 OCC, unf=0–1). Vacuous fat prepaid (planted >
+            // light) must not sticky a wide Win.
+            let light_quiet = planted >= 2
+                && planted <= light.max(2)
+                && unfenced < 4
+                && e.block_reexec_n < 2;
+            let absorbed_train = leftover_hops < 2
+                || had_sys
+                || had_dp
+                || sys_now
+                || double_pay_now
+                || light_quiet;
             if n_pairs > ORDER_WINDOW_K
                 && is_covering(e.decision, n_pairs, self.seg_cap(), need_now)
                 && e.block_reexec_n < 2
@@ -4936,6 +4961,18 @@ mod tests {
         assert!(
             !p.leftover_slide_ok(0x32be),
             "O: proven cover must not T3-slide leftover Detect hops"
+        );
+        {
+            let mut e = p.promoted.get_mut(&0x32be).unwrap();
+            e.last_cover_ok = false;
+            e.last_sys_reexec = false;
+            e.last_crisis = false;
+            e.decision = LocStrategy::win(2);
+            e.w_need = 2;
+        }
+        assert!(
+            !p.leftover_slide_ok(0x32be),
+            "O: planted Win_2 must not T3-slide on the same block"
         );
         {
             let mut e = p.promoted.get_mut(&0x32be).unwrap();
