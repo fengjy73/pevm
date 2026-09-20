@@ -1319,9 +1319,16 @@ impl CostPolicy {
         // L3: cold / crisis explores light `w_need±1` / Seg. Hot proven
         // light cover is sticky. Sys-reexec upgrade is greedy light cover.
         let sticky = self.covering_sticky(location, n_pairs);
+        // L4: a proven cover must not UCB-explore unused Opt (3356896
+        // false retreat after quiet Win_2). Greedy ĉ may still yield
+        // when Opt is itself measured cheaper (prepaid blowout).
+        let cover_ok = self
+            .promoted
+            .get(&location)
+            .is_some_and(|s| s.last_cover_ok);
         // L3: cold generate still offers w_need±1 / Seg; reopen itself is
         // greedy min-ĉ (no UCB inventing an unmeasured cover over Defer).
-        let explore_ok = if leftover_pay_once || upgrading || sticky || reopen {
+        let explore_ok = if leftover_pay_once || upgrading || sticky || reopen || cover_ok {
             false
         } else if crisis || !hot {
             true
@@ -1664,9 +1671,20 @@ impl CostPolicy {
                     && !a.is_ordered()
                     && let Some(paid) = paid
                 {
-                    // L3/L4: proven light cover hysteresis only when it
-                    // beats OCC. Prepaid blowout may yield to Opt (PRIMARY).
-                    if paid + NS_DELTA < abort {
+                    // L4: unused Opt/Defer prior must not undercut a proven
+                    // cover. After quiet Win_2, abort EMA drops and the 25k
+                    // Opt prior looks cheaper → false retreat, unf explodes
+                    // (3356896 i=3/i=5). Yield to OCC only when Opt/Defer
+                    // is itself measured cheaper (prepaid blowout).
+                    let opt_measured_cheaper = loc
+                        .as_ref()
+                        .and_then(|s| {
+                            s.stat(a)
+                                .filter(|(_, n)| *n > 1.5)
+                                .map(|(oc, _)| oc + NS_DELTA < paid)
+                        })
+                        .unwrap_or(false);
+                    if !opt_measured_cheaper {
                         c = c.max(paid + NS_DELTA);
                     }
                 }
@@ -4783,6 +4801,63 @@ mod tests {
         assert!(
             !matches!(arm, LocStrategy::OptimisticRead | LocStrategy::DeferPlant),
             "L4: Opt/Defer is floored under systematic reexec, got {arm:?}"
+        );
+    }
+
+    #[test]
+    fn cover_ok_unused_opt_prior_does_not_retreat() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(176, 8);
+        p.promote_short_edge(0x32be, 12_000);
+        for pair in [
+            (4, 31),
+            (31, 66),
+            (66, 67),
+            (67, 69),
+            (69, 70),
+            (70, 93),
+            (93, 96),
+            (96, 103),
+            (103, 115),
+            (115, 131),
+            (131, 132),
+            (132, 135),
+            (135, 138),
+            (138, 141),
+            (141, 166),
+            (166, 171),
+        ] {
+            p.note_short_pair(0x32be, pair.0, pair.1);
+        }
+        {
+            let mut e = p.promoted.get_mut(&0x32be).unwrap();
+            e.samples = 4;
+            e.measured = true;
+            e.decision = LocStrategy::win(2);
+            e.w_star = 2;
+            e.w_need = 2;
+            e.last_cover_ok = true;
+            e.last_sys_reexec = false;
+            e.last_double_pay = false;
+            e.last_crisis = false;
+            // Quiet cover: abort EMA has dropped below measured Win_2.
+            e.reexec_ns_ema = 8_000.0;
+            e.upsert_stat(LocStrategy::win(2), 36_828.0, 3.0);
+            // Opt stays on the unused 25k prior (n=1).
+        }
+        p.block_arm.clear();
+        let (arm, explore, _) = p.select_arm(0x32be, 16);
+        assert!(
+            !explore,
+            "L4: proven cover must not UCB-explore unused Opt"
+        );
+        assert!(
+            is_covering(arm, 16, p.seg_cap(), 2),
+            "L4: unused Opt prior must not retreat off proven Win_2, got {arm:?}"
+        );
+        assert!(
+            !matches!(arm, LocStrategy::OptimisticRead | LocStrategy::DeferPlant),
+            "L4: cover_ok + unused Opt prior stays ordered, got {arm:?}"
         );
     }
 
