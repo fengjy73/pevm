@@ -34,13 +34,17 @@ pub(crate) fn next_sf_task(
         let _ = crate::specfence::admit::flush_pending_idle_edges(ready, p);
     }
     let refuse_before = ready.refuse_count();
-    // S1/P1: no *pending* holes → OCC idx pick. Finished gates are not a
-    // global mode switch — independents return to `next_occ_task`.
-    if !stages.has_reserved() && !ready.has_pending_gated() {
+    // P1: gates ≠ global mode. Ungated txs keep the OCC collaborative
+    // index; a closed hole is skip-only (`next_task_with_wave_ready`).
+    // Fat + lazy already seen → ignore leftover reservations (K8 shell).
+    // Sub-fat real spines (CallWaw / Win_2, e.g. 19469101 n=469) still
+    // have pending gates without ProducerStage reserve — must not OCC-steal
+    // through those holes (PR24 abort-train hang).
+    let fat_lazy =
+        policy.is_some_and(|p| p.block_n() >= super::policy::FAT_N && p.lazy_already_seen());
+    if fat_lazy || (!stages.has_reserved() && !ready.has_pending_gated()) {
         return scheduler.next_task();
     }
-    // A0-majority / no RAW-fan reservation: OCC-class pick (no empty DashMap scan).
-    // Gated txs still need refuse / wave-admit / wake (P2).
     if !stages.has_reserved() {
         let task = scheduler.next_task_with_wave_ready(Some(wave), Some(ready));
         if let Some(m) = metrics {

@@ -143,11 +143,15 @@ pub(crate) fn classify_first_conflict(
     let val = mv_memory.current_data_value(tx_idx, location);
     let class = if commute_ok(hints, mv_memory, beneficiary, tx_idx, invalid) {
         ConflictClass::CommuteCandidate
-    } else if matches!(val, Some(MemoryValue::Storage(_)))
-        || matches!(val, Some(MemoryValue::Basic(_)))
-    {
+    } else if matches!(val, Some(MemoryValue::Storage(_))) {
         ConflictClass::EffectiveWAW
-    } else if lazy || matches!(val, Some(MemoryValue::LazyRecipient(_))) {
+    } else if lazy
+        || matches!(
+            val,
+            Some(MemoryValue::LazyRecipient(_)) | Some(MemoryValue::LazySender(_))
+        )
+    {
+        // C1: evaluated Lazy→Basic must not become EffectiveWAW (K8 S-lazy).
         ConflictClass::LazyNoise
     } else if is_value_transfer(hints, tx_idx)
         && peer.is_some_and(|p| {
@@ -156,8 +160,8 @@ pub(crate) fn classify_first_conflict(
     {
         // Same-from 21k nonce race: lazy-accumulate, do not promote the spine.
         ConflictClass::LazyNoise
-    } else if matches!(val, Some(MemoryValue::LazySender(_))) {
-        ConflictClass::LazyNoise
+    } else if matches!(val, Some(MemoryValue::Basic(_))) {
+        ConflictClass::EffectiveWAW
     } else {
         ConflictClass::EffectiveWAW
     };

@@ -16,7 +16,7 @@ use super::bayes::BayesMap;
 use super::feeder::{seed_known_stars, top_is_known_star};
 use super::learner::{InterBlockPrior, LiveLearner};
 use super::metrics::MetricsInner;
-use super::policy::{CohortKind, CostPolicy, ORDER_WINDOW_K, THIN_ORDERED_K};
+use super::policy::{CohortKind, CostPolicy, FAT_N, ORDER_WINDOW_K, THIN_ORDERED_K};
 use super::producer_stage::ProducerStageTable;
 use super::ready_edge::ReadyEdgeTable;
 use super::wave::WaveParkTable;
@@ -132,6 +132,8 @@ pub(crate) fn admit_seed_begin_block(
         let _ = (stages, learner, bayes, prior, beneficiary, contracts);
         return edges;
     }
+    // C2: fat reuse still plants the real Basic/storage spine (not lazy).
+    let mut edges = admit_seed_promoted_short_edges(ready, hints, policy, metrics);
     let stars = seed_known_stars(learner, bayes, prior);
     let fan = learner.morph_weights().dominant_fan_out();
     let prior_star = prior.top_locations().iter().any(top_is_known_star);
@@ -285,9 +287,18 @@ pub(crate) fn admit_seed_begin_block(
         }
     }
 
-    let mut edges = 0;
     let mut queued: HashSet<TxIdx> = HashSet::new();
     for c in cands {
+        let loc = match c.kind {
+            CohortKind::RawFan | CohortKind::SameFrom | CohortKind::EmptyTo => {
+                hash_deterministic(MemoryLocation::Basic(c.addr))
+            }
+            CohortKind::CallWaw => envelope_loc(c.addr),
+        };
+        // C1: never plant a lazy / near_independent object.
+        if policy.loc_forbids_ordered(loc) {
+            continue;
+        }
         if let Some(m) = metrics {
             m.record_edge_ordered_admit();
         }
@@ -295,11 +306,10 @@ pub(crate) fn admit_seed_begin_block(
             CohortKind::RawFan => {
                 let producer = c.txs[0];
                 stages.reserve(producer);
-                let basic = hash_deterministic(MemoryLocation::Basic(c.addr));
                 if star_edges {
-                    learner.seed_predicted_essential(basic, FAN_STAR_K);
+                    learner.seed_predicted_essential(loc, FAN_STAR_K);
                 }
-                ready.note_raw_producer(basic, producer);
+                ready.note_raw_producer(loc, producer);
                 queued.insert(producer);
                 // Probe the first successor only. A full-envelope star
                 // (ERC-20 independent) serializes the block and livelocks
@@ -307,31 +317,47 @@ pub(crate) fn admit_seed_begin_block(
                 if let Some(&succ) = c.txs.get(1)
                     && !queued.contains(&succ)
                 {
-                    ready.note_consumer_on(succ, producer, Some(basic));
+                    ready.note_consumer_on(succ, producer, Some(loc));
                     queued.insert(succ);
                     edges += 1;
                 }
             }
             CohortKind::CallWaw => {
-                let loc = envelope_loc(c.addr);
-                // Storage / calldata WAW keeps the full pred chain (seq≡par).
-                edges += note_predecessor_chain(ready, &c.txs, loc, &mut queued, false);
+                // C2: fat CallWaw is light-cover (short hop), not a full chain.
+                let short = policy.block_n() >= FAT_N;
+                edges += note_predecessor_chain(ready, &c.txs, loc, &mut queued, short);
             }
             CohortKind::EmptyTo => {
-                let loc = envelope_loc(c.addr);
+                // choose() already A0 on fat; keep thin-path dead.
                 edges += note_probe_star(ready, &c.txs, loc, &mut queued, false);
             }
             CohortKind::SameFrom => {
-                let basic = hash_deterministic(MemoryLocation::Basic(c.addr));
-                ready.note_raw_producer(basic, c.txs[0]);
+                ready.note_raw_producer(loc, c.txs[0]);
                 // Short hop only — never a full nonce spine (ERC-20 clusters).
-                edges += note_predecessor_chain(ready, &c.txs, basic, &mut queued, true);
+                edges += note_predecessor_chain(ready, &c.txs, loc, &mut queued, true);
             }
         }
         let _ = c.is_contract;
     }
 
+    soft_cap_begin_blocked(ready, policy);
     edges
+}
+
+/// P2: fat n≥512 soft-cap begin holes. Keep earliest (real-spine prefix).
+fn soft_cap_begin_blocked(ready: &ReadyEdgeTable, policy: &CostPolicy) {
+    let cap = policy.fat_begin_hole_cap();
+    if cap == usize::MAX {
+        return;
+    }
+    let mut blocked = ready.blocked_consumers();
+    if blocked.len() <= cap {
+        return;
+    }
+    blocked.sort_unstable();
+    for &tx in &blocked[cap..] {
+        ready.ungate(tx);
+    }
 }
 
 /// C1/C5: thin begin — storage-trio CallWaw only (`3..=4`).
@@ -520,8 +546,18 @@ pub(crate) fn admit_seed_on_write_set(
     // PC-2 / D3: ReadyEdge A1 only on effective (non-lazy Data / Storage).
     for &loc in all_write_locs {
         ready.note_location_writer(loc, writer);
+        if let Some(p) = policy {
+            let lazy = !effective_locs.iter().any(|&l| l == loc);
+            p.note_loc_write(loc, lazy);
+        }
     }
-    if effective_locs.iter().any(|&l| l == from_loc) {
+    // C1/P3: fat lazy block — D1 record only. No envelope walk / plant.
+    if policy.is_some_and(|p| p.block_n() >= FAT_N && p.lazy_already_seen()) {
+        return;
+    }
+    if effective_locs.iter().any(|&l| l == from_loc)
+        && !policy.is_some_and(|p| p.loc_forbids_ordered(from_loc))
+    {
         ready.note_raw_producer(from_loc, writer);
         // PC-2 / PC-5: 2-tx pairs and empty-calldata same-from stay A0 even
         // when nonce/balance is Data — refuse meta loses to one OCC abort.
@@ -534,9 +570,11 @@ pub(crate) fn admit_seed_on_write_set(
 
     let Some(to) = to else {
         for &loc in effective_locs {
-            if loc != from_loc {
+            if loc != from_loc && !policy.is_some_and(|p| p.loc_forbids_ordered(loc)) {
                 ready.note_raw_producer(loc, writer);
-                ready.note_immediate_pred(loc, writer);
+                if policy.is_none_or(|p| p.hops_to_plant(loc, p.pairs_of(loc).len().max(1)) > 0) {
+                    ready.note_immediate_pred(loc, writer);
+                }
             }
         }
         return;
@@ -612,9 +650,20 @@ pub(crate) fn admit_seed_on_write_set(
     for &loc in &hidden_eff {
         ready.note_raw_producer(loc, writer);
         ready.note_location_writer(loc, writer);
-        // D1: 4→31 when 4 already published this ℓ (any envelope).
-        ready.note_immediate_pred(loc, writer);
-        if !chain_later {
+        let n_writers = ready.writers_of(loc).len();
+        let n_pairs = n_writers
+            .saturating_sub(1)
+            .max(policy.map(|p| p.pairs_of(loc).len()).unwrap_or(0));
+        if policy.is_some_and(|p| p.loc_forbids_n(loc, n_pairs)) {
+            continue;
+        }
+        // C2: real spine only. hops=0 (Opt/Defer / lazy) leaves OCC.
+        let plant = policy.is_none_or(|p| p.hops_to_plant(loc, n_pairs.max(1)) > 0);
+        if plant {
+            // D1: 4→31 when 4 already published this ℓ (any envelope).
+            ready.note_immediate_pred(loc, writer);
+        }
+        if !chain_later || !plant {
             continue;
         }
         let pred = ready
@@ -626,7 +675,10 @@ pub(crate) fn admit_seed_on_write_set(
         let mut ordered = Vec::with_capacity(later.len() + 1);
         ordered.push(pred);
         ordered.extend(later.iter().copied());
-        let _ = note_predecessor_chain(ready, &ordered, loc, &mut queued, false);
+        // C2: production plants a light hop, not the full envelope (K8
+        // 47-hole stars). Tests pass policy=None and still expect D1 chain.
+        let short = policy.is_some();
+        let _ = note_predecessor_chain(ready, &ordered, loc, &mut queued, short);
     }
     // P0-B: cost-EV demote / commute-absorbed star — release later envelope
     // waiters that D1 did **not** keep as WAW. Never release when the keep-set
@@ -637,6 +689,9 @@ pub(crate) fn admit_seed_on_write_set(
                 ready.release_consumer(t, wave);
             }
         }
+    }
+    if let Some(p) = policy {
+        soft_cap_begin_blocked(ready, p);
     }
 }
 
@@ -669,6 +724,10 @@ fn seed_short_edges_after_publish(
     // D1: record lazy + Data so 4→31 is visible even when tx4 is lazy-only.
     for &loc in all_write_locs {
         ready.note_location_writer(loc, writer);
+        if let Some(p) = policy {
+            let lazy = !effective_locs.iter().any(|&l| l == loc);
+            p.note_loc_write(loc, lazy);
+        }
     }
     for &loc in all_write_locs {
         if !effective_locs.iter().any(|&l| l == loc) {
@@ -985,8 +1044,9 @@ mod tests {
         hints: &AccountHints,
         contracts: &HashSet<Address>,
     ) -> usize {
-        // Structural A1 tests use a full shell. Thin / a0_majority defaults A0 (L1).
-        let policy = policy_for(4096);
+        // Structural A1 tests use a full shell (n > THIN_N_MAX) that is
+        // still below FAT_N — fat EmptyTo is A0 (C1/P2).
+        let policy = policy_for(400);
         admit_seed_begin_block(
             ready,
             stages,
@@ -2105,5 +2165,38 @@ mod tests {
             ready.may_execute(31) && ready.may_execute(66),
             "T3: skipped hops stay OptimisticRead"
         );
+    }
+
+    #[test]
+    fn fat_empty_to_does_not_plant() {
+        let ready = ReadyEdgeTable::new();
+        let stages = ProducerStageTable::new();
+        let learner = LiveLearner::new();
+        learner.begin_block(MorphWeights::default());
+        let bayes = BayesMap::new();
+        let prior = InterBlockPrior::new();
+        let payee = Address::repeat_byte(0x20);
+        let hints = AccountHints::from_to_txs(payee, (0..64).collect());
+        let mut contracts = HashSet::new();
+        contracts.insert(payee);
+        let policy = policy_for(800);
+        assert!(!policy.is_optimistic_majority_block());
+        let n = admit_seed_begin_block(
+            &ready,
+            &stages,
+            &learner,
+            &bayes,
+            &prior,
+            &hints,
+            Address::ZERO,
+            &policy,
+            &contracts,
+            None,
+        );
+        assert_eq!(
+            n, 0,
+            "C1/P2: fat EmptyTo must not plant a lazy star, got {n}"
+        );
+        assert!(ready.may_execute(1) && ready.may_execute(32));
     }
 }

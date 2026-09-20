@@ -753,6 +753,53 @@ impl ReadyEdgeTable {
         self.refuse.load(Ordering::Relaxed)
     }
 
+    /// P2: drop a begin hole without a wave (pre-worker soft-cap).
+    /// Clears the gated bit so pick does not treat this tx as a global mode.
+    pub(crate) fn ungate(&self, tx: TxIdx) {
+        let i = tx / 64;
+        let was = if i < self.gated_bits.len() {
+            let bit = 1u64 << (tx % 64);
+            let prev = self.gated_bits[i].fetch_and(!bit, Ordering::Release);
+            prev & bit != 0
+        } else {
+            self.consumers.contains_key(&tx)
+        };
+        if was {
+            let mut g = self.gated_n.load(Ordering::Relaxed);
+            while g > 0 {
+                match self.gated_n.compare_exchange_weak(
+                    g,
+                    g - 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(v) => g = v,
+                }
+            }
+            if !self.is_writer_done(tx) {
+                let mut p = self.pending_gated.load(Ordering::Relaxed);
+                while p > 0 {
+                    match self.pending_gated.compare_exchange_weak(
+                        p,
+                        p - 1,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(v) => p = v,
+                    }
+                }
+            }
+        }
+        if let Some(e) = self.consumers.get(&tx) {
+            e.store(NONE, Ordering::Relaxed);
+        }
+        self.queued_on.remove(&tx);
+        self.sleeping.remove(&tx);
+        self.a0_force.remove(&tx);
+    }
+
     /// Drop a provisional consumer bit and wake it (lazy `to` was not a real WAW).
     pub(crate) fn release_consumer(&self, consumer: TxIdx, wave: &WaveParkTable) {
         if let Some(e) = self.consumers.get(&consumer) {
@@ -1002,5 +1049,20 @@ mod tests {
         );
         assert_eq!(t.wake_ready_sleepers(&wave), 1);
         assert_eq!(wave.pop_ready(), Some(25));
+    }
+
+    #[test]
+    fn ungate_clears_begin_hole() {
+        let t = ReadyEdgeTable::new();
+        t.note_consumer(9, 1);
+        assert!(t.is_gated(9));
+        assert!(t.has_pending_gated());
+        t.ungate(9);
+        assert!(!t.is_gated(9), "P2: ungate drops the edge constraint");
+        assert!(t.may_execute(9));
+        assert!(
+            !t.has_pending_gated(),
+            "P2: ungate returns pick to OCC for that hole"
+        );
     }
 }

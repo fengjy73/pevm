@@ -619,6 +619,7 @@ impl Pevm {
                                 // started when this tx is gated or a hop is queued.
                                 if sf
                                     && (specfence.ready_edges.is_gated(tx_version.tx_idx)
+                                        || specfence.ready_edges.has_pending_gated()
                                         || specfence.policy.is_some_and(|p| p.has_pending_idle()))
                                 {
                                     specfence.ready_edges.note_started(tx_version.tx_idx);
@@ -818,7 +819,11 @@ impl Pevm {
             // (same lean as 3356896 stable D1). First fat block still persists.
             let fat_reuse =
                 block_size >= 512 && self.cost_policy.d1_pairs_already_stored(&d1_orders);
-            let lean_end = stable_d1 || fat_reuse;
+            // P3: fat + lazy already classified → skip HotSet / inter-prior /
+            // sketch. Real-spine D1 persist is filtered below.
+            let lean_end = stable_d1
+                || fat_reuse
+                || (block_size >= 512 && self.cost_policy.lazy_already_seen());
             // S5: edge_4_31 already true → skip MV merge and HotSet walk.
             // lean_end still skips HotSet below.
             if !ready_has_4_31 && !fat_reuse {
@@ -896,7 +901,9 @@ impl Pevm {
                         Some(note) => {
                             miss += 1;
                             self.cost_policy.bump_unfenced_reexec();
-                            if !self.cost_policy.is_promoted(note.location) {
+                            if !self.cost_policy.loc_forbids_ordered(note.location)
+                                && !self.cost_policy.is_promoted(note.location)
+                            {
                                 self.cost_policy.promote_short_edge(note.location, 1);
                             }
                         }
@@ -914,8 +921,9 @@ impl Pevm {
             if !stable_d1 || !self.cost_policy.d1_pairs_already_stored(&d1_orders) {
                 let persist: Vec<_> = d1_orders
                     .iter()
-                    .filter(|(_, w)| {
-                        !crate::specfence::admit::is_wide_envelope_writer_set(&hints, w)
+                    .filter(|(loc, w)| {
+                        !self.cost_policy.loc_forbids_ordered(*loc)
+                            && !crate::specfence::admit::is_wide_envelope_writer_set(&hints, w)
                     })
                     .cloned()
                     .collect();
