@@ -190,7 +190,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 .specfence
                 .policy
                 .is_some_and(|p| p.skip_ungated_tx_path_tax())
-            && !self.specfence.ready_edges.was_queued(tx_idx);
+            && !self.specfence.ready_edges.is_gated(tx_idx);
         self.has_nonce = has_nonce;
         self.read_set.clear();
         self.read_accounts.clear();
@@ -518,7 +518,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
             .specfence
             .policy
             .is_some_and(|p| p.skip_ungated_tx_path_tax())
-            && !self.specfence.ready_edges.was_queued(self.tx_idx)
+            && !self.specfence.ready_edges.is_gated(self.tx_idx)
         {
             return Ok(());
         }
@@ -2404,7 +2404,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 .specfence
                 .policy
                 .is_some_and(|p| p.skip_ungated_tx_path_tax())
-            && !self.specfence.ready_edges.was_queued(tx_version.tx_idx);
+            && !self.specfence.ready_edges.is_gated(tx_version.tx_idx);
         let lean = self.specfence.mode == crate::ConcurrencyMode::SpecFence
             && self.specfence.engagement.begin_tx(tx_version.tx_idx);
         let repair_armed = self.specfence.mode == crate::ConcurrencyMode::SpecFence
@@ -3240,7 +3240,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         .specfence
                         .policy
                         .is_some_and(|p| p.skip_ungated_tx_path_tax())
-                    && !self.specfence.ready_edges.was_queued(tx_version.tx_idx);
+                    && !self.specfence.ready_edges.is_gated(tx_version.tx_idx);
                 if !optimistic_ungated
                     && self.specfence.mode == crate::ConcurrencyMode::SpecFence
                     && self.specfence.certificates.rem_legal(tx_version.tx_idx)

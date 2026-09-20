@@ -754,7 +754,9 @@ impl ReadyEdgeTable {
     }
 
     /// Drop a wait-set entry without a wave (pre-worker soft-cap).
-    /// Clears the gated bit so pick does not treat this tx as a global mode.
+    /// Clears the gated bit **and** ReadyEdge membership so `was_queued`
+    /// is false — P3 cap-0 must not leave dropped txs on the SpecFence
+    /// execute/validate path (13287210 19× after plant-then-drop).
     pub(crate) fn ungate(&self, tx: TxIdx) {
         let i = tx / 64;
         let was = if i < self.gated_bits.len() {
@@ -792,12 +794,23 @@ impl ReadyEdgeTable {
                 }
             }
         }
-        if let Some(e) = self.consumers.get(&tx) {
-            e.store(NONE, Ordering::Relaxed);
-        }
+        let pred = self.consumers.remove(&tx).and_then(|(_, e)| {
+            let p = e.load(Ordering::Relaxed);
+            (p != NONE).then_some(p)
+        });
         self.queued_on.remove(&tx);
         self.sleeping.remove(&tx);
         self.a0_force.remove(&tx);
+        if let Some(p) = pred
+            && let Some(mut w) = self.waiters.get_mut(&p)
+        {
+            w.retain(|&c| c != tx);
+            let empty = w.is_empty();
+            drop(w);
+            if empty {
+                self.waiters.remove(&p);
+            }
+        }
     }
 
     /// Drop a provisional consumer bit and wake it (lazy `to` was not a real WAW).
@@ -1057,12 +1070,18 @@ mod tests {
         t.note_consumer(9, 1);
         assert!(t.is_gated(9));
         assert!(t.has_pending_gated());
+        assert!(t.was_queued(9));
+        assert!(t.was_queued(1), "producer is a waiter while the edge is live");
         t.ungate(9);
         assert!(!t.is_gated(9), "ungate drops the wait-for constraint");
         assert!(t.may_execute(9));
         assert!(
             !t.has_pending_gated(),
             "ungate returns pick to ungated OCC task selection"
+        );
+        assert!(
+            !t.was_queued(9) && !t.was_queued(1),
+            "P3 cap-drop must clear ReadyEdge membership so ungated execute is OCC-equivalent"
         );
     }
 }

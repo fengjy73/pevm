@@ -134,6 +134,13 @@ pub(crate) fn admit_seed_begin_block(
         policy.note_wait_set(ready.blocked_consumers().len());
         return edges;
     }
+    // P3: no mid-band coverable spine → do not plant-then-drop. A
+    // cap-0 walk still marked `was_queued` on every cohort reject /
+    // dropped consumer and paid the SpecFence execute path (13287210).
+    if policy.wait_set_soft_cap() == Some(0) {
+        policy.note_wait_set(0);
+        return 0;
+    }
     // C2: fat reuse still plants the real Basic/storage spine (not lazy).
     let mut edges = admit_seed_promoted_short_edges(ready, hints, policy, metrics);
     let stars = seed_known_stars(learner, bayes, prior);
@@ -2246,5 +2253,38 @@ mod tests {
             "C1/P2: fat EmptyTo must not plant a lazy star, got {n}"
         );
         assert!(ready.may_execute(1) && ready.may_execute(32));
+    }
+
+    #[test]
+    fn large_near_independent_does_not_plant_then_drop() {
+        let ready = ReadyEdgeTable::new();
+        let stages = ProducerStageTable::new();
+        let learner = LiveLearner::new();
+        learner.begin_block(MorphWeights::default());
+        let bayes = BayesMap::new();
+        let prior = InterBlockPrior::new();
+        let from = Address::repeat_byte(0x21);
+        let hints = AccountHints::from_account_txs(from, (0..64).collect());
+        let policy = policy_for(1414);
+        assert_eq!(policy.wait_set_soft_cap(), Some(0));
+        let n = admit_seed_begin_block(
+            &ready,
+            &stages,
+            &learner,
+            &bayes,
+            &prior,
+            &hints,
+            Address::ZERO,
+            &policy,
+            &HashSet::new(),
+            None,
+        );
+        assert_eq!(n, 0, "P3: cap-0 must not plant, got {n}");
+        for t in 0..64 {
+            assert!(
+                !ready.was_queued(t) && !ready.is_gated(t),
+                "P3: tx {t} must stay ungated after cap-0 begin"
+            );
+        }
     }
 }
