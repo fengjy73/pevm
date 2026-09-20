@@ -34,11 +34,12 @@ pub(crate) fn next_sf_task(
         let _ = crate::specfence::admit::flush_pending_idle_edges(ready, p);
     }
     let refuse_before = ready.refuse_count();
-    // P1: ProducerStage reservations are the only global SF schedule.
-    // Holes are execute-time edge constraints — not a pick-mode switch.
-    // Fat S-lazy with 6–9 leftover gates used to walk wave_ready and
-    // pay the 4–25× shell (`pick_occ≈0`). Ungated txs stay on OCC idx.
-    if !stages.has_reserved() {
+    // P1: gates ≠ global mode. Fat + lazy already seen → OCC idx pick
+    // even if a leftover reservation exists (K8 S-lazy 4–25× shell).
+    // Thin real spines keep the ProducerStage / wave path (3356896 C2).
+    let fat_lazy =
+        policy.is_some_and(|p| p.block_n() >= super::policy::FAT_N && p.lazy_already_seen());
+    if !stages.has_reserved() || fat_lazy {
         return scheduler.next_task();
     }
     // Drop Aborting / Done reservations so a dead writer cannot wait_for_dependency the

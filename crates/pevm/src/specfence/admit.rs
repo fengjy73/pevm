@@ -551,6 +551,10 @@ pub(crate) fn admit_seed_on_write_set(
             p.note_loc_write(loc, lazy);
         }
     }
+    // C1/P3: fat lazy block — D1 record only. No envelope walk / plant.
+    if policy.is_some_and(|p| p.block_n() >= FAT_N && p.lazy_already_seen()) {
+        return;
+    }
     if effective_locs.iter().any(|&l| l == from_loc)
         && !policy.is_some_and(|p| p.loc_forbids_ordered(from_loc))
     {
