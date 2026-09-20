@@ -841,9 +841,8 @@ pub(crate) fn persist_short_chain_after_abort(
 ) {
     if producer < consumer {
         policy.note_short_pair(location, producer, consumer);
-        // C1: Opt/Defer leftover is pay-once OCC. hops=0 hops are dropped at
-        // the next pick — queuing them only sets has_pending_idle and forces
-        // note_started on every subsequent tx (shell tax, no plant).
+        // C1: hops=0 (Opt/Defer) must not queue idle. Covering ordered after
+        // systematic reexec has hops>0 and plants via the same mouth.
         let n_pairs = policy.pairs_of(location).len();
         if policy.hops_to_plant(location, n_pairs) > 0 {
             policy.queue_idle_edge(location, producer, consumer);
@@ -882,7 +881,7 @@ pub(crate) fn queue_nearest_unfinished_successor(
     }
     let w = policy
         .window_w_of(location, n_pairs)
-        .clamp(1, policy.w_cap_of(n_pairs).max(1));
+        .clamp(1, policy.w_cap_for(location, n_pairs).max(1));
     let mut hops: Vec<(TxIdx, TxIdx)> = policy
         .pairs_of(location)
         .into_iter()
