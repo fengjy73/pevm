@@ -185,10 +185,13 @@ fn batch_park_abort(
     specfence: SpecFenceCtx<'_>,
     invalid: &[MemoryLocationHash],
 ) -> Option<Task> {
+    // C1: park only behind an *Executing* writer (Iter3/8). Aborting/Ready
+    // leftover writers would serialize the Opt/Defer spine and raise wall
+    // vs harness OCC (Estimate-park train). Unfinished-but-idle → OCC reexec.
     let writer = invalid.iter().find_map(|&loc| {
         mv_memory
             .last_writer_before(loc, tx_version.tx_idx)
-            .filter(|&w| w < tx_version.tx_idx && !scheduler.is_done(w))
+            .filter(|&w| w < tx_version.tx_idx && scheduler.is_executing(w))
     });
     if !scheduler.try_validation_abort(tx_version) {
         return scheduler.finish_validation(tx_version, false);

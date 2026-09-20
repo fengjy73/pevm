@@ -900,14 +900,18 @@ impl Pevm {
             // Post-publish: persist consecutive D1 pairs on promoted ℓ
             // (4→31→66→… on Basic(0x32be)). Skip wide empty-to / CallWaw
             // envelopes so 0x209c is not stored as a star. No mid-execute insert.
-            let persist: Vec<_> = d1_orders
-                .iter()
-                .filter(|(_, w)| !crate::specfence::admit::is_wide_envelope_writer_set(&hints, w))
-                .cloned()
-                .collect();
-            // O4: reuse D1 already has 4→31… — skip the persist walk.
-            if !self.cost_policy.d1_pairs_already_stored(&persist) {
-                self.cost_policy.note_promoted_writer_orders(&persist);
+            // C3: reuse stable D1 already stored — skip the clone/filter walk.
+            if !stable_d1 || !self.cost_policy.d1_pairs_already_stored(&d1_orders) {
+                let persist: Vec<_> = d1_orders
+                    .iter()
+                    .filter(|(_, w)| {
+                        !crate::specfence::admit::is_wide_envelope_writer_set(&hints, w)
+                    })
+                    .cloned()
+                    .collect();
+                if !self.cost_policy.d1_pairs_already_stored(&persist) {
+                    self.cost_policy.note_promoted_writer_orders(&persist);
+                }
             }
             let mut d1_orders = d1_orders;
             if !stable_d1 {

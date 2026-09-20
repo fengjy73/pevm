@@ -841,8 +841,13 @@ pub(crate) fn persist_short_chain_after_abort(
 ) {
     if producer < consumer {
         policy.note_short_pair(location, producer, consumer);
-        // CC-L2: OrderedAdmit retry for the aborted consumer.
-        policy.queue_idle_edge(location, producer, consumer);
+        // C1: Opt/Defer leftover is pay-once OCC. hops=0 hops are dropped at
+        // the next pick — queuing them only sets has_pending_idle and forces
+        // note_started on every subsequent tx (shell tax, no plant).
+        let n_pairs = policy.pairs_of(location).len();
+        if policy.hops_to_plant(location, n_pairs) > 0 {
+            policy.queue_idle_edge(location, producer, consumer);
+        }
     }
     // Long spine already persisted — skip envelope walk on the abort path.
     if policy.pairs_of(location).len() > ORDER_WINDOW_K {
@@ -1983,6 +1988,45 @@ mod tests {
         assert!(
             ready.may_execute(67),
             "O3: started 67 must stay A0 this incarnation"
+        );
+    }
+
+    #[test]
+    fn leftover_opt_abort_does_not_queue_idle() {
+        let policy = policy_for(176);
+        policy.promote_short_edge(0x32be, 40_000);
+        for pair in [
+            (4, 31),
+            (31, 66),
+            (66, 67),
+            (67, 69),
+            (69, 70),
+            (70, 93),
+            (93, 96),
+            (96, 103),
+        ] {
+            policy.note_short_pair(0x32be, pair.0, pair.1);
+        }
+        policy.remember_arm(
+            0x32be,
+            crate::specfence::policy::LocStrategy::OptimisticRead,
+        );
+        persist_short_chain_after_abort(&AccountHints::default(), &policy, 166, 141, 0x32be);
+        assert_eq!(
+            policy.hops_to_plant(0x32be, 8),
+            0,
+            "C1: leftover Opt plants zero hops"
+        );
+        assert!(
+            !policy.has_pending_idle(),
+            "C1: hops=0 must not queue a pick-quantum hop the flush would drop"
+        );
+        assert!(
+            policy
+                .pairs_of(0x32be)
+                .iter()
+                .any(|&(a, b)| a == 141 && b == 166),
+            "C1: proven pair is still persisted for the next begin"
         );
     }
 
