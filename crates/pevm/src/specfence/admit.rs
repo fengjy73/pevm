@@ -564,10 +564,14 @@ pub(crate) fn admit_seed_on_write_set(
         }
     }
     // C1/P3: fat lazy-update may steal leftover reservations — D1 record
-    // only, no envelope walk / plant. Mid-band Opt path-tax skip must
-    // still D1-walk a live short-chain wait-set (19716145-class hang
-    // when after-publish skipped ungate while hops=0 leftover-long yield).
-    if policy.is_some_and(|p| p.ignore_leftover_reservations()) {
+    // only, no envelope walk / plant. Empty wait-set Opt path-tax skip
+    // is the same. A live short-chain wait-set must still D1-walk
+    // (19716145-class hang when ungate was skipped under hops=0 yield).
+    if policy.is_some_and(|p| p.ignore_leftover_reservations())
+        || (policy.is_some_and(|p| p.skip_ungated_path_tax())
+            && !ready.has_pending_gated()
+            && !ready.has_any_gated())
+    {
         return;
     }
     if effective_locs.iter().any(|&l| l == from_loc)

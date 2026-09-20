@@ -1262,6 +1262,15 @@ impl CostPolicy {
         if n <= THIN_N_MAX {
             return false;
         }
+        // M2: mid/large Opt path-tax skip on reuse — end_block is the same
+        // tax as execute/validate. First mid-band after a thin block still
+        // persists D1.
+        if self.skip_ungated_path_tax()
+            && self.block_seq.load(Ordering::Relaxed) > 1
+            && self.last_block_n.load(Ordering::Relaxed) > THIN_N_MAX
+        {
+            return true;
+        }
         d1_stored || self.should_reuse_stored_d1()
     }
 
