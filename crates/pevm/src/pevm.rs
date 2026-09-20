@@ -613,10 +613,13 @@ impl Pevm {
                         task = match task.unwrap() {
                             Task::Execution(tx_version) => {
                                 let sf = self.concurrency_mode == ConcurrencyMode::SpecFence;
-                                // O5: ungated + no live gates ≡ OCC (no started/done meta).
+                                // O5: ungated + no live gates ≡ OCC (no started meta).
+                                // Still mark started when a leftover hop is queued
+                                // so pick-quantum flush cannot mid-plant an in-flight succ.
                                 if sf
                                     && (specfence.ready_edges.is_gated(tx_version.tx_idx)
-                                        || specfence.ready_edges.has_any_gated())
+                                        || specfence.ready_edges.has_any_gated()
+                                        || specfence.policy.is_some_and(|p| p.has_pending_idle()))
                                 {
                                     specfence.ready_edges.note_started(tx_version.tx_idx);
                                 }
@@ -627,23 +630,16 @@ impl Pevm {
                                     let next = self
                                         .try_execute(&mut vm, &scheduler, tx_version, None, None);
                                     if sf && scheduler.is_done(done_idx) {
-                                        // Wake only after a successful incarnation.
-                                        // Stamping Done on abort lets dependents
-                                        // OCC-steal against ESTIMATE → seq≠par.
-                                        // O5: skip stamp when the block has no gates.
-                                        if specfence.ready_edges.has_any_gated()
-                                            || specfence.ready_edges.has_known_waiters(done_idx)
+                                        // Done-on-success: always stamp. O5 used to
+                                        // skip when !has_any_gated(); a later
+                                        // pick-quantum flush then planted
+                                        // consumer→pred with is_writer_done=false
+                                        // → refuse-forever (iter11 ~400% spin).
+                                        specfence.ready_edges.note_producer_done_stamp(done_idx);
+                                        if specfence.ready_edges.has_known_waiters(done_idx)
+                                            && let Some(w) = wave_ref
                                         {
-                                            specfence
-                                                .ready_edges
-                                                .note_producer_done_stamp(done_idx);
-                                            if specfence.ready_edges.has_known_waiters(done_idx)
-                                                && let Some(w) = wave_ref
-                                            {
-                                                specfence
-                                                    .ready_edges
-                                                    .note_producer_done(done_idx, w);
-                                            }
+                                            specfence.ready_edges.note_producer_done(done_idx, w);
                                         }
                                     }
                                     next
@@ -936,7 +932,12 @@ impl Pevm {
             };
             self.cost_policy
                 .note_cost_sample(refuse_unit, inc_gt0 > 0, idle);
-            self.cost_policy.end_block_learn();
+            // C3: edge_4_31 + thin D1 — skip morph flush / re-widen.
+            if ready_has_4_31 && thin {
+                self.cost_policy.end_block_learn_stable_d1();
+            } else {
+                self.cost_policy.end_block_learn();
+            }
             let mut report = self.cost_policy.take_report(ready_w, idle);
             report.end_block_ns = end_t0.elapsed().as_nanos() as u64;
             report.pick_occ_n = ready_edges.pick_occ_n();

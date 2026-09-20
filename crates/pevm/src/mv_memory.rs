@@ -320,6 +320,42 @@ impl MvMemory {
         invalid
     }
 
+    /// C2: one `last_locations` lock — commute-check + value-stable rebind.
+    /// No separate `collect_invalid_reads` Vec on the accept path.
+    pub(crate) fn try_commute_rebind_invalid(
+        &self,
+        tx_idx: TxIdx,
+        mut commute_loc: impl FnMut(MemoryLocationHash) -> bool,
+    ) -> bool {
+        let mut planned = Vec::new();
+        {
+            let locs = index_mutex!(self.last_locations, tx_idx);
+            for (location, prior_origins) in &locs.read {
+                if self.origin_still_valid(tx_idx, *location, prior_origins) {
+                    continue;
+                }
+                if !commute_loc(*location) {
+                    return false;
+                }
+                let Some(new_origins) = self.current_read_origins(tx_idx, *location) else {
+                    return false;
+                };
+                if !self.origin_still_valid(tx_idx, *location, &new_origins) {
+                    return false;
+                }
+                planned.push((*location, new_origins));
+            }
+        }
+        if planned.is_empty() {
+            return false;
+        }
+        let mut locs = index_mutex!(self.last_locations, tx_idx);
+        for (location, new_origins) in planned {
+            locs.read.insert(location, new_origins);
+        }
+        true
+    }
+
     /// M1 RebindOnly: patch invalid read origins to the current valid version
     /// without aborting. Refuses multi-origin (lazy) reads — those need RewindTo
     /// unless [`Self::try_rebind_invalid_reads_value_stable`] (same-output).

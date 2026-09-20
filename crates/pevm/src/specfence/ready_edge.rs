@@ -717,6 +717,25 @@ impl ReadyEdgeTable {
             .any(|t| self.blocking_producer(*t).is_some_and(|w| is_executing(w)))
     }
 
+    /// I1: stamp preds that the scheduler already published. A pick-quantum
+    /// flush can insert `consumer←pred` after O5 skipped the Done bit —
+    /// `may_execute` stays false and workers yield-spin (~400% CPU).
+    pub(crate) fn heal_finished_preds(&self, mut finished: impl FnMut(TxIdx) -> bool) {
+        if self.sleeping.is_empty() {
+            return;
+        }
+        let preds: Vec<TxIdx> = self
+            .sleeping
+            .iter()
+            .take(SLEEP_CAP)
+            .filter_map(|t| self.blocking_producer(*t))
+            .filter(|&w| finished(w))
+            .collect();
+        for w in preds {
+            self.mark_done(w);
+        }
+    }
+
     #[inline]
     pub(crate) fn add_refuse_ns(&self, ns: u64) {
         if ns > 0 {
@@ -954,5 +973,34 @@ mod tests {
             "O3: incarnation retry may take the windowed edge"
         );
         assert_eq!(t.blocking_producer(31), Some(4));
+    }
+
+    #[test]
+    fn done_stamp_prevents_late_flush_refuse_forever() {
+        let t = ReadyEdgeTable::new();
+        t.note_producer_done_stamp(24);
+        t.note_consumer_on(25, 24, Some(0xabc));
+        assert!(
+            t.may_execute(25),
+            "I1: flush after success stamp must not gate the successor"
+        );
+        assert!(t.blocking_producer(25).is_none());
+    }
+
+    #[test]
+    fn heal_finished_preds_unsticks_late_plant() {
+        let t = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        t.note_consumer_on(25, 24, Some(0xabc));
+        t.note_skip_gate(25);
+        assert!(!t.may_execute(25));
+        assert!(t.has_sleeping_waiters());
+        t.heal_finished_preds(|w| w == 24);
+        assert!(
+            t.may_execute(25),
+            "I1: scheduler-Done pred must heal the refuse-forever bit"
+        );
+        assert_eq!(t.wake_ready_sleepers(&wave), 1);
+        assert_eq!(wave.pop_ready(), Some(25));
     }
 }

@@ -276,6 +276,11 @@ impl Scheduler {
             let validation_idx = self.validation_idx.load(Ordering::Relaxed);
             if execution_idx >= self.block_size && validation_idx >= self.block_size {
                 // Re-check wave ready before yield — a producer may have just pushed.
+                if let Some(edges) = ready {
+                    // I1: scheduler-Done pred with a missing ReadyEdge stamp
+                    // (O5 skip / flush race) must not refuse forever.
+                    edges.heal_finished_preds(|w| self.is_done(w));
+                }
                 if let Some(wave) = wave {
                     if let Some(edges) = ready {
                         let _ = edges.wake_ready_sleepers(wave);
@@ -288,9 +293,14 @@ impl Scheduler {
                     }
                 }
                 let waiting = ready.is_some_and(|e| e.has_sleeping_waiters());
+                let busy =
+                    waiting && ready.is_some_and(|e| e.sleeper_pred_busy(|w| self.is_executing(w)));
                 let validated_done = self.num_validated.load(Ordering::Relaxed)
                     >= self.block_size - self.min_validation_idx.load(Ordering::Relaxed);
-                if !waiting {
+                // C4: a short-ℓ sleeper must not skip min_runnable. Independents
+                // and a Ready pred lost from the wave stay issuable. Only skip
+                // the scan while the sleeper's pred is actually Executing.
+                if !busy {
                     match self.min_runnable(ready) {
                         MinRun::Hit(idx) => {
                             self.execution_idx.fetch_min(idx, Ordering::Relaxed);
@@ -310,12 +320,9 @@ impl Scheduler {
                 // Sleeping on a not-yet-started hole is skip, not busy-wait.
                 // Instant idle ≠ ĉ (S2).
                 let idle_t0 = Instant::now();
-                if waiting {
-                    let busy = ready.is_some_and(|e| e.sleeper_pred_busy(|w| self.is_executing(w)));
-                    if busy {
-                        for _ in 0..16 {
-                            std::hint::spin_loop();
-                        }
+                if busy {
+                    for _ in 0..16 {
+                        std::hint::spin_loop();
                     }
                 }
                 thread::yield_now();
@@ -1181,6 +1188,65 @@ mod tests {
             ready.refuse_count(),
             1,
             "second refuse of the same consumer must not spin-count"
+        );
+    }
+
+    #[test]
+    fn short_hole_does_not_block_independent_min_runnable() {
+        let s = Scheduler::new(4);
+        let ready = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        ready.note_consumer(1, 0);
+        ready.note_skip_gate(1);
+        assert!(ready.has_sleeping_waiters());
+        assert!(s.is_ready(0), "pred still Ready");
+        let first = s
+            .next_task_with_wave_ready(Some(&wave), Some(&ready))
+            .expect("C4: sleeper on 1 must not hide Ready pred 0");
+        let Task::Execution(v0) = first else {
+            panic!("expected Execution");
+        };
+        assert_eq!(v0.tx_idx, 0);
+        let second = s
+            .next_task_with_wave_ready(Some(&wave), Some(&ready))
+            .expect("C4: independent 2 issues while 1 sleeps");
+        let Task::Execution(v2) = second else {
+            panic!("expected Execution, got {second:?}");
+        };
+        assert_eq!(v2.tx_idx, 2);
+    }
+
+    #[test]
+    fn heal_done_pred_wakes_late_flush_sleeper() {
+        let s = Scheduler::new(3);
+        let ready = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        let v0 = s.try_execute(0).expect("pred");
+        let _ = s.finish_execution(v0, FinishExecFlags::empty());
+        let v2 = s.try_execute(2).expect("independent");
+        let _ = s.finish_execution(v2, FinishExecFlags::empty());
+        assert!(s.is_done(0));
+        // Late pick-quantum plant after the pred already published (O5 race).
+        ready.note_consumer(1, 0);
+        ready.note_skip_gate(1);
+        assert!(!ready.may_execute(1));
+        let mut saw = None;
+        for _ in 0..16 {
+            match s.next_task_with_wave_ready(Some(&wave), Some(&ready)) {
+                Some(Task::Execution(v)) => {
+                    saw = Some(v.tx_idx);
+                    break;
+                }
+                Some(Task::Validation(v)) => {
+                    let _ = s.finish_validation(&v, false);
+                }
+                None => break,
+            }
+        }
+        assert_eq!(
+            saw,
+            Some(1),
+            "I1: heal+wake must issue the late-gated successor"
         );
     }
 

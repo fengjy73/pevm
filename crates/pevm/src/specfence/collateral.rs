@@ -73,6 +73,43 @@ pub(crate) fn location_is_lazy(
     )
 }
 
+/// One invalid ℓ is a commutative lazy add (beneficiary / recipient).
+#[inline]
+pub(crate) fn commute_location_ok(
+    hints: &AccountHints,
+    mv_memory: &MvMemory,
+    beneficiary: alloy_primitives::Address,
+    tx_idx: TxIdx,
+    loc: MemoryLocationHash,
+) -> bool {
+    let from = hints.from_of(tx_idx);
+    let from_loc = hash_deterministic(MemoryLocation::Basic(from));
+    if loc == from_loc {
+        return false;
+    }
+    let ben_loc = hash_deterministic(MemoryLocation::Basic(beneficiary));
+    if loc == ben_loc {
+        return true;
+    }
+    let val = mv_memory.current_data_value(tx_idx, loc);
+    if matches!(val, Some(MemoryValue::LazyRecipient(_))) {
+        return true;
+    }
+    let Some(peer) = mv_memory.last_writer_before(loc, tx_idx) else {
+        return false;
+    };
+    if peer >= tx_idx || !is_value_transfer(hints, peer) {
+        return false;
+    }
+    if hints.from_of(peer) == from {
+        return false;
+    }
+    matches!(
+        val,
+        Some(MemoryValue::LazyRecipient(_)) | Some(MemoryValue::LazySender(_))
+    )
+}
+
 /// CC-X1: skip full abort when every invalid ℓ is a commutative lazy add
 /// (beneficiary / recipient / LazyRecipient) and no sender-nonce WAW.
 pub(crate) fn commute_ok(
@@ -85,43 +122,9 @@ pub(crate) fn commute_ok(
     if invalid.is_empty() || !is_value_transfer(hints, tx_idx) {
         return false;
     }
-    let from = hints.from_of(tx_idx);
-    let from_loc = hash_deterministic(MemoryLocation::Basic(from));
-    let to_loc = hints
-        .to_of(tx_idx)
-        .map(|t| hash_deterministic(MemoryLocation::Basic(t)));
-    let ben_loc = hash_deterministic(MemoryLocation::Basic(beneficiary));
-    for &loc in invalid {
-        if loc == from_loc {
-            return false;
-        }
-        if loc == ben_loc {
-            continue;
-        }
-        let val = mv_memory.current_data_value(tx_idx, loc);
-        if matches!(val, Some(MemoryValue::LazyRecipient(_))) {
-            continue;
-        }
-        if to_loc == Some(loc) && matches!(val, Some(MemoryValue::LazyRecipient(_))) {
-            continue;
-        }
-        let Some(peer) = mv_memory.last_writer_before(loc, tx_idx) else {
-            return false;
-        };
-        if peer >= tx_idx || !is_value_transfer(hints, peer) {
-            return false;
-        }
-        if hints.from_of(peer) == from {
-            return false;
-        }
-        if !matches!(
-            val,
-            Some(MemoryValue::LazyRecipient(_)) | Some(MemoryValue::LazySender(_))
-        ) {
-            return false;
-        }
-    }
-    true
+    invalid
+        .iter()
+        .all(|&loc| commute_location_ok(hints, mv_memory, beneficiary, tx_idx, loc))
 }
 
 /// C1: first invalid ℓ + peer → CommuteCandidate / EffectiveWAW / LazyNoise.
@@ -203,6 +206,22 @@ pub(crate) fn optimistic_majority_hinted_lazy(
 mod tests {
     use super::*;
     use alloy_primitives::Address;
+
+    #[test]
+    fn commute_ok_matches_per_location() {
+        let from = Address::repeat_byte(0x11);
+        let hints = AccountHints::from_account_txs(from, vec![0, 1]);
+        let mv = MvMemory::new(2, [], []);
+        let ben = Address::ZERO;
+        assert!(
+            !commute_ok(&hints, &mv, ben, 0, &[]),
+            "empty invalid is not a commute"
+        );
+        assert_eq!(
+            commute_ok(&hints, &mv, ben, 0, &[7]),
+            commute_location_ok(&hints, &mv, ben, 0, 7)
+        );
+    }
 
     #[test]
     fn value_transfer_is_empty_input_not_exact_21k() {

@@ -2193,6 +2193,16 @@ impl CostPolicy {
 
     /// L3: flush EMAs, compare prepaid vs abort counterfactual, decay if prepaid loses.
     pub(crate) fn end_block_learn(&self) {
+        self.end_block_learn_inner(false);
+    }
+
+    /// C3: D1 already has 4→31 on a thin block — skip morph flush / re-widen.
+    /// Loc ĉ still updates so Opt/Defer leftover stays the product path.
+    pub(crate) fn end_block_learn_stable_d1(&self) {
+        self.end_block_learn_inner(true);
+    }
+
+    fn end_block_learn_inner(&self, stable_d1: bool) {
         let refuse = self.refuse_ns.load(Ordering::Relaxed);
         let reexec = self.reexec_ns.load(Ordering::Relaxed);
         // S2: prepaid is wall-clock gate stall only. Instant idle / width
@@ -2220,13 +2230,16 @@ impl CostPolicy {
             if n >= PREPAID_LOSE_CONF as usize {
                 self.decay_ordered_priors();
             }
-            self.demote_long_spines();
+            if !stable_d1 {
+                self.demote_long_spines();
+            }
         } else {
             self.prepaid_lose_streak.store(0, Ordering::Relaxed);
         }
         // L-E: abort_cf without prepaid → raise *short* edges. Long spines
         // that O2 demoted stay A0 — those aborts are the cheaper path.
-        if abort_cf > prepaid {
+        // C3: stable D1 must not re-widen (O1 leftover is pay-once OCC).
+        if abort_cf > prepaid && !stable_d1 {
             let long: hashbrown::HashSet<MemoryLocationHash> = self
                 .short_chain
                 .iter()
@@ -2245,7 +2258,9 @@ impl CostPolicy {
         // L3: per-ℓ reward = −(reexec_ns + ordered_ns + refuse_share).
         // Instant idle / occ_aborts / ready_width never enter ĉ.
         self.update_loc_counterfactuals(prepaid, abort_cf);
-        self.flush_morph_priors();
+        if !stable_d1 {
+            self.flush_morph_priors();
+        }
         // L-D: refresh thin snap from flushed EMAs so next begin can seed.
         // Use per-tx abort hat, not the whole-block reexec sum.
         let c_opt = if abort_cf > 0 {
@@ -3816,6 +3831,46 @@ mod tests {
             p.explore_budget() >= 1,
             "E2: roomier cores/block may explore, got {}",
             p.explore_budget()
+        );
+    }
+
+    #[test]
+    fn stable_d1_learn_does_not_rewiden_leftover_opt() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(176, 8);
+        p.promote_short_edge(0x32be, 40_000);
+        for pair in [
+            (4, 31),
+            (31, 66),
+            (66, 67),
+            (67, 69),
+            (69, 70),
+            (70, 93),
+            (93, 96),
+            (96, 103),
+        ] {
+            p.note_short_pair(0x32be, pair.0, pair.1);
+        }
+        {
+            let mut e = p.promoted.get_mut(&0x32be).unwrap();
+            e.samples = 4;
+            e.measured = true;
+            e.decision = LocStrategy::OptimisticRead;
+            e.last_double_pay = true;
+            e.last_crisis = false;
+            e.upsert_stat(LocStrategy::OptimisticRead, 9_000.0, 3.0);
+            e.upsert_stat(LocStrategy::DeferPlant, 8_096.0, 2.0);
+        }
+        for _ in 0..8 {
+            p.bump_unfenced_reexec();
+        }
+        p.end_block_learn_stable_d1();
+        p.begin_block_with_cores(176, 8);
+        p.block_arm.clear();
+        let (arm, explore, _) = p.select_arm(0x32be, 8);
+        assert!(
+            !explore && matches!(arm, LocStrategy::OptimisticRead | LocStrategy::DeferPlant),
+            "C3: stable D1 leftover must stay Opt/Defer, got explore={explore} {arm:?}"
         );
     }
 }
