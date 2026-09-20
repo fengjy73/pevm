@@ -1241,6 +1241,16 @@ impl CostPolicy {
         self.ordered_prepaid_ge_abort()
     }
 
+    /// Begin-seed mouth: skip OrderedAdmit wait-set when the spine yields
+    /// to OptimisticRead / OCC abort. Unpromoted short chains still seed.
+    pub(crate) fn should_skip_ordered_admit_seed(
+        &self,
+        location: MemoryLocationHash,
+        n_pairs: usize,
+    ) -> bool {
+        self.loc_forbids_n(location, n_pairs) || self.yield_to_occ_abort(location, n_pairs)
+    }
+
     /// Seed a new `PromotedLoc`. Must not touch `self.promoted` — callers
     /// hold `promoted.entry()` (write lock) and a nested get deadlocks.
     fn new_promoted_seeded(&self, location: MemoryLocationHash, n_pairs: usize) -> PromotedLoc {
@@ -1481,7 +1491,14 @@ impl CostPolicy {
             return 0;
         }
         let n_pairs = self.loc_n_pairs(location, n_pairs);
-        if self.yield_to_occ_abort(location, n_pairs) {
+        // Honor this block's already-committed arm so a mid-block yield
+        // does not zero hops under a live wait-set.
+        if self.yield_to_occ_abort(location, n_pairs)
+            && !self
+                .block_arm
+                .get(&location)
+                .is_some_and(|a| a.is_ordered())
+        {
             return 0;
         }
         self.hops_for_arm(self.loc_strategy(location, n_pairs), n_pairs)
@@ -1581,15 +1598,15 @@ impl CostPolicy {
         if n_pairs == 0 {
             return LocStrategy::OptimisticRead;
         }
-        if self.yield_to_occ_abort(location, n_pairs) {
-            return LocStrategy::OptimisticRead;
-        }
         if let Some(a) = self.block_arm.get(&location) {
             let cached = *a;
             drop(a);
             if n_pairs <= ORDER_WINDOW_K || cached != LocStrategy::FullChain {
                 return cached;
             }
+        }
+        if self.yield_to_occ_abort(location, n_pairs) {
+            return LocStrategy::OptimisticRead;
         }
         if !self.is_promoted(location) {
             return LocStrategy::OptimisticRead;
@@ -1610,15 +1627,15 @@ impl CostPolicy {
         if n_pairs == 0 {
             return LocStrategy::OptimisticRead;
         }
-        if self.yield_to_occ_abort(location, n_pairs) {
-            return LocStrategy::OptimisticRead;
-        }
         if let Some(a) = self.block_arm.get(&location) {
             if n_pairs > ORDER_WINDOW_K && *a == LocStrategy::FullChain {
                 // fall through
             } else {
                 return *a;
             }
+        }
+        if self.yield_to_occ_abort(location, n_pairs) {
+            return LocStrategy::OptimisticRead;
         }
         self.commit_arm(location, n_pairs)
     }

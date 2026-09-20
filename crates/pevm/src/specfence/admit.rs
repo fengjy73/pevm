@@ -299,6 +299,12 @@ pub(crate) fn admit_seed_begin_block(
         if policy.loc_forbids_ordered(loc) {
             continue;
         }
+        // E2: under-covered / prepaid≥abort — do not plant a wait-set
+        // the mouth will not cover (19469101 refuse livelock).
+        let n_pairs = c.txs.len().saturating_sub(1);
+        if policy.should_skip_ordered_admit_seed(loc, n_pairs) {
+            continue;
+        }
         if let Some(m) = metrics {
             m.record_edge_ordered_admit();
         }
