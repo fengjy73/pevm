@@ -130,6 +130,8 @@ pub(crate) fn admit_seed_begin_block(
         }
         edges += admit_seed_hint_short_edges(ready, hints, policy, metrics);
         let _ = (stages, learner, bayes, prior, beneficiary, contracts);
+        soft_cap_wait_set(ready, policy);
+        policy.note_wait_set(ready.blocked_consumers().len());
         return edges;
     }
     // C2: fat reuse still plants the real Basic/storage spine (not lazy).
@@ -299,12 +301,13 @@ pub(crate) fn admit_seed_begin_block(
         if policy.loc_forbids_ordered(loc) {
             continue;
         }
-        // E2: under-covered / prepaid≥abort — do not plant a wait-set
-        // the mouth will not cover (19469101 refuse livelock).
+        // E2/M1: under-covered / prepaid not cheaper / leftover-long
+        // mid-band — do not plant a wait-set the mouth will not cover.
         let n_pairs = c.txs.len().saturating_sub(1);
-        if policy.should_skip_ordered_admit_seed(loc, n_pairs) {
+        if policy.should_skip_cohort_seed(loc, n_pairs, Some(c.kind)) {
             continue;
         }
+        policy.note_ordered_seed(n_pairs);
         if let Some(m) = metrics {
             m.record_edge_ordered_admit();
         }
@@ -347,6 +350,7 @@ pub(crate) fn admit_seed_begin_block(
     }
 
     soft_cap_wait_set(ready, policy);
+    policy.note_wait_set(ready.blocked_consumers().len());
     edges
 }
 
@@ -420,6 +424,7 @@ fn admit_seed_hint_short_edges(
             planted += 1;
         }
         if planted > 0 {
+            policy.note_ordered_seed(n_pairs.max(pairs.len()));
             policy.promote_short_edge(loc, 0);
             policy.note_hops_decision(loc, n_pairs.max(pairs.len()));
             edges += planted;
@@ -472,6 +477,7 @@ fn admit_seed_promoted_short_edges(
         if policy.hops_to_admit(loc, n_pairs) == 0 {
             continue;
         }
+        policy.note_ordered_seed(n_pairs);
         policy.note_hops_decision(loc, n_pairs);
         let strategy = policy.loc_strategy(loc, n_pairs);
         let plant = policy.admit_pairs(strategy, &pairs);
@@ -570,7 +576,13 @@ pub(crate) fn admit_seed_on_write_set(
         let from_txs = hints.from_txs(&from);
         // Wide nonce chains stay OptimisticRead (ERC-20 clusters).
         if (3..8).contains(&from_txs.len()) && !hints.cohort_all_empty(from_txs) {
-            ready.note_immediate_pred(from_loc, writer);
+            let n_pairs = from_txs.len().saturating_sub(1);
+            if !policy.is_some_and(|p| p.should_skip_ordered_admit_seed(from_loc, n_pairs)) {
+                ready.note_immediate_pred(from_loc, writer);
+                if let Some(p) = policy {
+                    p.note_ordered_seed(n_pairs);
+                }
+            }
         }
     }
 
@@ -666,6 +678,9 @@ pub(crate) fn admit_seed_on_write_set(
         // C2: real spine only. hops=0 (Opt/Defer / lazy) leaves OCC.
         let plant = policy.is_none_or(|p| p.hops_to_admit(loc, n_pairs.max(1)) > 0);
         if plant {
+            if let Some(p) = policy {
+                p.note_ordered_seed(n_pairs.max(1));
+            }
             // D1: 4→31 when 4 already published this ℓ (any envelope).
             ready.note_immediate_pred(loc, writer);
         }
@@ -698,6 +713,7 @@ pub(crate) fn admit_seed_on_write_set(
     }
     if let Some(p) = policy {
         soft_cap_wait_set(ready, p);
+        p.note_wait_set(ready.blocked_consumers().len());
     }
 }
 

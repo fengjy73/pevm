@@ -37,11 +37,11 @@ pub(crate) fn next_sf_task(
     // Gates ≠ global mode. Ungated txs keep OCC collaborative task
     // selection; a closed wait-for is skip-only (`next_task_with_wave_ready`).
     // Large + lazy-update already seen → ignore leftover reservations.
-    // Mid-band real spines (CallWaw / Win_2, e.g. 19469101 n=469) still
-    // have pending gates without ProducerStage reserve — must not OCC-steal
-    // through those wait-for deps (PR24 abort-train hang).
-    let large_lazy = policy.is_some_and(|p| p.skip_ungated_path_tax());
-    if large_lazy || (!stages.has_reserved() && !ready.has_pending_gated()) {
+    // Mid-band Opt path-tax skip must not steal through a live wait-set
+    // (19469101 leftover-slide hang). Honor pending gates unless the
+    // object is large lazy-update (never an OrderedAdmit wait-set).
+    let ignore_leftover = policy.is_some_and(|p| p.ignore_leftover_reservations());
+    if ignore_leftover || (!stages.has_reserved() && !ready.has_pending_gated()) {
         return scheduler.next_task();
     }
     if !stages.has_reserved() {
