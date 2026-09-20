@@ -3395,6 +3395,24 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         total_steps,
                     );
                 }
+                if self.specfence.mode == crate::ConcurrencyMode::SpecFence
+                    && let Some(p) = self.specfence.policy
+                {
+                    for (loc, val) in &write_set {
+                        if *loc == self.beneficiary_location_hash {
+                            continue;
+                        }
+                        match val {
+                            MemoryValue::LazyRecipient(_) | MemoryValue::LazySender(_) => {
+                                p.note_loc_write(*loc, true)
+                            }
+                            MemoryValue::Storage(_) | MemoryValue::CodeHash(_) => {
+                                p.note_loc_storage(*loc)
+                            }
+                            _ => p.note_loc_write(*loc, false),
+                        }
+                    }
+                }
                 let (wrote_new_location, contended) =
                     self.mv_memory.record(tx_version, read_set, write_set);
                 // M3: learn process WŜ from this incarnation's writes (no residual publish).

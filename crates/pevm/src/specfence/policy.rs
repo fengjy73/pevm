@@ -997,19 +997,20 @@ impl CostPolicy {
     /// C1: `basic_lazy` (and equivalent lazy writer chains) never OrderedAdmit.
     /// Near-independent fat heads with no EffectiveWAW are the same object.
     ///
-    /// Reads `loc_object` first (safe under `promoted.entry`). Promoted is
-    /// only peeked when the map is Unknown — never from `new_promoted_seeded`.
+    /// Fat + long chain without Storage evidence is lazy-equivalent even
+    /// when nonce/evaluated `Basic` mis-labeled the loc (K8 58-pair Win).
+    /// Thin real Basic (3356896) stays C2.
     pub(crate) fn loc_forbids_ordered(&self, location: MemoryLocationHash) -> bool {
         match self.loc_object_map(location) {
             LocObject::Lazy => true,
-            LocObject::Basic | LocObject::Storage => false,
-            LocObject::Unknown => {
+            LocObject::Storage => false,
+            LocObject::Basic | LocObject::Unknown => {
                 let n_pairs = self
                     .short_chain
                     .get(&location)
                     .map(|c| c.len())
                     .unwrap_or(0);
-                self.unknown_looks_lazy(n_pairs, self.promoted_saw_effective(location))
+                self.unknown_looks_lazy(n_pairs, false)
             }
         }
     }
@@ -1059,8 +1060,9 @@ impl CostPolicy {
             .map(|o| *o)
             .unwrap_or(LocObject::Unknown);
         let keep = match (cur, next) {
-            (LocObject::Basic | LocObject::Storage, LocObject::Lazy) => cur,
-            (LocObject::Lazy, LocObject::Basic | LocObject::Storage) => next,
+            (LocObject::Storage, _) | (_, LocObject::Storage) => LocObject::Storage,
+            (LocObject::Basic, LocObject::Lazy) => cur,
+            (LocObject::Lazy, LocObject::Basic) => next,
             (LocObject::Unknown, _) => next,
             (a, _) => a,
         };
@@ -1070,6 +1072,15 @@ impl CostPolicy {
             if !lazy {
                 e.saw_effective = true;
             }
+        }
+    }
+
+    /// C2/C3: storage / code_hash is a real spine, never lazy-equivalent.
+    pub(crate) fn note_loc_storage(&self, location: MemoryLocationHash) {
+        self.loc_object.insert(location, LocObject::Storage);
+        if let Some(mut e) = self.promoted.get_mut(&location) {
+            e.object = LocObject::Storage;
+            e.saw_effective = true;
         }
     }
 
@@ -5387,6 +5398,52 @@ mod tests {
         assert!(
             !arm.is_ordered(),
             "L1: lazy after morph seed stays unordered, got {arm:?}"
+        );
+    }
+
+    #[test]
+    fn fat_long_basic_is_lazy_equivalent() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(800, 8);
+        p.note_loc_write(0xca19, false);
+        p.promote_short_edge(0xca19, 40_000);
+        for i in 0..40 {
+            p.note_short_pair(0xca19, 100 + i, 101 + i);
+        }
+        assert!(
+            p.loc_forbids_ordered(0xca19),
+            "C1: fat long Basic (mis-labeled lazy) is not an OrderedAdmit object"
+        );
+        assert_eq!(p.hops_to_plant(0xca19, 40), 0);
+        let (arm, _, _) = p.select_arm(0xca19, 40);
+        assert!(
+            !arm.is_ordered(),
+            "C1: fat long Basic must not pick Win/Full, got {arm:?}"
+        );
+    }
+
+    #[test]
+    fn fat_storage_spine_still_covers() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(800, 8);
+        p.note_loc_storage(0x571);
+        p.promote_short_edge(0x571, 40_000);
+        for i in 0..40 {
+            p.note_short_pair(0x571, 10 + i, 11 + i);
+        }
+        {
+            let mut e = p.promoted.get_mut(&0x571).unwrap();
+            e.last_sys_reexec = true;
+            e.decision = LocStrategy::OptimisticRead;
+        }
+        assert!(
+            !p.loc_forbids_ordered(0x571),
+            "C2: fat storage is still an OrderedAdmit object"
+        );
+        let cands = p.generate_arms(0x571, 40, false, true, true);
+        assert!(
+            !cands.iter().any(|a| *a == LocStrategy::FullChain),
+            "C3: fat storage must not offer Full, got {cands:?}"
         );
     }
 

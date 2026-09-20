@@ -667,7 +667,10 @@ pub(crate) fn admit_seed_on_write_set(
         let mut ordered = Vec::with_capacity(later.len() + 1);
         ordered.push(pred);
         ordered.extend(later.iter().copied());
-        let _ = note_predecessor_chain(ready, &ordered, loc, &mut queued, false);
+        // C2: production plants a light hop, not the full envelope (K8
+        // 47-hole stars). Tests pass policy=None and still expect D1 chain.
+        let short = policy.is_some();
+        let _ = note_predecessor_chain(ready, &ordered, loc, &mut queued, short);
     }
     // P0-B: cost-EV demote / commute-absorbed star — release later envelope
     // waiters that D1 did **not** keep as WAW. Never release when the keep-set

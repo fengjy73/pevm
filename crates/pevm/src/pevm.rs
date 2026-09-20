@@ -901,7 +901,9 @@ impl Pevm {
                         Some(note) => {
                             miss += 1;
                             self.cost_policy.bump_unfenced_reexec();
-                            if !self.cost_policy.is_promoted(note.location) {
+                            if !self.cost_policy.loc_forbids_ordered(note.location)
+                                && !self.cost_policy.is_promoted(note.location)
+                            {
                                 self.cost_policy.promote_short_edge(note.location, 1);
                             }
                         }
