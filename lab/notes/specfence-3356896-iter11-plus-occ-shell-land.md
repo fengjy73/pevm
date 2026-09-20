@@ -48,7 +48,23 @@ iter11 的 24-CALL 多 SSTORE 正好走这条：首个 storage abort 排队 1 ho
 - `commute_ok_matches_per_location`
 - `flush_skips_done_pred_and_started_succ`（已有）
 
-## Compare
+## Compare 3356896 @8 Soft=0 N=7（隔离测量 @ `309fa6e`）
+
+| | OCC med | SF reuse | 长 ℓ 臂 | PRIMARY |
+|---|---|---|---|---|
+| PR30 | 0.875 | **1.273** | Opt/Defer | false |
+| **this** | **0.950** | **1.190** | **Opt/Defer/16** | **false** |
+
+Reuse SF walls: 1.186, 1.190, 1.093, 1.146, 1.289, 1.205（med 1.190）。  
+长脊 `dff71d59:Opt|Defer/16`（不是 Win 前缀双付）。短 storage 仍 Win/Full。  
+`commute=77`（次数同 PR30；accept 不再 collect+二次 rebind）。`batch_repair` 5–14（C1 接线）。  
+`end_block` 57–91µs。`reexec_ns` 94–192µs（PR30 132–405）。`refuse_admit` 0–3；`taxed_begin=0`。  
+Soft=0；墙 ≪ PR22 ~1.40。PRIMARY 未过（盒噪声 OCC 0.77–1.14）。
+
+iter11：release **0.01s pass**（3min 上界未触发；PR30 为 12min@400% 杀进程）。  
+`erc20_independent` 0.42s。lib 314；specfence 集成 44 pass / 20 ignored。
+
+C3 后补：`stable_d1` 要求 `n≥64`，避免 32–48 tx 夹具误跳 HotSet（m3/m4/r1）。
 
 ```
 SPECFENCE_COMPARE_ITERS=7 cargo run -p pevm --release \
