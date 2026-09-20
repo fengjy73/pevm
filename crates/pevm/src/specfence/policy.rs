@@ -1689,12 +1689,8 @@ impl CostPolicy {
         if self.yield_to_occ_abort(location, n_pairs) {
             return false;
         }
-        // C1/C4: mid-band probe slides the next segment while leftover remains.
-        if self.is_midband_coverable(location, n_pairs)
-            && !self.cover_proven_cheaper(location, n_pairs)
-        {
-            return true;
-        }
+        // C4 deepen is end_block `cover_window`, not a perpetual T3 slide.
+        // Always-true mid-band slide livelocks 19469101 (plant → refuse → flush).
         let Some(s) = self.promoted.get(&location) else {
             return true;
         };
@@ -6336,9 +6332,10 @@ mod tests {
             p.skip_ungated_path_tax(),
             "P1: empty wait-set on mid-band skips block-level path tax"
         );
+        let _ = p.commit_arm(0xabc, 20);
         assert!(
-            p.leftover_slide_ok(0xabc),
-            "C4: mid-band probe slides the next segment"
+            !p.leftover_slide_ok(0xabc),
+            "C4: planted covering prefix must not T3-slide the same block (19469101)"
         );
     }
 
