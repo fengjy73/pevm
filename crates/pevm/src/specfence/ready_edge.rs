@@ -1071,7 +1071,10 @@ mod tests {
         assert!(t.is_gated(9));
         assert!(t.has_pending_gated());
         assert!(t.was_queued(9));
-        assert!(t.was_queued(1), "producer is a waiter while the edge is live");
+        assert!(
+            t.was_queued(1),
+            "producer is a waiter while the edge is live"
+        );
         t.ungate(9);
         assert!(!t.is_gated(9), "ungate drops the wait-for constraint");
         assert!(t.may_execute(9));

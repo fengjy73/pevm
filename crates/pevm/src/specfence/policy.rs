@@ -1432,7 +1432,11 @@ impl CostPolicy {
             .get(&location)
             .map(|s| s.cover_window as usize)
             .unwrap_or(0);
-        stored.max(seg).min(self.train_hat(n_pairs)).min(full).max(2)
+        stored
+            .max(seg)
+            .min(self.train_hat(n_pairs))
+            .min(full)
+            .max(2)
     }
 
     /// Cover is proven cheaper than OCC abort: measured covering arm,
@@ -1694,11 +1698,18 @@ impl CostPolicy {
         let Some(s) = self.promoted.get(&location) else {
             return true;
         };
-        if s.last_sys_reexec || s.last_double_charge || s.last_crisis {
-            return true;
-        }
         if s.last_cover_ok {
             return false;
+        }
+        // Mid-band / large planted prefix: never T3-slide, even in crisis.
+        // Thin leftover-long may still slide when the loc leaks (T3).
+        if self.is_midband_coverable(location, n_pairs)
+            || (s.decision.is_ordered() && self.block_n() >= LARGE_BLOCK_N)
+        {
+            return false;
+        }
+        if s.last_sys_reexec || s.last_double_charge || s.last_crisis {
+            return true;
         }
         if n_pairs > ORDER_WINDOW_K
             && is_covering(
@@ -1707,14 +1718,6 @@ impl CostPolicy {
                 self.seg_cap(),
                 self.loc_cover_window(location, n_pairs),
             )
-        {
-            return false;
-        }
-        // Planted OrderedAdmit prefix — no same-block T3 slide. Mid-band
-        // covering probe is the same hang class as large leftover-long
-        // (19469101 plant → refuse → flush). C4 deepens at end_block.
-        if s.decision.is_ordered()
-            && (self.block_n() >= LARGE_BLOCK_N || self.is_midband_coverable(location, n_pairs))
         {
             return false;
         }
@@ -2033,7 +2036,10 @@ impl CostPolicy {
         // L1: force a covering probe — unused Opt prior must not skip never-tried cover.
         if self.can_probe_cover(location, n_pairs) {
             if let Some(&probe) = eligible.iter().find(|a| {
-                matches!(a, LocStrategy::OrderedWindow { .. } | LocStrategy::Segmented { .. })
+                matches!(
+                    a,
+                    LocStrategy::OrderedWindow { .. } | LocStrategy::Segmented { .. }
+                )
             }) {
                 return (probe, true, probe);
             }
@@ -2132,11 +2138,7 @@ impl CostPolicy {
                 LocStrategy::win(w),
             ];
             if n_pairs >= 3 {
-                probe.push(LocStrategy::seg(covering_seg_len(
-                    n_pairs,
-                    self.cores(),
-                    w,
-                )));
+                probe.push(LocStrategy::seg(covering_seg_len(n_pairs, self.cores(), w)));
             }
             return probe;
         }
@@ -3504,7 +3506,10 @@ impl CostPolicy {
             if under_covered || futile_cover || (capped_lose && !midband) {
                 e.last_crisis = false;
             }
-            if e.decision.is_ordered() && loc_wall >= abort_hat && loc_wall > 0 && prepaid >= abort_cf
+            if e.decision.is_ordered()
+                && loc_wall >= abort_hat
+                && loc_wall > 0
+                && prepaid >= abort_cf
             {
                 e.cover_wall_lost = true;
                 e.last_cover_ok = false;
@@ -6329,7 +6334,9 @@ mod tests {
         );
         let cands = p.generate_arms(0xabc, 20, false, true, true);
         assert!(
-            cands.iter().any(|a| a.is_ordered() && *a != LocStrategy::win(1)),
+            cands
+                .iter()
+                .any(|a| a.is_ordered() && *a != LocStrategy::win(1)),
             "C1: probe eligible set includes segmented/sliding cover, got {cands:?}"
         );
         assert!(
@@ -6344,6 +6351,16 @@ mod tests {
         assert!(
             !p.leftover_slide_ok(0xabc),
             "C4: planted covering prefix must not T3-slide the same block (19469101)"
+        );
+        {
+            let mut e = p.promoted.get_mut(&0xabc).unwrap();
+            e.last_crisis = true;
+            e.last_sys_reexec = true;
+            e.last_double_charge = true;
+        }
+        assert!(
+            !p.leftover_slide_ok(0xabc),
+            "C4: mid-band crisis must not T3-slide leftover (19469101 N=3 reuse)"
         );
     }
 
