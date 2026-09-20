@@ -31,9 +31,9 @@ iter11 的 24-CALL 多 SSTORE 正好走这条：首个 storage abort 排队 1 ho
 
 | ID | 落地 | 相对 PR30 |
 |----|------|-----------|
-| **C1** | 接线已有 `batch_park_abort`：未完成 writer 上 park，不立刻对 ESTIMATE 重跑 | 无效 reexec ↓ |
+| **C1** | `batch_park_abort` 仅 park **Executing** writer（禁 Aborting/Ready Estimate 链）；hops=0 Opt/Defer 不 `queue_idle` | 无效 reexec ↓；不串行 leftover |
 | **C2** | commute accept = 一次 `last_locations` 锁（`try_commute_rebind_invalid`）；非 value-transfer 走 OCC validate | 去掉 collect Vec + 二次 rebind |
-| **C3** | `edge_4_31`+thin → `end_block_learn_stable_d1`（跳 morph flush / 再扩窗） | end_block 再削 |
+| **C3** | `edge_4_31`+thin+`n≥64` → `end_block_learn_stable_d1`；reuse 已存 D1 跳 persist clone | end_block 再削 |
 | **C4** | 上表 min_runnable；短 ℓ refuse 不阻塞独立 tx | 与 S1 一致 |
 
 未恢复长脊 Full/Win 前缀双付。Soft=0。Instant idle 不进 ĉ。
@@ -47,22 +47,24 @@ iter11 的 24-CALL 多 SSTORE 正好走这条：首个 storage abort 排队 1 ho
 - `stable_d1_learn_does_not_rewiden_leftover_opt`
 - `commute_ok_matches_per_location`
 - `flush_skips_done_pred_and_started_succ`（已有）
+- `leftover_opt_abort_does_not_queue_idle`
 
-## Compare 3356896 @8 Soft=0 N=7（隔离测量 @ `309fa6e`）
+## Compare 3356896 @8 Soft=0 N=7（隔离测量 @ `3dfd246`）
 
 | | OCC med | SF reuse | 长 ℓ 臂 | PRIMARY |
 |---|---|---|---|---|
 | PR30 | 0.875 | **1.273** | Opt/Defer | false |
-| **this** | **0.950** | **1.190** | **Opt/Defer/16** | **false** |
+| this @ `309fa6e` | 0.950 | 1.190 | Opt/Defer/16 | false |
+| **this @ `3dfd246`** | **0.916** | **1.147** | **Opt/Defer/16–18** | **false** |
 
-Reuse SF walls: 1.186, 1.190, 1.093, 1.146, 1.289, 1.205（med 1.190）。  
-长脊 `dff71d59:Opt|Defer/16`（不是 Win 前缀双付）。短 storage 仍 Win/Full。  
-`commute=77`（次数同 PR30；accept 不再 collect+二次 rebind）。`batch_repair` 5–14（C1 接线）。  
-`end_block` 57–91µs。`reexec_ns` 94–192µs（PR30 132–405）。`refuse_admit` 0–3；`taxed_begin=0`。  
-Soft=0；墙 ≪ PR22 ~1.40。PRIMARY 未过（盒噪声 OCC 0.77–1.14）。
+Reuse SF walls: 1.137, 1.147, 1.391, 1.250, 1.085, 1.122（med 1.147）。  
+长脊 `dff71d59:Opt|Defer/16–18`（不是 Win 前缀双付）。短 storage 仍 Win/Full。  
+`commute=77`（次数同 PR30；accept 不再 collect+二次 rebind）。`batch_repair` 5–8。  
+`end_block` 68–91µs。`reexec_ns` 111–289µs。`refuse_admit` 1–8；`taxed_begin=0`。  
+Soft=0；墙 ≪ PR22 ~1.40。PRIMARY 未过：leftover OCC reexec（16-writer Opt/Defer）+ end_block ≈ 大部分 0.231ms 间隙。不恢复 Win 前缀双付。
 
-iter11：release **0.01s pass**（3min 上界未触发；PR30 为 12min@400% 杀进程）。  
-`erc20_independent` 0.42s。lib 314；specfence 集成 44 pass / 20 ignored。
+iter11：release **0.02s pass**（3min 上界未触发；PR30 为 12min@400% 杀进程）。  
+`erc20_independent` 0.53s。lib 315；specfence 集成先前 44 pass / 20 ignored。
 
 C3 后补：`stable_d1` 要求 `n≥64`，避免 32–48 tx 夹具误跳 HotSet（m3/m4/r1）。
 
