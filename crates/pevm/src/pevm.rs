@@ -613,10 +613,13 @@ impl Pevm {
                         task = match task.unwrap() {
                             Task::Execution(tx_version) => {
                                 let sf = self.concurrency_mode == ConcurrencyMode::SpecFence;
-                                // O5: ungated + no live gates ≡ OCC (no started/done meta).
+                                // O5: ungated + no live gates ≡ OCC (no started meta).
+                                // Still mark started when a leftover hop is queued
+                                // so pick-quantum flush cannot mid-plant an in-flight succ.
                                 if sf
                                     && (specfence.ready_edges.is_gated(tx_version.tx_idx)
-                                        || specfence.ready_edges.has_any_gated())
+                                        || specfence.ready_edges.has_any_gated()
+                                        || specfence.policy.is_some_and(|p| p.has_pending_idle()))
                                 {
                                     specfence.ready_edges.note_started(tx_version.tx_idx);
                                 }
@@ -627,23 +630,16 @@ impl Pevm {
                                     let next = self
                                         .try_execute(&mut vm, &scheduler, tx_version, None, None);
                                     if sf && scheduler.is_done(done_idx) {
-                                        // Wake only after a successful incarnation.
-                                        // Stamping Done on abort lets dependents
-                                        // OCC-steal against ESTIMATE → seq≠par.
-                                        // O5: skip stamp when the block has no gates.
-                                        if specfence.ready_edges.has_any_gated()
-                                            || specfence.ready_edges.has_known_waiters(done_idx)
+                                        // Done-on-success: always stamp. O5 used to
+                                        // skip when !has_any_gated(); a later
+                                        // pick-quantum flush then planted
+                                        // consumer→pred with is_writer_done=false
+                                        // → refuse-forever (iter11 ~400% spin).
+                                        specfence.ready_edges.note_producer_done_stamp(done_idx);
+                                        if specfence.ready_edges.has_known_waiters(done_idx)
+                                            && let Some(w) = wave_ref
                                         {
-                                            specfence
-                                                .ready_edges
-                                                .note_producer_done_stamp(done_idx);
-                                            if specfence.ready_edges.has_known_waiters(done_idx)
-                                                && let Some(w) = wave_ref
-                                            {
-                                                specfence
-                                                    .ready_edges
-                                                    .note_producer_done(done_idx, w);
-                                            }
+                                            specfence.ready_edges.note_producer_done(done_idx, w);
                                         }
                                     }
                                     next
@@ -809,6 +805,11 @@ impl Pevm {
                 matches!((i4, i31), (Some(a), Some(b)) if a < b)
             });
             let thin = self.cost_policy.is_optimistic_majority_block();
+            // C3: 4→31 on a *mainnet-sized* thin block (3356896 n=176).
+            // 32–48-tx seq≡par fixtures can also list writers 4 and 31 —
+            // those still need HotSet / inter-prior (m3/m4/r1).
+            const STABLE_D1_N_MIN: usize = 64;
+            let stable_d1 = ready_has_4_31 && thin && block_size >= STABLE_D1_N_MIN;
             // S5: edge_4_31 already true → skip MV merge and HotSet walk.
             if !ready_has_4_31 {
                 for (loc, writers) in mv_writers_for_locs(
@@ -826,7 +827,7 @@ impl Pevm {
                     }
                 }
             }
-            if !(ready_has_4_31 && thin) {
+            if !stable_d1 {
                 for (loc, writers) in &d1_orders {
                     if writers.len() < 2 {
                         continue;
@@ -842,9 +843,9 @@ impl Pevm {
                     self.hotset.end_block();
                 }
             }
-            // O4: edge_4_31 + thin D1 is stable — skip HotSet (above),
+            // O4/C3: stable 3356896 D1 — skip HotSet (above),
             // inter-prior pack, and sketch decay.
-            if !(ready_has_4_31 && thin) {
+            if !stable_d1 {
                 let morph_hat = learner.morph_hat();
                 let top = learner.pack_top_locations();
                 let _alpha = self.inter_prior.end_block(morph_hat, top);
@@ -899,17 +900,21 @@ impl Pevm {
             // Post-publish: persist consecutive D1 pairs on promoted ℓ
             // (4→31→66→… on Basic(0x32be)). Skip wide empty-to / CallWaw
             // envelopes so 0x209c is not stored as a star. No mid-execute insert.
-            let persist: Vec<_> = d1_orders
-                .iter()
-                .filter(|(_, w)| !crate::specfence::admit::is_wide_envelope_writer_set(&hints, w))
-                .cloned()
-                .collect();
-            // O4: reuse D1 already has 4→31… — skip the persist walk.
-            if !self.cost_policy.d1_pairs_already_stored(&persist) {
-                self.cost_policy.note_promoted_writer_orders(&persist);
+            // C3: reuse stable D1 already stored — skip the clone/filter walk.
+            if !stable_d1 || !self.cost_policy.d1_pairs_already_stored(&d1_orders) {
+                let persist: Vec<_> = d1_orders
+                    .iter()
+                    .filter(|(_, w)| {
+                        !crate::specfence::admit::is_wide_envelope_writer_set(&hints, w)
+                    })
+                    .cloned()
+                    .collect();
+                if !self.cost_policy.d1_pairs_already_stored(&persist) {
+                    self.cost_policy.note_promoted_writer_orders(&persist);
+                }
             }
             let mut d1_orders = d1_orders;
-            if !(ready_has_4_31 && thin) {
+            if !stable_d1 {
                 for (loc, writers) in self.cost_policy.writer_orders_from_pairs() {
                     if let Some((_, w)) = d1_orders.iter_mut().find(|(l, _)| *l == loc) {
                         w.extend(writers);
@@ -936,7 +941,12 @@ impl Pevm {
             };
             self.cost_policy
                 .note_cost_sample(refuse_unit, inc_gt0 > 0, idle);
-            self.cost_policy.end_block_learn();
+            // C3: stable 3356896 D1 — skip morph flush / re-widen.
+            if stable_d1 {
+                self.cost_policy.end_block_learn_stable_d1();
+            } else {
+                self.cost_policy.end_block_learn();
+            }
             let mut report = self.cost_policy.take_report(ready_w, idle);
             report.end_block_ns = end_t0.elapsed().as_nanos() as u64;
             report.pick_occ_n = ready_edges.pick_occ_n();

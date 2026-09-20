@@ -11,7 +11,8 @@ use super::LeanAbortRepair;
 use super::SpecFenceCtx;
 use super::certificate::CertificateTable;
 use super::collateral::{
-    ConflictClass, classify_first_conflict, commute_ok, is_value_transfer, location_is_lazy,
+    ConflictClass, classify_first_conflict, commute_location_ok, commute_ok, is_value_transfer,
+    location_is_lazy,
 };
 use super::dag::FenceGraph;
 use super::learner::LiveLearner;
@@ -119,22 +120,39 @@ pub(crate) fn validate_occ_stage(
 }
 
 /// C1+C2: record first conflict ℓ and accept a commute without incarnation++.
+/// Accept path is a single `last_locations` lock (no collect Vec + rebind).
 fn note_and_try_commute(
     specfence: SpecFenceCtx<'_>,
     mv_memory: &MvMemory,
     tx_idx: TxIdx,
     invalid: &[MemoryLocationHash],
 ) -> bool {
-    // Commute first — classify/DashMap only when the accept path misses.
-    if commute_ok(
-        specfence.hints,
-        mv_memory,
-        specfence.beneficiary,
-        tx_idx,
-        invalid,
-    ) {
-        // O3: commute accept is lazy value-stable first; skip ignore_conflict
-        // DashMap on the success path (count only).
+    if is_value_transfer(specfence.hints, tx_idx)
+        && mv_memory.try_commute_rebind_invalid(tx_idx, |loc| {
+            commute_location_ok(
+                specfence.hints,
+                mv_memory,
+                specfence.beneficiary,
+                tx_idx,
+                loc,
+            )
+        })
+    {
+        specfence.metrics.record_commute_skip();
+        if let Some(p) = specfence.policy {
+            p.note_commute_skip();
+        }
+        return true;
+    }
+    if !invalid.is_empty()
+        && commute_ok(
+            specfence.hints,
+            mv_memory,
+            specfence.beneficiary,
+            tx_idx,
+            invalid,
+        )
+    {
         let _ = mv_memory.try_rebind_invalid_reads_value_stable(tx_idx, invalid)
             || mv_memory.try_rebind_invalid_reads(tx_idx, invalid);
         specfence.metrics.record_commute_skip();
@@ -159,8 +177,7 @@ fn note_and_try_commute(
 }
 
 /// CC-R3: park an off-edge abort behind the unfinished writer (no suffix storm).
-/// Gated / non-thin validate still owns this; A1=0 uses `occ_abort_ungated`.
-#[allow(dead_code)]
+/// Wired on the single-pay OCC abort path (C1) — not a long-spine Win prefix.
 fn batch_park_abort(
     mv_memory: &MvMemory,
     scheduler: &Scheduler,
@@ -168,10 +185,13 @@ fn batch_park_abort(
     specfence: SpecFenceCtx<'_>,
     invalid: &[MemoryLocationHash],
 ) -> Option<Task> {
+    // C1: park only behind an *Executing* writer (Iter3/8). Aborting/Ready
+    // leftover writers would serialize the Opt/Defer spine and raise wall
+    // vs harness OCC (Estimate-park train). Unfinished-but-idle → OCC reexec.
     let writer = invalid.iter().find_map(|&loc| {
         mv_memory
             .last_writer_before(loc, tx_version.tx_idx)
-            .filter(|&w| w < tx_version.tx_idx && !scheduler.is_done(w))
+            .filter(|&w| w < tx_version.tx_idx && scheduler.is_executing(w))
     });
     if !scheduler.try_validation_abort(tx_version) {
         return scheduler.finish_validation(tx_version, false);
@@ -246,7 +266,9 @@ fn promote_and_seed_short_edge(
     specfence.ready_edges.clear_started(tx_idx);
 }
 
-/// A0 / ungated: OCC abort after a failed commute. L2 still promotes the ℓ.
+/// A0 / ungated: OCC abort after a failed commute. C1: park behind the
+/// unfinished writer when one exists (batch repair) so we do not immediately
+/// reexec against ESTIMATE. L2 still promotes the ℓ for the next begin.
 fn occ_abort_ungated(
     mv_memory: &MvMemory,
     scheduler: &Scheduler,
@@ -254,35 +276,7 @@ fn occ_abort_ungated(
     specfence: SpecFenceCtx<'_>,
     invalid: &[MemoryLocationHash],
 ) -> Option<Task> {
-    let first = specfence.policy.and_then(|_| {
-        classify_first_conflict(
-            specfence.hints,
-            mv_memory,
-            specfence.beneficiary,
-            tx_version.tx_idx,
-            invalid,
-        )
-    });
-    let aborted = scheduler.try_validation_abort(tx_version);
-    if aborted {
-        mv_memory.convert_writes_to_estimates(tx_version.tx_idx);
-        specfence.metrics.record_occ_abort();
-        specfence.metrics.record_full_abort_reexecute();
-        if let Some(p) = specfence.policy {
-            p.note_wave_off_edge_reexec();
-            if let Some(f) = first {
-                match f.class {
-                    ConflictClass::EffectiveWAW => {
-                        promote_and_seed_short_edge(specfence, p, tx_version.tx_idx, &f);
-                    }
-                    ConflictClass::LazyNoise | ConflictClass::CommuteCandidate => {
-                        p.ignore_conflict(Some(f.location));
-                    }
-                }
-            }
-        }
-    }
-    scheduler.finish_validation(tx_version, aborted)
+    batch_park_abort(mv_memory, scheduler, tx_version, specfence, invalid)
 }
 
 /// S4: success path ≡ `validate_occ_stage` (bool walk + finish). Commute
@@ -297,12 +291,14 @@ pub(crate) fn validate_optimistic_fast(
         return scheduler.finish_validation(tx_version, false);
     }
     if !is_value_transfer(specfence.hints, tx_version.tx_idx) {
+        // C2: OCC validate success/abort — no commute collect/rebind.
         return validate_occ_stage(mv_memory, scheduler, tx_version, Some(specfence.metrics));
     }
-    let invalid = mv_memory.collect_invalid_reads(tx_version.tx_idx);
-    if note_and_try_commute(specfence, mv_memory, tx_version.tx_idx, &invalid) {
+    // C2: commute accept without a prior collect Vec.
+    if note_and_try_commute(specfence, mv_memory, tx_version.tx_idx, &[]) {
         return scheduler.finish_validation(tx_version, false);
     }
+    let invalid = mv_memory.collect_invalid_reads(tx_version.tx_idx);
     occ_abort_ungated(mv_memory, scheduler, tx_version, specfence, &invalid)
 }
 
@@ -319,10 +315,10 @@ pub(crate) fn validate_occ_kernel(
         return scheduler.finish_validation(tx_version, false);
     }
     specfence.metrics.record_occ_kernel_validate();
-    let invalid = mv_memory.collect_invalid_reads(tx_version.tx_idx);
-    if note_and_try_commute(specfence, mv_memory, tx_version.tx_idx, &invalid) {
+    if note_and_try_commute(specfence, mv_memory, tx_version.tx_idx, &[]) {
         return scheduler.finish_validation(tx_version, false);
     }
+    let invalid = mv_memory.collect_invalid_reads(tx_version.tx_idx);
     let optimistic_ungated = specfence
         .policy
         .is_some_and(|p| p.is_optimistic_majority_block())
@@ -480,11 +476,11 @@ pub(crate) fn validate_specfence(
     if occ_read_set_valid(mv_memory, tx_version.tx_idx) {
         return scheduler.finish_validation(tx_version, false);
     }
-
-    let invalid = mv_memory.collect_invalid_reads(tx_version.tx_idx);
-    if note_and_try_commute(specfence, mv_memory, tx_version.tx_idx, &invalid) {
+    if note_and_try_commute(specfence, mv_memory, tx_version.tx_idx, &[]) {
         return scheduler.finish_validation(tx_version, false);
     }
+
+    let invalid = mv_memory.collect_invalid_reads(tx_version.tx_idx);
     // Thin-shell A0: commute already tried; failed commute ≡ OCC abort.
     let optimistic_ungated = specfence
         .policy
