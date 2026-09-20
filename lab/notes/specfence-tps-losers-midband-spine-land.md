@@ -17,7 +17,7 @@ Lazy-update chains stay **not** OrderedAdmit objects. Ungated OCC task selection
 | **M1** | Mid-band leftover-long: sticky OptimisticRead unless cover is proven cheaper. Wait-set at the soft-cap that still loses drops `cover_window` and withdraws order. Thin 3356896 keeps light-cover Win_2. |
 | **M2** | `skip_ungated_path_tax` covers mid/large when the wait-set is empty or only short-chain. `ignore_leftover_reservations` stays large-lazy only (19469101). |
 | **M3** | Empty Win_1 banned on leftover-long mid/large until a measured covering arm is cheaper than OCC abort. Under-covered spines stay Opt. |
-| **M4** | Full 99-block Soft=0 TPS vs OCC (pending / see sweep). |
+| **M4** | Full 99-block Soft=0 TPS vs OCC — see sweep. |
 | **M5** | Keep PR36/38/39: lazy-update never OrderedAdmit; Done-on-success; Soft=0. |
 
 ## Implementation notes
@@ -27,12 +27,23 @@ Lazy-update chains stay **not** OrderedAdmit objects. Ungated OCC task selection
 - `generate_arms` drops `Win_1` when `ban_empty_win1`.
 - `note_ordered_seed` / `note_wait_set` record leftover-long plants and the post-cap wait-set.
 - `skip_ungated_path_tax` = large+lazy **or** (n>thin ∧ ¬leftover-long wait-set).
-- After-publish D1 walk stays on for mid-band short-chain wait-sets (`ignore_leftover_reservations` is the fat-lazy skip). Skipping that walk under M2 livelocked 19716145 (wait-set live, leftover-long hops=0).
+- After-publish D1 walk stays on for a **live** wait-set. Empty Opt wait-sets skip the walk (M2). Skipping a live walk under M2 livelocked 19716145.
 - Leftover-long mid/large yield does not T3-slide or flush idle hops.
+- Mid-band reuse after another mid/large block leans `end_block` under the Opt path-tax skip.
 
-## Metrics
+## Metrics (Soft=0, N=3 reuse @8, n>0)
 
-See sweep after M4.
+| metric | PR39 | this (`578e25b`) |
+|--------|-----:|-----------------:|
+| SF TPS≥OCC | 28/98 | **23/98** |
+| TPS ratio median | 0.857 | **0.832** |
+| wall median / p90 / max | 1.168 / 2.272 / 4.062 | **1.202 / 2.195 / 3.220** |
+| 19716145 SF/OCC | 0.440 | **0.660** |
+| 19638737 SF/OCC | 0.450 | **0.475** |
+| 19860366 SF/OCC | 0.500 | **0.677** |
+| 16146267 SF/OCC | 0.407 | 0.362 |
+
+Hang-fix-only (`7de412c`) was 27/98, median 0.861, wall max 3.49. Named mid-band 19716145 / 19638737 / 19860366 up; 16146267 still below PR39. Wall max stays on the ~3× near-indep line (14396881), not a 4–27× lazy-update tail. Soft=0 every row. 30/70 PR39 losers improved (Δ>+0.01).
 
 ## Commands
 
