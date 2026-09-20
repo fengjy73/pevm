@@ -1207,7 +1207,8 @@ impl CostPolicy {
         if self.loc_forbids_n(location, n_pairs) {
             return false;
         }
-        under_covered_object(self.loc_object(location), n_pairs)
+        // loc_object_map only — callers may already hold `promoted`.
+        under_covered_object(self.loc_object_map(location), n_pairs)
     }
 
     /// Ordered prepaid (gate stall) ≥ OCC abort cost — sticky OptimisticRead.
@@ -1379,14 +1380,6 @@ impl CostPolicy {
     /// A planted covering prefix (Win_2+) must not slide on the same
     /// block — 3356896 i=1 otherwise prepaid-blows ĉ and retreats to Opt.
     pub(crate) fn leftover_slide_ok(&self, location: MemoryLocationHash) -> bool {
-        let n_pairs = self
-            .short_chain
-            .get(&location)
-            .map(|c| c.len())
-            .unwrap_or(0);
-        if self.yield_to_occ_abort(location, n_pairs) {
-            return false;
-        }
         let Some(s) = self.promoted.get(&location) else {
             return true;
         };
@@ -1396,6 +1389,11 @@ impl CostPolicy {
         if s.last_cover_ok {
             return false;
         }
+        let n_pairs = self
+            .short_chain
+            .get(&location)
+            .map(|c| c.len())
+            .unwrap_or(0);
         if n_pairs > ORDER_WINDOW_K
             && is_covering(
                 s.decision,
@@ -1415,20 +1413,22 @@ impl CostPolicy {
     /// L3: a proven **light** covering arm stays sticky. Cold may walk
     /// `cover_window±1`; hot does not default-widen to full cover.
     fn covering_sticky(&self, location: MemoryLocationHash, n_pairs: usize) -> bool {
+        if n_pairs <= ORDER_WINDOW_K {
+            return false;
+        }
         if self.yield_to_occ_abort(location, n_pairs) {
             return false;
         }
-        n_pairs > ORDER_WINDOW_K
-            && self.promoted.get(&location).is_some_and(|s| {
-                s.last_cover_ok
-                    && !s.last_crisis
-                    && is_covering(
-                        s.decision,
-                        n_pairs,
-                        self.seg_cap(),
-                        self.loc_cover_window(location, n_pairs),
-                    )
-            })
+        self.promoted.get(&location).is_some_and(|s| {
+            s.last_cover_ok
+                && !s.last_crisis
+                && is_covering(
+                    s.decision,
+                    n_pairs,
+                    self.seg_cap(),
+                    self.loc_cover_window(location, n_pairs),
+                )
+        })
     }
 
     /// G2: planted-segment safety bound from block width / cores (not SEG_CAP=2).
