@@ -189,7 +189,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
             && self
                 .specfence
                 .policy
-                .is_some_and(|p| p.is_optimistic_majority_block())
+                .is_some_and(|p| p.is_optimistic_majority_block() || p.skip_ungated_path_tax())
             && !self.specfence.ready_edges.was_queued(tx_idx);
         self.has_nonce = has_nonce;
         self.read_set.clear();

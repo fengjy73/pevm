@@ -657,9 +657,20 @@ fn main() {
                 let occ_tps = occ["tps"].as_f64().unwrap_or(0.0);
                 let sf_wall = sf["wall_ms"].as_f64().unwrap_or(0.0);
                 let occ_wall = occ["wall_ms"].as_f64().unwrap_or(0.0);
+                let gas = sf["gas_used"].as_u64().unwrap_or(0) as f64;
                 let sf_occ = if occ_tps > 0.0 { sf_tps / occ_tps } else { 0.0 };
                 let wall_ratio = if occ_wall > 0.0 {
                     sf_wall / occ_wall
+                } else {
+                    0.0
+                };
+                let sf_gps = if sf_wall > 0.0 {
+                    gas / (sf_wall / 1000.0)
+                } else {
+                    0.0
+                };
+                let occ_gps = if occ_wall > 0.0 {
+                    gas / (occ_wall / 1000.0)
                 } else {
                     0.0
                 };
@@ -672,6 +683,8 @@ fn main() {
                     "sf_tps": sf_tps,
                     "occ_tps": occ_tps,
                     "sf_occ": sf_occ,
+                    "sf_gas_per_s": sf_gps,
+                    "occ_gas_per_s": occ_gps,
                     "sf_wall_ms": sf_wall,
                     "occ_wall_ms": occ_wall,
                     "wall_ratio": wall_ratio,
@@ -835,12 +848,22 @@ fn main() {
         .filter(|p| p["soft_wait_arms"].as_u64().unwrap_or(0) > 0)
         .filter_map(|p| p["block"].as_u64())
         .collect();
+    let sf_tps_ge_occ = pairs
+        .iter()
+        .filter(|p| p["sf_occ"].as_f64().unwrap_or(0.0) >= 1.0)
+        .count();
+    let wall_r_max = pairs
+        .iter()
+        .filter_map(|p| p["wall_ratio"].as_f64())
+        .fold(0.0_f64, f64::max);
 
     let worst10: Vec<_> = pairs.iter().take(10).cloned().collect();
     let best10: Vec<_> = pairs.iter().rev().take(10).cloned().collect();
 
     let summary = serde_json::json!({
         "n_pairs": pairs.len(),
+        "sf_tps_ge_occ": sf_tps_ge_occ,
+        "soft0_all_rows": soft_nonzero.is_empty(),
         "sf_occ": {
             "median": sf_occ_med,
             "p10_worst": sf_occ_p10,
@@ -851,6 +874,7 @@ fn main() {
         "wall_ratio_sf_over_occ": {
             "median": wall_r_med,
             "p90": wall_r_p90,
+            "max": wall_r_max,
             "min": wall_r_min,
             "mean": wall_r_mean,
         },

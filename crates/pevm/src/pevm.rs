@@ -798,7 +798,8 @@ impl Pevm {
             // promoted ℓ. Skip HotSet decay + sketch on thin (not next-begin).
             let beneficiary = hash_deterministic(MemoryLocation::Basic(block_env.beneficiary));
             let ready_d1 = ready_edges.writer_order_snapshot();
-            let mut d1_orders = if ready_d1.iter().any(|(_, w)| w.len() >= 2) {
+            let ready_conflict = ready_d1.iter().any(|(_, w)| w.len() >= 2);
+            let mut d1_orders = if ready_conflict {
                 ready_d1
             } else {
                 mv_writer_order_snapshot(&mv_memory, block_size, beneficiary)
@@ -817,13 +818,16 @@ impl Pevm {
             let stable_d1 = ready_has_4_31 && thin && block_size >= STABLE_D1_N_MIN;
             // Mid-band / large reuse with stored D1 skips HotSet / inter-prior /
             // sketch (same lean as 3356896 stable D1). First block still persists.
-            let d1_reuse = self.cost_policy.d1_pairs_already_stored(&d1_orders);
+            let d1_reuse = self.cost_policy.d1_pairs_already_stored(&d1_orders)
+                || self.cost_policy.should_reuse_stored_d1();
             // Large + lazy-update already classified → skip HotSet / inter-prior /
-            // sketch. Real-spine D1 persist is filtered below.
+            // sketch / MV merge. Real-spine D1 persist is filtered below.
             let lean_end = stable_d1 || self.cost_policy.should_lean_end_block(d1_reuse);
             // edge_4_31 already true → skip MV merge and HotSet walk.
+            // E1: ready D1 with a conflict structure, or lean reuse, skips
+            // the promoted-ℓ MV merge (19860366-class ~4ms tail).
             // lean_end still skips HotSet below.
-            if !ready_has_4_31 && !d1_reuse {
+            if !ready_has_4_31 && !d1_reuse && !lean_end && !ready_conflict {
                 for (loc, writers) in mv_writers_for_locs(
                     &mv_memory,
                     &self.cost_policy.promoted_locations(),
@@ -872,7 +876,7 @@ impl Pevm {
             let inc_gt0 = incs.iter().filter(|&&i| i > 0).count();
             let reexec: usize = incs.iter().sum();
             let mut miss = 0usize;
-            if thin {
+            if thin || lean_end {
                 for (tx, &inc) in incs.iter().enumerate() {
                     if inc > 0 && !ready_edges.was_queued(tx) {
                         miss += 1;
@@ -915,7 +919,8 @@ impl Pevm {
             // (4→31→66→… on Basic(0x32be)). Skip wide empty-to / CallWaw
             // envelopes so 0x209c is not stored as a star. No mid-execute insert.
             // C3: reuse stable D1 already stored — skip the clone/filter walk.
-            if !stable_d1 || !self.cost_policy.d1_pairs_already_stored(&d1_orders) {
+            // E1: lean mid-band / large reuse also skips persist + pair merge.
+            if !d1_reuse && (!stable_d1 || !self.cost_policy.d1_pairs_already_stored(&d1_orders)) {
                 let persist: Vec<_> = d1_orders
                     .iter()
                     .filter(|(loc, w)| {
@@ -929,7 +934,7 @@ impl Pevm {
                 }
             }
             let mut d1_orders = d1_orders;
-            if !stable_d1 {
+            if !stable_d1 && !lean_end {
                 for (loc, writers) in self.cost_policy.writer_orders_from_pairs() {
                     if let Some((_, w)) = d1_orders.iter_mut().find(|(l, _)| *l == loc) {
                         w.extend(writers);
@@ -957,7 +962,8 @@ impl Pevm {
             self.cost_policy
                 .note_cost_sample(refuse_unit, inc_gt0 > 0, idle);
             // C3: stable 3356896 D1 — skip morph flush / re-widen.
-            if stable_d1 {
+            // E1: lean mid-band / large reuse is the same stable learn.
+            if stable_d1 || lean_end {
                 self.cost_policy.end_block_learn_stable_d1();
             } else {
                 self.cost_policy.end_block_learn();

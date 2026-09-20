@@ -40,8 +40,7 @@ pub(crate) fn next_sf_task(
     // Mid-band real spines (CallWaw / Win_2, e.g. 19469101 n=469) still
     // have pending gates without ProducerStage reserve — must not OCC-steal
     // through those wait-for deps (PR24 abort-train hang).
-    let large_lazy = policy
-        .is_some_and(|p| p.block_n() >= super::policy::LARGE_BLOCK_N && p.lazy_already_seen());
+    let large_lazy = policy.is_some_and(|p| p.skip_ungated_path_tax());
     if large_lazy || (!stages.has_reserved() && !ready.has_pending_gated()) {
         return scheduler.next_task();
     }
