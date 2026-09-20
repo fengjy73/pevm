@@ -152,6 +152,7 @@ struct IterRow {
     double_pay_n: usize,
     sys_reexec_n: usize,
     covering_n: usize,
+    chosen_w_need: u8,
     begin_blocked: Vec<usize>,
     taxed_indep_blocked: Vec<usize>,
     main_inc_gt0: Vec<usize>,
@@ -227,7 +228,7 @@ fn run_once(
                 .map(|(t, _)| t)
                 .collect();
             println!(
-                "  {mode_name}[{i}] ok wall_ms={wall_ms:.3} tps={:.0} occ_aborts={} inc>0={} reexec={} refuse_admit={} wait_for_dependency={} soft_wait_arms={} idle_ns={} ready_width={:.2} ordered_admit={} optimistic_read={} edge_oa={} edge_or={} refuse_ns={} reexec_ns={} ordered_ns={} prepaid_ns={} abort_cf_ns={} prior_decay={} opt_maj={} ev_keep={} ev_demote={} commute={} batch={} d1_prom={} d1_ign={} taxed_begin={} edge_4_31={} unfenced_reexec={} double_pay={} sys_reexec={} covering={} learn={} win_w={} w_cap={} seg_len={} uniq_w/s={}/{} expl_bud={} win1/2/3/seg/full/defer={}/{}/{}/{}/{}/{} arms={} switch={} explore={} win2_dev={} c_opt/w1/w2/w3/def={:.0}/{:.0}/{:.0}/{:.0}/{:.0} main_inc={:?} storage_inc={:?} admit_seed_ns={} end_block_ns={} opt_path_tax_ns={} pick_occ={} pick_gate={} skip_gate={} occ_while_gated={} yield_ns={} gate_stall_ns={} busy_ns={}",
+                "  {mode_name}[{i}] ok wall_ms={wall_ms:.3} tps={:.0} occ_aborts={} inc>0={} reexec={} refuse_admit={} wait_for_dependency={} soft_wait_arms={} idle_ns={} ready_width={:.2} ordered_admit={} optimistic_read={} edge_oa={} edge_or={} refuse_ns={} reexec_ns={} ordered_ns={} prepaid_ns={} abort_cf_ns={} prior_decay={} opt_maj={} ev_keep={} ev_demote={} commute={} batch={} d1_prom={} d1_ign={} taxed_begin={} edge_4_31={} unfenced_reexec={} double_pay={} sys_reexec={} covering={} w_need={} learn={} win_w={} w_cap={} seg_len={} uniq_w/s={}/{} expl_bud={} win1/2/3/seg/full/defer={}/{}/{}/{}/{}/{} arms={} switch={} explore={} win2_dev={} c_opt/w1/w2/w3/def={:.0}/{:.0}/{:.0}/{:.0}/{:.0} main_inc={:?} storage_inc={:?} admit_seed_ns={} end_block_ns={} opt_path_tax_ns={} pick_occ={} pick_gate={} skip_gate={} occ_while_gated={} yield_ns={} gate_stall_ns={} busy_ns={}",
                 n as f64 / (wall_ms / 1000.0),
                 m.occ_aborts,
                 m.incarnation_gt0,
@@ -260,6 +261,7 @@ fn run_once(
                 learn.double_pay_n,
                 learn.sys_reexec_n,
                 learn.covering_n,
+                learn.chosen_w_need,
                 learn.chosen_strategy,
                 learn.chosen_win_w,
                 learn.chosen_w_cap,
@@ -361,6 +363,7 @@ fn run_once(
                 double_pay_n: learn.double_pay_n,
                 sys_reexec_n: learn.sys_reexec_n,
                 covering_n: learn.covering_n,
+                chosen_w_need: learn.chosen_w_need,
                 begin_blocked: begin,
                 taxed_indep_blocked: taxed,
                 main_inc_gt0: inc_gt0_in(&incs, MAIN_CHAIN),

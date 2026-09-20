@@ -5,7 +5,8 @@
 //!
 //! # Default block set: lab/notes/specfence-high-bound-occ-gap-block-ids.txt (~52)
 //! # Optional:
-//! SPECFENCE_ALL_ITERS=1          # default 1; set 3 for slow outliers
+//! SPECFENCE_ALL_ITERS=1          # default 1; set 3 for reuse / outliers
+//! SPECFENCE_ALL_REUSE=1          # reuse one SpecFence Pevm across iters (arm Opt→Win)
 //! SPECFENCE_ALL_PROCESS_TOP=10   # process-trace top-K worst SF/OCC (default 10; 0=off)
 //! SPECFENCE_ALL_OUT=lab/results/all-blocks-sf-occ-sweep.json
 //! SPECFENCE_ALL_BLOCKS=all                 # full ~99 corpus
@@ -354,6 +355,7 @@ fn run_mode(
     cores: usize,
     iters: usize,
     process_trace: bool,
+    reuse: bool,
 ) -> serde_json::Value {
     let n = n_tx(&loaded.block);
     let cores_nz = NonZeroUsize::new(cores.max(1)).unwrap();
@@ -361,16 +363,35 @@ fn run_mode(
     let mut tpss = Vec::with_capacity(iters);
     let mut last_metrics = None;
     let mut last_process = None;
+    let mut last_learn = None;
+    let mut first_arm: Option<String> = None;
+    let mut last_arm: Option<String> = None;
     let mut ok_all = true;
     let mut last_err: Option<String> = None;
 
-    for i in 0..iters {
-        let mut pevm = match mode {
-            "occ" => Pevm::with_concurrency_mode(ConcurrencyMode::Occ),
-            _ => Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence),
-        };
+    let mut pevm = match mode {
+        "occ" => Pevm::with_concurrency_mode(ConcurrencyMode::Occ),
+        _ => Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence),
+    };
+    if !reuse {
         pevm.reset_heat();
         pevm.reset_inter_prior();
+    } else if mode == "specfence" {
+        pevm.reset_heat();
+        pevm.reset_inter_prior();
+    }
+
+    for i in 0..iters {
+        if !reuse {
+            pevm = match mode {
+                "occ" => Pevm::with_concurrency_mode(ConcurrencyMode::Occ),
+                _ => Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence),
+            };
+            pevm.reset_heat();
+            pevm.reset_inter_prior();
+        } else if mode == "occ" {
+            pevm = Pevm::with_concurrency_mode(ConcurrencyMode::Occ);
+        }
         if process_trace && mode == "specfence" && i + 1 == iters {
             pevm.set_finegrain_trace(true);
         }
@@ -388,10 +409,16 @@ fn run_mode(
                 walls.push(wall_ms);
                 tpss.push(tps);
                 let m = pevm.last_specfence_metrics().clone();
-                if mode == "specfence" && i + 1 == iters {
-                    // Always keep process snapshot for decision-field contingencies;
-                    // full process_summary still gated by process_trace / process_top.
-                    last_process = Some(pevm.last_exec_process().clone());
+                if mode == "specfence" {
+                    let learn = pevm.last_learn_report().clone();
+                    if i == 0 {
+                        first_arm = Some(learn.chosen_strategy.clone());
+                    }
+                    last_arm = Some(learn.chosen_strategy.clone());
+                    if i + 1 == iters {
+                        last_process = Some(pevm.last_exec_process().clone());
+                        last_learn = Some(learn);
+                    }
                 }
                 last_metrics = Some(m);
             }
@@ -418,11 +445,18 @@ fn run_mode(
         .as_ref()
         .map(|m| metrics_json(m, n))
         .unwrap_or_else(|| serde_json::json!({}));
+    let reuse_med = if walls.len() >= 2 {
+        let mut rest = walls[1..].to_vec();
+        Some(summarize_f64(&mut rest).0)
+    } else {
+        None
+    };
     let mut row = serde_json::json!({
         "block": loaded.number,
         "mode": mode,
         "cores": cores,
         "iters": iters,
+        "reuse": reuse,
         "ok": ok_all && last_err.is_none(),
         "error": last_err,
         "n_tx": n,
@@ -436,8 +470,33 @@ fn run_mode(
         "wall_ms_p90": wall_p90,
         "wall_ms_min": wall_min,
         "wall_ms_mean": wall_mean,
+        "wall_ms_cold": walls.first().copied(),
+        "wall_ms_reuse_median": reuse_med,
         "metrics": metrics,
+        "arm_cold": first_arm,
+        "arm_last": last_arm,
     });
+    if let Some(learn) = last_learn {
+        row["learn"] = serde_json::json!({
+            "chosen_strategy": learn.chosen_strategy,
+            "chosen_win_w": learn.chosen_win_w,
+            "chosen_w_need": learn.chosen_w_need,
+            "chosen_w_cap": learn.chosen_w_cap,
+            "selected_arms": learn.selected_arms,
+            "unfenced_reexec": learn.unfenced_reexec,
+            "double_pay_n": learn.double_pay_n,
+            "sys_reexec_n": learn.sys_reexec_n,
+            "covering_n": learn.covering_n,
+            "win1_locs": learn.win1_locs,
+            "win2_locs": learn.win2_locs,
+            "win3_locs": learn.win3_locs,
+            "seg_locs": learn.seg_locs,
+            "full_locs": learn.full_locs,
+            "defer_locs": learn.defer_locs,
+            "opt_locs": learn.opt_locs,
+            "occ_pick_while_gated": learn.occ_pick_while_gated,
+        });
+    }
     if let Some(proc) = last_process {
         row["decision_fields"] = serde_json::to_value(&proc.decision_fields).unwrap_or_default();
         if process_trace {
@@ -483,9 +542,13 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(10usize);
+    let reuse = std::env::var("SPECFENCE_ALL_REUSE")
+        .ok()
+        .map(|s| s != "0" && !s.is_empty())
+        .unwrap_or(false);
     let (numbers, numbers_src) = resolve_block_numbers(&blocks_dir);
     eprintln!(
-        "all-blocks sweep: {} candidates ({numbers_src}), iters={iters}, process_top={process_top}, out={}",
+        "all-blocks sweep: {} candidates ({numbers_src}), iters={iters}, reuse={reuse}, process_top={process_top}, out={}",
         numbers.len(),
         out_path.display()
     );
@@ -513,28 +576,31 @@ fn main() {
                     loaded.block.header.gas_used
                 );
                 for mode in ["occ", "specfence"] {
-                    let row = run_mode(&chain, &loaded, mode, 8, iters, false);
+                    let row = run_mode(&chain, &loaded, mode, 8, iters, false, reuse);
                     eprintln!(
-                        "  {mode:10} ok={} tps={:.0} wall_ms={:.1} soft={} aborts={} ordered_admit={} wait={} unf={} rewind={} rebind={} full={} r1={}/{} resume_k={} full_retry={}",
+                        "  {mode:10} ok={} tps={:.0} wall_ms={:.1} reuse_med={} arm={}→{} unf={} dp={} sys={} cover={} w={} need={} soft={} aborts={} ordered_admit={} wait={} rewind={} rebind={} full={}",
                         row["ok"],
                         row["tps"].as_f64().unwrap_or(0.0),
                         row["wall_ms"].as_f64().unwrap_or(0.0),
+                        row["wall_ms_reuse_median"]
+                            .as_f64()
+                            .map(|v| format!("{v:.1}"))
+                            .unwrap_or_else(|| "-".into()),
+                        row["arm_cold"].as_str().unwrap_or("-"),
+                        row["arm_last"].as_str().unwrap_or("-"),
+                        row["learn"]["unfenced_reexec"].as_u64().unwrap_or(0),
+                        row["learn"]["double_pay_n"].as_u64().unwrap_or(0),
+                        row["learn"]["sys_reexec_n"].as_u64().unwrap_or(0),
+                        row["learn"]["covering_n"].as_u64().unwrap_or(0),
+                        row["learn"]["chosen_win_w"].as_u64().unwrap_or(0),
+                        row["learn"]["chosen_w_need"].as_u64().unwrap_or(0),
                         row["metrics"]["soft_wait_arms"].as_u64().unwrap_or(0),
                         row["metrics"]["occ_aborts"].as_u64().unwrap_or(0),
                         row["metrics"]["edge_ordered_admit"].as_u64().unwrap_or(0),
                         row["metrics"]["edge_wait_for"].as_u64().unwrap_or(0),
-                        row["metrics"]["edge_optimistic_read"].as_u64().unwrap_or(0),
                         row["metrics"]["rewind_to_cp"].as_u64().unwrap_or(0),
                         row["metrics"]["rebind_only"].as_u64().unwrap_or(0),
                         row["metrics"]["full_abort_reexecute"].as_u64().unwrap_or(0),
-                        row["metrics"]["partial_abort_win"].as_u64().unwrap_or(0),
-                        row["metrics"]["partial_abort_attempt"]
-                            .as_u64()
-                            .unwrap_or(0),
-                        row["metrics"]["park_resume_at_k"].as_u64().unwrap_or(0),
-                        row["metrics"]["park_resume_full_abort_reexecute"]
-                            .as_u64()
-                            .unwrap_or(0),
                     );
                     rows.push(row);
                 }
@@ -554,6 +620,7 @@ fn main() {
             "head": option_env!("SPECFENCE_BUILD_HEAD").unwrap_or("f74f875"),
             "cores": 8,
             "iters": iters,
+            "reuse": reuse,
             "coverage": {
                 "candidates": numbers.len(),
                 "loaded": loaded_ok,
@@ -622,6 +689,16 @@ fn main() {
                     "refuse_admit": sf["metrics"]["refuse_admit"],
                     "park_resume_at_k": sf["metrics"]["park_resume_at_k"],
                     "park_resume_full_abort_reexecute": sf["metrics"]["park_resume_full_abort_reexecute"],
+                    "arm_cold": sf["arm_cold"],
+                    "arm_last": sf["arm_last"],
+                    "unfenced_reexec": sf["learn"]["unfenced_reexec"],
+                    "double_pay_n": sf["learn"]["double_pay_n"],
+                    "sys_reexec_n": sf["learn"]["sys_reexec_n"],
+                    "covering_n": sf["learn"]["covering_n"],
+                    "chosen_win_w": sf["learn"]["chosen_win_w"],
+                    "chosen_w_need": sf["learn"]["chosen_w_need"],
+                    "selected_arms": sf["learn"]["selected_arms"],
+                    "sf_reuse_wall_ms": sf["wall_ms_reuse_median"],
                 }));
             }
             _ => {}
@@ -656,7 +733,7 @@ fn main() {
                 Arc::clone(&block_hashes),
             ) {
                 Ok(loaded) => {
-                    let row = run_mode(&chain, &loaded, "specfence", 8, 1, true);
+                    let row = run_mode(&chain, &loaded, "specfence", 8, 1, true, false);
                     let pname = format!("all-blocks-process-{bn}.json");
                     let ppath = out_path.parent().unwrap().join(&pname);
                     fs::write(&ppath, serde_json::to_string_pretty(&row).unwrap()).ok();
@@ -782,6 +859,7 @@ fn main() {
         "head": option_env!("SPECFENCE_BUILD_HEAD").unwrap_or("f74f875"),
         "cores": 8,
         "iters": iters,
+        "reuse": reuse,
         "coverage": {
             "candidates": numbers.len(),
             "loaded": loaded_ok,

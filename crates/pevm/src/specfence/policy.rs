@@ -15,9 +15,12 @@
 //!
 //! Systematic reexec on an Opt/Defer leftover (multi-incarnation / high
 //! `reexec_ns` / unfenced train) is a **CC feedback signal**: the next
-//! begin re-opens covering OrderedWindow/Seg. Leftover is not “OCC
-//! forever.” ĉ compares **full-spine** ordered wall vs Opt; a half-window
-//! plus OCC tail is double-pay and is not scheduled.
+//! begin re-opens a **light** covering OrderedWindow/Seg — the minimal
+//! `w` / Seg that absorbs the train (T3 slides leftover idle hops).
+//! Leftover is not “OCC forever,” and covering is not a default
+//! `w = n_pairs−1` nail. ĉ compares **light prepaid** vs OCC whole-spine;
+//! a prefix shorter than `w_need` plus OCC tail is double-pay and is not
+//! scheduled. Independent holes stay ungated (S1).
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -326,8 +329,10 @@ pub struct LearnReport {
     pub double_pay_n: usize,
     /// R1: locations whose Opt/Defer leftover paid a systematic reexec train.
     pub sys_reexec_n: usize,
-    /// R2: long-spine locations whose chosen arm leaves leftover &lt; 2.
+    /// L1: long-spine locations whose chosen arm meets light `w_need`.
     pub covering_n: usize,
+    /// L1: telemetry loc `w_need` (minimal cover; 0 = unset).
+    pub chosen_w_need: u8,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -456,8 +461,11 @@ struct PromotedLoc {
     /// R1: Opt/Defer (or leftover) paid a systematic reexec train. Next begin
     /// must re-open OrderedWindow/Seg — not nail Opt/Defer-only forever.
     last_sys_reexec: bool,
-    /// R3: last covering arm absorbed leftover OCC (unfenced down).
+    /// L1/R3: last light covering arm absorbed the systematic train.
     last_cover_ok: bool,
+    /// L1: minimal `w` that absorbs the last systematic reexec / leftover
+    /// train. 0 = unset (cold uses `light_cover_w`, never `n_pairs−1`).
+    w_need: u8,
     /// G4 morph bucket this loc last contributed to.
     morph: MorphKey,
     /// Telemetry only — leftover hops after the chosen arm (not a pick driver).
@@ -488,6 +496,7 @@ impl PromotedLoc {
             last_double_pay: false,
             last_sys_reexec: false,
             last_cover_ok: false,
+            w_need: 0,
             morph: morph_key(0),
             leftover_reexec: 0,
             block_reexec_ns: 0,
@@ -969,9 +978,9 @@ impl CostPolicy {
             .min(n_pairs)
     }
 
-    /// Per-ℓ window cap. Oversub hat stays 2 until a covering arm is the
-    /// CC mouth (systematic reexec / leftover double-pay / proven cover).
-    /// Never FullChain on long spines (`n_pairs - 1`).
+    /// Per-ℓ window cap. Oversub hat stays 2 until a **light** covering
+    /// arm is the CC mouth (systematic reexec / leftover double-pay /
+    /// proven cover). Raises to `w_need`, never nails `n_pairs−1`.
     pub(crate) fn w_cap_for(&self, location: MemoryLocationHash, n_pairs: usize) -> usize {
         let base = self.w_cap_of(n_pairs);
         if n_pairs <= ORDER_WINDOW_K {
@@ -980,13 +989,47 @@ impl CostPolicy {
         let Some(s) = self.promoted.get(&location) else {
             return base;
         };
+        let need = self.loc_w_need(location, n_pairs);
         let proven_cover =
-            (s.w_star as usize) > base && is_covering(s.decision, n_pairs, self.seg_cap());
+            (s.w_star as usize) >= need && is_covering(s.decision, n_pairs, self.seg_cap(), need);
         if s.last_sys_reexec || s.last_double_pay || proven_cover {
-            covering_w(n_pairs).max(base)
+            need.max(base).min(full_cover_w(n_pairs))
         } else {
             base
         }
+    }
+
+    /// L1: prepaid-safe cover hat. Same shape as `w_cap_of` so 176@8
+    /// stays Win_2-class — never a default `n_pairs−1` nail.
+    fn light_hat(&self, n_pairs: usize) -> usize {
+        if n_pairs <= ORDER_WINDOW_K {
+            return n_pairs.max(1);
+        }
+        self.w_cap_of(n_pairs).min(full_cover_w(n_pairs)).max(1)
+    }
+
+    /// L1: minimal cover width for `ℓ`. Unset + reopen → light first
+    /// cover (observed reexec ∩ hat), never a full-spine nail.
+    fn loc_w_need(&self, location: MemoryLocationHash, n_pairs: usize) -> usize {
+        let full = full_cover_w(n_pairs);
+        let hat = self.light_hat(n_pairs);
+        let stored = self
+            .promoted
+            .get(&location)
+            .map(|s| s.w_need as usize)
+            .unwrap_or(0);
+        if stored >= 1 {
+            return stored.min(full).min(hat).max(1);
+        }
+        if self.reopen_ordered(location) {
+            let observed = self
+                .promoted
+                .get(&location)
+                .map(|s| (s.block_reexec_n as usize).max(2))
+                .unwrap_or(2);
+            return light_cover_w(n_pairs, hat, observed);
+        }
+        1.min(full.max(1))
     }
 
     fn reopen_ordered(&self, location: MemoryLocationHash) -> bool {
@@ -995,13 +1038,19 @@ impl CostPolicy {
             .is_some_and(|s| s.last_sys_reexec || s.last_double_pay)
     }
 
-    /// R3: a covering arm that already absorbed leftover OCC stays sticky.
+    /// L3: a proven **light** covering arm stays sticky. Cold may walk
+    /// `w_need±1`; hot does not default-widen to full cover.
     fn covering_sticky(&self, location: MemoryLocationHash, n_pairs: usize) -> bool {
         n_pairs > ORDER_WINDOW_K
             && self.promoted.get(&location).is_some_and(|s| {
                 s.last_cover_ok
                     && !s.last_crisis
-                    && is_covering(s.decision, n_pairs, self.seg_cap())
+                    && is_covering(
+                        s.decision,
+                        n_pairs,
+                        self.seg_cap(),
+                        self.loc_w_need(location, n_pairs),
+                    )
             })
     }
 
@@ -1186,7 +1235,7 @@ impl CostPolicy {
         // Safety: never persist FullChain on a long spine (short-n cache).
         if n_pairs > ORDER_WINDOW_K && arm == LocStrategy::FullChain {
             arm = if self.reopen_ordered(location) {
-                LocStrategy::win(covering_w(n_pairs))
+                LocStrategy::win(self.loc_w_need(location, n_pairs))
             } else {
                 LocStrategy::OptimisticRead
             };
@@ -1229,14 +1278,14 @@ impl CostPolicy {
             && self.promoted.get(&location).is_some_and(|s| {
                 s.measured && s.samples >= 2 && !s.decision.is_ordered() && !reopen
             });
-        // R3: cold / crisis explores covering w±1. Hot proven ordered is
-        // sticky. Sys-reexec upgrade is greedy covering (no Defer UCB).
+        // L3: cold / crisis explores light `w_need±1` / Seg. Hot proven
+        // light cover is sticky. Sys-reexec upgrade is greedy light cover.
         let sticky = self.covering_sticky(location, n_pairs);
-        let explore_ok = if leftover_pay_once || upgrading || sticky {
+        // L3: cold generate still offers w_need±1 / Seg; reopen itself is
+        // greedy min-ĉ (no UCB inventing an unmeasured cover over Defer).
+        let explore_ok = if leftover_pay_once || upgrading || sticky || reopen {
             false
-        } else if reopen && hot {
-            false
-        } else if crisis || !hot || reopen {
+        } else if crisis || !hot {
             true
         } else {
             self.try_consume_explore_budget()
@@ -1335,14 +1384,15 @@ impl CostPolicy {
             && self.promoted.get(&location).is_some_and(|s| {
                 s.measured && s.samples >= 2 && !s.decision.is_ordered() && !reopen
             });
-        // R1: leftover / sys-reexec re-opens covering OrderedWindow/Seg.
+        // L1: leftover / sys-reexec re-opens **light** OrderedWindow/Seg.
         // Pin-Opt is only unused-Win-prior protection (no signal yet).
         let pin_opt = leftover_pay_once && !reopen;
+        let w_need = self.loc_w_need(location, n_pairs);
         if n_pairs >= 1 && w_cap >= 1 && !pin_opt {
             if reopen {
-                let w_cover = covering_w(n_pairs).min(w_cap).max(1);
+                let w_cover = w_need.min(w_cap).max(1);
                 out.push(LocStrategy::win(w_cover));
-                // R3: cold explores covering w±1 only. Never FullChain.
+                // L3: cold explores light w±1 / Seg. Never FullChain.
                 if cold || crisis {
                     if w_cover > 1 {
                         out.push(LocStrategy::win((w_cover - 1).min(n_pairs)));
@@ -1370,7 +1420,7 @@ impl CostPolicy {
             && (reopen || ((cold || crisis) && w_star >= w_cap && w_cap >= 3));
         if want_seg {
             let sl = if reopen {
-                covering_seg_len(n_pairs, self.cores())
+                covering_seg_len(n_pairs, self.cores(), w_need)
             } else {
                 s_star.clamp(2, (n_pairs + 1).min(SEG_LEN_SAFETY_HAT))
             };
@@ -1394,7 +1444,7 @@ impl CostPolicy {
             let loc = self.promoted.get(&location);
             let keep = loc.as_ref().map(|s| s.decision);
             let w_keep = if reopen {
-                covering_w(n_pairs).min(w_cap).max(1)
+                w_need.min(w_cap).max(1)
             } else {
                 w_star.min(n_pairs).min(w_cap.max(1))
             };
@@ -1409,22 +1459,22 @@ impl CostPolicy {
                         .unwrap_or(false)
             });
         }
-        // R3: proven covering does not walk w−1 back into an OCC tail.
+        // L3: proven light cover does not walk below w_need (OCC tail).
         if self.covering_sticky(location, n_pairs) {
             let keep = self.promoted.get(&location).map(|s| s.decision);
-            let w_cover = covering_w(n_pairs).min(w_cap).max(1);
+            let w_cover = w_need.min(w_cap).max(1);
             out.retain(|a| {
                 keep == Some(*a)
                     || *a == LocStrategy::win(w_cover)
                     || matches!(a, LocStrategy::OptimisticRead | LocStrategy::DeferPlant)
             });
         }
-        // R2: never schedule half-window + OCC tail once CC owns the ℓ.
+        // L1: never schedule a prefix shorter than w_need + OCC tail.
         if reopen {
             let seg_cap = self.seg_cap();
             out.retain(|a| {
                 matches!(a, LocStrategy::OptimisticRead | LocStrategy::DeferPlant)
-                    || is_covering(*a, n_pairs, seg_cap)
+                    || is_covering(*a, n_pairs, seg_cap, w_need)
             });
         }
         out.sort_by_key(|a| a.tie_key());
@@ -1481,23 +1531,44 @@ impl CostPolicy {
                     c = arm_prior(a, n_pairs);
                 }
                 if reopen {
-                    // R2: ĉ is the **full-spine** wall. Half-window = prepaid
-                    // + leftover OCC (double-pay). Covering = hops × stall.
+                    // L4: ĉ is **light prepaid** vs OCC whole-spine.
+                    // Prefix shorter than w_need = prepaid + leftover OCC.
                     let hops = hops_for_strategy(a, n_pairs, seg_cap);
-                    let left = n_pairs.saturating_sub(hops);
+                    let hat = self.light_hat(n_pairs);
+                    let need = loc
+                        .as_ref()
+                        .map(|s| {
+                            if s.w_need >= 1 {
+                                s.w_need as usize
+                            } else {
+                                light_cover_w(n_pairs, hat, (s.block_reexec_n as usize).max(2))
+                            }
+                        })
+                        .unwrap_or_else(|| light_cover_w(n_pairs, hat, 2))
+                        .min(hat)
+                        .max(1);
                     if a.is_ordered() {
-                        // leftover==1 is covering continuation, not an OCC train.
-                        let tail = if left >= 2 { left as f64 * abort } else { 0.0 };
+                        let short = hops < need;
+                        let tail = if short {
+                            (need - hops) as f64 * abort
+                        } else {
+                            0.0
+                        };
                         let wall = hops as f64 * stall + tail;
-                        if n <= 1.0 || left >= 2 {
+                        if n <= 1.0 || short {
                             c = wall.max(c);
                         }
                     } else if sys_reexec && loc.as_ref().is_some_and(|s| !s.decision.is_ordered()) {
-                        // Upgrade: stale cheap Defer/Opt must not nail OCC
-                        // after a systematic reexec train. Floor above the
-                        // covering hat so the CC mouth actually switches.
-                        let cover_hat = covering_w(n_pairs) as f64 * stall;
-                        c = c.max(abort).max(cover_hat + NS_DELTA);
+                        // First upgrade: unused cheap Defer/Opt must not nail
+                        // OCC. After light cover is measured, ĉ may pick OCC
+                        // if prepaid lost (PRIMARY).
+                        let measured_cover = loc
+                            .as_ref()
+                            .and_then(|s| s.stat(LocStrategy::win(need)).filter(|(_, n)| *n > 1.5));
+                        if measured_cover.is_none() {
+                            let cover_hat = need as f64 * stall;
+                            c = c.max(abort).max(cover_hat + NS_DELTA);
+                        }
                     }
                 } else {
                     if measured
@@ -1532,9 +1603,11 @@ impl CostPolicy {
                     && !a.is_ordered()
                     && let Some(paid) = paid
                 {
-                    // R3: proven covering hysteresis — Opt/Defer must beat
-                    // the absorbed wall by NS_DELTA, not win a tie.
-                    c = c.max(paid + NS_DELTA);
+                    // L3/L4: proven light cover hysteresis only when it
+                    // beats OCC. Prepaid blowout may yield to Opt (PRIMARY).
+                    if paid + NS_DELTA < abort {
+                        c = c.max(paid + NS_DELTA);
+                    }
                 }
                 (a, c.max(1.0), n.max(1.0))
             })
@@ -2432,18 +2505,18 @@ impl CostPolicy {
                 e.leftover_reexec = 0;
             }
             let unfenced = self.unfenced_reexec.load(Ordering::Relaxed);
-            // O1: half-window + leftover OCC train. Re-opens covering; does
-            // not pin Opt/Defer-only and does not climb another half-window.
-            let double_pay_now = e.decision.is_ordered()
-                && leftover_hops >= 2
-                && (unfenced >= 4 || e.block_reexec_n >= 4);
+            let full = full_cover_w(n_pairs);
+            let hat = self.light_hat(n_pairs);
+            // O1: prefix shorter than the light hat + leftover OCC train.
+            // Meeting the hat with leftover_hops≥2 is T3-slide territory,
+            // not a climb toward n_pairs−1 (Win_9 prepaid blowout).
+            let leftover_train = leftover_hops >= 2 && (unfenced >= 4 || e.block_reexec_n >= 4);
+            let double_pay_now = e.decision.is_ordered() && leftover_train && planted < hat;
+            let had_sys = e.last_sys_reexec;
+            let had_dp = e.last_double_pay;
             if double_pay_now {
                 e.last_double_pay = true;
-            } else if e.decision.is_ordered()
-                && leftover_hops < 2
-                && unfenced < 4
-                && e.block_reexec_n < 2
-            {
+            } else if e.decision.is_ordered() && unfenced < 4 && e.block_reexec_n < 2 {
                 e.last_double_pay = false;
             }
             // R1: systematic reexec on Opt/Defer leftover — CC mouth owns it.
@@ -2456,12 +2529,32 @@ impl CostPolicy {
             if sys_now {
                 e.last_sys_reexec = true;
                 e.last_double_pay = false;
-            } else if e.decision.is_ordered()
-                && leftover_hops < 2
-                && e.block_reexec_n < 2
-                && unfenced < 4
-            {
+            } else if e.decision.is_ordered() && e.block_reexec_n < 2 && unfenced < 4 {
                 e.last_sys_reexec = false;
+            }
+            // L1: learn minimal w_need. First sys-reexec opens a light
+            // cover (not n_pairs−1). Leftover OCC train grows it. Absorb
+            // shrinks it to the proven planted width.
+            if sys_now {
+                let obs = (e.block_reexec_n as usize).max(2);
+                let first = light_cover_w(n_pairs, hat, obs);
+                e.w_need = if e.w_need == 0 {
+                    first as u8
+                } else {
+                    (e.w_need as usize).max(first).min(hat).min(full) as u8
+                };
+            } else if double_pay_now {
+                let cur = if e.w_need >= 1 {
+                    e.w_need as usize
+                } else {
+                    planted.max(1)
+                };
+                e.w_need = (cur.max(planted) + 1).min(hat).min(full) as u8;
+            } else if e.decision.is_ordered() && e.block_reexec_n < 2 && unfenced < 4 {
+                let proven = planted.max(1).min(hat).min(full);
+                if e.w_need == 0 || (e.w_need as usize) > proven {
+                    e.w_need = proven as u8;
+                }
             }
             e.last_crisis = match e.decision {
                 LocStrategy::OptimisticRead | LocStrategy::DeferPlant => {
@@ -2474,17 +2567,27 @@ impl CostPolicy {
                     unfenced >= 4 && leftover_hops >= 2
                 }
             };
-            if e.decision.is_ordered() && leftover_hops < 2 && e.block_reexec_n < 2 {
+            if e.decision.is_ordered() && e.block_reexec_n < 2 && unfenced < 4 {
                 e.last_crisis = false;
             }
+            let need_now = if e.w_need >= 1 {
+                e.w_need as usize
+            } else {
+                planted.max(1)
+            };
+            // Light leftover_hops≥2 is cover_ok only after a real train was
+            // the reason we opened the window (sys-reexec / double-pay).
+            // Vacuous unfenced=0 + fat prepaid must not sticky a wide Win.
+            let absorbed_train =
+                leftover_hops < 2 || had_sys || had_dp || sys_now || double_pay_now;
             if n_pairs > ORDER_WINDOW_K
-                && is_covering(e.decision, n_pairs, self.seg_cap())
-                && leftover_hops < 2
+                && is_covering(e.decision, n_pairs, self.seg_cap(), need_now)
                 && e.block_reexec_n < 2
                 && unfenced < 4
+                && absorbed_train
             {
                 e.last_cover_ok = true;
-            } else if leftover_hops >= 2 || e.block_reexec_n >= 2 || unfenced >= 4 {
+            } else if e.block_reexec_n >= 2 || unfenced >= 4 {
                 e.last_cover_ok = false;
             }
             if !e.measured
@@ -2638,7 +2741,8 @@ impl CostPolicy {
                 seg_ls.insert(seg_len);
             }
             let n_pairs = self.short_chain.get(e.key()).map(|c| c.len()).unwrap_or(0);
-            if n_pairs > ORDER_WINDOW_K && is_covering(e.decision, n_pairs, self.seg_cap()) {
+            let need = if e.w_need >= 1 { e.w_need as usize } else { 1 };
+            if n_pairs > ORDER_WINDOW_K && is_covering(e.decision, n_pairs, self.seg_cap(), need) {
                 covering_n += 1;
             }
             arms.push((*e.key(), e.decision, n_pairs));
@@ -2746,6 +2850,7 @@ impl CostPolicy {
             double_pay_n,
             sys_reexec_n,
             covering_n,
+            chosen_w_need: self.promoted.get(&tel_loc).map(|s| s.w_need).unwrap_or(0),
         }
     }
 
@@ -2779,8 +2884,9 @@ fn explore_score(c: f64, n_a: f64, n_tot: f64, sigma: f64) -> f64 {
     c.max(1.0) - bonus
 }
 
-/// Covering window: leftover &lt; 2, never FullChain on a long spine.
-fn covering_w(n_pairs: usize) -> usize {
+/// Full-spine cover cap: leftover &lt; 2, never FullChain on a long spine.
+/// Safety / grow ceiling only — not the default ĉ pick (L1).
+fn full_cover_w(n_pairs: usize) -> usize {
     if n_pairs == 0 {
         return 0;
     }
@@ -2791,12 +2897,21 @@ fn covering_w(n_pairs: usize) -> usize {
     }
 }
 
-fn leftover_after(arm: LocStrategy, n_pairs: usize, seg_cap: usize) -> usize {
-    n_pairs.saturating_sub(hops_for_strategy(arm, n_pairs, seg_cap))
+/// L1: first light cover. Absorbs observed systematic reexec, capped by
+/// the prepaid-safe hat — not `n_pairs−1`.
+fn light_cover_w(n_pairs: usize, hat: usize, observed: usize) -> usize {
+    if n_pairs == 0 {
+        return 0;
+    }
+    if n_pairs <= ORDER_WINDOW_K {
+        return n_pairs;
+    }
+    let full = full_cover_w(n_pairs);
+    observed.max(2).min(hat.max(2)).min(full)
 }
 
-fn leaves_occ_tail(arm: LocStrategy, n_pairs: usize, seg_cap: usize) -> bool {
-    arm.is_ordered() && leftover_after(arm, n_pairs, seg_cap) >= 2
+fn leaves_occ_tail(arm: LocStrategy, n_pairs: usize, seg_cap: usize, w_need: usize) -> bool {
+    arm.is_ordered() && hops_for_strategy(arm, n_pairs, seg_cap) < w_need.max(1)
 }
 
 /// Long-spine hops == n_pairs is FullChain by another name (R4).
@@ -2804,15 +2919,20 @@ fn is_full_equiv(arm: LocStrategy, n_pairs: usize, seg_cap: usize) -> bool {
     n_pairs > ORDER_WINDOW_K && hops_for_strategy(arm, n_pairs, seg_cap) >= n_pairs
 }
 
-fn is_covering(arm: LocStrategy, n_pairs: usize, seg_cap: usize) -> bool {
+/// Light covering: hops meet `w_need`, not a full-spine nail.
+fn is_covering(arm: LocStrategy, n_pairs: usize, seg_cap: usize, w_need: usize) -> bool {
     arm.is_ordered()
-        && leftover_after(arm, n_pairs, seg_cap) < 2
+        && hops_for_strategy(arm, n_pairs, seg_cap) >= w_need.max(1)
         && !is_full_equiv(arm, n_pairs, seg_cap)
 }
 
-fn covering_seg_len(n_pairs: usize, _cores: usize) -> usize {
-    // One segment of `n_pairs` writers → hops = n_pairs−1 (leftover 1).
-    n_pairs.clamp(2, SEG_LEN_SAFETY_HAT)
+fn covering_seg_len(n_pairs: usize, cores: usize, w_need: usize) -> usize {
+    (w_need + 1).clamp(
+        2,
+        default_seg_len(n_pairs, cores)
+            .max(2)
+            .min(SEG_LEN_SAFETY_HAT),
+    )
 }
 
 fn hops_for_strategy(strategy: LocStrategy, n_pairs: usize, seg_cap: usize) -> usize {
@@ -3815,8 +3935,8 @@ mod tests {
                 "O7: leftover OCC train on proven Win_2 is not a widen-window crisis"
             );
             assert!(
-                e.last_double_pay,
-                "O1: leftover OCC train on Win_2 is double-pay (Detect+OCC)"
+                !e.last_double_pay,
+                "L1: Win_2 meeting the oversub hat is T3-slide, not a climb"
             );
         }
     }
@@ -3824,7 +3944,7 @@ mod tests {
     #[test]
     fn double_pay_reopens_covering_not_half_window() {
         let p = CostPolicy::new();
-        p.begin_block_with_cores(176, 8);
+        p.begin_block_with_cores(32, 16);
         p.promote_short_edge(0x32be, 40_000);
         for pair in [(4, 31), (31, 66), (66, 67), (67, 69)] {
             p.note_short_pair(0x32be, pair.0, pair.1);
@@ -3837,6 +3957,7 @@ mod tests {
             e.last_crisis = false;
             e.last_double_pay = true;
             e.last_sys_reexec = false;
+            e.w_need = 3;
             e.upsert_stat(LocStrategy::win(2), 80_000.0, 4.0);
             e.upsert_stat(LocStrategy::OptimisticRead, 20_000.0, 3.0);
             e.upsert_stat(LocStrategy::DeferPlant, 18_000.0, 3.0);
@@ -3848,17 +3969,17 @@ mod tests {
             "R1: leftover double-pay still keeps Opt/Defer as a trial: {hot:?}"
         );
         assert!(
-            hot.iter().any(|a| is_covering(*a, 4, p.seg_cap())),
-            "R1: leftover re-opens a covering ordered arm, got {hot:?}"
+            hot.iter().any(|a| is_covering(*a, 4, p.seg_cap(), 3)),
+            "L1: leftover re-opens a light covering arm (w_need=3), got {hot:?}"
         );
         assert!(
-            !hot.iter().any(|a| leaves_occ_tail(*a, 4, p.seg_cap())),
-            "R2: half-window + OCC tail is not eligible after leftover, got {hot:?}"
+            !hot.iter().any(|a| leaves_occ_tail(*a, 4, p.seg_cap(), 3)),
+            "L1: prefix shorter than w_need + OCC tail is not eligible, got {hot:?}"
         );
         let cold_dp = p.generate_arms(0x32be, 4, false, true, true);
         assert!(
-            cold_dp.iter().any(|a| is_covering(*a, 4, p.seg_cap())),
-            "R1: cold leftover set includes covering Win/Seg, got {cold_dp:?}"
+            cold_dp.iter().any(|a| is_covering(*a, 4, p.seg_cap(), 3)),
+            "L1: cold leftover set includes light Win/Seg, got {cold_dp:?}"
         );
         // Half-window Win_2 prior must not win ĉ after leftover OCC.
         {
@@ -3869,12 +3990,13 @@ mod tests {
             e.last_double_pay = true;
             e.decision = LocStrategy::win(2);
             e.w_star = 2;
+            e.w_need = 3;
         }
         p.block_arm.clear();
         let (arm2, _, _) = p.select_arm(0x32be, 4);
         assert!(
-            !leaves_occ_tail(arm2, 4, p.seg_cap()),
-            "R2: select_arm must not schedule half-window + OCC tail, got {arm2:?}"
+            !leaves_occ_tail(arm2, 4, p.seg_cap(), 3),
+            "L1: select_arm must not schedule prefix < w_need + OCC tail, got {arm2:?}"
         );
     }
 
@@ -4083,10 +4205,15 @@ mod tests {
         }
         p.begin_block_with_cores(176, 8);
         p.block_arm.clear();
+        let need = p.loc_w_need(0x32be, 8);
+        assert!(
+            need >= 2 && need < 8,
+            "L1: first sys-reexec opens light w_need, not full spine, need={need}"
+        );
         let (arm, _, _) = p.select_arm(0x32be, 8);
         assert!(
-            is_covering(arm, 8, p.seg_cap()),
-            "R1/R2: stable D1 sys-reexec upgrades to covering ordered, got {arm:?}"
+            is_covering(arm, 8, p.seg_cap(), need),
+            "L1: stable D1 sys-reexec upgrades to light covering, got {arm:?} need={need}"
         );
         assert_ne!(
             arm,
@@ -4095,8 +4222,8 @@ mod tests {
         );
         let hops = p.hops_to_plant(0x32be, 8);
         assert!(
-            hops == 7,
-            "R2: covering plants leftover==1 and not FullChain, hops={hops}"
+            hops == need && hops < 8,
+            "L1: light cover plants w_need not n_pairs−1, hops={hops} need={need}"
         );
     }
 
@@ -4137,19 +4264,26 @@ mod tests {
         p.end_block_learn();
         p.begin_block_with_cores(176, 8);
         p.block_arm.clear();
+        let need = p.loc_w_need(0x32be, 8);
+        assert!(
+            need >= 2 && need < 8,
+            "L1: sys-reexec w_need is light, not n_pairs−1, need={need}"
+        );
         let arms = p.generate_arms(0x32be, 8, false, true, true);
         assert!(
-            arms.iter().any(|a| is_covering(*a, 8, p.seg_cap())),
-            "R1: sys-reexec eligible set includes covering Win/Seg, got {arms:?}"
+            arms.iter().any(|a| is_covering(*a, 8, p.seg_cap(), need)),
+            "L1: sys-reexec eligible set includes light Win/Seg, got {arms:?} need={need}"
         );
         assert!(
-            !arms.iter().any(|a| leaves_occ_tail(*a, 8, p.seg_cap())),
-            "R2: sys-reexec must not offer half-window + OCC tail, got {arms:?}"
+            !arms
+                .iter()
+                .any(|a| leaves_occ_tail(*a, 8, p.seg_cap(), need)),
+            "L1: sys-reexec must not offer prefix < w_need, got {arms:?}"
         );
         let (arm, _, _) = p.select_arm(0x32be, 8);
         assert!(
-            is_covering(arm, 8, p.seg_cap()),
-            "R1: sys-reexec upgrades leftover Defer to covering ordered, got {arm:?}"
+            is_covering(arm, 8, p.seg_cap(), need),
+            "L1: sys-reexec upgrades leftover Defer to light covering, got {arm:?}"
         );
         p.remember_arm(0x32be, arm);
         let r = p.take_report(0.0, 0);
@@ -4164,7 +4298,7 @@ mod tests {
     #[test]
     fn sys_reexec_full_spine_wall_rejects_half_window() {
         let p = CostPolicy::new();
-        p.begin_block_with_cores(176, 8);
+        p.begin_block_with_cores(32, 16);
         p.promote_short_edge(0x32be, 40_000);
         for pair in [
             (4, 31),
@@ -4185,6 +4319,7 @@ mod tests {
             e.decision = LocStrategy::OptimisticRead;
             e.last_sys_reexec = true;
             e.last_double_pay = false;
+            e.w_need = 4;
             e.reexec_ns_ema = 150_000.0;
             e.upsert_stat(LocStrategy::OptimisticRead, 80_000.0, 3.0);
             e.upsert_stat(LocStrategy::win(2), 12_000.0, 1.0);
@@ -4194,16 +4329,62 @@ mod tests {
         assert_ne!(
             arm,
             LocStrategy::win(2),
-            "R2: unused cheap Win_2 prior is half-window double-pay, got {arm:?}"
+            "L1: unused cheap Win_2 prior is shorter than w_need=4, got {arm:?}"
         );
         assert!(
-            !leaves_occ_tail(arm, 8, p.seg_cap()),
-            "R2: full-spine ĉ must not pick leftover≥2 ordered, got {arm:?}"
+            !leaves_occ_tail(arm, 8, p.seg_cap(), 4),
+            "L1: ĉ must not pick prefix < w_need, got {arm:?}"
         );
     }
 
     #[test]
     fn hot_covering_ordered_is_sticky() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(32, 16);
+        p.promote_short_edge(0x32be, 40_000);
+        for pair in [
+            (4, 31),
+            (31, 66),
+            (66, 67),
+            (67, 69),
+            (69, 70),
+            (70, 93),
+            (93, 96),
+            (96, 103),
+        ] {
+            p.note_short_pair(0x32be, pair.0, pair.1);
+        }
+        let cover = LocStrategy::win(4);
+        {
+            let mut e = p.promoted.get_mut(&0x32be).unwrap();
+            e.samples = 5;
+            e.measured = true;
+            e.decision = cover;
+            e.prev_decision = cover;
+            e.w_star = 4;
+            e.w_need = 4;
+            e.last_crisis = false;
+            e.last_double_pay = false;
+            e.last_sys_reexec = false;
+            e.last_cover_ok = true;
+            e.leftover_reexec = 0;
+            e.upsert_stat(cover, 40_000.0, 5.0);
+            e.upsert_stat(LocStrategy::OptimisticRead, 180_000.0, 3.0);
+            e.upsert_stat(LocStrategy::DeferPlant, 180_000.0, 3.0);
+        }
+        let (hot, crisis) = p.phase_of(0x32be);
+        assert!(hot && !crisis, "L3: proven light covering arm is hot");
+        let (arm, explore, greedy) = p.select_arm(0x32be, 8);
+        assert!(
+            !explore,
+            "L3: hot light cover is sticky, got explore {arm:?}"
+        );
+        assert_eq!(arm, greedy);
+        assert_eq!(arm, cover, "L3: hot exploit stays on proven light cover");
+    }
+
+    #[test]
+    fn sys_reexec_picks_minimal_w_not_full_cover() {
         let p = CostPolicy::new();
         p.begin_block_with_cores(176, 8);
         p.promote_short_edge(0x32be, 40_000);
@@ -4219,27 +4400,187 @@ mod tests {
         ] {
             p.note_short_pair(0x32be, pair.0, pair.1);
         }
-        let cover = LocStrategy::win(covering_w(8));
+        p.remember_arm(0x32be, LocStrategy::OptimisticRead);
+        {
+            let mut e = p.promoted.get_mut(&0x32be).unwrap();
+            e.samples = 3;
+            e.measured = true;
+            e.decision = LocStrategy::OptimisticRead;
+            e.upsert_stat(LocStrategy::OptimisticRead, 90_000.0, 3.0);
+            e.upsert_stat(LocStrategy::DeferPlant, 8_000.0, 2.0);
+        }
+        p.note_reexec_ns_at(Some(0x32be), 70_000);
+        p.note_reexec_ns_at(Some(0x32be), 70_000);
+        for _ in 0..8 {
+            p.bump_unfenced_reexec();
+        }
+        p.end_block_learn();
+        {
+            let e = p.promoted.get(&0x32be).unwrap();
+            assert!(e.last_sys_reexec, "R1: Opt leftover train is sys-reexec");
+            assert!(
+                e.w_need >= 2 && (e.w_need as usize) < 7,
+                "L1: first need is light, not n_pairs−1, w_need={}",
+                e.w_need
+            );
+        }
+        p.begin_block_with_cores(176, 8);
+        p.block_arm.clear();
+        let (arm, _, _) = p.select_arm(0x32be, 8);
+        let hops = hops_for_strategy(arm, 8, p.seg_cap());
+        assert!(
+            arm.is_ordered() && hops < 7 && hops >= 2,
+            "L1: first ordered arm is light cover, got {arm:?} hops={hops}"
+        );
+    }
+
+    #[test]
+    fn double_pay_grows_w_need_not_occ_tail() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(32, 16);
+        p.promote_short_edge(0x32be, 40_000);
+        for pair in [
+            (4, 31),
+            (31, 66),
+            (66, 67),
+            (67, 69),
+            (69, 70),
+            (70, 93),
+            (93, 96),
+            (96, 103),
+        ] {
+            p.note_short_pair(0x32be, pair.0, pair.1);
+        }
+        p.remember_arm(0x32be, LocStrategy::win(2));
+        {
+            let mut e = p.promoted.get_mut(&0x32be).unwrap();
+            e.samples = 4;
+            e.measured = true;
+            e.decision = LocStrategy::win(2);
+            e.w_star = 2;
+            e.w_need = 2;
+            e.last_sys_reexec = false;
+            e.upsert_stat(LocStrategy::win(2), 40_000.0, 3.0);
+        }
+        for _ in 0..8 {
+            p.bump_unfenced_reexec();
+        }
+        p.note_reexec_ns_at(Some(0x32be), 20_000);
+        p.note_reexec_ns_at(Some(0x32be), 20_000);
+        p.note_reexec_ns_at(Some(0x32be), 20_000);
+        p.note_reexec_ns_at(Some(0x32be), 20_000);
+        p.end_block_learn();
+        {
+            let e = p.promoted.get(&0x32be).unwrap();
+            assert!(e.last_double_pay, "L1: leftover OCC on Win_2 is double-pay");
+            assert!(
+                (e.w_need as usize) > 2,
+                "L1: leftover train grows w_need above 2, got {}",
+                e.w_need
+            );
+            assert!(
+                (e.w_need as usize) <= 7,
+                "L1: grow is capped at n_pairs−1, got {}",
+                e.w_need
+            );
+        }
+        p.begin_block_with_cores(32, 16);
+        p.block_arm.clear();
+        let need = p.loc_w_need(0x32be, 8);
+        let (arm, _, _) = p.select_arm(0x32be, 8);
+        assert!(
+            !leaves_occ_tail(arm, 8, p.seg_cap(), need),
+            "L1: grown need must not schedule OCC tail, got {arm:?} need={need}"
+        );
+    }
+
+    #[test]
+    fn light_cover_ok_allows_leftover_hops() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(176, 8);
+        p.promote_short_edge(0x32be, 40_000);
+        for pair in [
+            (4, 31),
+            (31, 66),
+            (66, 67),
+            (67, 69),
+            (69, 70),
+            (70, 93),
+            (93, 96),
+            (96, 103),
+        ] {
+            p.note_short_pair(0x32be, pair.0, pair.1);
+        }
+        p.remember_arm(0x32be, LocStrategy::win(4));
+        {
+            let mut e = p.promoted.get_mut(&0x32be).unwrap();
+            e.samples = 4;
+            e.measured = true;
+            e.decision = LocStrategy::win(4);
+            e.w_star = 4;
+            e.w_need = 4;
+            e.last_sys_reexec = true;
+            e.block_reexec_n = 0;
+            e.block_reexec_ns = 0;
+            e.block_ordered_ns = 8_000;
+        }
+        p.end_block_learn();
+        {
+            let e = p.promoted.get(&0x32be).unwrap();
+            assert!(
+                e.last_cover_ok,
+                "L1: light Win_4 with unfenced=0 is cover_ok even if leftover_hops≥2"
+            );
+            assert!(
+                !e.last_double_pay,
+                "L1: no leftover OCC train → no double-pay"
+            );
+            assert!(
+                e.w_need >= 2 && e.w_need <= 4,
+                "L1: absorbed light w stays at/under the hat, w_need={}",
+                e.w_need
+            );
+        }
+    }
+
+    #[test]
+    fn prepaid_blowout_allows_occ_after_light_cover() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(32, 16);
+        p.promote_short_edge(0x32be, 40_000);
+        for pair in [
+            (4, 31),
+            (31, 66),
+            (66, 67),
+            (67, 69),
+            (69, 70),
+            (70, 93),
+            (93, 96),
+            (96, 103),
+        ] {
+            p.note_short_pair(0x32be, pair.0, pair.1);
+        }
         {
             let mut e = p.promoted.get_mut(&0x32be).unwrap();
             e.samples = 5;
             e.measured = true;
-            e.decision = cover;
-            e.prev_decision = cover;
-            e.w_star = covering_w(8) as u8;
-            e.last_crisis = false;
-            e.last_double_pay = false;
+            e.decision = LocStrategy::win(4);
+            e.w_star = 4;
+            e.w_need = 4;
+            e.last_cover_ok = true;
             e.last_sys_reexec = false;
-            e.leftover_reexec = 0;
-            e.upsert_stat(cover, 40_000.0, 5.0);
-            e.upsert_stat(LocStrategy::OptimisticRead, 180_000.0, 3.0);
-            e.upsert_stat(LocStrategy::DeferPlant, 180_000.0, 3.0);
+            e.last_double_pay = false;
+            e.last_crisis = false;
+            e.reexec_ns_ema = 40_000.0;
+            e.upsert_stat(LocStrategy::win(4), 200_000.0, 4.0);
+            e.upsert_stat(LocStrategy::OptimisticRead, 40_000.0, 3.0);
+            e.upsert_stat(LocStrategy::DeferPlant, 40_000.0, 3.0);
         }
-        let (hot, crisis) = p.phase_of(0x32be);
-        assert!(hot && !crisis, "R3: proven covering arm is hot");
-        let (arm, explore, greedy) = p.select_arm(0x32be, 8);
-        assert!(!explore, "R3: hot covering is sticky, got explore {arm:?}");
-        assert_eq!(arm, greedy);
-        assert_eq!(arm, cover, "R3: hot exploit stays on proven covering arm");
+        p.block_arm.clear();
+        let (arm, _, _) = p.select_arm(0x32be, 8);
+        assert!(
+            matches!(arm, LocStrategy::OptimisticRead | LocStrategy::DeferPlant),
+            "L4: prepaid blowout vs OCC may yield to Opt/Defer, got {arm:?}"
+        );
     }
 }
