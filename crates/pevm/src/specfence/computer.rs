@@ -39,10 +39,11 @@ pub(crate) fn next_sf_task(
     if !stages.has_reserved() && !ready.has_pending_gated() {
         return scheduler.next_task();
     }
-    // A0-majority / no RAW-fan reservation: OCC-class pick (no empty DashMap scan).
-    // Gated txs still need refuse / wave-admit / wake (P2).
+    // P1: gates are edge constraints, not a global SF mode. Ungated txs
+    // use the OCC collaborative pick (`wave=None`); closed gates are
+    // skip-only. ProducerStage reservations still take the wave path.
     if !stages.has_reserved() {
-        let task = scheduler.next_task_with_wave_ready(Some(wave), Some(ready));
+        let task = scheduler.next_task_with_wave_ready(None, Some(ready));
         if let Some(m) = metrics {
             let n = ready.refuse_count().saturating_sub(refuse_before);
             m.record_refuse_admit_n(n);

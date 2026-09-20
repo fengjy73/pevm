@@ -46,6 +46,10 @@ use super::collateral::ConflictClass;
 pub(crate) const THIN_ORDERED_K: usize = 3;
 /// Short-chain Full safety bound. Long spines never FullChain.
 pub(crate) const ORDER_WINDOW_K: usize = 2;
+/// Fat-block n (S-lazy / S-mixed). Soft-cap begin holes; skip EmptyTo plant.
+pub(crate) const FAT_N: usize = 512;
+/// Unknown long chain on a fat block with no EffectiveWAW → treat as lazy.
+const LAZY_CHAIN_PAIR_FLOOR: usize = 32;
 /// Runaway-plant hat (safety, not a strategy nail like WINDOWED_W_MAX=3).
 const WINDOW_SAFETY_HAT: usize = 32;
 /// Seg length hat (safety, not SEG_TX=4).
@@ -196,6 +200,20 @@ impl LocStrategy {
             _ => false,
         }
     }
+}
+
+/// CC object class of a location (C1/C2). Lazy writer chains are never
+/// OrderedAdmit objects; real Basic / storage keep light-cover reexec→CC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub(crate) enum LocObject {
+    Unknown = 0,
+    /// `basic_lazy` / LazyRecipient / LazySender writer chain.
+    Lazy = 1,
+    /// Real Basic WAW (Data, not lazy-accumulate).
+    Basic = 2,
+    /// Storage / code_hash.
+    Storage = 3,
 }
 
 /// Envelope / location cohort used as the B2 context key.
@@ -386,12 +404,14 @@ struct ArmStat {
     n: f64,
 }
 
-/// Migratable morph bucket (G4): n_pairs band + long vs short spine.
+/// Migratable morph bucket (G4): n_pairs band + long vs short + lazy object.
 /// Bayes/morph are **features** that seed priors — not a second decide() mouth.
+/// L1: lazy / near_independent heads share a bucket that never carries Win.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct MorphKey {
     band: u8,
     long: bool,
+    lazy: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -470,6 +490,10 @@ struct PromotedLoc {
     /// L1: minimal `w` that absorbs the last systematic reexec / leftover
     /// train. 0 = unset (cold uses `light_cover_w`, never `n_pairs−1`).
     w_need: u8,
+    /// C1/C2: lazy vs real Basic/storage. Sticky once observed.
+    object: LocObject,
+    /// True after an EffectiveWAW / non-lazy Data write on this ℓ.
+    saw_effective: bool,
     /// G4 morph bucket this loc last contributed to.
     morph: MorphKey,
     /// Telemetry only — leftover hops after the chosen arm (not a pick driver).
@@ -501,7 +525,9 @@ impl PromotedLoc {
             last_sys_reexec: false,
             last_cover_ok: false,
             w_need: 0,
-            morph: morph_key(0),
+            object: LocObject::Unknown,
+            saw_effective: false,
+            morph: morph_key(0, false),
             leftover_reexec: 0,
             block_reexec_ns: 0,
             block_ordered_ns: 0,
@@ -588,8 +614,19 @@ impl PromotedLoc {
     }
 
     fn seed_from_morph(&mut self, prior: &MorphPrior, n_pairs: usize) {
-        self.morph = morph_key(n_pairs);
+        let lazy = self.object == LocObject::Lazy;
+        self.morph = morph_key(n_pairs, lazy);
         if prior.seen == 0 {
+            return;
+        }
+        if prior.n_opt > 1.0 {
+            self.upsert_stat(LocStrategy::OptimisticRead, prior.c_opt, prior.n_opt);
+        }
+        if prior.n_defer > 1.0 {
+            self.upsert_stat(LocStrategy::DeferPlant, prior.c_defer, prior.n_defer);
+        }
+        // L1: lazy / near_independent never inherit Win/Full/Seg.
+        if lazy {
             return;
         }
         if prior.w_star >= 1 {
@@ -597,12 +634,6 @@ impl PromotedLoc {
         }
         if prior.seg_star >= 2 {
             self.seg_star = prior.seg_star;
-        }
-        if prior.n_opt > 1.0 {
-            self.upsert_stat(LocStrategy::OptimisticRead, prior.c_opt, prior.n_opt);
-        }
-        if prior.n_defer > 1.0 {
-            self.upsert_stat(LocStrategy::DeferPlant, prior.c_defer, prior.n_defer);
         }
         if prior.n_full > 1.0 {
             self.upsert_stat(LocStrategy::FullChain, prior.c_full, prior.n_full);
@@ -639,10 +670,11 @@ fn morph_band(n_pairs: usize) -> u8 {
     }
 }
 
-fn morph_key(n_pairs: usize) -> MorphKey {
+fn morph_key(n_pairs: usize, lazy: bool) -> MorphKey {
     MorphKey {
         band: morph_band(n_pairs),
         long: n_pairs > ORDER_WINDOW_K,
+        lazy,
     }
 }
 
@@ -729,6 +761,10 @@ pub(crate) struct CostPolicy {
     block_arm: DashMap<MemoryLocationHash, LocStrategy, FxBuildHasher>,
     /// G4: morph-bucket priors shared across new ℓs (features only).
     morphs: DashMap<MorphKey, MorphPrior, FxBuildHasher>,
+    /// C1: observed object class (lazy vs Basic/storage), even before promote.
+    loc_object: DashMap<MemoryLocationHash, LocObject, FxBuildHasher>,
+    /// P3: this process has seen a lazy writer chain (skip fat end_block walks).
+    lazy_seen: AtomicBool,
     /// Process-persistent begin count (reuse iters). Not tx-count `block_n`.
     block_seq: AtomicUsize,
     arm_switch_n: AtomicUsize,
@@ -788,6 +824,8 @@ impl Default for CostPolicy {
             pending_idle_n: AtomicUsize::new(0),
             block_arm: DashMap::default(),
             morphs: DashMap::default(),
+            loc_object: DashMap::default(),
+            lazy_seen: AtomicBool::new(false),
             block_seq: AtomicUsize::new(0),
             arm_switch_n: AtomicUsize::new(0),
             explore_n: AtomicUsize::new(0),
@@ -821,6 +859,8 @@ impl CostPolicy {
         self.pending_idle_n.store(0, Ordering::Relaxed);
         self.block_arm.clear();
         self.morphs.clear();
+        self.loc_object.clear();
+        self.lazy_seen.store(false, Ordering::Relaxed);
         self.prepaid_lose_streak.store(0, Ordering::Relaxed);
         self.last_block_n.store(0, Ordering::Relaxed);
         self.block_seq.store(0, Ordering::Relaxed);
@@ -868,6 +908,8 @@ impl CostPolicy {
         self.explore_n.store(0, Ordering::Relaxed);
         self.win2_deviate_n.store(0, Ordering::Relaxed);
         self.explore_budget_left.store(0, Ordering::Relaxed);
+        // P3 is per-block: a prior lazy block must not lean-end a later real spine.
+        self.lazy_seen.store(false, Ordering::Relaxed);
     }
 
     pub(crate) fn begin_block(&self, n: usize) {
@@ -950,6 +992,112 @@ impl CostPolicy {
     #[inline]
     pub(crate) fn cores(&self) -> usize {
         self.cores.load(Ordering::Relaxed).max(1)
+    }
+
+    /// C1: `basic_lazy` (and equivalent lazy writer chains) never OrderedAdmit.
+    /// Near-independent fat heads with no EffectiveWAW are the same object.
+    ///
+    /// Reads `loc_object` first (safe under `promoted.entry`). Promoted is
+    /// only peeked when the map is Unknown — never from `new_promoted_seeded`.
+    pub(crate) fn loc_forbids_ordered(&self, location: MemoryLocationHash) -> bool {
+        match self.loc_object_map(location) {
+            LocObject::Lazy => true,
+            LocObject::Basic | LocObject::Storage => false,
+            LocObject::Unknown => {
+                let n_pairs = self
+                    .short_chain
+                    .get(&location)
+                    .map(|c| c.len())
+                    .unwrap_or(0);
+                self.unknown_looks_lazy(n_pairs, self.promoted_saw_effective(location))
+            }
+        }
+    }
+
+    fn loc_object_map(&self, location: MemoryLocationHash) -> LocObject {
+        self.loc_object
+            .get(&location)
+            .map(|o| *o)
+            .unwrap_or(LocObject::Unknown)
+    }
+
+    fn unknown_looks_lazy(&self, n_pairs: usize, saw_effective: bool) -> bool {
+        self.block_n() >= FAT_N && n_pairs >= LAZY_CHAIN_PAIR_FLOOR && !saw_effective
+    }
+
+    fn promoted_saw_effective(&self, location: MemoryLocationHash) -> bool {
+        self.promoted.get(&location).is_some_and(|s| {
+            s.saw_effective || matches!(s.object, LocObject::Basic | LocObject::Storage)
+        })
+    }
+
+    pub(crate) fn loc_object(&self, location: MemoryLocationHash) -> LocObject {
+        let mapped = self.loc_object_map(location);
+        if mapped != LocObject::Unknown {
+            return mapped;
+        }
+        self.promoted
+            .get(&location)
+            .map(|e| e.object)
+            .unwrap_or(LocObject::Unknown)
+    }
+
+    /// C1/C2: record write-set / conflict object. Lazy never upgrades a
+    /// Basic/storage spine; effective never downgrades to lazy.
+    pub(crate) fn note_loc_write(&self, location: MemoryLocationHash, lazy: bool) {
+        let next = if lazy {
+            LocObject::Lazy
+        } else {
+            LocObject::Basic
+        };
+        if lazy {
+            self.lazy_seen.store(true, Ordering::Relaxed);
+        }
+        let cur = self
+            .loc_object
+            .get(&location)
+            .map(|o| *o)
+            .unwrap_or(LocObject::Unknown);
+        let keep = match (cur, next) {
+            (LocObject::Basic | LocObject::Storage, LocObject::Lazy) => cur,
+            (LocObject::Lazy, LocObject::Basic | LocObject::Storage) => next,
+            (LocObject::Unknown, _) => next,
+            (a, _) => a,
+        };
+        self.loc_object.insert(location, keep);
+        if let Some(mut e) = self.promoted.get_mut(&location) {
+            e.object = keep;
+            if !lazy {
+                e.saw_effective = true;
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn lazy_already_seen(&self) -> bool {
+        self.lazy_seen.load(Ordering::Relaxed)
+    }
+
+    /// P2: fat begin hole cap — keep a light real-spine prefix, not 95-hole prepaid.
+    pub(crate) fn fat_begin_hole_cap(&self) -> usize {
+        if self.block_n() < FAT_N {
+            return usize::MAX;
+        }
+        self.cores().max(8).min(16)
+    }
+
+    /// Seed a new `PromotedLoc`. Must not touch `self.promoted` — callers
+    /// hold `promoted.entry()` (write lock) and a nested get deadlocks.
+    fn new_promoted_seeded(&self, location: MemoryLocationHash, n_pairs: usize) -> PromotedLoc {
+        let mut loc = PromotedLoc::new();
+        loc.object = self.loc_object_map(location);
+        loc.saw_effective = matches!(loc.object, LocObject::Basic | LocObject::Storage);
+        let lazy =
+            loc.object == LocObject::Lazy || self.unknown_looks_lazy(n_pairs, loc.saw_effective);
+        if let Some(p) = self.morphs.get(&morph_key(n_pairs, lazy)) {
+            loc.seed_from_morph(&p, n_pairs);
+        }
+        loc
     }
 
     /// G1: online window cap. Grows with `n_pairs` / cores; never Full-spine
@@ -1056,6 +1204,9 @@ impl CostPolicy {
     }
 
     fn reopen_ordered(&self, location: MemoryLocationHash) -> bool {
+        if self.loc_forbids_ordered(location) {
+            return false;
+        }
         self.promoted
             .get(&location)
             .is_some_and(|s| s.last_sys_reexec || s.last_double_pay)
@@ -1075,7 +1226,11 @@ impl CostPolicy {
         if s.last_cover_ok {
             return false;
         }
-        let n_pairs = self.short_chain.get(&location).map(|c| c.len()).unwrap_or(0);
+        let n_pairs = self
+            .short_chain
+            .get(&location)
+            .map(|c| c.len())
+            .unwrap_or(0);
         if n_pairs > ORDER_WINDOW_K
             && is_covering(
                 s.decision,
@@ -1154,6 +1309,9 @@ impl CostPolicy {
     /// Sole mouth: `select_arm`. Full only when n_pairs ≤ `ORDER_WINDOW_K`.
     /// Long spines never FullChain (PR22 1.40ms prepaid wall — safety).
     pub(crate) fn hops_to_plant(&self, location: MemoryLocationHash, n_pairs: usize) -> usize {
+        if self.loc_forbids_ordered(location) {
+            return 0;
+        }
         let n_pairs = self.loc_n_pairs(location, n_pairs);
         self.hops_for_arm(self.loc_strategy(location, n_pairs), n_pairs)
     }
@@ -1227,13 +1385,10 @@ impl CostPolicy {
             arm
         };
         self.block_arm.insert(location, arm);
-        let mut e = self.promoted.entry(location).or_insert_with(|| {
-            let mut loc = PromotedLoc::new();
-            if let Some(p) = self.morphs.get(&morph_key(n_pairs)) {
-                loc.seed_from_morph(&p, n_pairs);
-            }
-            loc
-        });
+        let mut e = self
+            .promoted
+            .entry(location)
+            .or_insert_with(|| self.new_promoted_seeded(location, n_pairs));
         e.decision = arm;
         e.hits = e.hits.max(1);
         if let LocStrategy::OrderedWindow { w } = arm {
@@ -1246,6 +1401,9 @@ impl CostPolicy {
 
     /// L1: per-ℓ arm. Cached for the block so hops / hint / flush share one mouth.
     pub(crate) fn loc_strategy(&self, location: MemoryLocationHash, n_pairs: usize) -> LocStrategy {
+        if self.loc_forbids_ordered(location) {
+            return LocStrategy::OptimisticRead;
+        }
         let n_pairs = self.loc_n_pairs(location, n_pairs);
         if n_pairs == 0 {
             return LocStrategy::OptimisticRead;
@@ -1269,6 +1427,9 @@ impl CostPolicy {
         location: MemoryLocationHash,
         n_pairs: usize,
     ) -> LocStrategy {
+        if self.loc_forbids_ordered(location) {
+            return LocStrategy::OptimisticRead;
+        }
         let n_pairs = self.loc_n_pairs(location, n_pairs);
         if n_pairs == 0 {
             return LocStrategy::OptimisticRead;
@@ -1286,7 +1447,12 @@ impl CostPolicy {
     fn commit_arm(&self, location: MemoryLocationHash, n_pairs: usize) -> LocStrategy {
         let n_pairs = self.loc_n_pairs(location, n_pairs);
         let (mut arm, explore, greedy) = self.select_arm(location, n_pairs);
+        // C1/L1: lazy / near_independent never persist an ordered arm.
+        if self.loc_forbids_ordered(location) && arm.is_ordered() {
+            arm = LocStrategy::OptimisticRead;
+        }
         // Safety: never persist FullChain on a long spine (short-n cache).
+        // C3: ultra-long storage is the same ban — never Full(n_pairs).
         if n_pairs > ORDER_WINDOW_K && arm == LocStrategy::FullChain {
             arm = if self.reopen_ordered(location) {
                 LocStrategy::win(self.loc_w_need(location, n_pairs))
@@ -1383,11 +1549,9 @@ impl CostPolicy {
         if self.promoted.contains_key(&location) {
             return;
         }
-        let mut loc = PromotedLoc::new();
-        if let Some(p) = self.morphs.get(&morph_key(n_pairs)) {
-            loc.seed_from_morph(&p, n_pairs);
-        }
-        self.promoted.entry(location).or_insert(loc);
+        self.promoted
+            .entry(location)
+            .or_insert_with(|| self.new_promoted_seeded(location, n_pairs));
     }
 
     fn phase_of(&self, location: MemoryLocationHash) -> (bool, bool) {
@@ -1425,6 +1589,11 @@ impl CostPolicy {
         cold: bool,
         crisis: bool,
     ) -> Vec<LocStrategy> {
+        // C1/L1/L3: lazy / near_independent — Opt/Defer only. Cold must
+        // not explore Win/Full on that ℓ. Hot sticky is no-order.
+        if self.loc_forbids_ordered(location) {
+            return vec![LocStrategy::OptimisticRead, LocStrategy::DeferPlant];
+        }
         let mut out = vec![LocStrategy::OptimisticRead, LocStrategy::DeferPlant];
         let w_cap = self.w_cap_for(location, n_pairs);
         let reopen = self.reopen_ordered(location);
@@ -1490,6 +1659,7 @@ impl CostPolicy {
                 out.push(LocStrategy::seg(sl - 1));
             }
         }
+        // C3: Full only on short chains. Ultra-long storage never Full(n).
         if n_pairs > 0
             && n_pairs <= ORDER_WINDOW_K
             && !demoted
@@ -1652,7 +1822,10 @@ impl CostPolicy {
                             .and_then(|s| s.stat(LocStrategy::win(need)).filter(|(_, n)| *n > 1.5))
                             .map(|(c, _)| c)
                             .unwrap_or(cover_hat);
-                        c = c.max(abort).max(cover_hat + NS_DELTA).max(cover_c + NS_DELTA);
+                        c = c
+                            .max(abort)
+                            .max(cover_hat + NS_DELTA)
+                            .max(cover_c + NS_DELTA);
                     }
                 } else {
                     if measured
@@ -1884,6 +2057,11 @@ impl CostPolicy {
         }
         // PC-2: envelope empty-to on an EOA is LazyRecipient — never A1.
         if kind == CohortKind::EmptyTo && !is_contract {
+            self.optimistic_read_cohorts.fetch_add(1, Ordering::Relaxed);
+            return AdmitAction::OptimisticRead;
+        }
+        // C1/P2: fat EmptyTo is a lazy-payee star (95-hole prepaid). Never A1.
+        if kind == CohortKind::EmptyTo && self.block_n() >= FAT_N {
             self.optimistic_read_cohorts.fetch_add(1, Ordering::Relaxed);
             return AdmitAction::OptimisticRead;
         }
@@ -2185,6 +2363,12 @@ impl CostPolicy {
             class,
             lazy,
         });
+        let lazy_obj = lazy
+            || matches!(
+                class,
+                ConflictClass::LazyNoise | ConflictClass::CommuteCandidate
+            );
+        self.note_loc_write(location, lazy_obj);
     }
 
     /// C3: one off-edge reexec in this wave. First time count ≥ 2 → batch_repair.
@@ -2214,13 +2398,10 @@ impl CostPolicy {
             .get(&location)
             .map(|c| c.len())
             .unwrap_or(0);
-        let mut e = self.promoted.entry(location).or_insert_with(|| {
-            let mut loc = PromotedLoc::new();
-            if let Some(p) = self.morphs.get(&morph_key(n_pairs)) {
-                loc.seed_from_morph(&p, n_pairs);
-            }
-            loc
-        });
+        let mut e = self
+            .promoted
+            .entry(location)
+            .or_insert_with(|| self.new_promoted_seeded(location, n_pairs));
         e.hits = e.hits.saturating_add(1);
         let a = learn_alpha(e.samples as f64);
         e.reexec_ns_ema = (1.0 - a) * e.reexec_ns_ema + a * measured_ns;
@@ -2241,13 +2422,10 @@ impl CostPolicy {
             .get(&location)
             .map(|c| c.len() + 1)
             .unwrap_or(1);
-        let mut e = self.promoted.entry(location).or_insert_with(|| {
-            let mut loc = PromotedLoc::new();
-            if let Some(p) = self.morphs.get(&morph_key(n_pairs)) {
-                loc.seed_from_morph(&p, n_pairs);
-            }
-            loc
-        });
+        let mut e = self
+            .promoted
+            .entry(location)
+            .or_insert_with(|| self.new_promoted_seeded(location, n_pairs));
         if e.pred == usize::MAX || pred < e.pred {
             e.pred = pred;
             e.succ = succ;
@@ -2267,6 +2445,10 @@ impl CostPolicy {
             if writers.len() < 2 || !self.is_promoted(*loc) {
                 continue;
             }
+            // C1/P3: never persist a lazy writer chain as plantable pairs.
+            if self.loc_forbids_ordered(*loc) {
+                continue;
+            }
             for pair in writers.windows(2) {
                 self.note_short_pair(*loc, pair[0], pair[1]);
             }
@@ -2284,13 +2466,16 @@ impl CostPolicy {
         let mut out = Vec::new();
         for e in self.promoted.iter() {
             let s = e.value();
+            if s.object == LocObject::Lazy {
+                continue;
+            }
             if s.hits >= 1 && s.measured && s.pred < s.succ && s.succ < n {
                 out.push((*e.key(), s.pred, s.succ));
             }
         }
         for e in self.short_chain.iter() {
             let loc = *e.key();
-            if !self.is_promoted(loc) {
+            if !self.is_promoted(loc) || self.loc_forbids_ordered(loc) {
                 continue;
             }
             for &(pred, succ) in e.value() {
@@ -2333,6 +2518,9 @@ impl CostPolicy {
         has_earlier: bool,
         hint_later: usize,
     ) -> bool {
+        if self.loc_forbids_ordered(location) {
+            return false;
+        }
         if self.is_promoted(location) {
             let n_pairs = self
                 .short_chain
@@ -2603,6 +2791,37 @@ impl CostPolicy {
             let full = full_cover_w(n_pairs);
             let light = self.light_hat(n_pairs);
             let train = self.train_hat(n_pairs);
+            // C1/L2/L3: lazy / near_independent never raise Win from
+            // unfenced or sys-reexec. Reward stays OCC-comparable wall.
+            let lazy_obj = e.object == LocObject::Lazy
+                || (self.block_n() >= FAT_N
+                    && n_pairs >= LAZY_CHAIN_PAIR_FLOOR
+                    && !e.saw_effective);
+            if lazy_obj {
+                e.last_sys_reexec = false;
+                e.last_double_pay = false;
+                e.last_crisis = false;
+                e.last_cover_ok = false;
+                e.object = LocObject::Lazy;
+                if e.decision.is_ordered() {
+                    e.decision = LocStrategy::OptimisticRead;
+                }
+                if !e.measured
+                    && e.decision != LocStrategy::DeferPlant
+                    && e.block_reexec_ns == 0
+                    && e.block_ordered_ns == 0
+                {
+                    continue;
+                }
+                let actual = e
+                    .block_reexec_ns
+                    .saturating_add(e.block_ordered_ns.saturating_add(refuse_share));
+                let arm = e.decision;
+                e.update_arm(arm, actual.max(1) as f64);
+                e.samples = e.samples.saturating_add(1);
+                e.morph = morph_key(n_pairs, true);
+                continue;
+            }
             // O1: prefix shorter than the light hat + leftover OCC train.
             // U: grow only after Win_2+ still leaks (unf≥8 or loc reexec≥4
             // past planted). First Win_1 leftover (3356896 cold) is T3 /
@@ -2681,16 +2900,10 @@ impl CostPolicy {
             // double-pay) *or* a quiet light Win_2+ (3356896: leftover is
             // expected S1 OCC, unf=0–1). Vacuous fat prepaid (planted >
             // light) must not sticky a wide Win.
-            let light_quiet = planted >= 2
-                && planted <= light.max(2)
-                && unfenced < 4
-                && e.block_reexec_n < 2;
-            let absorbed_train = leftover_hops < 2
-                || had_sys
-                || had_dp
-                || sys_now
-                || double_pay_now
-                || light_quiet;
+            let light_quiet =
+                planted >= 2 && planted <= light.max(2) && unfenced < 4 && e.block_reexec_n < 2;
+            let absorbed_train =
+                leftover_hops < 2 || had_sys || had_dp || sys_now || double_pay_now || light_quiet;
             if n_pairs > ORDER_WINDOW_K
                 && is_covering(e.decision, n_pairs, self.seg_cap(), need_now)
                 && e.block_reexec_n < 2
@@ -2730,7 +2943,7 @@ impl CostPolicy {
                 e.bump_c_floor(ordered, tax);
             }
             e.samples = e.samples.saturating_add(1);
-            e.morph = morph_key(n_pairs);
+            e.morph = morph_key(n_pairs, e.object == LocObject::Lazy);
             // Safety: Full on a long spine (should be ineligible) stays demoted.
             if e.decision == LocStrategy::FullChain && n_pairs > ORDER_WINDOW_K {
                 e.demoted = true;
@@ -2745,19 +2958,17 @@ impl CostPolicy {
                 continue;
             }
             let n_pairs = self.short_chain.get(e.key()).map(|c| c.len()).unwrap_or(0);
-            let key = morph_key(n_pairs);
+            // Do not call loc_forbids_ordered while holding promoted.iter().
+            let lazy =
+                e.object == LocObject::Lazy || self.unknown_looks_lazy(n_pairs, e.saw_effective);
+            let key = morph_key(n_pairs, lazy);
             let mut prior = self
                 .morphs
                 .get(&key)
                 .map(|p| *p)
                 .unwrap_or_else(MorphPrior::new);
             let alpha = 0.25;
-            if e.w_star >= 1 {
-                prior.w_star = e.w_star;
-            }
-            if e.seg_star >= 2 {
-                prior.seg_star = e.seg_star;
-            }
+            let lazy = key.lazy;
             if let Some((c, n)) = e.stat(LocStrategy::OptimisticRead) {
                 prior.c_opt = (1.0 - alpha) * prior.c_opt + alpha * c;
                 prior.n_opt = (prior.n_opt + n) * 0.5;
@@ -2766,21 +2977,30 @@ impl CostPolicy {
                 prior.c_defer = (1.0 - alpha) * prior.c_defer + alpha * c;
                 prior.n_defer = (prior.n_defer + n) * 0.5;
             }
-            if let Some((c, n)) = e.stat(LocStrategy::FullChain) {
-                prior.c_full = (1.0 - alpha) * prior.c_full + alpha * c;
-                prior.n_full = (prior.n_full + n) * 0.5;
-            }
-            if e.w_star >= 1
-                && let Some((c, n)) = e.stat(LocStrategy::win(e.w_star as usize))
-            {
-                prior.c_win = (1.0 - alpha) * prior.c_win + alpha * c;
-                prior.n_win = (prior.n_win + n) * 0.5;
-            }
-            if e.seg_star >= 2
-                && let Some((c, n)) = e.stat(LocStrategy::seg(e.seg_star as usize))
-            {
-                prior.c_seg = (1.0 - alpha) * prior.c_seg + alpha * c;
-                prior.n_seg = (prior.n_seg + n) * 0.5;
+            // L1: lazy morph never carries Win/Full/Seg into the next ℓ.
+            if !lazy {
+                if e.w_star >= 1 {
+                    prior.w_star = e.w_star;
+                }
+                if e.seg_star >= 2 {
+                    prior.seg_star = e.seg_star;
+                }
+                if let Some((c, n)) = e.stat(LocStrategy::FullChain) {
+                    prior.c_full = (1.0 - alpha) * prior.c_full + alpha * c;
+                    prior.n_full = (prior.n_full + n) * 0.5;
+                }
+                if e.w_star >= 1
+                    && let Some((c, n)) = e.stat(LocStrategy::win(e.w_star as usize))
+                {
+                    prior.c_win = (1.0 - alpha) * prior.c_win + alpha * c;
+                    prior.n_win = (prior.n_win + n) * 0.5;
+                }
+                if e.seg_star >= 2
+                    && let Some((c, n)) = e.stat(LocStrategy::seg(e.seg_star as usize))
+                {
+                    prior.c_seg = (1.0 - alpha) * prior.c_seg + alpha * c;
+                    prior.n_seg = (prior.n_seg + n) * 0.5;
+                }
             }
             prior.seen = prior.seen.saturating_add(1);
             self.morphs.insert(key, prior);
@@ -3182,7 +3402,8 @@ mod tests {
     #[test]
     fn full_shell_contract_empty_to_hot_payee_is_a1() {
         let p = CostPolicy::new();
-        p.begin_block(4096);
+        // Full shell but not fat (THIN_N_MAX < n < FAT_N). Fat EmptyTo is A0.
+        p.begin_block(400);
         let addr = Address::repeat_byte(0x20);
         assert!(
             p.choose_ordered(CohortKind::EmptyTo, addr, 16, true, 0.30),
@@ -3245,7 +3466,7 @@ mod tests {
     #[test]
     fn b2_raises_p_after_effective_waw() {
         let p = CostPolicy::new();
-        p.begin_block(4096);
+        p.begin_block(400);
         let addr = Address::repeat_byte(0x20);
         for _ in 0..4 {
             p.note_eff_waw(CohortKind::EmptyTo, addr, true);
@@ -3378,7 +3599,7 @@ mod tests {
     #[test]
     fn cost_ev_keeps_proven_contract_spine() {
         let p = CostPolicy::new();
-        p.begin_block(4096);
+        p.begin_block(400);
         let addr = Address::repeat_byte(0x20);
         for _ in 0..4 {
             p.note_eff_waw(CohortKind::EmptyTo, addr, true);
@@ -4872,10 +5093,7 @@ mod tests {
         }
         p.block_arm.clear();
         let (arm, explore, _) = p.select_arm(0x32be, 16);
-        assert!(
-            !explore,
-            "L4: proven cover must not UCB-explore unused Opt"
-        );
+        assert!(!explore, "L4: proven cover must not UCB-explore unused Opt");
         assert!(
             is_covering(arm, 16, p.seg_cap(), 2),
             "L4: unused Opt prior must not retreat off proven Win_2, got {arm:?}"
@@ -5005,6 +5223,201 @@ mod tests {
             p.train_hat(8) <= 4,
             "S/O: fat block train hat stays light, got {}",
             p.train_hat(8)
+        );
+    }
+
+    #[test]
+    fn lazy_loc_never_plants_ordered_admit() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(800, 8);
+        p.note_loc_write(0x1a2e, true);
+        p.promote_short_edge(0x1a2e, 40_000);
+        for i in 0..40 {
+            p.note_short_pair(0x1a2e, 100 + i, 101 + i);
+        }
+        assert!(
+            p.loc_forbids_ordered(0x1a2e),
+            "C1: basic_lazy is not an OrderedAdmit object"
+        );
+        assert_eq!(
+            p.hops_to_plant(0x1a2e, 40),
+            0,
+            "C1: lazy hops_to_plant is 0"
+        );
+        let cands = p.generate_arms(0x1a2e, 40, false, true, true);
+        assert!(
+            cands.iter().all(|a| !a.is_ordered()),
+            "L1/L3: lazy candidates are Opt/Defer only, got {cands:?}"
+        );
+        let (arm, _, _) = p.select_arm(0x1a2e, 40);
+        assert!(
+            !arm.is_ordered(),
+            "C1: select_arm must not pick Win/Full on lazy, got {arm:?}"
+        );
+        assert_eq!(p.loc_strategy(0x1a2e, 40), LocStrategy::OptimisticRead);
+    }
+
+    #[test]
+    fn sys_reexec_on_lazy_does_not_promote_win() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(800, 8);
+        p.note_loc_write(0x1a2e, true);
+        p.promote_short_edge(0x1a2e, 40_000);
+        for i in 0..40 {
+            p.note_short_pair(0x1a2e, 100 + i, 101 + i);
+        }
+        p.remember_arm(0x1a2e, LocStrategy::OptimisticRead);
+        {
+            let mut e = p.promoted.get_mut(&0x1a2e).unwrap();
+            e.object = LocObject::Lazy;
+            e.samples = 3;
+            e.measured = true;
+            e.decision = LocStrategy::OptimisticRead;
+            e.last_sys_reexec = false;
+        }
+        for _ in 0..8 {
+            p.bump_unfenced_reexec();
+        }
+        p.note_reexec_ns_at(Some(0x1a2e), 50_000);
+        p.note_reexec_ns_at(Some(0x1a2e), 50_000);
+        p.end_block_learn();
+        {
+            let e = p.promoted.get(&0x1a2e).unwrap();
+            assert!(
+                !e.last_sys_reexec,
+                "C1/L2: sys-reexec on lazy must not reopen Win"
+            );
+        }
+        let (arm, _, _) = p.select_arm(0x1a2e, 40);
+        assert!(
+            !arm.is_ordered(),
+            "C1: after unfenced train, lazy stays Opt/Defer, got {arm:?}"
+        );
+    }
+
+    #[test]
+    fn real_basic_spine_still_covers() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(176, 8);
+        p.note_loc_write(0x32be, false);
+        p.promote_short_edge(0x32be, 40_000);
+        for pair in [(4, 31), (31, 66), (66, 67), (67, 69)] {
+            p.note_short_pair(0x32be, pair.0, pair.1);
+        }
+        {
+            let mut e = p.promoted.get_mut(&0x32be).unwrap();
+            e.object = LocObject::Basic;
+            e.saw_effective = true;
+            e.samples = 5;
+            e.decision = LocStrategy::win(2);
+            e.w_star = 2;
+            e.last_cover_ok = true;
+            e.upsert_stat(LocStrategy::win(2), 10_000.0, 5.0);
+            e.upsert_stat(LocStrategy::OptimisticRead, 80_000.0, 3.0);
+        }
+        assert!(
+            !p.loc_forbids_ordered(0x32be),
+            "C2: real Basic is still an OrderedAdmit object"
+        );
+        let (arm, _, _) = p.select_arm(0x32be, 4);
+        assert_eq!(
+            arm,
+            LocStrategy::win(2),
+            "C2: 3356896-class Basic keeps light cover, got {arm:?}"
+        );
+        assert!(p.hops_to_plant(0x32be, 4) >= 2);
+    }
+
+    #[test]
+    fn long_storage_never_full_chain() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(800, 8);
+        p.note_loc_write(0x571, false);
+        p.promote_short_edge(0x571, 40_000);
+        for i in 0..80 {
+            p.note_short_pair(0x571, 10 + i, 11 + i);
+        }
+        {
+            let mut e = p.promoted.get_mut(&0x571).unwrap();
+            e.object = LocObject::Storage;
+            e.saw_effective = true;
+            e.last_sys_reexec = true;
+        }
+        let cands = p.generate_arms(0x571, 80, false, true, true);
+        assert!(
+            !cands.iter().any(|a| *a == LocStrategy::FullChain),
+            "C3: ultra-long storage must not offer Full, got {cands:?}"
+        );
+        let (arm, _, _) = p.select_arm(0x571, 80);
+        assert_ne!(
+            arm,
+            LocStrategy::FullChain,
+            "C3: select_arm must not Full(571)-class, got {arm:?}"
+        );
+    }
+
+    #[test]
+    fn morph_does_not_inherit_win_onto_lazy() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(176, 8);
+        p.note_loc_write(0x32be, false);
+        p.promote_short_edge(0x32be, 40_000);
+        for pair in [(4, 31), (31, 66), (66, 67), (67, 69)] {
+            p.note_short_pair(0x32be, pair.0, pair.1);
+        }
+        p.remember_arm(0x32be, LocStrategy::win(2));
+        {
+            let mut e = p.promoted.get_mut(&0x32be).unwrap();
+            e.samples = 4;
+            e.w_star = 2;
+            e.object = LocObject::Basic;
+            e.upsert_stat(LocStrategy::win(2), 11_000.0, 4.0);
+            e.upsert_stat(LocStrategy::OptimisticRead, 90_000.0, 3.0);
+        }
+        p.end_block_learn();
+        p.begin_block_with_cores(800, 8);
+        p.note_loc_write(0xfeed, true);
+        p.ensure_promoted_seeded(0xfeed, 40);
+        let seeded = p.promoted.get(&0xfeed).unwrap();
+        assert!(
+            seeded.stat(LocStrategy::win(2)).is_none(),
+            "L1: lazy loc must not inherit Win_2 morph from Basic"
+        );
+        let (arm, _, _) = p.select_arm(0xfeed, 40);
+        assert!(
+            !arm.is_ordered(),
+            "L1: lazy after morph seed stays unordered, got {arm:?}"
+        );
+    }
+
+    #[test]
+    fn fat_empty_to_is_a0() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(800, 8);
+        let addr = Address::repeat_byte(0x20);
+        assert!(
+            !p.choose_ordered(CohortKind::EmptyTo, addr, 64, true, 0.5),
+            "C1/P2: fat EmptyTo contract payee is A0 (lazy star)"
+        );
+        for _ in 0..4 {
+            p.note_eff_waw(CohortKind::EmptyTo, addr, true);
+        }
+        assert!(
+            !p.choose_ordered(CohortKind::EmptyTo, addr, 64, true, 0.5),
+            "C1: fat EmptyTo stays A0 even after envelope eff-WAW (real spine is C2)"
+        );
+    }
+
+    #[test]
+    fn fat_begin_hole_cap_is_light() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(176, 8);
+        assert_eq!(p.fat_begin_hole_cap(), usize::MAX, "thin has no hole cap");
+        p.begin_block_with_cores(800, 8);
+        let cap = p.fat_begin_hole_cap();
+        assert!(
+            (8..=16).contains(&cap),
+            "P2: fat begin hole cap is soft 8–16, got {cap}"
         );
     }
 }
