@@ -1089,10 +1089,10 @@ impl CostPolicy {
             return LocStrategy::OptimisticRead;
         }
         if let Some(a) = self.block_arm.get(&location) {
-            if n_pairs > ORDER_WINDOW_K && *a == LocStrategy::FullChain {
-                // Stale short-n Full — re-select; long spines never FullChain.
-            } else {
-                return *a;
+            let cached = *a;
+            drop(a);
+            if n_pairs <= ORDER_WINDOW_K || cached != LocStrategy::FullChain {
+                return cached;
             }
         }
         if !self.is_promoted(location) {
