@@ -7,31 +7,23 @@
 
 ## Read order
 
-1. **[MAIN](specfence-pr40-tps-losers-optimal-vs-overhead.md)** — NEAR/FAR vs theoretical optimal arrangement; why FAR or why residual overhead if NEAR; PC / CC / learn; corpus 23/98.
-2. **[Summary JSON](specfence-pr40-tps-losers-optimal-vs-overhead-summary.json)** — K-block Instant-off + DAG bounds.
-3. Per-block Instant-off JSON under `lab/results/pr40-k11-optimal-overhead/`.
-4. DAG / serial hat: `lab/results/pr40-k11-optimal-overhead/dag-upper-bound.json`.
+1. **[MAIN](specfence-pr40-tps-losers-optimal-vs-overhead.md)** — 先读。NEAR/FAR、为何没到最优排列、NEAR 后为何还有壳、PC/CC/学习、23/98。  
+2. **[Appendix](specfence-pr40-tps-losers-optimal-vs-overhead-appendix.md)** — 逐块 Instant-off + DAG 表。  
+3. **[Summary JSON](specfence-pr40-tps-losers-optimal-vs-overhead-summary.json)** — 机器可读 K=11。  
+4. Raw（gitignore）: `lab/results/pr40-k11-optimal-overhead/{*-compare.json,dag-upper-bound.json}`。
+
+## Verdict
+
+| 簇 | 块 | 相对等权最优 |
+|----|----|--------------|
+| A 近独立 / 薄 | 14396881, 13217637, 19638737, 3356896 | **NEAR** — 残差是壳 |
+| B 真脊欠盖 | 19807137, 16146267, 8889776, 19716145, 19860366, 19469101 | **FAR** — 软顶 8 + sticky Opt/空 Full |
+| C 错对象 | 15274915 | **FAR** — Full/996 on lazy |
+
+Corpus Soft=0 SF TPS≥OCC remains **23/98**. PR40 mid-band Δ withdrew over-admission; it did not reach L-wave schedules. Next cut must fork A/B/C.
 
 ## Context
 
-- Task SoT: user question after PR #40 mid-band land (`23/98` SF TPS≥OCC).
-- Corpus: [`specfence-tps-losers-midband-spine-summary.json`](specfence-tps-losers-midband-spine-summary.json) · land [`specfence-tps-losers-midband-spine-land.md`](specfence-tps-losers-midband-spine-land.md).
-- Style: [`specfence-3356896-optimal-vs-overhead-pr19`](https://github.com/fengjy73/pevm) (NEAR/FAR vs equal-weight list-schedule; Instant-tax not added into wall).
-
-## K=11 (this analysis)
-
-| # | Block | Why selected |
-|--:|------:|--------------|
-| 1 | 14396881 | Worst SF/OCC TPS (0.311); large near-independent contrast |
-| 2 | 15274915 | 2nd-worst TPS (0.325); large n=1226 |
-| 3 | 13217637 | Worst-tier (0.360); n=1100, wait-set 8, Opt |
-| 4 | 16146267 | Mid-band real spine; below PR39 |
-| 5 | 19807137 | Under-covered conflict spine |
-| 6 | 8889776 | Mid-band real-spine representative |
-| 7 | 19638737 | Mid-band real-spine representative |
-| 8 | 19716145 | Mid-band; largest named Δ vs PR39 |
-| 9 | 19860366 | Mid-band; named Δ vs PR39 |
-| 10 | 19469101 | Mid-large Opt leftover (key_blocks) |
-| 11 | 3356896 | Thin light-cover; prior NEAR style reference |
-
-Sweep rows for these blocks are Soft=0 in the PR #40 99-block JSON.
+- Land: [`specfence-tps-losers-midband-spine-land.md`](specfence-tps-losers-midband-spine-land.md)  
+- Sweep JSON: [`specfence-tps-losers-midband-spine-summary.json`](specfence-tps-losers-midband-spine-summary.json)  
+- Style: PR19 3356896 NEAR vs unit-cost bound（Instant-tax 不加总进墙）
