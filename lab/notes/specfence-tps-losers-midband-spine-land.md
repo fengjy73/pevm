@@ -27,7 +27,8 @@ Lazy-update chains stay **not** OrderedAdmit objects. Ungated OCC task selection
 - `generate_arms` drops `Win_1` when `ban_empty_win1`.
 - `note_ordered_seed` / `note_wait_set` record leftover-long plants and the post-cap wait-set.
 - `skip_ungated_path_tax` = large+lazy **or** (n>thin ∧ ¬leftover-long wait-set).
-- After-publish does not grow a leftover-long wait-set once the Opt path-tax skip is on.
+- After-publish D1 walk stays on for mid-band short-chain wait-sets (`ignore_leftover_reservations` is the fat-lazy skip). Skipping that walk under M2 livelocked 19716145 (wait-set live, leftover-long hops=0).
+- Leftover-long mid/large yield does not T3-slide or flush idle hops.
 
 ## Metrics
 

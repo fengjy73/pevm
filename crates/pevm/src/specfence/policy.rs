@@ -1523,6 +1523,16 @@ impl CostPolicy {
     /// A planted covering prefix (Win_2+) must not slide on the same
     /// block — 3356896 i=1 otherwise prepaid-blows ĉ and retreats to Opt.
     pub(crate) fn leftover_slide_ok(&self, location: MemoryLocationHash) -> bool {
+        let n_pairs = self
+            .short_chain
+            .get(&location)
+            .map(|c| c.len())
+            .unwrap_or(0);
+        // M1: leftover-long mid/large that yields to OCC abort must not
+        // T3-slide extra Detect hops (19716145 wait-set + hops=0 hang).
+        if self.yield_to_occ_abort(location, n_pairs) {
+            return false;
+        }
         let Some(s) = self.promoted.get(&location) else {
             return true;
         };
@@ -1532,11 +1542,6 @@ impl CostPolicy {
         if s.last_cover_ok {
             return false;
         }
-        let n_pairs = self
-            .short_chain
-            .get(&location)
-            .map(|c| c.len())
-            .unwrap_or(0);
         if n_pairs > ORDER_WINDOW_K
             && is_covering(
                 s.decision,
@@ -6075,6 +6080,10 @@ mod tests {
         assert!(
             p.skip_ungated_path_tax(),
             "M2: empty wait-set on mid-band skips Opt path tax"
+        );
+        assert!(
+            !p.leftover_slide_ok(0xabc),
+            "M1: leftover-long mid-band yield must not T3-slide"
         );
     }
 

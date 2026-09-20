@@ -563,8 +563,11 @@ pub(crate) fn admit_seed_on_write_set(
             p.note_loc_write(loc, lazy);
         }
     }
-    // C1/P3: fat lazy block — D1 record only. No envelope walk / plant.
-    if policy.is_some_and(|p| p.skip_ungated_path_tax()) {
+    // C1/P3: fat lazy-update may steal leftover reservations — D1 record
+    // only, no envelope walk / plant. Mid-band Opt path-tax skip must
+    // still D1-walk a live short-chain wait-set (19716145-class hang
+    // when after-publish skipped ungate while hops=0 leftover-long yield).
+    if policy.is_some_and(|p| p.ignore_leftover_reservations()) {
         return;
     }
     if effective_locs.iter().any(|&l| l == from_loc)
@@ -925,7 +928,9 @@ pub(crate) fn persist_short_chain_after_abort(
         // C1: hops=0 (Opt/Defer) must not queue idle. Covering ordered after
         // systematic reexec has hops>0 and plants via the same mouth.
         let n_pairs = policy.pairs_of(location).len();
-        if policy.hops_to_admit(location, n_pairs) > 0 {
+        if policy.hops_to_admit(location, n_pairs) > 0
+            && !policy.should_skip_ordered_admit_seed(location, n_pairs)
+        {
             policy.queue_idle_edge(location, producer, consumer);
         }
     }
@@ -957,7 +962,9 @@ pub(crate) fn queue_nearest_unfinished_successor(
     to: Option<Address>,
 ) {
     let n_pairs = policy.pairs_of(location).len();
-    if policy.hops_to_admit(location, n_pairs) == 0 {
+    if policy.hops_to_admit(location, n_pairs) == 0
+        || policy.should_skip_ordered_admit_seed(location, n_pairs)
+    {
         return;
     }
     let w = policy
@@ -1021,9 +1028,14 @@ pub(crate) fn flush_pending_idle_edges(ready: &ReadyEdgeTable, policy: &CostPoli
         pairs.sort_unstable();
         pairs.dedup();
         let n_pairs = policy.pairs_of(loc).len().max(pairs.len());
-        if policy.hops_to_admit(loc, n_pairs) == 0 {
+        // M1: leftover-long mid/large yield must not plant a hop under a
+        // this-block ordered arm (hops_to_admit honors that arm).
+        if policy.hops_to_admit(loc, n_pairs) == 0
+            || policy.should_skip_ordered_admit_seed(loc, n_pairs)
+        {
             continue;
         }
+        policy.note_ordered_seed(n_pairs);
         // O1: next-quantum flush is leftover continuation — 1 hop, never
         // a begin-width or full-spine prepaid list.
         if pairs.len() > 1 {
@@ -1260,7 +1272,13 @@ mod tests {
         );
         // D1 write-set still chains a hidden Basic spine when Detect sees it.
         let mut queued = HashSet::new();
-        let _ = note_probe_star(&ready, &[31, 66, 67, 69, 70, 93, 96, 103, 115], 0x20, &mut queued, true);
+        let _ = note_probe_star(
+            &ready,
+            &[31, 66, 67, 69, 70, 93, 96, 103, 115],
+            0x20,
+            &mut queued,
+            true,
+        );
         let hidden = 0x32be_u64;
         let wave = WaveParkTable::new();
         admit_seed_on_write_set(
