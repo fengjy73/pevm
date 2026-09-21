@@ -896,54 +896,53 @@ impl Pevm {
             // S4: thin / near-independent / lazy-update reuse with a stable
             // empty wait-set skips the per-tx mutex incarnation walk.
             // Mid-band real spines keep the walk so leftover unfenced trains.
-            let (inc_gt0, reexec, miss) = if skip_end_walks {
-                (0, 0, 0)
+            let incs = if skip_end_walks {
+                Vec::new()
             } else {
-                let incs = scheduler.incarnation_snapshot();
-                let inc_gt0 = incs.iter().filter(|&&i| i > 0).count();
-                let reexec: usize = incs.iter().sum();
-                let mut miss = 0usize;
-                if thin || lean_end {
-                    for (tx, &inc) in incs.iter().enumerate() {
-                        if inc > 0 && !ready_edges.was_queued(tx) {
+                scheduler.incarnation_snapshot()
+            };
+            let inc_gt0 = incs.iter().filter(|&&i| i > 0).count();
+            let reexec: usize = incs.iter().sum();
+            let mut miss = 0usize;
+            if !skip_end_walks && (thin || lean_end) {
+                for (tx, &inc) in incs.iter().enumerate() {
+                    if inc > 0 && !ready_edges.was_queued(tx) {
+                        miss += 1;
+                        self.cost_policy.bump_unfenced_reexec();
+                    }
+                }
+            } else if !skip_end_walks {
+                for (tx, &inc) in incs.iter().enumerate() {
+                    if inc == 0 || ready_edges.was_queued(tx) {
+                        continue;
+                    }
+                    match self.cost_policy.conflict_of(tx) {
+                        Some(note)
+                            if note.lazy
+                                || matches!(
+                                    note.class,
+                                    crate::specfence::ConflictClass::LazyNoise
+                                        | crate::specfence::ConflictClass::CommuteCandidate
+                                ) =>
+                        {
+                            let _ = note.location;
+                        }
+                        Some(note) => {
+                            miss += 1;
+                            self.cost_policy.bump_unfenced_reexec();
+                            if !self.cost_policy.loc_forbids_ordered(note.location)
+                                && !self.cost_policy.is_promoted(note.location)
+                            {
+                                self.cost_policy.promote_short_edge(note.location, 1);
+                            }
+                        }
+                        None => {
                             miss += 1;
                             self.cost_policy.bump_unfenced_reexec();
                         }
                     }
-                } else {
-                    for (tx, &inc) in incs.iter().enumerate() {
-                        if inc == 0 || ready_edges.was_queued(tx) {
-                            continue;
-                        }
-                        match self.cost_policy.conflict_of(tx) {
-                            Some(note)
-                                if note.lazy
-                                    || matches!(
-                                        note.class,
-                                        crate::specfence::ConflictClass::LazyNoise
-                                            | crate::specfence::ConflictClass::CommuteCandidate
-                                    ) =>
-                            {
-                                let _ = note.location;
-                            }
-                            Some(note) => {
-                                miss += 1;
-                                self.cost_policy.bump_unfenced_reexec();
-                                if !self.cost_policy.loc_forbids_ordered(note.location)
-                                    && !self.cost_policy.is_promoted(note.location)
-                                {
-                                    self.cost_policy.promote_short_edge(note.location, 1);
-                                }
-                            }
-                            None => {
-                                miss += 1;
-                                self.cost_policy.bump_unfenced_reexec();
-                            }
-                        }
-                    }
                 }
-                (inc_gt0, reexec, miss)
-            };
+            }
             // Post-publish: persist consecutive D1 pairs on promoted ℓ
             // (4→31→66→… on Basic(0x32be)). Skip wide empty-to / CallWaw
             // envelopes so 0x209c is not stored as a star. No mid-execute insert.
@@ -1036,7 +1035,9 @@ impl Pevm {
                 report.conflict_ignore,
             );
             self.last_learn_report = report;
-            self.last_incarnations = incs;
+            if !skip_end_walks {
+                self.last_incarnations = incs;
+            }
         } else {
             self.last_process = ExecProcessSnapshot::default();
             self.last_learn_report = LearnReport::default();

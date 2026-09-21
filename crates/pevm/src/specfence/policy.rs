@@ -1372,9 +1372,13 @@ impl CostPolicy {
         }
         let seq = self.block_seq.load(Ordering::Relaxed);
         // S4: reuse + empty/short-chain wait-set leans — thin included.
-        // First incarnation still persists D1 (3356896 4→31).
+        // First thin still persists D1 (3356896 4→31). First mid-band
+        // after a thin block still persists (last_n ≤ THIN).
         if self.skip_ungated_path_tax() && seq > 1 {
-            return true;
+            let last = self.last_block_n.load(Ordering::Relaxed);
+            if n <= THIN_N_MAX || last > THIN_N_MAX {
+                return true;
+            }
         }
         if n <= THIN_N_MAX {
             return false;
@@ -1386,11 +1390,19 @@ impl CostPolicy {
     /// lazy-update large — skip writer-order snapshot and incarnation walk.
     /// Mid-band real spines keep the walk so leftover unfenced still trains.
     pub(crate) fn should_skip_end_block_walks(&self) -> bool {
-        self.skip_ungated_path_tax()
-            && self.block_seq.load(Ordering::Relaxed) > 1
-            && (self.large_lazy_path_tax()
-                || self.should_drop_noncritical_wait_set()
-                || self.block_n() <= THIN_N_MAX)
+        if !self.skip_ungated_path_tax() {
+            return false;
+        }
+        let seq = self.block_seq.load(Ordering::Relaxed);
+        if seq <= 1 {
+            return false;
+        }
+        let n = self.block_n();
+        let last = self.last_block_n.load(Ordering::Relaxed);
+        if n <= THIN_N_MAX {
+            return last > 0 && last <= THIN_N_MAX;
+        }
+        self.large_lazy_path_tax() || self.should_drop_noncritical_wait_set()
     }
 
     /// S3: Done-on-success stamp is required when a later plant can race
@@ -1651,11 +1663,12 @@ impl CostPolicy {
             return light;
         }
         let n = self.block_n();
-        // S2: thin never climbs a mid-band train hat (6137495 Win_16).
-        if n <= THIN_N_MAX {
-            return light;
-        }
         let cores = self.cores();
+        // S2: thin leftover-train may exceed light (3356896 Win_2→8) but
+        // never a mid-band 16-wide plant (6137495 Win_16).
+        if n <= THIN_N_MAX {
+            return cores.max(4).min(8).min(full).max(light);
+        }
         let cap = if n_pairs >= MIDBAND_COVER_MIN && n < LARGE_BLOCK_N {
             // C4: one segment first, room to deepen a second segment.
             cores.max(8).saturating_mul(2).min(16)
