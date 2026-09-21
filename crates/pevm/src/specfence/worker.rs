@@ -139,25 +139,13 @@ pub(crate) fn run_sf_block<F, V>(
                         if let Some(w) = on {
                             if specfence.ready_edges.is_live_leftover_min(tx_idx) {
                                 // leftover_min must not Detect-plant on tx-1 /
-                                // surplus. That gated leftover_min off pick
-                                // (19807137 glob_min=448 pred=447 n_unf=268).
-                                // Scheduler dep only. Done/later: flush and
-                                // requeue so leftover_min commits. No recover
-                                // on earlier←later leftover_min (619 heap).
+                                // surplus (19807137 glob_min=448 pred=447).
+                                // Flush + mark_wait only — recover/force_push
+                                // leftover_min raced ST_RUNNING and heap-aborted
+                                // 198 first-SF (`unaligned chunk`).
                                 specfence.ready_edges.flush_wait_on(w, tx_idx);
                                 let _ = scheduler.detach_dependent(w, tx_idx);
-                                if w > tx_idx
-                                    || scheduler.is_done(w)
-                                    || scheduler.is_validated(w)
-                                    || specfence.ready_edges.leftover_surplus(w)
-                                {
-                                    let _ = scheduler.recover_executing_waiter(tx_idx);
-                                    runnable.mark_wait(tx_idx);
-                                    runnable
-                                        .force_push(tx_idx, super::runnable_set::QueueKind::Indep);
-                                } else {
-                                    runnable.mark_wait(tx_idx);
-                                }
+                                runnable.mark_wait(tx_idx);
                             } else if w < tx_idx {
                                 specfence.ready_edges.note_consumer_on(tx_idx, w, None);
                                 runnable.mark_wait(tx_idx);
