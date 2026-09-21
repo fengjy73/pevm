@@ -26,10 +26,21 @@ Lazy-update chains stay **not** OrderedAdmit objects. Ungated OCC task selection
 - 19469101 leftover-slide hang class: **mid-band** never T3-slides (first iter included — empty short_chain first-pick). Mid-band reuse always drops leftover flush. Large ERC-20 (fence-cover / subgrain) may still slide a leaking loc; large with a live mid-band spine still flushes. Reuse does not *start* a cover probe (`cover_probe_n==0`). Thin leftover-long may still slide. C4 still deepens `cover_window` at `end_block`.
 - iter11 Done-on-success: stamp stays whenever `has_pending_gated` / pending idle / thin storage-like D1 can plant.
 
-## Acceptance (after 99-block Soft=0 sweep)
+## Acceptance (99-block Soft=0, N=3 reuse @8, head `2add58d`)
 
-- SF TPS≥OCC **clearly > 33/98**
-- median **> 0.908**
-- NEAR shell reps 14396881 / 13217637 better (shell ↓)
-- no lazy fat-tail
-- iter11 / erc20 independent
+| bar | this | hit |
+|-----|-----:|:---:|
+| SF TPS ≥ OCC clearly > 33/98 | **26 / 98** | **no** (win-rate is the north star) |
+| SF/OCC median > 0.908 | **0.923** | yes |
+| NEAR 14396881 better than 0.840 | **0.893** | yes |
+| NEAR 13217637 better than 0.835 | **0.928** | yes |
+| no lazy 4–27× tail | none (wall max 3.41 = 13287210 OCC-noise) | yes |
+| Soft=0 / iter11 / erc20 | hold | yes |
+
+Sweep: [`specfence-shell-cut-then-redig-sweep.md`](specfence-shell-cut-then-redig-sweep.md)
+JSON: [`specfence-shell-cut-then-redig-summary.json`](specfence-shell-cut-then-redig-summary.json)
+Instant-off: [`specfence-shell-cut-then-redig-instant-off.md`](specfence-shell-cut-then-redig-instant-off.md)
+Three-lens: [`specfence-shell-cut-then-redig-pc-cc-learn.md`](specfence-shell-cut-then-redig-pc-cc-learn.md)
+Index: [`specfence-shell-cut-then-redig-index.md`](specfence-shell-cut-then-redig-index.md)
+
+Win-rate missed. Median / NEAR shells / Soft=0 / no lazy tail hit. Next cut is **not** another ungated path-tax skip — see Instant-off + three-lens.
