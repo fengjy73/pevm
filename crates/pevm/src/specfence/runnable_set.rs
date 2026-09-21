@@ -419,7 +419,12 @@ impl RunnableSet {
             }
             if scheduler.is_aborting(tx) {
                 match ready.blocking_producer(tx) {
-                    Some(w) if scheduler.is_executing(w) => continue,
+                    Some(w)
+                        if scheduler.is_executing(w)
+                            && self.state[w].load(Ordering::Acquire) == ST_RUNNING =>
+                    {
+                        continue;
+                    }
                     Some(w) if scheduler.is_ready(w) => {
                         self.requeue_ready(w, ready);
                         n += 1;
@@ -432,10 +437,16 @@ impl RunnableSet {
                         }
                         continue;
                     }
-                    // Scheduler-only park (no Detect edge): recovering while
-                    // any producer is still Executing re-issues the waiter and
-                    // livelocks independent transfers at ~400% CPU.
-                    _ => continue,
+                    // Lost add_dependency wake, or Detect names another
+                    // Aborting leftover (8-core 19469101: pending=0,
+                    // gated=false, unfinished). Recover when no live owner.
+                    _ => {
+                        if scheduler.recover_aborting(tx) {
+                            self.requeue_ready(tx, ready);
+                            n += 1;
+                        }
+                        continue;
+                    }
                 }
             }
             if scheduler.is_executing(tx) && st != ST_RUNNING {
@@ -512,14 +523,14 @@ impl RunnableSet {
                         self.requeue_ready(tx, ready);
                         n += 1;
                     }
-                } else if scheduler.is_aborting(tx)
-                    && ready
-                        .blocking_producer(tx)
-                        .is_none_or(|w| scheduler.is_done(w))
-                    && scheduler.recover_aborting(tx)
-                {
-                    self.requeue_ready(tx, ready);
-                    n += 1;
+                } else if scheduler.is_aborting(tx) {
+                    let live_owner = ready.blocking_producer(tx).is_some_and(|w| {
+                        !scheduler.is_done(w) && self.state[w].load(Ordering::Acquire) == ST_RUNNING
+                    });
+                    if !live_owner && scheduler.recover_aborting(tx) {
+                        self.requeue_ready(tx, ready);
+                        n += 1;
+                    }
                 } else if scheduler.is_executed(tx) {
                     self.force_push(tx, QueueKind::Revalidate);
                     n += 1;
@@ -788,6 +799,27 @@ mod tests {
             panic!("expected execute");
         };
         assert_eq!(tx, 4, "must skip gated !may_execute head 1");
+    }
+
+    #[test]
+    fn heal_recovers_aborting_chain_with_no_running_owner() {
+        let ready = ReadyEdgeTable::new();
+        let sched = Scheduler::new(4);
+        let r = RunnableSet::new(4, 1);
+        ready.note_consumer(2, 1);
+        let _v1 = sched.try_execute_producer(1).unwrap();
+        let _v2 = sched.try_execute_producer(2).unwrap();
+        assert!(sched.add_dependency(2, 1));
+        assert!(sched.is_aborting(2));
+        r.mark_wait(1);
+        r.mark_wait(2);
+        assert_eq!(r.pending_work(), 0);
+        let n = r.heal(&ready, &sched);
+        assert!(
+            n >= 1,
+            "Aborting leftovers with no ST_RUNNING owner must recover, got {n}"
+        );
+        assert!(sched.is_ready(2) || sched.is_ready(1));
     }
 
     #[test]
