@@ -140,9 +140,12 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
                 break_replay_mill(&ctx, &f);
             }
             plant_invalid_locs(&ctx);
-            // Do not plant_global leftover. Width-1 starred 19807137 onto
-            // leftover_min=405; width-8 overflow still hung leftover_w=8
-            // (n_unf=190/544). Same-ℓ WAW is plant_observed_window only.
+            // Per-ℓ leftover can still leave many Released tips. Cap
+            // cross-ℓ leftovers that still may_execute. Do not drain-rebind
+            // first-wave onto leftover_min (6196166 heap).
+            if ctx.specfence.ready_edges.may_execute(tx) {
+                let _ = ctx.specfence.ready_edges.plant_global_leftover(tx);
+            }
             ctx.scheduler
                 .finish_validation_sf(ctx.tx_version, true, Some(tx + 1));
             ctx.specfence.ready_edges.clear_started(tx);
@@ -176,6 +179,9 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
                 }
             }
             plant_invalid_locs(&ctx);
+            if ctx.specfence.ready_edges.may_execute(tx) {
+                let _ = ctx.specfence.ready_edges.plant_global_leftover(tx);
+            }
             ctx.scheduler
                 .finish_validation_sf(ctx.tx_version, true, Some(tx + 1));
             ctx.specfence.ready_edges.clear_started(tx);
