@@ -78,6 +78,10 @@ pub(crate) struct ReadyEdgeTable {
     /// Stops a reverse-order election cascade (later tip, then every earlier
     /// leftover also executing — 19807137 ~12 Q_released).
     leftover_min: DashMap<MemoryLocationHash, AtomicUsize, BuildIdentityHasher>,
+    /// Block-wide leftover chain. 19807137 planted 23 locs × 1 tip and the
+    /// tips milled each other (`live_wait=false`, pending≈23).
+    global_leftover_min: AtomicUsize,
+    global_leftover_chain: AtomicUsize,
     /// Ordered-admit gated txs. Marked **before** the consumer map insert so
     /// an ungated steal cannot race past a newly created wait-for edge.
     gated_bits: [AtomicU64; GATED_WORDS],
@@ -123,6 +127,8 @@ impl Default for ReadyEdgeTable {
             loc_tip: DashMap::default(),
             overflow_tip: DashMap::default(),
             leftover_min: DashMap::default(),
+            global_leftover_min: AtomicUsize::new(NONE),
+            global_leftover_chain: AtomicUsize::new(NONE),
             gated_bits: std::array::from_fn(|_| AtomicU64::new(0)),
             gated_n: AtomicUsize::new(0),
             pending_gated: AtomicUsize::new(0),
@@ -924,6 +930,9 @@ impl ReadyEdgeTable {
                 return true;
             }
         }
+        if !producer_live {
+            return self.plant_global_leftover(consumer);
+        }
         let loc_tip = self
             .loc_tip
             .get(&location)
@@ -973,6 +982,51 @@ impl ReadyEdgeTable {
                     Ok(_) => break cand,
                     Err(_) => {}
                 }
+            }
+        };
+        match pred {
+            Some(p) if self.should_plant_observed_waw(consumer, p) => {
+                self.note_consumer_on(consumer, p, None);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// One leftover writer executes at a time in the block. Per-ℓ election
+    /// left 19807137 with ~23 Q_released tips (`leftover_min=23`).
+    fn plant_global_leftover(&self, consumer: TxIdx) -> bool {
+        self.global_leftover_min
+            .fetch_min(consumer, Ordering::Relaxed);
+        let min = self.global_leftover_min.load(Ordering::Relaxed);
+        let pred = loop {
+            let cur = self.global_leftover_chain.load(Ordering::Relaxed);
+            if cur == consumer {
+                break None;
+            }
+            let cand = if cur != NONE && cur < consumer && !self.is_writer_done(cur) {
+                Some(cur)
+            } else if min < consumer && min != NONE && !self.is_writer_done(min) {
+                Some(min)
+            } else if cur != NONE && cur > consumer && !self.is_writer_done(cur) {
+                if min == consumer {
+                    None
+                } else if min < consumer && !self.is_writer_done(min) {
+                    Some(min)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            match self.global_leftover_chain.compare_exchange_weak(
+                cur,
+                consumer,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break cand,
+                Err(_) => {}
             }
         };
         match pred {
@@ -1622,6 +1676,24 @@ mod tests {
         assert_eq!(t.blocking_producer(30), Some(10));
         assert!(t.may_execute(10));
         assert!(!t.may_execute(30));
+    }
+
+    #[test]
+    fn plant_window_global_leftover_serializes_across_locs() {
+        let t = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        t.note_producer_done(0, &wave);
+        assert!(
+            !t.plant_observed_window(20, 0, 0xaaa, 1),
+            "first leftover across locs is the global tip"
+        );
+        assert!(
+            t.plant_observed_window(40, 0, 0xbbb, 1),
+            "other-loc leftover must wait on the global chain"
+        );
+        assert_eq!(t.blocking_producer(40), Some(20));
+        assert!(!t.may_execute(40));
+        assert!(t.may_execute(20));
     }
 
     #[test]
