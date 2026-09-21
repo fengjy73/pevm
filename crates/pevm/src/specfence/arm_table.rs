@@ -11,11 +11,11 @@ use dashmap::{DashMap, DashSet};
 
 use crate::{BuildIdentityHasher, MemoryLocationHash, TxIdx};
 
+use super::ResolvePlan;
 use super::learner::InterBlockPrior;
 use super::policy::{CostPolicy, LocStrategy, THIN_SHELL_N};
 use super::ready_edge::ReadyEdgeTable;
 use super::runnable_set::{QueueKind, RunnableSet};
-use super::ResolvePlan;
 
 /// Soft=0 arm stored per ℓ.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -429,7 +429,11 @@ impl ArmTable {
         if self.promoted_this_block.contains(&loc) {
             return;
         }
-        if self.entries.get(&loc).is_some_and(|e| e.lazy || e.under_covered) {
+        if self
+            .entries
+            .get(&loc)
+            .is_some_and(|e| e.lazy || e.under_covered)
+        {
             return;
         }
         let cap = Self::w_max(block_n, chain_len, false);
@@ -621,7 +625,10 @@ mod tests {
         let prior = InterBlockPrior::new();
         t.end_pack(&prior, 200);
         let snap = prior.arm_snapshot();
-        assert!(snap.iter().any(|s| s.location == 3 && matches!(s.arm, ArmKind::Opt)));
+        assert!(
+            snap.iter()
+                .any(|s| s.location == 3 && matches!(s.arm, ArmKind::Opt))
+        );
     }
 
     #[test]

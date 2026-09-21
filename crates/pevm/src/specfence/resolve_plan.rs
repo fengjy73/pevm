@@ -7,11 +7,11 @@ use crate::mv_memory::MvMemory;
 use crate::scheduler::Scheduler;
 use crate::{MemoryLocationHash, TxVersion};
 
-use super::arm_table::ArmTable;
-use super::collateral::{classify_first_conflict, location_is_lazy, ConflictClass};
-use super::runnable_set::{QueueKind, RunnableSet};
 use super::SpecFenceCtx;
 use super::VisibilityPolicy;
+use super::arm_table::ArmTable;
+use super::collateral::{ConflictClass, classify_first_conflict, location_is_lazy};
+use super::runnable_set::{QueueKind, RunnableSet};
 
 /// Structured validate outcome. Replaces “bool valid → abort” as the SF root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -149,7 +149,9 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
             ctx.scheduler
                 .finish_validation_sf(ctx.tx_version, true, Some(tx + 1));
             ctx.specfence.ready_edges.clear_started(tx);
-            if ctx.specfence.ready_edges.is_gated(tx) && !ctx.specfence.ready_edges.may_execute(tx)
+            if ctx.specfence.ready_edges.leftover_surplus(tx)
+                || (ctx.specfence.ready_edges.is_gated(tx)
+                    && !ctx.specfence.ready_edges.may_execute(tx))
             {
                 ctx.runnable.mark_wait(tx);
             } else if ctx.specfence.ready_edges.is_gated(tx) || ctx.vis.needs_fence() {
@@ -187,7 +189,9 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
             ctx.specfence.ready_edges.clear_started(tx);
             enqueue_higher_revalidate(&ctx, tx);
             // Observed WAW: wait for the producer instead of Opt ping-pong.
-            if ctx.specfence.ready_edges.is_gated(tx) && !ctx.specfence.ready_edges.may_execute(tx)
+            if ctx.specfence.ready_edges.leftover_surplus(tx)
+                || (ctx.specfence.ready_edges.is_gated(tx)
+                    && !ctx.specfence.ready_edges.may_execute(tx))
             {
                 ctx.runnable.mark_wait(tx);
             } else {

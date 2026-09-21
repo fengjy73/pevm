@@ -5,12 +5,12 @@
 
 use std::time::Instant;
 
+use super::SpecFenceCtx;
+use super::VisibilityPolicy;
 use super::arm_table::ArmTable;
 use super::resolve_plan::{self, ApplyCtx};
 use super::runnable_set::RunnableSet;
 use super::schedule;
-use super::SpecFenceCtx;
-use super::VisibilityPolicy;
 use crate::mv_memory::MvMemory;
 use crate::scheduler::Scheduler;
 use crate::{Task, TxVersion};
@@ -116,6 +116,26 @@ pub(crate) fn run_sf_block<F, V>(
                         if let Some(w) = on {
                             if w < tx_idx {
                                 specfence.ready_edges.note_consumer_on(tx_idx, w, None);
+                                runnable.mark_wait(tx_idx);
+                            } else if specfence.ready_edges.is_live_leftover_min(tx_idx)
+                                || specfence.ready_edges.is_leftover_claimed(tx_idx)
+                            {
+                                // leftover_min must commit. Detect-starring
+                                // surplus let 405 park on a later waiter.
+                                // Detach us←later; do not recover later
+                                // (both-sides recover milled n_unf=437).
+                                specfence.ready_edges.flush_wait_on(w, tx_idx);
+                                let _ = scheduler.detach_dependent(w, tx_idx);
+                                if runnable.is_running(w) {
+                                    runnable.mark_wait(tx_idx);
+                                } else {
+                                    recover_leftover_min(
+                                        scheduler,
+                                        runnable,
+                                        specfence.ready_edges,
+                                        tx_idx,
+                                    );
+                                }
                             } else if specfence.ready_edges.detect_waits_on(w, tx_idx) {
                                 // Later leftover is Detect-gated on us; we
                                 // parked Aborting on them (6196166 reuse
@@ -133,9 +153,13 @@ pub(crate) fn run_sf_block<F, V>(
                                     };
                                     runnable.force_push(w, kind);
                                 }
+                                runnable.mark_wait(tx_idx);
+                            } else {
+                                runnable.mark_wait(tx_idx);
                             }
+                        } else {
+                            runnable.mark_wait(tx_idx);
                         }
-                        runnable.mark_wait(tx_idx);
                         drain_wave(specfence, scheduler, runnable);
                     }
                     SfExec::Fatal => break,
@@ -217,6 +241,33 @@ pub(crate) enum SfExec {
     Fatal,
 }
 
+fn recover_leftover_min(
+    scheduler: &Scheduler,
+    runnable: &RunnableSet,
+    ready: &super::ready_edge::ReadyEdgeTable,
+    tx: crate::TxIdx,
+) {
+    if scheduler.is_aborting(tx) {
+        let _ = scheduler.recover_aborting(tx);
+    } else if scheduler.is_executing(tx) {
+        let _ = scheduler.recover_executing_waiter(tx);
+    }
+    if ready.leftover_surplus(tx) || (ready.is_gated(tx) && !ready.may_execute(tx)) {
+        runnable.mark_wait(tx);
+        return;
+    }
+    if scheduler.is_ready(tx) {
+        let kind = if ready.is_gated(tx) {
+            super::runnable_set::QueueKind::Released
+        } else {
+            super::runnable_set::QueueKind::Indep
+        };
+        runnable.force_push(tx, kind);
+    } else {
+        runnable.mark_wait(tx);
+    }
+}
+
 fn drain_wave(specfence: SpecFenceCtx<'_>, scheduler: &Scheduler, runnable: &RunnableSet) {
     while let Some(t) = specfence.wave.pop_ready() {
         if scheduler.is_validated(t) {
@@ -226,7 +277,9 @@ fn drain_wave(specfence: SpecFenceCtx<'_>, scheduler: &Scheduler, runnable: &Run
         // force_push: the waiter may still be ST_RUNNING inside try_execute_sf
         // (add_dependency succeeded, Blocked not yet returned). push() would
         // refuse and drop the wake.
-        if specfence.ready_edges.is_gated(t) && !specfence.ready_edges.may_execute(t) {
+        if specfence.ready_edges.leftover_surplus(t)
+            || (specfence.ready_edges.is_gated(t) && !specfence.ready_edges.may_execute(t))
+        {
             runnable.mark_wait(t);
             continue;
         }

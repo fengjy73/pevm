@@ -823,7 +823,10 @@ mod tests {
     #[test]
     fn validate_to_plan_source_never_falls_back_to_occ_kernel() {
         let src = include_str!("executor.rs");
-        let before_specfence = src.split("pub(crate) fn validate_specfence").next().unwrap();
+        let before_specfence = src
+            .split("pub(crate) fn validate_specfence")
+            .next()
+            .unwrap();
         let to_plan = before_specfence
             .split("pub(crate) fn validate_to_plan")
             .nth(1)

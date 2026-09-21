@@ -10,8 +10,8 @@ use super::producer_stage::ProducerStageTable;
 use super::ready_edge::ReadyEdgeTable;
 use super::runnable_set::{RunnableSet, SfPick};
 use super::wave::WaveParkTable;
-use crate::scheduler::Scheduler;
 use crate::Task;
+use crate::scheduler::Scheduler;
 
 /// SpecFence schedule entry. Queues + steal only.
 #[inline]

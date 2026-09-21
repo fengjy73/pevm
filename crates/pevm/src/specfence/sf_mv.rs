@@ -19,9 +19,7 @@ pub(crate) enum SfRead {
         value: MemoryValue,
     },
     /// Race tip is an ESTIMATE — only [`VisibilityPolicy::Opt`] may see this.
-    Estimate {
-        writer: TxIdx,
-    },
+    Estimate { writer: TxIdx },
     /// No prior MV write; fall back to storage.
     Storage,
 }
@@ -131,7 +129,10 @@ mod tests {
     #[test]
     fn edged_read_skips_estimate_tip() {
         let mv = empty_mv(3);
-        mv.data.entry(7).or_default().insert(0, MemoryEntry::Estimate);
+        mv.data
+            .entry(7)
+            .or_default()
+            .insert(0, MemoryEntry::Estimate);
         let sf = SfMvMemory::new(&mv);
         match sf.read(7, VisibilityPolicy::WaitReleased, 2) {
             SfRead::Storage => {}
@@ -163,7 +164,9 @@ mod tests {
         let sf = SfMvMemory::new(&mv);
         match sf.read(9, VisibilityPolicy::OrderedTip, 2) {
             SfRead::Data {
-                writer, incarnation, ..
+                writer,
+                incarnation,
+                ..
             } => {
                 assert_eq!(writer, 0);
                 assert_eq!(incarnation, 0);

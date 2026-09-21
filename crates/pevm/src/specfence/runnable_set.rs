@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 
-use crate::scheduler::Scheduler;
 use crate::TxIdx;
+use crate::scheduler::Scheduler;
 
 use super::producer_stage::ProducerStageTable;
 use super::ready_edge::ReadyEdgeTable;
@@ -296,7 +296,7 @@ impl RunnableSet {
         kind: QueueKind,
         ready: &ReadyEdgeTable,
     ) -> Option<SfPick> {
-        if ready.is_gated(tx) && !ready.may_execute(tx) {
+        if ready.leftover_surplus(tx) || (ready.is_gated(tx) && !ready.may_execute(tx)) {
             ready.note_skip_gate(tx);
             self.mark_wait(tx);
             self.refuse_fill_n.fetch_add(1, Ordering::Relaxed);
@@ -332,7 +332,7 @@ impl RunnableSet {
         // Gated !may_execute on a queue is the 19807137 refuse mill:
         // pick mark_waits, heal force_pushes, pending stays ~60, idle
         // ungate never runs.
-        if ready.is_gated(tx) && !ready.may_execute(tx) {
+        if ready.leftover_surplus(tx) || (ready.is_gated(tx) && !ready.may_execute(tx)) {
             self.mark_wait(tx);
             return;
         }
@@ -383,6 +383,9 @@ impl RunnableSet {
                 self.mark_done(tx);
                 continue;
             }
+            if ready.leftover_surplus(tx) {
+                continue;
+            }
             if self.state[tx].load(Ordering::Acquire) == ST_RUNNING {
                 continue;
             }
@@ -425,6 +428,9 @@ impl RunnableSet {
             if self.state[tx].load(Ordering::Acquire) == ST_RUNNING {
                 continue;
             }
+            if ready.leftover_surplus(tx) {
+                continue;
+            }
             if !scheduler.is_executing(tx) || !ready.has_known_waiters(tx) {
                 continue;
             }
@@ -444,6 +450,9 @@ impl RunnableSet {
             for tx in 0..self.block_size {
                 let st = self.state[tx].load(Ordering::Acquire);
                 if st == ST_RUNNING || st == ST_DONE || !scheduler.is_executing(tx) {
+                    continue;
+                }
+                if ready.leftover_surplus(tx) {
                     continue;
                 }
                 if ready.blocking_producer(tx).is_some_and(|w| {
@@ -478,6 +487,9 @@ impl RunnableSet {
         for tx in 0..self.block_size {
             let st = self.state[tx].load(Ordering::Acquire);
             if st == ST_DONE {
+                continue;
+            }
+            if ready.leftover_surplus(tx) {
                 continue;
             }
             if st == ST_RUNNING && scheduler.is_executing(tx) {
@@ -600,6 +612,9 @@ impl RunnableSet {
             for tx in 0..self.block_size {
                 let st = self.state[tx].load(Ordering::Acquire);
                 if st == ST_DONE || st == ST_RUNNING || scheduler.is_validated(tx) {
+                    continue;
+                }
+                if ready.leftover_surplus(tx) {
                     continue;
                 }
                 if scheduler.is_executing(tx) {

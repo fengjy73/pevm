@@ -170,10 +170,10 @@ use alloy_primitives::Address;
 use hashbrown::HashMap;
 
 mod access_log;
-mod arm_table;
 mod access_policy;
 mod access_vis;
 pub(crate) mod admit;
+mod arm_table;
 mod bayes;
 mod boundary;
 mod certificate;
@@ -218,6 +218,7 @@ pub(crate) use access_policy::{
     AccessDecision, AccessVis, decide as decide_access, decide_queried as decide_access_queried,
 };
 pub(crate) use access_vis::compose_unfinished;
+pub(crate) use arm_table::ArmTable;
 pub(crate) use bayes::BayesAccessQuery;
 pub(crate) use bayes::{BayesMap, DEFAULT_TAU};
 pub use boundary::SpecFenceInspector;
@@ -244,8 +245,6 @@ pub(crate) use collateral::{
     ConflictClass, FirstConflict, classify_first_conflict, commute_ok, envelopes_disjoint,
     is_value_transfer, location_is_lazy, optimistic_majority_hinted_lazy,
 };
-pub(crate) use arm_table::ArmTable;
-pub(crate) use worker::{SfExec, run_sf_block};
 pub(crate) use dag::{FenceGraph, SpecDag};
 pub(crate) use decision_field::{DecisionFeat, DecisionVerb};
 pub use decision_field::{DecisionFieldSnap, QualityProxies, VerbHist};
@@ -277,6 +276,7 @@ pub use resolve_plan::ResolvePlan;
 pub(crate) use runnable_set::RunnableSet;
 pub(crate) use sf_mv::SfMvMemory;
 pub use visibility::VisibilityPolicy;
+pub(crate) use worker::{SfExec, run_sf_block};
 // kernel.rs museum — tests only; rem-legal SoT is CertificateTable.
 pub(crate) use lane::LaneTable;
 pub(crate) use learner::{AdaptiveParams, InterBlockPrior, LiveLearner};

@@ -596,20 +596,7 @@ fn main() {
         );
         println!(
             "  learn e1={} e2={} e3={} e4={} e5={} e6={} mid_promote={} mid_promote_veto={} prior_plant={} began_from_prior={} steal={} refuse_fill={} resolve_apply={} explore_n={}",
-            m.16,
-            m.17,
-            m.18,
-            m.19,
-            m.20,
-            m.21,
-            m.22,
-            m.23,
-            m.24,
-            m.25,
-            m.26,
-            m.27,
-            m.28,
-            m.29
+            m.16, m.17, m.18, m.19, m.20, m.21, m.22, m.23, m.24, m.25, m.26, m.27, m.28, m.29
         );
     }
 

@@ -207,10 +207,7 @@ fn specfence_sf_ps_pick_never_calls_next_occ_task() {
         sf.visibility_opt + sf.visibility_wait_released + sf.visibility_ordered_tip > 0,
         "VisibilityPolicy must be recorded: {sf:?}"
     );
-    assert!(
-        sf.resolve_apply_n > 0,
-        "ResolvePlan.apply must run: {sf:?}"
-    );
+    assert!(sf.resolve_apply_n > 0, "ResolvePlan.apply must run: {sf:?}");
 }
 
 /// True-spine call-graph: SF sources never mention Block-STM next_task*.

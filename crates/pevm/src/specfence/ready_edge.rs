@@ -7,8 +7,8 @@
 //!
 //! Ungated / A0-majority txs use an OCC-class `may_execute` (bitset; no DashMap).
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use dashmap::{DashMap, DashSet};
@@ -82,6 +82,10 @@ pub(crate) struct ReadyEdgeTable {
     /// tips milled each other (`live_wait=false`, pending≈23).
     global_leftover_min: AtomicUsize,
     global_leftover_chain: AtomicUsize,
+    /// Leftover writers that called `plant_global_leftover`. Claim-only:
+    /// surplus is pick-refused while leftover_min is live. Do **not**
+    /// Detect-star them onto leftover_min (19807137 leftover_min=405 hang).
+    leftover_claimed: DashSet<TxIdx, BuildIdentityHasher>,
     /// Ordered-admit gated txs. Marked **before** the consumer map insert so
     /// an ungated steal cannot race past a newly created wait-for edge.
     gated_bits: [AtomicU64; GATED_WORDS],
@@ -129,6 +133,7 @@ impl Default for ReadyEdgeTable {
             leftover_min: DashMap::default(),
             global_leftover_min: AtomicUsize::new(NONE),
             global_leftover_chain: AtomicUsize::new(NONE),
+            leftover_claimed: DashSet::default(),
             gated_bits: std::array::from_fn(|_| AtomicU64::new(0)),
             gated_n: AtomicUsize::new(0),
             pending_gated: AtomicUsize::new(0),
@@ -688,24 +693,30 @@ impl ReadyEdgeTable {
             .map(|(_, v)| v)
             .unwrap_or_default();
         let had_waiters = !cs.is_empty();
-        // leftover_min is fetch_min-only. After the elected head Commits it
-        // stayed sticky-done and later leftovers planted with a dead pred
-        // (19807137 glob_min=24 for the whole hang).
-        if self.global_leftover_min.load(Ordering::Relaxed) == writer {
-            let next = cs
-                .iter()
-                .copied()
-                .filter(|&c| c > writer && !self.is_writer_done(c))
-                .min()
-                .unwrap_or(NONE);
+        // leftover_min is a claim token, not a Detect wait-set. Elect the
+        // next leftover from leftover_claimed — waiters of leftover_min
+        // used to be surplus Detect-stars (19807137 leftover_min=405).
+        self.leftover_claimed.remove(&writer);
+        let leftover_wake = if self.global_leftover_min.load(Ordering::Relaxed) == writer {
+            let next = self.elect_next_leftover();
             let _ = self.global_leftover_min.compare_exchange(
                 writer,
                 next,
                 Ordering::Release,
                 Ordering::Relaxed,
             );
-        }
+            if next != NONE {
+                self.global_leftover_chain.store(next, Ordering::Relaxed);
+            }
+            next
+        } else {
+            self.live_leftover_min()
+        };
         self.mark_done(writer);
+        // Claim token: wake leftover_min even when no Detect gates exist.
+        if leftover_wake != NONE && leftover_wake != writer && self.may_execute(leftover_wake) {
+            wave.push_ready(leftover_wake);
+        }
         if !self.has_any_gated() {
             return;
         }
@@ -771,6 +782,9 @@ impl ReadyEdgeTable {
     pub(crate) fn may_execute(&self, tx_idx: TxIdx) -> bool {
         if tx_idx == 0 {
             return true;
+        }
+        if self.leftover_surplus(tx_idx) {
+            return false;
         }
         if !self.is_gated(tx_idx) {
             return true;
@@ -1152,6 +1166,32 @@ impl ReadyEdgeTable {
         }
     }
 
+    fn elect_next_leftover(&self) -> usize {
+        self.leftover_claimed
+            .iter()
+            .map(|e| *e)
+            .filter(|&c| !self.is_writer_done(c))
+            .min()
+            .unwrap_or(NONE)
+    }
+
+    /// Surplus leftover: claimed after leftover_min, not Detect-starred.
+    #[inline]
+    pub(crate) fn leftover_surplus(&self, tx: TxIdx) -> bool {
+        let min = self.live_leftover_min();
+        min != NONE && min < tx && self.leftover_claimed.contains(&tx)
+    }
+
+    #[inline]
+    pub(crate) fn is_leftover_claimed(&self, tx: TxIdx) -> bool {
+        self.leftover_claimed.contains(&tx)
+    }
+
+    #[inline]
+    pub(crate) fn is_live_leftover_min(&self, tx: TxIdx) -> bool {
+        self.live_leftover_min() == tx
+    }
+
     fn install_leftover_min(&self, consumer: TxIdx) {
         if self.is_writer_done(consumer) {
             return;
@@ -1168,68 +1208,28 @@ impl ReadyEdgeTable {
                 Ordering::Release,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return,
+                Ok(_) => {
+                    self.global_leftover_chain
+                        .store(consumer, Ordering::Relaxed);
+                    return;
+                }
                 Err(_) => {}
             }
         }
     }
 
-    /// One leftover writer executes at a time in the block. Per-ℓ election
-    /// left 19807137 with ~23 Q_released tips (`leftover_min=23`).
+    /// One leftover writer executes at a time. Claim-only: record the
+    /// leftover and elect leftover_min. Do **not** Detect-star surplus
+    /// onto leftover_min — that wait-set let leftover_min add_dependency
+    /// park on a later waiter (19807137 leftover_min=405 n_unf=307).
+    /// Returns true when `consumer` is surplus (pick-refused).
     pub(crate) fn plant_global_leftover(&self, consumer: TxIdx) -> bool {
+        if consumer == 0 || self.is_writer_done(consumer) {
+            return false;
+        }
+        self.leftover_claimed.insert(consumer);
         self.install_leftover_min(consumer);
-        let min = self.live_leftover_min();
-        let (pred, stolen_head) = loop {
-            let cur = self.global_leftover_chain.load(Ordering::Relaxed);
-            if cur == consumer {
-                break (None, None);
-            }
-            let cand = if cur != NONE && cur < consumer && !self.is_writer_done(cur) {
-                Some(cur)
-            } else if min < consumer && min != NONE && !self.is_writer_done(min) {
-                Some(min)
-            } else if cur != NONE && cur > consumer && !self.is_writer_done(cur) {
-                if min == consumer {
-                    None
-                } else if min < consumer && !self.is_writer_done(min) {
-                    Some(min)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            match self.global_leftover_chain.compare_exchange_weak(
-                cur,
-                consumer,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    let stolen = if min == consumer
-                        && cur != NONE
-                        && cur > consumer
-                        && !self.is_writer_done(cur)
-                    {
-                        Some(cur)
-                    } else {
-                        None
-                    };
-                    break (cand, stolen);
-                }
-                Err(_) => {}
-            }
-        };
-        if let Some(old) = stolen_head {
-            self.rebind_stolen_leftover_head(old, consumer);
-        }
-        match pred {
-            Some(p) if self.should_plant_observed_waw(consumer, p) => {
-                self.note_consumer_on(consumer, p, None);
-                true
-            }
-            _ => stolen_head.is_some(),
-        }
+        self.leftover_surplus(consumer)
     }
 
     /// Keep at most `w_max` Detect waiters on `ℓ`. Evict oldest first,
@@ -1937,12 +1937,17 @@ mod tests {
         );
         assert!(t.may_execute(40));
         assert!(t.plant_global_leftover(60));
-        assert_eq!(t.blocking_producer(60), Some(40));
+        assert_eq!(
+            t.blocking_producer(60),
+            None,
+            "surplus leftover is claim-refused, not Detect-starred"
+        );
         assert!(!t.may_execute(60));
+        assert!(t.leftover_surplus(60));
     }
 
     #[test]
-    fn plant_global_leftover_rebinds_previous_tip_onto_new_min() {
+    fn plant_global_leftover_claim_refuses_previous_tip() {
         let t = ReadyEdgeTable::new();
         let wave = WaveParkTable::new();
         t.note_producer_done(0, &wave);
@@ -1952,15 +1957,37 @@ mod tests {
         );
         assert!(t.may_execute(40));
         assert!(
-            t.plant_global_leftover(10),
-            "lower leftover must steal and gate the previous tip"
+            !t.plant_global_leftover(10),
+            "lower leftover steals leftover_min without Detect-starring 40"
         );
-        assert_eq!(t.blocking_producer(40), Some(10));
+        assert_eq!(t.blocking_producer(40), None);
         assert!(t.may_execute(10));
         assert!(
             !t.may_execute(40),
             "two leftover heads must not both execute"
         );
+        assert!(t.leftover_surplus(40));
+    }
+
+    #[test]
+    fn plant_global_leftover_does_not_detect_star_surplus() {
+        let t = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        t.note_producer_done(0, &wave);
+        assert!(!t.plant_global_leftover(20));
+        assert!(t.plant_global_leftover(40));
+        assert!(t.plant_global_leftover(60));
+        assert_eq!(t.blocking_producer(40), None);
+        assert_eq!(t.blocking_producer(60), None);
+        assert!(t.may_execute(20));
+        assert!(!t.may_execute(40));
+        assert!(!t.may_execute(60));
+        t.note_producer_done(20, &wave);
+        assert!(
+            t.may_execute(40),
+            "next leftover_min executes after the claim head commits"
+        );
+        assert!(t.leftover_surplus(60));
     }
 
     #[test]
