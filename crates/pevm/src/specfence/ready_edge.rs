@@ -451,17 +451,6 @@ impl ReadyEdgeTable {
 
     #[inline]
     fn mark_done(&self, writer: TxIdx) {
-        // heal_finished_preds stamps Done without note_producer_done.
-        // fetch_min leftover election then stays on a dead head
-        // (19807137 glob_min=121 min_done=true → 32-head mill).
-        if self.global_leftover_min.load(Ordering::Relaxed) == writer {
-            let _ = self.global_leftover_min.compare_exchange(
-                writer,
-                NONE,
-                Ordering::Release,
-                Ordering::Relaxed,
-            );
-        }
         let newly = {
             let i = writer / 64;
             if i < self.done_bits.len() {
@@ -747,14 +736,9 @@ impl ReadyEdgeTable {
                 continue;
             }
             self.sleeping.remove(&c);
-            // First-wave pred is the original producer (often later than
-            // leftover_min). `should_plant` skips a lower leftover plant, so
-            // after this Done they would Opt-mill the leftover head
-            // (19807137 glob_min=24 vs loc tips). Rebind onto the live min.
-            let min = self.live_leftover_min();
-            if min != NONE && min < c && min != writer {
-                self.note_consumer_on(c, min, None);
-            }
+            // Do not note_consumer_on here — DashMap re-entry on the wake
+            // path SEGVd 19807137 after leftover_min started cycling.
+            // First-wave already joined leftover election at plant time.
             if self.may_execute(c) {
                 wave.push_ready(c);
             }
@@ -1067,6 +1051,18 @@ impl ReadyEdgeTable {
 
     /// Live leftover head only. A sticky-done min makes every later plant
     /// a no-op (`should_plant` / wake-rebind skip) and re-arms the Released mill.
+    /// After a producer Done wake, bind the waiter onto the live leftover
+    /// head. Called from drain (not from `note_producer_done`) so DashMap
+    /// is not re-entered on the wake path (19807137 SEGV).
+    pub(crate) fn gate_on_live_leftover(&self, tx: TxIdx) -> bool {
+        let min = self.live_leftover_min();
+        if min == NONE || min >= tx {
+            return false;
+        }
+        self.note_consumer_on(tx, min, None);
+        !self.may_execute(tx)
+    }
+
     fn live_leftover_min(&self) -> usize {
         let m = self.global_leftover_min.load(Ordering::Relaxed);
         if m == NONE || self.is_writer_done(m) {
@@ -1751,6 +1747,10 @@ mod tests {
             "overflow must not stampede with the window tip"
         );
         t.note_producer_done(2, &wave);
+        assert!(
+            t.gate_on_live_leftover(3),
+            "drain rebinds overflow onto leftover min"
+        );
         assert_eq!(
             t.blocking_producer(3),
             Some(1),
@@ -1843,6 +1843,10 @@ mod tests {
             "live original producer still gates first-wave"
         );
         t.note_producer_done(50, &wave);
+        assert!(
+            t.gate_on_live_leftover(100),
+            "drain-path leftover rebind after original Done"
+        );
         assert_eq!(
             t.blocking_producer(100),
             Some(24),

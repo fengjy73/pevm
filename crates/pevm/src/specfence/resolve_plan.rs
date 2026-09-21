@@ -387,7 +387,10 @@ fn drain_wave_to_runnable(ctx: &ApplyCtx<'_>) {
             ctx.runnable.mark_done(t);
             continue;
         }
-        if ctx.specfence.ready_edges.is_gated(t) && !ctx.specfence.ready_edges.may_execute(t) {
+        if ctx.specfence.ready_edges.gate_on_live_leftover(t)
+            || (ctx.specfence.ready_edges.is_gated(t)
+                && !ctx.specfence.ready_edges.may_execute(t))
+        {
             ctx.runnable.mark_wait(t);
             continue;
         }
