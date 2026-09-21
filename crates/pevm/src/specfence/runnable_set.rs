@@ -268,15 +268,21 @@ impl RunnableSet {
             1 => [QueueKind::Released, QueueKind::Indep, QueueKind::Ordered],
             _ => [QueueKind::Indep, QueueKind::Ordered, QueueKind::Released],
         };
+        // One gated !may_execute head must not hide a later runnable in the
+        // same deque (19469101: pending=30 stuck, schedule broke on first None).
         for kind in prefer {
-            if let Some(tx) = self.pop_kind(kind) {
-                return self.admit_or_refuse(tx, kind, ready);
+            while let Some(tx) = self.pop_kind(kind) {
+                if let Some(p) = self.admit_or_refuse(tx, kind, ready) {
+                    return Some(p);
+                }
             }
         }
         // Global steal: independents first (PC-3: keep width while a spine runs).
         for kind in [QueueKind::Indep, QueueKind::Released, QueueKind::Ordered] {
-            if let Some(tx) = self.steal_kind(kind) {
-                return self.admit_or_refuse(tx, kind, ready);
+            while let Some(tx) = self.steal_kind(kind) {
+                if let Some(p) = self.admit_or_refuse(tx, kind, ready) {
+                    return Some(p);
+                }
             }
         }
         if let Some(tx) = self.steal_kind(QueueKind::Revalidate) {
@@ -340,6 +346,28 @@ impl RunnableSet {
         // leaves `may_execute=false` and workers yield-spin (~400% CPU).
         ready.heal_finished_preds(|w| scheduler.is_done(w));
         let mut n = 0;
+        // Ghost Executing *producer* (worker already left, not ST_RUNNING)
+        // that still gates waiters. Recover even when queues are non-empty —
+        // otherwise 30 Released heads sit behind a leftover root (19469101).
+        // Recovering waiters into a live antichain is the 390% mill; this
+        // path is producer-only (`has_known_waiters`).
+        for tx in 0..self.block_size {
+            if self.state[tx].load(Ordering::Acquire) == ST_RUNNING {
+                continue;
+            }
+            if !scheduler.is_executing(tx) || !ready.has_known_waiters(tx) {
+                continue;
+            }
+            if ready.blocking_producer(tx).is_some_and(|w| {
+                !scheduler.is_done(w) && self.state[w].load(Ordering::Acquire) == ST_RUNNING
+            }) {
+                continue;
+            }
+            if scheduler.recover_executing_waiter(tx) {
+                self.requeue_ready(tx, ready);
+                n += 1;
+            }
+        }
         // WaitForDependency leftovers (Executing, worker gone). Only when
         // queues are empty — recovering into a live antichain mills at ~390%.
         if self.pending_work() == 0 {
@@ -349,8 +377,7 @@ impl RunnableSet {
                     continue;
                 }
                 if ready.blocking_producer(tx).is_some_and(|w| {
-                    !scheduler.is_done(w)
-                        && self.state[w].load(Ordering::Acquire) == ST_RUNNING
+                    !scheduler.is_done(w) && self.state[w].load(Ordering::Acquire) == ST_RUNNING
                 }) {
                     continue;
                 }
@@ -416,8 +443,7 @@ impl RunnableSet {
                     continue;
                 }
                 if ready.blocking_producer(tx).is_some_and(|w| {
-                    !scheduler.is_done(w)
-                        && self.state[w].load(Ordering::Acquire) == ST_RUNNING
+                    !scheduler.is_done(w) && self.state[w].load(Ordering::Acquire) == ST_RUNNING
                 }) {
                     continue;
                 }
@@ -471,8 +497,8 @@ impl RunnableSet {
         // / complete_arch idle-spin. A live owner is `ST_RUNNING`, not a
         // leftover Executing bit.
         if n == 0 && self.pending_work() == 0 {
-            let any_running = (0..self.block_size)
-                .any(|t| self.state[t].load(Ordering::Acquire) == ST_RUNNING);
+            let any_running =
+                (0..self.block_size).any(|t| self.state[t].load(Ordering::Acquire) == ST_RUNNING);
             for tx in 0..self.block_size {
                 let st = self.state[tx].load(Ordering::Acquire);
                 if st == ST_DONE || st == ST_RUNNING || scheduler.is_validated(tx) {
@@ -584,8 +610,7 @@ impl RunnableSet {
         (0..self.block_size).any(|tx| {
             self.state[tx].load(Ordering::Acquire) == ST_WAIT
                 && ready.blocking_producer(tx).is_some_and(|w| {
-                    scheduler.is_executing(w)
-                        && self.state[w].load(Ordering::Acquire) == ST_RUNNING
+                    scheduler.is_executing(w) && self.state[w].load(Ordering::Acquire) == ST_RUNNING
                 })
         })
     }
@@ -685,7 +710,10 @@ mod tests {
         assert!(sched.is_executing(1), "WaitForDependency leaves Executing");
         assert_eq!(r.pending_work(), 0);
         let n = r.heal(&ready, &sched);
-        assert!(n >= 1, "Executing leftover with no ST_RUNNING must recover, got {n}");
+        assert!(
+            n >= 1,
+            "Executing leftover with no ST_RUNNING must recover, got {n}"
+        );
         assert!(sched.is_ready(1));
         let mut saw = false;
         while let Some(SfPick::Execute { tx, .. }) = r.pick(0, &ready) {
@@ -729,6 +757,38 @@ mod tests {
         }
         assert!(n >= 2);
         assert!(r.steal_n() > 0 || r.q_indep_len() == 0);
+    }
+
+    #[test]
+    fn pick_skips_gated_head_and_takes_later_runnable() {
+        let ready = ReadyEdgeTable::new();
+        let r = RunnableSet::new(6, 1);
+        ready.note_consumer(1, 0);
+        // pop_back: last push is the head. Gated 1 must be skipped.
+        r.force_push(4, QueueKind::Released);
+        r.force_push(1, QueueKind::Released);
+        let SfPick::Execute { tx, .. } = r.pick(0, &ready).expect("later runnable") else {
+            panic!("expected execute");
+        };
+        assert_eq!(tx, 4, "must skip gated !may_execute head 1");
+    }
+
+    #[test]
+    fn heal_recovers_ghost_producer_while_waiters_queued() {
+        let ready = ReadyEdgeTable::new();
+        let sched = Scheduler::new(4);
+        let r = RunnableSet::new(4, 1);
+        ready.note_consumer(2, 1);
+        ready.note_consumer(3, 1);
+        let _v = sched.try_execute_producer(1).unwrap();
+        r.mark_wait(1);
+        r.force_push(2, QueueKind::Released);
+        r.force_push(3, QueueKind::Released);
+        assert!(r.pending_work() >= 2, "waiters stay queued");
+        assert!(sched.is_executing(1));
+        let n = r.heal(&ready, &sched);
+        assert!(n >= 1, "ghost producer with waiters must recover, got {n}");
+        assert!(sched.is_ready(1));
     }
 
     #[test]
