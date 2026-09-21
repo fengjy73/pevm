@@ -7,6 +7,7 @@
 //!
 //! Ungated / A0-majority txs use an OCC-class `may_execute` (bitset; no DashMap).
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -67,6 +68,9 @@ pub(crate) struct ReadyEdgeTable {
     ungated_occ_while_gated: AtomicUsize,
     /// Producer → known consumers (completion event → bag; no DashMap scan).
     waiters: DashMap<TxIdx, Vec<TxIdx>, BuildIdentityHasher>,
+    /// Waiter lists parked at Commit so FullReplay can re-block without
+    /// cloning a live DashMap Vec (19807137 N=3 `unaligned tcache`).
+    released_waiters: Mutex<HashMap<TxIdx, Vec<TxIdx>>>,
     /// Ordered-admit gated txs. Marked **before** the consumer map insert so
     /// an ungated steal cannot race past a newly created wait-for edge.
     gated_bits: [AtomicU64; GATED_WORDS],
@@ -108,6 +112,7 @@ impl Default for ReadyEdgeTable {
             skip_gate_n: AtomicUsize::new(0),
             ungated_occ_while_gated: AtomicUsize::new(0),
             waiters: DashMap::default(),
+            released_waiters: Mutex::new(HashMap::new()),
             gated_bits: std::array::from_fn(|_| AtomicU64::new(0)),
             gated_n: AtomicUsize::new(0),
             pending_gated: AtomicUsize::new(0),
@@ -484,11 +489,12 @@ impl ReadyEdgeTable {
             self.pending_gated.fetch_add(1, Ordering::Relaxed);
         }
         let cs = self
-            .waiters
-            .get(&writer)
-            .map(|v| v.clone())
+            .released_waiters
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&writer).cloned())
             .unwrap_or_default();
-        for c in cs {
+        for &c in &cs {
             if c <= writer {
                 continue;
             }
@@ -499,6 +505,9 @@ impl ReadyEdgeTable {
                     e.store(writer, Ordering::Relaxed);
                 }
             }
+        }
+        if !cs.is_empty() {
+            self.waiters.insert(writer, cs);
         }
     }
 
@@ -682,10 +691,13 @@ impl ReadyEdgeTable {
     pub(crate) fn note_producer_done(&self, writer: TxIdx, wave: &WaveParkTable) {
         let cs = self
             .waiters
-            .get(&writer)
-            .map(|v| v.clone())
+            .remove(&writer)
+            .map(|(_, v)| v)
             .unwrap_or_default();
         let had_waiters = !cs.is_empty();
+        if had_waiters && let Ok(mut g) = self.released_waiters.lock() {
+            g.insert(writer, cs.clone());
+        }
         self.mark_done(writer);
         if !self.has_any_gated() {
             return;
