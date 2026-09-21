@@ -103,13 +103,7 @@ pub(crate) fn run_sf_block<F, V>(
             Some(Task::Execution(tx_version)) => {
                 let tx_idx = tx_version.tx_idx;
                 specfence.ready_edges.note_started(tx_idx);
-                // leftover_min must skip Estimate tips (Opt mills on
-                // leftover FullReplay). WaitReleased is not OCC pick.
-                let vis = if specfence.ready_edges.is_live_leftover_min(tx_idx) {
-                    VisibilityPolicy::WaitReleased
-                } else {
-                    VisibilityPolicy::for_ready(specfence.ready_edges, tx_idx)
-                };
+                let vis = VisibilityPolicy::for_ready(specfence.ready_edges, tx_idx);
                 match execute(tx_version.clone(), vis) {
                     SfExec::Executed { wrote_new_location } => {
                         // finish_execution may have waved dependents — park them
@@ -142,22 +136,12 @@ pub(crate) fn run_sf_block<F, V>(
                             } else if specfence.ready_edges.is_live_leftover_min(tx_idx)
                                 || specfence.ready_edges.is_leftover_claimed(tx_idx)
                             {
-                                // leftover_min must commit. Detect-starring
-                                // surplus let 405 park on a later waiter.
-                                // Detach us←later; do not recover later
-                                // (both-sides recover milled n_unf=437).
+                                // leftover_min must not stay parked on a later
+                                // waiter. Flush Detect + detach only — recover
+                                // leftover_min here raced 6196166 reuse heap.
                                 specfence.ready_edges.flush_wait_on(w, tx_idx);
                                 let _ = scheduler.detach_dependent(w, tx_idx);
-                                if runnable.is_running(w) {
-                                    runnable.mark_wait(tx_idx);
-                                } else {
-                                    recover_leftover_min(
-                                        scheduler,
-                                        runnable,
-                                        specfence.ready_edges,
-                                        tx_idx,
-                                    );
-                                }
+                                runnable.mark_wait(tx_idx);
                             } else if specfence.ready_edges.detect_waits_on(w, tx_idx) {
                                 // Later leftover is Detect-gated on us; we
                                 // parked Aborting on them (6196166 reuse
@@ -189,14 +173,7 @@ pub(crate) fn run_sf_block<F, V>(
                 metrics.add_worker_busy_ns(t0.elapsed().as_nanos() as u64);
             }
             Some(Task::Validation(tx_version)) => {
-                let vis = if specfence
-                    .ready_edges
-                    .is_live_leftover_min(tx_version.tx_idx)
-                {
-                    VisibilityPolicy::WaitReleased
-                } else {
-                    VisibilityPolicy::for_ready(specfence.ready_edges, tx_version.tx_idx)
-                };
+                let vis = VisibilityPolicy::for_ready(specfence.ready_edges, tx_version.tx_idx);
                 let (plan, invalid) = validate_to_plan(&tx_version, vis);
                 resolve_plan::apply(
                     plan,
@@ -268,33 +245,6 @@ pub(crate) enum SfExec {
         on: Option<crate::TxIdx>,
     },
     Fatal,
-}
-
-fn recover_leftover_min(
-    scheduler: &Scheduler,
-    runnable: &RunnableSet,
-    ready: &super::ready_edge::ReadyEdgeTable,
-    tx: crate::TxIdx,
-) {
-    if scheduler.is_aborting(tx) {
-        let _ = scheduler.recover_aborting(tx);
-    } else if scheduler.is_executing(tx) {
-        let _ = scheduler.recover_executing_waiter(tx);
-    }
-    if ready.leftover_surplus(tx) || (ready.is_gated(tx) && !ready.may_execute(tx)) {
-        runnable.mark_wait(tx);
-        return;
-    }
-    if scheduler.is_ready(tx) {
-        let kind = if ready.is_gated(tx) {
-            super::runnable_set::QueueKind::Released
-        } else {
-            super::runnable_set::QueueKind::Indep
-        };
-        runnable.force_push(tx, kind);
-    } else {
-        runnable.mark_wait(tx);
-    }
 }
 
 fn drain_wave(specfence: SpecFenceCtx<'_>, scheduler: &Scheduler, runnable: &RunnableSet) {
