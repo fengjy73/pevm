@@ -25,7 +25,8 @@ use crate::{
     specfence::{
         AccessDecision, AccessMode, AccessVis, CheckpointKind, DecisionFeat, DecisionVerb, EdgeKey,
         EdgeKind, EdgeState, FfValue, OrderedAdmitSnapMode, ProcessReason, SpecFenceCtx,
-        StorageWriteReplay, absolute_jump_eligible, arm_call_outcome_cache, arm_ff_origin_seeds,
+        StorageWriteReplay, VisibilityPolicy, absolute_jump_eligible, arm_call_outcome_cache,
+        arm_ff_origin_seeds,
         attach_current_live_snap, early_val_probability, jump_is_safe, jump_refuse_reason,
         note_pending_effect_boundary, note_pending_ordered_admit_snap,
         ordered_admit_snap_jump_enabled, ordered_admit_snap_mode, resume_was_applied,
@@ -151,6 +152,8 @@ pub(crate) struct VmDb<'a, S: Storage> {
     optimistic_majority_lazy: bool,
     /// A1=0 ungated: skip access-gate / rem / ReadyEdge (P3 ≡ OCC).
     optimistic_skip_gate: bool,
+    /// SpecFence visibility for this incarnation (Opt / WaitReleased / OrderedTip).
+    vis: VisibilityPolicy,
     /// PCC overlay armed for the current access (PE ∩ ROI). OptimisticRead = OCC read.
     pcc_armed: Cell<bool>,
     /// OptimisticRead accesses this incarnation (end-tx process flush; no DashMap).
@@ -191,6 +194,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 .policy
                 .is_some_and(|p| p.skip_ungated_tx_path_tax())
             && !self.specfence.ready_edges.is_gated(tx_idx);
+        self.vis = if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            VisibilityPolicy::for_ready(self.specfence.ready_edges, tx_idx)
+        } else {
+            VisibilityPolicy::Opt
+        };
         self.has_nonce = has_nonce;
         self.read_set.clear();
         self.read_accounts.clear();
@@ -867,11 +875,26 @@ impl<'a, S: Storage> VmDb<'a, S> {
 
     /// Resolve-read overlay: PCC Fire **or** PrefixSkip/FF resume (PartialAbortRewind).
     /// First-incarnation OptimisticRead stays OCC (no FF / OrderedDirtyRead).
+    /// Edged SpecFence vis skips ESTIMATE tips via [`crate::specfence::sf_mv`].
     #[inline]
     fn resolve_read_overlay(&self) -> bool {
         self.pcc_armed.get()
             || self.specfence.partial_retry.is_rewind_resume(self.tx_idx)
             || self.specfence.partial_retry.has_ff_head(self.tx_idx)
+            || self.sf_skip_estimate()
+    }
+
+    /// WaitReleased / OrderedTip: never consume the OCC race Estimate tip.
+    #[inline]
+    fn sf_skip_estimate(&self) -> bool {
+        self.specfence.mode == crate::ConcurrencyMode::SpecFence && self.vis.needs_fence()
+    }
+
+    #[inline]
+    fn note_sf_mv_read(&self) {
+        if self.sf_skip_estimate() {
+            self.specfence.metrics.record_sf_mv_read(self.vis);
+        }
     }
 
     #[allow(dead_code)]
@@ -1646,10 +1669,16 @@ impl<S: Storage> Database for VmDb<'_, S> {
                             && nonce_addition == 0
                         {
                             self.specfence.metrics.record_optimistic_read();
+                            if self.specfence.mode == crate::ConcurrencyMode::SpecFence
+                                && self.vis.needs_fence()
+                            {
+                                self.specfence.metrics.record_sf_mv_read(self.vis);
+                            }
                             continue;
                         }
                         if resolve {
                             self.promote_on_conflict(address, location_hash);
+                            self.note_sf_mv_read();
                         } else {
                             self.note_unpublished_raw(location_hash, *blocking_idx);
                         }
@@ -2140,6 +2169,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             is_lazy: false,
             optimistic_majority_lazy: false,
             optimistic_skip_gate: false,
+            vis: VisibilityPolicy::Opt,
             pcc_armed: Cell::new(false),
             optimistic_read_this_tx: Cell::new(0),
             pcc_this_tx: Cell::new(0),

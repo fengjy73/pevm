@@ -750,6 +750,87 @@ impl Scheduler {
         (0..self.block_size).any(|i| !self.is_done(i) && !self.is_validated(i))
     }
 
+    /// Public unfinished probe for the SpecFence RunnableSet worker.
+    #[inline]
+    pub(crate) fn has_unfinished(&self) -> bool {
+        self.has_undone()
+    }
+
+    /// True when this incarnation is `Executed` (needs validate / revalidate).
+    #[inline]
+    pub(crate) fn is_executed(&self, tx_idx: TxIdx) -> bool {
+        if tx_idx >= self.block_size {
+            return false;
+        }
+        let tx = index_mutex!(self.transactions_status, tx_idx);
+        tx.status == IncarnationStatus::Executed
+    }
+
+    /// Current incarnation version (ledger, not a pick).
+    #[inline]
+    pub(crate) fn current_version(&self, tx_idx: TxIdx) -> Option<TxVersion> {
+        if tx_idx >= self.block_size {
+            return None;
+        }
+        let tx = index_mutex!(self.transactions_status, tx_idx);
+        Some(TxVersion {
+            tx_idx,
+            tx_incarnation: tx.incarnation,
+        })
+    }
+
+    /// Demote Validated → Executed so Resolve can re-check the read set.
+    pub(crate) fn prepare_revalidate(&self, tx_idx: TxIdx) -> Option<TxVersion> {
+        if tx_idx >= self.block_size {
+            return None;
+        }
+        let mut tx = index_mutex!(self.transactions_status, tx_idx);
+        if tx.status == IncarnationStatus::Validated {
+            tx.status = IncarnationStatus::Executed;
+            self.num_validated.fetch_sub(1, Ordering::Relaxed);
+            self.set_validated_flag(tx_idx, false);
+        }
+        if tx.status == IncarnationStatus::Executed {
+            Some(TxVersion {
+                tx_idx,
+                tx_incarnation: tx.incarnation,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// All txs have a Validated stamp (SF block-complete).
+    #[inline]
+    pub(crate) fn all_validated(&self) -> bool {
+        self.num_validated.load(Ordering::Relaxed) >= self.block_size
+            || (0..self.block_size).all(|i| self.is_validated(i))
+    }
+
+    /// SpecFence validation finish: never returns a Block-STM next task.
+    /// Abort leaves the tx Ready; the caller requeues on RunnableSet.
+    pub(crate) fn finish_validation_sf(
+        &self,
+        tx_version: &TxVersion,
+        aborted: bool,
+        rewind_to: Option<TxIdx>,
+    ) {
+        if aborted {
+            self.set_ready_status(tx_version.tx_idx);
+            if let Some(to) = rewind_to {
+                let to = to.clamp(tx_version.tx_idx + 1, self.block_size);
+                self.validation_idx.fetch_min(to, Ordering::Relaxed);
+            }
+            return;
+        }
+        let mut tx = index_mutex!(self.transactions_status, tx_version.tx_idx);
+        if tx.status == IncarnationStatus::Executed {
+            tx.status = IncarnationStatus::Validated;
+            self.num_validated.fetch_add(1, Ordering::Relaxed);
+            self.set_validated_flag(tx_version.tx_idx, true);
+        }
+    }
+
     /// True when the incarnation is queued `ReadyToExecute` (S1 prefer-admit).
     #[inline]
     pub(crate) fn is_ready(&self, tx_idx: TxIdx) -> bool {

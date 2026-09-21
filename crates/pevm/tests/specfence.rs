@@ -189,6 +189,43 @@ fn specfence_sf_ps_pick_never_calls_next_occ_task() {
         sf.visibility_opt + sf.visibility_wait_released + sf.visibility_ordered_tip > 0,
         "VisibilityPolicy must be recorded: {sf:?}"
     );
+    assert!(
+        sf.resolve_apply_n > 0,
+        "ResolvePlan.apply must run: {sf:?}"
+    );
+}
+
+/// True-spine call-graph: SF sources never mention Block-STM next_task*.
+#[test]
+fn specfence_true_spine_sources_never_call_next_task() {
+    let files = [
+        include_str!("../src/specfence/schedule.rs"),
+        include_str!("../src/specfence/runnable_set.rs"),
+        include_str!("../src/specfence/worker.rs"),
+        include_str!("../src/specfence/resolve_plan.rs"),
+        include_str!("../src/specfence/sf_mv.rs"),
+        include_str!("../src/specfence/arm_table.rs"),
+    ];
+    for src in files {
+        let code = src.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            !code.contains("next_task_with_wave_ready"),
+            "true spine must not call next_task_with_wave_ready"
+        );
+        assert!(
+            !code.contains("validate_occ_stage"),
+            "true spine must not call validate_occ_stage"
+        );
+    }
+    let pevm = include_str!("../src/pevm.rs");
+    assert!(
+        pevm.contains("run_sf_block"),
+        "pevm SpecFence worker must be the RunnableSet ring"
+    );
+    assert!(
+        !pevm.contains("next_sf_task"),
+        "pevm must not call the PR44 next_sf_task wrapper"
+    );
 }
 
 /// Same sender, increasing nonces: sender location WW promotes Wait (observed).

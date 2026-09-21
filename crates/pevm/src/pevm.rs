@@ -29,12 +29,13 @@ use crate::{
     mv_memory::MvMemory,
     scheduler::Scheduler,
     specfence::{
-        AccountHints, AdaptiveEngagement, AdaptiveParams, BayesMap, ConcurrencyMode, CostPolicy,
-        DEFAULT_TAU, EdgeTable, ExecProcessSnapshot, FineGrainCollector, FineGrainSnapshot,
-        HeatMap, HotSet, HotSketch, InterBlockPrior, LeanAbortRepair, LearnReport, LiveLearner,
-        MetricsInner, PartialRetryTable, ProcessTrace, RemCounters, ResearchAbortRepair,
-        RwPriorMap, SpecDag, SpecFenceCtx, SpecFenceMetrics, WaveParkTable, seed_wait_regions,
-        update_bayes, update_heat, update_rw_prior,
+        AccountHints, AdaptiveEngagement, AdaptiveParams, ArmTable, BayesMap, ConcurrencyMode,
+        CostPolicy, DEFAULT_TAU, EdgeTable, ExecProcessSnapshot, FineGrainCollector,
+        FineGrainSnapshot, HeatMap, HotSet, HotSketch, InterBlockPrior, LeanAbortRepair,
+        LearnReport, LiveLearner, MetricsInner, PartialRetryTable, ProcessTrace, RemCounters,
+        ResearchAbortRepair, RunnableSet, RwPriorMap, SfExec, SpecDag, SpecFenceCtx,
+        SpecFenceMetrics, VisibilityPolicy, WaveParkTable, seed_wait_regions, update_bayes,
+        update_heat, update_rw_prior,
     },
     storage::StorageWrapper,
     vm::{
@@ -480,6 +481,8 @@ impl Pevm {
         let certificates = crate::specfence::CertificateTable::new(block_size);
         let ready_edges = crate::specfence::ReadyEdgeTable::new();
         let producer_stages = crate::specfence::ProducerStageTable::new();
+        let runnable = RunnableSet::new(block_size, concurrency_level.get());
+        let arms = ArmTable::new();
         let lanes = crate::specfence::LaneTable::new();
         let edges = EdgeTable::new();
         let sketch = HotSketch::new();
@@ -492,6 +495,7 @@ impl Pevm {
             // PE even on quiet morph (M4). Truly cold seeds nothing.
             self.cost_policy
                 .begin_block_with_cores(block_size, concurrency_level.get());
+            arms.begin_from_prior(&self.inter_prior, self.cost_policy.is_reuse_block());
             // Thin CallWaw chain needs hints only (P2: skip contract walk).
             // PROFILE Instant only (product path must not pay begin Instant).
             {
@@ -520,6 +524,7 @@ impl Pevm {
             // P3/P4: bag serves gated wake only. A0 never seeds the bag.
             // Do not sample block_size as ready_width when A1=0 (that read as 176).
             self.last_begin_blocked = ready_edges.blocked_consumers();
+            runnable.seed_begin(&ready_edges, &producer_stages, &scheduler);
             // P3: do not sample (n_tx − blocked) as ready_width (reads as 172).
             if quiet && !learner.has_any_predicted() {
                 let n = sketch.revoke_prior_fences_if_quiet(true);
@@ -573,160 +578,107 @@ impl Pevm {
         };
 
         // TODO: Better thread handling
+        let sf_worker_seq = std::sync::atomic::AtomicUsize::new(0);
         thread::scope(|scope| {
-            for _ in 0..concurrency_level.into() {
-                scope.spawn(|| {
-                    let mut vm = Vm::new(
-                        chain, spec_id, &block_env, &txs, storage, &mv_memory, specfence,
-                    );
-                    let profile = crate::specfence::profile_timing_enabled();
-                    // SF-PS: SpecFence pick is Schedule.pick(RunnableSet).
-                    // Occupied OCC / PCC keep `next_occ_task` as the contrast
-                    // computer. SpecFence never falls back to it.
-                    let occ_mode = self.concurrency_mode == ConcurrencyMode::Occ;
-                    let mut sched_t0 = profile.then(Instant::now);
-                    let mut task = if occ_mode {
-                        crate::specfence::next_occ_task(&scheduler)
-                    } else if self.concurrency_mode == ConcurrencyMode::SpecFence {
-                        crate::specfence::next_sf_task(
+            if self.concurrency_mode == ConcurrencyMode::SpecFence {
+                // True SF-PS ring: RunnableSet.pick → Execute(vis) → Resolve.apply.
+                // Zero calls to Scheduler::next_task* / validate_occ_stage.
+                for _ in 0..concurrency_level.into() {
+                    scope.spawn(|| {
+                        let mut vm = Vm::new(
+                            chain, spec_id, &block_env, &txs, storage, &mv_memory, specfence,
+                        );
+                        let worker_i =
+                            sf_worker_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        crate::specfence::run_sf_block(
                             &scheduler,
-                            specfence.wave,
-                            specfence.ready_edges,
-                            specfence.producer_stages,
-                            specfence.policy,
-                            Some(&metrics_inner),
-                        )
-                    } else {
-                        crate::specfence::next_occ_task(&scheduler)
-                    };
-                    if let Some(t0) = sched_t0 {
-                        metrics_inner.add_profile_scheduler_ns(t0.elapsed().as_nanos() as u64);
-                    }
-                    while task.is_some() {
-                        task = match task.unwrap() {
-                            Task::Execution(tx_version) => {
-                                let sf = self.concurrency_mode == ConcurrencyMode::SpecFence;
-                                // Detect-gated / pending hops: stamp started so a
-                                // later flush cannot refuse an in-flight tx.
-                                if sf
-                                    && (specfence.ready_edges.is_gated(tx_version.tx_idx)
-                                        || specfence.ready_edges.has_pending_gated()
-                                        || specfence.policy.is_some_and(|p| p.has_pending_idle()))
-                                {
-                                    specfence.ready_edges.note_started(tx_version.tx_idx);
-                                }
-                                // SpecFence: VisibilityPolicy chooses the execute
-                                // wrap. Opt = Avoid=noop independent set (no fence
-                                // wrap) — not a switch to ConcurrencyMode::Occ.
-                                let vis = if sf {
-                                    crate::specfence::VisibilityPolicy::for_ready(
-                                        specfence.ready_edges,
-                                        tx_version.tx_idx,
-                                    )
-                                } else {
-                                    crate::specfence::VisibilityPolicy::Opt
-                                };
-                                let occ_exec = occ_mode || (sf && vis.is_opt());
-                                if occ_exec {
-                                    let done_idx = tx_version.tx_idx;
-                                    let next = self
-                                        .try_execute(&mut vm, &scheduler, tx_version, None, None);
-                                    if sf && scheduler.is_done(done_idx) {
-                                        // S5: Done-on-success always stamps.
-                                        // O5 skip-when-!has_any_gated livelocked
-                                        // iter11 (~400% spin) when a later flush
-                                        // planted consumer→pred with done=false.
-                                        specfence.ready_edges.note_producer_done_stamp(done_idx);
-                                        if specfence.ready_edges.has_known_waiters(done_idx)
-                                            && let Some(w) = wave_ref
-                                        {
-                                            specfence.ready_edges.note_producer_done(done_idx, w);
-                                        }
-                                    }
-                                    next
-                                } else {
-                                    let done_idx = tx_version.tx_idx;
+                            &mv_memory,
+                            specfence,
+                            &runnable,
+                            &arms,
+                            worker_i,
+                            || self.abort_reason.get().is_some(),
+                            |tx_version, vis| {
+                                self.try_execute_sf(
+                                    &mut vm,
+                                    &scheduler,
+                                    tx_version,
+                                    vis,
+                                    wave_ref,
+                                    &dag,
+                                )
+                            },
+                            |tx_version, vis| {
+                                crate::specfence::validate_to_plan(
+                                    &mv_memory,
+                                    &scheduler,
+                                    tx_version,
+                                    specfence,
+                                    vis,
+                                )
+                            },
+                        );
+                    });
+                }
+            } else {
+                for _ in 0..concurrency_level.into() {
+                    scope.spawn(|| {
+                        let mut vm = Vm::new(
+                            chain, spec_id, &block_env, &txs, storage, &mv_memory, specfence,
+                        );
+                        let profile = crate::specfence::profile_timing_enabled();
+                        let occ_mode = self.concurrency_mode == ConcurrencyMode::Occ;
+                        let mut sched_t0 = profile.then(Instant::now);
+                        let mut task = crate::specfence::next_occ_task(&scheduler);
+                        if let Some(t0) = sched_t0 {
+                            metrics_inner.add_profile_scheduler_ns(t0.elapsed().as_nanos() as u64);
+                        }
+                        while task.is_some() {
+                            task = match task.unwrap() {
+                                Task::Execution(tx_version) => {
                                     let fence_ref = crate::specfence::fence_for_mode(
                                         self.concurrency_mode,
                                         &dag,
                                     );
-                                    let next = self.try_execute(
+                                    self.try_execute(
                                         &mut vm, &scheduler, tx_version, wave_ref, fence_ref,
-                                    );
-                                    if scheduler.is_done(done_idx) {
-                                        specfence.ready_edges.note_producer_done_stamp(done_idx);
-                                        if specfence.ready_edges.has_known_waiters(done_idx)
-                                            && let Some(w) = wave_ref
-                                        {
-                                            specfence.ready_edges.note_producer_done(done_idx, w);
-                                        }
+                                    )
+                                }
+                                Task::Validation(tx_version) => {
+                                    let v0 = profile.then(Instant::now);
+                                    let next = if occ_mode {
+                                        crate::specfence::validate_occ_stage(
+                                            &mv_memory,
+                                            &scheduler,
+                                            &tx_version,
+                                            Some(&metrics_inner),
+                                        )
+                                    } else {
+                                        try_validate(&mv_memory, &scheduler, &tx_version, specfence)
+                                    };
+                                    if let Some(t0) = v0 {
+                                        metrics_inner.add_profile_validate_ns(
+                                            t0.elapsed().as_nanos() as u64,
+                                        );
                                     }
                                     next
                                 }
-                            }
-                            Task::Validation(tx_version) => {
-                                let v0 = profile.then(Instant::now);
-                                // SF-PS: SpecFence always Validate.to_resolve
-                                // (Opt Avoid=noop or edged ResolvePlan).
-                                // OCC contrast stays on validate_occ_stage.
-                                let next = if occ_mode {
-                                    crate::specfence::validate_occ_stage(
-                                        &mv_memory,
-                                        &scheduler,
-                                        &tx_version,
-                                        Some(&metrics_inner),
-                                    )
-                                } else if specfence.mode == ConcurrencyMode::SpecFence {
-                                    crate::specfence::validate_specfence(
-                                        &mv_memory,
-                                        &scheduler,
-                                        &tx_version,
-                                        specfence,
-                                    )
-                                } else {
-                                    try_validate(&mv_memory, &scheduler, &tx_version, specfence)
-                                };
-                                if let Some(t0) = v0 {
-                                    metrics_inner
-                                        .add_profile_validate_ns(t0.elapsed().as_nanos() as u64);
-                                }
-                                next
-                            }
-                        };
-
-                        // TODO: Have different functions or an enum for the caller to choose
-                        // the handling behaviour when a transaction's EVM execution fails.
-                        // Parallel block builders would like to exclude such transaction,
-                        // verifiers may want to exit early to save CPU cycles, while testers
-                        // may want to collect all execution results. We are exiting early as
-                        // the default behaviour for now.
-                        if self.abort_reason.get().is_some() {
-                            break;
-                        }
-
-                        if task.is_none() {
-                            sched_t0 = profile.then(Instant::now);
-                            task = if occ_mode {
-                                crate::specfence::next_occ_task(&scheduler)
-                            } else if self.concurrency_mode == ConcurrencyMode::SpecFence {
-                                crate::specfence::next_sf_task(
-                                    &scheduler,
-                                    specfence.wave,
-                                    specfence.ready_edges,
-                                    specfence.producer_stages,
-                                    specfence.policy,
-                                    Some(&metrics_inner),
-                                )
-                            } else {
-                                crate::specfence::next_occ_task(&scheduler)
                             };
-                            if let Some(t0) = sched_t0 {
-                                metrics_inner
-                                    .add_profile_scheduler_ns(t0.elapsed().as_nanos() as u64);
+                            if self.abort_reason.get().is_some() {
+                                break;
+                            }
+                            if task.is_none() {
+                                sched_t0 = profile.then(Instant::now);
+                                task = crate::specfence::next_occ_task(&scheduler);
+                                if let Some(t0) = sched_t0 {
+                                    metrics_inner.add_profile_scheduler_ns(
+                                        t0.elapsed().as_nanos() as u64,
+                                    );
+                                }
                             }
                         }
-                    }
-                });
+                    });
+                }
             }
         });
 
@@ -970,6 +922,15 @@ impl Pevm {
             } else {
                 self.cost_policy.end_block_learn();
             }
+            arms.end_pack(&self.inter_prior, block_size);
+            metrics_inner.set_true_spine_metrics(
+                runnable.steal_n(),
+                runnable.refuse_fill_n(),
+                arms.mid_promote_n(),
+                arms.explore_n(),
+                arms.began_from_prior(),
+            );
+            metrics_inner.add_idle_core_ns(ready_edges.idle_core_ns());
             let mut report = self.cost_policy.take_report(ready_w, idle);
             report.end_block_ns = end_t0.elapsed().as_nanos() as u64;
             report.ungated_occ_n = ready_edges.pick_occ_n();
@@ -1303,6 +1264,85 @@ impl Pevm {
                     self.abort_reason
                         .get_or_init(|| AbortReason::ExecutionError(err));
                     None
+                }
+            };
+        }
+    }
+
+    /// SpecFence execute: same EVM as OCC, but never steals via `next_task*`.
+    fn try_execute_sf<'a, S: Storage, C: PevmChain>(
+        &self,
+        vm: &mut Vm<'a, S, C>,
+        scheduler: &Scheduler,
+        tx_version: TxVersion,
+        vis: VisibilityPolicy,
+        wave: Option<&WaveParkTable>,
+        dag: &crate::specfence::SpecDag,
+    ) -> SfExec {
+        let _ = vis;
+        loop {
+            if let Some((blocking_tx_idx, address)) = vm.hinted_wait_blocker(tx_version.tx_idx) {
+                if !scheduler.add_dependency(tx_version.tx_idx, blocking_tx_idx)
+                    && self.abort_reason.get().is_none()
+                {
+                    continue;
+                }
+                vm.record_wait_admission(address);
+                return SfExec::Blocked;
+            }
+            if let Some(wave) = wave {
+                vm.try_apply_park_resume(tx_version.tx_idx, wave);
+            }
+            let exec_t0 = (tx_version.tx_incarnation > 0).then(Instant::now);
+            return match vm.execute(&tx_version, self.execution_results.slot_mut(tx_version.tx_idx))
+            {
+                Ok(flags) => {
+                    if let Some(t0) = exec_t0 {
+                        vm.note_hot_reexec_ns(tx_version.tx_idx, t0.elapsed().as_nanos() as u64);
+                    }
+                    let wrote_new_location =
+                        flags.contains(crate::FinishExecFlags::WroteNewLocation);
+                    let fence = crate::specfence::fence_for_mode(ConcurrencyMode::SpecFence, dag);
+                    let _ = scheduler.finish_execution_with_wave_fence(
+                        tx_version, flags, wave, fence,
+                    );
+                    SfExec::Executed {
+                        wrote_new_location,
+                    }
+                }
+                Err(VmExecutionError::Retry) => {
+                    if self.abort_reason.get().is_none() {
+                        continue;
+                    }
+                    SfExec::Fatal
+                }
+                Err(VmExecutionError::FallbackToSequential) => {
+                    scheduler.abort();
+                    self.abort_reason
+                        .get_or_init(|| AbortReason::FallbackToSequential);
+                    SfExec::Fatal
+                }
+                Err(VmExecutionError::Blocking(blocking_tx_idx)) => {
+                    let pending = vm.take_pending_park();
+                    let park_kind = pending
+                        .map(|p| p.kind)
+                        .unwrap_or(crate::specfence::ParkKind::BlockingOther);
+                    let parked = if park_kind == crate::specfence::ParkKind::WaitForDependency {
+                        scheduler.add_wait_for_dependency(tx_version.tx_idx, blocking_tx_idx)
+                    } else {
+                        scheduler.add_dependency(tx_version.tx_idx, blocking_tx_idx)
+                    };
+                    if !parked && self.abort_reason.get().is_none() {
+                        continue;
+                    }
+                    // Soft=0: do not park the worker; pick another runnable.
+                    SfExec::Blocked
+                }
+                Err(VmExecutionError::ExecutionError(err)) => {
+                    scheduler.abort();
+                    self.abort_reason
+                        .get_or_init(|| AbortReason::ExecutionError(err));
+                    SfExec::Fatal
                 }
             };
         }

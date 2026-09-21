@@ -1036,8 +1036,13 @@ impl CostPolicy {
             .store(c_opt.to_bits(), Ordering::Relaxed);
         self.c_ord_snap_bits
             .store(c_ord.to_bits(), Ordering::Relaxed);
-        self.explore_budget_left
-            .store(self.explore_budget(), Ordering::Relaxed);
+        // Reuse (2+ block): sticky hot path explore_n = 0. Cold ℓ stay greedy.
+        if self.block_seq.load(Ordering::Relaxed) > 1 {
+            self.explore_budget_left.store(0, Ordering::Relaxed);
+        } else {
+            self.explore_budget_left
+                .store(self.explore_budget(), Ordering::Relaxed);
+        }
         for mut e in self.promoted.iter_mut() {
             e.prev_decision = e.decision;
             e.block_reexec_ns = 0;
@@ -2647,7 +2652,12 @@ impl CostPolicy {
         }
     }
 
+    /// True on the 2nd+ Pevm block (inter-block reuse).
     #[inline]
+    pub(crate) fn is_reuse_block(&self) -> bool {
+        self.block_seq.load(Ordering::Relaxed) > 1
+    }
+
     pub(crate) fn block_n(&self) -> usize {
         self.block_n.load(Ordering::Relaxed)
     }

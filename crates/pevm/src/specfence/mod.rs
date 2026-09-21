@@ -12,10 +12,11 @@
 //! `ConcurrencyMode::Occ` is pristine Block-STM (**zero** SpecFence ticks) —
 //! contrast engine only.
 //! `ConcurrencyMode::SpecFence` is a **different protocol**: ready = Detect
-//! antichain ∪ released dependents; read = VisibilityPolicy; validate
-//! produces ResolvePlan. Independent txs may use Opt visibility
-//! (Avoid=noop). That is **not** a retreat to the OCC computer and
-//! **must not** call `next_occ_task` as the main pick.
+//! antichain ∪ released dependents on real `Q_indep`/`Q_released`/`Q_ordered`;
+//! read = `SfMvMemory.read(ℓ, vis)`; validate produces ResolvePlan and
+//! `ResolvePlan.apply` mutates certificates/queues. Independent txs may use
+//! Opt visibility (Avoid=noop). SpecFence **must not** call
+//! `Scheduler::next_task` / `next_task_with_wave_ready` / `validate_occ_stage`.
 //!
 //! Soft=0. seq≡par. Lazy-update / near-independent are never OrderedAdmit
 //! objects. Thin (n≤176) must not learn Win_8. Under-covered spines must
@@ -169,6 +170,7 @@ use alloy_primitives::Address;
 use hashbrown::HashMap;
 
 mod access_log;
+mod arm_table;
 mod access_policy;
 mod access_vis;
 pub(crate) mod admit;
@@ -205,9 +207,11 @@ mod resolve;
 mod resolve_plan;
 mod runnable_set;
 mod schedule;
+mod sf_mv;
 mod sketch;
 mod visibility;
 mod wave;
+mod worker;
 
 pub(crate) use access_log::AccessOrdinalLog;
 pub(crate) use access_policy::{
@@ -240,7 +244,8 @@ pub(crate) use collateral::{
     ConflictClass, FirstConflict, classify_first_conflict, commute_ok, envelopes_disjoint,
     is_value_transfer, location_is_lazy, optimistic_majority_hinted_lazy,
 };
-pub(crate) use computer::next_sf_task;
+pub(crate) use arm_table::ArmTable;
+pub(crate) use worker::{SfExec, run_sf_block};
 pub(crate) use dag::{FenceGraph, SpecDag};
 pub(crate) use decision_field::{DecisionFeat, DecisionVerb};
 pub use decision_field::{DecisionFieldSnap, QualityProxies, VerbHist};
@@ -254,7 +259,7 @@ pub(crate) use executor::{
     reset_occ_pick_calls, specfence_access_is_occ, specfence_cost_class_spec,
     specfence_partial_abort_validate, specfence_plant_is_occ, uses_specfence_resolve,
     validate_occ_kernel, validate_occ_stage, validate_optimistic_fast, validate_specfence,
-    wave_for_mode,
+    validate_to_plan, wave_for_mode,
 };
 pub use finegrain::{
     AbortEvent, AccountGrainObserve, ConsumerFirstCross, DagStats, EffectClass, EffectLogEntry,
@@ -270,6 +275,7 @@ pub(crate) use hotset::HotSet;
 pub(crate) use hotset::{H_A, H_W};
 pub use resolve_plan::ResolvePlan;
 pub(crate) use runnable_set::RunnableSet;
+pub(crate) use sf_mv::SfMvMemory;
 pub use visibility::VisibilityPolicy;
 // kernel.rs museum — tests only; rem-legal SoT is CertificateTable.
 pub(crate) use lane::LaneTable;

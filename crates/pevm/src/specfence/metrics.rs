@@ -361,6 +361,24 @@ pub struct SpecFenceMetrics {
     /// OCC `next_occ_task` picks observed this process (must be 0 on SF blocks
     /// after [`crate::specfence::executor::reset_occ_pick_calls`]).
     pub occ_schedule_picks: usize,
+    /// SF-PS: work-steal count across the three queues.
+    pub steal_n: usize,
+    /// SF-PS: Detect refuse that immediately filled from Q_indep (PC-2).
+    pub refuse_fill_n: usize,
+    /// SF-PS: mid-block IntraPatch promotes (≤1 per ℓ per block).
+    pub mid_promote_n: usize,
+    /// SF-PS: idle_core_ns / (idle_core_ns + worker_busy_ns).
+    pub idle_core_frac: f64,
+    /// SF-PS: ResolvePlan.apply invocations (must change queues/certs).
+    pub resolve_apply_n: usize,
+    /// SF-PS: SfMvMemory WaitReleased reads.
+    pub sf_mv_wait_released_reads: usize,
+    /// SF-PS: SfMvMemory OrderedTip reads.
+    pub sf_mv_ordered_tip_reads: usize,
+    /// SF-PS: explore pulls this block (reuse sticky must be 0).
+    pub explore_n: usize,
+    /// SF-PS: begin restored ArmTable from inter-block prior.
+    pub began_from_prior: bool,
 }
 
 /// Shared counters written by worker threads.
@@ -529,6 +547,14 @@ pub(crate) struct MetricsInner {
     resolve_ordered_replay: AtomicUsize,
     resolve_full_replay: AtomicUsize,
     sf_schedule_picks: AtomicUsize,
+    steal_n: AtomicUsize,
+    refuse_fill_n: AtomicUsize,
+    mid_promote_n: AtomicUsize,
+    resolve_apply_n: AtomicUsize,
+    sf_mv_wait_released_reads: AtomicUsize,
+    sf_mv_ordered_tip_reads: AtomicUsize,
+    explore_n: AtomicUsize,
+    began_from_prior: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -1040,6 +1066,58 @@ impl MetricsInner {
     }
 
     #[inline]
+    pub(crate) fn record_refuse_fill(&self, n: usize) {
+        if n > 0 {
+            self.refuse_fill_n.fetch_add(n, Ordering::Relaxed);
+            self.refuse_admit.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn record_resolve_apply(&self) {
+        self.resolve_apply_n.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn add_idle_core_ns(&self, ns: u64) {
+        if ns > 0 {
+            self.idle_core_ns.fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn record_sf_mv_read(&self, vis: super::VisibilityPolicy) {
+        match vis {
+            super::VisibilityPolicy::WaitReleased => {
+                self.sf_mv_wait_released_reads
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            super::VisibilityPolicy::OrderedTip => {
+                self.sf_mv_ordered_tip_reads.fetch_add(1, Ordering::Relaxed);
+            }
+            super::VisibilityPolicy::Opt => {}
+        }
+    }
+
+    #[inline]
+    pub(crate) fn set_true_spine_metrics(
+        &self,
+        steal_n: usize,
+        refuse_fill_n: usize,
+        mid_promote_n: usize,
+        explore_n: usize,
+        began_from_prior: bool,
+    ) {
+        self.steal_n.store(steal_n, Ordering::Relaxed);
+        self.refuse_fill_n
+            .fetch_add(refuse_fill_n, Ordering::Relaxed);
+        self.mid_promote_n.store(mid_promote_n, Ordering::Relaxed);
+        self.explore_n.store(explore_n, Ordering::Relaxed);
+        self.began_from_prior
+            .store(usize::from(began_from_prior), Ordering::Relaxed);
+    }
+
+    #[inline]
     pub(crate) fn sample_runnable_width(&self, width: usize) {
         self.runnable_width_sum
             .fetch_add(width as u64, Ordering::Relaxed);
@@ -1514,6 +1592,24 @@ impl MetricsInner {
             resolve_full_replay: self.resolve_full_replay.load(Ordering::Relaxed),
             sf_schedule_picks: self.sf_schedule_picks.load(Ordering::Relaxed),
             occ_schedule_picks: crate::specfence::executor::occ_pick_calls(),
+            steal_n: self.steal_n.load(Ordering::Relaxed),
+            refuse_fill_n: self.refuse_fill_n.load(Ordering::Relaxed),
+            mid_promote_n: self.mid_promote_n.load(Ordering::Relaxed),
+            idle_core_frac: {
+                let idle = self.idle_core_ns.load(Ordering::Relaxed);
+                let busy = self.worker_busy_ns.load(Ordering::Relaxed);
+                let den = idle.saturating_add(busy);
+                if den == 0 {
+                    0.0
+                } else {
+                    idle as f64 / den as f64
+                }
+            },
+            resolve_apply_n: self.resolve_apply_n.load(Ordering::Relaxed),
+            sf_mv_wait_released_reads: self.sf_mv_wait_released_reads.load(Ordering::Relaxed),
+            sf_mv_ordered_tip_reads: self.sf_mv_ordered_tip_reads.load(Ordering::Relaxed),
+            explore_n: self.explore_n.load(Ordering::Relaxed),
+            began_from_prior: self.began_from_prior.load(Ordering::Relaxed) != 0,
         }
     }
 }

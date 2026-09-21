@@ -1,37 +1,32 @@
-//! Schedule.pick — SpecFence Parallel Spine pick (SF-PS §A).
+//! Schedule.pick — SpecFence Parallel Spine pick (SF-PS T1 / PC).
 //!
-//! Main loop: Detect → RunnableSet → pick → Execute(vis) → Validate.to_resolve
-//! → Resolve.apply → Learn.
-//!
-//! **Forbidden as SpecFence main pick:** the OCC contrast `next_task` entry.
-//! Empty wait-set is Avoid=noop antichain pick on this spine, not a retreat
-//! to the Block-STM OCC computer.
-//!
-//! `refuse_admit` = wave-fill the next independent / released member of R.
+//! **Forbidden:** `Scheduler::next_task`, `next_task_with_wave_ready`,
+//! any Block-STM index cursor as the pick host.
 
+use super::arm_table::ArmTable;
 use super::metrics::MetricsInner;
-use super::policy::{CostPolicy, LARGE_BLOCK_N, THIN_N_MAX};
+use super::policy::CostPolicy;
 use super::producer_stage::ProducerStageTable;
 use super::ready_edge::ReadyEdgeTable;
-use super::runnable_set::RunnableSet;
+use super::runnable_set::{RunnableSet, SfPick};
 use super::wave::WaveParkTable;
 use crate::Task;
 use crate::scheduler::Scheduler;
 
-/// SpecFence schedule entry. Never calls the OCC contrast pick.
+/// SpecFence schedule entry. Queues + steal only.
 #[inline]
 pub(crate) fn pick(
     scheduler: &Scheduler,
     wave: &WaveParkTable,
     ready: &ReadyEdgeTable,
     stages: &ProducerStageTable,
+    runnable: &RunnableSet,
+    arms: &ArmTable,
     policy: Option<&CostPolicy>,
     metrics: Option<&MetricsInner>,
+    worker_i: usize,
 ) -> Option<Task> {
-    // O1: plant queued leftover continuation hops at this pick quantum
-    // (not mid-execute). One hop, never full-spine.
-    // Near-independent / lazy-update large — drop leftover hops; do not
-    // plant a useless cover wait-set (lazy is never an OrderedAdmit object).
+    let _ = (wave, stages);
     if let Some(p) = policy
         && p.has_pending_idle()
     {
@@ -42,95 +37,100 @@ pub(crate) fn pick(
         }
     }
 
-    let runnable = RunnableSet::from_detect(ready, stages);
+    // IntraPatch at the pick quantum — never inside the interpreter frame.
+    let _ = arms.apply_pending_patches(
+        runnable,
+        ready,
+        policy,
+        runnable.cores(),
+        scheduler.block_size(),
+    );
+
     if let Some(m) = metrics {
         m.record_sf_schedule_pick();
+        runnable.sample_width();
         m.sample_runnable_width(runnable.width_hint());
     }
 
-    let refuse_before = ready.refuse_count();
-    // Leftover reservations are not OrderedAdmit objects:
-    //   - large lazy (never an OrderedAdmit wait-set)
-    //   - mid-band reuse leftover flush (19469101 plant→refuse hang)
-    //   - empty pending wait-set (stale gated bits must not refuse)
-    // Skip ReadyEdge refuse. Still Schedule.pick on the wave host —
-    // Avoid=noop antichain, never the OCC contrast pick.
-    let ignore_leftover =
-        policy.is_some_and(|p| p.ignore_leftover_reservations() || p.skip_reuse_leftover_flush());
-    let empty_wait = !runnable.has_producer_work() && !ready.has_pending_gated();
-    // Mid-band leftover Detect bits (19469101) can stay pending_gated>0
-    // and refuse the collaborative index forever. Those leftover hops are
-    // not OrderedAdmit objects — pick the antichain (Avoid=noop).
-    let mid_leftover = policy.is_some_and(|p| {
-        let n = p.block_n();
-        n > THIN_N_MAX && n < LARGE_BLOCK_N
-    });
-    if ignore_leftover || empty_wait || mid_leftover {
-        let task = scheduler.next_task_with_wave_ready(Some(wave), None);
-        if let (Some(m), Some(Task::Execution(v))) = (metrics, &task) {
-            m.record_visibility(runnable.visibility(v.tx_idx));
-        }
-        return task;
-    }
-    if runnable.has_producer_work() {
-        for _ in 0..8 {
-            let Some(w) = runnable.next_producer() else {
-                break;
-            };
-            if scheduler.is_done(w) {
-                stages.note_done(w);
-                continue;
-            }
-            scheduler.admit_spine(w, wave);
-            stages.note_promote();
-            if let Some(tx_version) = scheduler.try_execute_producer(w) {
-                record_refuse(metrics, ready, refuse_before);
-                if let Some(m) = metrics {
-                    m.record_visibility(runnable.visibility(tx_version.tx_idx));
+    let refuse_before = runnable.refuse_fill_n();
+    for _ in 0..16 {
+        match runnable.pick(worker_i, ready) {
+            Some(SfPick::Execute {
+                tx,
+                vis,
+                refused,
+                ..
+            }) => {
+                if scheduler.is_validated(tx) {
+                    runnable.mark_done(tx);
+                    continue;
                 }
-                return Some(Task::Execution(tx_version));
+                if scheduler.is_executed(tx) {
+                    if let Some(v) = scheduler.prepare_revalidate(tx) {
+                        if let Some(m) = metrics {
+                            m.record_visibility(vis);
+                        }
+                        return Some(Task::Validation(v));
+                    }
+                    continue;
+                }
+                if let Some(tx_version) = scheduler.try_execute_producer(tx) {
+                    if let Some(m) = metrics {
+                        m.record_visibility(vis);
+                        if refused {
+                            m.record_refuse_fill(1);
+                        }
+                    }
+                    return Some(Task::Execution(tx_version));
+                }
+                if scheduler.is_ready(tx) {
+                    // Race: still Ready but claim failed — requeue independent.
+                    runnable.push(tx, super::runnable_set::QueueKind::Indep);
+                    continue;
+                }
+                if scheduler.is_executed(tx) {
+                    if let Some(v) = scheduler.prepare_revalidate(tx) {
+                        return Some(Task::Validation(v));
+                    }
+                }
             }
-            if !scheduler.producer_stage_runnable(w) {
-                stages.note_done(w);
-                continue;
+            Some(SfPick::Revalidate(tx)) => {
+                if let Some(v) = scheduler.prepare_revalidate(tx) {
+                    if let Some(m) = metrics {
+                        m.record_visibility(runnable.visibility(ready, tx));
+                    }
+                    return Some(Task::Validation(v));
+                }
+                if scheduler.is_ready(tx) {
+                    if let Some(tx_version) = scheduler.try_execute_producer(tx) {
+                        return Some(Task::Execution(tx_version));
+                    }
+                }
             }
-            break;
+            None => break,
         }
     }
 
-    // Host index walk + wave bag + ReadyEdge refuse. This is Schedule.pick
-    // over RunnableSet, including the independent antichain (Avoid=noop).
-    let task = scheduler.next_task_with_wave_ready(Some(wave), Some(ready));
-    record_refuse(metrics, ready, refuse_before);
-    if let (Some(m), Some(Task::Execution(v))) = (metrics, &task) {
-        m.record_visibility(runnable.visibility(v.tx_idx));
-    }
-    task
-}
-
-#[inline]
-fn record_refuse(metrics: Option<&MetricsInner>, ready: &ReadyEdgeTable, refuse_before: usize) {
     if let Some(m) = metrics {
-        let n = ready.refuse_count().saturating_sub(refuse_before);
-        m.record_refuse_admit_n(n);
+        let n = runnable.refuse_fill_n().saturating_sub(refuse_before);
+        if n > 0 {
+            m.record_refuse_fill(n);
+        }
     }
+    None
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
-    fn pick_source_never_calls_next_occ_task() {
+    fn pick_source_never_calls_block_stm_next_task() {
         let src = include_str!("schedule.rs");
         let code = src.split("#[cfg(test)]").next().unwrap();
         assert!(
-            !code.contains("next_occ_task"),
-            "SF-PS pick body must not invoke next_occ_task"
+            !code.contains("next_task_with_wave_ready(") && !code.contains(".next_task("),
+            "SF-PS pick must not call Scheduler::next_task*"
         );
-        assert!(
-            !code.contains(".next_task()"),
-            "SF-PS pick must not retreat to OCC next_task()"
-        );
+        assert!(!code.contains("next_occ_task("));
+        assert!(!code.contains("validate_occ_stage("));
     }
 }

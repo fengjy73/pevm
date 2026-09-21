@@ -261,6 +261,8 @@ pub(crate) struct InterBlockPrior {
     flip_count: AtomicUsize,
     /// A6: last `end_block` saw a morphology flip (warm-start decay).
     last_flipped: AtomicUsize,
+    /// SF-PS: packed ArmTable at last end_block (begin restores it).
+    arm_snaps: Mutex<Vec<super::arm_table::ArmSnap>>,
 }
 
 impl InterBlockPrior {
@@ -321,6 +323,22 @@ impl InterBlockPrior {
         *self.last_morph_hat.lock().unwrap() = MorphWeights::default();
         self.flip_count.store(0, Ordering::Relaxed);
         self.last_flipped.store(0, Ordering::Relaxed);
+        self.arm_snaps.lock().unwrap().clear();
+    }
+
+    /// Begin-block ArmTable restore.
+    pub(crate) fn arm_snapshot(&self) -> Vec<super::arm_table::ArmSnap> {
+        self.arm_snaps.lock().unwrap().clone()
+    }
+
+    /// End-block pack. Morph flip decays sticky on the snapshot.
+    pub(crate) fn pack_arm_snapshot(&self, mut snaps: Vec<super::arm_table::ArmSnap>) {
+        if self.last_flipped.load(Ordering::Relaxed) != 0 {
+            for s in &mut snaps {
+                s.sticky = false;
+            }
+        }
+        *self.arm_snaps.lock().unwrap() = snaps;
     }
 }
 
