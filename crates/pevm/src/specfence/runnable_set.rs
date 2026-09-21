@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 
-use crate::TxIdx;
 use crate::scheduler::Scheduler;
+use crate::TxIdx;
 
 use super::producer_stage::ProducerStageTable;
 use super::ready_edge::ReadyEdgeTable;
@@ -672,6 +672,14 @@ impl RunnableSet {
     #[inline]
     pub(crate) fn refuse_fill_n(&self) -> usize {
         self.refuse_fill_n.load(Ordering::Relaxed)
+    }
+
+    /// Hang-trace: leaked `ST_RUNNING` after a missed `try_execute`.
+    #[inline]
+    pub(crate) fn running_n(&self) -> usize {
+        (0..self.block_size)
+            .filter(|&t| self.state[t].load(Ordering::Acquire) == ST_RUNNING)
+            .count()
     }
 
     #[inline]

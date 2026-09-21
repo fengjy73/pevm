@@ -10,8 +10,8 @@ use super::producer_stage::ProducerStageTable;
 use super::ready_edge::ReadyEdgeTable;
 use super::runnable_set::{RunnableSet, SfPick};
 use super::wave::WaveParkTable;
-use crate::Task;
 use crate::scheduler::Scheduler;
+use crate::Task;
 
 /// SpecFence schedule entry. Queues + steal only.
 #[inline]
@@ -69,6 +69,7 @@ pub(crate) fn pick(
                         }
                         return Some(Task::Validation(v));
                     }
+                    runnable.force_push(tx, super::runnable_set::QueueKind::Revalidate);
                     continue;
                 }
                 if scheduler.is_aborting(tx) && ready.may_execute(tx) {
@@ -96,7 +97,12 @@ pub(crate) fn pick(
                         return Some(Task::Validation(v));
                     }
                     runnable.force_push(tx, super::runnable_set::QueueKind::Revalidate);
+                    continue;
                 }
+                // try_execute missed (Executing leftover / Aborting).
+                // Leaving ST_RUNNING here blocked force_idle_recover
+                // (6196166 N=3: gated=false, n_unf=27, pending=0).
+                runnable.mark_wait(tx);
             }
             Some(SfPick::Revalidate(tx)) => {
                 if let Some(v) = scheduler.prepare_revalidate(tx) {

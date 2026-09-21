@@ -42,7 +42,7 @@ pub(crate) fn run_sf_block<F, V>(
                 .filter(|&t| !scheduler.is_validated(t))
                 .count();
             eprintln!(
-                "sf-hang-trace spins={spins} pending={} q_i/r/o/v={}/{}/{}/{} unfinished={} validated={} gated={} live_wait={} refuse={} leftover_min={} loc_tip={} overflow_tip={} glob_min={} glob_chain={} min_done={} min_exec={} min_pred={} n_unf={}",
+                "sf-hang-trace spins={spins} pending={} q_i/r/o/v={}/{}/{}/{} unfinished={} validated={} gated={} live_wait={} refuse={} leftover_min={} loc_tip={} overflow_tip={} glob_min={} glob_chain={} min_done={} min_exec={} min_pred={} n_unf={} n_run={}",
                 runnable.pending_work(),
                 runnable.q_indep_len(),
                 runnable.q_released_len(),
@@ -62,6 +62,7 @@ pub(crate) fn run_sf_block<F, V>(
                 min_run,
                 min_pred,
                 n_unf,
+                runnable.running_n(),
             );
         }
         if abort() {
