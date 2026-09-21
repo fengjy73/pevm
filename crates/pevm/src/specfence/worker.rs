@@ -78,17 +78,20 @@ pub(crate) fn run_sf_block<F, V>(
                         // on RunnableSet before this worker spends time validating.
                         drain_wave(specfence, scheduler, runnable);
                         let (plan, invalid) = validate_to_plan(&tx_version, vis);
-                        resolve_plan::apply(plan, ApplyCtx {
-                            specfence,
-                            mv_memory,
-                            scheduler,
-                            runnable,
-                            arms,
-                            tx_version: &tx_version,
-                            vis,
-                            wrote_new_location,
-                            invalid: &invalid,
-                        });
+                        resolve_plan::apply(
+                            plan,
+                            ApplyCtx {
+                                specfence,
+                                mv_memory,
+                                scheduler,
+                                runnable,
+                                arms,
+                                tx_version: &tx_version,
+                                vis,
+                                wrote_new_location,
+                                invalid: &invalid,
+                            },
+                        );
                     }
                     SfExec::Blocked { on } => {
                         // add_dependency parks leave Aborting with no Detect
@@ -107,17 +110,20 @@ pub(crate) fn run_sf_block<F, V>(
             Some(Task::Validation(tx_version)) => {
                 let vis = VisibilityPolicy::for_ready(specfence.ready_edges, tx_version.tx_idx);
                 let (plan, invalid) = validate_to_plan(&tx_version, vis);
-                resolve_plan::apply(plan, ApplyCtx {
-                    specfence,
-                    mv_memory,
-                    scheduler,
-                    runnable,
-                    arms,
-                    tx_version: &tx_version,
-                    vis,
-                    wrote_new_location: false,
-                    invalid: &invalid,
-                });
+                resolve_plan::apply(
+                    plan,
+                    ApplyCtx {
+                        specfence,
+                        mv_memory,
+                        scheduler,
+                        runnable,
+                        arms,
+                        tx_version: &tx_version,
+                        vis,
+                        wrote_new_location: false,
+                        invalid: &invalid,
+                    },
+                );
                 metrics.add_worker_busy_ns(t0.elapsed().as_nanos() as u64);
             }
             None => {
@@ -189,7 +195,9 @@ fn drain_wave(specfence: SpecFenceCtx<'_>, scheduler: &Scheduler, runnable: &Run
             runnable.mark_wait(t);
             continue;
         }
-        let kind = if specfence.ready_edges.is_gated(t) {
+        let kind = if specfence.ready_edges.admitted_on_location(t) {
+            super::runnable_set::QueueKind::Ordered
+        } else if specfence.ready_edges.is_gated(t) {
             super::runnable_set::QueueKind::Released
         } else {
             super::runnable_set::QueueKind::Indep

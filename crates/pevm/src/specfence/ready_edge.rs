@@ -300,6 +300,15 @@ impl ReadyEdgeTable {
         self.queued_on.contains_key(&tx) || self.consumers.contains_key(&tx)
     }
 
+    /// Location-admitted Detect/Win cohort. Anonymous fan-in
+    /// (`note_consumer_on(..., None)`) is `was_queued` but must not
+    /// take Q_ordered / OrderedTip — that milled 19807137 (~40 spine
+    /// consumers). Heal/drain send those Released or Indep.
+    #[inline]
+    pub(crate) fn admitted_on_location(&self, tx: TxIdx) -> bool {
+        self.queued_on.contains_key(&tx)
+    }
+
     /// Ordered-admit readiness: this tx has (or is gaining) a wait-for edge.
     #[inline]
     fn mark_gated(&self, tx: TxIdx) {

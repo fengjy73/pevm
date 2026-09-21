@@ -340,9 +340,12 @@ impl RunnableSet {
             self.mark_wait(tx);
             return;
         }
-        // Never Q_ordered from heal: 19807137 milled ~40 OrderedTip
-        // consumers on one storage spine. Released/Indep + plant waits.
-        if ready.is_gated(tx) {
+        // Location-admitted cohort only. Anonymous was_queued consumers
+        // on Q_ordered were the 19807137 OrderedTip mill; sending every
+        // heal leftover Indep re-armed the 19469101 vis_opt mill.
+        if ready.admitted_on_location(tx) {
+            self.force_push(tx, QueueKind::Ordered);
+        } else if ready.is_gated(tx) {
             self.force_push(tx, QueueKind::Released);
         } else {
             self.force_push(tx, QueueKind::Indep);
@@ -918,6 +921,49 @@ mod tests {
             "idle must free waiter of non-running producer, n={n}"
         );
         assert!(r.pending_work() > 0 || ready.may_execute(2) || sched.is_ready(0));
+    }
+
+    #[test]
+    fn heal_orders_location_cohort_not_anonymous_fanin() {
+        let ready = ReadyEdgeTable::new();
+        let sched = Scheduler::new(6);
+        let r = RunnableSet::new(6, 1);
+        let wave = crate::specfence::wave::WaveParkTable::new();
+        ready.note_consumer_on(2, 0, Some(0xabc));
+        ready.note_consumer_on(3, 0, None);
+        ready.note_producer_done(0, &wave);
+        assert!(ready.admitted_on_location(2));
+        assert!(!ready.admitted_on_location(3));
+        assert!(ready.was_queued(3), "anonymous fan-in is still was_queued");
+        r.mark_wait(2);
+        r.mark_wait(3);
+        let n = r.heal(&ready, &sched);
+        assert!(n >= 2, "both released waiters must requeue, n={n}");
+        let mut from2 = None;
+        let mut from3 = None;
+        while let Some(p) = r.pick(0, &ready) {
+            match p {
+                SfPick::Execute { tx, from, .. } => {
+                    if tx == 2 {
+                        from2 = Some(from);
+                    } else if tx == 3 {
+                        from3 = Some(from);
+                    }
+                    r.mark_done(tx);
+                }
+                SfPick::Revalidate(tx) => r.mark_done(tx),
+            }
+        }
+        assert_eq!(
+            from2,
+            Some(QueueKind::Ordered),
+            "location cohort → Q_ordered"
+        );
+        assert_ne!(
+            from3,
+            Some(QueueKind::Ordered),
+            "anonymous fan-in must not take Q_ordered"
+        );
     }
 
     #[test]

@@ -386,7 +386,9 @@ fn drain_wave_to_runnable(ctx: &ApplyCtx<'_>) {
             ctx.runnable.mark_wait(t);
             continue;
         }
-        let kind = if ctx.specfence.ready_edges.is_gated(t) {
+        let kind = if ctx.specfence.ready_edges.admitted_on_location(t) {
+            QueueKind::Ordered
+        } else if ctx.specfence.ready_edges.is_gated(t) {
             QueueKind::Released
         } else {
             QueueKind::Indep
