@@ -1,7 +1,7 @@
 //! Schedule.pick — SpecFence Parallel Spine pick (SF-PS T1 / PC).
 //!
-//! **Forbidden:** `Scheduler::next_task`, `next_task_with_wave_ready`,
-//! any Block-STM index cursor as the pick host.
+//! **Forbidden:** `Scheduler::next_task` / wave-ready next-task / OCC stage
+//! validate. Any Block-STM index cursor as the pick host is banned.
 
 use super::arm_table::ArmTable;
 use super::metrics::MetricsInner;

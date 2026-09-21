@@ -343,6 +343,9 @@ impl RunnableSet {
             if st == ST_RUNNING && scheduler.is_executing(tx) {
                 continue;
             }
+            if st == ST_REVALIDATE {
+                continue;
+            }
             if scheduler.is_validated(tx) {
                 self.mark_done(tx);
                 continue;

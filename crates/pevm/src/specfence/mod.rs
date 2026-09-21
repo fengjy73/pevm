@@ -16,7 +16,7 @@
 //! read = `SfMvMemory.read(ℓ, vis)`; validate produces ResolvePlan and
 //! `ResolvePlan.apply` mutates certificates/queues. Independent txs may use
 //! Opt visibility (Avoid=noop). SpecFence **must not** call
-//! `Scheduler::next_task` / `next_task_with_wave_ready` / `validate_occ_stage`.
+//! `Scheduler::next_task` / wave-ready next-task / OCC-stage validate.
 //!
 //! Soft=0. seq≡par. Lazy-update / near-independent are never OrderedAdmit
 //! objects. Thin (n≤176) must not learn Win_8. Under-covered spines must

@@ -97,9 +97,10 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
             ctx.scheduler
                 .finish_validation_sf(ctx.tx_version, false, None);
             release_successors(&ctx, tx);
-            if ctx.wrote_new_location {
-                enqueue_higher_revalidate(&ctx, tx);
-            }
+            // Every published write can invalidate a higher reader, including
+            // a re-execution that rewrites the same locations (not only
+            // WroteNewLocation). Block-STM did this via validation_idx.
+            enqueue_higher_revalidate(&ctx, tx, ctx.wrote_new_location);
             ctx.runnable.mark_done(tx);
         }
         ResolvePlan::PartialAbortRewind => {
@@ -122,7 +123,7 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
                 .finish_validation_sf(ctx.tx_version, true, Some(tx + 1));
             ctx.specfence.ready_edges.clear_started(tx);
             requeue(&ctx, tx, QueueKind::Released);
-            enqueue_higher_revalidate(&ctx, tx);
+            enqueue_higher_revalidate(&ctx, tx, true);
         }
         ResolvePlan::OrderedReplay => {
             abort_and_estimate(&ctx);
@@ -136,7 +137,7 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
                 .finish_validation_sf(ctx.tx_version, true, Some(tx + 1));
             ctx.specfence.ready_edges.clear_started(tx);
             requeue(&ctx, tx, QueueKind::Ordered);
-            enqueue_higher_revalidate(&ctx, tx);
+            enqueue_higher_revalidate(&ctx, tx, true);
         }
         ResolvePlan::FullReplay => {
             abort_and_estimate(&ctx);
@@ -167,7 +168,7 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
                 QueueKind::Indep
             };
             requeue(&ctx, tx, kind);
-            enqueue_higher_revalidate(&ctx, tx);
+            enqueue_higher_revalidate(&ctx, tx, true);
         }
     }
 
@@ -295,13 +296,22 @@ fn requeue(ctx: &ApplyCtx<'_>, tx: crate::TxIdx, kind: QueueKind) {
     ctx.runnable.force_push(tx, kind);
 }
 
-fn enqueue_higher_revalidate(ctx: &ApplyCtx<'_>, tx: crate::TxIdx) {
+fn enqueue_higher_revalidate(ctx: &ApplyCtx<'_>, tx: crate::TxIdx, new_location: bool) {
     let writes = ctx.mv_memory.write_locations(tx);
     for loc in writes {
         for reader in ctx.mv_memory.higher_readers_of(loc, tx) {
             if reader <= tx {
                 continue;
             }
+            if ctx.scheduler.is_executed(reader) || ctx.scheduler.is_validated(reader) {
+                ctx.runnable.force_push(reader, QueueKind::Revalidate);
+            }
+        }
+    }
+    // New locations may have been read from storage before this writer
+    // existed — readers index can miss them until the next incarnation.
+    if new_location {
+        for reader in (tx + 1)..ctx.scheduler.block_size() {
             if ctx.scheduler.is_executed(reader) || ctx.scheduler.is_validated(reader) {
                 ctx.runnable.force_push(reader, QueueKind::Revalidate);
             }

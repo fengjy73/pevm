@@ -209,8 +209,12 @@ fn specfence_true_spine_sources_never_call_next_task() {
     for src in files {
         let code = src.split("#[cfg(test)]").next().unwrap();
         assert!(
-            !code.contains("next_task_with_wave_ready"),
+            !code.contains("next_task_with_wave_ready("),
             "true spine must not call next_task_with_wave_ready"
+        );
+        assert!(
+            !code.contains(".next_task("),
+            "true spine must not call Scheduler::next_task"
         );
         assert!(
             !code.contains("validate_occ_stage"),
