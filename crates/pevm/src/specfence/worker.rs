@@ -120,6 +120,18 @@ pub(crate) fn run_sf_block<F, V>(
                 if scheduler.all_validated() && runnable.pending_work() == 0 {
                     break;
                 }
+                // Last-ditch: unfinished + empty queues + no live producer.
+                // Heal already ran; if still stuck, yield then retry heal.
+                if runnable.pending_work() == 0
+                    && scheduler.has_unfinished()
+                    && !runnable.waiting_on_live_producer(specfence.ready_edges, scheduler)
+                {
+                    let _ = runnable.heal(specfence.ready_edges, scheduler);
+                    drain_wave(specfence, scheduler, runnable);
+                    if runnable.pending_work() > 0 {
+                        continue;
+                    }
+                }
                 if runnable.waiting_on_live_producer(specfence.ready_edges, scheduler) {
                     for _ in 0..32 {
                         std::hint::spin_loop();

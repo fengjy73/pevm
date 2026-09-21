@@ -235,9 +235,17 @@ impl ArmTable {
             if arm == LocStrategy::FullChain && block_n <= THIN_SHELL_N {
                 arm = LocStrategy::win(w_cap as usize);
             }
+            // Under-covered / thin long spine: Prior must not nail a begin
+            // wait-set. Mid-block plant_observed_waw still raises real edges.
+            let n_pairs = policy.pairs_of(loc).len();
+            if arm.is_ordered() && n_pairs > w_cap as usize {
+                arm = LocStrategy::OptimisticRead;
+            }
             policy.remember_arm(loc, arm);
+            // Remember only — do not promote_short_edge here. admit_seed
+            // plants from already-measured pairs; inventing a promote on a
+            // cold leftover loc recreates a wait-set with nobody runnable.
             if arm.is_ordered() {
-                policy.promote_short_edge(loc, 0);
                 planted += 1;
             }
         }
@@ -302,6 +310,9 @@ impl ArmTable {
         let tick = self.bump_tick();
         let Some(loc) = location else {
             match plan {
+                ResolvePlan::Commit => {
+                    self.e1_n.fetch_add(1, Ordering::Relaxed);
+                }
                 ResolvePlan::PartialAbortRebind | ResolvePlan::PartialAbortRewind => {
                     self.e3_n.fetch_add(1, Ordering::Relaxed);
                 }

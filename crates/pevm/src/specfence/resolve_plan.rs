@@ -133,6 +133,9 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
             {
                 seed_short_edge(ctx.specfence, p, tx, &f);
             }
+            if let Some(f) = first {
+                plant_observed_waw(&ctx, &f);
+            }
             ctx.scheduler
                 .finish_validation_sf(ctx.tx_version, true, Some(tx + 1));
             ctx.specfence.ready_edges.clear_started(tx);
@@ -147,6 +150,7 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
                         if let Some(p) = ctx.specfence.policy {
                             seed_short_edge(ctx.specfence, p, tx, &f);
                         }
+                        plant_observed_waw(&ctx, &f);
                     }
                     ConflictClass::LazyNoise | ConflictClass::CommuteCandidate => {
                         if let Some(p) = ctx.specfence.policy {
@@ -158,17 +162,22 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
             ctx.scheduler
                 .finish_validation_sf(ctx.tx_version, true, Some(tx + 1));
             ctx.specfence.ready_edges.clear_started(tx);
-            let kind = if ctx.vis.needs_fence() {
-                if ctx.specfence.ready_edges.was_queued(tx) {
-                    QueueKind::Ordered
-                } else {
-                    QueueKind::Released
-                }
-            } else {
-                QueueKind::Indep
-            };
-            requeue(&ctx, tx, kind);
             enqueue_higher_revalidate(&ctx, tx);
+            // Observed WAW: wait for the producer instead of Opt ping-pong.
+            if ctx.specfence.ready_edges.is_gated(tx)
+                && !ctx.specfence.ready_edges.may_execute(tx)
+            {
+                ctx.runnable.mark_wait(tx);
+            } else {
+                let kind = if ctx.specfence.ready_edges.was_queued(tx) {
+                    QueueKind::Ordered
+                } else if ctx.specfence.ready_edges.is_gated(tx) || ctx.vis.needs_fence() {
+                    QueueKind::Released
+                } else {
+                    QueueKind::Indep
+                };
+                requeue(&ctx, tx, kind);
+            }
         }
     }
 
@@ -184,6 +193,32 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
         ctx.arms
             .demote_lazy_graph(l, ctx.specfence.ready_edges, ctx.runnable);
     }
+}
+
+/// Always raise a Detect edge on a observed non-lazy WAW. Thin `hops=0`
+/// must not leave two Opt writers ping-ponging FullReplay forever.
+fn plant_observed_waw(ctx: &ApplyCtx<'_>, f: &super::collateral::FirstConflict) {
+    if f.lazy || f.class != ConflictClass::EffectiveWAW {
+        return;
+    }
+    let tx = ctx.tx_version.tx_idx;
+    let Some(producer) = f.peer.filter(|&w| w < tx) else {
+        return;
+    };
+    if ctx.specfence.ready_edges.is_writer_done(producer) {
+        return;
+    }
+    if ctx
+        .specfence
+        .ready_edges
+        .blocking_producer(tx)
+        .is_some_and(|w| w >= producer)
+    {
+        return;
+    }
+    ctx.specfence
+        .ready_edges
+        .note_consumer_on(tx, producer, Some(f.location));
 }
 
 fn seed_short_edge(

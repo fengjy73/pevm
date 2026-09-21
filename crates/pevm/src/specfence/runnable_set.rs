@@ -449,6 +449,22 @@ impl RunnableSet {
         if n == 0 && self.pending_work() == 0 {
             let any_executing = (0..self.block_size).any(|t| scheduler.is_executing(t));
             if !any_executing {
+                // PC-5 nuclear: leftover wait-set, nobody runnable, nobody
+                // Executing. Drop every false gate and rejoin Q_indep.
+                if scheduler.has_unfinished() {
+                    let freed = ready.collapse_false_gates(|_| false);
+                    for tx in freed {
+                        if scheduler.is_aborting(tx) {
+                            let _ = scheduler.recover_aborting(tx);
+                        } else if scheduler.is_executing(tx) {
+                            let _ = scheduler.recover_executing_waiter(tx);
+                        }
+                        if scheduler.is_ready(tx) || scheduler.is_executed(tx) {
+                            self.requeue_ready(tx, ready);
+                            n += 1;
+                        }
+                    }
+                }
                 for tx in 0..self.block_size {
                     let st = self.state[tx].load(Ordering::Acquire);
                     if st == ST_DONE || scheduler.is_validated(tx) {

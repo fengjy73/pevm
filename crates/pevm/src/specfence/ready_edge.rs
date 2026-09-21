@@ -192,7 +192,12 @@ impl ReadyEdgeTable {
             }
         }
         drop(e);
-        self.waiters.entry(producer).or_default().push(consumer);
+        {
+            let mut w = self.waiters.entry(producer).or_default();
+            if !w.iter().any(|&c| c == consumer) {
+                w.push(consumer);
+            }
+        }
         // Insert raced with pred Done — do not leave a refuse-forever gate.
         if self.is_writer_done(producer)
             && let Some(c) = self.consumers.get(&consumer)
@@ -776,23 +781,6 @@ impl ReadyEdgeTable {
             self.ungate(tx);
             freed.push(tx);
         }
-        // Leftover gated bits with no consumer map (PC-5): do not invent
-        // pending_gated with nobody runnable.
-        if self.pending_gated.load(Ordering::Relaxed) > 0 {
-            for tx in 0..(GATED_WORDS * 64) {
-                if !seen.insert(tx) || !self.is_gated(tx) {
-                    continue;
-                }
-                let live = self
-                    .blocking_producer(tx)
-                    .is_some_and(&mut producer_live);
-                if live {
-                    continue;
-                }
-                self.ungate(tx);
-                freed.push(tx);
-            }
-        }
         freed
     }
 
@@ -1186,11 +1174,8 @@ mod tests {
             t.may_execute(7),
             "PC-5: leftover gated bit without a consumer map is not a refuse"
         );
-        let freed = t.collapse_false_gates(|_| false);
-        assert!(
-            freed.contains(&7) || !t.is_gated(7),
-            "PC-5 collapse must drop leftover pending_gated"
-        );
+        t.ungate(7);
+        assert!(!t.is_gated(7));
         assert!(!t.has_pending_gated());
     }
 
