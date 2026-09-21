@@ -342,6 +342,67 @@ impl RunnableSet {
         }
     }
 
+    /// Last-ditch when queues are empty, nothing is `ST_RUNNING`, and the
+    /// scheduler still has unfinished txs. Recovers Aborting / Executing
+    /// leftovers and requeues Ready/Executed. 8-core 19469101 flaked because
+    /// Detect still named a ghost producer so ordinary heal no-op'd.
+    pub(crate) fn force_idle_recover(
+        &self,
+        ready: &ReadyEdgeTable,
+        scheduler: &Scheduler,
+    ) -> usize {
+        if self.pending_work() > 0 {
+            return 0;
+        }
+        if (0..self.block_size).any(|t| self.state[t].load(Ordering::Acquire) == ST_RUNNING) {
+            return 0;
+        }
+        let freed = ready.collapse_false_gates(|w| {
+            scheduler.is_executing(w) && self.state[w].load(Ordering::Acquire) == ST_RUNNING
+        });
+        let mut n = 0;
+        for tx in freed {
+            if scheduler.is_aborting(tx) {
+                let _ = scheduler.recover_aborting(tx);
+            } else if scheduler.is_executing(tx) {
+                let _ = scheduler.recover_executing_waiter(tx);
+            }
+            if scheduler.is_ready(tx) || scheduler.is_executed(tx) {
+                self.requeue_ready(tx, ready);
+                n += 1;
+            }
+        }
+        for tx in 0..self.block_size {
+            if scheduler.is_validated(tx) {
+                self.mark_done(tx);
+                continue;
+            }
+            if self.state[tx].load(Ordering::Acquire) == ST_RUNNING {
+                continue;
+            }
+            if scheduler.is_executing(tx) && scheduler.recover_executing_waiter(tx) {
+                self.requeue_ready(tx, ready);
+                n += 1;
+                continue;
+            }
+            if scheduler.is_aborting(tx) && scheduler.recover_aborting(tx) {
+                self.requeue_ready(tx, ready);
+                n += 1;
+                continue;
+            }
+            if scheduler.is_executed(tx) {
+                self.force_push(tx, QueueKind::Revalidate);
+                n += 1;
+                continue;
+            }
+            if scheduler.is_ready(tx) && ready.may_execute(tx) {
+                self.requeue_ready(tx, ready);
+                n += 1;
+            }
+        }
+        n
+    }
+
     /// Idle heal: released waiters, leftover Executed, abandoned Ready.
     /// Does not steal `ST_RUNNING` while the scheduler is still `Executing`.
     pub(crate) fn heal(&self, ready: &ReadyEdgeTable, scheduler: &Scheduler) -> usize {

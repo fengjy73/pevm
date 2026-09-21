@@ -139,6 +139,10 @@ pub(crate) fn run_sf_block<F, V>(
                 {
                     let _ = runnable.heal(specfence.ready_edges, scheduler);
                     drain_wave(specfence, scheduler, runnable);
+                    if runnable.pending_work() == 0 {
+                        let _ = runnable.force_idle_recover(specfence.ready_edges, scheduler);
+                        drain_wave(specfence, scheduler, runnable);
+                    }
                     if runnable.pending_work() > 0 {
                         continue;
                     }
