@@ -1310,6 +1310,13 @@ impl CostPolicy {
         self.block_n() >= LARGE_BLOCK_N && !self.has_midband_coverable_spine()
     }
 
+    /// S2: mid/large reuse drops leftover flush. First block may still
+    /// probe; starting a Win_2 plant on reuse livelocks 19469101 N=3.
+    #[inline]
+    pub(crate) fn skip_reuse_leftover_flush(&self) -> bool {
+        self.block_seq.load(Ordering::Relaxed) > 1 && self.block_n() > THIN_N_MAX
+    }
+
     fn has_midband_coverable_spine(&self) -> bool {
         self.short_chain.iter().any(|e| {
             let n_pairs = e.value().len();
@@ -1449,6 +1456,12 @@ impl CostPolicy {
             return false;
         }
         if s.cover_probe_n >= COVER_PROBE_BUDGET {
+            return false;
+        }
+        // Reuse: do not *start* a cover probe. First-block Opt leftover
+        // sets last_crisis; forcing Win_2 then livelocks 19469101 N=3.
+        // A probe already in budget may continue; proven cover is sticky.
+        if self.block_seq.load(Ordering::Relaxed) > 1 && s.cover_probe_n == 0 {
             return false;
         }
         // Do not call phase_of here — it → covering_sticky → yield → here.
@@ -1715,6 +1728,13 @@ impl CostPolicy {
     /// A planted covering prefix (Win_2+) must not slide on the same
     /// block — 3356896 i=1 otherwise prepaid-blows ĉ and retreats to Opt.
     pub(crate) fn leftover_slide_ok(&self, location: MemoryLocationHash) -> bool {
+        // Mid/large never T3-slide. `is_midband_coverable` needs short_chain
+        // n_pairs; begin_block / first-pick flush can see n_pairs=0 and
+        // plant→refuse→flush livelock 19469101 N=3 reuse. C4 deepens
+        // `cover_window` at end_block instead. Thin leftover-long may slide.
+        if self.block_n() > THIN_N_MAX {
+            return false;
+        }
         let n_pairs = self
             .short_chain
             .get(&location)
@@ -5883,6 +5903,12 @@ mod tests {
             p.leftover_slide_ok(0x32be),
             "T3: still-leaking loc may slide leftover hops"
         );
+        let mid = CostPolicy::new();
+        mid.begin_block_with_cores(469, 8);
+        assert!(
+            !mid.leftover_slide_ok(0xabc),
+            "19469101: mid/large never T3-slides even with empty short_chain"
+        );
     }
 
     #[test]
@@ -6480,9 +6506,53 @@ mod tests {
         }
         p.begin_block_with_cores(430, 8);
         p.note_loc_write(0xabc, false);
+        {
+            let e = p.promoted.get(&0xabc).unwrap();
+            assert!(
+                (e.cover_window as usize) > 4,
+                "C4: deepened cover_window persists on reuse, got {}",
+                e.cover_window
+            );
+        }
         assert!(
-            !p.should_skip_ordered_admit_seed(0xabc, 20),
-            "C4: next begin still probes the deeper segment"
+            !p.can_probe_cover(0xabc, 20),
+            "reuse does not start a cover probe (cover_probe_n==0)"
+        );
+        assert!(
+            p.should_skip_ordered_admit_seed(0xabc, 20),
+            "C4: reuse seed skip is intended — deepen at end_block, do not plant Win_2"
+        );
+        assert!(
+            p.skip_reuse_leftover_flush(),
+            "19469101: mid reuse drops leftover flush"
+        );
+    }
+
+    #[test]
+    fn reuse_does_not_start_cover_probe() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(469, 8);
+        p.note_loc_write(0xabc, false);
+        p.promote_short_edge(0xabc, 20);
+        for i in 0..20 {
+            p.note_short_pair(0xabc, 10 + i, 11 + i);
+        }
+        assert!(
+            p.can_probe_cover(0xabc, 20),
+            "first mid-band begin may still start a Win_2 probe"
+        );
+        assert!(!p.skip_reuse_leftover_flush());
+        p.end_block_learn();
+        p.begin_block_with_cores(469, 8);
+        p.note_loc_write(0xabc, false);
+        assert!(
+            !p.can_probe_cover(0xabc, 20),
+            "19469101: reuse must not start Win_2 after first-block Opt leftover"
+        );
+        assert!(p.skip_reuse_leftover_flush());
+        assert!(
+            p.should_skip_ordered_admit_seed(0xabc, 20),
+            "reuse leftover hops stay ungated OCC"
         );
     }
 

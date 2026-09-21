@@ -33,7 +33,7 @@ pub(crate) fn next_sf_task(
     if let Some(p) = policy
         && p.has_pending_idle()
     {
-        if p.skip_useless_cover_probe() {
+        if p.skip_useless_cover_probe() || p.skip_reuse_leftover_flush() {
             let _ = p.take_pending_idle();
         } else {
             let _ = crate::specfence::admit::flush_pending_idle_edges(ready, p);
