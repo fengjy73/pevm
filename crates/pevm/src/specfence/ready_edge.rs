@@ -821,6 +821,16 @@ impl ReadyEdgeTable {
             .count()
     }
 
+    /// Hang-trace: leftover_min / loc_tip / overflow_tip occupancy.
+    #[inline]
+    pub(crate) fn hang_plant_n(&self) -> (usize, usize, usize) {
+        (
+            self.leftover_min.len(),
+            self.loc_tip.len(),
+            self.overflow_tip.len(),
+        )
+    }
+
     /// Newest still-live waiter reachable from `start` with index `< before`.
     /// Overflow plants must chain, not star on one tip — a star wakes
     /// every leftover writer at once (19807137 ~40 Released mill).

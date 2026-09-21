@@ -139,6 +139,7 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
                 plant_observed_waw(&ctx, &f);
                 break_replay_mill(&ctx, &f);
             }
+            plant_invalid_locs(&ctx);
             ctx.scheduler
                 .finish_validation_sf(ctx.tx_version, true, Some(tx + 1));
             ctx.specfence.ready_edges.clear_started(tx);
@@ -171,6 +172,7 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
                     }
                 }
             }
+            plant_invalid_locs(&ctx);
             ctx.scheduler
                 .finish_validation_sf(ctx.tx_version, true, Some(tx + 1));
             ctx.specfence.ready_edges.clear_started(tx);
@@ -201,9 +203,22 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
         ctx.scheduler.block_size(),
         ctx.invalid.len(),
     );
-    if lazy && let Some(l) = loc {
-        ctx.arms
-            .demote_lazy_graph(l, ctx.specfence.ready_edges, ctx.runnable);
+    // E6: only ungate *lazy* ℓ. Demoting the first-conflict loc whenever
+    // any invalid was lazy tore down observed-WAW plants (19807137 mill).
+    if lazy {
+        if first.is_some_and(|f| f.lazy) {
+            ctx.arms
+                .demote_lazy_graph(loc.unwrap(), ctx.specfence.ready_edges, ctx.runnable);
+        }
+        for &l in ctx.invalid {
+            if first.is_some_and(|f| f.location == l && f.lazy) {
+                continue;
+            }
+            if location_is_lazy(ctx.mv_memory, tx, l) {
+                ctx.arms
+                    .demote_lazy_graph(l, ctx.specfence.ready_edges, ctx.runnable);
+            }
+        }
     }
 }
 
@@ -231,6 +246,26 @@ fn plant_observed_waw(ctx: &ApplyCtx<'_>, f: &super::collateral::FirstConflict) 
 /// Second+ incarnation FullReplay that is not EffectiveWAW still Opt-mills
 /// (19469101 ~390%). After one retry, raise an anonymous wait on the peer
 /// even if Learn classified LazyNoise / Commute.
+/// Plant every non-lazy invalid ℓ, not only FirstConflict. Shared storage
+/// slots that are not the first fail still Opt-mill (19807137 ~30 heads).
+fn plant_invalid_locs(ctx: &ApplyCtx<'_>) {
+    let tx = ctx.tx_version.tx_idx;
+    for &loc in ctx.invalid {
+        if location_is_lazy(ctx.mv_memory, tx, loc) {
+            continue;
+        }
+        let producer = ctx
+            .mv_memory
+            .last_writer_before(loc, tx)
+            .filter(|&w| w < tx)
+            .unwrap_or(tx);
+        let _ = ctx
+            .specfence
+            .ready_edges
+            .plant_observed_window(tx, producer, loc, 1);
+    }
+}
+
 fn break_replay_mill(ctx: &ApplyCtx<'_>, f: &super::collateral::FirstConflict) {
     if ctx.tx_version.tx_incarnation < 1 {
         return;

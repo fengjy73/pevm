@@ -5,12 +5,12 @@
 
 use std::time::Instant;
 
-use super::SpecFenceCtx;
-use super::VisibilityPolicy;
 use super::arm_table::ArmTable;
 use super::resolve_plan::{self, ApplyCtx};
 use super::runnable_set::RunnableSet;
 use super::schedule;
+use super::SpecFenceCtx;
+use super::VisibilityPolicy;
 use crate::mv_memory::MvMemory;
 use crate::scheduler::Scheduler;
 use crate::{Task, TxVersion};
@@ -35,8 +35,9 @@ pub(crate) fn run_sf_block<F, V>(
     loop {
         spins += 1;
         if spins.is_multiple_of(8_000) && std::env::var_os("SPECFENCE_HANG_TRACE").is_some() {
+            let (n_min, n_tip, n_ov) = specfence.ready_edges.hang_plant_n();
             eprintln!(
-                "sf-hang-trace spins={spins} pending={} q_i/r/o/v={}/{}/{}/{} unfinished={} validated={} gated={} live_wait={} refuse={}",
+                "sf-hang-trace spins={spins} pending={} q_i/r/o/v={}/{}/{}/{} unfinished={} validated={} gated={} live_wait={} refuse={} leftover_min={} loc_tip={} overflow_tip={}",
                 runnable.pending_work(),
                 runnable.q_indep_len(),
                 runnable.q_released_len(),
@@ -47,6 +48,9 @@ pub(crate) fn run_sf_block<F, V>(
                 specfence.ready_edges.has_any_gated(),
                 runnable.waiting_on_live_producer(specfence.ready_edges, scheduler),
                 runnable.refuse_fill_n(),
+                n_min,
+                n_tip,
+                n_ov,
             );
         }
         if abort() {
