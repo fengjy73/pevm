@@ -100,7 +100,7 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
             // Every published write can invalidate a higher reader, including
             // a re-execution that rewrites the same locations (not only
             // WroteNewLocation). Block-STM did this via validation_idx.
-            enqueue_higher_revalidate(&ctx, tx, ctx.wrote_new_location);
+            enqueue_higher_revalidate(&ctx, tx);
             ctx.runnable.mark_done(tx);
         }
         ResolvePlan::PartialAbortRewind => {
@@ -123,7 +123,7 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
                 .finish_validation_sf(ctx.tx_version, true, Some(tx + 1));
             ctx.specfence.ready_edges.clear_started(tx);
             requeue(&ctx, tx, QueueKind::Released);
-            enqueue_higher_revalidate(&ctx, tx, true);
+            enqueue_higher_revalidate(&ctx, tx);
         }
         ResolvePlan::OrderedReplay => {
             abort_and_estimate(&ctx);
@@ -137,7 +137,7 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
                 .finish_validation_sf(ctx.tx_version, true, Some(tx + 1));
             ctx.specfence.ready_edges.clear_started(tx);
             requeue(&ctx, tx, QueueKind::Ordered);
-            enqueue_higher_revalidate(&ctx, tx, true);
+            enqueue_higher_revalidate(&ctx, tx);
         }
         ResolvePlan::FullReplay => {
             abort_and_estimate(&ctx);
@@ -168,7 +168,7 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
                 QueueKind::Indep
             };
             requeue(&ctx, tx, kind);
-            enqueue_higher_revalidate(&ctx, tx, true);
+            enqueue_higher_revalidate(&ctx, tx);
         }
     }
 
@@ -303,26 +303,24 @@ fn enqueue_revalidate(ctx: &ApplyCtx<'_>, reader: crate::TxIdx) {
     if !ctx.scheduler.is_executed(reader) && !ctx.scheduler.is_validated(reader) {
         return;
     }
+    // Skip readers whose read set still matches — avoids an O(n²) beneficiary
+    // revalidate mill on independent raw transfers.
+    if super::occ_read_set_valid(ctx.mv_memory, reader) {
+        return;
+    }
     // Demote before the worker loop samples all_validated, otherwise the
     // last Commit exits every core and the revalidate never runs.
     let _ = ctx.scheduler.prepare_revalidate(reader);
     ctx.runnable.force_push(reader, QueueKind::Revalidate);
 }
 
-fn enqueue_higher_revalidate(ctx: &ApplyCtx<'_>, tx: crate::TxIdx, new_location: bool) {
+fn enqueue_higher_revalidate(ctx: &ApplyCtx<'_>, tx: crate::TxIdx) {
     let writes = ctx.mv_memory.write_locations(tx);
     for loc in writes {
         for reader in ctx.mv_memory.higher_readers_of(loc, tx) {
             if reader > tx {
                 enqueue_revalidate(ctx, reader);
             }
-        }
-    }
-    // New locations may have been read from storage before this writer
-    // existed — readers index can miss them until the next incarnation.
-    if new_location {
-        for reader in (tx + 1)..ctx.scheduler.block_size() {
-            enqueue_revalidate(ctx, reader);
         }
     }
 }
