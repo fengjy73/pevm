@@ -7,7 +7,6 @@
 //!
 //! Ungated / A0-majority txs use an OCC-class `may_execute` (bitset; no DashMap).
 
-use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -68,9 +67,6 @@ pub(crate) struct ReadyEdgeTable {
     ungated_occ_while_gated: AtomicUsize,
     /// Producer → known consumers (completion event → bag; no DashMap scan).
     waiters: DashMap<TxIdx, Vec<TxIdx>, BuildIdentityHasher>,
-    /// Waiter lists parked at Commit so FullReplay can re-block without
-    /// cloning a live DashMap Vec (19807137 N=3 `unaligned tcache`).
-    released_waiters: Mutex<HashMap<TxIdx, Vec<TxIdx>>>,
     /// Ordered-admit gated txs. Marked **before** the consumer map insert so
     /// an ungated steal cannot race past a newly created wait-for edge.
     gated_bits: [AtomicU64; GATED_WORDS],
@@ -112,7 +108,6 @@ impl Default for ReadyEdgeTable {
             skip_gate_n: AtomicUsize::new(0),
             ungated_occ_while_gated: AtomicUsize::new(0),
             waiters: DashMap::default(),
-            released_waiters: Mutex::new(HashMap::new()),
             gated_bits: std::array::from_fn(|_| AtomicU64::new(0)),
             gated_n: AtomicUsize::new(0),
             pending_gated: AtomicUsize::new(0),
@@ -473,7 +468,9 @@ impl ReadyEdgeTable {
     }
 
     /// FullReplay / OrderedReplay: this writer is no longer published.
-    /// Clear the done stamp and re-block waiters that Commit had woken.
+    /// Clear the done stamp so later plants are not no-ops. Do **not**
+    /// walk waiters/consumers here — that raced DashMap (19469101 SEGV,
+    /// 19807137 unaligned tcache).
     pub(crate) fn note_abort_reincarnate(&self, writer: TxIdx) {
         let i = writer / 64;
         let was_done = if i < self.done_bits.len() {
@@ -482,32 +479,8 @@ impl ReadyEdgeTable {
         } else {
             self.finished.remove(&writer).is_some()
         };
-        if !was_done {
-            return;
-        }
-        if self.is_gated(writer) {
+        if was_done && self.is_gated(writer) {
             self.pending_gated.fetch_add(1, Ordering::Relaxed);
-        }
-        let cs = self
-            .released_waiters
-            .lock()
-            .ok()
-            .and_then(|g| g.get(&writer).cloned())
-            .unwrap_or_default();
-        for &c in &cs {
-            if c <= writer {
-                continue;
-            }
-            self.mark_gated(c);
-            if let Some(e) = self.consumers.get(&c) {
-                let cur = e.load(Ordering::Relaxed);
-                if cur == NONE || cur == writer {
-                    e.store(writer, Ordering::Relaxed);
-                }
-            }
-        }
-        if !cs.is_empty() {
-            self.waiters.insert(writer, cs);
         }
     }
 
@@ -677,10 +650,9 @@ impl ReadyEdgeTable {
     }
 
     /// True when some consumer is already gated on this writer (publish-wake needed).
-    /// Committed writers keep the waiter list for abort-rebind but are not live.
     #[inline]
     pub(crate) fn has_known_waiters(&self, writer: TxIdx) -> bool {
-        !self.is_writer_done(writer) && self.waiters.get(&writer).is_some_and(|v| !v.is_empty())
+        self.waiters.get(&writer).is_some_and(|v| !v.is_empty())
     }
 
     /// Writer finished. Wake known consumers whose producer is now done.
@@ -695,9 +667,6 @@ impl ReadyEdgeTable {
             .map(|(_, v)| v)
             .unwrap_or_default();
         let had_waiters = !cs.is_empty();
-        if had_waiters && let Ok(mut g) = self.released_waiters.lock() {
-            g.insert(writer, cs.clone());
-        }
         self.mark_done(writer);
         if !self.has_any_gated() {
             return;
@@ -1410,21 +1379,21 @@ mod tests {
     }
 
     #[test]
-    fn abort_rebinds_woken_waiters() {
+    fn abort_clears_done_stamp() {
         let t = ReadyEdgeTable::new();
         let wave = WaveParkTable::new();
         t.note_consumer_on(3, 1, Some(0xabc));
-        assert!(!t.may_execute(3));
         t.note_producer_done(1, &wave);
-        assert!(t.may_execute(3), "Commit wakes the waiter");
         assert!(t.is_writer_done(1));
         t.note_abort_reincarnate(1);
-        assert!(!t.is_writer_done(1));
         assert!(
-            !t.may_execute(3),
-            "FullReplay must re-block waiters of the aborted writer"
+            !t.is_writer_done(1),
+            "FullReplay must clear done so later plants are not no-ops"
         );
-        assert_eq!(t.blocking_producer(3), Some(1));
+        assert!(
+            t.should_plant_observed_waw(4, 1),
+            "cleared done stamp must allow a new plant"
+        );
     }
 
     #[test]
