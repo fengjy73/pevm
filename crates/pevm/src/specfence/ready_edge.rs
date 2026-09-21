@@ -859,8 +859,9 @@ impl ReadyEdgeTable {
     }
 
     /// Cap location waiters at `w_max` with an atomic slot, then chain
-    /// surplus onto `overflow_tip`. A star onto one window tip woke every
-    /// leftover writer at once (19807137 ~45 Q_released, live_wait=false).
+    /// surplus onto `overflow_tip`. After the original peer publishes,
+    /// leftover writers elect one live tip and chain — they must not all
+    /// requeue Released (19807137 ~40-head mill, `live_wait=false`).
     /// Does not walk `waiters` / `queued_on` (those munmap'd FullReplay).
     pub(crate) fn plant_observed_window(
         &self,
@@ -869,36 +870,44 @@ impl ReadyEdgeTable {
         location: MemoryLocationHash,
         w_max: usize,
     ) -> bool {
-        if !self.should_plant_observed_waw(consumer, producer) {
+        if consumer == 0 {
             return false;
         }
         let w_max = w_max.max(1);
-        let got_slot = {
-            let n = self
-                .loc_waiter_n
-                .entry(location)
-                .or_insert_with(|| AtomicUsize::new(0));
-            loop {
-                let cur = n.load(Ordering::Relaxed);
-                if cur >= w_max {
-                    break false;
-                }
-                match n.compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed) {
-                    Ok(_) => break true,
-                    Err(_) => {}
-                }
-            }
-        };
-        if got_slot {
-            self.note_consumer_on(consumer, producer, Some(location));
-            {
-                let e = self
-                    .loc_tip
+        let producer_live = producer < consumer && !self.is_writer_done(producer);
+        if producer_live {
+            let got_slot = {
+                let n = self
+                    .loc_waiter_n
                     .entry(location)
-                    .or_insert_with(|| AtomicUsize::new(consumer));
-                e.fetch_max(consumer, Ordering::Relaxed);
+                    .or_insert_with(|| AtomicUsize::new(0));
+                loop {
+                    let cur = n.load(Ordering::Relaxed);
+                    if cur >= w_max {
+                        break false;
+                    }
+                    match n.compare_exchange_weak(
+                        cur,
+                        cur + 1,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break true,
+                        Err(_) => {}
+                    }
+                }
+            };
+            if got_slot {
+                self.note_consumer_on(consumer, producer, Some(location));
+                {
+                    let e = self
+                        .loc_tip
+                        .entry(location)
+                        .or_insert_with(|| AtomicUsize::new(consumer));
+                    e.fetch_max(consumer, Ordering::Relaxed);
+                }
+                return true;
             }
-            return true;
         }
         let loc_tip = self
             .loc_tip
@@ -911,28 +920,32 @@ impl ReadyEdgeTable {
                 .overflow_tip
                 .entry(location)
                 .or_insert_with(|| AtomicUsize::new(NONE));
-            let mut cur = e.load(Ordering::Relaxed);
             loop {
+                let cur = e.load(Ordering::Relaxed);
+                if cur == consumer {
+                    break None;
+                }
                 let cand = if cur != NONE && cur < consumer && !self.is_writer_done(cur) {
-                    cur
+                    Some(cur)
                 } else if loc_tip < consumer && !self.is_writer_done(loc_tip) {
-                    loc_tip
-                } else if producer < consumer && !self.is_writer_done(producer) {
-                    producer
+                    Some(loc_tip)
+                } else if producer_live {
+                    Some(producer)
                 } else {
-                    return false;
+                    None
                 };
                 match e.compare_exchange_weak(cur, consumer, Ordering::Release, Ordering::Relaxed) {
                     Ok(_) => break cand,
-                    Err(v) => cur = v,
+                    Err(_) => {}
                 }
             }
         };
-        if self.should_plant_observed_waw(consumer, pred) {
-            self.note_consumer_on(consumer, pred, None);
-            true
-        } else {
-            false
+        match pred {
+            Some(p) if self.should_plant_observed_waw(consumer, p) => {
+                self.note_consumer_on(consumer, p, None);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -1528,6 +1541,27 @@ mod tests {
         t.note_producer_done(2, &wave);
         assert!(t.may_execute(3));
         assert!(!t.may_execute(4), "chain continues after loc-tip Commit");
+    }
+
+    #[test]
+    fn plant_window_rebinds_leftovers_after_producer_done() {
+        let t = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        let loc = 0xabc;
+        assert!(t.plant_observed_window(1, 0, loc, 1));
+        t.note_producer_done(0, &wave);
+        t.note_producer_done(1, &wave);
+        assert!(
+            !t.plant_observed_window(3, 0, loc, 1),
+            "first leftover is elected tip and must execute"
+        );
+        assert!(
+            t.plant_observed_window(5, 0, loc, 1),
+            "later leftover must wait on the elected tip — not Released-mill"
+        );
+        assert_eq!(t.blocking_producer(5), Some(3));
+        assert!(t.may_execute(3));
+        assert!(!t.may_execute(5));
     }
 
     #[test]

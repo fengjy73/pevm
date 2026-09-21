@@ -244,24 +244,13 @@ fn break_replay_mill(ctx: &ApplyCtx<'_>, f: &super::collateral::FirstConflict) {
     let producer = f
         .peer
         .or_else(|| ctx.mv_memory.last_writer_before(f.location, tx))
-        .filter(|&w| w < tx);
-    let Some(producer) = producer else {
-        return;
-    };
-    if ctx.specfence.ready_edges.is_writer_done(producer) {
-        return;
-    }
-    if ctx
+        .filter(|&w| w < tx)
+        .unwrap_or(tx);
+    let w_max = ArmTable::w_max(ctx.scheduler.block_size(), 0, false) as usize;
+    let _ = ctx
         .specfence
         .ready_edges
-        .blocking_producer(tx)
-        .is_some_and(|w| w >= producer)
-    {
-        return;
-    }
-    ctx.specfence
-        .ready_edges
-        .note_consumer_on(tx, producer, None);
+        .plant_observed_window(tx, producer, f.location, w_max);
 }
 
 fn seed_short_edge(
