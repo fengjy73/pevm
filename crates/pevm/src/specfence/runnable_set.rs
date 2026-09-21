@@ -389,14 +389,12 @@ impl RunnableSet {
                 }
             }
             if scheduler.is_executing(tx) && st != ST_RUNNING {
-                if ready
-                    .blocking_producer(tx)
-                    .is_some_and(|w| !scheduler.is_done(w))
-                {
-                    continue;
-                }
-                // True-idle leftover only — any live Executing owner is ST_RUNNING.
-                if scheduler.has_unfinished() && self.width() + self.q_revalidate.len() > 0 {
+                // WaitForDependency leftover: worker already left. Skip only
+                // when the Detect producer still has a live ST_RUNNING owner.
+                if ready.blocking_producer(tx).is_some_and(|w| {
+                    !scheduler.is_done(w)
+                        && self.state[w].load(Ordering::Acquire) == ST_RUNNING
+                }) {
                     continue;
                 }
                 if scheduler.recover_executing_waiter(tx) {
