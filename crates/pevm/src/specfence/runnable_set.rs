@@ -389,8 +389,12 @@ impl RunnableSet {
                 }
             }
             if scheduler.is_executing(tx) && st != ST_RUNNING {
-                // WaitForDependency leftover: worker already left. Skip only
-                // when the Detect producer still has a live ST_RUNNING owner.
+                // WaitForDependency leftover: worker already left. Do not
+                // recover into a live antichain (390% execute-park mill).
+                // True-idle recover is the pending_work==0 pass below.
+                if self.pending_work() > 0 {
+                    continue;
+                }
                 if ready.blocking_producer(tx).is_some_and(|w| {
                     !scheduler.is_done(w)
                         && self.state[w].load(Ordering::Acquire) == ST_RUNNING
