@@ -500,9 +500,10 @@ impl RunnableSet {
                 }
             }
             if n == 0 && !any_running && scheduler.has_unfinished() {
-                // PC-5 nuclear: leftover wait-set, nobody runnable, nobody
-                // in-flight. Drop every false gate and rejoin Q_indep.
-                let freed = ready.collapse_false_gates(|_| false);
+                // PC-5: leftover gate only when the producer is gone.
+                // ` |_| false` ungated waiters of a still-Ready producer and
+                // re-armed the 1-core Opt mill (19469101).
+                let freed = ready.collapse_false_gates(|w| !scheduler.is_done(w));
                 for tx in freed {
                     if scheduler.is_aborting(tx) {
                         let _ = scheduler.recover_aborting(tx);
