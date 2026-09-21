@@ -296,7 +296,9 @@ impl RunnableSet {
         kind: QueueKind,
         ready: &ReadyEdgeTable,
     ) -> Option<SfPick> {
-        if ready.leftover_surplus(tx) || (ready.is_gated(tx) && !ready.may_execute(tx)) {
+        if !ready.leftover_min_on_skippable_gate(tx)
+            && (ready.leftover_surplus(tx) || (ready.is_gated(tx) && !ready.may_execute(tx)))
+        {
             ready.note_skip_gate(tx);
             self.mark_wait(tx);
             self.refuse_fill_n.fetch_add(1, Ordering::Relaxed);
@@ -328,10 +330,36 @@ impl RunnableSet {
         })
     }
 
+    /// `Aborting` parked on a still-unpublished writer must not incarnation++.
+    /// Nudge that writer instead (19807137 root_inc mill).
+    fn recover_aborting_unless_parked(
+        &self,
+        tx: TxIdx,
+        ready: &ReadyEdgeTable,
+        scheduler: &Scheduler,
+    ) -> bool {
+        if let Some(b) = scheduler.live_block(tx) {
+            if b < self.block_size && self.state[b].load(Ordering::Acquire) != ST_RUNNING {
+                if scheduler.is_ready(b) || scheduler.is_executed(b) {
+                    self.requeue_ready(b, ready);
+                }
+            }
+            return false;
+        }
+        scheduler.recover_aborting(tx)
+    }
+
     fn requeue_ready(&self, tx: TxIdx, ready: &ReadyEdgeTable) {
         // Gated !may_execute on a queue is the 19807137 refuse mill:
         // pick mark_waits, heal force_pushes, pending stays ~60, idle
         // ungate never runs.
+        if ready.leftover_min_on_skippable_gate(tx) {
+            let st = self.state[tx].load(Ordering::Acquire);
+            if st != ST_RUNNING && st != ST_DONE {
+                self.force_push(tx, QueueKind::Indep);
+            }
+            return;
+        }
         if ready.leftover_surplus(tx) || (ready.is_gated(tx) && !ready.may_execute(tx)) {
             self.mark_wait(tx);
             return;
@@ -373,7 +401,7 @@ impl RunnableSet {
                 continue;
             }
             if scheduler.is_aborting(tx) {
-                let _ = scheduler.recover_aborting(tx);
+                let _ = self.recover_aborting_unless_parked(tx, ready, scheduler);
             } else if scheduler.is_executing(tx) {
                 let _ = scheduler.recover_executing_waiter(tx);
             }
@@ -387,7 +415,7 @@ impl RunnableSet {
         }
         for tx in freed {
             if scheduler.is_aborting(tx) {
-                let _ = scheduler.recover_aborting(tx);
+                let _ = self.recover_aborting_unless_parked(tx, ready, scheduler);
             } else if scheduler.is_executing(tx) {
                 let _ = scheduler.recover_executing_waiter(tx);
             }
@@ -412,7 +440,9 @@ impl RunnableSet {
                 n += 1;
                 continue;
             }
-            if scheduler.is_aborting(tx) && scheduler.recover_aborting(tx) {
+            if scheduler.is_aborting(tx)
+                && self.recover_aborting_unless_parked(tx, ready, scheduler)
+            {
                 self.requeue_ready(tx, ready);
                 n += 1;
                 continue;
@@ -422,7 +452,11 @@ impl RunnableSet {
                 n += 1;
                 continue;
             }
-            if scheduler.is_ready(tx) && (ready.may_execute(tx) || ready.has_known_waiters(tx)) {
+            if scheduler.is_ready(tx)
+                && (ready.may_execute(tx)
+                    || ready.has_known_waiters(tx)
+                    || ready.leftover_min_on_skippable_gate(tx))
+            {
                 self.requeue_ready(tx, ready);
                 n += 1;
             }
@@ -493,7 +527,7 @@ impl RunnableSet {
         });
         for tx in freed {
             if scheduler.is_aborting(tx) {
-                let _ = scheduler.recover_aborting(tx);
+                let _ = self.recover_aborting_unless_parked(tx, ready, scheduler);
             } else if scheduler.is_executing(tx) {
                 let _ = scheduler.recover_executing_waiter(tx);
             }
@@ -527,7 +561,7 @@ impl RunnableSet {
                     if !ready.is_gated(tx) && self.pending_work() > 0 {
                         continue;
                     }
-                    if scheduler.recover_aborting(tx) {
+                    if self.recover_aborting_unless_parked(tx, ready, scheduler) {
                         self.requeue_ready(tx, ready);
                         n += 1;
                     }
@@ -546,7 +580,7 @@ impl RunnableSet {
                         continue;
                     }
                     Some(w) if scheduler.is_done(w) => {
-                        if scheduler.recover_aborting(tx) {
+                        if self.recover_aborting_unless_parked(tx, ready, scheduler) {
                             self.requeue_ready(tx, ready);
                             n += 1;
                         }
@@ -555,7 +589,9 @@ impl RunnableSet {
                     // True idle only. Detect naming another Aborting leftover
                     // (8-core 19469101 pending=0) still recovers here.
                     _ => {
-                        if self.pending_work() == 0 && scheduler.recover_aborting(tx) {
+                        if self.pending_work() == 0
+                            && self.recover_aborting_unless_parked(tx, ready, scheduler)
+                        {
                             self.requeue_ready(tx, ready);
                             n += 1;
                         }
@@ -603,6 +639,11 @@ impl RunnableSet {
                 continue;
             }
             if st == ST_WAIT && !ready.may_execute(tx) {
+                if ready.leftover_min_on_skippable_gate(tx) {
+                    self.requeue_ready(tx, ready);
+                    n += 1;
+                    continue;
+                }
                 if let Some(w) = ready.blocking_producer(tx)
                     && scheduler.is_done(w)
                 {
@@ -628,7 +669,7 @@ impl RunnableSet {
             if let Some(next) = ready.take_finished_leftover_min(|t| scheduler.is_validated(t)) {
                 if !scheduler.is_validated(next) {
                     if scheduler.is_aborting(next) {
-                        let _ = scheduler.recover_aborting(next);
+                        let _ = self.recover_aborting_unless_parked(next, ready, scheduler);
                     } else if scheduler.is_executing(next) {
                         let _ = scheduler.recover_executing_waiter(next);
                     }
@@ -660,14 +701,16 @@ impl RunnableSet {
                     let live_owner = ready.blocking_producer(tx).is_some_and(|w| {
                         !scheduler.is_done(w) && self.state[w].load(Ordering::Acquire) == ST_RUNNING
                     });
-                    if !live_owner && scheduler.recover_aborting(tx) {
+                    if !live_owner && self.recover_aborting_unless_parked(tx, ready, scheduler) {
                         self.requeue_ready(tx, ready);
                         n += 1;
                     }
                 } else if scheduler.is_executed(tx) {
                     self.force_push(tx, QueueKind::Revalidate);
                     n += 1;
-                } else if scheduler.is_ready(tx) && ready.may_execute(tx) {
+                } else if scheduler.is_ready(tx)
+                    && (ready.may_execute(tx) || ready.leftover_min_on_skippable_gate(tx))
+                {
                     self.requeue_ready(tx, ready);
                     n += 1;
                 }
@@ -679,7 +722,7 @@ impl RunnableSet {
                 let freed = ready.collapse_false_gates(|w| !scheduler.is_done(w));
                 for tx in freed {
                     if scheduler.is_aborting(tx) {
-                        let _ = scheduler.recover_aborting(tx);
+                        let _ = self.recover_aborting_unless_parked(tx, ready, scheduler);
                     } else if scheduler.is_executing(tx) {
                         let _ = scheduler.recover_executing_waiter(tx);
                     }
@@ -734,6 +777,15 @@ impl RunnableSet {
     #[inline]
     pub(crate) fn is_running(&self, tx: TxIdx) -> bool {
         tx < self.block_size && self.state[tx].load(Ordering::Acquire) == ST_RUNNING
+    }
+
+    /// Hang-trace: runnable state byte (`ST_*`).
+    #[inline]
+    pub(crate) fn hang_state(&self, tx: TxIdx) -> u8 {
+        if tx >= self.block_size {
+            return 0xff;
+        }
+        self.state[tx].load(Ordering::Acquire)
     }
 
     #[inline]

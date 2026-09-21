@@ -121,6 +121,11 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
                 ctx.specfence.metrics.record_partial_retry();
                 ctx.specfence.partial_retry.mark_needs_live_capture(tx);
             }
+            // Partial rewind drops the publish. Leaving the edge done-bit set
+            // made `note_consumer_on` bail (`is_writer_done`) while
+            // `add_dependency` still parked, and heal incarnation-milled
+            // (19807137 root_inc tens of thousands on a Ready passed writer).
+            ctx.specfence.ready_edges.note_abort_reincarnate(tx);
             ctx.scheduler
                 .finish_validation_sf(ctx.tx_version, true, Some(tx + 1));
             ctx.specfence.ready_edges.clear_started(tx);

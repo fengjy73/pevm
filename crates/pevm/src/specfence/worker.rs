@@ -38,9 +38,85 @@ pub(crate) fn run_sf_block<F, V>(
             let (n_min, n_tip, n_ov) = specfence.ready_edges.hang_plant_n();
             let (g_min, g_chain) = specfence.ready_edges.hang_global_leftover();
             let (min_done, min_run, min_pred) = specfence.ready_edges.hang_leftover_min_status();
+            let (pred_passed, pred_surplus, pred_claim, pred_done, pred_gated, pred_may) =
+                specfence.ready_edges.hang_pred_flags(min_pred);
+            let pred_st = if min_pred == usize::MAX {
+                "-"
+            } else if scheduler.is_validated(min_pred) {
+                "val"
+            } else if scheduler.is_executed(min_pred) {
+                "exed"
+            } else if scheduler.is_executing(min_pred) {
+                "exec"
+            } else if scheduler.is_aborting(min_pred) {
+                "abt"
+            } else if scheduler.is_ready(min_pred) {
+                "rdy"
+            } else {
+                "?"
+            };
             let n_unf = (0..scheduler.block_size())
                 .filter(|&t| !scheduler.is_validated(t))
                 .count();
+            let chain = specfence.ready_edges.hang_block_chain(g_min);
+            let depth = chain.len();
+            let root = chain.last().map(|(tx, _)| *tx).unwrap_or(usize::MAX);
+            let (root_inc, root_dep, root_wfd) = if root == usize::MAX {
+                (0, usize::MAX, usize::MAX)
+            } else {
+                scheduler.hang_dep_of(root)
+            };
+            let dep_st = if root_dep == usize::MAX {
+                "-".to_string()
+            } else {
+                let (p, s, c, d, g, m) = specfence.ready_edges.hang_pred_flags(root_dep);
+                let (dep_inc, _, _) = scheduler.hang_dep_of(root_dep);
+                format!(
+                    "{root_dep}:{}/{dep_inc}/rst{} p/s/c/d/g/m={}/{}/{}/{}/{}/{}",
+                    hang_sched(scheduler, root_dep),
+                    runnable.hang_state(root_dep),
+                    u8::from(p),
+                    u8::from(s),
+                    u8::from(c),
+                    u8::from(d),
+                    u8::from(g),
+                    u8::from(m),
+                )
+            };
+            let passed_hop = chain
+                .iter()
+                .find_map(|(tx, _)| specfence.ready_edges.leftover_passed(*tx).then_some(*tx));
+            let surplus_hop = chain
+                .iter()
+                .find_map(|(tx, _)| specfence.ready_edges.leftover_surplus(*tx).then_some(*tx));
+            let chain_s: String = chain
+                .iter()
+                .rev()
+                .take(3)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .map(|(tx, pred)| {
+                    let (p, s, c, d, g, m) = specfence.ready_edges.hang_pred_flags(*tx);
+                    format!(
+                        "{tx}->{} st={} rst={} p/s/c/d/g/m={}/{}/{}/{}/{}/{}",
+                        if *pred == usize::MAX {
+                            "-".to_string()
+                        } else {
+                            pred.to_string()
+                        },
+                        hang_sched(scheduler, *tx),
+                        runnable.hang_state(*tx),
+                        u8::from(p),
+                        u8::from(s),
+                        u8::from(c),
+                        u8::from(d),
+                        u8::from(g),
+                        u8::from(m),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
             let min_st = if g_min == usize::MAX {
                 "none"
             } else if scheduler.is_validated(g_min) {
@@ -57,7 +133,7 @@ pub(crate) fn run_sf_block<F, V>(
                 "?"
             };
             eprintln!(
-                "sf-hang-trace spins={spins} pending={} q_i/r/o/v={}/{}/{}/{} unfinished={} validated={} gated={} live_wait={} refuse={} leftover_min={} loc_tip={} overflow_tip={} glob_min={} glob_chain={} min_done={} min_exec={} min_pred={} min_st={} n_unf={} n_run={}",
+                "sf-hang-trace spins={spins} pending={} q_i/r/o/v={}/{}/{}/{} unfinished={} validated={} gated={} live_wait={} refuse={} leftover_min={} loc_tip={} overflow_tip={} glob_min={} glob_chain={} min_done={} min_exec={} min_pred={} min_st={} pred_passed={} pred_surp={} pred_claim={} pred_done={} pred_gated={} pred_may={} pred_st={} n_unf={} n_run={} depth={depth} root_inc={root_inc} root_dep={root_dep} dep=[{dep_st}] root_wfd={root_wfd} passed_hop={passed_hop:?} surplus_hop={surplus_hop:?} tail=[{chain_s}]",
                 runnable.pending_work(),
                 runnable.q_indep_len(),
                 runnable.q_released_len(),
@@ -77,6 +153,13 @@ pub(crate) fn run_sf_block<F, V>(
                 min_run,
                 min_pred,
                 min_st,
+                pred_passed,
+                pred_surplus,
+                pred_claim,
+                pred_done,
+                pred_gated,
+                pred_may,
+                pred_st,
                 n_unf,
                 runnable.running_n(),
             );
@@ -238,6 +321,22 @@ pub(crate) fn run_sf_block<F, V>(
                 std::thread::yield_now();
             }
         }
+    }
+}
+
+fn hang_sched(scheduler: &Scheduler, tx: crate::TxIdx) -> &'static str {
+    if scheduler.is_validated(tx) {
+        "val"
+    } else if scheduler.is_executed(tx) {
+        "exed"
+    } else if scheduler.is_executing(tx) {
+        "exec"
+    } else if scheduler.is_aborting(tx) {
+        "abt"
+    } else if scheduler.is_ready(tx) {
+        "rdy"
+    } else {
+        "?"
     }
 }
 

@@ -939,6 +939,41 @@ impl ReadyEdgeTable {
         )
     }
 
+    /// Hang-trace: pred passed / surplus / claimed / done / gated / may_execute.
+    #[inline]
+    pub(crate) fn hang_pred_flags(&self, pred: usize) -> (bool, bool, bool, bool, bool, bool) {
+        if pred == NONE {
+            return (false, false, false, false, false, false);
+        }
+        (
+            self.leftover_passed(pred),
+            self.leftover_surplus(pred),
+            self.leftover_claim_has(pred),
+            self.is_writer_done(pred),
+            self.is_gated(pred),
+            self.may_execute(pred),
+        )
+    }
+
+    /// Hang-trace: walk `start ← pred ← …` (at most 48). Each entry is
+    /// `(tx, blocking_pred or NONE)`.
+    pub(crate) fn hang_block_chain(&self, start: TxIdx) -> Vec<(usize, usize)> {
+        let mut out = Vec::with_capacity(16);
+        if start == NONE {
+            return out;
+        }
+        let mut tx = start;
+        for _ in 0..48 {
+            let pred = self.blocking_producer(tx).unwrap_or(NONE);
+            out.push((tx, pred));
+            if pred == NONE || pred >= tx {
+                break;
+            }
+            tx = pred;
+        }
+        out
+    }
+
     /// Newest still-live waiter reachable from `start` with index `< before`.
     /// Overflow plants must chain, not star on one tip — a star wakes
     /// every leftover writer at once (19807137 ~40 Released mill).
@@ -1219,6 +1254,17 @@ impl ReadyEdgeTable {
     #[inline]
     pub(crate) fn leftover_min_skips_blocker(&self, writer: TxIdx) -> bool {
         self.leftover_surplus(writer) || self.leftover_passed(writer)
+    }
+
+    /// leftover_min is Detect-gated on a leftover-passed or surplus writer.
+    /// Pick may run it; `may_execute` stays false so drain does not
+    /// `force_push` a live execute (3356896 / 6196166 heap).
+    #[inline]
+    pub(crate) fn leftover_min_on_skippable_gate(&self, tx: TxIdx) -> bool {
+        self.is_live_leftover_min(tx)
+            && self
+                .blocking_producer(tx)
+                .is_some_and(|w| self.leftover_min_skips_blocker(w))
     }
 
     /// leftover_min Detect-gated on leftover leftover_min passed — flush so
@@ -2205,7 +2251,7 @@ mod tests {
         t.flush_leftover_min_passed_pred();
         assert!(
             t.may_execute(205),
-            "flush leftover_min ← leftover-passed pred so leftover_min can commit"
+            "flush leftover_min ← leftover_passed pred so leftover_min can commit"
         );
         assert!(
             t.leftover_min_skips_blocker(204),

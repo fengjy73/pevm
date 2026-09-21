@@ -68,6 +68,10 @@ pub(crate) struct Scheduler {
     // The list of dependent transactions to resume when the
     // key transaction is re-executed.
     transactions_dependents: Vec<Mutex<SmallVec<[TxIdx; 1]>>>,
+    /// `add_dependency` target while status is `Aborting`. `usize::MAX` if none.
+    /// Heal must not `recover_aborting` (incarnation++) while this writer is
+    /// still unpublished — that mill hit 19807137 (`root_inc` tens of thousands).
+    blocked_on: Vec<AtomicUsize>,
     /// wait_for_dependency waiters: park without `Aborting`; wake keeps incarnation.
     wait_for_dependency_waiters: Vec<Mutex<SmallVec<[TxIdx; 1]>>>,
     // The next transaction to try and execute.
@@ -107,6 +111,9 @@ impl Scheduler {
             done_flags: (0..block_size).map(|_| AtomicBool::new(false)).collect(),
             validated_flags: (0..block_size).map(|_| AtomicBool::new(false)).collect(),
             transactions_dependents: (0..block_size).map(|_| Mutex::default()).collect(),
+            blocked_on: (0..block_size)
+                .map(|_| AtomicUsize::new(usize::MAX))
+                .collect(),
             wait_for_dependency_waiters: (0..block_size).map(|_| Mutex::default()).collect(),
             // We won't validate until we find the first non-lazy transaction that
             // needs to read explicit values. We also skip the first transaction.
@@ -524,6 +531,8 @@ impl Scheduler {
         debug_assert_eq!(tx.status, IncarnationStatus::Executing);
         tx.status = IncarnationStatus::Aborting;
         self.set_done_flag(tx_idx, false);
+        drop(tx);
+        self.blocked_on[tx_idx].store(blocking_tx_idx, Ordering::Release);
 
         let mut blocking_dependents = index_mutex!(self.transactions_dependents, blocking_tx_idx);
         blocking_dependents.push(tx_idx);
@@ -669,6 +678,23 @@ impl Scheduler {
         tx.status = IncarnationStatus::ReadyToExecute;
         tx.incarnation += 1;
         self.set_done_flag(tx_idx, false);
+        drop(tx);
+        self.blocked_on[tx_idx].store(usize::MAX, Ordering::Release);
+    }
+
+    /// Writer still owed by an `Aborting` park. `None` once that writer is
+    /// `Executed`/`Validated` or the park was cleared.
+    #[inline]
+    pub(crate) fn live_block(&self, tx_idx: TxIdx) -> Option<TxIdx> {
+        if tx_idx >= self.block_size {
+            return None;
+        }
+        let b = self.blocked_on[tx_idx].load(Ordering::Acquire);
+        if b >= self.block_size || self.is_done(b) {
+            None
+        } else {
+            Some(b)
+        }
     }
 
     /// A1/D6: pull the spine writer into the ready queue so WaitFor targets
@@ -864,6 +890,8 @@ impl Scheduler {
         tx.status = IncarnationStatus::ReadyToExecute;
         tx.incarnation += 1;
         self.set_done_flag(tx_idx, false);
+        drop(tx);
+        self.blocked_on[tx_idx].store(usize::MAX, Ordering::Release);
         true
     }
 
@@ -1041,6 +1069,9 @@ impl Scheduler {
         if aborting {
             tx.status = IncarnationStatus::Aborting;
             self.set_done_flag(tx_version.tx_idx, false);
+            drop(tx);
+            // Validation abort is not an `add_dependency` park.
+            self.blocked_on[tx_version.tx_idx].store(usize::MAX, Ordering::Release);
         }
         aborting
     }
@@ -1083,6 +1114,37 @@ impl Scheduler {
         }
         let tx = index_mutex!(self.transactions_status, tx_idx);
         tx.status == IncarnationStatus::Aborting
+    }
+
+    /// Hang-trace: incarnation and scheduler deps that name `waiter`.
+    pub(crate) fn hang_dep_of(&self, waiter: TxIdx) -> (usize, usize, usize) {
+        if waiter >= self.block_size {
+            return (0, usize::MAX, usize::MAX);
+        }
+        let inc = {
+            let tx = index_mutex!(self.transactions_status, waiter);
+            tx.incarnation
+        };
+        let mut dep = usize::MAX;
+        let mut wfd = usize::MAX;
+        for b in 0..self.block_size {
+            if dep == usize::MAX {
+                let deps = index_mutex!(self.transactions_dependents, b);
+                if deps.iter().any(|&t| t == waiter) {
+                    dep = b;
+                }
+            }
+            if wfd == usize::MAX {
+                let waits = index_mutex!(self.wait_for_dependency_waiters, b);
+                if waits.iter().any(|&t| t == waiter) {
+                    wfd = b;
+                }
+            }
+            if dep != usize::MAX && wfd != usize::MAX {
+                break;
+            }
+        }
+        (inc, dep, wfd)
     }
 
     /// Lost-wakeup recover: `Aborting` → Ready (incarnation++).
