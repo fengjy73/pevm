@@ -13,7 +13,7 @@ Lazy-update chains stay **not** OrderedAdmit objects. Ungated OCC task selection
 |----|---------|
 | **S1** | `skip_ungated_path_tax` is empty/short-chain wait-set on **every n** (thin included). `skip_ungated_tx_path_tax` is OCC-equivalent for every ungated tx. Leftover-long still keeps gated D1 / end_block. |
 | **S2** | Near-independent / lazy-update large: wait-set soft-cap 0; `skip_useless_cover_probe` bans cover plant / leftover-slide / pick-quantum flush. Thin `train_hat` stays `light_hat` (no 6137495 Win_16 climb). |
-| **S3** | Ungated skip path: no engagement stamp, no kernel-exec counter, no finegrain. Done-on-success stamp only when thin / leftover flush / live wait-set can plant. Mid/large empty wait-set does not stamp. |
+| **S3** | Ungated skip path: no engagement stamp, no kernel-exec counter, no finegrain. Order branches stay on gated txs. Done-on-success always stamps (iter11 flush race). |
 | **S4** | Thin reuse with empty/short-chain wait-set leans `end_block`. Thin / near-independent / lazy-update reuse skips writer-order snapshot, MV walk, and per-tx incarnation mutex walk. Mid-band real spines keep the walk so leftover unfenced still trains. |
 | **S5** | lazy never OrderedAdmit; L1 controlled cover probe on mid-band real spines; Done-on-success when a plant can race; Soft=0; professional terms. |
 

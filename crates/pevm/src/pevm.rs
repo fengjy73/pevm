@@ -631,30 +631,15 @@ impl Pevm {
                                     let next = self
                                         .try_execute(&mut vm, &scheduler, tx_version, None, None);
                                     if sf && scheduler.is_done(done_idx) {
-                                        // S3: Done-on-success when a later plant
-                                        // can race (thin storage-like D1, leftover
-                                        // flush, live wait-set). Mid/large empty
-                                        // wait-set with path-tax skip cannot plant.
+                                        // S5: Done-on-success always stamps.
                                         // O5 skip-when-!has_any_gated livelocked
                                         // iter11 (~400% spin) when a later flush
                                         // planted consumer→pred with done=false.
-                                        let need_stamp =
-                                            specfence.ready_edges.has_known_waiters(done_idx)
-                                                || specfence.ready_edges.has_pending_gated()
-                                                || specfence
-                                                    .policy
-                                                    .is_some_and(|p| p.need_ungated_done_stamp());
-                                        if need_stamp {
-                                            specfence
-                                                .ready_edges
-                                                .note_producer_done_stamp(done_idx);
-                                            if specfence.ready_edges.has_known_waiters(done_idx)
-                                                && let Some(w) = wave_ref
-                                            {
-                                                specfence
-                                                    .ready_edges
-                                                    .note_producer_done(done_idx, w);
-                                            }
+                                        specfence.ready_edges.note_producer_done_stamp(done_idx);
+                                        if specfence.ready_edges.has_known_waiters(done_idx)
+                                            && let Some(w) = wave_ref
+                                        {
+                                            specfence.ready_edges.note_producer_done(done_idx, w);
                                         }
                                     }
                                     next

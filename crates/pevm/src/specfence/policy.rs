@@ -1405,14 +1405,11 @@ impl CostPolicy {
         self.large_lazy_path_tax() || self.should_drop_noncritical_wait_set()
     }
 
-    /// S3: Done-on-success stamp is required when a later plant can race
-    /// (thin storage-like D1, leftover flush, live wait-set). Mid/large
-    /// empty wait-set with path-tax skip cannot D1-plant.
+    /// S5: Done-on-success always stamps. A later pick-quantum flush
+    /// can plant consumer→pred after an empty wait-set (iter11).
     #[inline]
     pub(crate) fn need_ungated_done_stamp(&self) -> bool {
-        self.is_optimistic_majority_block()
-            || self.has_pending_idle()
-            || !self.skip_ungated_path_tax()
+        true
     }
 
     /// Under-covered conflict spine: cover_window cannot absorb leftover.
@@ -6714,23 +6711,17 @@ mod tests {
     }
 
     #[test]
-    fn mid_large_empty_wait_set_skips_ungated_done_stamp() {
+    fn done_on_success_stamp_always() {
         let p = CostPolicy::new();
         p.begin_block_with_cores(1346, 8);
         assert!(
-            !p.need_ungated_done_stamp(),
-            "S3: large empty wait-set does not stamp ungated Done"
+            p.need_ungated_done_stamp(),
+            "S5: Done-on-success always stamps (iter11 flush race)"
         );
         p.begin_block_with_cores(176, 8);
-        assert!(
-            p.need_ungated_done_stamp(),
-            "S3: thin keeps Done-on-success (storage-like D1 can plant)"
-        );
+        assert!(p.need_ungated_done_stamp());
         p.begin_block_with_cores(430, 8);
         p.note_ordered_seed(20);
-        assert!(
-            p.need_ungated_done_stamp(),
-            "S3: leftover-long wait-set keeps Done-on-success"
-        );
+        assert!(p.need_ungated_done_stamp());
     }
 }
