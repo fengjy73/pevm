@@ -107,7 +107,9 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
             ctx.specfence.metrics.record_partial_abort_attempt();
             if ctx.scheduler.try_validation_abort(ctx.tx_version) {
                 let write_locations = ctx.mv_memory.write_locations(tx);
-                let estimated = ctx.mv_memory.invalidate_partial_suffix(tx, &write_locations);
+                let estimated = ctx
+                    .mv_memory
+                    .invalidate_partial_suffix(tx, &write_locations);
                 if !estimated.is_empty() {
                     ctx.specfence
                         .metrics
@@ -167,8 +169,7 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
             ctx.specfence.ready_edges.clear_started(tx);
             enqueue_higher_revalidate(&ctx, tx);
             // Observed WAW: wait for the producer instead of Opt ping-pong.
-            if ctx.specfence.ready_edges.is_gated(tx)
-                && !ctx.specfence.ready_edges.may_execute(tx)
+            if ctx.specfence.ready_edges.is_gated(tx) && !ctx.specfence.ready_edges.may_execute(tx)
             {
                 ctx.runnable.mark_wait(tx);
             } else {
@@ -241,9 +242,7 @@ fn plant_observed_waw(ctx: &ApplyCtx<'_>, f: &super::collateral::FirstConflict) 
         .ready_edges
         .should_plant_observed_waw(tx, pred)
     {
-        ctx.specfence
-            .ready_edges
-            .note_consumer_on(tx, pred, None);
+        ctx.specfence.ready_edges.note_consumer_on(tx, pred, None);
     }
 }
 
@@ -360,9 +359,7 @@ fn clear_retry(specfence: SpecFenceCtx<'_>, tx: crate::TxIdx) {
 }
 
 fn release_successors(ctx: &ApplyCtx<'_>, producer: crate::TxIdx) {
-    ctx.specfence
-        .ready_edges
-        .note_producer_done_stamp(producer);
+    ctx.specfence.ready_edges.note_producer_done_stamp(producer);
     if ctx.specfence.ready_edges.has_known_waiters(producer) {
         ctx.specfence
             .ready_edges
@@ -384,6 +381,10 @@ fn drain_wave_to_runnable(ctx: &ApplyCtx<'_>) {
     while let Some(t) = ctx.specfence.wave.pop_ready() {
         if ctx.scheduler.is_validated(t) {
             ctx.runnable.mark_done(t);
+            continue;
+        }
+        if ctx.specfence.ready_edges.is_gated(t) && !ctx.specfence.ready_edges.may_execute(t) {
+            ctx.runnable.mark_wait(t);
             continue;
         }
         let kind = if ctx.specfence.ready_edges.was_queued(t) {

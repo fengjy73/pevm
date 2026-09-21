@@ -181,6 +181,10 @@ fn drain_wave(specfence: SpecFenceCtx<'_>, scheduler: &Scheduler, runnable: &Run
         // force_push: the waiter may still be ST_RUNNING inside try_execute_sf
         // (add_dependency succeeded, Blocked not yet returned). push() would
         // refuse and drop the wake.
+        if specfence.ready_edges.is_gated(t) && !specfence.ready_edges.may_execute(t) {
+            runnable.mark_wait(t);
+            continue;
+        }
         let kind = if specfence.ready_edges.was_queued(t) {
             super::runnable_set::QueueKind::Ordered
         } else if specfence.ready_edges.is_gated(t) {

@@ -333,6 +333,13 @@ impl RunnableSet {
     }
 
     fn requeue_ready(&self, tx: TxIdx, ready: &ReadyEdgeTable) {
+        // Gated !may_execute on a queue is the 19807137 refuse mill:
+        // pick mark_waits, heal force_pushes, pending stays ~60, idle
+        // ungate never runs.
+        if ready.is_gated(tx) && !ready.may_execute(tx) {
+            self.mark_wait(tx);
+            return;
+        }
         if ready.was_queued(tx) {
             self.force_push(tx, QueueKind::Ordered);
         } else if ready.is_gated(tx) {
@@ -901,6 +908,33 @@ mod tests {
             "idle must free waiter of non-running producer, n={n}"
         );
         assert!(r.pending_work() > 0 || ready.may_execute(2) || sched.is_ready(0));
+    }
+
+    #[test]
+    fn heal_does_not_requeue_gated_unready() {
+        let ready = ReadyEdgeTable::new();
+        let sched = Scheduler::new(4);
+        let r = RunnableSet::new(4, 1);
+        ready.note_consumer_on(2, 0, None);
+        let _v0 = sched.try_execute_producer(0).unwrap();
+        r.mark_wait(0);
+        r.force_push(2, QueueKind::Released);
+        r.force_push(3, QueueKind::Indep);
+        assert!(!ready.may_execute(2));
+        let _ = r.heal(&ready, &sched);
+        while let Some(p) = r.pick(0, &ready) {
+            match p {
+                SfPick::Execute { tx, .. } => {
+                    assert_ne!(tx, 2, "gated !may_execute must stay off queues");
+                    r.mark_done(tx);
+                }
+                SfPick::Revalidate(tx) => r.mark_done(tx),
+            }
+        }
+        assert!(
+            !ready.may_execute(2) || r.pending_work() == 0,
+            "waiter 2 must not refuse-mill on Released"
+        );
     }
 
     #[test]
