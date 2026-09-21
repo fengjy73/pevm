@@ -357,9 +357,9 @@ impl RunnableSet {
         if (0..self.block_size).any(|t| self.state[t].load(Ordering::Acquire) == ST_RUNNING) {
             return 0;
         }
-        let freed = ready.collapse_false_gates(|w| {
-            scheduler.is_executing(w) && self.state[w].load(Ordering::Acquire) == ST_RUNNING
-        });
+        // Unfinished producers (incl. Aborting leftovers) stay live.
+        // Ungating their waiters into Q_indep is the incarnation++ mill.
+        let freed = ready.collapse_false_gates(|w| !scheduler.is_done(w));
         let mut n = 0;
         for tx in freed {
             if scheduler.is_aborting(tx) {
@@ -453,7 +453,10 @@ impl RunnableSet {
         }
         // PC-5: leftover gated bits with no live producer must rejoin Q_indep.
         let freed = ready.collapse_false_gates(|w| {
-            scheduler.is_executing(w) || scheduler.is_ready(w) || scheduler.is_executed(w)
+            scheduler.is_executing(w)
+                || scheduler.is_ready(w)
+                || scheduler.is_executed(w)
+                || scheduler.is_aborting(w)
         });
         for tx in freed {
             if scheduler.is_aborting(tx) {
@@ -479,6 +482,21 @@ impl RunnableSet {
                 continue;
             }
             if scheduler.is_aborting(tx) {
+                // Producer already published (or never gated): lost wake.
+                // Recovering an still-gated Aborting into a live antichain
+                // incarnation++ mills (6196166 reuse / 19807137 first SF).
+                if ready.may_execute(tx) {
+                    // Ungated Aborting + live antichain: add_dependency park
+                    // recovered too early (incarnation++ mill). Wait for idle.
+                    if !ready.is_gated(tx) && self.pending_work() > 0 {
+                        continue;
+                    }
+                    if scheduler.recover_aborting(tx) {
+                        self.requeue_ready(tx, ready);
+                        n += 1;
+                    }
+                    continue;
+                }
                 match ready.blocking_producer(tx) {
                     Some(w)
                         if scheduler.is_executing(w)
@@ -498,11 +516,10 @@ impl RunnableSet {
                         }
                         continue;
                     }
-                    // Lost add_dependency wake, or Detect names another
-                    // Aborting leftover (8-core 19469101: pending=0,
-                    // gated=false, unfinished). Recover when no live owner.
+                    // True idle only. Detect naming another Aborting leftover
+                    // (8-core 19469101 pending=0) still recovers here.
                     _ => {
-                        if scheduler.recover_aborting(tx) {
+                        if self.pending_work() == 0 && scheduler.recover_aborting(tx) {
                             self.requeue_ready(tx, ready);
                             n += 1;
                         }
@@ -860,6 +877,25 @@ mod tests {
             panic!("expected execute");
         };
         assert_eq!(tx, 4, "must skip gated !may_execute head 1");
+    }
+
+    #[test]
+    fn heal_does_not_recover_aborting_into_live_antichain() {
+        let ready = ReadyEdgeTable::new();
+        let sched = Scheduler::new(4);
+        let r = RunnableSet::new(4, 1);
+        let _v0 = sched.try_execute_producer(0).unwrap();
+        let _v1 = sched.try_execute_producer(1).unwrap();
+        assert!(sched.add_dependency(1, 0));
+        assert!(sched.is_aborting(1));
+        ready.note_consumer_on(1, 0, None);
+        r.mark_wait(1);
+        r.force_push(3, QueueKind::Indep);
+        let n = r.heal(&ready, &sched);
+        assert!(
+            sched.is_aborting(1),
+            "gated Aborting must wait for the producer, heal n={n}"
+        );
     }
 
     #[test]

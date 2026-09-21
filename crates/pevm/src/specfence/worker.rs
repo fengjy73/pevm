@@ -74,22 +74,25 @@ pub(crate) fn run_sf_block<F, V>(
                         // on RunnableSet before this worker spends time validating.
                         drain_wave(specfence, scheduler, runnable);
                         let (plan, invalid) = validate_to_plan(&tx_version, vis);
-                        resolve_plan::apply(
-                            plan,
-                            ApplyCtx {
-                                specfence,
-                                mv_memory,
-                                scheduler,
-                                runnable,
-                                arms,
-                                tx_version: &tx_version,
-                                vis,
-                                wrote_new_location,
-                                invalid: &invalid,
-                            },
-                        );
+                        resolve_plan::apply(plan, ApplyCtx {
+                            specfence,
+                            mv_memory,
+                            scheduler,
+                            runnable,
+                            arms,
+                            tx_version: &tx_version,
+                            vis,
+                            wrote_new_location,
+                            invalid: &invalid,
+                        });
                     }
-                    SfExec::Blocked => {
+                    SfExec::Blocked { on } => {
+                        // add_dependency parks leave Aborting with no Detect
+                        // edge. Heal then recovered them into a live antichain
+                        // (incarnation++ mill — 6196166 reuse 206k / 19807137).
+                        if let Some(w) = on {
+                            specfence.ready_edges.note_consumer_on(tx_idx, w, None);
+                        }
                         runnable.mark_wait(tx_idx);
                         drain_wave(specfence, scheduler, runnable);
                     }
@@ -100,20 +103,17 @@ pub(crate) fn run_sf_block<F, V>(
             Some(Task::Validation(tx_version)) => {
                 let vis = VisibilityPolicy::for_ready(specfence.ready_edges, tx_version.tx_idx);
                 let (plan, invalid) = validate_to_plan(&tx_version, vis);
-                resolve_plan::apply(
-                    plan,
-                    ApplyCtx {
-                        specfence,
-                        mv_memory,
-                        scheduler,
-                        runnable,
-                        arms,
-                        tx_version: &tx_version,
-                        vis,
-                        wrote_new_location: false,
-                        invalid: &invalid,
-                    },
-                );
+                resolve_plan::apply(plan, ApplyCtx {
+                    specfence,
+                    mv_memory,
+                    scheduler,
+                    runnable,
+                    arms,
+                    tx_version: &tx_version,
+                    vis,
+                    wrote_new_location: false,
+                    invalid: &invalid,
+                });
                 metrics.add_worker_busy_ns(t0.elapsed().as_nanos() as u64);
             }
             None => {
@@ -162,8 +162,13 @@ pub(crate) fn run_sf_block<F, V>(
 /// Execute outcome for the SF ring (no Block-STM next-task steal).
 #[derive(Debug)]
 pub(crate) enum SfExec {
-    Executed { wrote_new_location: bool },
-    Blocked,
+    Executed {
+        wrote_new_location: bool,
+    },
+    /// Parked. `on` is the scheduler-dependency producer when known.
+    Blocked {
+        on: Option<crate::TxIdx>,
+    },
     Fatal,
 }
 
@@ -199,5 +204,9 @@ mod tests {
         assert!(!code.contains(".next_task("));
         assert!(code.contains("run_sf_block"));
         assert!(code.contains("resolve_plan::apply"));
+        assert!(
+            code.contains("note_consumer_on"),
+            "Blocked parks must plant Detect so heal cannot incarnation++ mill"
+        );
     }
 }

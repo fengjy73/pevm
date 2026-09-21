@@ -56,10 +56,7 @@ pub(crate) fn pick(
     for _ in 0..16 {
         match runnable.pick(worker_i, ready) {
             Some(SfPick::Execute {
-                tx,
-                vis,
-                refused,
-                ..
+                tx, vis, refused, ..
             }) => {
                 if scheduler.is_validated(tx) {
                     runnable.mark_done(tx);
@@ -73,6 +70,9 @@ pub(crate) fn pick(
                         return Some(Task::Validation(v));
                     }
                     continue;
+                }
+                if scheduler.is_aborting(tx) && ready.may_execute(tx) {
+                    let _ = scheduler.recover_aborting(tx);
                 }
                 if let Some(tx_version) = scheduler.try_execute_producer(tx) {
                     if refused {
@@ -104,6 +104,9 @@ pub(crate) fn pick(
                         m.record_visibility(runnable.visibility(ready, tx));
                     }
                     return Some(Task::Validation(v));
+                }
+                if scheduler.is_aborting(tx) && ready.may_execute(tx) {
+                    let _ = scheduler.recover_aborting(tx);
                 }
                 if scheduler.is_ready(tx) {
                     if let Some(tx_version) = scheduler.try_execute_producer(tx) {

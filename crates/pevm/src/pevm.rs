@@ -1292,7 +1292,7 @@ impl Pevm {
         let mut retry_n = 0u32;
         loop {
             if retry_n > 16 {
-                return SfExec::Blocked;
+                return SfExec::Blocked { on: None };
             }
             if let Some((blocking_tx_idx, address)) = vm.hinted_wait_blocker(tx_version.tx_idx) {
                 if !scheduler.add_dependency(tx_version.tx_idx, blocking_tx_idx)
@@ -1302,7 +1302,9 @@ impl Pevm {
                     continue;
                 }
                 vm.record_wait_admission(address);
-                return SfExec::Blocked;
+                return SfExec::Blocked {
+                    on: Some(blocking_tx_idx),
+                };
             }
             if let Some(wave) = wave {
                 vm.try_apply_park_resume(tx_version.tx_idx, wave);
@@ -1351,7 +1353,11 @@ impl Pevm {
                         continue;
                     }
                     // Soft=0: do not park the worker; pick another runnable.
-                    SfExec::Blocked
+                    // Carry the producer so the worker plants Detect (heal
+                    // must not incarnation++ this Aborting into Q_indep).
+                    SfExec::Blocked {
+                        on: Some(blocking_tx_idx),
+                    }
                 }
                 Err(VmExecutionError::ExecutionError(err)) => {
                     scheduler.abort();
