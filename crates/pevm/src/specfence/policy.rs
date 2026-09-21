@@ -1737,11 +1737,14 @@ impl CostPolicy {
     /// A planted covering prefix (Win_2+) must not slide on the same
     /// block — 3356896 i=1 otherwise prepaid-blows ĉ and retreats to Opt.
     pub(crate) fn leftover_slide_ok(&self, location: MemoryLocationHash) -> bool {
-        // Mid/large never T3-slides. `is_midband_coverable` needs short_chain
+        // Mid-band never T3-slides. `is_midband_coverable` needs short_chain
         // n_pairs; first-pick flush can see n_pairs=0 and plant→refuse→flush
-        // livelock 19469101 (first iter, not only reuse). C4 deepens
-        // `cover_window` at end_block. Thin leftover-long may still slide.
-        if self.block_n() > THIN_N_MAX {
+        // livelock 19469101 (first iter). Large ERC-20 (fence-cover /
+        // subgrain n=768) may still slide a leaking loc unless the
+        // mid-band / planted-prefix rules below fire. Thin leftover-long
+        // may still slide. C4 deepens `cover_window` at end_block.
+        let n = self.block_n();
+        if n > THIN_N_MAX && n < LARGE_BLOCK_N {
             return false;
         }
         let n_pairs = self
@@ -5916,7 +5919,7 @@ mod tests {
         mid.begin_block_with_cores(469, 8);
         assert!(
             !mid.leftover_slide_ok(0xabc),
-            "19469101: mid/large never T3-slides even with empty short_chain"
+            "19469101: mid-band never T3-slides even with empty short_chain"
         );
     }
 
