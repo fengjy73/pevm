@@ -257,7 +257,13 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     self.specfence.ready_edges.was_queued(tx_idx),
                 );
             self.optimistic_majority_lazy = optimistic_majority_lazy;
-            self.is_lazy = already || optimistic_majority_lazy;
+            // Detect same-to fan-in (≥2) is lazy even when the majority-block
+            // flag is still cold. Otherwise a higher-idx first-touch Basic
+            // resets the lazy evaluation chain (iter11 24×hot).
+            let to_fanin = eoa
+                && self.specfence.mode == crate::ConcurrencyMode::SpecFence
+                && self.specfence.hints.to_txs(&to).len() >= 2;
+            self.is_lazy = already || optimistic_majority_lazy || to_fanin;
             if optimistic_majority_lazy && self.specfence.hints.prev(&tx.caller, tx_idx).is_some() {
                 self.specfence.metrics.record_commute_skip();
                 if let Some(p) = self.specfence.policy {
