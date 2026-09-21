@@ -696,6 +696,9 @@ impl ReadyEdgeTable {
         // next leftover from leftover_claimed — waiters of leftover_min
         // used to be surplus Detect-stars (19807137 leftover_min=405).
         self.clear_leftover_claim(writer);
+        // Wake only the next leftover when leftover_min itself commits.
+        // Pushing leftover_min on every producer-done raced a live execute
+        // and heap-aborted 6196166 (`double free` / `munmap_chunk`).
         let leftover_wake = if self.global_leftover_min.load(Ordering::Relaxed) == writer {
             let next = self.elect_next_leftover();
             let _ = self.global_leftover_min.compare_exchange(
@@ -709,10 +712,9 @@ impl ReadyEdgeTable {
             }
             next
         } else {
-            self.live_leftover_min()
+            NONE
         };
         self.mark_done(writer);
-        // Claim token: wake leftover_min even when no Detect gates exist.
         if leftover_wake != NONE && leftover_wake != writer && self.may_execute(leftover_wake) {
             wave.push_ready(leftover_wake);
         }
@@ -2085,6 +2087,28 @@ mod tests {
             "next leftover_min executes after the claim head commits"
         );
         assert!(t.leftover_surplus(60));
+    }
+
+    #[test]
+    fn leftover_wake_only_when_leftover_min_commits() {
+        let t = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        t.note_producer_done(0, &wave);
+        assert!(!t.plant_global_leftover(20));
+        assert!(t.plant_global_leftover(40));
+        while wave.pop_ready().is_some() {}
+        t.note_producer_done(5, &wave);
+        assert_eq!(
+            wave.pop_ready(),
+            None,
+            "non-min producer-done must not force_push leftover_min (619 heap)"
+        );
+        t.note_producer_done(20, &wave);
+        assert_eq!(
+            wave.pop_ready(),
+            Some(40),
+            "leftover_min commit elects the next leftover"
+        );
     }
 
     #[test]

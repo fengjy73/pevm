@@ -103,7 +103,14 @@ pub(crate) fn run_sf_block<F, V>(
             Some(Task::Execution(tx_version)) => {
                 let tx_idx = tx_version.tx_idx;
                 specfence.ready_edges.note_started(tx_idx);
-                let vis = VisibilityPolicy::for_ready(specfence.ready_edges, tx_idx);
+                // leftover_min must skip Estimate tips so nonce/fund
+                // Blocking(tx-1) on a done writer cannot ghost-Executing mill
+                // (19807137 leftover_min=514 n_unf=198). Not OCC pick.
+                let vis = if specfence.ready_edges.is_live_leftover_min(tx_idx) {
+                    VisibilityPolicy::WaitReleased
+                } else {
+                    VisibilityPolicy::for_ready(specfence.ready_edges, tx_idx)
+                };
                 match execute(tx_version.clone(), vis) {
                     SfExec::Executed { wrote_new_location } => {
                         // finish_execution may have waved dependents — park them

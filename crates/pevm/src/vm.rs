@@ -194,6 +194,8 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 .is_some_and(|p| p.skip_ungated_tx_path_tax())
             && !self.specfence.ready_edges.is_gated(tx_idx);
         self.vis = if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            // leftover_min → WaitReleased (for_ready). Worker vis was
+            // discarded here and leftover_min stayed Opt (19807137 ghost).
             VisibilityPolicy::for_ready(self.specfence.ready_edges, tx_idx)
         } else {
             VisibilityPolicy::Opt
@@ -823,6 +825,15 @@ impl<'a, S: Storage> VmDb<'a, S> {
         location_hash: MemoryLocationHash,
         writer: TxIdx,
     ) -> ReadError {
+        // leftover_min must not ghost-park on a done / later writer.
+        // InconsistentRead → Retry so the incarnation re-reads Data.
+        if self.specfence.ready_edges.is_live_leftover_min(self.tx_idx)
+            && (writer > self.tx_idx
+                || self.specfence.scheduler.is_done(writer)
+                || self.specfence.scheduler.is_validated(writer))
+        {
+            return ReadError::InconsistentRead;
+        }
         let pe_known = self.specfence.learner.location_predicted(location_hash)
             || self
                 .specfence
@@ -1883,14 +1894,21 @@ impl<S: Storage> Database for VmDb<'_, S> {
             // Check sender nonce
             account.nonce += nonce_addition;
             if self.has_nonce && location_hash == self.from_hash && self.tx.nonce != account.nonce {
-                return if self.tx_idx > 0 {
+                let pred_done =
+                    self.tx_idx > 0 && self.specfence.scheduler.is_done(self.tx_idx - 1);
+                let leftover_min = self.specfence.ready_edges.is_live_leftover_min(self.tx_idx);
+                if leftover_min && pred_done {
+                    // leftover_min must commit on a done prefix. Blocking(tx-1)
+                    // parks fail, leftover_min stays Executing, heal mills
+                    // (19807137 leftover_min=514 n_unf=198).
+                } else if self.tx_idx > 0 && !pred_done {
                     // TODO: Better retry strategy -- immediately, to the
                     // closest sender tx, to the missing sender tx, etc.
                     self.promote_on_conflict(address, location_hash);
-                    Err(ReadError::Blocking(self.tx_idx - 1))
+                    return Err(ReadError::Blocking(self.tx_idx - 1));
                 } else {
-                    Err(ReadError::InvalidNonce(self.tx_idx))
-                };
+                    return Err(ReadError::InvalidNonce(self.tx_idx));
+                }
             }
 
             // Fully evaluate the account and register it to read cache
@@ -3657,7 +3675,18 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         )
                     )
                 {
-                    Err(VmExecutionError::Blocking(tx_version.tx_idx - 1))
+                    let pred_done = self.specfence.scheduler.is_done(tx_version.tx_idx - 1);
+                    if self
+                        .specfence
+                        .ready_edges
+                        .is_live_leftover_min(tx_version.tx_idx)
+                        && pred_done
+                    {
+                        // leftover_min + done prefix: do not ghost-park.
+                        Err(VmExecutionError::Retry)
+                    } else {
+                        Err(VmExecutionError::Blocking(tx_version.tx_idx - 1))
+                    }
                 } else {
                     Err(VmExecutionError::ExecutionError(err))
                 }

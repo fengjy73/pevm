@@ -361,8 +361,7 @@ impl RunnableSet {
         if (0..self.block_size).any(|t| self.state[t].load(Ordering::Acquire) == ST_RUNNING) {
             return 0;
         }
-        let leftover_next =
-            ready.take_finished_leftover_min(|t| scheduler.is_validated(t));
+        let leftover_next = ready.take_finished_leftover_min(|t| scheduler.is_validated(t));
         // Keep unfinished producers. `is_executing && ST_RUNNING` is always
         // false here (we just proved no ST_RUNNING) and nuclear-ungated the
         // leftover chain into a 32-head Q_released mill (19807137). Ghost
@@ -626,9 +625,7 @@ impl RunnableSet {
         // / complete_arch idle-spin. A live owner is `ST_RUNNING`, not a
         // leftover Executing bit.
         if n == 0 && self.pending_work() == 0 {
-            if let Some(next) = ready
-                .take_finished_leftover_min(|t| scheduler.is_validated(t))
-            {
+            if let Some(next) = ready.take_finished_leftover_min(|t| scheduler.is_validated(t)) {
                 if !scheduler.is_validated(next) {
                     if scheduler.is_aborting(next) {
                         let _ = scheduler.recover_aborting(next);

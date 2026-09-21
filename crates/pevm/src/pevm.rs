@@ -1290,11 +1290,26 @@ impl Pevm {
         // OCC-style `continue` re-enters execute forever (19469101 1-core:
         // worker hang-trace never fires). Cap the same-thread retry.
         let mut retry_n = 0u32;
+        let leftover_min = vm.ready_edges().is_live_leftover_min(tx_version.tx_idx);
         loop {
             if retry_n > 16 {
+                // leftover_min park-failed on a done writer and stayed
+                // Executing (19807137 ghost mill n_unf=198). Ready it so
+                // heal cannot incarnation++ a leftover Executing leftover.
+                if leftover_min {
+                    let _ = scheduler.recover_executing_waiter(tx_version.tx_idx);
+                }
                 return SfExec::Blocked { on: None };
             }
             if let Some((blocking_tx_idx, address)) = vm.hinted_wait_blocker(tx_version.tx_idx) {
+                if leftover_min
+                    && (blocking_tx_idx > tx_version.tx_idx
+                        || scheduler.is_done(blocking_tx_idx)
+                        || scheduler.is_validated(blocking_tx_idx))
+                {
+                    retry_n += 1;
+                    continue;
+                }
                 if !scheduler.add_dependency(tx_version.tx_idx, blocking_tx_idx)
                     && self.abort_reason.get().is_none()
                 {
@@ -1343,6 +1358,18 @@ impl Pevm {
                     let park_kind = pending
                         .map(|p| p.kind)
                         .unwrap_or(crate::specfence::ParkKind::BlockingOther);
+                    // leftover_min must commit when the blocker is already
+                    // done (nonce / WaitForDependency on tx-1). Parking
+                    // fails, leftover_min stays Executing, heal mills
+                    // (19807137 leftover_min=514). Do not recover later.
+                    if leftover_min
+                        && (blocking_tx_idx > tx_version.tx_idx
+                            || scheduler.is_done(blocking_tx_idx)
+                            || scheduler.is_validated(blocking_tx_idx))
+                    {
+                        retry_n += 1;
+                        continue;
+                    }
                     let parked = if park_kind == crate::specfence::ParkKind::WaitForDependency {
                         scheduler.add_wait_for_dependency(tx_version.tx_idx, blocking_tx_idx)
                     } else {
