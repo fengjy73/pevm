@@ -451,6 +451,17 @@ impl ReadyEdgeTable {
 
     #[inline]
     fn mark_done(&self, writer: TxIdx) {
+        // heal_finished_preds stamps Done without note_producer_done.
+        // fetch_min leftover election then stays on a dead head
+        // (19807137 glob_min=121 min_done=true → 32-head mill).
+        if self.global_leftover_min.load(Ordering::Relaxed) == writer {
+            let _ = self.global_leftover_min.compare_exchange(
+                writer,
+                NONE,
+                Ordering::Release,
+                Ordering::Relaxed,
+            );
+        }
         let newly = {
             let i = writer / 64;
             if i < self.done_bits.len() {
@@ -740,8 +751,8 @@ impl ReadyEdgeTable {
             // leftover_min). `should_plant` skips a lower leftover plant, so
             // after this Done they would Opt-mill the leftover head
             // (19807137 glob_min=24 vs loc tips). Rebind onto the live min.
-            let min = self.global_leftover_min.load(Ordering::Relaxed);
-            if min != NONE && min < c && min != writer && !self.is_writer_done(min) {
+            let min = self.live_leftover_min();
+            if min != NONE && min < c && min != writer {
                 self.note_consumer_on(c, min, None);
             }
             if self.may_execute(c) {
@@ -1054,12 +1065,44 @@ impl ReadyEdgeTable {
         self.note_consumer_on(old_head, new_min, None);
     }
 
+    /// Live leftover head only. A sticky-done min makes every later plant
+    /// a no-op (`should_plant` / wake-rebind skip) and re-arms the Released mill.
+    fn live_leftover_min(&self) -> usize {
+        let m = self.global_leftover_min.load(Ordering::Relaxed);
+        if m == NONE || self.is_writer_done(m) {
+            NONE
+        } else {
+            m
+        }
+    }
+
+    fn install_leftover_min(&self, consumer: TxIdx) {
+        if self.is_writer_done(consumer) {
+            return;
+        }
+        loop {
+            let cur = self.global_leftover_min.load(Ordering::Relaxed);
+            let cur_live = cur != NONE && !self.is_writer_done(cur);
+            if cur_live && cur <= consumer {
+                return;
+            }
+            match self.global_leftover_min.compare_exchange_weak(
+                cur,
+                consumer,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(_) => {}
+            }
+        }
+    }
+
     /// One leftover writer executes at a time in the block. Per-ℓ election
     /// left 19807137 with ~23 Q_released tips (`leftover_min=23`).
     pub(crate) fn plant_global_leftover(&self, consumer: TxIdx) -> bool {
-        self.global_leftover_min
-            .fetch_min(consumer, Ordering::Relaxed);
-        let min = self.global_leftover_min.load(Ordering::Relaxed);
+        self.install_leftover_min(consumer);
+        let min = self.live_leftover_min();
         let (pred, stolen_head) = loop {
             let cur = self.global_leftover_chain.load(Ordering::Relaxed);
             if cur == consumer {
@@ -1807,6 +1850,24 @@ mod tests {
         );
         assert!(t.may_execute(24));
         assert!(!t.may_execute(100));
+    }
+
+    #[test]
+    fn plant_global_leftover_replaces_done_min() {
+        let t = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        t.note_producer_done(0, &wave);
+        assert!(!t.plant_global_leftover(20));
+        t.note_producer_done(20, &wave);
+        assert!(t.is_writer_done(20));
+        assert!(
+            !t.plant_global_leftover(40),
+            "next leftover must become the new live min, not wait on a done head"
+        );
+        assert!(t.may_execute(40));
+        assert!(t.plant_global_leftover(60));
+        assert_eq!(t.blocking_producer(60), Some(40));
+        assert!(!t.may_execute(60));
     }
 
     #[test]
