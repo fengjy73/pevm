@@ -1284,18 +1284,41 @@ impl ReadyEdgeTable {
         }
     }
 
-    /// One leftover writer executes at a time. Claim-only: record the
-    /// leftover and elect leftover_min. Do **not** Detect-star surplus
-    /// onto leftover_min — that wait-set let leftover_min add_dependency
-    /// park on a later waiter (19807137 leftover_min=405 n_unf=307).
-    /// Returns true when `consumer` is surplus (pick-refused).
+    /// One leftover writer executes at a time. Surplus is claim-refused.
+    /// Detect-star **only the next leftover** onto leftover_min — not the
+    /// whole wait-set (19807137 leftover_min=405 n_unf=307). Dropping
+    /// Detect entirely heap-aborted 6196166. Returns true when surplus.
     pub(crate) fn plant_global_leftover(&self, consumer: TxIdx) -> bool {
         if consumer == 0 || self.is_writer_done(consumer) {
             return false;
         }
         self.mark_leftover_claim(consumer);
         self.install_leftover_min(consumer);
-        self.leftover_surplus(consumer)
+        let min = self.live_leftover_min();
+        if min == NONE || min >= consumer {
+            return false;
+        }
+        if self.next_leftover_after(min) == Some(consumer)
+            && self.should_plant_observed_waw(consumer, min)
+        {
+            self.note_consumer_on(consumer, min, None);
+        }
+        true
+    }
+
+    fn next_leftover_after(&self, min: TxIdx) -> Option<TxIdx> {
+        for (wi, word) in self.leftover_bits.iter().enumerate() {
+            let mut bits = word.load(Ordering::Acquire);
+            while bits != 0 {
+                let b = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let c = wi * 64 + b;
+                if c > min && !self.is_writer_done(c) {
+                    return Some(c);
+                }
+            }
+        }
+        None
     }
 
     /// Keep at most `w_max` Detect waiters on `ℓ`. Evict oldest first,
@@ -2005,8 +2028,8 @@ mod tests {
         assert!(t.plant_global_leftover(60));
         assert_eq!(
             t.blocking_producer(60),
-            None,
-            "surplus leftover is claim-refused, not Detect-starred"
+            Some(40),
+            "immediate next leftover may Detect-wait leftover_min"
         );
         assert!(!t.may_execute(60));
         assert!(t.leftover_surplus(60));
@@ -2043,8 +2066,16 @@ mod tests {
         assert!(!t.plant_global_leftover(20));
         assert!(t.plant_global_leftover(40));
         assert!(t.plant_global_leftover(60));
-        assert_eq!(t.blocking_producer(40), None);
-        assert_eq!(t.blocking_producer(60), None);
+        assert_eq!(
+            t.blocking_producer(40),
+            Some(20),
+            "next leftover Detect-waits leftover_min"
+        );
+        assert_eq!(
+            t.blocking_producer(60),
+            None,
+            "surplus beyond next is claim-only, not Detect-starred"
+        );
         assert!(t.may_execute(20));
         assert!(!t.may_execute(40));
         assert!(!t.may_execute(60));
