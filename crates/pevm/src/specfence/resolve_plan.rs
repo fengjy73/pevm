@@ -140,7 +140,6 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
                 break_replay_mill(&ctx, &f);
             }
             plant_invalid_locs(&ctx);
-            let _ = ctx.specfence.ready_edges.plant_global_leftover(tx);
             ctx.scheduler
                 .finish_validation_sf(ctx.tx_version, true, Some(tx + 1));
             ctx.specfence.ready_edges.clear_started(tx);
@@ -174,7 +173,6 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
                 }
             }
             plant_invalid_locs(&ctx);
-            let _ = ctx.specfence.ready_edges.plant_global_leftover(tx);
             ctx.scheduler
                 .finish_validation_sf(ctx.tx_version, true, Some(tx + 1));
             ctx.specfence.ready_edges.clear_started(tx);
@@ -387,10 +385,7 @@ fn drain_wave_to_runnable(ctx: &ApplyCtx<'_>) {
             ctx.runnable.mark_done(t);
             continue;
         }
-        if ctx.specfence.ready_edges.gate_on_live_leftover(t)
-            || (ctx.specfence.ready_edges.is_gated(t)
-                && !ctx.specfence.ready_edges.may_execute(t))
-        {
+        if ctx.specfence.ready_edges.is_gated(t) && !ctx.specfence.ready_edges.may_execute(t) {
             ctx.runnable.mark_wait(t);
             continue;
         }
@@ -459,7 +454,7 @@ mod tests {
         assert!(code.contains("finish_validation_sf"));
         assert!(code.contains("release_successors"));
         assert!(
-            code.contains("should_plant_observed_waw"),
+            code.contains("plant_observed_window"),
             "mid-block WAW plant must stay windowed (no deep/fat spine)"
         );
         assert!(

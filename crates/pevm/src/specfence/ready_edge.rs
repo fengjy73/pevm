@@ -924,8 +924,13 @@ impl ReadyEdgeTable {
 
     /// Cap location waiters at `w_max` with an atomic slot, then chain
     /// surplus onto `overflow_tip`. After the original peer publishes,
-    /// leftover writers elect one live tip and chain — they must not all
-    /// requeue Released (19807137 ~40-head mill, `live_wait=false`).
+    /// leftover writers elect one live tip **on this ℓ** and chain.
+    ///
+    /// A block-wide leftover chain (every FullReplay → `plant_global` +
+    /// drain `gate_on_live_leftover`) serialized 6196166 onto leftover
+    /// min=18 (`n_unf=75`, `live_wait=true`) and DashMap-rebound first-wave
+    /// wakeups into a complete_arch heap abort. Cross-ℓ leftovers stay
+    /// independent; shared storage still serializes via `plant_invalid_locs`.
     /// Does not walk `waiters` / `queued_on` (those munmap'd FullReplay).
     pub(crate) fn plant_observed_window(
         &self,
@@ -972,28 +977,37 @@ impl ReadyEdgeTable {
                 }
                 return true;
             }
+            let loc_tip = self
+                .loc_tip
+                .get(&location)
+                .map(|e| e.load(Ordering::Relaxed))
+                .filter(|&t| t < consumer)
+                .unwrap_or(producer);
+            return self.chain_overflow(consumer, location, loc_tip, producer);
         }
-        if !producer_live {
-            return self.plant_global_leftover(consumer);
-        }
+        // Leftover: original peer already published. Prefer a live first-wave
+        // loc_tip; else elect leftover_min on this ℓ only.
         let loc_tip = self
             .loc_tip
             .get(&location)
             .map(|e| e.load(Ordering::Relaxed))
             .filter(|&t| t < consumer)
-            .unwrap_or(producer);
-        // Snapshot leftover_min *before* overflow_tip.entry — DashMap is not
-        // reentrant across maps on the same thread either when nested.
-        let steal_min = if producer_live {
-            NONE
-        } else {
-            let e = self
-                .leftover_min
-                .entry(location)
-                .or_insert_with(|| AtomicUsize::new(NONE));
-            e.fetch_min(consumer, Ordering::Relaxed);
-            e.load(Ordering::Relaxed)
-        };
+            .unwrap_or(NONE);
+        if loc_tip != NONE && !self.is_writer_done(loc_tip) {
+            return self.chain_overflow(consumer, location, loc_tip, loc_tip);
+        }
+        self.plant_leftover_on_loc(consumer, location)
+    }
+
+    /// Overflow chain: wait on the newest live overflow / loc_tip / fallback.
+    /// Snapshot preds before `overflow_tip.entry` — DashMap is not reentrant.
+    fn chain_overflow(
+        &self,
+        consumer: TxIdx,
+        location: MemoryLocationHash,
+        loc_tip: TxIdx,
+        fallback: TxIdx,
+    ) -> bool {
         let pred = {
             let e = self
                 .overflow_tip
@@ -1008,16 +1022,8 @@ impl ReadyEdgeTable {
                     Some(cur)
                 } else if loc_tip < consumer && !self.is_writer_done(loc_tip) {
                     Some(loc_tip)
-                } else if producer_live {
-                    Some(producer)
-                } else if cur != NONE && cur > consumer && !self.is_writer_done(cur) {
-                    if steal_min == consumer {
-                        None
-                    } else if steal_min < consumer && !self.is_writer_done(steal_min) {
-                        Some(steal_min)
-                    } else {
-                        None
-                    }
+                } else if fallback < consumer && !self.is_writer_done(fallback) {
+                    Some(fallback)
                 } else {
                     None
                 };
@@ -1036,6 +1042,46 @@ impl ReadyEdgeTable {
         }
     }
 
+    /// Per-ℓ leftover election. Replaces a done min (fetch_min-only stayed
+    /// sticky-done and re-armed the Released mill). Steal rebind happens
+    /// after the leftover_min shard is dropped.
+    fn plant_leftover_on_loc(&self, consumer: TxIdx, location: MemoryLocationHash) -> bool {
+        if self.is_writer_done(consumer) {
+            return false;
+        }
+        let (min, stolen) = {
+            let e = self
+                .leftover_min
+                .entry(location)
+                .or_insert_with(|| AtomicUsize::new(NONE));
+            loop {
+                let cur = e.load(Ordering::Relaxed);
+                let cur_live = cur != NONE && !self.is_writer_done(cur);
+                if cur_live && cur <= consumer {
+                    break (cur, None);
+                }
+                match e.compare_exchange_weak(cur, consumer, Ordering::Release, Ordering::Relaxed) {
+                    Ok(_) => {
+                        let stolen = if cur != NONE && cur > consumer && !self.is_writer_done(cur) {
+                            Some(cur)
+                        } else {
+                            None
+                        };
+                        break (consumer, stolen);
+                    }
+                    Err(_) => {}
+                }
+            }
+        };
+        if let Some(old) = stolen {
+            self.rebind_stolen_leftover_head(old, consumer);
+        }
+        if min == consumer || min == NONE || self.is_writer_done(min) {
+            return stolen.is_some();
+        }
+        self.chain_overflow(consumer, location, min, min)
+    }
+
     /// Previous leftover head stays Indep after a lower writer steals `min`.
     /// Both then Opt-execute (19807137 leftover mill / nuclear 32-head mill).
     fn rebind_stolen_leftover_head(&self, old_head: TxIdx, new_min: TxIdx) {
@@ -1048,8 +1094,9 @@ impl ReadyEdgeTable {
     /// Live leftover head only. A sticky-done min makes every later plant
     /// a no-op (`should_plant` / wake-rebind skip) and re-arms the Released mill.
     /// After a producer Done wake, bind the waiter onto the live leftover
-    /// head. Called from drain (not from `note_producer_done`) so DashMap
-    /// is not re-entered on the wake path (19807137 SEGV).
+    /// head. Kept for leftover-election unit tests; the product drain path
+    /// no longer rebinds first-wave onto a block-wide leftover min.
+    #[allow(dead_code)]
     pub(crate) fn gate_on_live_leftover(&self, tx: TxIdx) -> bool {
         let min = self.live_leftover_min();
         if min == NONE || min >= tx {
@@ -1795,29 +1842,35 @@ mod tests {
     }
 
     #[test]
-    fn plant_window_global_leftover_serializes_across_locs() {
+    fn plant_window_leftover_elections_are_per_location() {
         let t = ReadyEdgeTable::new();
         let wave = WaveParkTable::new();
         t.note_producer_done(0, &wave);
         assert!(
             !t.plant_observed_window(20, 0, 0xaaa, 1),
-            "first leftover across locs is the global tip"
+            "first leftover on ℓA is that loc's tip"
         );
         assert!(
-            t.plant_observed_window(40, 0, 0xbbb, 1),
-            "other-loc leftover must wait on the global chain"
+            !t.plant_observed_window(40, 0, 0xbbb, 1),
+            "other-loc leftover is a separate tip — not a block-wide chain"
         );
-        assert_eq!(t.blocking_producer(40), Some(20));
-        assert!(!t.may_execute(40));
+        assert_eq!(t.blocking_producer(40), None);
         assert!(t.may_execute(20));
+        assert!(t.may_execute(40));
+        assert!(
+            t.plant_observed_window(60, 0, 0xaaa, 1),
+            "same-ℓ leftover still waits on leftover_min"
+        );
+        assert_eq!(t.blocking_producer(60), Some(20));
+        assert!(!t.may_execute(60));
     }
 
     #[test]
-    fn first_wave_window_joins_global_leftover() {
+    fn first_wave_stays_on_original_producer() {
         let t = ReadyEdgeTable::new();
         let wave = WaveParkTable::new();
         t.note_producer_done(0, &wave);
-        assert!(!t.plant_global_leftover(24));
+        assert!(!t.plant_observed_window(24, 0, 0xdef, 1));
         assert!(t.plant_observed_window(100, 50, 0xabc, 1));
         assert_eq!(
             t.blocking_producer(100),
@@ -1826,16 +1879,11 @@ mod tests {
         );
         t.note_producer_done(50, &wave);
         assert!(
-            t.gate_on_live_leftover(100),
-            "drain-path leftover rebind after original Done"
-        );
-        assert_eq!(
-            t.blocking_producer(100),
-            Some(24),
-            "after original Done, first-wave must wait on leftover min"
+            t.may_execute(100),
+            "after original Done, first-wave is this ℓ's leftover tip — not rebound onto another loc"
         );
         assert!(t.may_execute(24));
-        assert!(!t.may_execute(100));
+        assert_eq!(t.blocking_producer(100), None);
     }
 
     #[test]
@@ -1872,7 +1920,10 @@ mod tests {
         );
         assert_eq!(t.blocking_producer(40), Some(10));
         assert!(t.may_execute(10));
-        assert!(!t.may_execute(40), "two leftover heads must not both execute");
+        assert!(
+            !t.may_execute(40),
+            "two leftover heads must not both execute"
+        );
     }
 
     #[test]
