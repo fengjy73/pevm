@@ -367,6 +367,22 @@ pub struct SpecFenceMetrics {
     pub refuse_fill_n: usize,
     /// SF-PS: mid-block IntraPatch promotes (≤1 per ℓ per block).
     pub mid_promote_n: usize,
+    /// SF-PS: IntraPatch promotes vetoed by PC (width would collapse).
+    pub mid_promote_veto_n: usize,
+    /// Learn E1: Commit on an edged location.
+    pub learn_e1_n: usize,
+    /// Learn E2: FullReplay / systematic reexec.
+    pub learn_e2_n: usize,
+    /// Learn E3: PartialAbort success.
+    pub learn_e3_n: usize,
+    /// Learn E4: refuse_fill that immediately ran an independent.
+    pub learn_e4_n: usize,
+    /// Learn E5: unfenced storm after prepaid → under-covered.
+    pub learn_e5_n: usize,
+    /// Learn E6: lazy / near-indep immediate Opt demote.
+    pub learn_e6_n: usize,
+    /// B4: ordered prior arms planted into CostPolicy before admit_seed.
+    pub prior_plant_n: usize,
     /// SF-PS: idle_core_ns / (idle_core_ns + worker_busy_ns).
     pub idle_core_frac: f64,
     /// SF-PS: ResolvePlan.apply invocations (must change queues/certs).
@@ -550,6 +566,14 @@ pub(crate) struct MetricsInner {
     steal_n: AtomicUsize,
     refuse_fill_n: AtomicUsize,
     mid_promote_n: AtomicUsize,
+    mid_promote_veto_n: AtomicUsize,
+    learn_e1_n: AtomicUsize,
+    learn_e2_n: AtomicUsize,
+    learn_e3_n: AtomicUsize,
+    learn_e4_n: AtomicUsize,
+    learn_e5_n: AtomicUsize,
+    learn_e6_n: AtomicUsize,
+    prior_plant_n: AtomicUsize,
     resolve_apply_n: AtomicUsize,
     sf_mv_wait_released_reads: AtomicUsize,
     sf_mv_ordered_tip_reads: AtomicUsize,
@@ -1105,16 +1129,33 @@ impl MetricsInner {
         steal_n: usize,
         refuse_fill_n: usize,
         mid_promote_n: usize,
+        mid_promote_veto_n: usize,
         explore_n: usize,
         began_from_prior: bool,
+        e1_n: usize,
+        e2_n: usize,
+        e3_n: usize,
+        e4_n: usize,
+        e5_n: usize,
+        e6_n: usize,
+        prior_plant_n: usize,
     ) {
         self.steal_n.store(steal_n, Ordering::Relaxed);
         self.refuse_fill_n
             .fetch_add(refuse_fill_n, Ordering::Relaxed);
         self.mid_promote_n.store(mid_promote_n, Ordering::Relaxed);
+        self.mid_promote_veto_n
+            .store(mid_promote_veto_n, Ordering::Relaxed);
         self.explore_n.store(explore_n, Ordering::Relaxed);
         self.began_from_prior
             .store(usize::from(began_from_prior), Ordering::Relaxed);
+        self.learn_e1_n.store(e1_n, Ordering::Relaxed);
+        self.learn_e2_n.store(e2_n, Ordering::Relaxed);
+        self.learn_e3_n.store(e3_n, Ordering::Relaxed);
+        self.learn_e4_n.store(e4_n, Ordering::Relaxed);
+        self.learn_e5_n.store(e5_n, Ordering::Relaxed);
+        self.learn_e6_n.store(e6_n, Ordering::Relaxed);
+        self.prior_plant_n.store(prior_plant_n, Ordering::Relaxed);
     }
 
     #[inline]
@@ -1595,6 +1636,14 @@ impl MetricsInner {
             steal_n: self.steal_n.load(Ordering::Relaxed),
             refuse_fill_n: self.refuse_fill_n.load(Ordering::Relaxed),
             mid_promote_n: self.mid_promote_n.load(Ordering::Relaxed),
+            mid_promote_veto_n: self.mid_promote_veto_n.load(Ordering::Relaxed),
+            learn_e1_n: self.learn_e1_n.load(Ordering::Relaxed),
+            learn_e2_n: self.learn_e2_n.load(Ordering::Relaxed),
+            learn_e3_n: self.learn_e3_n.load(Ordering::Relaxed),
+            learn_e4_n: self.learn_e4_n.load(Ordering::Relaxed),
+            learn_e5_n: self.learn_e5_n.load(Ordering::Relaxed),
+            learn_e6_n: self.learn_e6_n.load(Ordering::Relaxed),
+            prior_plant_n: self.prior_plant_n.load(Ordering::Relaxed),
             idle_core_frac: {
                 let idle = self.idle_core_ns.load(Ordering::Relaxed);
                 let busy = self.worker_busy_ns.load(Ordering::Relaxed);

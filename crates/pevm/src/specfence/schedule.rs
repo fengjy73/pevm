@@ -75,6 +75,9 @@ pub(crate) fn pick(
                     continue;
                 }
                 if let Some(tx_version) = scheduler.try_execute_producer(tx) {
+                    if refused {
+                        arms.note_e4();
+                    }
                     if let Some(m) = metrics {
                         m.record_visibility(vis);
                         if refused {

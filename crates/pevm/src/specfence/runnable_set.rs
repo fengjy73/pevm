@@ -340,6 +340,21 @@ impl RunnableSet {
         // leaves `may_execute=false` and workers yield-spin (~400% CPU).
         ready.heal_finished_preds(|w| scheduler.is_done(w));
         let mut n = 0;
+        // PC-5: leftover gated bits with no live producer must rejoin Q_indep.
+        let freed = ready.collapse_false_gates(|w| {
+            scheduler.is_executing(w) || scheduler.is_ready(w) || scheduler.is_executed(w)
+        });
+        for tx in freed {
+            if scheduler.is_aborting(tx) {
+                let _ = scheduler.recover_aborting(tx);
+            } else if scheduler.is_executing(tx) {
+                let _ = scheduler.recover_executing_waiter(tx);
+            }
+            if scheduler.is_ready(tx) || scheduler.is_executed(tx) {
+                self.requeue_ready(tx, ready);
+                n += 1;
+            }
+        }
         for tx in 0..self.block_size {
             let st = self.state[tx].load(Ordering::Acquire);
             if st == ST_DONE {
@@ -605,10 +620,14 @@ mod tests {
         let n = r.heal(&ready, &sched);
         assert!(n >= 1, "heal must requeue the released waiter, got {n}");
         assert!(ready.may_execute(2), "producer Done must open the edge");
-        assert!(matches!(
-            r.pick(0, &ready),
-            Some(SfPick::Execute { tx: 2, .. })
-        ));
+        let mut saw_waiter = false;
+        while let Some(SfPick::Execute { tx, .. }) = r.pick(0, &ready) {
+            if tx == 2 {
+                saw_waiter = true;
+                break;
+            }
+        }
+        assert!(saw_waiter, "healed waiter must be pickable from Q_*");
     }
 
     #[test]

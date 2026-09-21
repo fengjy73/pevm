@@ -496,6 +496,9 @@ impl Pevm {
             self.cost_policy
                 .begin_block_with_cores(block_size, concurrency_level.get());
             arms.begin_from_prior(&self.inter_prior, self.cost_policy.is_reuse_block());
+            // B4: Prior → CostPolicy.block_arm before admit_seed so wave-1
+            // hops_to_admit / Detect.G match ArmTable (not a cold re-select).
+            let _ = arms.install_prior_into_policy(&self.cost_policy, block_size);
             // Thin CallWaw chain needs hints only (P2: skip contract walk).
             // PROFILE Instant only (product path must not pay begin Instant).
             {
@@ -927,8 +930,16 @@ impl Pevm {
                 runnable.steal_n(),
                 runnable.refuse_fill_n(),
                 arms.mid_promote_n(),
+                arms.mid_promote_veto_n(),
                 arms.explore_n(),
                 arms.began_from_prior(),
+                arms.e1_n(),
+                arms.e2_n(),
+                arms.e3_n(),
+                arms.e4_n(),
+                arms.e5_n(),
+                arms.e6_n(),
+                arms.prior_plant_n(),
             );
             metrics_inner.add_idle_core_ns(ready_edges.idle_core_ns());
             let mut report = self.cost_policy.take_report(ready_w, idle);

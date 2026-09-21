@@ -690,9 +690,9 @@ impl ReadyEdgeTable {
                 let w = e.load(Ordering::Relaxed);
                 w == NONE || w >= tx_idx || self.is_writer_done(w)
             }
-            // Gated bit is stored *before* the consumer-map insert. Treat the
-            // window as not-ready so an OCC-class steal cannot pass the edge.
-            None => false,
+            // PC-5: leftover gated bit without a consumer map is not a
+            // refuse. The mark_gated→insert race is over after admit_seed.
+            None => true,
         }
     }
 
@@ -731,6 +731,69 @@ impl ReadyEdgeTable {
             .iter()
             .take(8)
             .any(|t| self.blocking_producer(*t).is_some_and(|w| is_executing(w)))
+    }
+
+    /// Consumers queued on `ℓ` (IntraPatch must not move strangers).
+    pub(crate) fn consumers_queued_on(&self, location: MemoryLocationHash) -> Vec<TxIdx> {
+        let mut out: Vec<TxIdx> = self
+            .queued_on
+            .iter()
+            .filter_map(|e| (*e.value() == location).then_some(*e.key()))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// PC-5: drop gates whose producer is gone or already published so
+    /// `pending_gated>0` cannot exist with an empty RunnableSet.
+    /// Returns the txs that became executable.
+    pub(crate) fn collapse_false_gates(
+        &self,
+        mut producer_live: impl FnMut(TxIdx) -> bool,
+    ) -> Vec<TxIdx> {
+        let mut freed = Vec::new();
+        let candidates: Vec<TxIdx> = self
+            .consumers
+            .iter()
+            .map(|e| *e.key())
+            .chain(self.sleeping.iter().map(|t| *t))
+            .collect();
+        let mut seen = std::collections::BTreeSet::new();
+        for tx in candidates {
+            if !seen.insert(tx) {
+                continue;
+            }
+            if !self.is_gated(tx) {
+                continue;
+            }
+            let live = self
+                .blocking_producer(tx)
+                .is_some_and(&mut producer_live);
+            if live {
+                continue;
+            }
+            self.ungate(tx);
+            freed.push(tx);
+        }
+        // Leftover gated bits with no consumer map (PC-5): do not invent
+        // pending_gated with nobody runnable.
+        if self.pending_gated.load(Ordering::Relaxed) > 0 {
+            for tx in 0..(GATED_WORDS * 64) {
+                if !seen.insert(tx) || !self.is_gated(tx) {
+                    continue;
+                }
+                let live = self
+                    .blocking_producer(tx)
+                    .is_some_and(&mut producer_live);
+                if live {
+                    continue;
+                }
+                self.ungate(tx);
+                freed.push(tx);
+            }
+        }
+        freed
     }
 
     /// I1: stamp preds that the scheduler already published. A pick-quantum
@@ -1112,5 +1175,43 @@ mod tests {
             !t.was_queued(9) && !t.was_queued(1),
             "P3 cap-drop must clear ReadyEdge membership so ungated execute is OCC-equivalent"
         );
+    }
+
+    #[test]
+    fn leftover_gated_bit_without_consumer_is_not_refuse() {
+        let t = ReadyEdgeTable::new();
+        t.mark_gated(7);
+        assert!(t.is_gated(7));
+        assert!(
+            t.may_execute(7),
+            "PC-5: leftover gated bit without a consumer map is not a refuse"
+        );
+        let freed = t.collapse_false_gates(|_| false);
+        assert!(
+            freed.contains(&7) || !t.is_gated(7),
+            "PC-5 collapse must drop leftover pending_gated"
+        );
+        assert!(!t.has_pending_gated());
+    }
+
+    #[test]
+    fn collapse_false_gates_frees_dead_producer() {
+        let t = ReadyEdgeTable::new();
+        t.note_consumer(3, 1);
+        assert!(!t.may_execute(3));
+        let freed = t.collapse_false_gates(|_| false);
+        assert!(freed.contains(&3));
+        assert!(t.may_execute(3));
+        assert!(!t.is_gated(3));
+    }
+
+    #[test]
+    fn consumers_queued_on_is_this_location_only() {
+        let t = ReadyEdgeTable::new();
+        t.note_consumer_on(3, 0, Some(11));
+        t.note_consumer_on(5, 1, Some(22));
+        assert_eq!(t.consumers_queued_on(11), vec![3]);
+        assert_eq!(t.consumers_queued_on(22), vec![5]);
+        assert!(t.consumers_queued_on(99).is_empty());
     }
 }

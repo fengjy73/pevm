@@ -53,6 +53,17 @@ impl ArmKind {
     pub(crate) fn is_full(self) -> bool {
         matches!(self, Self::Full)
     }
+
+    #[inline]
+    pub(crate) fn to_loc(self) -> LocStrategy {
+        match self {
+            Self::Opt => LocStrategy::OptimisticRead,
+            Self::Defer => LocStrategy::DeferPlant,
+            Self::Win { w } => LocStrategy::win(w as usize),
+            Self::Seg { s } => LocStrategy::seg(s as usize),
+            Self::Full => LocStrategy::FullChain,
+        }
+    }
 }
 
 /// Packed inter-block arm (prior).
@@ -98,9 +109,11 @@ pub(crate) struct ArmTable {
     e1_n: AtomicUsize,
     e2_n: AtomicUsize,
     e3_n: AtomicUsize,
+    e4_n: AtomicUsize,
     e5_n: AtomicUsize,
     e6_n: AtomicUsize,
     begin_from_prior: AtomicUsize,
+    prior_plant_n: AtomicUsize,
 }
 
 impl Default for ArmTable {
@@ -116,9 +129,11 @@ impl Default for ArmTable {
             e1_n: AtomicUsize::new(0),
             e2_n: AtomicUsize::new(0),
             e3_n: AtomicUsize::new(0),
+            e4_n: AtomicUsize::new(0),
             e5_n: AtomicUsize::new(0),
             e6_n: AtomicUsize::new(0),
             begin_from_prior: AtomicUsize::new(0),
+            prior_plant_n: AtomicUsize::new(0),
         }
     }
 }
@@ -158,8 +173,10 @@ impl ArmTable {
         self.e1_n.store(0, Ordering::Relaxed);
         self.e2_n.store(0, Ordering::Relaxed);
         self.e3_n.store(0, Ordering::Relaxed);
+        self.e4_n.store(0, Ordering::Relaxed);
         self.e5_n.store(0, Ordering::Relaxed);
         self.e6_n.store(0, Ordering::Relaxed);
+        self.prior_plant_n.store(0, Ordering::Relaxed);
         let snaps = prior.arm_snapshot();
         self.begin_from_prior
             .store(if snaps.is_empty() { 0 } else { 1 }, Ordering::Relaxed);
@@ -193,6 +210,39 @@ impl ArmTable {
                 }
             }
         }
+    }
+
+    /// B4: plant Prior arms into CostPolicy before `admit_seed` so wave-1
+    /// `hops_to_admit` / Detect.G match ArmTable (not a cold re-select).
+    /// Lazy / under-covered Full stay Opt. Thin caps `w`.
+    pub(crate) fn install_prior_into_policy(&self, policy: &CostPolicy, block_n: usize) -> usize {
+        let w_cap = Self::w_max(block_n, 0, false);
+        let mut planted = 0;
+        for e in self.entries.iter() {
+            let loc = *e.key();
+            if e.lazy || policy.loc_forbids_ordered(loc) {
+                policy.remember_arm(loc, LocStrategy::OptimisticRead);
+                continue;
+            }
+            if e.under_covered && e.arm.is_full() {
+                policy.remember_arm(loc, LocStrategy::OptimisticRead);
+                continue;
+            }
+            let mut arm = e.arm.to_loc();
+            if let LocStrategy::OrderedWindow { w } = arm {
+                arm = LocStrategy::win((w as usize).min(w_cap as usize));
+            }
+            if arm == LocStrategy::FullChain && block_n <= THIN_SHELL_N {
+                arm = LocStrategy::win(w_cap as usize);
+            }
+            policy.remember_arm(loc, arm);
+            if arm.is_ordered() {
+                policy.promote_short_edge(loc, 0);
+                planted += 1;
+            }
+        }
+        self.prior_plant_n.store(planted, Ordering::Relaxed);
+        planted
     }
 
     /// End: pack into inter-block prior. Thin / under-covered force Opt.
@@ -409,7 +459,7 @@ impl ArmTable {
                 continue;
             }
             let consumers: Vec<TxIdx> = ready
-                .blocked_consumers()
+                .consumers_queued_on(p.location)
                 .into_iter()
                 .filter(|&c| !ready.is_started(c))
                 .collect();
@@ -459,6 +509,29 @@ impl ArmTable {
         self.explore_n.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// E4: refuse_fill that immediately ran an independent (PC positive).
+    #[inline]
+    pub(crate) fn note_e4(&self) {
+        self.e4_n.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// E6 graph change: drop leftover OrderedAdmit on lazy ℓ and return
+    /// not-yet-started consumers to Q_indep. Observe already force_opt.
+    pub(crate) fn demote_lazy_graph(
+        &self,
+        loc: MemoryLocationHash,
+        ready: &ReadyEdgeTable,
+        runnable: &RunnableSet,
+    ) {
+        for c in ready.consumers_queued_on(loc) {
+            if ready.is_started(c) {
+                continue;
+            }
+            ready.ungate(c);
+            runnable.force_push(c, QueueKind::Indep);
+        }
+    }
+
     #[inline]
     pub(crate) fn e1_n(&self) -> usize {
         self.e1_n.load(Ordering::Relaxed)
@@ -467,6 +540,36 @@ impl ArmTable {
     #[inline]
     pub(crate) fn e2_n(&self) -> usize {
         self.e2_n.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn e3_n(&self) -> usize {
+        self.e3_n.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn e4_n(&self) -> usize {
+        self.e4_n.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn e5_n(&self) -> usize {
+        self.e5_n.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn e6_n(&self) -> usize {
+        self.e6_n.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn prior_plant_n(&self) -> usize {
+        self.prior_plant_n.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn arm_of(&self, loc: MemoryLocationHash) -> Option<ArmKind> {
+        self.entries.get(&loc).map(|e| e.arm)
     }
 }
 
@@ -508,5 +611,76 @@ mod tests {
         t.end_pack(&prior, 200);
         let snap = prior.arm_snapshot();
         assert!(snap.iter().any(|s| s.location == 3 && matches!(s.arm, ArmKind::Opt)));
+    }
+
+    #[test]
+    fn install_prior_seeds_policy_block_arm() {
+        let prior = InterBlockPrior::new();
+        prior.pack_arm_snapshot(vec![ArmSnap {
+            location: 0x32be,
+            arm: ArmKind::Win { w: 2 },
+            sticky: true,
+            under_covered: false,
+        }]);
+        let t = ArmTable::new();
+        t.begin_from_prior(&prior, true);
+        let p = CostPolicy::new();
+        p.begin_block(300);
+        p.note_short_pair(0x32be, 4, 31);
+        p.promote_short_edge(0x32be, 0);
+        let n = t.install_prior_into_policy(&p, 300);
+        assert!(n >= 1, "prior Win must plant into CostPolicy");
+        assert_eq!(p.loc_strategy(0x32be, 1), LocStrategy::win(2));
+        assert!(
+            p.hops_to_admit(0x32be, 1) > 0,
+            "B4: Prior arm must make wave-1 hops_to_admit > 0"
+        );
+        assert_eq!(t.explore_n(), 0);
+    }
+
+    #[test]
+    fn intra_patch_moves_only_this_location() {
+        let ready = ReadyEdgeTable::new();
+        ready.note_consumer_on(3, 0, Some(11));
+        ready.note_consumer_on(5, 1, Some(22));
+        let r = RunnableSet::new(8, 2);
+        r.push(3, QueueKind::Indep);
+        r.push(5, QueueKind::Indep);
+        r.push(6, QueueKind::Indep);
+        let t = ArmTable::new();
+        t.pending.lock().unwrap().push(IntraPatch {
+            location: 11,
+            new_arm: ArmKind::Win { w: 1 },
+        });
+        let applied = t.apply_pending_patches(&r, &ready, None, 2, 8);
+        assert_eq!(applied, 1);
+        assert_eq!(t.mid_promote_n(), 1);
+        // 5 is on a different ℓ — must stay independent, not WAIT.
+        let first = r.pick(2, &ready);
+        match first {
+            Some(super::super::runnable_set::SfPick::Execute { tx, .. }) => {
+                assert_ne!(tx, 3, "promoted consumer of ℓ=11 left Q_indep");
+            }
+            other => panic!("expected an independent execute, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pc_veto_when_width_would_collapse() {
+        let ready = ReadyEdgeTable::new();
+        ready.note_consumer_on(1, 0, Some(11));
+        ready.note_consumer_on(2, 0, Some(11));
+        let r = RunnableSet::new(4, 4);
+        r.push(1, QueueKind::Indep);
+        r.push(2, QueueKind::Indep);
+        let t = ArmTable::new();
+        t.pending.lock().unwrap().push(IntraPatch {
+            location: 11,
+            new_arm: ArmKind::Win { w: 1 },
+        });
+        let applied = t.apply_pending_patches(&r, &ready, None, 4, 4);
+        assert_eq!(applied, 0, "PC veto: width 2 − 2 < 4 cores");
+        assert_eq!(t.mid_promote_veto_n(), 1);
+        assert_eq!(t.mid_promote_n(), 0);
     }
 }

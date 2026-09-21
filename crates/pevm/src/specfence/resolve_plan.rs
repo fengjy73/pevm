@@ -180,6 +180,10 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
         ctx.scheduler.block_size(),
         ctx.invalid.len(),
     );
+    if lazy && let Some(l) = loc {
+        ctx.arms
+            .demote_lazy_graph(l, ctx.specfence.ready_edges, ctx.runnable);
+    }
 }
 
 fn seed_short_edge(
@@ -274,6 +278,14 @@ fn release_successors(ctx: &ApplyCtx<'_>, producer: crate::TxIdx) {
     }
     ctx.specfence.producer_stages.note_done(producer);
     drain_wave_to_runnable(ctx);
+    // IntraPatch at the release boundary (same rule as pick): ≤1 / ℓ / block.
+    let _ = ctx.arms.apply_pending_patches(
+        ctx.runnable,
+        ctx.specfence.ready_edges,
+        ctx.specfence.policy,
+        ctx.runnable.cores(),
+        ctx.scheduler.block_size(),
+    );
 }
 
 fn drain_wave_to_runnable(ctx: &ApplyCtx<'_>) {
