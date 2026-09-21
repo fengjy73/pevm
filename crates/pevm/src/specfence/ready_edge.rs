@@ -737,16 +737,26 @@ impl ReadyEdgeTable {
     /// flush can insert `consumer←pred` after O5 skipped the Done bit —
     /// `may_execute` stays false and workers yield-spin (~400% CPU).
     pub(crate) fn heal_finished_preds(&self, mut finished: impl FnMut(TxIdx) -> bool) {
-        if self.sleeping.is_empty() {
-            return;
-        }
-        let preds: Vec<TxIdx> = self
+        let mut preds: Vec<TxIdx> = self
             .sleeping
             .iter()
             .take(SLEEP_CAP)
             .filter_map(|t| self.blocking_producer(*t))
             .filter(|&w| finished(w))
             .collect();
+        // Detect-gated waiters are often ST_WAIT without a sleeping bit
+        // (RunnableSet refuse does not always call `note_skip_gate`).
+        if preds.is_empty() && !self.consumers.is_empty() {
+            for e in self.consumers.iter() {
+                let c = *e.key();
+                let w = e.value().load(Ordering::Relaxed);
+                if w < c && !self.is_writer_done(w) && finished(w) {
+                    preds.push(w);
+                }
+            }
+        }
+        preds.sort_unstable();
+        preds.dedup();
         for w in preds {
             self.mark_done(w);
         }

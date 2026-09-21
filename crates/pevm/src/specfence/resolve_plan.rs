@@ -282,13 +282,14 @@ fn drain_wave_to_runnable(ctx: &ApplyCtx<'_>) {
             ctx.runnable.mark_done(t);
             continue;
         }
-        if ctx.specfence.ready_edges.was_queued(t) {
-            ctx.runnable.push(t, QueueKind::Ordered);
+        let kind = if ctx.specfence.ready_edges.was_queued(t) {
+            QueueKind::Ordered
         } else if ctx.specfence.ready_edges.is_gated(t) {
-            ctx.runnable.push(t, QueueKind::Released);
+            QueueKind::Released
         } else {
-            ctx.runnable.push(t, QueueKind::Indep);
-        }
+            QueueKind::Indep
+        };
+        ctx.runnable.force_push(t, kind);
     }
 }
 

@@ -1085,6 +1085,32 @@ impl Scheduler {
         tx.status == IncarnationStatus::Aborting
     }
 
+    /// Lost-wakeup recover: `Aborting` → Ready (incarnation++).
+    #[inline]
+    pub(crate) fn recover_aborting(&self, tx_idx: TxIdx) -> bool {
+        if tx_idx >= self.block_size || !self.is_aborting(tx_idx) {
+            return false;
+        }
+        self.set_ready_status(tx_idx);
+        self.is_ready(tx_idx)
+    }
+
+    /// WaitForDependency leftover: status stayed `Executing` after the worker
+    /// returned `Blocked`. Same incarnation → Ready.
+    #[inline]
+    pub(crate) fn recover_executing_waiter(&self, tx_idx: TxIdx) -> bool {
+        if tx_idx >= self.block_size {
+            return false;
+        }
+        let mut tx = index_mutex!(self.transactions_status, tx_idx);
+        if tx.status != IncarnationStatus::Executing {
+            return false;
+        }
+        tx.status = IncarnationStatus::ReadyToExecute;
+        self.set_done_flag(tx_idx, false);
+        true
+    }
+
     #[inline]
     fn set_done_flag(&self, tx_idx: TxIdx, done: bool) {
         // SAFETY: callers only use inbound tx indices.

@@ -107,9 +107,15 @@ pub(crate) fn run_sf_block<F, V>(
                 if abort() {
                     break;
                 }
+                specfence
+                    .ready_edges
+                    .heal_finished_preds(|w| scheduler.is_done(w));
+                let _ = specfence
+                    .ready_edges
+                    .wake_ready_sleepers(specfence.wave);
                 let _ = runnable.heal(specfence.ready_edges, scheduler);
                 drain_wave(specfence, scheduler, runnable);
-                if scheduler.all_validated() {
+                if scheduler.all_validated() && runnable.pending_work() == 0 {
                     break;
                 }
                 if runnable.waiting_on_live_producer(specfence.ready_edges, scheduler) {
@@ -138,13 +144,17 @@ fn drain_wave(specfence: SpecFenceCtx<'_>, scheduler: &Scheduler, runnable: &Run
             runnable.mark_done(t);
             continue;
         }
-        if specfence.ready_edges.was_queued(t) {
-            runnable.push(t, super::runnable_set::QueueKind::Ordered);
+        // force_push: the waiter may still be ST_RUNNING inside try_execute_sf
+        // (add_dependency succeeded, Blocked not yet returned). push() would
+        // refuse and drop the wake.
+        let kind = if specfence.ready_edges.was_queued(t) {
+            super::runnable_set::QueueKind::Ordered
         } else if specfence.ready_edges.is_gated(t) {
-            runnable.push(t, super::runnable_set::QueueKind::Released);
+            super::runnable_set::QueueKind::Released
         } else {
-            runnable.push(t, super::runnable_set::QueueKind::Indep);
-        }
+            super::runnable_set::QueueKind::Indep
+        };
+        runnable.force_push(t, kind);
     }
 }
 

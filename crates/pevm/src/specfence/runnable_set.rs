@@ -149,6 +149,7 @@ impl RunnableSet {
                         self.push(tx, QueueKind::Released);
                     }
                 } else {
+                    ready.note_skip_gate(tx);
                     self.mark_wait(tx);
                 }
             } else {
@@ -291,6 +292,7 @@ impl RunnableSet {
         ready: &ReadyEdgeTable,
     ) -> Option<SfPick> {
         if ready.is_gated(tx) && !ready.may_execute(tx) {
+            ready.note_skip_gate(tx);
             self.mark_wait(tx);
             self.refuse_fill_n.fetch_add(1, Ordering::Relaxed);
             // PC-2: immediately fill from Q_indep.
@@ -334,6 +336,9 @@ impl RunnableSet {
     /// Idle heal: released waiters, leftover Executed, abandoned Ready.
     /// Does not steal `ST_RUNNING` while the scheduler is still `Executing`.
     pub(crate) fn heal(&self, ready: &ReadyEdgeTable, scheduler: &Scheduler) -> usize {
+        // I1: Detect consumer←pred inserted after the producer already published
+        // leaves `may_execute=false` and workers yield-spin (~400% CPU).
+        ready.heal_finished_preds(|w| scheduler.is_done(w));
         let mut n = 0;
         for tx in 0..self.block_size {
             let st = self.state[tx].load(Ordering::Acquire);
@@ -343,14 +348,53 @@ impl RunnableSet {
             if st == ST_RUNNING && scheduler.is_executing(tx) {
                 continue;
             }
-            if st == ST_REVALIDATE {
-                continue;
-            }
-            if scheduler.is_validated(tx) {
+            if scheduler.is_validated(tx) && st != ST_REVALIDATE {
                 self.mark_done(tx);
                 continue;
             }
-            if scheduler.is_executed(tx) && st != ST_REVALIDATE {
+            if scheduler.is_aborting(tx) {
+                let producer_live = ready.blocking_producer(tx).is_some_and(|w| {
+                    scheduler.is_executing(w) || scheduler.is_ready(w)
+                });
+                if producer_live {
+                    if let Some(w) = ready.blocking_producer(tx)
+                        && scheduler.is_ready(w)
+                    {
+                        self.requeue_ready(w, ready);
+                        n += 1;
+                    }
+                    continue;
+                }
+                if scheduler.recover_aborting(tx) {
+                    self.requeue_ready(tx, ready);
+                    n += 1;
+                }
+                continue;
+            }
+            if scheduler.is_executing(tx) && st != ST_RUNNING {
+                let producer_live = ready
+                    .blocking_producer(tx)
+                    .is_some_and(|w| scheduler.is_executing(w));
+                if !producer_live && scheduler.recover_executing_waiter(tx) {
+                    self.requeue_ready(tx, ready);
+                    n += 1;
+                }
+                continue;
+            }
+            if st == ST_REVALIDATE {
+                if (scheduler.is_executed(tx) || scheduler.is_validated(tx))
+                    && self.q_revalidate.len() == 0
+                {
+                    self.state[tx].store(ST_NONE, Ordering::Release);
+                    self.force_push(tx, QueueKind::Revalidate);
+                    n += 1;
+                } else if scheduler.is_ready(tx) {
+                    self.requeue_ready(tx, ready);
+                    n += 1;
+                }
+                continue;
+            }
+            if scheduler.is_executed(tx) {
                 self.force_push(tx, QueueKind::Revalidate);
                 n += 1;
                 continue;
@@ -359,6 +403,15 @@ impl RunnableSet {
                 continue;
             }
             if st == ST_WAIT && !ready.may_execute(tx) {
+                if let Some(w) = ready.blocking_producer(tx)
+                    && scheduler.is_done(w)
+                {
+                    ready.heal_finished_preds(|p| p == w);
+                    if ready.may_execute(tx) {
+                        self.requeue_ready(tx, ready);
+                        n += 1;
+                    }
+                }
                 continue;
             }
             if st == ST_NONE || st == ST_WAIT || st == ST_RUNNING {
@@ -496,6 +549,27 @@ mod tests {
         r.mark_done(2);
         r.force_push(2, QueueKind::Revalidate);
         assert!(matches!(r.pick(0, &ready), Some(SfPick::Revalidate(2))));
+    }
+
+    #[test]
+    fn heal_recovers_wait_after_producer_done() {
+        let ready = ReadyEdgeTable::new();
+        let sched = Scheduler::new(4);
+        ready.note_consumer(2, 0);
+        let r = RunnableSet::new(4, 2);
+        r.mark_wait(2);
+        ready.note_skip_gate(2);
+        assert!(!ready.may_execute(2));
+        let v = sched.try_execute_producer(0).unwrap();
+        let _ = sched.finish_execution(v, crate::FinishExecFlags::empty());
+        assert!(sched.is_done(0));
+        let n = r.heal(&ready, &sched);
+        assert!(n >= 1, "heal must requeue the released waiter, got {n}");
+        assert!(ready.may_execute(2), "producer Done must open the edge");
+        assert!(matches!(
+            r.pick(0, &ready),
+            Some(SfPick::Execute { tx: 2, .. })
+        ));
     }
 
     #[test]
