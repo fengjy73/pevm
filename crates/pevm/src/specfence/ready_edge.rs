@@ -1167,12 +1167,51 @@ impl ReadyEdgeTable {
     }
 
     fn elect_next_leftover(&self) -> usize {
-        self.leftover_claimed
-            .iter()
-            .map(|e| *e)
+        let claimed: Vec<TxIdx> = self.leftover_claimed.iter().map(|e| *e).collect();
+        claimed
+            .into_iter()
             .filter(|&c| !self.is_writer_done(c))
             .min()
             .unwrap_or(NONE)
+    }
+
+    /// leftover_min stayed sticky after Commit when the wake was lost
+    /// (`19807137` glob_min=184 min_exec=true pending=0 n_unf=527).
+    /// Advance the claim and return the next leftover to requeue.
+    pub(crate) fn take_finished_leftover_min(
+        &self,
+        mut finished: impl FnMut(TxIdx) -> bool,
+    ) -> Option<TxIdx> {
+        let min = self.global_leftover_min.load(Ordering::Relaxed);
+        if min == NONE {
+            return None;
+        }
+        if !self.is_writer_done(min) && !finished(min) {
+            return None;
+        }
+        self.leftover_claimed.remove(&min);
+        if !self.is_writer_done(min) {
+            self.mark_done(min);
+        }
+        let next = self.elect_next_leftover();
+        let _ = self.global_leftover_min.compare_exchange(
+            min,
+            next,
+            Ordering::Release,
+            Ordering::Relaxed,
+        );
+        if next != NONE {
+            self.global_leftover_chain.store(next, Ordering::Relaxed);
+            Some(next)
+        } else {
+            None
+        }
+    }
+
+    /// Live leftover claim that still may_execute (lost-queue recover).
+    pub(crate) fn live_leftover_head(&self) -> Option<TxIdx> {
+        let min = self.live_leftover_min();
+        (min != NONE).then_some(min)
     }
 
     /// Surplus leftover: claimed after leftover_min, not Detect-starred.
@@ -1988,6 +2027,18 @@ mod tests {
             "next leftover_min executes after the claim head commits"
         );
         assert!(t.leftover_surplus(60));
+    }
+
+    #[test]
+    fn take_finished_leftover_min_advances_sticky_claim() {
+        let t = ReadyEdgeTable::new();
+        assert!(!t.plant_global_leftover(20));
+        assert!(t.plant_global_leftover(40));
+        t.mark_done(20);
+        let next = t.take_finished_leftover_min(|_| false);
+        assert_eq!(next, Some(40));
+        assert!(t.may_execute(40));
+        assert!(!t.leftover_surplus(40));
     }
 
     #[test]

@@ -361,12 +361,31 @@ impl RunnableSet {
         if (0..self.block_size).any(|t| self.state[t].load(Ordering::Acquire) == ST_RUNNING) {
             return 0;
         }
+        let leftover_next =
+            ready.take_finished_leftover_min(|t| scheduler.is_done(t) || scheduler.is_validated(t));
         // Keep unfinished producers. `is_executing && ST_RUNNING` is always
         // false here (we just proved no ST_RUNNING) and nuclear-ungated the
         // leftover chain into a 32-head Q_released mill (19807137). Ghost
         // Ready producers are requeued below via has_known_waiters.
         let freed = ready.collapse_false_gates(|w| !scheduler.is_done(w));
         let mut n = 0;
+        for tx in leftover_next.into_iter().chain(ready.live_leftover_head()) {
+            if scheduler.is_validated(tx) {
+                continue;
+            }
+            if scheduler.is_aborting(tx) {
+                let _ = scheduler.recover_aborting(tx);
+            } else if scheduler.is_executing(tx) {
+                let _ = scheduler.recover_executing_waiter(tx);
+            }
+            if scheduler.is_executed(tx) {
+                self.force_push(tx, QueueKind::Revalidate);
+                n += 1;
+            } else if scheduler.is_ready(tx) {
+                self.requeue_ready(tx, ready);
+                n += 1;
+            }
+        }
         for tx in freed {
             if scheduler.is_aborting(tx) {
                 let _ = scheduler.recover_aborting(tx);
@@ -607,6 +626,24 @@ impl RunnableSet {
         // / complete_arch idle-spin. A live owner is `ST_RUNNING`, not a
         // leftover Executing bit.
         if n == 0 && self.pending_work() == 0 {
+            if let Some(next) = ready
+                .take_finished_leftover_min(|t| scheduler.is_done(t) || scheduler.is_validated(t))
+            {
+                if !scheduler.is_validated(next) {
+                    if scheduler.is_aborting(next) {
+                        let _ = scheduler.recover_aborting(next);
+                    } else if scheduler.is_executing(next) {
+                        let _ = scheduler.recover_executing_waiter(next);
+                    }
+                    if scheduler.is_executed(next) {
+                        self.force_push(next, QueueKind::Revalidate);
+                        n += 1;
+                    } else if scheduler.is_ready(next) {
+                        self.requeue_ready(next, ready);
+                        n += 1;
+                    }
+                }
+            }
             let any_running =
                 (0..self.block_size).any(|t| self.state[t].load(Ordering::Acquire) == ST_RUNNING);
             for tx in 0..self.block_size {
