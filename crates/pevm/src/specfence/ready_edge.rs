@@ -688,6 +688,23 @@ impl ReadyEdgeTable {
             .map(|(_, v)| v)
             .unwrap_or_default();
         let had_waiters = !cs.is_empty();
+        // leftover_min is fetch_min-only. After the elected head Commits it
+        // stayed sticky-done and later leftovers planted with a dead pred
+        // (19807137 glob_min=24 for the whole hang).
+        if self.global_leftover_min.load(Ordering::Relaxed) == writer {
+            let next = cs
+                .iter()
+                .copied()
+                .filter(|&c| c > writer)
+                .min()
+                .unwrap_or(NONE);
+            let _ = self.global_leftover_min.compare_exchange(
+                writer,
+                next,
+                Ordering::Release,
+                Ordering::Relaxed,
+            );
+        }
         self.mark_done(writer);
         if !self.has_any_gated() {
             return;
@@ -719,6 +736,14 @@ impl ReadyEdgeTable {
                 continue;
             }
             self.sleeping.remove(&c);
+            // First-wave pred is the original producer (often later than
+            // leftover_min). `should_plant` skips a lower leftover plant, so
+            // after this Done they would Opt-mill the leftover head
+            // (19807137 glob_min=24 vs loc tips). Rebind onto the live min.
+            let min = self.global_leftover_min.load(Ordering::Relaxed);
+            if min != NONE && min < c && min != writer && !self.is_writer_done(min) {
+                self.note_consumer_on(c, min, None);
+            }
             if self.may_execute(c) {
                 wave.push_ready(c);
             }
@@ -846,6 +871,20 @@ impl ReadyEdgeTable {
         )
     }
 
+    /// Hang-trace: leftover-min done / may_execute / blocking pred.
+    #[inline]
+    pub(crate) fn hang_leftover_min_status(&self) -> (bool, bool, usize) {
+        let min = self.global_leftover_min.load(Ordering::Relaxed);
+        if min == NONE {
+            return (true, true, NONE);
+        }
+        (
+            self.is_writer_done(min),
+            self.may_execute(min),
+            self.blocking_producer(min).unwrap_or(NONE),
+        )
+    }
+
     /// Newest still-live waiter reachable from `start` with index `< before`.
     /// Overflow plants must chain, not star on one tip — a star wakes
     /// every leftover writer at once (19807137 ~40 Released mill).
@@ -936,6 +975,10 @@ impl ReadyEdgeTable {
                         .or_insert_with(|| AtomicUsize::new(consumer));
                     e.fetch_max(consumer, Ordering::Relaxed);
                 }
+                // First-wave window waiters must join leftover election.
+                // Otherwise they wake on the original producer Done and
+                // Opt-mill the leftover min (19807137 glob_min=24 vs 6 loc tips).
+                let _ = self.plant_global_leftover(consumer);
                 return true;
             }
         }
@@ -1654,13 +1697,23 @@ mod tests {
         assert_eq!(t.blocking_producer(5), Some(4));
         t.note_producer_done(0, &wave);
         assert!(t.may_execute(1), "window waiter of 0 wakes");
-        assert!(t.may_execute(2), "window waiter of 0 wakes");
+        assert_eq!(
+            t.blocking_producer(2),
+            Some(1),
+            "first-wave joins leftover election so two window tips do not mill"
+        );
+        assert!(!t.may_execute(2));
         assert!(
             !t.may_execute(3) && !t.may_execute(5),
             "overflow must not stampede with the window tip"
         );
         t.note_producer_done(2, &wave);
-        assert!(t.may_execute(3));
+        assert_eq!(
+            t.blocking_producer(3),
+            Some(1),
+            "overflow rebinds onto leftover min instead of racing a second head"
+        );
+        assert!(!t.may_execute(3));
         assert!(!t.may_execute(4), "chain continues after loc-tip Commit");
     }
 
@@ -1732,6 +1785,28 @@ mod tests {
         assert_eq!(t.blocking_producer(40), Some(20));
         assert!(!t.may_execute(40));
         assert!(t.may_execute(20));
+    }
+
+    #[test]
+    fn first_wave_window_joins_global_leftover() {
+        let t = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        t.note_producer_done(0, &wave);
+        assert!(!t.plant_global_leftover(24));
+        assert!(t.plant_observed_window(100, 50, 0xabc, 1));
+        assert_eq!(
+            t.blocking_producer(100),
+            Some(50),
+            "live original producer still gates first-wave"
+        );
+        t.note_producer_done(50, &wave);
+        assert_eq!(
+            t.blocking_producer(100),
+            Some(24),
+            "after original Done, first-wave must wait on leftover min"
+        );
+        assert!(t.may_execute(24));
+        assert!(!t.may_execute(100));
     }
 
     #[test]
