@@ -36,13 +36,17 @@ pub(crate) fn run_sf_block<F, V>(
         spins += 1;
         if spins.is_multiple_of(8_000) && std::env::var_os("SPECFENCE_HANG_TRACE").is_some() {
             eprintln!(
-                "sf-hang-trace spins={spins} pending={} q_indep={} unfinished={} validated={} gated={} live_wait={}",
+                "sf-hang-trace spins={spins} pending={} q_i/r/o/v={}/{}/{}/{} unfinished={} validated={} gated={} live_wait={} refuse={}",
                 runnable.pending_work(),
                 runnable.q_indep_len(),
+                runnable.q_released_len(),
+                runnable.q_ordered_len(),
+                runnable.q_revalidate_len(),
                 scheduler.has_unfinished(),
                 scheduler.all_validated(),
                 specfence.ready_edges.has_any_gated(),
                 runnable.waiting_on_live_producer(specfence.ready_edges, scheduler),
+                runnable.refuse_fill_n(),
             );
         }
         if abort() {

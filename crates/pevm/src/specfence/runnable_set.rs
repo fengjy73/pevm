@@ -690,6 +690,16 @@ impl RunnableSet {
     }
 
     #[inline]
+    pub(crate) fn q_released_len(&self) -> usize {
+        self.q_released.len()
+    }
+
+    #[inline]
+    pub(crate) fn q_revalidate_len(&self) -> usize {
+        self.q_revalidate.len()
+    }
+
+    #[inline]
     pub(crate) fn q_ordered_len(&self) -> usize {
         self.q_ordered.len()
     }
