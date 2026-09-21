@@ -1310,11 +1310,13 @@ impl CostPolicy {
         self.block_n() >= LARGE_BLOCK_N && !self.has_midband_coverable_spine()
     }
 
-    /// S2: mid/large reuse drops leftover flush. First block may still
-    /// probe; starting a Win_2 plant on reuse livelocks 19469101 N=3.
+    /// S2: large near-independent reuse drops leftover flush. Mid-band
+    /// reuse with a live cover probe must still flush continuation hops
+    /// (ERC-20 fence-cover n=768). 19469101 is closed by leftover_slide
+    /// reuse-ban + no-start probe, not by dropping every mid flush.
     #[inline]
     pub(crate) fn skip_reuse_leftover_flush(&self) -> bool {
-        self.block_seq.load(Ordering::Relaxed) > 1 && self.block_n() > THIN_N_MAX
+        self.block_seq.load(Ordering::Relaxed) > 1 && self.skip_useless_cover_probe()
     }
 
     fn has_midband_coverable_spine(&self) -> bool {
@@ -1728,11 +1730,13 @@ impl CostPolicy {
     /// A planted covering prefix (Win_2+) must not slide on the same
     /// block — 3356896 i=1 otherwise prepaid-blows ĉ and retreats to Opt.
     pub(crate) fn leftover_slide_ok(&self, location: MemoryLocationHash) -> bool {
-        // Mid/large never T3-slide. `is_midband_coverable` needs short_chain
-        // n_pairs; begin_block / first-pick flush can see n_pairs=0 and
-        // plant→refuse→flush livelock 19469101 N=3 reuse. C4 deepens
-        // `cover_window` at end_block instead. Thin leftover-long may slide.
-        if self.block_n() > THIN_N_MAX {
+        // Mid/large *reuse* never T3-slides. `is_midband_coverable` needs
+        // short_chain n_pairs; reuse begin / first-pick flush can see
+        // n_pairs=0 and plant→refuse→flush livelock 19469101 N=3.
+        // First mid/large begin may still slide a leaking loc (ERC-20
+        // fence-cover n=768). C4 deepens `cover_window` at end_block.
+        // Thin leftover-long may slide on any incarnation.
+        if self.block_seq.load(Ordering::Relaxed) > 1 && self.block_n() > THIN_N_MAX {
             return false;
         }
         let n_pairs = self
@@ -5905,9 +5909,11 @@ mod tests {
         );
         let mid = CostPolicy::new();
         mid.begin_block_with_cores(469, 8);
+        mid.end_block_learn();
+        mid.begin_block_with_cores(469, 8);
         assert!(
             !mid.leftover_slide_ok(0xabc),
-            "19469101: mid/large never T3-slides even with empty short_chain"
+            "19469101: mid/large reuse never T3-slides even with empty short_chain"
         );
     }
 
@@ -6523,8 +6529,8 @@ mod tests {
             "C4: reuse seed skip is intended — deepen at end_block, do not plant Win_2"
         );
         assert!(
-            p.skip_reuse_leftover_flush(),
-            "19469101: mid reuse drops leftover flush"
+            !p.skip_reuse_leftover_flush(),
+            "C4 mid-band reuse still flushes continuation hops"
         );
     }
 
@@ -6541,7 +6547,10 @@ mod tests {
             p.can_probe_cover(0xabc, 20),
             "first mid-band begin may still start a Win_2 probe"
         );
-        assert!(!p.skip_reuse_leftover_flush());
+        assert!(
+            !p.skip_reuse_leftover_flush(),
+            "mid-band first begin still flushes leftover"
+        );
         p.end_block_learn();
         p.begin_block_with_cores(469, 8);
         p.note_loc_write(0xabc, false);
@@ -6549,7 +6558,10 @@ mod tests {
             !p.can_probe_cover(0xabc, 20),
             "19469101: reuse must not start Win_2 after first-block Opt leftover"
         );
-        assert!(p.skip_reuse_leftover_flush());
+        assert!(
+            !p.skip_reuse_leftover_flush(),
+            "mid-band reuse still flushes; leftover_slide + no-start probe close 19469101"
+        );
         assert!(
             p.should_skip_ordered_admit_seed(0xabc, 20),
             "reuse leftover hops stay ungated OCC"
