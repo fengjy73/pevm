@@ -695,7 +695,7 @@ impl ReadyEdgeTable {
             let next = cs
                 .iter()
                 .copied()
-                .filter(|&c| c > writer)
+                .filter(|&c| c > writer && !self.is_writer_done(c))
                 .min()
                 .unwrap_or(NONE);
             let _ = self.global_leftover_min.compare_exchange(

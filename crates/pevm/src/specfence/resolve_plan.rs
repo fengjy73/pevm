@@ -328,6 +328,10 @@ fn abort_and_estimate(ctx: &ApplyCtx<'_>) {
         ctx.specfence.metrics.record_occ_abort();
         ctx.specfence.metrics.record_full_abort_reexecute();
     }
+    // Clear a prior Commit done-stamp. Leaving it set made leftover_min
+    // sticky-done (19807137 glob_min=396 min_done=true, 24-head mill).
+    // Bits only — do not walk waiters (DashMap abort).
+    ctx.specfence.ready_edges.note_abort_reincarnate(tx);
     if !ctx.invalid.is_empty() {
         ctx.specfence
             .metrics
