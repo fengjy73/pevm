@@ -353,29 +353,38 @@ impl RunnableSet {
                 continue;
             }
             if scheduler.is_aborting(tx) {
-                let producer_live = ready.blocking_producer(tx).is_some_and(|w| {
-                    scheduler.is_executing(w) || scheduler.is_ready(w)
-                });
-                if producer_live {
-                    if let Some(w) = ready.blocking_producer(tx)
-                        && scheduler.is_ready(w)
-                    {
+                match ready.blocking_producer(tx) {
+                    Some(w) if scheduler.is_executing(w) => continue,
+                    Some(w) if scheduler.is_ready(w) => {
                         self.requeue_ready(w, ready);
                         n += 1;
+                        continue;
                     }
-                    continue;
+                    Some(w) if scheduler.is_done(w) => {
+                        if scheduler.recover_aborting(tx) {
+                            self.requeue_ready(tx, ready);
+                            n += 1;
+                        }
+                        continue;
+                    }
+                    // Scheduler-only park (no Detect edge): recovering while
+                    // any producer is still Executing re-issues the waiter and
+                    // livelocks independent transfers at ~400% CPU.
+                    _ => continue,
                 }
-                if scheduler.recover_aborting(tx) {
-                    self.requeue_ready(tx, ready);
-                    n += 1;
-                }
-                continue;
             }
             if scheduler.is_executing(tx) && st != ST_RUNNING {
-                let producer_live = ready
+                if ready
                     .blocking_producer(tx)
-                    .is_some_and(|w| scheduler.is_executing(w));
-                if !producer_live && scheduler.recover_executing_waiter(tx) {
+                    .is_some_and(|w| !scheduler.is_done(w))
+                {
+                    continue;
+                }
+                // True-idle leftover only — any live Executing owner is ST_RUNNING.
+                if scheduler.has_unfinished() && self.width() + self.q_revalidate.len() > 0 {
+                    continue;
+                }
+                if scheduler.recover_executing_waiter(tx) {
                     self.requeue_ready(tx, ready);
                     n += 1;
                 }
@@ -417,6 +426,36 @@ impl RunnableSet {
             if st == ST_NONE || st == ST_WAIT || st == ST_RUNNING {
                 self.requeue_ready(tx, ready);
                 n += 1;
+            }
+        }
+        // Lost scheduler-only wakeup: recover only when the block is truly
+        // idle (no Executing owner). Doing this while a producer is live
+        // re-issues waiters and livelocks independent transfers.
+        if n == 0 && self.pending_work() == 0 {
+            let any_executing = (0..self.block_size).any(|t| scheduler.is_executing(t));
+            if !any_executing {
+                for tx in 0..self.block_size {
+                    let st = self.state[tx].load(Ordering::Acquire);
+                    if st == ST_DONE || scheduler.is_validated(tx) {
+                        continue;
+                    }
+                    if scheduler.is_aborting(tx) && scheduler.recover_aborting(tx) {
+                        self.requeue_ready(tx, ready);
+                        n += 1;
+                    } else if scheduler.is_executing(tx)
+                        && st != ST_RUNNING
+                        && scheduler.recover_executing_waiter(tx)
+                    {
+                        self.requeue_ready(tx, ready);
+                        n += 1;
+                    } else if scheduler.is_executed(tx) {
+                        self.force_push(tx, QueueKind::Revalidate);
+                        n += 1;
+                    } else if scheduler.is_ready(tx) && ready.may_execute(tx) {
+                        self.requeue_ready(tx, ready);
+                        n += 1;
+                    }
+                }
             }
         }
         n
