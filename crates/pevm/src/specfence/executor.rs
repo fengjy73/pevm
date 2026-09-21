@@ -25,7 +25,7 @@ use super::repair::{RepairGrain, repair_grain};
 use super::wave::WaveParkTable;
 use crate::mv_memory::MvMemory;
 use crate::scheduler::Scheduler;
-use crate::{MemoryLocationHash, Task, TxIdx, TxVersion};
+use crate::{MemoryEntry, MemoryLocationHash, MemoryValue, Task, TxIdx, TxVersion};
 
 /// OCC schedule / execute / validate never take wave or fence handles.
 #[inline]
@@ -142,12 +142,29 @@ pub(crate) fn validate_occ_stage(
 
 /// C1+C2: record first conflict ℓ and accept a commute without incarnation++.
 /// Accept path is a single `last_locations` lock (no collect Vec + rebind).
+/// A first-touch absolute Basic on a shared ℓ resets later lazy evaluation
+/// (higher-idx Basic after lower LazyRecipient). Commute must not keep it.
+fn wrote_shared_absolute_basic(mv_memory: &MvMemory, tx_idx: TxIdx) -> bool {
+    mv_memory.write_locations(tx_idx).iter().any(|&loc| {
+        let Some(written) = mv_memory.data.get(&loc) else {
+            return false;
+        };
+        matches!(
+            written.get(&tx_idx),
+            Some(MemoryEntry::Data(_, MemoryValue::Basic(_)))
+        ) && written.keys().any(|&w| w != tx_idx)
+    })
+}
+
 fn note_and_try_commute(
     specfence: SpecFenceCtx<'_>,
     mv_memory: &MvMemory,
     tx_idx: TxIdx,
     invalid: &[MemoryLocationHash],
 ) -> bool {
+    if wrote_shared_absolute_basic(mv_memory, tx_idx) {
+        return false;
+    }
     if is_value_transfer(specfence.hints, tx_idx)
         && mv_memory.try_commute_rebind_invalid(tx_idx, |loc| {
             commute_location_ok(

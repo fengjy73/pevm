@@ -118,12 +118,30 @@ where
             conc,
         )
         .expect("parallel");
-    assert_eq!(
-        sequential,
-        parallel,
-        "committed state must match sequential; metrics={:?}",
-        pevm.last_specfence_metrics()
-    );
+    if sequential != parallel {
+        for (i, (s, p)) in sequential.iter().zip(parallel.iter()).enumerate() {
+            if s != p {
+                let mut diffs = Vec::new();
+                for (addr, sv) in &s.state {
+                    let pv = p.state.get(addr);
+                    if pv != Some(sv) {
+                        diffs.push(format!("{addr:?} seq={sv:?} par={pv:?}"));
+                    }
+                }
+                for (addr, pv) in &p.state {
+                    if !s.state.contains_key(addr) {
+                        diffs.push(format!("{addr:?} seq=None par={pv:?}"));
+                    }
+                }
+                panic!(
+                    "tx {i} seq≠par gas {} vs {}; diffs={diffs:?}; metrics={:?}",
+                    s.receipt.cumulative_gas_used,
+                    p.receipt.cumulative_gas_used,
+                    pevm.last_specfence_metrics()
+                );
+            }
+        }
+    }
     let metrics = pevm.last_specfence_metrics().clone();
     (parallel, metrics, pevm)
 }
