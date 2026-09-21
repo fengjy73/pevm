@@ -107,12 +107,9 @@ pub(crate) fn run_sf_block<F, V>(
                 if abort() {
                     break;
                 }
-                if scheduler.all_validated() && runnable.pending_work() == 0 {
-                    break;
-                }
                 let _ = runnable.heal(specfence.ready_edges, scheduler);
                 drain_wave(specfence, scheduler, runnable);
-                if scheduler.all_validated() && runnable.pending_work() == 0 {
+                if scheduler.all_validated() {
                     break;
                 }
                 if runnable.waiting_on_live_producer(specfence.ready_edges, scheduler) {
