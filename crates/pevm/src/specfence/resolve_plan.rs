@@ -173,9 +173,8 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
             {
                 ctx.runnable.mark_wait(tx);
             } else {
-                let kind = if ctx.specfence.ready_edges.was_queued(tx) {
-                    QueueKind::Ordered
-                } else if ctx.specfence.ready_edges.is_gated(tx) || ctx.vis.needs_fence() {
+                // FullReplay must not re-enter Q_ordered (19807137 OrderedTip mill).
+                let kind = if ctx.specfence.ready_edges.is_gated(tx) || ctx.vis.needs_fence() {
                     QueueKind::Released
                 } else {
                     QueueKind::Indep
@@ -387,9 +386,7 @@ fn drain_wave_to_runnable(ctx: &ApplyCtx<'_>) {
             ctx.runnable.mark_wait(t);
             continue;
         }
-        let kind = if ctx.specfence.ready_edges.was_queued(t) {
-            QueueKind::Ordered
-        } else if ctx.specfence.ready_edges.is_gated(t) {
+        let kind = if ctx.specfence.ready_edges.is_gated(t) {
             QueueKind::Released
         } else {
             QueueKind::Indep

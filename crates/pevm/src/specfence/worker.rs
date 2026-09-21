@@ -189,9 +189,7 @@ fn drain_wave(specfence: SpecFenceCtx<'_>, scheduler: &Scheduler, runnable: &Run
             runnable.mark_wait(t);
             continue;
         }
-        let kind = if specfence.ready_edges.was_queued(t) {
-            super::runnable_set::QueueKind::Ordered
-        } else if specfence.ready_edges.is_gated(t) {
+        let kind = if specfence.ready_edges.is_gated(t) {
             super::runnable_set::QueueKind::Released
         } else {
             super::runnable_set::QueueKind::Indep

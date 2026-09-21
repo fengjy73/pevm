@@ -340,9 +340,9 @@ impl RunnableSet {
             self.mark_wait(tx);
             return;
         }
-        if ready.was_queued(tx) {
-            self.force_push(tx, QueueKind::Ordered);
-        } else if ready.is_gated(tx) {
+        // Never Q_ordered from heal: 19807137 milled ~40 OrderedTip
+        // consumers on one storage spine. Released/Indep + plant waits.
+        if ready.is_gated(tx) {
             self.force_push(tx, QueueKind::Released);
         } else {
             self.force_push(tx, QueueKind::Indep);
