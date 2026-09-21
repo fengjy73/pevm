@@ -54,6 +54,9 @@ pub(crate) fn run_sf_block<F, V>(
                 let vis = VisibilityPolicy::for_ready(specfence.ready_edges, tx_idx);
                 match execute(tx_version.clone(), vis) {
                     SfExec::Executed { wrote_new_location } => {
+                        // finish_execution may have waved dependents — park them
+                        // on RunnableSet before this worker spends time validating.
+                        drain_wave(specfence, scheduler, runnable);
                         let (plan, invalid) = validate_to_plan(&tx_version, vis);
                         resolve_plan::apply(
                             plan,
@@ -72,6 +75,7 @@ pub(crate) fn run_sf_block<F, V>(
                     }
                     SfExec::Blocked => {
                         runnable.mark_wait(tx_idx);
+                        drain_wave(specfence, scheduler, runnable);
                     }
                     SfExec::Fatal => break,
                 }
@@ -102,16 +106,12 @@ pub(crate) fn run_sf_block<F, V>(
                 }
                 let _ = runnable.heal(specfence.ready_edges, scheduler);
                 drain_wave(specfence, scheduler, runnable);
+                if scheduler.all_validated() {
+                    break;
+                }
                 if runnable.waiting_on_live_producer(specfence.ready_edges, scheduler) {
                     for _ in 0..32 {
                         std::hint::spin_loop();
-                    }
-                    continue;
-                }
-                if !scheduler.has_unfinished() && runnable.width() == 0 {
-                    std::thread::yield_now();
-                    if scheduler.all_validated() || abort() {
-                        break;
                     }
                     continue;
                 }

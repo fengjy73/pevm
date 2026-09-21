@@ -164,6 +164,8 @@ impl RunnableSet {
         }
         let tag = kind.tag();
         let prev = self.state[tx].swap(tag, Ordering::AcqRel);
+        // Concurrent seed/drain must not steal a live claim or a committed tx.
+        // Owners reclaim via [`Self::force_push`].
         if prev == ST_RUNNING || prev == ST_DONE {
             self.state[tx].store(prev, Ordering::Release);
             return;
@@ -174,11 +176,26 @@ impl RunnableSet {
         self.q(kind).push_local(tx);
     }
 
+    /// Owner / heal requeue: reclaim RUNNING (this worker released) or DONE
+    /// (higher-reader revalidate). Never used to steal an in-flight execute.
+    #[inline]
+    pub(crate) fn force_push(&self, tx: TxIdx, kind: QueueKind) {
+        if tx >= self.block_size {
+            return;
+        }
+        let tag = kind.tag();
+        let prev = self.state[tx].swap(tag, Ordering::AcqRel);
+        if prev == tag {
+            return;
+        }
+        self.q(kind).push_local(tx);
+    }
+
     #[inline]
     pub(crate) fn mark_wait(&self, tx: TxIdx) {
         if tx < self.block_size {
             let prev = self.state[tx].load(Ordering::Acquire);
-            if prev != ST_RUNNING && prev != ST_DONE {
+            if prev != ST_DONE {
                 self.state[tx].store(ST_WAIT, Ordering::Release);
             }
         }
@@ -304,12 +321,26 @@ impl RunnableSet {
         })
     }
 
-    /// Idle heal: released waiters and leftover Executed txs.
+    fn requeue_ready(&self, tx: TxIdx, ready: &ReadyEdgeTable) {
+        if ready.was_queued(tx) {
+            self.force_push(tx, QueueKind::Ordered);
+        } else if ready.is_gated(tx) {
+            self.force_push(tx, QueueKind::Released);
+        } else {
+            self.force_push(tx, QueueKind::Indep);
+        }
+    }
+
+    /// Idle heal: released waiters, leftover Executed, abandoned Ready.
+    /// Does not steal `ST_RUNNING` while the scheduler is still `Executing`.
     pub(crate) fn heal(&self, ready: &ReadyEdgeTable, scheduler: &Scheduler) -> usize {
         let mut n = 0;
         for tx in 0..self.block_size {
             let st = self.state[tx].load(Ordering::Acquire);
-            if st == ST_DONE || st == ST_RUNNING {
+            if st == ST_DONE {
+                continue;
+            }
+            if st == ST_RUNNING && scheduler.is_executing(tx) {
                 continue;
             }
             if scheduler.is_validated(tx) {
@@ -317,18 +348,18 @@ impl RunnableSet {
                 continue;
             }
             if scheduler.is_executed(tx) && st != ST_REVALIDATE {
-                self.push(tx, QueueKind::Revalidate);
+                self.force_push(tx, QueueKind::Revalidate);
                 n += 1;
                 continue;
             }
-            if st == ST_WAIT && ready.may_execute(tx) && scheduler.is_ready(tx) {
-                if ready.was_queued(tx) {
-                    self.push(tx, QueueKind::Ordered);
-                } else if ready.is_gated(tx) {
-                    self.push(tx, QueueKind::Released);
-                } else {
-                    self.push(tx, QueueKind::Indep);
-                }
+            if !scheduler.is_ready(tx) {
+                continue;
+            }
+            if st == ST_WAIT && !ready.may_execute(tx) {
+                continue;
+            }
+            if st == ST_NONE || st == ST_WAIT || st == ST_RUNNING {
+                self.requeue_ready(tx, ready);
                 n += 1;
             }
         }
@@ -441,6 +472,22 @@ mod tests {
         };
         assert_ne!(tx, 3, "refused consumer must not occupy a core");
         assert_eq!(vis, VisibilityPolicy::Opt);
+    }
+
+    #[test]
+    fn force_push_reclaims_running_and_done() {
+        let ready = ReadyEdgeTable::new();
+        let r = RunnableSet::new(4, 2);
+        r.push(1, QueueKind::Indep);
+        let picked = r.pick(0, &ready);
+        assert!(matches!(picked, Some(SfPick::Execute { tx: 1, .. })));
+        // Owner abort/requeue must not no-op on ST_RUNNING.
+        r.force_push(1, QueueKind::Indep);
+        let again = r.pick(2, &ready);
+        assert!(matches!(again, Some(SfPick::Execute { tx: 1, .. })));
+        r.mark_done(2);
+        r.force_push(2, QueueKind::Revalidate);
+        assert!(matches!(r.pick(0, &ready), Some(SfPick::Revalidate(2))));
     }
 
     #[test]

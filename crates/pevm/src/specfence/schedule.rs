@@ -84,14 +84,15 @@ pub(crate) fn pick(
                     return Some(Task::Execution(tx_version));
                 }
                 if scheduler.is_ready(tx) {
-                    // Race: still Ready but claim failed — requeue independent.
-                    runnable.push(tx, super::runnable_set::QueueKind::Indep);
+                    // Race: still Ready but claim failed — owner requeue.
+                    runnable.force_push(tx, super::runnable_set::QueueKind::Indep);
                     continue;
                 }
                 if scheduler.is_executed(tx) {
                     if let Some(v) = scheduler.prepare_revalidate(tx) {
                         return Some(Task::Validation(v));
                     }
+                    runnable.force_push(tx, super::runnable_set::QueueKind::Revalidate);
                 }
             }
             Some(SfPick::Revalidate(tx)) => {
@@ -105,6 +106,11 @@ pub(crate) fn pick(
                     if let Some(tx_version) = scheduler.try_execute_producer(tx) {
                         return Some(Task::Execution(tx_version));
                     }
+                    runnable.force_push(tx, super::runnable_set::QueueKind::Indep);
+                } else if scheduler.is_executed(tx) {
+                    runnable.force_push(tx, super::runnable_set::QueueKind::Revalidate);
+                } else {
+                    runnable.mark_wait(tx);
                 }
             }
             None => break,

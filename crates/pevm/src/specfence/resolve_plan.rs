@@ -292,7 +292,7 @@ fn drain_wave_to_runnable(ctx: &ApplyCtx<'_>) {
 }
 
 fn requeue(ctx: &ApplyCtx<'_>, tx: crate::TxIdx, kind: QueueKind) {
-    ctx.runnable.push(tx, kind);
+    ctx.runnable.force_push(tx, kind);
 }
 
 fn enqueue_higher_revalidate(ctx: &ApplyCtx<'_>, tx: crate::TxIdx) {
@@ -303,7 +303,7 @@ fn enqueue_higher_revalidate(ctx: &ApplyCtx<'_>, tx: crate::TxIdx) {
                 continue;
             }
             if ctx.scheduler.is_executed(reader) || ctx.scheduler.is_validated(reader) {
-                ctx.runnable.push(reader, QueueKind::Revalidate);
+                ctx.runnable.force_push(reader, QueueKind::Revalidate);
             }
         }
     }
