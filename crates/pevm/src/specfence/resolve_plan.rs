@@ -315,7 +315,6 @@ fn seed_short_edge(
 
 fn abort_and_estimate(ctx: &ApplyCtx<'_>) {
     let tx = ctx.tx_version.tx_idx;
-    ctx.specfence.ready_edges.note_abort_reincarnate(tx);
     let aborted = ctx.scheduler.try_validation_abort(ctx.tx_version);
     if aborted {
         ctx.mv_memory.convert_writes_to_estimates(tx);
