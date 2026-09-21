@@ -140,6 +140,7 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
                 break_replay_mill(&ctx, &f);
             }
             plant_invalid_locs(&ctx);
+            let _ = ctx.specfence.ready_edges.plant_global_leftover(tx);
             ctx.scheduler
                 .finish_validation_sf(ctx.tx_version, true, Some(tx + 1));
             ctx.specfence.ready_edges.clear_started(tx);
@@ -173,6 +174,7 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
                 }
             }
             plant_invalid_locs(&ctx);
+            let _ = ctx.specfence.ready_edges.plant_global_leftover(tx);
             ctx.scheduler
                 .finish_validation_sf(ctx.tx_version, true, Some(tx + 1));
             ctx.specfence.ready_edges.clear_started(tx);

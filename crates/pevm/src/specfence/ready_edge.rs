@@ -995,7 +995,7 @@ impl ReadyEdgeTable {
 
     /// One leftover writer executes at a time in the block. Per-ℓ election
     /// left 19807137 with ~23 Q_released tips (`leftover_min=23`).
-    fn plant_global_leftover(&self, consumer: TxIdx) -> bool {
+    pub(crate) fn plant_global_leftover(&self, consumer: TxIdx) -> bool {
         self.global_leftover_min
             .fetch_min(consumer, Ordering::Relaxed);
         let min = self.global_leftover_min.load(Ordering::Relaxed);
