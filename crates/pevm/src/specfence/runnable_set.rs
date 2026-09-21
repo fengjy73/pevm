@@ -340,6 +340,26 @@ impl RunnableSet {
         // leaves `may_execute=false` and workers yield-spin (~400% CPU).
         ready.heal_finished_preds(|w| scheduler.is_done(w));
         let mut n = 0;
+        // WaitForDependency leftovers (Executing, worker gone). Only when
+        // queues are empty — recovering into a live antichain mills at ~390%.
+        if self.pending_work() == 0 {
+            for tx in 0..self.block_size {
+                let st = self.state[tx].load(Ordering::Acquire);
+                if st == ST_RUNNING || st == ST_DONE || !scheduler.is_executing(tx) {
+                    continue;
+                }
+                if ready.blocking_producer(tx).is_some_and(|w| {
+                    !scheduler.is_done(w)
+                        && self.state[w].load(Ordering::Acquire) == ST_RUNNING
+                }) {
+                    continue;
+                }
+                if scheduler.recover_executing_waiter(tx) {
+                    self.requeue_ready(tx, ready);
+                    n += 1;
+                }
+            }
+        }
         // PC-5: leftover gated bits with no live producer must rejoin Q_indep.
         let freed = ready.collapse_false_gates(|w| {
             scheduler.is_executing(w) || scheduler.is_ready(w) || scheduler.is_executed(w)
