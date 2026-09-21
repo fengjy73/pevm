@@ -1301,19 +1301,13 @@ impl ReadyEdgeTable {
             return false;
         }
         self.install_leftover_min(consumer);
-        match self.live_chain_before(consumer) {
-            Some(p) if self.should_plant_observed_waw(consumer, p) => {
-                self.advance_leftover_chain(consumer);
-                self.note_consumer_on(consumer, p, None);
-                true
-            }
-            _ => {
-                // No earlier leftover tip. Execute rather than wait on a
-                // later writer (leftover_min steal-rebind hung 19807137).
-                self.advance_leftover_chain(consumer);
-                false
-            }
-        }
+        self.advance_leftover_chain(consumer);
+        // Do not Detect-gate surplus. Overflow wait starred 19807137
+        // (leftover_w=8 n_unf=190/544) and DashMap-rebound complete_arch
+        // (`munmap_chunk` / `free(): invalid pointer`). Same-ℓ WAW stays
+        // on plant_observed_window. leftover_n still tracks 8 live tips
+        // so 6196166 does not reopen the full Released mill.
+        false
     }
 
     /// Keep at most `w_max` Detect waiters on `ℓ`. Evict oldest first,
@@ -2026,13 +2020,11 @@ mod tests {
                 "width-8 leftover tips must execute"
             );
         }
-        assert!(t.plant_global_leftover(60));
-        assert_eq!(
-            t.blocking_producer(60),
-            Some(47),
-            "surplus waits on the newest live tip, not leftover_min"
+        assert!(
+            !t.plant_global_leftover(60),
+            "surplus leftover executes — no block-wide Detect star"
         );
-        assert!(!t.may_execute(60));
+        assert!(t.may_execute(60));
     }
 
     #[test]
@@ -2057,13 +2049,11 @@ mod tests {
             t.may_execute(50),
             "later slot holders stay Indep (no leftover_min steal-rebind)"
         );
-        assert!(t.plant_global_leftover(70));
-        assert_eq!(
-            t.blocking_producer(70),
-            Some(56),
-            "surplus later leftover waits on the newest tip < itself"
+        assert!(
+            !t.plant_global_leftover(70),
+            "surplus leftover executes — no block-wide Detect star"
         );
-        assert!(!t.may_execute(70));
+        assert!(t.may_execute(70));
     }
 
     #[test]
@@ -2073,8 +2063,8 @@ mod tests {
             assert!(!t.plant_global_leftover(10 + i));
         }
         assert!(
-            t.plant_global_leftover(30),
-            "ninth leftover overflows while slots are full"
+            !t.plant_global_leftover(30),
+            "ninth leftover still executes (no Detect overflow star)"
         );
         t.note_abort_reincarnate(10);
         assert!(
