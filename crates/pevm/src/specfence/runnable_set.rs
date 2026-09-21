@@ -361,15 +361,11 @@ impl RunnableSet {
         if (0..self.block_size).any(|t| self.state[t].load(Ordering::Acquire) == ST_RUNNING) {
             return 0;
         }
-        // Mid-block pending=0 must not nuclear-ungate (that re-armed a
-        // 49-head Q_released mill). After a real idle stretch the last
-        // gated Indep refuse mill (19807137 pending=0/1, refuse=8) is freed.
-        let nuclear = self.idle_spins.load(Ordering::Relaxed) >= 256;
-        let freed = ready.collapse_false_gates(|w| {
-            !nuclear
-                && scheduler.is_executing(w)
-                && self.state[w].load(Ordering::Acquire) == ST_RUNNING
-        });
+        // Keep unfinished producers. `is_executing && ST_RUNNING` is always
+        // false here (we just proved no ST_RUNNING) and nuclear-ungated the
+        // leftover chain into a 32-head Q_released mill (19807137). Ghost
+        // Ready producers are requeued below via has_known_waiters.
+        let freed = ready.collapse_false_gates(|w| !scheduler.is_done(w));
         let mut n = 0;
         for tx in freed {
             if scheduler.is_aborting(tx) {

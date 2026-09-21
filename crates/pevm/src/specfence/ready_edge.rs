@@ -837,6 +837,15 @@ impl ReadyEdgeTable {
         )
     }
 
+    /// Hang-trace: global leftover election (`NONE` → `usize::MAX`).
+    #[inline]
+    pub(crate) fn hang_global_leftover(&self) -> (usize, usize) {
+        (
+            self.global_leftover_min.load(Ordering::Relaxed),
+            self.global_leftover_chain.load(Ordering::Relaxed),
+        )
+    }
+
     /// Newest still-live waiter reachable from `start` with index `< before`.
     /// Overflow plants must chain, not star on one tip — a star wakes
     /// every leftover writer at once (19807137 ~40 Released mill).
@@ -993,16 +1002,25 @@ impl ReadyEdgeTable {
         }
     }
 
+    /// Previous leftover head stays Indep after a lower writer steals `min`.
+    /// Both then Opt-execute (19807137 leftover mill / nuclear 32-head mill).
+    fn rebind_stolen_leftover_head(&self, old_head: TxIdx, new_min: TxIdx) {
+        if old_head <= new_min || self.is_writer_done(new_min) {
+            return;
+        }
+        self.note_consumer_on(old_head, new_min, None);
+    }
+
     /// One leftover writer executes at a time in the block. Per-ℓ election
     /// left 19807137 with ~23 Q_released tips (`leftover_min=23`).
     pub(crate) fn plant_global_leftover(&self, consumer: TxIdx) -> bool {
         self.global_leftover_min
             .fetch_min(consumer, Ordering::Relaxed);
         let min = self.global_leftover_min.load(Ordering::Relaxed);
-        let pred = loop {
+        let (pred, stolen_head) = loop {
             let cur = self.global_leftover_chain.load(Ordering::Relaxed);
             if cur == consumer {
-                break None;
+                break (None, None);
             }
             let cand = if cur != NONE && cur < consumer && !self.is_writer_done(cur) {
                 Some(cur)
@@ -1025,16 +1043,30 @@ impl ReadyEdgeTable {
                 Ordering::Release,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => break cand,
+                Ok(_) => {
+                    let stolen = if min == consumer
+                        && cur != NONE
+                        && cur > consumer
+                        && !self.is_writer_done(cur)
+                    {
+                        Some(cur)
+                    } else {
+                        None
+                    };
+                    break (cand, stolen);
+                }
                 Err(_) => {}
             }
         };
+        if let Some(old) = stolen_head {
+            self.rebind_stolen_leftover_head(old, consumer);
+        }
         match pred {
             Some(p) if self.should_plant_observed_waw(consumer, p) => {
                 self.note_consumer_on(consumer, p, None);
                 true
             }
-            _ => false,
+            _ => stolen_head.is_some(),
         }
     }
 
@@ -1666,16 +1698,22 @@ mod tests {
             "later leftover may elect first"
         );
         assert!(
-            !t.plant_observed_window(10, 0, loc, 1),
-            "lowest leftover steals and executes"
+            t.plant_observed_window(10, 0, loc, 1),
+            "lowest leftover steals and rebinds the previous head"
         );
         assert!(
             t.plant_observed_window(30, 0, loc, 1),
             "mid leftover waits on leftover_min — not a third tip"
         );
         assert_eq!(t.blocking_producer(30), Some(10));
+        assert_eq!(
+            t.blocking_producer(50),
+            Some(10),
+            "stolen head must not stay Indep"
+        );
         assert!(t.may_execute(10));
         assert!(!t.may_execute(30));
+        assert!(!t.may_execute(50));
     }
 
     #[test]
@@ -1694,6 +1732,25 @@ mod tests {
         assert_eq!(t.blocking_producer(40), Some(20));
         assert!(!t.may_execute(40));
         assert!(t.may_execute(20));
+    }
+
+    #[test]
+    fn plant_global_leftover_rebinds_previous_tip_onto_new_min() {
+        let t = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        t.note_producer_done(0, &wave);
+        assert!(
+            !t.plant_global_leftover(40),
+            "first leftover is the global tip"
+        );
+        assert!(t.may_execute(40));
+        assert!(
+            t.plant_global_leftover(10),
+            "lower leftover must steal and gate the previous tip"
+        );
+        assert_eq!(t.blocking_producer(40), Some(10));
+        assert!(t.may_execute(10));
+        assert!(!t.may_execute(40), "two leftover heads must not both execute");
     }
 
     #[test]

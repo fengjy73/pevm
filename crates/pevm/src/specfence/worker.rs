@@ -36,8 +36,9 @@ pub(crate) fn run_sf_block<F, V>(
         spins += 1;
         if spins.is_multiple_of(8_000) && std::env::var_os("SPECFENCE_HANG_TRACE").is_some() {
             let (n_min, n_tip, n_ov) = specfence.ready_edges.hang_plant_n();
+            let (g_min, g_chain) = specfence.ready_edges.hang_global_leftover();
             eprintln!(
-                "sf-hang-trace spins={spins} pending={} q_i/r/o/v={}/{}/{}/{} unfinished={} validated={} gated={} live_wait={} refuse={} leftover_min={} loc_tip={} overflow_tip={}",
+                "sf-hang-trace spins={spins} pending={} q_i/r/o/v={}/{}/{}/{} unfinished={} validated={} gated={} live_wait={} refuse={} leftover_min={} loc_tip={} overflow_tip={} glob_min={} glob_chain={}",
                 runnable.pending_work(),
                 runnable.q_indep_len(),
                 runnable.q_released_len(),
@@ -51,6 +52,8 @@ pub(crate) fn run_sf_block<F, V>(
                 n_min,
                 n_tip,
                 n_ov,
+                g_min,
+                g_chain,
             );
         }
         if abort() {
