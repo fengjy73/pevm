@@ -340,12 +340,10 @@ impl RunnableSet {
             self.mark_wait(tx);
             return;
         }
-        // Location-admitted cohort only. Anonymous was_queued consumers
-        // on Q_ordered were the 19807137 OrderedTip mill; sending every
-        // heal leftover Indep re-armed the 19469101 vis_opt mill.
-        if ready.admitted_on_location(tx) {
-            self.force_push(tx, QueueKind::Ordered);
-        } else if ready.is_gated(tx) {
+        // Never Q_ordered from heal: 19807137 mills ~40 OrderedTip heads
+        // even when only location-admitted txs are pushed (8148ded).
+        // Released/Indep + plant waits; FullReplay stays off Ordered.
+        if ready.is_gated(tx) {
             self.force_push(tx, QueueKind::Released);
         } else {
             self.force_push(tx, QueueKind::Indep);
@@ -959,8 +957,8 @@ mod tests {
         }
         assert_eq!(
             from2,
-            Some(QueueKind::Ordered),
-            "location cohort → Q_ordered"
+            Some(QueueKind::Released),
+            "location cohort must not take Q_ordered (19807137 mill)"
         );
         assert_eq!(
             from3,
