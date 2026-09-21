@@ -513,6 +513,10 @@ impl ReadyEdgeTable {
         if was_done && self.is_gated(writer) {
             self.pending_gated.fetch_add(1, Ordering::Relaxed);
         }
+        // FullReplay kept leftover_n at 8 forever (19807137 leftover_w=8
+        // n_unf=190 hang). The slot is only live while this incarnation
+        // may still Commit.
+        self.clear_leftover_slot(writer);
     }
 
     /// PC-5: force A0 on this consumer (execute anyway).
@@ -1270,6 +1274,17 @@ impl ReadyEdgeTable {
             }
         }
         (best != NONE).then_some(best)
+    }
+
+    /// Drop leftover slots whose writers already published. leftover_n stuck
+    /// at 8 after Commit-without-clear blocked every later leftover.
+    pub(crate) fn reap_done_leftover_slots(&self) {
+        for slot in &self.leftover_ids {
+            let t = slot.load(Ordering::Relaxed);
+            if t != NONE && self.is_writer_done(t) {
+                self.clear_leftover_slot(t);
+            }
+        }
     }
 
     /// At most `LEFTOVER_W` leftover tips execute. Surplus chain onto a live
@@ -2049,6 +2064,24 @@ mod tests {
             "surplus later leftover waits on the newest tip < itself"
         );
         assert!(!t.may_execute(70));
+    }
+
+    #[test]
+    fn leftover_slot_frees_on_abort() {
+        let t = ReadyEdgeTable::new();
+        for i in 0..8 {
+            assert!(!t.plant_global_leftover(10 + i));
+        }
+        assert!(
+            t.plant_global_leftover(30),
+            "ninth leftover overflows while slots are full"
+        );
+        t.note_abort_reincarnate(10);
+        assert!(
+            !t.plant_global_leftover(40),
+            "FullReplay must free a leftover slot"
+        );
+        assert!(t.may_execute(40));
     }
 
     #[test]
