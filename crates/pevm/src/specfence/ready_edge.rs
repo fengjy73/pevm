@@ -271,13 +271,21 @@ impl ReadyEdgeTable {
     }
 
     /// Consumers that cannot execute at the moment (begin-block tax snapshot).
+    ///
+    /// Must not call [`may_execute`] while the `consumers` iter is live —
+    /// DashMap is not reentrant (same-map `iter` + `get` corrupts the heap).
     pub(crate) fn blocked_consumers(&self) -> Vec<TxIdx> {
         let mut out: Vec<TxIdx> = self
             .consumers
             .iter()
             .filter_map(|e| {
                 let t = *e.key();
-                if self.may_execute(t) { None } else { Some(t) }
+                if t == 0 || self.a0_force.contains(&t) {
+                    return None;
+                }
+                let w = e.value().load(Ordering::Relaxed);
+                let blocked = w != NONE && w < t && !self.is_writer_done(w);
+                blocked.then_some(t)
             })
             .collect();
         out.sort_unstable();
@@ -642,13 +650,22 @@ impl ReadyEdgeTable {
             for c in cs {
                 // Only the consumers still gated on *this* writer. Probe-star
                 // leftovers that already rebased onto a later pred must stay.
-                let Some(e) = self.consumers.get(&c) else {
-                    continue;
+                //
+                // DashMap is not reentrant: drop the `consumers` shard
+                // *before* `may_execute`, which also `consumers.get`. Nested
+                // get on the same shard is the heap-abort after
+                // `plant_observed_waw` increased waiter traffic
+                // (`free(): invalid pointer` / `corrupted size vs. prev_size`).
+                let still_mine = match self.consumers.get(&c) {
+                    Some(e) if e.load(Ordering::Relaxed) == writer => {
+                        e.store(NONE, Ordering::Relaxed);
+                        true
+                    }
+                    _ => false,
                 };
-                if e.load(Ordering::Relaxed) != writer {
+                if !still_mine {
                     continue;
                 }
-                e.store(NONE, Ordering::Relaxed);
                 self.sleeping.remove(&c);
                 if self.may_execute(c) {
                     wave.push_ready(c);
@@ -750,6 +767,42 @@ impl ReadyEdgeTable {
         out
     }
 
+    /// Live Detect waiters bound to `ℓ` (no sort — plant-cap hot path).
+    #[inline]
+    pub(crate) fn consumer_count_on(&self, location: MemoryLocationHash) -> usize {
+        self.queued_on
+            .iter()
+            .filter(|e| *e.value() == location)
+            .count()
+    }
+
+    /// Mid-block observed-WAW plant. Stops 2-writer Opt ping-pong without
+    /// deepening a spine (producer itself waiting) or over-planting a
+    /// token/storage fan past `w_max`.
+    pub(crate) fn should_plant_observed_waw(
+        &self,
+        consumer: TxIdx,
+        producer: TxIdx,
+        location: MemoryLocationHash,
+        w_max: usize,
+    ) -> bool {
+        if producer >= consumer || self.is_writer_done(producer) {
+            return false;
+        }
+        if self
+            .blocking_producer(consumer)
+            .is_some_and(|w| w >= producer)
+        {
+            return false;
+        }
+        // Window: only wait on a producer that can run. A pred that is
+        // itself waiting would serialize ERC-20 / 19469101.
+        if self.is_gated(producer) && !self.may_execute(producer) {
+            return false;
+        }
+        w_max > 0 && self.consumer_count_on(location) < w_max
+    }
+
     /// PC-5: drop gates whose producer is gone or already published so
     /// `pending_gated>0` cannot exist with an empty RunnableSet.
     /// Returns the txs that became executable.
@@ -797,10 +850,14 @@ impl ReadyEdgeTable {
             .collect();
         // Detect-gated waiters are often ST_WAIT without a sleeping bit
         // (RunnableSet refuse does not always call `note_skip_gate`).
+        // Snapshot first — do not hold `consumers.iter` across other maps.
         if preds.is_empty() && !self.consumers.is_empty() {
-            for e in self.consumers.iter() {
-                let c = *e.key();
-                let w = e.value().load(Ordering::Relaxed);
+            let snapshot: Vec<(TxIdx, TxIdx)> = self
+                .consumers
+                .iter()
+                .map(|e| (*e.key(), e.value().load(Ordering::Relaxed)))
+                .collect();
+            for (c, w) in snapshot {
                 if w < c && !self.is_writer_done(w) && finished(w) {
                     preds.push(w);
                 }
@@ -1198,5 +1255,93 @@ mod tests {
         assert_eq!(t.consumers_queued_on(11), vec![3]);
         assert_eq!(t.consumers_queued_on(22), vec![5]);
         assert!(t.consumers_queued_on(99).is_empty());
+    }
+
+    #[test]
+    fn producer_done_many_waiters_then_may_execute() {
+        let t = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        for c in 1..64 {
+            t.note_consumer(c, 0);
+            assert!(!t.may_execute(c));
+        }
+        t.note_producer_done(0, &wave);
+        for c in 1..64 {
+            assert!(
+                t.may_execute(c),
+                "waiter {c} must execute after producer done (no nested DashMap get)"
+            );
+        }
+        let mut woke = 0;
+        while wave.pop_ready().is_some() {
+            woke += 1;
+        }
+        assert_eq!(woke, 63);
+    }
+
+    #[test]
+    fn producer_done_concurrent_with_may_execute() {
+        use std::sync::Arc;
+        let t = Arc::new(ReadyEdgeTable::new());
+        let wave = Arc::new(WaveParkTable::new());
+        for c in 1..48 {
+            t.note_consumer(c, 0);
+        }
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let t = t.clone();
+            handles.push(std::thread::spawn(move || {
+                for c in 1..48 {
+                    let _ = t.may_execute(c);
+                    let _ = t.blocking_producer(c);
+                    let _ = t.blocked_consumers();
+                }
+            }));
+        }
+        t.note_producer_done(0, &wave);
+        for h in handles {
+            h.join().expect("no DashMap re-entry panic");
+        }
+        for c in 1..48 {
+            assert!(t.may_execute(c));
+        }
+    }
+
+    #[test]
+    fn plant_observed_waw_allows_two_writer_ping_pong() {
+        let t = ReadyEdgeTable::new();
+        assert!(
+            t.should_plant_observed_waw(5, 3, 0x32be, 2),
+            "thin hops=0 pair must plant"
+        );
+        t.note_consumer_on(5, 3, Some(0x32be));
+        assert!(
+            !t.may_execute(5),
+            "planted waiter must not Opt-ping-pong"
+        );
+    }
+
+    #[test]
+    fn plant_observed_waw_skips_when_producer_itself_waiting() {
+        let t = ReadyEdgeTable::new();
+        t.note_consumer_on(5, 1, Some(0x32be));
+        assert!(!t.may_execute(5));
+        assert!(
+            !t.should_plant_observed_waw(8, 5, 0x32be, 4),
+            "must not deepen a spine behind a blocked producer"
+        );
+    }
+
+    #[test]
+    fn plant_observed_waw_skips_when_loc_at_w_max() {
+        let t = ReadyEdgeTable::new();
+        t.note_consumer_on(3, 0, Some(0xabc));
+        t.note_consumer_on(5, 1, Some(0xabc));
+        assert_eq!(t.consumer_count_on(0xabc), 2);
+        assert!(
+            !t.should_plant_observed_waw(7, 2, 0xabc, 2),
+            "over-plant past w_max serializes ERC-20 / 19469101"
+        );
+        assert!(t.should_plant_observed_waw(7, 2, 0xdef, 2));
     }
 }

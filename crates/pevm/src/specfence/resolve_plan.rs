@@ -195,8 +195,10 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
     }
 }
 
-/// Always raise a Detect edge on a observed non-lazy WAW. Thin `hops=0`
-/// must not leave two Opt writers ping-ponging FullReplay forever.
+/// Raise a Detect edge on an observed non-lazy WAW. Thin `hops=0` must
+/// not leave two Opt writers ping-ponging FullReplay forever — but a
+/// deep / fat plant serializes ERC-20 and 19469101. Window = wait only
+/// on a runnable producer, and at most `w_max` waiters per ℓ.
 fn plant_observed_waw(ctx: &ApplyCtx<'_>, f: &super::collateral::FirstConflict) {
     if f.lazy || f.class != ConflictClass::EffectiveWAW {
         return;
@@ -205,14 +207,11 @@ fn plant_observed_waw(ctx: &ApplyCtx<'_>, f: &super::collateral::FirstConflict) 
     let Some(producer) = f.peer.filter(|&w| w < tx) else {
         return;
     };
-    if ctx.specfence.ready_edges.is_writer_done(producer) {
-        return;
-    }
-    if ctx
+    let w_max = ArmTable::w_max(ctx.scheduler.block_size(), 0, false) as usize;
+    if !ctx
         .specfence
         .ready_edges
-        .blocking_producer(tx)
-        .is_some_and(|w| w >= producer)
+        .should_plant_observed_waw(tx, producer, f.location, w_max)
     {
         return;
     }
@@ -395,5 +394,9 @@ mod tests {
         assert!(!code.contains("validate_occ_kernel("));
         assert!(code.contains("finish_validation_sf"));
         assert!(code.contains("release_successors"));
+        assert!(
+            code.contains("should_plant_observed_waw"),
+            "mid-block WAW plant must stay windowed (no deep/fat spine)"
+        );
     }
 }
