@@ -1965,128 +1965,140 @@ impl<S: Storage> Database for VmDb<'_, S> {
 
         let read_origins = self.read_set.entry(location_hash).or_default();
 
-        // Try reading from multi-version data
-        if self.tx_idx > 0
-            && let Some(written_transactions) = self.mv_memory.data.get(&location_hash)
-            && let Some((closest_idx, entry)) =
-                written_transactions.range(..self.tx_idx).next_back()
-        {
-            match entry {
-                MemoryEntry::Data(tx_incarnation, MemoryValue::Storage(value)) => {
-                    if self
-                        .mv_memory
-                        .is_aborted_incarnation(*closest_idx, *tx_incarnation)
-                    {
-                        // PCC OrderedDirtyRead only. OptimisticRead/OCC Block (Block-STM).
-                        if resolve {
-                            if let Some((idx, inc)) =
-                                self.mv_memory.last_data_before(location_hash, self.tx_idx)
-                            {
-                                if let Some(written) = self.mv_memory.data.get(&location_hash)
-                                    && let Some(MemoryEntry::Data(i2, MemoryValue::Storage(v2))) =
-                                        written.get(&idx)
-                                    && *i2 == inc
-                                {
-                                    self.specfence.metrics.record_optimistic_read();
-                                    self.specfence.metrics.record_db_heavy_op();
-                                    let origin = ReadOrigin::MvMemory(TxVersion {
-                                        tx_idx: idx,
-                                        tx_incarnation: inc,
-                                    });
-                                    Self::push_origin(read_origins, origin.clone())?;
-                                    self.deep_trace_read(
-                                        location_hash,
-                                        crate::specfence::LocationKind::Storage,
-                                        Some(&origin),
-                                    );
-                                    self.maybe_note_value(
-                                        location_hash,
-                                        FfValue::Storage {
-                                            address,
-                                            slot: index,
-                                            value: *v2,
-                                            origin: Some((idx, inc)),
-                                        },
-                                    );
-                                    self.maybe_early_val(address, location_hash)?;
-                                    return Ok(*v2);
-                                }
-                            }
-                            self.promote_on_conflict(address, location_hash);
+        // Snapshot the closest prior entry under one `data.get`, then drop
+        // the DashMap guard before `last_data_before` / `maybe_early_val`
+        // (same-map re-entry is the 19807137 `double free or corruption`).
+        enum StorageTip {
+            Live {
+                idx: TxIdx,
+                inc: crate::TxIncarnation,
+                value: U256,
+            },
+            SkipTo {
+                closest_idx: TxIdx,
+                prior: Option<(TxIdx, crate::TxIncarnation, U256)>,
+                estimate: bool,
+            },
+            BadType,
+        }
+        let tip = if self.tx_idx > 0 {
+            self.mv_memory.data.get(&location_hash).and_then(|written| {
+                let (idx, entry) = written.range(..self.tx_idx).next_back()?;
+                match entry {
+                    MemoryEntry::Data(inc, MemoryValue::Storage(v)) => {
+                        if self.mv_memory.is_aborted_incarnation(*idx, *inc) {
+                            let prior = crate::mv_memory::MvMemory::last_live_storage_in(
+                                &written,
+                                self.tx_idx,
+                                |i, inc| self.mv_memory.is_aborted_incarnation(i, inc),
+                            );
+                            Some(StorageTip::SkipTo {
+                                closest_idx: *idx,
+                                prior,
+                                estimate: false,
+                            })
+                        } else {
+                            Some(StorageTip::Live {
+                                idx: *idx,
+                                inc: *inc,
+                                value: *v,
+                            })
                         }
-                        return Err(self.park_estimate_blocking(location_hash, *closest_idx));
                     }
-                    self.specfence.metrics.record_db_heavy_op();
-                    let origin = ReadOrigin::MvMemory(TxVersion {
-                        tx_idx: *closest_idx,
-                        tx_incarnation: *tx_incarnation,
-                    });
-                    Self::push_origin(read_origins, origin.clone())?;
-                    self.deep_trace_read(
-                        location_hash,
-                        crate::specfence::LocationKind::Storage,
-                        Some(&origin),
-                    );
-                    self.maybe_note_value(
-                        location_hash,
-                        FfValue::Storage {
-                            address,
-                            slot: index,
-                            value: *value,
-                            origin: Some((*closest_idx, *tx_incarnation)),
-                        },
-                    );
-                    if resolve {
-                        self.maybe_early_val(address, location_hash)?;
+                    MemoryEntry::Estimate => {
+                        let prior = crate::mv_memory::MvMemory::last_live_storage_in(
+                            &written,
+                            self.tx_idx,
+                            |i, inc| self.mv_memory.is_aborted_incarnation(i, inc),
+                        );
+                        Some(StorageTip::SkipTo {
+                            closest_idx: *idx,
+                            prior,
+                            estimate: true,
+                        })
                     }
-                    return Ok(*value);
+                    _ => Some(StorageTip::BadType),
                 }
-                MemoryEntry::Estimate => {
-                    // PCC may skip ESTIMATE → prior Data. OptimisticRead/OCC Block.
-                    if resolve {
-                        if let Some((idx, inc)) =
-                            self.mv_memory.last_data_before(location_hash, self.tx_idx)
-                        {
-                            if let Some(written) = self.mv_memory.data.get(&location_hash)
-                                && let Some(MemoryEntry::Data(i2, MemoryValue::Storage(v2))) =
-                                    written.get(&idx)
-                                && *i2 == inc
-                            {
-                                self.specfence.metrics.record_optimistic_read();
-                                self.specfence.metrics.record_db_heavy_op();
-                                let origin = ReadOrigin::MvMemory(TxVersion {
-                                    tx_idx: idx,
-                                    tx_incarnation: inc,
-                                });
-                                Self::push_origin(read_origins, origin.clone())?;
-                                self.deep_trace_read(
-                                    location_hash,
-                                    crate::specfence::LocationKind::Storage,
-                                    Some(&origin),
-                                );
-                                self.maybe_note_value(
-                                    location_hash,
-                                    FfValue::Storage {
-                                        address,
-                                        slot: index,
-                                        value: *v2,
-                                        origin: Some((idx, inc)),
-                                    },
-                                );
-                                self.maybe_early_val(address, location_hash)?;
-                                return Ok(*v2);
-                            }
-                        }
+            })
+        } else {
+            None
+        };
+
+        match tip {
+            Some(StorageTip::Live { idx, inc, value }) => {
+                self.specfence.metrics.record_db_heavy_op();
+                let origin = ReadOrigin::MvMemory(TxVersion {
+                    tx_idx: idx,
+                    tx_incarnation: inc,
+                });
+                Self::push_origin(read_origins, origin.clone())?;
+                self.deep_trace_read(
+                    location_hash,
+                    crate::specfence::LocationKind::Storage,
+                    Some(&origin),
+                );
+                self.maybe_note_value(
+                    location_hash,
+                    FfValue::Storage {
+                        address,
+                        slot: index,
+                        value,
+                        origin: Some((idx, inc)),
+                    },
+                );
+                if resolve {
+                    self.maybe_early_val(address, location_hash)?;
+                }
+                return Ok(value);
+            }
+            Some(StorageTip::SkipTo {
+                closest_idx,
+                prior,
+                estimate,
+            }) => {
+                if resolve {
+                    if let Some((idx, inc, v2)) = prior {
+                        self.specfence.metrics.record_optimistic_read();
+                        self.specfence.metrics.record_db_heavy_op();
+                        let origin = ReadOrigin::MvMemory(TxVersion {
+                            tx_idx: idx,
+                            tx_incarnation: inc,
+                        });
+                        Self::push_origin(read_origins, origin.clone())?;
+                        self.deep_trace_read(
+                            location_hash,
+                            crate::specfence::LocationKind::Storage,
+                            Some(&origin),
+                        );
+                        self.maybe_note_value(
+                            location_hash,
+                            FfValue::Storage {
+                                address,
+                                slot: index,
+                                value: v2,
+                                origin: Some((idx, inc)),
+                            },
+                        );
+                        self.maybe_early_val(address, location_hash)?;
+                        return Ok(v2);
+                    }
+                    if estimate {
                         // No prior Data: fall through to storage (not BlockingOther).
                         self.specfence.metrics.record_optimistic_read();
                     } else {
                         self.promote_on_conflict(address, location_hash);
-                        self.note_unpublished_raw(location_hash, *closest_idx);
-                        return Err(self.park_estimate_blocking(location_hash, *closest_idx));
+                        return Err(self.park_estimate_blocking(location_hash, closest_idx));
                     }
+                } else if estimate {
+                    self.promote_on_conflict(address, location_hash);
+                    self.note_unpublished_raw(location_hash, closest_idx);
+                    return Err(self.park_estimate_blocking(location_hash, closest_idx));
+                } else {
+                    return Err(self.park_estimate_blocking(location_hash, closest_idx));
                 }
-                _ => return Err(ReadError::InvalidMemoryValueType),
             }
+            Some(StorageTip::BadType) => return Err(ReadError::InvalidMemoryValueType),
+            None => {}
         }
 
         // Fall back to storage

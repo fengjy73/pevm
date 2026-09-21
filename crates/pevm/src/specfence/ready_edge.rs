@@ -777,15 +777,9 @@ impl ReadyEdgeTable {
     }
 
     /// Mid-block observed-WAW plant. Stops 2-writer Opt ping-pong without
-    /// deepening a spine (producer itself waiting) or over-planting a
-    /// token/storage fan past `w_max`.
-    pub(crate) fn should_plant_observed_waw(
-        &self,
-        consumer: TxIdx,
-        producer: TxIdx,
-        location: MemoryLocationHash,
-        w_max: usize,
-    ) -> bool {
+    /// deepening a spine (producer itself waiting). Caller evicts surplus
+    /// waiters on `ℓ` after insert so a token/storage fan stays ≤ `w_max`.
+    pub(crate) fn should_plant_observed_waw(&self, consumer: TxIdx, producer: TxIdx) -> bool {
         if producer >= consumer || self.is_writer_done(producer) {
             return false;
         }
@@ -800,7 +794,35 @@ impl ReadyEdgeTable {
         if self.is_gated(producer) && !self.may_execute(producer) {
             return false;
         }
-        w_max > 0 && self.consumer_count_on(location) < w_max
+        true
+    }
+
+    /// Keep at most `w_max` Detect waiters on `ℓ`. Evict oldest first,
+    /// never `keep` (the aborting consumer that just planted). Returns
+    /// ungated txs — caller must requeue them onto `Q_indep`.
+    pub(crate) fn evict_surplus_waiters(
+        &self,
+        location: MemoryLocationHash,
+        keep: TxIdx,
+        w_max: usize,
+    ) -> Vec<TxIdx> {
+        let queued = self.consumers_queued_on(location);
+        if queued.len() <= w_max {
+            return Vec::new();
+        }
+        let surplus = queued.len() - w_max;
+        let mut evicted = Vec::new();
+        for &c in &queued {
+            if evicted.len() >= surplus {
+                break;
+            }
+            if c == keep {
+                continue;
+            }
+            self.ungate(c);
+            evicted.push(c);
+        }
+        evicted
     }
 
     /// PC-5: drop gates whose producer is gone or already published so
@@ -1311,7 +1333,7 @@ mod tests {
     fn plant_observed_waw_allows_two_writer_ping_pong() {
         let t = ReadyEdgeTable::new();
         assert!(
-            t.should_plant_observed_waw(5, 3, 0x32be, 2),
+            t.should_plant_observed_waw(5, 3),
             "thin hops=0 pair must plant"
         );
         t.note_consumer_on(5, 3, Some(0x32be));
@@ -1327,21 +1349,23 @@ mod tests {
         t.note_consumer_on(5, 1, Some(0x32be));
         assert!(!t.may_execute(5));
         assert!(
-            !t.should_plant_observed_waw(8, 5, 0x32be, 4),
+            !t.should_plant_observed_waw(8, 5),
             "must not deepen a spine behind a blocked producer"
         );
     }
 
     #[test]
-    fn plant_observed_waw_skips_when_loc_at_w_max() {
+    fn evict_surplus_waiters_keeps_newest_and_w_max() {
         let t = ReadyEdgeTable::new();
         t.note_consumer_on(3, 0, Some(0xabc));
         t.note_consumer_on(5, 1, Some(0xabc));
-        assert_eq!(t.consumer_count_on(0xabc), 2);
-        assert!(
-            !t.should_plant_observed_waw(7, 2, 0xabc, 2),
-            "over-plant past w_max serializes ERC-20 / 19469101"
-        );
-        assert!(t.should_plant_observed_waw(7, 2, 0xdef, 2));
+        t.note_consumer_on(7, 2, Some(0xabc));
+        assert_eq!(t.consumer_count_on(0xabc), 3);
+        let evicted = t.evict_surplus_waiters(0xabc, 7, 2);
+        assert_eq!(evicted, vec![3]);
+        assert_eq!(t.consumers_queued_on(0xabc), vec![5, 7]);
+        assert!(t.may_execute(3), "evicted waiter returns to Opt");
+        assert!(!t.may_execute(5));
+        assert!(!t.may_execute(7));
     }
 }

@@ -207,17 +207,28 @@ fn plant_observed_waw(ctx: &ApplyCtx<'_>, f: &super::collateral::FirstConflict) 
     let Some(producer) = f.peer.filter(|&w| w < tx) else {
         return;
     };
-    let w_max = ArmTable::w_max(ctx.scheduler.block_size(), 0, false) as usize;
     if !ctx
         .specfence
         .ready_edges
-        .should_plant_observed_waw(tx, producer, f.location, w_max)
+        .should_plant_observed_waw(tx, producer)
     {
         return;
     }
     ctx.specfence
         .ready_edges
         .note_consumer_on(tx, producer, Some(f.location));
+    // Sliding window: this abort must wait (stop ping-pong) but a fat
+    // token/storage fan must not serialize the block. Evict oldest.
+    let w_max = ArmTable::w_max(ctx.scheduler.block_size(), 0, false) as usize;
+    for c in ctx
+        .specfence
+        .ready_edges
+        .evict_surplus_waiters(f.location, tx, w_max)
+    {
+        if !ctx.scheduler.is_validated(c) {
+            ctx.runnable.force_push(c, QueueKind::Indep);
+        }
+    }
 }
 
 fn seed_short_edge(

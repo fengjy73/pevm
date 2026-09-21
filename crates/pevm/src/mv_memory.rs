@@ -535,8 +535,29 @@ impl MvMemory {
         }
     }
 
+    /// Last live Storage Data below `tx_idx` inside an already-held location map.
+    /// Callers that hold `data.get(location)` must use this instead of
+    /// [`last_data_before`] — DashMap is not reentrant.
+    pub(crate) fn last_live_storage_in(
+        written: &BTreeMap<TxIdx, MemoryEntry>,
+        tx_idx: TxIdx,
+        is_aborted: impl Fn(TxIdx, TxIncarnation) -> bool,
+    ) -> Option<(TxIdx, TxIncarnation, alloy_primitives::U256)> {
+        for (idx, entry) in written.range(..tx_idx).rev() {
+            if let MemoryEntry::Data(inc, MemoryValue::Storage(v)) = entry
+                && !is_aborted(*idx, *inc)
+            {
+                return Some((*idx, *inc, *v));
+            }
+        }
+        None
+    }
+
     /// Last non-ESTIMATE Data version strictly below `tx_idx` (OrderedDirtyRead).
     /// Skips ESTIMATE markers and aborted incarnations (continue past both).
+    ///
+    /// Must not be called while the caller holds `data.get` on the same
+    /// location (DashMap is not reentrant — 19807137 `double free`).
     pub(crate) fn last_data_before(
         &self,
         location: MemoryLocationHash,
