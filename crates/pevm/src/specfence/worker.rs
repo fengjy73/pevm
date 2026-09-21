@@ -114,7 +114,28 @@ pub(crate) fn run_sf_block<F, V>(
                         // edge. Heal then recovered them into a live antichain
                         // (incarnation++ mill — 6196166 reuse 206k / 19807137).
                         if let Some(w) = on {
-                            specfence.ready_edges.note_consumer_on(tx_idx, w, None);
+                            if w < tx_idx {
+                                specfence.ready_edges.note_consumer_on(tx_idx, w, None);
+                            } else if specfence.ready_edges.detect_waits_on(w, tx_idx) {
+                                // Later leftover is Detect-gated on us; we
+                                // parked Aborting on them (6196166 reuse
+                                // n_unf=44). Ungate the leftover so it can
+                                // Commit and wake this Aborting.
+                                specfence.ready_edges.ungate(w);
+                                if scheduler.is_aborting(w) {
+                                    let _ = scheduler.recover_aborting(w);
+                                } else if scheduler.is_executing(w) {
+                                    let _ = scheduler.recover_executing_waiter(w);
+                                }
+                                if scheduler.is_ready(w) || scheduler.is_executed(w) {
+                                    let kind = if specfence.ready_edges.is_gated(w) {
+                                        super::runnable_set::QueueKind::Released
+                                    } else {
+                                        super::runnable_set::QueueKind::Indep
+                                    };
+                                    runnable.force_push(w, kind);
+                                }
+                            }
                         }
                         runnable.mark_wait(tx_idx);
                         drain_wave(specfence, scheduler, runnable);

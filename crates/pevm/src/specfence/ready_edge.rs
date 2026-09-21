@@ -797,6 +797,19 @@ impl ReadyEdgeTable {
             .filter(|&w| w < tx_idx && !self.is_writer_done(w))
     }
 
+    /// Detect pred chain reaches `target`. Used to break add_dependency
+    /// cycles: later leftover waits on us, we parked Aborting on them.
+    pub(crate) fn detect_waits_on(&self, mut tx: TxIdx, target: TxIdx) -> bool {
+        for _ in 0..8 {
+            match self.blocking_producer(tx) {
+                Some(p) if p == target => return true,
+                Some(p) if p < tx => tx = p,
+                _ => return false,
+            }
+        }
+        false
+    }
+
     /// Defer a known consumer. Count once until the producer finishes —
     /// re-probing the same head must not spin `refuse_admit` (19606599 31k).
     /// PC-W1: mark sleeping so steal/index skip this head until pred Done.
@@ -1924,6 +1937,17 @@ mod tests {
             !t.may_execute(40),
             "two leftover heads must not both execute"
         );
+    }
+
+    #[test]
+    fn detect_waits_on_follows_pred_chain() {
+        let t = ReadyEdgeTable::new();
+        t.note_consumer_on(15, 10, Some(0xaaa));
+        t.note_consumer_on(20, 15, Some(0xbbb));
+        assert!(t.detect_waits_on(20, 10));
+        assert!(t.detect_waits_on(15, 10));
+        assert!(!t.detect_waits_on(10, 20));
+        assert!(!t.detect_waits_on(20, 3));
     }
 
     #[test]
