@@ -117,41 +117,28 @@ pub(crate) fn run_sf_block<F, V>(
                         if let Some(w) = on {
                             if w < tx_idx {
                                 specfence.ready_edges.note_consumer_on(tx_idx, w, None);
-                                if specfence.ready_edges.may_execute(tx_idx) {
-                                    recover_and_requeue(
-                                        scheduler,
-                                        runnable,
-                                        specfence.ready_edges,
-                                        tx_idx,
-                                    );
-                                } else {
-                                    runnable.mark_wait(tx_idx);
-                                }
-                            } else {
-                                // Earlier parked on a later leftover. Detect
-                                //  later←us + scheduler  us←later is the
-                                // 19807137 leftover_min hang. Detach both
-                                // sides; do not ungate (that double-freed).
+                            } else if specfence.ready_edges.detect_waits_on(w, tx_idx) {
+                                // Later leftover is Detect-gated on us; we
+                                // parked Aborting on them. Flush the leftover
+                                // pred only — `ungate` + recover_executing
+                                // double-freed. Recovering both sides here
+                                // incarnation++ milled 19807137 (n_unf=437).
                                 specfence.ready_edges.flush_wait_on(w, tx_idx);
                                 let _ = scheduler.detach_dependent(w, tx_idx);
-                                recover_and_requeue(
-                                    scheduler,
-                                    runnable,
-                                    specfence.ready_edges,
-                                    tx_idx,
-                                );
-                                if !runnable.is_running(w) {
-                                    recover_and_requeue(
-                                        scheduler,
-                                        runnable,
-                                        specfence.ready_edges,
-                                        w,
-                                    );
+                                if !runnable.is_running(w)
+                                    && specfence.ready_edges.may_execute(w)
+                                    && (scheduler.is_ready(w) || scheduler.is_executed(w))
+                                {
+                                    let kind = if specfence.ready_edges.is_gated(w) {
+                                        super::runnable_set::QueueKind::Released
+                                    } else {
+                                        super::runnable_set::QueueKind::Indep
+                                    };
+                                    runnable.force_push(w, kind);
                                 }
                             }
-                        } else {
-                            runnable.mark_wait(tx_idx);
                         }
+                        runnable.mark_wait(tx_idx);
                         drain_wave(specfence, scheduler, runnable);
                     }
                     SfExec::Fatal => break,
@@ -232,41 +219,6 @@ pub(crate) enum SfExec {
         on: Option<crate::TxIdx>,
     },
     Fatal,
-}
-
-fn recover_and_requeue(
-    scheduler: &Scheduler,
-    runnable: &RunnableSet,
-    ready: &super::ready_edge::ReadyEdgeTable,
-    tx: crate::TxIdx,
-) {
-    if scheduler.is_aborting(tx) {
-        let _ = scheduler.recover_aborting(tx);
-    } else if scheduler.is_executing(tx) {
-        let _ = scheduler.recover_executing_waiter(tx);
-    }
-    if scheduler.is_validated(tx) {
-        runnable.mark_done(tx);
-        return;
-    }
-    if ready.is_gated(tx) && !ready.may_execute(tx) {
-        runnable.mark_wait(tx);
-        return;
-    }
-    if scheduler.is_executed(tx) {
-        runnable.force_push(tx, super::runnable_set::QueueKind::Revalidate);
-        return;
-    }
-    if scheduler.is_ready(tx) {
-        let kind = if ready.is_gated(tx) {
-            super::runnable_set::QueueKind::Released
-        } else {
-            super::runnable_set::QueueKind::Indep
-        };
-        runnable.force_push(tx, kind);
-    } else {
-        runnable.mark_wait(tx);
-    }
 }
 
 fn drain_wave(specfence: SpecFenceCtx<'_>, scheduler: &Scheduler, runnable: &RunnableSet) {
