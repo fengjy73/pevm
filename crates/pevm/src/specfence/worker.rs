@@ -143,21 +143,28 @@ pub(crate) fn run_sf_block<F, V>(
                 }
                 // Last-ditch: unfinished + empty queues + no live producer.
                 // Heal already ran; if still stuck, yield then retry heal.
+                let live_wait = runnable.waiting_on_live_producer(specfence.ready_edges, scheduler);
+                let stale_running = runnable.idle_spins() > 4096;
                 if runnable.pending_work() == 0
                     && scheduler.has_unfinished()
-                    && !runnable.waiting_on_live_producer(specfence.ready_edges, scheduler)
+                    && (!live_wait || stale_running)
                 {
                     let _ = runnable.heal(specfence.ready_edges, scheduler);
                     drain_wave(specfence, scheduler, runnable);
                     if runnable.pending_work() == 0 {
-                        let _ = runnable.force_idle_recover(specfence.ready_edges, scheduler);
+                        if stale_running {
+                            let _ =
+                                runnable.force_idle_recover_stale(specfence.ready_edges, scheduler);
+                        } else {
+                            let _ = runnable.force_idle_recover(specfence.ready_edges, scheduler);
+                        }
                         drain_wave(specfence, scheduler, runnable);
                     }
                     if runnable.pending_work() > 0 {
                         continue;
                     }
                 }
-                if runnable.waiting_on_live_producer(specfence.ready_edges, scheduler) {
+                if live_wait && !stale_running {
                     for _ in 0..32 {
                         std::hint::spin_loop();
                     }

@@ -477,7 +477,10 @@ impl ReadyEdgeTable {
         } else {
             self.finished.remove(&writer).is_some()
         };
-        if was_done && self.is_gated(writer) {
+        if !was_done {
+            return;
+        }
+        if self.is_gated(writer) {
             self.pending_gated.fetch_add(1, Ordering::Relaxed);
         }
         let cs = self
