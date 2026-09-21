@@ -137,17 +137,7 @@ pub(crate) fn run_sf_block<F, V>(
                         // edge. Heal then recovered them into a live antichain
                         // (incarnation++ mill — 6196166 reuse 206k / 19807137).
                         if let Some(w) = on {
-                            if specfence.ready_edges.is_live_leftover_min(tx_idx)
-                                && specfence.ready_edges.leftover_min_skips_blocker(w)
-                            {
-                                // leftover leftover_min already passed (204 when
-                                // leftover_min=205). Detect-plant gates leftover_min
-                                // off pick; refuse mill heap-aborts (unaligned tcache).
-                                // Flush leftover_min ← w only — no recover / force_push.
-                                specfence.ready_edges.flush_wait_on(tx_idx, w);
-                                let _ = scheduler.detach_dependent(w, tx_idx);
-                                runnable.mark_wait(tx_idx);
-                            } else if w < tx_idx {
+                            if w < tx_idx {
                                 specfence.ready_edges.note_consumer_on(tx_idx, w, None);
                                 runnable.mark_wait(tx_idx);
                             } else if specfence.ready_edges.is_live_leftover_min(tx_idx)

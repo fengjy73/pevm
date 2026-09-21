@@ -513,12 +513,6 @@ impl ReadyEdgeTable {
         if was_done && self.is_gated(writer) {
             self.pending_gated.fetch_add(1, Ordering::Relaxed);
         }
-        // leftover leftover_min already passed aborted — leftover_min stayed
-        // Detect-gated (19807137 leftover_min=205 pred=204). Flush leftover_min
-        // only; do not walk waiters.
-        if self.leftover_passed(writer) {
-            self.flush_leftover_min_passed_pred();
-        }
     }
 
     /// PC-5: force A0 on this consumer (execute anyway).
