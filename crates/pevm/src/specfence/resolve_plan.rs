@@ -142,15 +142,7 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
             ctx.scheduler
                 .finish_validation_sf(ctx.tx_version, true, Some(tx + 1));
             ctx.specfence.ready_edges.clear_started(tx);
-            // Same as FullReplay: Q_ordered re-entry is the 19807137 mill.
-            if ctx.specfence.ready_edges.is_gated(tx) && !ctx.specfence.ready_edges.may_execute(tx)
-            {
-                ctx.runnable.mark_wait(tx);
-            } else if ctx.specfence.ready_edges.is_gated(tx) || ctx.vis.needs_fence() {
-                requeue(&ctx, tx, QueueKind::Released);
-            } else {
-                requeue(&ctx, tx, QueueKind::Indep);
-            }
+            requeue(&ctx, tx, QueueKind::Ordered);
             enqueue_higher_revalidate(&ctx, tx);
         }
         ResolvePlan::FullReplay => {
