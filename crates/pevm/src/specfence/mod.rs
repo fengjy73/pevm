@@ -1,22 +1,25 @@
-//! SpecFence — pevm's fused PC⊗CC⊗Bayes protocol on **one** parallel spine.
+//! SpecFence Parallel Spine (SF-PS) — Detect → RunnableSet → Schedule.pick →
+//! Execute(vis) → Validate.to_resolve → Resolve.apply → Learn.
 //!
-//! SoT: `lab/notes/specfence-complete-architecture-v10-raw-mixed.md`
-//! (RAW_fan_out + mixed_RAW_WAW; wave-fill refuse; wait_for resumes or does not park);
-//! `v9.4-file-srp.md` (file SRP); `v9.3-pevm-unified.md` (one spine);
-//! `v9.1-cc-pc-bayes.md` (Bayes→admit→decide→pessimistic admit→Validate; Soft=0).
-//! Live vocabulary: `lab/notes/specfence-cc-glossary.md`.
-//! Triple = analysis lens, **not** folder kingdoms.
+//! SoT: `lab/notes/specfence-first-class-architecture-redesign-v1.md`
+//! and `lab/notes/specfence-sf-ps-full-land-v1.md`.
+//! Live vocabulary: `lab/notes/specfence-cc-glossary.md`
+//! (`OptimisticRead` / `OrderedAdmit` / `refuse_admit` / `wait_for_dependency` /
+//! `partial_abort` / `full_abort_reexecute` plus `RunnableSet` /
+//! `VisibilityPolicy` / `ResolvePlan`).
+//! Triple PC⊗CC⊗Learn = analysis lens, **not** folder kingdoms.
 //!
-//! Call order: Bayes.seed → admit_seed → Execute(if admitted) →
-//! decide←Bayes → pessimistic admit (`wait_for_dependency` / `refuse_admit`;
-//! `OrderedAdmit` rare) → Validate / `partial_abort`.
-//! Quiet/cold = optimistic_read cost class on the same spine (not an OCC-computer retreat).
+//! `ConcurrencyMode::Occ` is pristine Block-STM (**zero** SpecFence ticks) —
+//! contrast engine only.
+//! `ConcurrencyMode::SpecFence` is a **different protocol**: ready = Detect
+//! antichain ∪ released dependents; read = VisibilityPolicy; validate
+//! produces ResolvePlan. Independent txs may use Opt visibility
+//! (Avoid=noop). That is **not** a retreat to the OCC computer and
+//! **must not** call `next_occ_task` as the main pick.
 //!
-//! `ConcurrencyMode::OCC` is pristine Block-STM (**zero** SpecFence ticks).
-//! `ConcurrencyMode::SpecFence` owns schedule / execute wrap / validate / rem.
-//! Default optimistic_read ≡ OCC-cost (`occ_read` + bool validate + full_abort_reexecute).
-//! Pessimistic-admit verbs fire only on \(a + e_{\mathrm{vis}} + \mathrm{PE}(\mathrm{true}\,k)\).
-//! Mode is **access-local**, not an incarnation Occ\|Pcc fork.
+//! Soft=0. seq≡par. Lazy-update / near-independent are never OrderedAdmit
+//! objects. Thin (n≤176) must not learn Win_8. Under-covered spines must
+//! not leak Full as success.
 //!
 //! Frozen π: \(a=(t,k,\mathrm{depth},ℓ,\mathrm{mode})\) + \(e_{\mathrm{vis}}\) +
 //! gate `PredictedEssential(ℓ,k,morph) ∨ independence_certified`.
@@ -199,7 +202,11 @@ mod region;
 mod rem;
 mod repair;
 mod resolve;
+mod resolve_plan;
+mod runnable_set;
+mod schedule;
 mod sketch;
+mod visibility;
 mod wave;
 
 pub(crate) use access_log::AccessOrdinalLog;
@@ -243,10 +250,11 @@ pub(crate) use edge::{
 };
 pub(crate) use engagement::{AdaptiveEngagement, profile_timing_enabled, research_inspect_enabled};
 pub(crate) use executor::{
-    fence_for_mode, hinted_wait_enabled, next_occ_task, occ_read_set_valid,
-    specfence_access_is_occ, specfence_cost_class_spec, specfence_partial_abort_validate,
-    specfence_plant_is_occ, uses_specfence_resolve, validate_occ_kernel, validate_occ_stage,
-    validate_optimistic_fast, validate_specfence, wave_for_mode,
+    fence_for_mode, hinted_wait_enabled, next_occ_task, occ_pick_calls, occ_read_set_valid,
+    reset_occ_pick_calls, specfence_access_is_occ, specfence_cost_class_spec,
+    specfence_partial_abort_validate, specfence_plant_is_occ, uses_specfence_resolve,
+    validate_occ_kernel, validate_occ_stage, validate_optimistic_fast, validate_specfence,
+    wave_for_mode,
 };
 pub use finegrain::{
     AbortEvent, AccountGrainObserve, ConsumerFirstCross, DagStats, EffectClass, EffectLogEntry,
@@ -260,6 +268,9 @@ pub(crate) use heat::HeatMap;
 pub(crate) use hotset::HotSet;
 #[allow(unused_imports)]
 pub(crate) use hotset::{H_A, H_W};
+pub use resolve_plan::ResolvePlan;
+pub(crate) use runnable_set::RunnableSet;
+pub use visibility::VisibilityPolicy;
 // kernel.rs museum — tests only; rem-legal SoT is CertificateTable.
 pub(crate) use lane::LaneTable;
 pub(crate) use learner::{AdaptiveParams, InterBlockPrior, LiveLearner};

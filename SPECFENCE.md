@@ -46,9 +46,9 @@ SpecFence discovers the true DAG **during** execution and dynamically fuses opti
 
 | Mode | Role |
 |------|------|
-| `Occ` | Baseline Block-STM (instrumented abort metrics). |
+| `Occ` | Contrast Block-STM / OCC engine (instrumented abort metrics). |
 | `Pcc` | Conservative hinted Wait baseline (over-serialization upper bound). |
-| `SpecFence` | Target adaptive region/wave controller (WIP redesign). |
+| `SpecFence` | SpecFence Parallel Spine: Detect → RunnableSet → Schedule.pick → Execute(vis) → ResolvePlan → Learn. |
 
 ## Hooks
 

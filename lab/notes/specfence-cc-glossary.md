@@ -90,6 +90,17 @@ Snapshot fields: `bind_total` → `ordered_admit_total`; `unfenced_*` → `optim
 - SoftWait Soft may appear only as “Soft=0 / not armed”.
 - Research-milestone headings like “R0 LeanOCC / R1 HotSet” in old tests are workstream IDs, not the partial-abort protocol. Do not rewrite those as `partial_abort`.
 
+## SF-PS first-class objects (2026-09-21)
+
+| Term | Meaning |
+|------|---------|
+| `RunnableSet` | Detect-driven ready set: AntiChain(independent) ∪ Released(dependents). SpecFence pick root. |
+| `VisibilityPolicy` | `Opt` \| `WaitReleased` \| `OrderedTip`. Opt on an independent tx is Avoid=noop, **not** `ConcurrencyMode::Occ`. |
+| `ResolvePlan` | `Commit` \| `PartialAbortRebind` \| `PartialAbortRewind` \| `OrderedReplay` \| `FullReplay`. Validate output on the SpecFence spine. |
+| `Schedule.pick` | SpecFence main pick over RunnableSet. Must not call `next_occ_task`. |
+
+`skip_ungated_*` is a leftover compat name for Avoid=noop Opt, **not** an architecture lever or Learn target.
+
 ## Invariants this rename does not change
 
 - Soft=0 (`soft_wait_arms == 0`).

@@ -338,6 +338,29 @@ pub struct SpecFenceMetrics {
     pub conflict_ignore: usize,
     /// Begin-block admit_seed wall (one Instant, not per-tx).
     pub admit_seed_begin_ns: u64,
+    /// SF-PS: mean RunnableSet width sampled at Schedule.pick.
+    pub runnable_set_width_mean: f64,
+    /// SF-PS: Execute under VisibilityPolicy::Opt (Avoid=noop independent set).
+    pub visibility_opt: usize,
+    /// SF-PS: Execute under VisibilityPolicy::WaitReleased.
+    pub visibility_wait_released: usize,
+    /// SF-PS: Execute under VisibilityPolicy::OrderedTip.
+    pub visibility_ordered_tip: usize,
+    /// SF-PS: ResolvePlan::Commit.
+    pub resolve_commit: usize,
+    /// SF-PS: ResolvePlan::PartialAbortRebind.
+    pub resolve_partial_rebind: usize,
+    /// SF-PS: ResolvePlan::PartialAbortRewind.
+    pub resolve_partial_rewind: usize,
+    /// SF-PS: ResolvePlan::OrderedReplay.
+    pub resolve_ordered_replay: usize,
+    /// SF-PS: ResolvePlan::FullReplay (Learn penalty; not “this is OCC”).
+    pub resolve_full_replay: usize,
+    /// SF-PS: Schedule.pick entries (SpecFence spine).
+    pub sf_schedule_picks: usize,
+    /// OCC `next_occ_task` picks observed this process (must be 0 on SF blocks
+    /// after [`crate::specfence::executor::reset_occ_pick_calls`]).
+    pub occ_schedule_picks: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -495,6 +518,17 @@ pub(crate) struct MetricsInner {
     conflict_ignore: AtomicUsize,
     admit_seed_begin_ns: AtomicU64,
     worker_busy_ns: AtomicU64,
+    runnable_width_sum: AtomicU64,
+    runnable_width_n: AtomicUsize,
+    visibility_opt: AtomicUsize,
+    visibility_wait_released: AtomicUsize,
+    visibility_ordered_tip: AtomicUsize,
+    resolve_commit: AtomicUsize,
+    resolve_partial_rebind: AtomicUsize,
+    resolve_partial_rewind: AtomicUsize,
+    resolve_ordered_replay: AtomicUsize,
+    resolve_full_replay: AtomicUsize,
+    sf_schedule_picks: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -1001,6 +1035,55 @@ impl MetricsInner {
     }
 
     #[inline]
+    pub(crate) fn record_sf_schedule_pick(&self) {
+        self.sf_schedule_picks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn sample_runnable_width(&self, width: usize) {
+        self.runnable_width_sum
+            .fetch_add(width as u64, Ordering::Relaxed);
+        self.runnable_width_n.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn record_visibility(&self, vis: super::VisibilityPolicy) {
+        match vis {
+            super::VisibilityPolicy::Opt => {
+                self.visibility_opt.fetch_add(1, Ordering::Relaxed);
+            }
+            super::VisibilityPolicy::WaitReleased => {
+                self.visibility_wait_released
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            super::VisibilityPolicy::OrderedTip => {
+                self.visibility_ordered_tip.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn record_resolve_plan(&self, plan: super::ResolvePlan) {
+        match plan {
+            super::ResolvePlan::Commit => {
+                self.resolve_commit.fetch_add(1, Ordering::Relaxed);
+            }
+            super::ResolvePlan::PartialAbortRebind => {
+                self.resolve_partial_rebind.fetch_add(1, Ordering::Relaxed);
+            }
+            super::ResolvePlan::PartialAbortRewind => {
+                self.resolve_partial_rewind.fetch_add(1, Ordering::Relaxed);
+            }
+            super::ResolvePlan::OrderedReplay => {
+                self.resolve_ordered_replay.fetch_add(1, Ordering::Relaxed);
+            }
+            super::ResolvePlan::FullReplay => {
+                self.resolve_full_replay.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[inline]
     pub(crate) fn record_batch_repair(&self) {
         self.batch_repair.fetch_add(1, Ordering::Relaxed);
     }
@@ -1413,6 +1496,24 @@ impl MetricsInner {
             conflict_promote: self.conflict_promote.load(Ordering::Relaxed),
             conflict_ignore: self.conflict_ignore.load(Ordering::Relaxed),
             admit_seed_begin_ns: self.admit_seed_begin_ns.load(Ordering::Relaxed),
+            runnable_set_width_mean: {
+                let n = self.runnable_width_n.load(Ordering::Relaxed);
+                if n == 0 {
+                    0.0
+                } else {
+                    self.runnable_width_sum.load(Ordering::Relaxed) as f64 / n as f64
+                }
+            },
+            visibility_opt: self.visibility_opt.load(Ordering::Relaxed),
+            visibility_wait_released: self.visibility_wait_released.load(Ordering::Relaxed),
+            visibility_ordered_tip: self.visibility_ordered_tip.load(Ordering::Relaxed),
+            resolve_commit: self.resolve_commit.load(Ordering::Relaxed),
+            resolve_partial_rebind: self.resolve_partial_rebind.load(Ordering::Relaxed),
+            resolve_partial_rewind: self.resolve_partial_rewind.load(Ordering::Relaxed),
+            resolve_ordered_replay: self.resolve_ordered_replay.load(Ordering::Relaxed),
+            resolve_full_replay: self.resolve_full_replay.load(Ordering::Relaxed),
+            sf_schedule_picks: self.sf_schedule_picks.load(Ordering::Relaxed),
+            occ_schedule_picks: crate::specfence::executor::occ_pick_calls(),
         }
     }
 }

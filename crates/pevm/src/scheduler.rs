@@ -247,10 +247,10 @@ impl Scheduler {
         self.next_task_with_wave_ready(wave, None)
     }
 
-    /// SpecFence ready-set: gates are **edge constraints**, not a global
-    /// mode switch. Ungated txs use the OCC collaborative-index pick;
-    /// wave/refuse applies only to `is_gated` holes. Independents keep
-    /// issuing while OrderedAdmit waiters sleep (P1).
+    /// SpecFence host walk over RunnableSet. Gated holes are Detect
+    /// edges: refuse and wave-fill the next independent (Avoid=noop Opt).
+    /// This is **not** `next_occ_task`. Independents keep issuing while
+    /// OrderedAdmit waiters sleep.
     pub(crate) fn next_task_with_wave_ready(
         &self,
         wave: Option<&WaveParkTable>,

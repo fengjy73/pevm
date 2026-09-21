@@ -146,6 +146,49 @@ fn specfence_independent_raw_transfers() {
         "independent txs must speculate: {sf_metrics:?}"
     );
     assert_eq!(occ_metrics.wait_admissions, 0);
+    assert_eq!(
+        sf_metrics.occ_schedule_picks, 0,
+        "SF-PS: SpecFence pick must not enter next_occ_task: {sf_metrics:?}"
+    );
+    assert!(
+        sf_metrics.sf_schedule_picks > 0,
+        "SF-PS: Schedule.pick must run: {sf_metrics:?}"
+    );
+    assert!(
+        sf_metrics.visibility_opt > 0,
+        "independent set is Avoid=noop Opt, not OCC mode: {sf_metrics:?}"
+    );
+    assert!(
+        sf_metrics.resolve_commit + sf_metrics.resolve_full_replay > 0,
+        "SF-PS ResolvePlan must fire on independents: {sf_metrics:?}"
+    );
+}
+
+/// SF-PS call-graph: SpecFence main pick never increments next_occ_task.
+#[test]
+fn specfence_sf_ps_pick_never_calls_next_occ_task() {
+    let n = 32;
+    let txs: Vec<TxEnv> = (1..=n)
+        .map(|i| self_transfer(Address::from(U160::from(i)), 1))
+        .collect();
+    let storage = storage_for(n);
+    let (_, occ, _) = run_mode(ConcurrencyMode::Occ, &storage, txs.clone());
+    assert!(
+        occ.occ_schedule_picks > 0,
+        "OCC contrast engine must use next_occ_task: {occ:?}"
+    );
+    let (_, sf, _) = run_mode(ConcurrencyMode::SpecFence, &storage, txs);
+    assert_eq!(sf.soft_wait_arms, 0, "Soft=0: {sf:?}");
+    assert_eq!(
+        sf.occ_schedule_picks, 0,
+        "SF-PS pick must not call next_occ_task: sf_picks={} {sf:?}",
+        sf.sf_schedule_picks
+    );
+    assert!(sf.sf_schedule_picks > 0);
+    assert!(
+        sf.visibility_opt + sf.visibility_wait_released + sf.visibility_ordered_tip > 0,
+        "VisibilityPolicy must be recorded: {sf:?}"
+    );
 }
 
 /// Same sender, increasing nonces: sender location WW promotes Wait (observed).

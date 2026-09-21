@@ -554,7 +554,7 @@ fn main() {
                 "summary": summary
             }),
         )
-            .expect("write json");
+        .expect("write json");
         println!("wrote {path}");
     } else {
         println!(

@@ -321,11 +321,24 @@ impl ReadyEdgeTable {
         self.gated_n.load(Ordering::Relaxed) > 0
     }
 
-    /// Unfinished OrderedAdmit wait-set. Cleared as each gated tx `mark_done`s
-    /// so independents return to `next_occ_task` (S1 — not a mode switch).
+    /// Unfinished Detect wait-set. Cleared as each gated tx `mark_done`s
+    /// so those txs rejoin the RunnableSet antichain (Avoid=noop Opt).
+    /// This is **not** a retreat to `next_occ_task`.
     #[inline]
     pub(crate) fn has_pending_gated(&self) -> bool {
         self.pending_gated.load(Ordering::Relaxed) > 0
+    }
+
+    /// Live gated-tx count (Detect edges).
+    #[inline]
+    pub(crate) fn gated_count(&self) -> usize {
+        self.gated_n.load(Ordering::Relaxed)
+    }
+
+    /// Unfinished gated txs still in the wait-set.
+    #[inline]
+    pub(crate) fn pending_gated_count(&self) -> usize {
+        self.pending_gated.load(Ordering::Relaxed)
     }
 
     /// Stamp Done without waiter wake (A0 OCC wrap / P3).

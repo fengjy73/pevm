@@ -440,6 +440,7 @@ impl Pevm {
         let learner = LiveLearner::new();
         let mut abc_prior_morph = None;
         if self.concurrency_mode == ConcurrencyMode::SpecFence {
+            crate::specfence::reset_occ_pick_calls();
             self.hotset.begin_block();
             let prior_morph = self.inter_prior.morph_ema();
             learner.begin_block_with_params(prior_morph, self.adaptive_params);
@@ -579,30 +580,22 @@ impl Pevm {
                         chain, spec_id, &block_env, &txs, storage, &mv_memory, specfence,
                     );
                     let profile = crate::specfence::profile_timing_enabled();
-                    // v9.3: one spine. SpecFence always uses unified next_sf
-                    // (empty extras ≡ OCC walk). Occ mode is a separate computer.
-                    // Ban: cost-class empty-PE → next_occ_task (no second OCC engine).
+                    // SF-PS: SpecFence pick is Schedule.pick(RunnableSet).
+                    // Occupied OCC / PCC keep `next_occ_task` as the contrast
+                    // computer. SpecFence never falls back to it.
                     let occ_mode = self.concurrency_mode == ConcurrencyMode::Occ;
                     let mut sched_t0 = profile.then(Instant::now);
                     let mut task = if occ_mode {
                         crate::specfence::next_occ_task(&scheduler)
                     } else if self.concurrency_mode == ConcurrencyMode::SpecFence {
-                        // T3 idle hops are queued on abort and planted at the
-                        // *next begin* (Win_w / Seg). Do not flush ReadyEdges
-                        // mid-block — that prepaid the cold 3356896 wall and
-                        // races done-stamp / ERC-20 (iter11).
-                        if let Some(w) = wave_ref {
-                            crate::specfence::next_sf_task(
-                                &scheduler,
-                                w,
-                                specfence.ready_edges,
-                                specfence.producer_stages,
-                                specfence.policy,
-                                Some(&metrics_inner),
-                            )
-                        } else {
-                            crate::specfence::next_occ_task(&scheduler)
-                        }
+                        crate::specfence::next_sf_task(
+                            &scheduler,
+                            specfence.wave,
+                            specfence.ready_edges,
+                            specfence.producer_stages,
+                            specfence.policy,
+                            Some(&metrics_inner),
+                        )
                     } else {
                         crate::specfence::next_occ_task(&scheduler)
                     };
@@ -613,10 +606,8 @@ impl Pevm {
                         task = match task.unwrap() {
                             Task::Execution(tx_version) => {
                                 let sf = self.concurrency_mode == ConcurrencyMode::SpecFence;
-                                // O5/P1: ungated + no leftover flush ≡ OCC (no started
-                                // meta). Sibling gates must not tax independents —
-                                // flush only plants pending idle pairs, so mark
-                                // started when this tx is gated or a hop is queued.
+                                // Detect-gated / pending hops: stamp started so a
+                                // later flush cannot refuse an in-flight tx.
                                 if sf
                                     && (specfence.ready_edges.is_gated(tx_version.tx_idx)
                                         || specfence.ready_edges.has_pending_gated()
@@ -624,8 +615,18 @@ impl Pevm {
                                 {
                                     specfence.ready_edges.note_started(tx_version.tx_idx);
                                 }
-                                let occ_exec = occ_mode
-                                    || (sf && !specfence.ready_edges.is_gated(tx_version.tx_idx));
+                                // SpecFence: VisibilityPolicy chooses the execute
+                                // wrap. Opt = Avoid=noop independent set (no fence
+                                // wrap) — not a switch to ConcurrencyMode::Occ.
+                                let vis = if sf {
+                                    crate::specfence::VisibilityPolicy::for_ready(
+                                        specfence.ready_edges,
+                                        tx_version.tx_idx,
+                                    )
+                                } else {
+                                    crate::specfence::VisibilityPolicy::Opt
+                                };
+                                let occ_exec = occ_mode || (sf && vis.is_opt());
                                 if occ_exec {
                                     let done_idx = tx_version.tx_idx;
                                     let next = self
@@ -665,26 +666,15 @@ impl Pevm {
                             }
                             Task::Validation(tx_version) => {
                                 let v0 = profile.then(Instant::now);
-                                // P2: success path ≡ OCC once the Detect hole is
-                                // open (ungated, or gated + pred done). SpecFence
-                                // validate is only for a still-closed gate.
-                                let occ_like_validate = specfence.mode
-                                    == ConcurrencyMode::SpecFence
-                                    && (!specfence.ready_edges.is_gated(tx_version.tx_idx)
-                                        || specfence.ready_edges.may_execute(tx_version.tx_idx));
+                                // SF-PS: SpecFence always Validate.to_resolve
+                                // (Opt Avoid=noop or edged ResolvePlan).
+                                // OCC contrast stays on validate_occ_stage.
                                 let next = if occ_mode {
                                     crate::specfence::validate_occ_stage(
                                         &mv_memory,
                                         &scheduler,
                                         &tx_version,
                                         Some(&metrics_inner),
-                                    )
-                                } else if occ_like_validate {
-                                    crate::specfence::validate_optimistic_fast(
-                                        &mv_memory,
-                                        &scheduler,
-                                        &tx_version,
-                                        specfence,
                                     )
                                 } else if specfence.mode == ConcurrencyMode::SpecFence {
                                     crate::specfence::validate_specfence(
@@ -719,18 +709,14 @@ impl Pevm {
                             task = if occ_mode {
                                 crate::specfence::next_occ_task(&scheduler)
                             } else if self.concurrency_mode == ConcurrencyMode::SpecFence {
-                                if let Some(w) = wave_ref {
-                                    crate::specfence::next_sf_task(
-                                        &scheduler,
-                                        w,
-                                        specfence.ready_edges,
-                                        specfence.producer_stages,
-                                        specfence.policy,
-                                        Some(&metrics_inner),
-                                    )
-                                } else {
-                                    crate::specfence::next_occ_task(&scheduler)
-                                }
+                                crate::specfence::next_sf_task(
+                                    &scheduler,
+                                    specfence.wave,
+                                    specfence.ready_edges,
+                                    specfence.producer_stages,
+                                    specfence.policy,
+                                    Some(&metrics_inner),
+                                )
                             } else {
                                 crate::specfence::next_occ_task(&scheduler)
                             };

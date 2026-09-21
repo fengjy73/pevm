@@ -1,14 +1,19 @@
-//! SpecFence parallel computer — Spec validate / OCC helpers.
+//! SpecFence validate — Validate.to_resolve → Resolve.apply (SF-PS §C).
 //!
-//! Owns SpecFence **validate** (CC Resolve). Ready/steal lives in `computer.rs` (PC).
-//! Spec-only incarnations use the shared OCC validate kernel (bool walk + full_abort_reexecute).
-//! partial_abort Resolve runs only when a certificate **strip** covers fail locations.
+//! Edged paths produce a [`ResolvePlan`] (rebind / rewind / ordered replay /
+//! full replay). Independent / Opt is Avoid=noop: optimistic validate then
+//! Commit or FullReplay. That is **not** `ConcurrencyMode::Occ`.
 //!
-//! Protocol: `lab/notes/specfence-complete-architecture-v8-parallel-computer.md`.
+//! OCC helpers (`next_occ_task`, `validate_occ_stage`) are the contrast
+//! engine only.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::ConcurrencyMode;
 use super::LeanAbortRepair;
+use super::ResolvePlan;
 use super::SpecFenceCtx;
+use super::VisibilityPolicy;
 use super::certificate::CertificateTable;
 use super::collateral::{
     ConflictClass, classify_first_conflict, commute_location_ok, commute_ok, is_value_transfer,
@@ -94,10 +99,26 @@ pub(crate) fn specfence_access_is_occ(
     specfence_cost_class_spec(mode, learner) || !learner.location_predicted(location)
 }
 
-/// OCC schedule — zero SpecFence symbols.
+/// Process-wide OCC pick counter. SpecFence Schedule.pick must not increment this.
+static OCC_PICK_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// OCC schedule — zero SpecFence symbols. Contrast engine only.
 #[inline]
 pub(crate) fn next_occ_task(scheduler: &Scheduler) -> Option<Task> {
+    OCC_PICK_CALLS.fetch_add(1, Ordering::Relaxed);
     scheduler.next_task()
+}
+
+/// Snapshot of `next_occ_task` calls since last reset.
+#[inline]
+pub(crate) fn occ_pick_calls() -> usize {
+    OCC_PICK_CALLS.load(Ordering::Relaxed)
+}
+
+/// Reset before a SpecFence block so tests can prove SF pick never entered OCC.
+#[inline]
+pub(crate) fn reset_occ_pick_calls() {
+    OCC_PICK_CALLS.store(0, Ordering::Relaxed);
 }
 
 /// OCC validate stage: bool walk + full_abort_reexecute estimates. Abort counters only (no rem).
@@ -279,8 +300,10 @@ fn occ_abort_ungated(
     batch_park_abort(mv_memory, scheduler, tx_version, specfence, invalid)
 }
 
-/// S4: success path ≡ `validate_occ_stage` (bool walk + finish). Commute
-/// only for necessary lazy value-transfer; other misses are OCC abort.
+/// Avoid=noop independent-set validate (VisibilityPolicy::Opt).
+///
+/// Implementation reuses the optimistic bool walk + commute. This is
+/// SpecFence DAG antichain validation — **not** `ConcurrencyMode::Occ`.
 pub(crate) fn validate_optimistic_fast(
     mv_memory: &MvMemory,
     scheduler: &Scheduler,
@@ -288,17 +311,23 @@ pub(crate) fn validate_optimistic_fast(
     specfence: SpecFenceCtx<'_>,
 ) -> Option<Task> {
     if occ_read_set_valid(mv_memory, tx_version.tx_idx) {
+        specfence.metrics.record_resolve_plan(ResolvePlan::Commit);
         return scheduler.finish_validation(tx_version, false);
     }
     if !is_value_transfer(specfence.hints, tx_version.tx_idx) {
-        // C2: OCC validate success/abort — no commute collect/rebind.
+        specfence
+            .metrics
+            .record_resolve_plan(ResolvePlan::FullReplay);
         return validate_occ_stage(mv_memory, scheduler, tx_version, Some(specfence.metrics));
     }
-    // C2: commute accept without a prior collect Vec.
     if note_and_try_commute(specfence, mv_memory, tx_version.tx_idx, &[]) {
+        specfence.metrics.record_resolve_plan(ResolvePlan::Commit);
         return scheduler.finish_validation(tx_version, false);
     }
     let invalid = mv_memory.collect_invalid_reads(tx_version.tx_idx);
+    specfence
+        .metrics
+        .record_resolve_plan(ResolvePlan::FullReplay);
     occ_abort_ungated(mv_memory, scheduler, tx_version, specfence, &invalid)
 }
 
@@ -312,18 +341,20 @@ pub(crate) fn validate_occ_kernel(
 ) -> Option<Task> {
     let valid = occ_read_set_valid(mv_memory, tx_version.tx_idx);
     if valid {
+        specfence.metrics.record_resolve_plan(ResolvePlan::Commit);
         return scheduler.finish_validation(tx_version, false);
     }
     specfence.metrics.record_occ_kernel_validate();
     if note_and_try_commute(specfence, mv_memory, tx_version.tx_idx, &[]) {
+        specfence.metrics.record_resolve_plan(ResolvePlan::Commit);
         return scheduler.finish_validation(tx_version, false);
     }
     let invalid = mv_memory.collect_invalid_reads(tx_version.tx_idx);
-    let optimistic_ungated = specfence
-        .policy
-        .is_some_and(|p| p.skip_ungated_tx_path_tax())
-        && !specfence.ready_edges.is_gated(tx_version.tx_idx);
-    if optimistic_ungated {
+    // Avoid=noop Opt (ungated): FullReplay, still on the SpecFence spine.
+    if !specfence.ready_edges.is_gated(tx_version.tx_idx) {
+        specfence
+            .metrics
+            .record_resolve_plan(ResolvePlan::FullReplay);
         return occ_abort_ungated(mv_memory, scheduler, tx_version, specfence, &invalid);
     }
     let aborted = scheduler.try_validation_abort(tx_version);
@@ -334,6 +365,7 @@ pub(crate) fn validate_occ_kernel(
     mv_memory.convert_writes_to_estimates(tx_version.tx_idx);
     specfence.metrics.record_occ_abort();
     specfence.metrics.record_full_abort_reexecute();
+    let mut resolve = ResolvePlan::FullReplay;
     if !invalid.is_empty() {
         specfence.metrics.record_region_validate_fail(invalid.len());
     }
@@ -366,6 +398,7 @@ pub(crate) fn validate_occ_kernel(
             match f.class {
                 ConflictClass::EffectiveWAW => {
                     promote_and_seed_short_edge(specfence, p, tx_version.tx_idx, &f);
+                    resolve = ResolvePlan::OrderedReplay;
                 }
                 ConflictClass::LazyNoise | ConflictClass::CommuteCandidate => {
                     p.ignore_conflict(Some(f.location));
@@ -446,8 +479,9 @@ pub(crate) fn validate_occ_kernel(
         None => (0, block_size.saturating_sub(cascade_from)),
     };
     specfence.metrics.record_fence_cascade(cascade, skipped);
-    // OCC-identical suffix cascade + wave ready for park steal.
-    // min_higher_reader skip left later txs Validated against ESTIMATE.
+    specfence.metrics.record_resolve_plan(resolve);
+    // Suffix cascade + wave ready for park steal. Repeated FullReplay
+    // feeds Detect/arm (deeper cover) — not “this belongs to OCC”.
     scheduler.finish_validation_fenced(
         tx_version,
         true,
@@ -456,17 +490,22 @@ pub(crate) fn validate_occ_kernel(
     )
 }
 
-/// CC Resolve: split RS_spec / RS_fence. Never always-full_abort_reexecute while certs exist.
+/// Validate.to_resolve → Resolve.apply. SpecFence product validate entry.
 ///
-/// No strip → OCC full_abort_reexecute + PE(true k). `covers_all` → PartialAbortRebind rebind; else full_abort_reexecute.
+/// Opt / independent: Avoid=noop optimistic validate (Commit | FullReplay).
+/// Edged: PartialAbortRebind / Rewind / OrderedReplay before FullReplay.
 pub(crate) fn validate_specfence(
     mv_memory: &MvMemory,
     scheduler: &Scheduler,
     tx_version: &TxVersion,
     specfence: SpecFenceCtx<'_>,
 ) -> Option<Task> {
+    let vis = VisibilityPolicy::for_ready(specfence.ready_edges, tx_version.tx_idx);
+    if vis.is_opt() {
+        return validate_optimistic_fast(mv_memory, scheduler, tx_version, specfence);
+    }
+
     let has_cert = specfence.certificates.has_any(tx_version.tx_idx)
-        || specfence.certificates.may_resolve(tx_version.tx_idx)
         || specfence.certificates.may_resolve(tx_version.tx_idx);
     if !has_cert {
         return validate_occ_kernel(mv_memory, scheduler, tx_version, specfence);
@@ -474,21 +513,15 @@ pub(crate) fn validate_specfence(
 
     specfence.metrics.record_occ_kernel_validate();
     if occ_read_set_valid(mv_memory, tx_version.tx_idx) {
+        specfence.metrics.record_resolve_plan(ResolvePlan::Commit);
         return scheduler.finish_validation(tx_version, false);
     }
     if note_and_try_commute(specfence, mv_memory, tx_version.tx_idx, &[]) {
+        specfence.metrics.record_resolve_plan(ResolvePlan::Commit);
         return scheduler.finish_validation(tx_version, false);
     }
 
     let invalid = mv_memory.collect_invalid_reads(tx_version.tx_idx);
-    // Thin-shell A0: commute already tried; failed commute ≡ OCC abort.
-    let optimistic_ungated = specfence
-        .policy
-        .is_some_and(|p| p.skip_ungated_tx_path_tax())
-        && !specfence.ready_edges.is_gated(tx_version.tx_idx);
-    if optimistic_ungated {
-        return occ_abort_ungated(mv_memory, scheduler, tx_version, specfence, &invalid);
-    }
     if !invalid.is_empty() {
         let grain = repair_grain(specfence.certificates, tx_version.tx_idx, &invalid);
         let covers = grain == RepairGrain::PartialAbort;
@@ -555,6 +588,9 @@ pub(crate) fn validate_specfence(
                     .partial_retry
                     .clear_suffix_repair_depth(tx_version.tx_idx);
                 specfence.learner.note_reexec_cost(0.1);
+                specfence
+                    .metrics
+                    .record_resolve_plan(ResolvePlan::PartialAbortRebind);
                 return scheduler.finish_validation(tx_version, false);
             }
             // PartialAbortRewind: **strip**-covered fail → RewindTo. repair_armed covers_all
@@ -595,6 +631,9 @@ pub(crate) fn validate_specfence(
                         specfence
                             .partial_retry
                             .mark_needs_live_capture(tx_version.tx_idx);
+                        specfence
+                            .metrics
+                            .record_resolve_plan(ResolvePlan::PartialAbortRewind);
                         return scheduler.finish_validation_fenced(
                             tx_version,
                             true,
