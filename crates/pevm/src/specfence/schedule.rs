@@ -49,11 +49,19 @@ pub(crate) fn pick(
     }
 
     let refuse_before = ready.refuse_count();
-    // Large lazy leftover reservations are not ProducerStage work — skip
-    // promote, still pick from R (Avoid=noop antichain). Do **not** call
-    // the OCC contrast pick.
+    // Large lazy leftover reservations are not OrderedAdmit objects.
+    // Skip ProducerStage promote **and** ReadyEdge refuse so leftover
+    // hops cannot serialize the block. Still Schedule.pick (wave host),
+    // never the OCC contrast pick.
     let ignore_leftover = policy.is_some_and(|p| p.ignore_leftover_reservations());
-    if !ignore_leftover && runnable.has_producer_work() {
+    if ignore_leftover {
+        let task = scheduler.next_task_with_wave_ready(Some(wave), None);
+        if let (Some(m), Some(Task::Execution(v))) = (metrics, &task) {
+            m.record_visibility(runnable.visibility(v.tx_idx));
+        }
+        return task;
+    }
+    if runnable.has_producer_work() {
         for _ in 0..8 {
             let Some(w) = runnable.next_producer() else {
                 break;
