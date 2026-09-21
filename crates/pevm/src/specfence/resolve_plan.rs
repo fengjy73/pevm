@@ -235,9 +235,8 @@ fn plant_observed_waw(ctx: &ApplyCtx<'_>, f: &super::collateral::FirstConflict) 
             .note_consumer_on(tx, producer, Some(f.location));
         return;
     }
-    // At w_max: fan-in to the window tip with an anonymous edge.
-    // Evict-to-Opt was a ~390% mill (19469101) — leftover writers
-    // re-FullReplay'd the same ℓ forever.
+    // At w_max: chain onto the newest live waiter, not a star on the
+    // window tip. Fan-in woke ~40 leftover writers together (19807137).
     let tip = ctx
         .specfence
         .ready_edges
@@ -245,7 +244,8 @@ fn plant_observed_waw(ctx: &ApplyCtx<'_>, f: &super::collateral::FirstConflict) 
         .into_iter()
         .rev()
         .find(|&c| c < tx && !ctx.specfence.ready_edges.is_writer_done(c));
-    let pred = tip.unwrap_or(producer);
+    let start = tip.unwrap_or(producer);
+    let pred = ctx.specfence.ready_edges.chain_tip_before(start, tx);
     if ctx
         .specfence
         .ready_edges
@@ -273,17 +273,16 @@ fn break_replay_mill(ctx: &ApplyCtx<'_>, f: &super::collateral::FirstConflict) {
     if ctx.specfence.ready_edges.is_writer_done(producer) {
         return;
     }
+    let pred = ctx.specfence.ready_edges.chain_tip_before(producer, tx);
     if ctx
         .specfence
         .ready_edges
         .blocking_producer(tx)
-        .is_some_and(|w| w >= producer)
+        .is_some_and(|w| w >= pred)
     {
         return;
     }
-    ctx.specfence
-        .ready_edges
-        .note_consumer_on(tx, producer, None);
+    ctx.specfence.ready_edges.note_consumer_on(tx, pred, None);
 }
 
 fn seed_short_edge(

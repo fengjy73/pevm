@@ -785,6 +785,29 @@ impl ReadyEdgeTable {
             .count()
     }
 
+    /// Newest still-live waiter reachable from `start` with index `< before`.
+    /// Overflow plants must chain, not star on one tip — a star wakes
+    /// every leftover writer at once (19807137 ~40 Released mill).
+    pub(crate) fn chain_tip_before(&self, start: TxIdx, before: TxIdx) -> TxIdx {
+        let mut pred = start;
+        for _ in 0..64 {
+            let next = {
+                let Some(w) = self.waiters.get(&pred) else {
+                    break;
+                };
+                w.iter()
+                    .copied()
+                    .filter(|&c| c > pred && c < before && !self.is_writer_done(c))
+                    .max()
+            };
+            let Some(n) = next else {
+                break;
+            };
+            pred = n;
+        }
+        pred
+    }
+
     /// Mid-block observed-WAW plant. Stops 2-writer Opt ping-pong without
     /// deepening a spine (producer itself waiting). Caller evicts surplus
     /// waiters on `ℓ` after insert so a token/storage fan stays ≤ `w_max`.
@@ -1332,6 +1355,23 @@ mod tests {
         for c in 1..48 {
             assert!(t.may_execute(c));
         }
+    }
+
+    #[test]
+    fn overflow_waiters_chain_not_star() {
+        let t = ReadyEdgeTable::new();
+        t.note_consumer_on(2, 0, Some(0xabc));
+        t.note_consumer_on(3, 2, None);
+        t.note_consumer_on(4, 3, None);
+        t.note_consumer_on(5, 4, None);
+        assert_eq!(t.chain_tip_before(0, 10), 5);
+        assert_eq!(t.blocking_producer(3), Some(2));
+        assert_eq!(t.blocking_producer(4), Some(3));
+        assert_eq!(t.blocking_producer(5), Some(4));
+        assert!(
+            !t.may_execute(5),
+            "chain tail must wait — not wake with the window tip"
+        );
     }
 
     #[test]
