@@ -94,7 +94,7 @@ enum MemoryValue {
     SelfDestructed,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum MemoryEntry {
     Data(TxIncarnation, MemoryValue),
     // When an incarnation is aborted due to a validation failure, the

@@ -443,46 +443,51 @@ impl RunnableSet {
                 n += 1;
             }
         }
-        // Lost scheduler-only wakeup: recover only when the block is truly
-        // idle (no Executing owner). Doing this while a producer is live
-        // re-issues waiters and livelocks independent transfers.
+        // Lost scheduler-only wakeup. WaitForDependency parks leave status
+        // `Executing` after `SfExec::Blocked` (worker has left). Those ghosts
+        // made `any_executing=true` and skipped recover — 19469101 / 19807137
+        // / complete_arch idle-spin. A live owner is `ST_RUNNING`, not a
+        // leftover Executing bit.
         if n == 0 && self.pending_work() == 0 {
-            let any_executing = (0..self.block_size).any(|t| scheduler.is_executing(t));
-            if !any_executing {
-                // PC-5 nuclear: leftover wait-set, nobody runnable, nobody
-                // Executing. Drop every false gate and rejoin Q_indep.
-                if scheduler.has_unfinished() {
-                    let freed = ready.collapse_false_gates(|_| false);
-                    for tx in freed {
-                        if scheduler.is_aborting(tx) {
-                            let _ = scheduler.recover_aborting(tx);
-                        } else if scheduler.is_executing(tx) {
-                            let _ = scheduler.recover_executing_waiter(tx);
-                        }
-                        if scheduler.is_ready(tx) || scheduler.is_executed(tx) {
-                            self.requeue_ready(tx, ready);
-                            n += 1;
-                        }
-                    }
+            let any_running = (0..self.block_size)
+                .any(|t| self.state[t].load(Ordering::Acquire) == ST_RUNNING);
+            for tx in 0..self.block_size {
+                let st = self.state[tx].load(Ordering::Acquire);
+                if st == ST_DONE || st == ST_RUNNING || scheduler.is_validated(tx) {
+                    continue;
                 }
-                for tx in 0..self.block_size {
-                    let st = self.state[tx].load(Ordering::Acquire);
-                    if st == ST_DONE || scheduler.is_validated(tx) {
-                        continue;
+                if scheduler.is_executing(tx) {
+                    if scheduler.recover_executing_waiter(tx) {
+                        self.requeue_ready(tx, ready);
+                        n += 1;
                     }
-                    if scheduler.is_aborting(tx) && scheduler.recover_aborting(tx) {
-                        self.requeue_ready(tx, ready);
-                        n += 1;
-                    } else if scheduler.is_executing(tx)
-                        && st != ST_RUNNING
-                        && scheduler.recover_executing_waiter(tx)
-                    {
-                        self.requeue_ready(tx, ready);
-                        n += 1;
-                    } else if scheduler.is_executed(tx) {
-                        self.force_push(tx, QueueKind::Revalidate);
-                        n += 1;
-                    } else if scheduler.is_ready(tx) && ready.may_execute(tx) {
+                } else if scheduler.is_aborting(tx)
+                    && ready
+                        .blocking_producer(tx)
+                        .is_none_or(|w| scheduler.is_done(w))
+                    && scheduler.recover_aborting(tx)
+                {
+                    self.requeue_ready(tx, ready);
+                    n += 1;
+                } else if scheduler.is_executed(tx) {
+                    self.force_push(tx, QueueKind::Revalidate);
+                    n += 1;
+                } else if scheduler.is_ready(tx) && ready.may_execute(tx) {
+                    self.requeue_ready(tx, ready);
+                    n += 1;
+                }
+            }
+            if n == 0 && !any_running && scheduler.has_unfinished() {
+                // PC-5 nuclear: leftover wait-set, nobody runnable, nobody
+                // in-flight. Drop every false gate and rejoin Q_indep.
+                let freed = ready.collapse_false_gates(|_| false);
+                for tx in freed {
+                    if scheduler.is_aborting(tx) {
+                        let _ = scheduler.recover_aborting(tx);
+                    } else if scheduler.is_executing(tx) {
+                        let _ = scheduler.recover_executing_waiter(tx);
+                    }
+                    if scheduler.is_ready(tx) || scheduler.is_executed(tx) {
                         self.requeue_ready(tx, ready);
                         n += 1;
                     }
@@ -555,9 +560,10 @@ impl RunnableSet {
     ) -> bool {
         (0..self.block_size).any(|tx| {
             self.state[tx].load(Ordering::Acquire) == ST_WAIT
-                && ready
-                    .blocking_producer(tx)
-                    .is_some_and(|w| scheduler.is_executing(w))
+                && ready.blocking_producer(tx).is_some_and(|w| {
+                    scheduler.is_executing(w)
+                        && self.state[w].load(Ordering::Acquire) == ST_RUNNING
+                })
         })
     }
 
@@ -644,6 +650,43 @@ mod tests {
             }
         }
         assert!(saw_waiter, "healed waiter must be pickable from Q_*");
+    }
+
+    #[test]
+    fn heal_recovers_wait_for_dependency_executing_leftover() {
+        let ready = ReadyEdgeTable::new();
+        let sched = Scheduler::new(4);
+        let r = RunnableSet::new(4, 2);
+        let _v = sched.try_execute_producer(1).unwrap();
+        r.mark_wait(1);
+        assert!(sched.is_executing(1), "WaitForDependency leaves Executing");
+        assert_eq!(r.pending_work(), 0);
+        let n = r.heal(&ready, &sched);
+        assert!(n >= 1, "Executing leftover with no ST_RUNNING must recover, got {n}");
+        assert!(sched.is_ready(1));
+        let mut saw = false;
+        while let Some(SfPick::Execute { tx, .. }) = r.pick(0, &ready) {
+            if tx == 1 {
+                saw = true;
+                break;
+            }
+        }
+        assert!(saw, "recovered leftover must be pickable");
+    }
+
+    #[test]
+    fn waiting_on_live_requires_st_running() {
+        let ready = ReadyEdgeTable::new();
+        let sched = Scheduler::new(4);
+        let r = RunnableSet::new(4, 2);
+        ready.note_consumer(2, 1);
+        r.mark_wait(2);
+        let _v = sched.try_execute_producer(1).unwrap();
+        r.mark_wait(1);
+        assert!(
+            !r.waiting_on_live_producer(&ready, &sched),
+            "ghost Executing producer is not a live owner"
+        );
     }
 
     #[test]

@@ -1540,15 +1540,18 @@ impl<'a, S: Storage> VmDb<'a, S> {
         // Try to read the latest code hash in [MvMemory]
         // TODO: Memoize read locations (expected to be small) here in [Vm] to avoid
         // contention in [MvMemory]
-        if let Some(written_transactions) = self.mv_memory.data.get(&location_hash)
-            && let Some((tx_idx, MemoryEntry::Data(tx_incarnation, value))) =
-                written_transactions.range(..self.tx_idx).next_back()
-        {
+        let closest = self.mv_memory.data.get(&location_hash).and_then(|written| {
+            written
+                .range(..self.tx_idx)
+                .next_back()
+                .map(|(idx, e)| (*idx, e.clone()))
+        });
+        if let Some((tx_idx, MemoryEntry::Data(tx_incarnation, value))) = closest {
             if self
                 .mv_memory
-                .is_aborted_incarnation(*tx_idx, *tx_incarnation)
+                .is_aborted_incarnation(tx_idx, tx_incarnation)
             {
-                return Err(ReadError::Blocking(*tx_idx));
+                return Err(ReadError::Blocking(tx_idx));
             }
             match value {
                 MemoryValue::SelfDestructed => {
@@ -1556,8 +1559,8 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 }
                 MemoryValue::CodeHash(code_hash) => {
                     let origin = ReadOrigin::MvMemory(TxVersion {
-                        tx_idx: *tx_idx,
-                        tx_incarnation: *tx_incarnation,
+                        tx_idx,
+                        tx_incarnation,
                     });
                     Self::push_origin(read_origins, origin.clone())?;
                     self.deep_trace_read(
@@ -1565,11 +1568,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
                         crate::specfence::LocationKind::CodeHash,
                         Some(&origin),
                     );
-                    return Ok(Some(*code_hash));
+                    return Ok(Some(code_hash));
                 }
                 _ => {}
             }
-        };
+        }
 
         // Fallback to storage
         Self::push_origin(read_origins, ReadOrigin::Storage)?;
@@ -1657,15 +1660,28 @@ impl<S: Storage> Database for VmDb<'_, S> {
         let mut positive_addition = true;
         let mut nonce_addition = 0;
 
-        // Try reading from multi-version data
-        if self.tx_idx > 0
-            && let Some(written_transactions) = self.mv_memory.data.get(&location_hash)
-        {
-            let mut iter = written_transactions.range(..self.tx_idx);
+        // Snapshot then drop the DashMap guard before any other `data.get`
+        // (same-shard re-entry corrupts the heap — 19807137).
+        let history: Vec<(TxIdx, MemoryEntry)> = if self.tx_idx > 0 {
+            self.mv_memory
+                .data
+                .get(&location_hash)
+                .map(|written| {
+                    written
+                        .range(..self.tx_idx)
+                        .map(|(k, v)| (*k, v.clone()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if !history.is_empty() {
+            let mut iter = history.iter().rev();
 
             // Fully evaluate lazy updates
             loop {
-                match iter.next_back() {
+                match iter.next() {
                     Some((blocking_idx, MemoryEntry::Estimate)) => {
                         // PCC / PrefixSkip OrderedDirtyRead. First-incarnation
                         // OptimisticRead/OCC Block on ESTIMATE (Block-STM).
