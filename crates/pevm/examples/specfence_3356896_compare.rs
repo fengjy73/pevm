@@ -381,7 +381,11 @@ fn run_once(
 
 fn main() {
     let data_dir = repo_root().join("data/ethereum");
-    let dir = data_dir.join("blocks").join(BLOCK.to_string());
+    let block_no = std::env::var("SPECFENCE_COMPARE_BLOCK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(BLOCK);
+    let dir = data_dir.join("blocks").join(block_no.to_string());
     if !dir.join("block.json").exists() {
         eprintln!("missing {dir:?}/block.json — cannot compare");
         std::process::exit(2);
@@ -411,7 +415,7 @@ fn main() {
     let cores_nz = NonZeroUsize::new(cores.max(1)).unwrap();
     let n = n_tx(&block);
     println!(
-        "block={BLOCK} n={n} cores={cores} iters={iters} Soft=0 reuse_sf={} (PRIMARY=learned)",
+        "block={block_no} n={n} cores={cores} iters={iters} Soft=0 reuse_sf={} (PRIMARY=learned)",
         !cold_each
     );
 
@@ -541,7 +545,15 @@ fn main() {
 
     if let Ok(path) = std::env::var("SPECFENCE_COMPARE_JSON") {
         let f = File::create(&path).expect("compare json");
-        serde_json::to_writer_pretty(f, &serde_json::json!({"rows": rows, "summary": summary}))
+        serde_json::to_writer_pretty(
+            f,
+            &serde_json::json!({
+                "block": block_no,
+                "n_tx": n,
+                "rows": rows,
+                "summary": summary
+            }),
+        )
             .expect("write json");
         println!("wrote {path}");
     } else {

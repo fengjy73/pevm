@@ -28,10 +28,16 @@ pub(crate) fn next_sf_task(
 ) -> Option<Task> {
     // O1: plant queued leftover continuation hops at this pick quantum
     // (not mid-execute). One hop, never full-spine.
+    // S2: near-independent / lazy-update large — drop leftover hops,
+    // do not plant a useless cover wait-set.
     if let Some(p) = policy
         && p.has_pending_idle()
     {
-        let _ = crate::specfence::admit::flush_pending_idle_edges(ready, p);
+        if p.skip_useless_cover_probe() || p.skip_reuse_leftover_flush() {
+            let _ = p.take_pending_idle();
+        } else {
+            let _ = crate::specfence::admit::flush_pending_idle_edges(ready, p);
+        }
     }
     let refuse_before = ready.refuse_count();
     // Gates ≠ global mode. Ungated txs keep OCC collaborative task

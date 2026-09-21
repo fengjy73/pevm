@@ -1,0 +1,46 @@
+# 压剩余 ungated 壳 — S1–S5 land
+
+**Base:** PR #42 `cursor/specfence-pc-cc-learn-complete-2cd0` @ `42cf30d`  
+**SoT:** `uploads/specfence-shell-cut-then-redig-v1.md`  
+**Baseline:** SF TPS≥OCC **33/98**, median **0.908**; ~65 losers are ungated execute/validate/调度壳  
+**Soft=0 · one spine · `select_arm` is the only mouth**
+
+Lazy-update chains stay **not** OrderedAdmit objects. Ungated OCC task selection, Done-on-success (when a later plant can race), and Soft=0 are preserved.
+
+## Landed
+
+| ID | Content |
+|----|---------|
+| **S1** | `skip_ungated_tx_path_tax` is OCC-equivalent for every ungated tx (thin included). Block-level `skip_ungated_path_tax` stays mid/large — thin D1 / HotSet still walk (same-sender lazy has no wait-set). Leftover-long still keeps gated D1 / end_block. |
+| **S2** | Near-independent / lazy-update large: wait-set soft-cap 0; `skip_useless_cover_probe` bans cover plant. Mid-band never leftover-slides and reuse drops leftover flush (19469101). Large ERC-20 may still slide a leaking loc and still flush a live probe. Reuse does not *start* a cover probe (`cover_probe_n==0`). Thin `train_hat` stays ≤8. |
+| **S3** | Order branches stay on gated txs. Ungated execute+validate is OCC-equivalent (`skip_ungated_tx_path_tax` + `is_gated`). Done-on-success always stamps (iter11 flush race). Engagement / kernel counters stay (test + reuse telemetry). |
+| **S4** | Mid/large empty/short-chain reuse leans `end_block`. Only large lazy-update reuse skips writer-order snapshot, MV walk, and per-tx incarnation mutex walk. Thin HotSet and mid-band leftover (p4) keep the walk. |
+| **S5** | lazy never OrderedAdmit; L1 controlled cover probe on mid-band real spines; Done-on-success when a plant can race; Soft=0; professional terms. |
+
+## Invariants
+
+- Thin first incarnation still persists D1 (3356896 4→31).
+- Thin leftover-long wait-set still takes gated D1 / end_block.
+- Thin reuse never leans / never skips end_block walks (HotSet / p1a).
+- Mid-band coverable spines still probe Win_2 on the **first** begin; unproven probe stays Win_2.
+- 19469101 leftover-slide hang class: **mid-band** never T3-slides (first iter included — empty short_chain first-pick). Mid-band reuse always drops leftover flush. Large ERC-20 (fence-cover / subgrain) may still slide a leaking loc; large with a live mid-band spine still flushes. Reuse does not *start* a cover probe (`cover_probe_n==0`). Thin leftover-long may still slide. C4 still deepens `cover_window` at `end_block`.
+- iter11 Done-on-success: stamp stays whenever `has_pending_gated` / pending idle / thin storage-like D1 can plant.
+
+## Acceptance (99-block Soft=0, N=3 reuse @8, head `2add58d`)
+
+| bar | this | hit |
+|-----|-----:|:---:|
+| SF TPS ≥ OCC clearly > 33/98 | **26 / 98** | **no** (win-rate is the north star) |
+| SF/OCC median > 0.908 | **0.923** | yes |
+| NEAR 14396881 better than 0.840 | **0.893** | yes |
+| NEAR 13217637 better than 0.835 | **0.928** | yes |
+| no lazy 4–27× tail | none (wall max 3.41 = 13287210 OCC-noise) | yes |
+| Soft=0 / iter11 / erc20 | hold | yes |
+
+Sweep: [`specfence-shell-cut-then-redig-sweep.md`](specfence-shell-cut-then-redig-sweep.md)
+JSON: [`specfence-shell-cut-then-redig-summary.json`](specfence-shell-cut-then-redig-summary.json)
+Instant-off: [`specfence-shell-cut-then-redig-instant-off.md`](specfence-shell-cut-then-redig-instant-off.md)
+Three-lens: [`specfence-shell-cut-then-redig-pc-cc-learn.md`](specfence-shell-cut-then-redig-pc-cc-learn.md)
+Index: [`specfence-shell-cut-then-redig-index.md`](specfence-shell-cut-then-redig-index.md)
+
+Win-rate missed. Median / NEAR shells / Soft=0 / no lazy tail hit. Next cut is **not** another ungated path-tax skip — see Instant-off + three-lens.
