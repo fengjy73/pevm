@@ -7,11 +7,11 @@ use crate::mv_memory::MvMemory;
 use crate::scheduler::Scheduler;
 use crate::{MemoryLocationHash, TxVersion};
 
+use super::arm_table::ArmTable;
+use super::collateral::{classify_first_conflict, location_is_lazy, ConflictClass};
+use super::runnable_set::{QueueKind, RunnableSet};
 use super::SpecFenceCtx;
 use super::VisibilityPolicy;
-use super::arm_table::ArmTable;
-use super::collateral::{ConflictClass, classify_first_conflict, location_is_lazy};
-use super::runnable_set::{QueueKind, RunnableSet};
 
 /// Structured validate outcome. Replaces “bool valid → abort” as the SF root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -227,30 +227,10 @@ fn plant_observed_waw(ctx: &ApplyCtx<'_>, f: &super::collateral::FirstConflict) 
         return;
     }
     let w_max = ArmTable::w_max(ctx.scheduler.block_size(), 0, false) as usize;
-    let queued = ctx.specfence.ready_edges.consumer_count_on(f.location);
-    if queued < w_max {
-        ctx.specfence
-            .ready_edges
-            .note_consumer_on(tx, producer, Some(f.location));
-        return;
-    }
-    // At w_max: anonymous edge onto the window tip. Chaining walked
-    // waiters DashMap in the FullReplay hot path and munmap'd 19807137.
-    let tip = ctx
+    let _ = ctx
         .specfence
         .ready_edges
-        .consumers_queued_on(f.location)
-        .into_iter()
-        .rev()
-        .find(|&c| c < tx && !ctx.specfence.ready_edges.is_writer_done(c));
-    let pred = tip.unwrap_or(producer);
-    if ctx
-        .specfence
-        .ready_edges
-        .should_plant_observed_waw(tx, pred)
-    {
-        ctx.specfence.ready_edges.note_consumer_on(tx, pred, None);
-    }
+        .plant_observed_window(tx, producer, f.location, w_max);
 }
 
 /// Second+ incarnation FullReplay that is not EffectiveWAW still Opt-mills

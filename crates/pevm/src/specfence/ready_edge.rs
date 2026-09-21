@@ -7,8 +7,8 @@
 //!
 //! Ungated / A0-majority txs use an OCC-class `may_execute` (bitset; no DashMap).
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use dashmap::{DashMap, DashSet};
@@ -67,6 +67,13 @@ pub(crate) struct ReadyEdgeTable {
     ungated_occ_while_gated: AtomicUsize,
     /// Producer → known consumers (completion event → bag; no DashMap scan).
     waiters: DashMap<TxIdx, Vec<TxIdx>, BuildIdentityHasher>,
+    /// Atomic live location-waiter count. `queued_on.iter` in plant is racy
+    /// (8 cores all see `< w_max`) and is a DashMap walk on the FullReplay path.
+    loc_waiter_n: DashMap<MemoryLocationHash, AtomicUsize, BuildIdentityHasher>,
+    /// Newest location-admitted waiter on `ℓ` (overflow chain start).
+    loc_tip: DashMap<MemoryLocationHash, AtomicUsize, BuildIdentityHasher>,
+    /// Last overflow consumer on `ℓ`. CAS-extended — never walk `waiters`.
+    overflow_tip: DashMap<MemoryLocationHash, AtomicUsize, BuildIdentityHasher>,
     /// Ordered-admit gated txs. Marked **before** the consumer map insert so
     /// an ungated steal cannot race past a newly created wait-for edge.
     gated_bits: [AtomicU64; GATED_WORDS],
@@ -108,6 +115,9 @@ impl Default for ReadyEdgeTable {
             skip_gate_n: AtomicUsize::new(0),
             ungated_occ_while_gated: AtomicUsize::new(0),
             waiters: DashMap::default(),
+            loc_waiter_n: DashMap::default(),
+            loc_tip: DashMap::default(),
+            overflow_tip: DashMap::default(),
             gated_bits: std::array::from_fn(|_| AtomicU64::new(0)),
             gated_n: AtomicUsize::new(0),
             pending_gated: AtomicUsize::new(0),
@@ -844,8 +854,86 @@ impl ReadyEdgeTable {
         }
         // Always plant if the producer is unfinished. Skipping when the
         // pred is itself waiting left leftover Opt writers ping-ponging
-        // (~390% on 19469101). Depth is capped by w_max + anonymous fan-in.
+        // (~390% on 19469101). Depth is capped by w_max + overflow chain.
         true
+    }
+
+    /// Cap location waiters at `w_max` with an atomic slot, then chain
+    /// surplus onto `overflow_tip`. A star onto one window tip woke every
+    /// leftover writer at once (19807137 ~45 Q_released, live_wait=false).
+    /// Does not walk `waiters` / `queued_on` (those munmap'd FullReplay).
+    pub(crate) fn plant_observed_window(
+        &self,
+        consumer: TxIdx,
+        producer: TxIdx,
+        location: MemoryLocationHash,
+        w_max: usize,
+    ) -> bool {
+        if !self.should_plant_observed_waw(consumer, producer) {
+            return false;
+        }
+        let w_max = w_max.max(1);
+        let got_slot = {
+            let n = self
+                .loc_waiter_n
+                .entry(location)
+                .or_insert_with(|| AtomicUsize::new(0));
+            loop {
+                let cur = n.load(Ordering::Relaxed);
+                if cur >= w_max {
+                    break false;
+                }
+                match n.compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed) {
+                    Ok(_) => break true,
+                    Err(_) => {}
+                }
+            }
+        };
+        if got_slot {
+            self.note_consumer_on(consumer, producer, Some(location));
+            {
+                let e = self
+                    .loc_tip
+                    .entry(location)
+                    .or_insert_with(|| AtomicUsize::new(consumer));
+                e.fetch_max(consumer, Ordering::Relaxed);
+            }
+            return true;
+        }
+        let loc_tip = self
+            .loc_tip
+            .get(&location)
+            .map(|e| e.load(Ordering::Relaxed))
+            .filter(|&t| t < consumer)
+            .unwrap_or(producer);
+        let pred = {
+            let e = self
+                .overflow_tip
+                .entry(location)
+                .or_insert_with(|| AtomicUsize::new(NONE));
+            let mut cur = e.load(Ordering::Relaxed);
+            loop {
+                let cand = if cur != NONE && cur < consumer && !self.is_writer_done(cur) {
+                    cur
+                } else if loc_tip < consumer && !self.is_writer_done(loc_tip) {
+                    loc_tip
+                } else if producer < consumer && !self.is_writer_done(producer) {
+                    producer
+                } else {
+                    return false;
+                };
+                match e.compare_exchange_weak(cur, consumer, Ordering::Release, Ordering::Relaxed) {
+                    Ok(_) => break cand,
+                    Err(v) => cur = v,
+                }
+            }
+        };
+        if self.should_plant_observed_waw(consumer, pred) {
+            self.note_consumer_on(consumer, pred, None);
+            true
+        } else {
+            false
+        }
     }
 
     /// Keep at most `w_max` Detect waiters on `ℓ`. Evict oldest first,
@@ -1411,6 +1499,35 @@ mod tests {
             !t.may_execute(5),
             "chain tail must wait — not wake with the window tip"
         );
+    }
+
+    #[test]
+    fn plant_window_caps_location_and_chains_overflow() {
+        let t = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        let loc = 0xabc;
+        assert!(t.plant_observed_window(1, 0, loc, 2));
+        assert!(t.plant_observed_window(2, 0, loc, 2));
+        assert!(t.admitted_on_location(1));
+        assert!(t.admitted_on_location(2));
+        assert!(t.plant_observed_window(3, 0, loc, 2));
+        assert!(t.plant_observed_window(4, 0, loc, 2));
+        assert!(t.plant_observed_window(5, 0, loc, 2));
+        assert!(!t.admitted_on_location(3));
+        assert_eq!(t.consumer_count_on(loc), 2, "atomic cap, not racy walk");
+        assert_eq!(t.blocking_producer(3), Some(2));
+        assert_eq!(t.blocking_producer(4), Some(3));
+        assert_eq!(t.blocking_producer(5), Some(4));
+        t.note_producer_done(0, &wave);
+        assert!(t.may_execute(1), "window waiter of 0 wakes");
+        assert!(t.may_execute(2), "window waiter of 0 wakes");
+        assert!(
+            !t.may_execute(3) && !t.may_execute(5),
+            "overflow must not stampede with the window tip"
+        );
+        t.note_producer_done(2, &wave);
+        assert!(t.may_execute(3));
+        assert!(!t.may_execute(4), "chain continues after loc-tip Commit");
     }
 
     #[test]
