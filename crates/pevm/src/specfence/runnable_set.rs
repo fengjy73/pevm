@@ -263,10 +263,13 @@ impl RunnableSet {
         if let Some(tx) = self.pop_kind(QueueKind::Revalidate) {
             return Some(SfPick::Revalidate(tx));
         }
+        // Independents first (PC-3). Worker 0 used to prefer Ordered/Released
+        // and 1-core starved Q_indep=29 behind one Released park-requeue
+        // (19469101 pending=30 / live_wait=false).
         let prefer = match worker_i % 3 {
-            0 => [QueueKind::Ordered, QueueKind::Released, QueueKind::Indep],
-            1 => [QueueKind::Released, QueueKind::Indep, QueueKind::Ordered],
-            _ => [QueueKind::Indep, QueueKind::Ordered, QueueKind::Released],
+            0 => [QueueKind::Indep, QueueKind::Released, QueueKind::Ordered],
+            1 => [QueueKind::Indep, QueueKind::Ordered, QueueKind::Released],
+            _ => [QueueKind::Released, QueueKind::Indep, QueueKind::Ordered],
         };
         // One gated !may_execute head must not hide a later runnable in the
         // same deque (19469101: pending=30 stuck, schedule broke on first None).
@@ -757,6 +760,20 @@ mod tests {
         }
         assert!(n >= 2);
         assert!(r.steal_n() > 0 || r.q_indep_len() == 0);
+    }
+
+    #[test]
+    fn pick_does_not_starve_indep_behind_released() {
+        let ready = ReadyEdgeTable::new();
+        let r = RunnableSet::new(6, 1);
+        ready.note_consumer(2, 0);
+        r.force_push(2, QueueKind::Released);
+        r.force_push(5, QueueKind::Indep);
+        let SfPick::Execute { tx, vis, .. } = r.pick(0, &ready).expect("indep") else {
+            panic!("expected execute");
+        };
+        assert_eq!(tx, 5, "worker 0 must not mill Released ahead of Q_indep");
+        assert_eq!(vis, VisibilityPolicy::Opt);
     }
 
     #[test]
