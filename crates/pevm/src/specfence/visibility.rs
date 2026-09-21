@@ -42,7 +42,7 @@ impl VisibilityPolicy {
             // still executes, that is still Avoid=noop — not OCC mode.
             return Self::Opt;
         }
-        if ready.admitted_on_location(tx) {
+        if ready.was_queued(tx) {
             Self::OrderedTip
         } else {
             Self::WaitReleased
@@ -78,21 +78,7 @@ mod tests {
     }
 
     #[test]
-    fn released_location_consumer_is_ordered_tip() {
-        let ready = ReadyEdgeTable::new();
-        let wave = super::super::wave::WaveParkTable::new();
-        ready.note_consumer_on(3, 1, Some(0xabc));
-        ready.note_producer_done(1, &wave);
-        assert!(ready.may_execute(3));
-        assert_eq!(
-            VisibilityPolicy::for_ready(&ready, 3),
-            VisibilityPolicy::OrderedTip
-        );
-        assert!(VisibilityPolicy::OrderedTip.needs_fence());
-    }
-
-    #[test]
-    fn released_anonymous_consumer_is_wait_released() {
+    fn released_consumer_is_ordered_tip() {
         let ready = ReadyEdgeTable::new();
         let wave = super::super::wave::WaveParkTable::new();
         ready.note_consumer(3, 1);
@@ -100,7 +86,8 @@ mod tests {
         assert!(ready.may_execute(3));
         assert_eq!(
             VisibilityPolicy::for_ready(&ready, 3),
-            VisibilityPolicy::WaitReleased
+            VisibilityPolicy::OrderedTip
         );
+        assert!(VisibilityPolicy::OrderedTip.needs_fence());
     }
 }
