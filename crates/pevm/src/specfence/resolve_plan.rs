@@ -149,6 +149,9 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
             ctx.scheduler
                 .finish_validation_sf(ctx.tx_version, true, Some(tx + 1));
             ctx.specfence.ready_edges.clear_started(tx);
+            if ctx.specfence.ready_edges.is_live_leftover_min(tx) {
+                ctx.specfence.ready_edges.flush_leftover_min_passed_pred();
+            }
             if ctx.specfence.ready_edges.leftover_surplus(tx)
                 || (ctx.specfence.ready_edges.is_gated(tx)
                     && !ctx.specfence.ready_edges.may_execute(tx))
@@ -188,6 +191,9 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
                 .finish_validation_sf(ctx.tx_version, true, Some(tx + 1));
             ctx.specfence.ready_edges.clear_started(tx);
             enqueue_higher_revalidate(&ctx, tx);
+            if ctx.specfence.ready_edges.is_live_leftover_min(tx) {
+                ctx.specfence.ready_edges.flush_leftover_min_passed_pred();
+            }
             // Observed WAW: wait for the producer instead of Opt ping-pong.
             if ctx.specfence.ready_edges.leftover_surplus(tx)
                 || (ctx.specfence.ready_edges.is_gated(tx)

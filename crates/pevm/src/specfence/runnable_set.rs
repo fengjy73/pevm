@@ -296,6 +296,13 @@ impl RunnableSet {
         kind: QueueKind,
         ready: &ReadyEdgeTable,
     ) -> Option<SfPick> {
+        // leftover_min Detect-gated on leftover leftover_min passed (204
+        // when leftover_min=205) stays !may_execute and refuse-mills into
+        // unaligned tcache. Flush that pred only — not leftover_min
+        // always-may_execute (619 heap).
+        if ready.is_live_leftover_min(tx) {
+            ready.flush_leftover_min_passed_pred();
+        }
         if ready.leftover_surplus(tx) || (ready.is_gated(tx) && !ready.may_execute(tx)) {
             ready.note_skip_gate(tx);
             self.mark_wait(tx);
@@ -332,6 +339,9 @@ impl RunnableSet {
         // Gated !may_execute on a queue is the 19807137 refuse mill:
         // pick mark_waits, heal force_pushes, pending stays ~60, idle
         // ungate never runs.
+        if ready.is_live_leftover_min(tx) {
+            ready.flush_leftover_min_passed_pred();
+        }
         if ready.leftover_surplus(tx) || (ready.is_gated(tx) && !ready.may_execute(tx)) {
             self.mark_wait(tx);
             return;
@@ -362,6 +372,7 @@ impl RunnableSet {
             return 0;
         }
         let leftover_next = ready.take_finished_leftover_min(|t| scheduler.is_validated(t));
+        ready.flush_leftover_min_passed_pred();
         // Keep unfinished producers. `is_executing && ST_RUNNING` is always
         // false here (we just proved no ST_RUNNING) and nuclear-ungated the
         // leftover chain into a 32-head Q_released mill (19807137). Ghost

@@ -85,6 +85,11 @@ pub(crate) struct ReadyEdgeTable {
     /// Leftover writers that called `plant_global_leftover`. Bitset — DashSet
     /// on the may_execute pick path heap-aborted 6196166 (`double free`).
     leftover_bits: [AtomicU64; GATED_WORDS],
+    /// Leftovers leftover_min already advanced past. leftover_surplus is
+    /// `min < tx`; leftover leftover_min walked past has `tx < min` so
+    /// leftover_surplus(204) is false when leftover_min=205 (19807137
+    /// leftover_min Ready gated on 204, then unaligned tcache mill).
+    leftover_passed_bits: [AtomicU64; GATED_WORDS],
     /// Ordered-admit gated txs. Marked **before** the consumer map insert so
     /// an ungated steal cannot race past a newly created wait-for edge.
     gated_bits: [AtomicU64; GATED_WORDS],
@@ -133,6 +138,7 @@ impl Default for ReadyEdgeTable {
             global_leftover_min: AtomicUsize::new(NONE),
             global_leftover_chain: AtomicUsize::new(NONE),
             leftover_bits: std::array::from_fn(|_| AtomicU64::new(0)),
+            leftover_passed_bits: std::array::from_fn(|_| AtomicU64::new(0)),
             gated_bits: std::array::from_fn(|_| AtomicU64::new(0)),
             gated_n: AtomicUsize::new(0),
             pending_gated: AtomicUsize::new(0),
@@ -507,6 +513,12 @@ impl ReadyEdgeTable {
         if was_done && self.is_gated(writer) {
             self.pending_gated.fetch_add(1, Ordering::Relaxed);
         }
+        // leftover leftover_min already passed aborted — leftover_min stayed
+        // Detect-gated (19807137 leftover_min=205 pred=204). Flush leftover_min
+        // only; do not walk waiters.
+        if self.leftover_passed(writer) {
+            self.flush_leftover_min_passed_pred();
+        }
     }
 
     /// PC-5: force A0 on this consumer (execute anyway).
@@ -700,6 +712,7 @@ impl ReadyEdgeTable {
         // Pushing leftover_min on every producer-done raced a live execute
         // and heap-aborted 6196166 (`double free` / `munmap_chunk`).
         let leftover_wake = if self.global_leftover_min.load(Ordering::Relaxed) == writer {
+            self.mark_leftover_passed(writer);
             let next = self.elect_next_leftover();
             let _ = self.global_leftover_min.compare_exchange(
                 writer,
@@ -710,6 +723,7 @@ impl ReadyEdgeTable {
             if next != NONE {
                 self.global_leftover_chain.store(next, Ordering::Relaxed);
             }
+            self.flush_leftover_min_passed_pred();
             next
         } else {
             NONE
@@ -1189,6 +1203,51 @@ impl ReadyEdgeTable {
             .is_some_and(|(i, bit)| self.leftover_bits[i].load(Ordering::Acquire) & bit != 0)
     }
 
+    fn mark_leftover_passed(&self, tx: TxIdx) {
+        if let Some((i, bit)) = Self::leftover_claim_bit(tx) {
+            self.leftover_passed_bits[i].fetch_or(bit, Ordering::Release);
+        }
+    }
+
+    /// Leftover leftover_min already advanced past (`tx < leftover_min`).
+    /// leftover_surplus is the later side (`leftover_min < tx`).
+    #[inline]
+    pub(crate) fn leftover_passed(&self, tx: TxIdx) -> bool {
+        Self::leftover_claim_bit(tx)
+            .is_some_and(|(i, bit)| self.leftover_passed_bits[i].load(Ordering::Acquire) & bit != 0)
+    }
+
+    /// leftover_min must not park on leftover leftover_min already passed
+    /// (19807137 leftover_min=205 gated on 204) or leftover surplus.
+    /// leftover_surplus is only `min < tx`; a leftover leftover_min walked
+    /// past has `tx < min` so leftover_surplus(204) is false at leftover_min=205.
+    #[inline]
+    pub(crate) fn leftover_min_skips_blocker(&self, writer: TxIdx) -> bool {
+        let min = self.live_leftover_min();
+        if writer == min {
+            return false;
+        }
+        self.leftover_surplus(writer)
+            || self.leftover_passed(writer)
+            || self.leftover_claim_has(writer)
+            || self.is_writer_done(writer)
+    }
+
+    /// leftover_min Detect-gated on leftover leftover_min passed — flush so
+    /// leftover_min can execute. Not leftover_min always-may_execute.
+    pub(crate) fn flush_leftover_min_passed_pred(&self) {
+        let min = self.live_leftover_min();
+        if min == NONE {
+            return;
+        }
+        let Some(w) = self.blocking_producer(min) else {
+            return;
+        };
+        if self.leftover_min_skips_blocker(w) {
+            self.flush_wait_on(min, w);
+        }
+    }
+
     fn elect_next_leftover(&self) -> usize {
         for (wi, word) in self.leftover_bits.iter().enumerate() {
             let mut bits = word.load(Ordering::Acquire);
@@ -1219,6 +1278,7 @@ impl ReadyEdgeTable {
             return None;
         }
         self.clear_leftover_claim(min);
+        self.mark_leftover_passed(min);
         if !self.is_writer_done(min) {
             self.mark_done(min);
         }
@@ -1231,8 +1291,10 @@ impl ReadyEdgeTable {
         );
         if next != NONE {
             self.global_leftover_chain.store(next, Ordering::Relaxed);
+            self.flush_leftover_min_passed_pred();
             Some(next)
         } else {
+            self.flush_leftover_min_passed_pred();
             None
         }
     }
@@ -2121,6 +2183,60 @@ mod tests {
         assert_eq!(next, Some(40));
         assert!(t.may_execute(40));
         assert!(!t.leftover_surplus(40));
+    }
+
+    #[test]
+    fn leftover_min_skips_passed_leftover_pred() {
+        // 19807137 leftover_min=205 Ready gated on leftover 204.
+        // leftover_surplus is min < tx, so leftover_surplus(204) is false.
+        let t = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        t.note_producer_done(0, &wave);
+        assert!(!t.plant_global_leftover(204));
+        assert!(t.plant_global_leftover(205));
+        assert_eq!(t.blocking_producer(205), Some(204));
+        t.note_producer_done(204, &wave);
+        assert!(t.is_live_leftover_min(205));
+        t.note_abort_reincarnate(204);
+        assert!(
+            t.leftover_min_skips_blocker(204),
+            "leftover leftover_min passed must skip even when leftover_surplus is false"
+        );
+        assert!(
+            !t.leftover_surplus(204),
+            "leftover_surplus is only the later side"
+        );
+        t.note_consumer_on(205, 204, None);
+        assert!(!t.may_execute(205), "Detect-gate on reincarnated 204");
+        t.flush_leftover_min_passed_pred();
+        assert!(
+            t.may_execute(205),
+            "flush leftover_min ← leftover-passed pred so leftover_min can commit"
+        );
+        assert!(
+            t.leftover_min_skips_blocker(204),
+            "still skip — leftover_min must not re-plant on 204"
+        );
+    }
+
+    #[test]
+    fn leftover_min_still_detect_plants_live_earlier_non_leftover() {
+        let t = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        t.note_producer_done(0, &wave);
+        assert!(!t.plant_global_leftover(205));
+        assert!(
+            !t.leftover_min_skips_blocker(100),
+            "live earlier non-leftover must still Detect-plant (619 reuse hang)"
+        );
+        t.note_consumer_on(205, 100, None);
+        assert_eq!(t.blocking_producer(205), Some(100));
+        assert!(!t.may_execute(205));
+        t.flush_leftover_min_passed_pred();
+        assert!(
+            !t.may_execute(205),
+            "flush must not drop a live earlier non-leftover Detect (not always-may_execute)"
+        );
     }
 
     #[test]

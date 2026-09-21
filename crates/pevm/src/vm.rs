@@ -831,7 +831,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
             && (writer > self.tx_idx
                 || self.specfence.scheduler.is_done(writer)
                 || self.specfence.scheduler.is_validated(writer)
-                || self.specfence.ready_edges.leftover_surplus(writer))
+                || self
+                    .specfence
+                    .ready_edges
+                    .leftover_min_skips_blocker(writer))
         {
             return ReadError::InconsistentRead;
         }
@@ -1898,9 +1901,12 @@ impl<S: Storage> Database for VmDb<'_, S> {
                 let pred_done =
                     self.tx_idx > 0 && self.specfence.scheduler.is_done(self.tx_idx - 1);
                 let leftover_min = self.specfence.ready_edges.is_live_leftover_min(self.tx_idx);
-                let pred_surplus =
-                    self.tx_idx > 0 && self.specfence.ready_edges.leftover_surplus(self.tx_idx - 1);
-                if leftover_min && (pred_done || pred_surplus) {
+                let pred_passed = self.tx_idx > 0
+                    && self
+                        .specfence
+                        .ready_edges
+                        .leftover_min_skips_blocker(self.tx_idx - 1);
+                if leftover_min && (pred_done || pred_passed) {
                     // leftover_min must commit on a done prefix. Blocking(tx-1)
                     // parks fail, leftover_min stays Executing, heal mills
                     // (19807137 leftover_min=514 n_unf=198).
@@ -3680,15 +3686,15 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     )
                 {
                     let pred_done = self.specfence.scheduler.is_done(tx_version.tx_idx - 1);
-                    let pred_surplus = self
+                    let pred_passed = self
                         .specfence
                         .ready_edges
-                        .leftover_surplus(tx_version.tx_idx - 1);
+                        .leftover_min_skips_blocker(tx_version.tx_idx - 1);
                     if self
                         .specfence
                         .ready_edges
                         .is_live_leftover_min(tx_version.tx_idx)
-                        && (pred_done || pred_surplus)
+                        && (pred_done || pred_passed)
                     {
                         // leftover_min + done prefix: do not ghost-park.
                         Err(VmExecutionError::Retry)
