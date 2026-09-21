@@ -1376,7 +1376,13 @@ impl CostPolicy {
         // after a thin block still persists (last_n ≤ THIN).
         if self.skip_ungated_path_tax() && seq > 1 {
             let last = self.last_block_n.load(Ordering::Relaxed);
-            if n <= THIN_N_MAX || last > THIN_N_MAX {
+            if n <= THIN_N_MAX {
+                // Thin reuse leans only when the wait-set stayed empty and
+                // no short-chain structure remains (HotSet tests keep a walk).
+                return self.wait_set_n.load(Ordering::Relaxed) == 0
+                    && !self.conflict_structure_seen();
+            }
+            if last > THIN_N_MAX {
                 return true;
             }
         }
@@ -1400,7 +1406,10 @@ impl CostPolicy {
         let n = self.block_n();
         let last = self.last_block_n.load(Ordering::Relaxed);
         if n <= THIN_N_MAX {
-            return last > 0 && last <= THIN_N_MAX;
+            return last > 0
+                && last <= THIN_N_MAX
+                && self.wait_set_n.load(Ordering::Relaxed) == 0
+                && !self.conflict_structure_seen();
         }
         self.large_lazy_path_tax() || self.should_drop_noncritical_wait_set()
     }
