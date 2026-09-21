@@ -357,45 +357,11 @@ impl RunnableSet {
         ready: &ReadyEdgeTable,
         scheduler: &Scheduler,
     ) -> usize {
-        self.force_idle_recover_inner(ready, scheduler, false)
-    }
-
-    /// `reclaim_running`: empty queues + long idle-spin means ST_RUNNING is
-    /// leftover (19807137 N=3: live_wait=true, pending=0, all workers in pick).
-    pub(crate) fn force_idle_recover_stale(
-        &self,
-        ready: &ReadyEdgeTable,
-        scheduler: &Scheduler,
-    ) -> usize {
-        self.force_idle_recover_inner(ready, scheduler, true)
-    }
-
-    fn force_idle_recover_inner(
-        &self,
-        ready: &ReadyEdgeTable,
-        scheduler: &Scheduler,
-        reclaim_running: bool,
-    ) -> usize {
         if self.pending_work() > 0 {
             return 0;
         }
-        let any_running =
-            (0..self.block_size).any(|t| self.state[t].load(Ordering::Acquire) == ST_RUNNING);
-        if any_running && !reclaim_running {
+        if (0..self.block_size).any(|t| self.state[t].load(Ordering::Acquire) == ST_RUNNING) {
             return 0;
-        }
-        if reclaim_running {
-            for tx in 0..self.block_size {
-                if self.state[tx].load(Ordering::Acquire) != ST_RUNNING {
-                    continue;
-                }
-                self.state[tx].store(ST_NONE, Ordering::Release);
-                if scheduler.is_executing(tx) {
-                    let _ = scheduler.recover_executing_waiter(tx);
-                } else if scheduler.is_aborting(tx) {
-                    let _ = scheduler.recover_aborting(tx);
-                }
-            }
         }
         // True idle only: a producer is live iff a worker still owns it.
         // Heal (pending>0) must not ungate Aborting parks — that mills —
