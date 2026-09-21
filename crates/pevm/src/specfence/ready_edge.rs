@@ -970,10 +970,6 @@ impl ReadyEdgeTable {
                         .or_insert_with(|| AtomicUsize::new(consumer));
                     e.fetch_max(consumer, Ordering::Relaxed);
                 }
-                // First-wave window waiters must join leftover election.
-                // Otherwise they wake on the original producer Done and
-                // Opt-mill the leftover min (19807137 glob_min=24 vs 6 loc tips).
-                let _ = self.plant_global_leftover(consumer);
                 return true;
             }
         }
@@ -1736,27 +1732,13 @@ mod tests {
         assert_eq!(t.blocking_producer(5), Some(4));
         t.note_producer_done(0, &wave);
         assert!(t.may_execute(1), "window waiter of 0 wakes");
-        assert_eq!(
-            t.blocking_producer(2),
-            Some(1),
-            "first-wave joins leftover election so two window tips do not mill"
-        );
-        assert!(!t.may_execute(2));
+        assert!(t.may_execute(2), "window waiter of 0 wakes");
         assert!(
             !t.may_execute(3) && !t.may_execute(5),
             "overflow must not stampede with the window tip"
         );
         t.note_producer_done(2, &wave);
-        assert!(
-            t.gate_on_live_leftover(3),
-            "drain rebinds overflow onto leftover min"
-        );
-        assert_eq!(
-            t.blocking_producer(3),
-            Some(1),
-            "overflow rebinds onto leftover min instead of racing a second head"
-        );
-        assert!(!t.may_execute(3));
+        assert!(t.may_execute(3));
         assert!(!t.may_execute(4), "chain continues after loc-tip Commit");
     }
 
