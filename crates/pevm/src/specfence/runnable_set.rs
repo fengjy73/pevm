@@ -362,7 +362,7 @@ impl RunnableSet {
             return 0;
         }
         let leftover_next =
-            ready.take_finished_leftover_min(|t| scheduler.is_done(t) || scheduler.is_validated(t));
+            ready.take_finished_leftover_min(|t| scheduler.is_validated(t));
         // Keep unfinished producers. `is_executing && ST_RUNNING` is always
         // false here (we just proved no ST_RUNNING) and nuclear-ungated the
         // leftover chain into a 32-head Q_released mill (19807137). Ghost
@@ -627,7 +627,7 @@ impl RunnableSet {
         // leftover Executing bit.
         if n == 0 && self.pending_work() == 0 {
             if let Some(next) = ready
-                .take_finished_leftover_min(|t| scheduler.is_done(t) || scheduler.is_validated(t))
+                .take_finished_leftover_min(|t| scheduler.is_validated(t))
             {
                 if !scheduler.is_validated(next) {
                     if scheduler.is_aborting(next) {
