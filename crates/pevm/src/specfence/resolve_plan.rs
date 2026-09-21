@@ -296,15 +296,25 @@ fn requeue(ctx: &ApplyCtx<'_>, tx: crate::TxIdx, kind: QueueKind) {
     ctx.runnable.force_push(tx, kind);
 }
 
+fn enqueue_revalidate(ctx: &ApplyCtx<'_>, reader: crate::TxIdx) {
+    if reader >= ctx.scheduler.block_size() {
+        return;
+    }
+    if !ctx.scheduler.is_executed(reader) && !ctx.scheduler.is_validated(reader) {
+        return;
+    }
+    // Demote before the worker loop samples all_validated, otherwise the
+    // last Commit exits every core and the revalidate never runs.
+    let _ = ctx.scheduler.prepare_revalidate(reader);
+    ctx.runnable.force_push(reader, QueueKind::Revalidate);
+}
+
 fn enqueue_higher_revalidate(ctx: &ApplyCtx<'_>, tx: crate::TxIdx, new_location: bool) {
     let writes = ctx.mv_memory.write_locations(tx);
     for loc in writes {
         for reader in ctx.mv_memory.higher_readers_of(loc, tx) {
-            if reader <= tx {
-                continue;
-            }
-            if ctx.scheduler.is_executed(reader) || ctx.scheduler.is_validated(reader) {
-                ctx.runnable.force_push(reader, QueueKind::Revalidate);
+            if reader > tx {
+                enqueue_revalidate(ctx, reader);
             }
         }
     }
@@ -312,9 +322,7 @@ fn enqueue_higher_revalidate(ctx: &ApplyCtx<'_>, tx: crate::TxIdx, new_location:
     // existed — readers index can miss them until the next incarnation.
     if new_location {
         for reader in (tx + 1)..ctx.scheduler.block_size() {
-            if ctx.scheduler.is_executed(reader) || ctx.scheduler.is_validated(reader) {
-                ctx.runnable.force_push(reader, QueueKind::Revalidate);
-            }
+            enqueue_revalidate(ctx, reader);
         }
     }
 }

@@ -420,6 +420,11 @@ impl RunnableSet {
     }
 
     #[inline]
+    pub(crate) fn pending_work(&self) -> usize {
+        self.width() + self.q_revalidate.len()
+    }
+
+    #[inline]
     pub(crate) fn waiting_on_live_producer(
         &self,
         ready: &ReadyEdgeTable,

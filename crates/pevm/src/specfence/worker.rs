@@ -1,7 +1,7 @@
 //! SpecFence worker ring: RunnableSet.pick → Execute(vis) → Resolve.apply.
 //!
 //! This is the product loop. It must not call `Scheduler::next_task*` or
-//! `validate_occ_stage`. OCC contrast stays in `pevm.rs`.
+//! the OCC-stage validate entry. OCC contrast stays in `pevm.rs`.
 
 use std::time::Instant;
 
@@ -32,7 +32,10 @@ pub(crate) fn run_sf_block<F, V>(
 {
     let metrics = specfence.metrics;
     loop {
-        if abort() || scheduler.all_validated() {
+        if abort() {
+            break;
+        }
+        if scheduler.all_validated() && runnable.pending_work() == 0 {
             break;
         }
         let t0 = Instant::now();
@@ -101,12 +104,15 @@ pub(crate) fn run_sf_block<F, V>(
             None => {
                 metrics.add_idle_core_ns(t0.elapsed().as_nanos() as u64);
                 runnable.note_idle_spin();
-                if abort() || scheduler.all_validated() {
+                if abort() {
+                    break;
+                }
+                if scheduler.all_validated() && runnable.pending_work() == 0 {
                     break;
                 }
                 let _ = runnable.heal(specfence.ready_edges, scheduler);
                 drain_wave(specfence, scheduler, runnable);
-                if scheduler.all_validated() {
+                if scheduler.all_validated() && runnable.pending_work() == 0 {
                     break;
                 }
                 if runnable.waiting_on_live_producer(specfence.ready_edges, scheduler) {

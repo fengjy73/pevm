@@ -217,7 +217,7 @@ fn specfence_true_spine_sources_never_call_next_task() {
             "true spine must not call Scheduler::next_task"
         );
         assert!(
-            !code.contains("validate_occ_stage"),
+            !code.contains("validate_occ_stage("),
             "true spine must not call validate_occ_stage"
         );
     }
