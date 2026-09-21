@@ -294,10 +294,10 @@ impl ReadyEdgeTable {
 
     #[inline]
     pub(crate) fn was_queued(&self, tx: TxIdx) -> bool {
-        // Probe heads are producers (waiters) but not consumers — they are A1.
-        self.queued_on.contains_key(&tx)
-            || self.consumers.contains_key(&tx)
-            || self.waiters.contains_key(&tx)
+        // Consumers / location-queue only. `waiters.contains(tx)` means this
+        // tx is a *producer* with dependents — those used to land on
+        // Q_ordered and mill (19807137: ~58 Ordered heads, live_wait=false).
+        self.queued_on.contains_key(&tx) || self.consumers.contains_key(&tx)
     }
 
     /// Ordered-admit readiness: this tx has (or is gaining) a wait-for edge.
@@ -845,9 +845,7 @@ impl ReadyEdgeTable {
             if !self.is_gated(tx) {
                 continue;
             }
-            let live = self
-                .blocking_producer(tx)
-                .is_some_and(&mut producer_live);
+            let live = self.blocking_producer(tx).is_some_and(&mut producer_live);
             if live {
                 continue;
             }
@@ -1226,8 +1224,8 @@ mod tests {
         assert!(t.has_pending_gated());
         assert!(t.was_queued(9));
         assert!(
-            t.was_queued(1),
-            "producer is a waiter while the edge is live"
+            !t.was_queued(1),
+            "producer-with-waiters is not Q_ordered membership"
         );
         t.ungate(9);
         assert!(!t.is_gated(9), "ungate drops the wait-for constraint");
@@ -1335,10 +1333,7 @@ mod tests {
             "thin hops=0 pair must plant"
         );
         t.note_consumer_on(5, 3, Some(0x32be));
-        assert!(
-            !t.may_execute(5),
-            "planted waiter must not Opt-ping-pong"
-        );
+        assert!(!t.may_execute(5), "planted waiter must not Opt-ping-pong");
     }
 
     #[test]
