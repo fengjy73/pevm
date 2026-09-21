@@ -219,18 +219,13 @@ fn plant_observed_waw(ctx: &ApplyCtx<'_>, f: &super::collateral::FirstConflict) 
     let Some(producer) = f.peer.filter(|&w| w < tx) else {
         return;
     };
-    if !ctx
-        .specfence
-        .ready_edges
-        .should_plant_observed_waw(tx, producer)
-    {
-        return;
-    }
-    let w_max = ArmTable::w_max(ctx.scheduler.block_size(), 0, false) as usize;
+    // Width 1: ArmTable::w_max is admit_seed cover. A window of 4 on one
+    // register is the 19807137 Released mill. Do not skip when `producer`
+    // is already done — leftover writers must elect/chain.
     let _ = ctx
         .specfence
         .ready_edges
-        .plant_observed_window(tx, producer, f.location, w_max);
+        .plant_observed_window(tx, producer, f.location, 1);
 }
 
 /// Second+ incarnation FullReplay that is not EffectiveWAW still Opt-mills
@@ -246,11 +241,10 @@ fn break_replay_mill(ctx: &ApplyCtx<'_>, f: &super::collateral::FirstConflict) {
         .or_else(|| ctx.mv_memory.last_writer_before(f.location, tx))
         .filter(|&w| w < tx)
         .unwrap_or(tx);
-    let w_max = ArmTable::w_max(ctx.scheduler.block_size(), 0, false) as usize;
     let _ = ctx
         .specfence
         .ready_edges
-        .plant_observed_window(tx, producer, f.location, w_max);
+        .plant_observed_window(tx, producer, f.location, 1);
 }
 
 fn seed_short_edge(

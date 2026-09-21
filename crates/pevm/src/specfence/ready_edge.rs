@@ -74,6 +74,10 @@ pub(crate) struct ReadyEdgeTable {
     loc_tip: DashMap<MemoryLocationHash, AtomicUsize, BuildIdentityHasher>,
     /// Last overflow consumer on `ℓ`. CAS-extended — never walk `waiters`.
     overflow_tip: DashMap<MemoryLocationHash, AtomicUsize, BuildIdentityHasher>,
+    /// Lowest leftover writer seen on `ℓ` after the original peer published.
+    /// Stops a reverse-order election cascade (later tip, then every earlier
+    /// leftover also executing — 19807137 ~12 Q_released).
+    leftover_min: DashMap<MemoryLocationHash, AtomicUsize, BuildIdentityHasher>,
     /// Ordered-admit gated txs. Marked **before** the consumer map insert so
     /// an ungated steal cannot race past a newly created wait-for edge.
     gated_bits: [AtomicU64; GATED_WORDS],
@@ -118,6 +122,7 @@ impl Default for ReadyEdgeTable {
             loc_waiter_n: DashMap::default(),
             loc_tip: DashMap::default(),
             overflow_tip: DashMap::default(),
+            leftover_min: DashMap::default(),
             gated_bits: std::array::from_fn(|_| AtomicU64::new(0)),
             gated_n: AtomicUsize::new(0),
             pending_gated: AtomicUsize::new(0),
@@ -915,6 +920,18 @@ impl ReadyEdgeTable {
             .map(|e| e.load(Ordering::Relaxed))
             .filter(|&t| t < consumer)
             .unwrap_or(producer);
+        // Snapshot leftover_min *before* overflow_tip.entry — DashMap is not
+        // reentrant across maps on the same thread either when nested.
+        let steal_min = if producer_live {
+            NONE
+        } else {
+            let e = self
+                .leftover_min
+                .entry(location)
+                .or_insert_with(|| AtomicUsize::new(NONE));
+            e.fetch_min(consumer, Ordering::Relaxed);
+            e.load(Ordering::Relaxed)
+        };
         let pred = {
             let e = self
                 .overflow_tip
@@ -931,6 +948,14 @@ impl ReadyEdgeTable {
                     Some(loc_tip)
                 } else if producer_live {
                     Some(producer)
+                } else if cur != NONE && cur > consumer && !self.is_writer_done(cur) {
+                    if steal_min == consumer {
+                        None
+                    } else if steal_min < consumer && !self.is_writer_done(steal_min) {
+                        Some(steal_min)
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 };
@@ -1562,6 +1587,31 @@ mod tests {
         assert_eq!(t.blocking_producer(5), Some(3));
         assert!(t.may_execute(3));
         assert!(!t.may_execute(5));
+    }
+
+    #[test]
+    fn plant_window_later_tip_only_lowest_leftover_steals() {
+        let t = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        let loc = 0xabc;
+        assert!(t.plant_observed_window(1, 0, loc, 1));
+        t.note_producer_done(0, &wave);
+        t.note_producer_done(1, &wave);
+        assert!(
+            !t.plant_observed_window(50, 0, loc, 1),
+            "later leftover may elect first"
+        );
+        assert!(
+            !t.plant_observed_window(10, 0, loc, 1),
+            "lowest leftover steals and executes"
+        );
+        assert!(
+            t.plant_observed_window(30, 0, loc, 1),
+            "mid leftover waits on leftover_min — not a third tip"
+        );
+        assert_eq!(t.blocking_producer(30), Some(10));
+        assert!(t.may_execute(10));
+        assert!(!t.may_execute(30));
     }
 
     #[test]
