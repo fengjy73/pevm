@@ -137,19 +137,12 @@ pub(crate) fn run_sf_block<F, V>(
                         // edge. Heal then recovered them into a live antichain
                         // (incarnation++ mill — 6196166 reuse 206k / 19807137).
                         if let Some(w) = on {
-                            if specfence.ready_edges.is_live_leftover_min(tx_idx) {
-                                // leftover_min must not Detect-plant on tx-1 /
-                                // surplus (19807137 glob_min=448 pred=447).
-                                // Flush + mark_wait only — recover/force_push
-                                // leftover_min raced ST_RUNNING and heap-aborted
-                                // 198 first-SF (`unaligned chunk`).
-                                specfence.ready_edges.flush_wait_on(w, tx_idx);
-                                let _ = scheduler.detach_dependent(w, tx_idx);
-                                runnable.mark_wait(tx_idx);
-                            } else if w < tx_idx {
+                            if w < tx_idx {
                                 specfence.ready_edges.note_consumer_on(tx_idx, w, None);
                                 runnable.mark_wait(tx_idx);
-                            } else if specfence.ready_edges.is_leftover_claimed(tx_idx) {
+                            } else if specfence.ready_edges.is_live_leftover_min(tx_idx)
+                                || specfence.ready_edges.is_leftover_claimed(tx_idx)
+                            {
                                 // leftover_min must not stay parked on a later
                                 // waiter. Flush Detect + detach only — recover
                                 // leftover_min here raced 6196166 reuse heap.
