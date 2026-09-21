@@ -467,6 +467,38 @@ impl ReadyEdgeTable {
         }
     }
 
+    /// FullReplay / OrderedReplay: this writer is no longer published.
+    /// Clear the done stamp and re-block waiters that Commit had woken.
+    pub(crate) fn note_abort_reincarnate(&self, writer: TxIdx) {
+        let i = writer / 64;
+        let was_done = if i < self.done_bits.len() {
+            let bit = 1u64 << (writer % 64);
+            self.done_bits[i].fetch_and(!bit, Ordering::Release) & bit != 0
+        } else {
+            self.finished.remove(&writer).is_some()
+        };
+        if was_done && self.is_gated(writer) {
+            self.pending_gated.fetch_add(1, Ordering::Relaxed);
+        }
+        let cs = self
+            .waiters
+            .get(&writer)
+            .map(|v| v.clone())
+            .unwrap_or_default();
+        for c in cs {
+            if c <= writer {
+                continue;
+            }
+            self.mark_gated(c);
+            if let Some(e) = self.consumers.get(&c) {
+                let cur = e.load(Ordering::Relaxed);
+                if cur == NONE || cur == writer {
+                    e.store(writer, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
     /// PC-5: force A0 on this consumer (execute anyway).
     #[inline]
     pub(crate) fn force_optimistic(&self, tx: TxIdx) {
@@ -633,9 +665,10 @@ impl ReadyEdgeTable {
     }
 
     /// True when some consumer is already gated on this writer (publish-wake needed).
+    /// Committed writers keep the waiter list for abort-rebind but are not live.
     #[inline]
     pub(crate) fn has_known_waiters(&self, writer: TxIdx) -> bool {
-        self.waiters.get(&writer).is_some_and(|v| !v.is_empty())
+        !self.is_writer_done(writer) && self.waiters.get(&writer).is_some_and(|v| !v.is_empty())
     }
 
     /// Writer finished. Wake known consumers whose producer is now done.
@@ -644,41 +677,45 @@ impl ReadyEdgeTable {
     /// and the producer/consumer DashMap scans — those were the A0-majority tax.
     /// A1=0 / no gated txs: no `finished` DashMap insert.
     pub(crate) fn note_producer_done(&self, writer: TxIdx, wave: &WaveParkTable) {
+        let cs = self
+            .waiters
+            .get(&writer)
+            .map(|v| v.clone())
+            .unwrap_or_default();
+        let had_waiters = !cs.is_empty();
         self.mark_done(writer);
         if !self.has_any_gated() {
             return;
         }
-        if !self.has_known_waiters(writer)
-            && !self.was_queued(writer)
-            && self.deferred_n.load(Ordering::Relaxed) == 0
+        if !had_waiters && !self.was_queued(writer) && self.deferred_n.load(Ordering::Relaxed) == 0
         {
             return;
         }
-        let waiters = self.waiters.remove(&writer);
-        if let Some((_, cs)) = waiters {
-            for c in cs {
-                // Only the consumers still gated on *this* writer. Probe-star
-                // leftovers that already rebased onto a later pred must stay.
-                //
-                // DashMap is not reentrant: drop the `consumers` shard
-                // *before* `may_execute`, which also `consumers.get`. Nested
-                // get on the same shard is the heap-abort after
-                // `plant_observed_waw` increased waiter traffic
-                // (`free(): invalid pointer` / `corrupted size vs. prev_size`).
-                let still_mine = match self.consumers.get(&c) {
-                    Some(e) if e.load(Ordering::Relaxed) == writer => {
-                        e.store(NONE, Ordering::Relaxed);
-                        true
-                    }
-                    _ => false,
-                };
-                if !still_mine {
-                    continue;
+        // Keep the waiter list so FullReplay can re-block them. Removing
+        // it made Commit+revalidate abort a permanent may_execute stampede
+        // (19807137 ~40 Released heads, live_wait=false).
+        for c in cs {
+            // Only the consumers still gated on *this* writer. Probe-star
+            // leftovers that already rebased onto a later pred must stay.
+            //
+            // DashMap is not reentrant: drop the `consumers` shard
+            // *before* `may_execute`, which also `consumers.get`. Nested
+            // get on the same shard is the heap-abort after
+            // `plant_observed_waw` increased waiter traffic
+            // (`free(): invalid pointer` / `corrupted size vs. prev_size`).
+            let still_mine = match self.consumers.get(&c) {
+                Some(e) if e.load(Ordering::Relaxed) == writer => {
+                    e.store(NONE, Ordering::Relaxed);
+                    true
                 }
-                self.sleeping.remove(&c);
-                if self.may_execute(c) {
-                    wave.push_ready(c);
-                }
+                _ => false,
+            };
+            if !still_mine {
+                continue;
+            }
+            self.sleeping.remove(&c);
+            if self.may_execute(c) {
+                wave.push_ready(c);
             }
         }
         if self.deferred_n.load(Ordering::Relaxed) == 0 {
@@ -1355,6 +1392,24 @@ mod tests {
         for c in 1..48 {
             assert!(t.may_execute(c));
         }
+    }
+
+    #[test]
+    fn abort_rebinds_woken_waiters() {
+        let t = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        t.note_consumer_on(3, 1, Some(0xabc));
+        assert!(!t.may_execute(3));
+        t.note_producer_done(1, &wave);
+        assert!(t.may_execute(3), "Commit wakes the waiter");
+        assert!(t.is_writer_done(1));
+        t.note_abort_reincarnate(1);
+        assert!(!t.is_writer_done(1));
+        assert!(
+            !t.may_execute(3),
+            "FullReplay must re-block waiters of the aborted writer"
+        );
+        assert_eq!(t.blocking_producer(3), Some(1));
     }
 
     #[test]
