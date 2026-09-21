@@ -284,6 +284,17 @@ fn metrics_json(m: &pevm::SpecFenceMetrics, n: usize) -> serde_json::Value {
         "partial_abort_attempt": m.partial_abort_attempt,
         "park_resume_at_k": m.park_resume_at_k,
         "park_resume_full_abort_reexecute": m.park_resume_full_abort_reexecute,
+        "sf_schedule_picks": m.sf_schedule_picks,
+        "occ_schedule_picks": m.occ_schedule_picks,
+        "visibility_opt": m.visibility_opt,
+        "visibility_wait_released": m.visibility_wait_released,
+        "visibility_ordered_tip": m.visibility_ordered_tip,
+        "resolve_commit": m.resolve_commit,
+        "resolve_partial_rebind": m.resolve_partial_rebind,
+        "resolve_partial_rewind": m.resolve_partial_rewind,
+        "resolve_ordered_replay": m.resolve_ordered_replay,
+        "resolve_full_replay": m.resolve_full_replay,
+        "runnable_set_width_mean": m.runnable_set_width_mean,
     })
 }
 

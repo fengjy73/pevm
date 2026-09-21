@@ -163,8 +163,9 @@ impl Scheduler {
         self.try_execute_ready(tx_idx, None, None)
     }
 
-    /// Dual-path pick helper: ungated ≡ OCC `try_execute`. Gated-not-ready
-    /// is an edge skip (not a global mode switch) — no admit-spine bag spam.
+    /// Dual-path pick helper: ungated = Avoid=noop `try_execute`.
+    /// Gated-not-ready is a Detect-edge skip (wave-fill another runnable) —
+    /// not a global OCC mode switch.
     #[inline]
     fn try_occ_or_skip_gate(
         &self,

@@ -70,10 +70,12 @@ pub(crate) struct ReadyEdgeTable {
     /// Ordered-admit gated txs. Marked **before** the consumer map insert so
     /// an ungated steal cannot race past a newly created wait-for edge.
     gated_bits: [AtomicU64; GATED_WORDS],
-    /// Live gated-tx count (P1/P3: A1=0 → OCC-class pick, no ReadyEdge walk).
+    /// Live gated-tx count (Detect edges). Zero gated → RunnableSet is the
+    /// independent antichain (Avoid=noop Opt), still on Schedule.pick.
     gated_n: AtomicUsize,
     /// Gated txs that have not yet `mark_done`. Gates are edge constraints:
-    /// when this hits 0, pick returns to `next_occ_task` even if bits remain.
+    /// when this hits 0 those txs rejoin the antichain — not a retreat to
+    /// `next_occ_task`.
     pending_gated: AtomicUsize,
     /// Done writers (bitset). A0 finish is an atomic or — no `finished` DashMap.
     done_bits: [AtomicU64; GATED_WORDS],
@@ -315,7 +317,8 @@ impl ReadyEdgeTable {
         }
     }
 
-    /// Any live A1 / gated tx in this block (P1: if false, pick ≡ OCC).
+    /// Any live Detect-gated tx in this block. False ⇒ RunnableSet is the
+    /// independent antichain (Avoid=noop Opt), not an OCC-engine switch.
     #[inline]
     pub(crate) fn has_any_gated(&self) -> bool {
         self.gated_n.load(Ordering::Relaxed) > 0

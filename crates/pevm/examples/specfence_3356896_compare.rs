@@ -1,4 +1,4 @@
-//! SpecFence (OptimisticRead / OrderedAdmit on one Block-STM spine) vs harness OCC
+//! SpecFence Parallel Spine (SF-PS) vs harness OCC
 //! baseline on Ethereum mainnet block 3356896 (Soft=0). Compare is measurement
 //! only — not a protocol fork.
 //!
@@ -153,6 +153,17 @@ struct IterRow {
     sys_reexec_n: usize,
     covering_n: usize,
     chosen_cover_window: u8,
+    sf_schedule_picks: usize,
+    occ_schedule_picks: usize,
+    visibility_opt: usize,
+    visibility_wait_released: usize,
+    visibility_ordered_tip: usize,
+    resolve_commit: usize,
+    resolve_partial_rebind: usize,
+    resolve_partial_rewind: usize,
+    resolve_ordered_replay: usize,
+    resolve_full_replay: usize,
+    runnable_set_width_mean: f64,
     begin_blocked: Vec<usize>,
     taxed_indep_blocked: Vec<usize>,
     main_inc_gt0: Vec<usize>,
@@ -228,7 +239,7 @@ fn run_once(
                 .map(|(t, _)| t)
                 .collect();
             println!(
-                "  {mode_name}[{i}] ok wall_ms={wall_ms:.3} tps={:.0} occ_aborts={} inc>0={} reexec={} refuse_admit={} wait_for_dependency={} soft_wait_arms={} idle_ns={} ready_width={:.2} ordered_admit={} optimistic_read={} edge_oa={} edge_or={} refuse_ns={} reexec_ns={} ordered_ns={} prepaid_ns={} abort_cf_ns={} prior_decay={} opt_maj={} ev_keep={} ev_demote={} commute={} batch={} d1_prom={} d1_ign={} taxed_begin={} edge_4_31={} unfenced_reexec={} double_charge={} sys_reexec={} covering={} cover_window={} learn={} win_w={} w_cap={} seg_len={} uniq_w/s={}/{} expl_bud={} win1/2/3/seg/full/defer={}/{}/{}/{}/{}/{} arms={} switch={} explore={} win2_dev={} c_opt/w1/w2/w3/def={:.0}/{:.0}/{:.0}/{:.0}/{:.0} main_inc={:?} storage_inc={:?} admit_seed_ns={} end_block_ns={} opt_path_tax_ns={} ungated_occ={} pick_gate={} skip_gate={} ungated_occ_while_gated={} yield_ns={} gate_stall_ns={} busy_ns={}",
+                "  {mode_name}[{i}] ok wall_ms={wall_ms:.3} tps={:.0} occ_aborts={} inc>0={} reexec={} refuse_admit={} wait_for_dependency={} soft_wait_arms={} idle_ns={} ready_width={:.2} ordered_admit={} optimistic_read={} edge_oa={} edge_or={} refuse_ns={} reexec_ns={} ordered_ns={} prepaid_ns={} abort_cf_ns={} prior_decay={} opt_maj={} ev_keep={} ev_demote={} commute={} batch={} d1_prom={} d1_ign={} taxed_begin={} edge_4_31={} unfenced_reexec={} double_charge={} sys_reexec={} covering={} cover_window={} learn={} win_w={} w_cap={} seg_len={} uniq_w/s={}/{} expl_bud={} win1/2/3/seg/full/defer={}/{}/{}/{}/{}/{} arms={} switch={} explore={} win2_dev={} c_opt/w1/w2/w3/def={:.0}/{:.0}/{:.0}/{:.0}/{:.0} main_inc={:?} storage_inc={:?} admit_seed_ns={} end_block_ns={} opt_path_tax_ns={} ungated_occ={} pick_gate={} skip_gate={} ungated_occ_while_gated={} yield_ns={} gate_stall_ns={} busy_ns={} sf_picks={} occ_picks={} vis_opt/wait/tip={}/{}/{} resolve_c/rebind/rewind/ord/full={}/{}/{}/{}/{} rset_w={:.2}",
                 n as f64 / (wall_ms / 1000.0),
                 m.occ_aborts,
                 m.incarnation_gt0,
@@ -295,7 +306,18 @@ fn run_once(
                 learn.ungated_occ_while_gated,
                 learn.yield_ns,
                 learn.gate_stall_ns,
-                learn.worker_busy_ns
+                learn.worker_busy_ns,
+                m.sf_schedule_picks,
+                m.occ_schedule_picks,
+                m.visibility_opt,
+                m.visibility_wait_released,
+                m.visibility_ordered_tip,
+                m.resolve_commit,
+                m.resolve_partial_rebind,
+                m.resolve_partial_rewind,
+                m.resolve_ordered_replay,
+                m.resolve_full_replay,
+                m.runnable_set_width_mean
             );
             IterRow {
                 mode: mode_name.to_string(),
@@ -364,6 +386,17 @@ fn run_once(
                 sys_reexec_n: learn.sys_reexec_n,
                 covering_n: learn.covering_n,
                 chosen_cover_window: learn.chosen_cover_window,
+                sf_schedule_picks: m.sf_schedule_picks,
+                occ_schedule_picks: m.occ_schedule_picks,
+                visibility_opt: m.visibility_opt,
+                visibility_wait_released: m.visibility_wait_released,
+                visibility_ordered_tip: m.visibility_ordered_tip,
+                resolve_commit: m.resolve_commit,
+                resolve_partial_rebind: m.resolve_partial_rebind,
+                resolve_partial_rewind: m.resolve_partial_rewind,
+                resolve_ordered_replay: m.resolve_ordered_replay,
+                resolve_full_replay: m.resolve_full_replay,
+                runnable_set_width_mean: m.runnable_set_width_mean,
                 begin_blocked: begin,
                 taxed_indep_blocked: taxed,
                 main_inc_gt0: inc_gt0_in(&incs, MAIN_CHAIN),
