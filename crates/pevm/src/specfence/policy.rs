@@ -33,12 +33,14 @@
 //! sticky only on wall success vs the OCC abort counterfactual, else
 //! OptimisticRead. Wait-set soft-cap is an over-admission predicate
 //! decoupled from cover depth: at-cap leftover deepens the next
-//! segment instead of total withdraw. Near-independent large blocks
-//! drop non-critical wait-set slots. Ungated execute+validate is
-//! OCC-equivalent (`skip_ungated_tx_path_tax`); gates are edge
-//! constraints (ungated_occ ≈ n − wait_set). Lazy-update /
+//! segment instead of total withdraw. Near-independent / lazy-update
+//! large blocks drop non-critical wait-set slots and skip useless
+//! cover probes. Ungated execute+validate is OCC-equivalent on every
+//! n (`skip_ungated_tx_path_tax`) whenever the wait-set is empty,
+//! short-chain, or the tx is ungated — thin included. Gates are
+//! edge constraints (ungated_occ ≈ n − wait_set). Lazy-update /
 //! thousand-writer chains are never OrderedAdmit objects. Instant
-//! idle never enters ĉ.
+//! idle never enters ĉ. Soft=0.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -1194,20 +1196,20 @@ impl CostPolicy {
     /// Large lazy-update / near-independent: drop ungated execute+validate
     /// path tax. Same-block reuse uses the process-persistent structure flag
     /// because `lazy_seen` is per-block. Must not disable ungated OCC pick.
-    /// Block-level: empty / short-chain wait-set only (lean `end_block`,
-    /// after-publish D1 skip). Per-tx ungated skip is
+    /// Block-level: empty / short-chain wait-set — **thin included** (S1).
+    /// Lean `end_block`, after-publish D1 skip. Per-tx ungated skip is
     /// [`skip_ungated_tx_path_tax`].
     #[inline]
     pub(crate) fn skip_ungated_path_tax(&self) -> bool {
         self.large_lazy_path_tax() || self.opt_aligned_path_tax()
     }
 
-    /// P1: ungated execute+validate is OCC-equivalent. Gated txs
-    /// (`was_queued` / `is_gated`) still take the SpecFence path.
-    /// Mid/large ungated txs skip even when a leftover-long wait-set exists.
+    /// S1: ungated execute+validate is OCC-equivalent on every n
+    /// (thin included). Gated txs (`was_queued` / `is_gated`) still
+    /// take the SpecFence path. Callers check `is_gated`.
     #[inline]
     pub(crate) fn skip_ungated_tx_path_tax(&self) -> bool {
-        self.is_optimistic_majority_block() || self.block_n() > THIN_N_MAX
+        true
     }
 
     /// Large + lazy-update may ignore leftover reservations at pick.
@@ -1223,12 +1225,12 @@ impl CostPolicy {
             && (self.lazy_already_seen() || self.lazy_structure_seen.load(Ordering::Relaxed))
     }
 
-    /// M2: OCC-aligned Opt path tax — mid/large wait-set empty or only
-    /// short-chain (n_pairs ≤ `ORDER_WINDOW_K`). A leftover-long plant
+    /// S1: OCC-aligned Opt path tax — wait-set empty or only short-chain
+    /// (n_pairs ≤ `ORDER_WINDOW_K`). Thin included. A leftover-long plant
     /// sets `wait_set_has_long` and clears the skip.
     #[inline]
     fn opt_aligned_path_tax(&self) -> bool {
-        self.block_n() > THIN_N_MAX && !self.wait_set_has_long.load(Ordering::Relaxed)
+        !self.wait_set_has_long.load(Ordering::Relaxed)
     }
 
     /// Begin-seed planted a leftover-long wait-for (not short-chain).
@@ -1265,8 +1267,8 @@ impl CostPolicy {
     ///
     /// C4: cap is decoupled from cover depth — at-cap leftover deepens
     /// `cover_window` by a segment instead of total withdraw.
-    /// P3: near-independent large blocks (and large blocks with no
-    /// mid-band coverable spine) drop non-critical wait-set slots.
+    /// S2: near-independent / lazy-update large blocks (and large blocks
+    /// with no mid-band coverable spine) drop non-critical wait-set slots.
     /// Thin short-chain (3356896) stays uncapped unless cover_window already
     /// inflated. Mid-band real spines keep the light prefix.
     pub(crate) fn wait_set_soft_cap(&self) -> Option<usize> {
@@ -1283,8 +1285,9 @@ impl CostPolicy {
         Some(self.cores().max(8).min(16))
     }
 
-    /// P3 / C2: no mid-band coverable spine → do not keep 4–8 leftover
-    /// holes on a near-independent or ultra-long-only large block.
+    /// S2: no mid-band coverable spine → do not keep leftover holes on a
+    /// near-independent or ultra-long-only large block. Cover probes on
+    /// that object are useless — OCC abort is the cheaper path.
     fn should_drop_noncritical_wait_set(&self) -> bool {
         if self.has_midband_coverable_spine() {
             return false;
@@ -1294,6 +1297,13 @@ impl CostPolicy {
             return true;
         }
         n > THIN_N_MAX && self.has_only_short_real_spines()
+    }
+
+    /// S2: near-independent / lazy-update large — cover probe cannot beat
+    /// OCC abort. Drop leftover hops; do not plant a wait-set.
+    #[inline]
+    pub(crate) fn skip_useless_cover_probe(&self) -> bool {
+        self.block_n() >= LARGE_BLOCK_N && !self.has_midband_coverable_spine()
     }
 
     fn has_midband_coverable_spine(&self) -> bool {
@@ -1354,24 +1364,43 @@ impl CostPolicy {
     /// Lean end_block: skip HotSet / inter-prior / sketch / MV merge.
     /// Mid-band reuse with stored D1 **or** already-seen conflict structure
     /// is the same lean as large+lazy-seen. First mid-band still persists.
+    /// S4: thin reuse with empty / short-chain wait-set leans too.
     pub(crate) fn should_lean_end_block(&self, d1_stored: bool) -> bool {
         let n = self.block_n();
         if n >= LARGE_BLOCK_N && self.large_lazy_path_tax() {
             return true;
         }
+        let seq = self.block_seq.load(Ordering::Relaxed);
+        // S4: reuse + empty/short-chain wait-set leans — thin included.
+        // First incarnation still persists D1 (3356896 4→31).
+        if self.skip_ungated_path_tax() && seq > 1 {
+            return true;
+        }
         if n <= THIN_N_MAX {
             return false;
         }
-        // M2: mid/large Opt path-tax skip on reuse — end_block is the same
-        // tax as execute/validate. First mid-band after a thin block still
-        // persists D1.
-        if self.skip_ungated_path_tax()
-            && self.block_seq.load(Ordering::Relaxed) > 1
-            && self.last_block_n.load(Ordering::Relaxed) > THIN_N_MAX
-        {
-            return true;
-        }
         d1_stored || self.should_reuse_stored_d1()
+    }
+
+    /// S4: reuse + empty/short-chain wait-set on thin / near-independent /
+    /// lazy-update large — skip writer-order snapshot and incarnation walk.
+    /// Mid-band real spines keep the walk so leftover unfenced still trains.
+    pub(crate) fn should_skip_end_block_walks(&self) -> bool {
+        self.skip_ungated_path_tax()
+            && self.block_seq.load(Ordering::Relaxed) > 1
+            && (self.large_lazy_path_tax()
+                || self.should_drop_noncritical_wait_set()
+                || self.block_n() <= THIN_N_MAX)
+    }
+
+    /// S3: Done-on-success stamp is required when a later plant can race
+    /// (thin storage-like D1, leftover flush, live wait-set). Mid/large
+    /// empty wait-set with path-tax skip cannot D1-plant.
+    #[inline]
+    pub(crate) fn need_ungated_done_stamp(&self) -> bool {
+        self.is_optimistic_majority_block()
+            || self.has_pending_idle()
+            || !self.skip_ungated_path_tax()
     }
 
     /// Under-covered conflict spine: cover_window cannot absorb leftover.
@@ -1397,6 +1426,9 @@ impl CostPolicy {
     /// wall success (`cover_proven_cheaper`). Failed probe → OptimisticRead.
     /// Never-tried is not a reason to refuse cover.
     fn can_probe_cover(&self, location: MemoryLocationHash, n_pairs: usize) -> bool {
+        if self.skip_useless_cover_probe() {
+            return false;
+        }
         if self.loc_forbids_n(location, n_pairs) {
             return false;
         }
@@ -1525,7 +1557,9 @@ impl CostPolicy {
         location: MemoryLocationHash,
         n_pairs: usize,
     ) -> bool {
-        self.loc_forbids_n(location, n_pairs) || self.yield_to_occ_abort(location, n_pairs)
+        self.loc_forbids_n(location, n_pairs)
+            || self.skip_useless_cover_probe()
+            || self.yield_to_occ_abort(location, n_pairs)
     }
 
     /// Seed a new `PromotedLoc`. Must not touch `self.promoted` — callers
@@ -1617,6 +1651,10 @@ impl CostPolicy {
             return light;
         }
         let n = self.block_n();
+        // S2: thin never climbs a mid-band train hat (6137495 Win_16).
+        if n <= THIN_N_MAX {
+            return light;
+        }
         let cores = self.cores();
         let cap = if n_pairs >= MIDBAND_COVER_MIN && n < LARGE_BLOCK_N {
             // C4: one segment first, room to deepen a second segment.
@@ -1682,7 +1720,8 @@ impl CostPolicy {
             .map(|c| c.len())
             .unwrap_or(0);
         // Yield must not T3-slide extra Detect hops (19716145 hops=0 hang).
-        if self.yield_to_occ_abort(location, n_pairs) {
+        // S2: near-independent / lazy-update large never slides a cover hop.
+        if self.skip_useless_cover_probe() || self.yield_to_occ_abort(location, n_pairs) {
             return false;
         }
         // C4 deepen is end_block `cover_window`, not a perpetual T3 slide.
@@ -6143,7 +6182,20 @@ mod tests {
         p.begin_block_with_cores(176, 8);
         assert!(
             !p.should_lean_end_block(true),
-            "thin reuse is not mid-band lean"
+            "first thin still persists D1"
+        );
+        assert!(
+            !p.should_skip_end_block_walks(),
+            "first thin still walks D1 / incarnation"
+        );
+        p.begin_block_with_cores(176, 8);
+        assert!(
+            p.should_lean_end_block(false),
+            "S4: thin reuse with empty wait-set leans end_block"
+        );
+        assert!(
+            p.should_skip_end_block_walks(),
+            "S4: thin reuse skips writer-order / incarnation walks"
         );
         p.begin_block_with_cores(341, 8);
         assert!(
@@ -6269,6 +6321,15 @@ mod tests {
         assert!(
             p.ignore_leftover_reservations(),
             "same-block large lazy reuse keeps leftover steal"
+        );
+        p.begin_block_with_cores(176, 8);
+        assert!(
+            p.skip_ungated_path_tax(),
+            "S1: thin empty wait-set is OCC-aligned Opt path-tax skip"
+        );
+        assert!(
+            p.skip_ungated_tx_path_tax(),
+            "S1: thin ungated execute+validate is OCC-equivalent"
         );
         p.begin_block_with_cores(400, 8);
         assert!(
@@ -6587,6 +6648,76 @@ mod tests {
         assert!(
             p.skip_ungated_tx_path_tax(),
             "P1: NEAR ungated execute+validate is OCC-equivalent"
+        );
+        assert!(
+            p.skip_useless_cover_probe(),
+            "S2: near-independent large skips useless cover probes"
+        );
+        assert!(
+            p.should_skip_ordered_admit_seed(0x1a, 5),
+            "S2: leftover hops on a near-independent large loc are not planted"
+        );
+    }
+
+    #[test]
+    fn thin_empty_wait_set_is_occ_equivalent() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(108, 8);
+        assert!(
+            p.skip_ungated_path_tax(),
+            "S1: thin empty wait-set skips block-level path tax"
+        );
+        assert!(p.skip_ungated_tx_path_tax());
+        assert!(
+            !p.should_lean_end_block(false),
+            "first thin still persists D1"
+        );
+        p.note_ordered_seed(8);
+        p.note_wait_set(4);
+        assert!(
+            !p.skip_ungated_path_tax(),
+            "S1: thin leftover-long wait-set keeps gated end_block / D1"
+        );
+        assert!(
+            p.skip_ungated_tx_path_tax(),
+            "S1: ungated txs still skip execute+validate path tax"
+        );
+    }
+
+    #[test]
+    fn thin_train_hat_stays_light() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(60, 8);
+        assert_eq!(
+            p.train_hat(20),
+            p.light_hat(20),
+            "S2: thin must not climb a mid-band train hat (6137495 Win_16)"
+        );
+        p.begin_block_with_cores(430, 8);
+        assert!(
+            p.train_hat(20) > p.light_hat(20),
+            "mid-band real spine may deepen a second segment"
+        );
+    }
+
+    #[test]
+    fn mid_large_empty_wait_set_skips_ungated_done_stamp() {
+        let p = CostPolicy::new();
+        p.begin_block_with_cores(1346, 8);
+        assert!(
+            !p.need_ungated_done_stamp(),
+            "S3: large empty wait-set does not stamp ungated Done"
+        );
+        p.begin_block_with_cores(176, 8);
+        assert!(
+            p.need_ungated_done_stamp(),
+            "S3: thin keeps Done-on-success (storage-like D1 can plant)"
+        );
+        p.begin_block_with_cores(430, 8);
+        p.note_ordered_seed(20);
+        assert!(
+            p.need_ungated_done_stamp(),
+            "S3: leftover-long wait-set keeps Done-on-success"
         );
     }
 }

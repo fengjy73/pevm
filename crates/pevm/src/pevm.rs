@@ -631,16 +631,30 @@ impl Pevm {
                                     let next = self
                                         .try_execute(&mut vm, &scheduler, tx_version, None, None);
                                     if sf && scheduler.is_done(done_idx) {
-                                        // Done-on-success: always stamp. O5 used to
-                                        // skip when !has_any_gated(); a later
-                                        // pick-quantum flush then planted
-                                        // consumer→pred with is_writer_done=false
-                                        // → refuse-forever (iter11 ~400% spin).
-                                        specfence.ready_edges.note_producer_done_stamp(done_idx);
-                                        if specfence.ready_edges.has_known_waiters(done_idx)
-                                            && let Some(w) = wave_ref
-                                        {
-                                            specfence.ready_edges.note_producer_done(done_idx, w);
+                                        // S3: Done-on-success when a later plant
+                                        // can race (thin storage-like D1, leftover
+                                        // flush, live wait-set). Mid/large empty
+                                        // wait-set with path-tax skip cannot plant.
+                                        // O5 skip-when-!has_any_gated livelocked
+                                        // iter11 (~400% spin) when a later flush
+                                        // planted consumer→pred with done=false.
+                                        let need_stamp =
+                                            specfence.ready_edges.has_known_waiters(done_idx)
+                                                || specfence.ready_edges.has_pending_gated()
+                                                || specfence
+                                                    .policy
+                                                    .is_some_and(|p| p.need_ungated_done_stamp());
+                                        if need_stamp {
+                                            specfence
+                                                .ready_edges
+                                                .note_producer_done_stamp(done_idx);
+                                            if specfence.ready_edges.has_known_waiters(done_idx)
+                                                && let Some(w) = wave_ref
+                                            {
+                                                specfence
+                                                    .ready_edges
+                                                    .note_producer_done(done_idx, w);
+                                            }
                                         }
                                     }
                                     next
@@ -797,9 +811,16 @@ impl Pevm {
             // when the ready table saw no writers. Thin HotSet: ≥3-writer /
             // promoted ℓ. Skip HotSet decay + sketch on thin (not next-begin).
             let beneficiary = hash_deterministic(MemoryLocation::Basic(block_env.beneficiary));
-            let ready_d1 = ready_edges.writer_order_snapshot();
+            // S4: reuse + empty/short-chain wait-set on thin / near-independent
+            // / lazy-update large — skip writer-order snapshot and MV walk.
+            let skip_end_walks = self.cost_policy.should_skip_end_block_walks();
+            let ready_d1 = if skip_end_walks && !self.last_location_writers.is_empty() {
+                std::mem::take(&mut self.last_location_writers)
+            } else {
+                ready_edges.writer_order_snapshot()
+            };
             let ready_conflict = ready_d1.iter().any(|(_, w)| w.len() >= 2);
-            let mut d1_orders = if ready_conflict {
+            let mut d1_orders = if ready_conflict || skip_end_walks {
                 ready_d1
             } else {
                 mv_writer_order_snapshot(&mv_memory, block_size, beneficiary)
@@ -872,55 +893,66 @@ impl Pevm {
             metrics_inner.set_soft_wait_arms(dag.soft_arm_count());
             metrics_inner.set_sketch_hot_size(sketch.hot_size());
             self.last_process = process.snapshot(16);
-            let incs = scheduler.incarnation_snapshot();
-            let inc_gt0 = incs.iter().filter(|&&i| i > 0).count();
-            let reexec: usize = incs.iter().sum();
-            let mut miss = 0usize;
-            if thin || lean_end {
-                for (tx, &inc) in incs.iter().enumerate() {
-                    if inc > 0 && !ready_edges.was_queued(tx) {
-                        miss += 1;
-                        self.cost_policy.bump_unfenced_reexec();
-                    }
-                }
+            // S4: thin / near-independent / lazy-update reuse with a stable
+            // empty wait-set skips the per-tx mutex incarnation walk.
+            // Mid-band real spines keep the walk so leftover unfenced trains.
+            let (inc_gt0, reexec, miss) = if skip_end_walks {
+                (0, 0, 0)
             } else {
-                for (tx, &inc) in incs.iter().enumerate() {
-                    if inc == 0 || ready_edges.was_queued(tx) {
-                        continue;
-                    }
-                    match self.cost_policy.conflict_of(tx) {
-                        Some(note)
-                            if note.lazy
-                                || matches!(
-                                    note.class,
-                                    crate::specfence::ConflictClass::LazyNoise
-                                        | crate::specfence::ConflictClass::CommuteCandidate
-                                ) =>
-                        {
-                            let _ = note.location;
-                        }
-                        Some(note) => {
+                let incs = scheduler.incarnation_snapshot();
+                let inc_gt0 = incs.iter().filter(|&&i| i > 0).count();
+                let reexec: usize = incs.iter().sum();
+                let mut miss = 0usize;
+                if thin || lean_end {
+                    for (tx, &inc) in incs.iter().enumerate() {
+                        if inc > 0 && !ready_edges.was_queued(tx) {
                             miss += 1;
                             self.cost_policy.bump_unfenced_reexec();
-                            if !self.cost_policy.loc_forbids_ordered(note.location)
-                                && !self.cost_policy.is_promoted(note.location)
+                        }
+                    }
+                } else {
+                    for (tx, &inc) in incs.iter().enumerate() {
+                        if inc == 0 || ready_edges.was_queued(tx) {
+                            continue;
+                        }
+                        match self.cost_policy.conflict_of(tx) {
+                            Some(note)
+                                if note.lazy
+                                    || matches!(
+                                        note.class,
+                                        crate::specfence::ConflictClass::LazyNoise
+                                            | crate::specfence::ConflictClass::CommuteCandidate
+                                    ) =>
                             {
-                                self.cost_policy.promote_short_edge(note.location, 1);
+                                let _ = note.location;
+                            }
+                            Some(note) => {
+                                miss += 1;
+                                self.cost_policy.bump_unfenced_reexec();
+                                if !self.cost_policy.loc_forbids_ordered(note.location)
+                                    && !self.cost_policy.is_promoted(note.location)
+                                {
+                                    self.cost_policy.promote_short_edge(note.location, 1);
+                                }
+                            }
+                            None => {
+                                miss += 1;
+                                self.cost_policy.bump_unfenced_reexec();
                             }
                         }
-                        None => {
-                            miss += 1;
-                            self.cost_policy.bump_unfenced_reexec();
-                        }
                     }
                 }
-            }
+                (inc_gt0, reexec, miss)
+            };
             // Post-publish: persist consecutive D1 pairs on promoted ℓ
             // (4→31→66→… on Basic(0x32be)). Skip wide empty-to / CallWaw
             // envelopes so 0x209c is not stored as a star. No mid-execute insert.
             // C3: reuse stable D1 already stored — skip the clone/filter walk.
             // E1: lean mid-band / large reuse also skips persist + pair merge.
-            if !d1_reuse && (!stable_d1 || !self.cost_policy.d1_pairs_already_stored(&d1_orders)) {
+            if !skip_end_walks
+                && !d1_reuse
+                && (!stable_d1 || !self.cost_policy.d1_pairs_already_stored(&d1_orders))
+            {
                 let persist: Vec<_> = d1_orders
                     .iter()
                     .filter(|(loc, w)| {

@@ -195,7 +195,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.read_set.clear();
         self.read_accounts.clear();
         self.pcc_armed.set(false);
-        if let Some(fg) = self.specfence.finegrain {
+        // S3: finegrain is research-only; skip on OCC-equivalent ungated.
+        if !self.optimistic_skip_gate
+            && let Some(fg) = self.specfence.finegrain
+        {
             fg.deep_begin_consumer(tx_idx, incarnation);
         }
         if self.specfence.mode == crate::ConcurrencyMode::SpecFence && !self.optimistic_skip_gate {
@@ -2405,8 +2408,10 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 .policy
                 .is_some_and(|p| p.skip_ungated_tx_path_tax())
             && !self.specfence.ready_edges.is_gated(tx_version.tx_idx);
-        let lean = self.specfence.mode == crate::ConcurrencyMode::SpecFence
-            && self.specfence.engagement.begin_tx(tx_version.tx_idx);
+        // S3: ungated skip path is OCC-equivalent — no engagement stamp.
+        let lean = optimistic_ungated_exec
+            || (self.specfence.mode == crate::ConcurrencyMode::SpecFence
+                && self.specfence.engagement.begin_tx(tx_version.tx_idx));
         let repair_armed = self.specfence.mode == crate::ConcurrencyMode::SpecFence
             && !optimistic_ungated_exec
             && (self
@@ -2414,7 +2419,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 .partial_retry
                 .is_rewind_resume(tx_version.tx_idx)
                 || self.specfence.partial_retry.has_ff_head(tx_version.tx_idx));
-        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+        if self.specfence.mode == crate::ConcurrencyMode::SpecFence && !optimistic_ungated_exec {
             if repair_armed {
                 self.specfence.metrics.record_pcc_kernel_exec();
             } else {
