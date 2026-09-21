@@ -138,16 +138,14 @@ impl RunnableSet {
                 continue;
             }
             if stages.is_reserved(tx) && !scheduler.is_done(tx) && ready.may_execute(tx) {
-                self.push(tx, QueueKind::Ordered);
+                // Q_ordered seed milled 19807137 (~130 OrderedTip heads).
+                // Reserved window still gets OrderedTip via for_ready.
+                self.push(tx, QueueKind::Released);
                 continue;
             }
             if ready.is_gated(tx) {
                 if ready.may_execute(tx) {
-                    if ready.was_queued(tx) {
-                        self.push(tx, QueueKind::Ordered);
-                    } else {
-                        self.push(tx, QueueKind::Released);
-                    }
+                    self.push(tx, QueueKind::Released);
                 } else {
                     ready.note_skip_gate(tx);
                     self.mark_wait(tx);
