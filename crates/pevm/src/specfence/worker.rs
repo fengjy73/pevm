@@ -119,15 +119,13 @@ pub(crate) fn run_sf_block<F, V>(
                             } else if specfence.ready_edges.detect_waits_on(w, tx_idx) {
                                 // Later leftover is Detect-gated on us; we
                                 // parked Aborting on them (6196166 reuse
-                                // n_unf=44). Ungate the leftover so it can
-                                // Commit and wake this Aborting.
-                                specfence.ready_edges.ungate(w);
-                                if scheduler.is_aborting(w) {
-                                    let _ = scheduler.recover_aborting(w);
-                                } else if scheduler.is_executing(w) {
-                                    let _ = scheduler.recover_executing_waiter(w);
-                                }
-                                if scheduler.is_ready(w) || scheduler.is_executed(w) {
+                                // n_unf=44). Flush the leftover pred only —
+                                // `ungate` + recover_executing double-freed.
+                                specfence.ready_edges.flush_wait_on(w, tx_idx);
+                                if !runnable.is_running(w)
+                                    && specfence.ready_edges.may_execute(w)
+                                    && (scheduler.is_ready(w) || scheduler.is_executed(w))
+                                {
                                     let kind = if specfence.ready_edges.is_gated(w) {
                                         super::runnable_set::QueueKind::Released
                                     } else {

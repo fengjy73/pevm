@@ -683,6 +683,11 @@ impl RunnableSet {
     }
 
     #[inline]
+    pub(crate) fn is_running(&self, tx: TxIdx) -> bool {
+        tx < self.block_size && self.state[tx].load(Ordering::Acquire) == ST_RUNNING
+    }
+
+    #[inline]
     pub(crate) fn idle_spins(&self) -> usize {
         self.idle_spins.load(Ordering::Relaxed)
     }

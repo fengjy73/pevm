@@ -810,6 +810,30 @@ impl ReadyEdgeTable {
         false
     }
 
+    /// Flush `consumer ← producer` without `ungate` (that DashMap walk
+    /// double-freed 6196166 on the Blocked path).
+    pub(crate) fn flush_pred_if(&self, consumer: TxIdx, producer: TxIdx) {
+        if let Some(e) = self.consumers.get(&consumer)
+            && e.load(Ordering::Relaxed) == producer
+        {
+            e.store(NONE, Ordering::Relaxed);
+        }
+    }
+
+    /// Walk the Detect chain and flush the edge that names `target`.
+    pub(crate) fn flush_wait_on(&self, mut tx: TxIdx, target: TxIdx) {
+        for _ in 0..8 {
+            match self.blocking_producer(tx) {
+                Some(p) if p == target => {
+                    self.flush_pred_if(tx, target);
+                    return;
+                }
+                Some(p) if p < tx => tx = p,
+                _ => return,
+            }
+        }
+    }
+
     /// Defer a known consumer. Count once until the producer finishes —
     /// re-probing the same head must not spin `refuse_admit` (19606599 31k).
     /// PC-W1: mark sleeping so steal/index skip this head until pred Done.
