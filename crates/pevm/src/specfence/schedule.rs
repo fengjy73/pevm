@@ -102,7 +102,8 @@ pub(crate) fn pick(
                 // try_execute missed (Executing leftover / Aborting).
                 // Leaving ST_RUNNING here blocked force_idle_recover
                 // (6196166 N=3: gated=false, n_unf=27, pending=0).
-                runnable.mark_wait(tx);
+                // CAS only: mark_wait would clear a stolen live owner.
+                runnable.release_running(tx);
             }
             Some(SfPick::Revalidate(tx)) => {
                 if let Some(v) = scheduler.prepare_revalidate(tx) {
@@ -122,7 +123,7 @@ pub(crate) fn pick(
                 } else if scheduler.is_executed(tx) {
                     runnable.force_push(tx, super::runnable_set::QueueKind::Revalidate);
                 } else {
-                    runnable.mark_wait(tx);
+                    runnable.release_running(tx);
                 }
             }
             None => break,

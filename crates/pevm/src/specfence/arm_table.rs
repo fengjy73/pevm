@@ -543,7 +543,7 @@ impl ArmTable {
                 continue;
             }
             ready.ungate(c);
-            runnable.force_push(c, QueueKind::Indep);
+            let _ = runnable.wake_idle(c, QueueKind::Indep);
         }
     }
 

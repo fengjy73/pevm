@@ -247,7 +247,7 @@ pub(crate) fn run_sf_block<F, V>(
                                     } else {
                                         super::runnable_set::QueueKind::Indep
                                     };
-                                    runnable.force_push(w, kind);
+                                    let _ = runnable.wake_idle(w, kind);
                                 }
                                 runnable.mark_wait(tx_idx);
                             } else {
@@ -354,18 +354,26 @@ pub(crate) enum SfExec {
 }
 
 fn drain_wave(specfence: SpecFenceCtx<'_>, scheduler: &Scheduler, runnable: &RunnableSet) {
+    let mut still_executing = Vec::new();
     while let Some(t) = specfence.wave.pop_ready() {
         if scheduler.is_validated(t) {
             runnable.mark_done(t);
             continue;
         }
-        // force_push: the waiter may still be ST_RUNNING inside try_execute_sf
-        // (add_dependency succeeded, Blocked not yet returned). push() would
-        // refuse and drop the wake.
+        // Do not mark_wait or force_push while the owner is still
+        // ST_RUNNING. mark_wait clears the bit (false ghost). force_push
+        // lets a second worker enter the same result slot (335 SEGV).
+        // add_dependency already set Aborting before Blocked returns, so
+        // "not Executing" is not proof the worker left. Put the wake back
+        // after this drain; the owner's post-return drain applies it.
+        if runnable.is_running(t) {
+            still_executing.push(t);
+            continue;
+        }
         if specfence.ready_edges.leftover_surplus(t)
             || (specfence.ready_edges.is_gated(t) && !specfence.ready_edges.may_execute(t))
         {
-            runnable.mark_wait(t);
+            runnable.note_wait_unless_running(t);
             continue;
         }
         let kind = if specfence.ready_edges.is_gated(t) {
@@ -373,7 +381,12 @@ fn drain_wave(specfence: SpecFenceCtx<'_>, scheduler: &Scheduler, runnable: &Run
         } else {
             super::runnable_set::QueueKind::Indep
         };
-        runnable.force_push(t, kind);
+        if !runnable.wake_idle(t, kind) && runnable.is_running(t) {
+            still_executing.push(t);
+        }
+    }
+    for t in still_executing {
+        specfence.wave.push_ready(t);
     }
 }
 

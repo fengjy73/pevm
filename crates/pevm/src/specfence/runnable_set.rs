@@ -173,8 +173,8 @@ impl RunnableSet {
         self.q(kind).push_local(tx);
     }
 
-    /// Owner / heal requeue: reclaim RUNNING (this worker released) or DONE
-    /// (higher-reader revalidate). Never used to steal an in-flight execute.
+    /// Owner requeue: this worker is done with the claim (failed pick or
+    /// validate requeue). Swaps `ST_RUNNING` onto the queue.
     #[inline]
     pub(crate) fn force_push(&self, tx: TxIdx, kind: QueueKind) {
         if tx >= self.block_size {
@@ -188,6 +188,50 @@ impl RunnableSet {
         self.q(kind).push_local(tx);
     }
 
+    /// Heal / drain wake. Does not take `ST_RUNNING`: that claim is an
+    /// in-flight execute, and swapping it lets a second worker enter the
+    /// same result slot (6196166 double free, 3356896 SEGV).
+    #[inline]
+    pub(crate) fn wake_idle(&self, tx: TxIdx, kind: QueueKind) -> bool {
+        if tx >= self.block_size {
+            return false;
+        }
+        let tag = kind.tag();
+        let prev = self.state[tx].load(Ordering::Acquire);
+        // `ST_DONE` is a finished claim, not an in-flight execute. Higher
+        // readers and rewind requeues must still land (335 n_unf stuck,
+        // has_unfinished false). Only `ST_RUNNING` is a live slot.
+        if prev == ST_RUNNING {
+            return false;
+        }
+        if prev == tag {
+            return true;
+        }
+        if self.state[tx]
+            .compare_exchange(prev, tag, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return false;
+        }
+        self.q(kind).push_local(tx);
+        true
+    }
+
+    /// Picker lost `try_execute`. Release only this claim — a plain
+    /// `mark_wait` store clobbers a live owner if the bit was stolen.
+    #[inline]
+    pub(crate) fn release_running(&self, tx: TxIdx) {
+        if tx >= self.block_size {
+            return;
+        }
+        let _ = self.state[tx].compare_exchange(
+            ST_RUNNING,
+            ST_WAIT,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+    }
+
     #[inline]
     pub(crate) fn mark_wait(&self, tx: TxIdx) {
         if tx < self.block_size {
@@ -196,6 +240,21 @@ impl RunnableSet {
                 self.state[tx].store(ST_WAIT, Ordering::Release);
             }
         }
+    }
+
+    /// Wave refuse while the owner may still be inside `try_execute_sf`.
+    /// `mark_wait` would clear `ST_RUNNING` and heal would treat a live
+    /// execute as a ghost (`recover_executing` → second entry, heap abort).
+    #[inline]
+    pub(crate) fn note_wait_unless_running(&self, tx: TxIdx) {
+        if tx >= self.block_size {
+            return;
+        }
+        let prev = self.state[tx].load(Ordering::Acquire);
+        if prev == ST_DONE || prev == ST_RUNNING {
+            return;
+        }
+        let _ = self.state[tx].compare_exchange(prev, ST_WAIT, Ordering::AcqRel, Ordering::Relaxed);
     }
 
     #[inline]
@@ -339,12 +398,22 @@ impl RunnableSet {
         scheduler: &Scheduler,
     ) -> bool {
         if let Some(b) = scheduler.live_block(tx) {
-            if b < self.block_size && self.state[b].load(Ordering::Acquire) != ST_RUNNING {
-                if scheduler.is_ready(b) || scheduler.is_executed(b) {
+            let idle = b < self.block_size && self.state[b].load(Ordering::Acquire) != ST_RUNNING;
+            // Claim already moved past this writer and its worker is gone.
+            // Drop the park and recover the waiter once. Execute will not
+            // `add_dependency` on `leftover_passed`, so this is not a mill.
+            // Do not `recover_executing` the writer (335/619 SEGV). The
+            // waiter must also have left: recovering `ST_RUNNING` lets
+            // `force_push` start a second execute on the same slot.
+            let waiter_idle = self.state[tx].load(Ordering::Acquire) != ST_RUNNING;
+            if idle && waiter_idle && ready.leftover_passed(b) {
+                scheduler.clear_stale_block(tx, b);
+            } else {
+                if idle && (scheduler.is_ready(b) || scheduler.is_executed(b)) {
                     self.requeue_ready(b, ready);
                 }
+                return false;
             }
-            return false;
         }
         scheduler.recover_aborting(tx)
     }
@@ -353,24 +422,25 @@ impl RunnableSet {
         // Gated !may_execute on a queue is the 19807137 refuse mill:
         // pick mark_waits, heal force_pushes, pending stays ~60, idle
         // ungate never runs.
+        let st = self.state[tx].load(Ordering::Acquire);
+        if st == ST_RUNNING {
+            return;
+        }
         if ready.leftover_min_on_skippable_gate(tx) {
-            let st = self.state[tx].load(Ordering::Acquire);
-            if st != ST_RUNNING && st != ST_DONE {
-                self.force_push(tx, QueueKind::Indep);
-            }
+            let _ = self.wake_idle(tx, QueueKind::Indep);
             return;
         }
         if ready.leftover_surplus(tx) || (ready.is_gated(tx) && !ready.may_execute(tx)) {
-            self.mark_wait(tx);
+            self.note_wait_unless_running(tx);
             return;
         }
         // Never Q_ordered from heal: 19807137 mills ~40 OrderedTip heads
         // even when only location-admitted txs are pushed (8148ded).
         // Released/Indep + plant waits; FullReplay stays off Ordered.
         if ready.is_gated(tx) {
-            self.force_push(tx, QueueKind::Released);
+            let _ = self.wake_idle(tx, QueueKind::Released);
         } else {
-            self.force_push(tx, QueueKind::Indep);
+            let _ = self.wake_idle(tx, QueueKind::Indep);
         }
     }
 
@@ -406,8 +476,9 @@ impl RunnableSet {
                 let _ = scheduler.recover_executing_waiter(tx);
             }
             if scheduler.is_executed(tx) {
-                self.force_push(tx, QueueKind::Revalidate);
-                n += 1;
+                if self.wake_idle(tx, QueueKind::Revalidate) {
+                    n += 1;
+                }
             } else if scheduler.is_ready(tx) {
                 self.requeue_ready(tx, ready);
                 n += 1;
@@ -448,8 +519,9 @@ impl RunnableSet {
                 continue;
             }
             if scheduler.is_executed(tx) {
-                self.force_push(tx, QueueKind::Revalidate);
-                n += 1;
+                if self.wake_idle(tx, QueueKind::Revalidate) {
+                    n += 1;
+                }
                 continue;
             }
             if scheduler.is_ready(tx)
@@ -539,6 +611,12 @@ impl RunnableSet {
         for tx in 0..self.block_size {
             let st = self.state[tx].load(Ordering::Acquire);
             if st == ST_DONE {
+                if scheduler.is_executed(tx) && self.wake_idle(tx, QueueKind::Revalidate) {
+                    n += 1;
+                } else if scheduler.is_ready(tx) {
+                    self.requeue_ready(tx, ready);
+                    n += 1;
+                }
                 continue;
             }
             if ready.leftover_surplus(tx) {
@@ -621,9 +699,18 @@ impl RunnableSet {
                 if (scheduler.is_executed(tx) || scheduler.is_validated(tx))
                     && self.q_revalidate.len() == 0
                 {
-                    self.state[tx].store(ST_NONE, Ordering::Release);
-                    self.force_push(tx, QueueKind::Revalidate);
-                    n += 1;
+                    if self.state[tx]
+                        .compare_exchange(
+                            ST_REVALIDATE,
+                            ST_NONE,
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                        && self.wake_idle(tx, QueueKind::Revalidate)
+                    {
+                        n += 1;
+                    }
                 } else if scheduler.is_ready(tx) {
                     self.requeue_ready(tx, ready);
                     n += 1;
@@ -631,8 +718,9 @@ impl RunnableSet {
                 continue;
             }
             if scheduler.is_executed(tx) {
-                self.force_push(tx, QueueKind::Revalidate);
-                n += 1;
+                if self.wake_idle(tx, QueueKind::Revalidate) {
+                    n += 1;
+                }
                 continue;
             }
             if !scheduler.is_ready(tx) {
@@ -655,7 +743,7 @@ impl RunnableSet {
                 }
                 continue;
             }
-            if st == ST_NONE || st == ST_WAIT || st == ST_RUNNING {
+            if st == ST_NONE || st == ST_WAIT {
                 self.requeue_ready(tx, ready);
                 n += 1;
             }
@@ -674,8 +762,9 @@ impl RunnableSet {
                         let _ = scheduler.recover_executing_waiter(next);
                     }
                     if scheduler.is_executed(next) {
-                        self.force_push(next, QueueKind::Revalidate);
-                        n += 1;
+                        if self.wake_idle(next, QueueKind::Revalidate) {
+                            n += 1;
+                        }
                     } else if scheduler.is_ready(next) {
                         self.requeue_ready(next, ready);
                         n += 1;
@@ -706,8 +795,9 @@ impl RunnableSet {
                         n += 1;
                     }
                 } else if scheduler.is_executed(tx) {
-                    self.force_push(tx, QueueKind::Revalidate);
-                    n += 1;
+                    if self.wake_idle(tx, QueueKind::Revalidate) {
+                        n += 1;
+                    }
                 } else if scheduler.is_ready(tx)
                     && (ready.may_execute(tx) || ready.leftover_min_on_skippable_gate(tx))
                 {

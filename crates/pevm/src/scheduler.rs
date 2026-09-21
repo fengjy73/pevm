@@ -682,6 +682,22 @@ impl Scheduler {
         self.blocked_on[tx_idx].store(usize::MAX, Ordering::Release);
     }
 
+    /// Drop a scheduler park. Used when the writer is `leftover_passed`
+    /// and not inside execute — the claim already committed, so the
+    /// waiter must not stay `Aborting` on it.
+    pub(crate) fn clear_stale_block(&self, waiter: TxIdx, writer: TxIdx) {
+        if waiter >= self.block_size {
+            return;
+        }
+        let cur = self.blocked_on[waiter].load(Ordering::Acquire);
+        if cur == writer {
+            self.blocked_on[waiter].store(usize::MAX, Ordering::Release);
+        }
+        if writer < self.block_size {
+            let _ = self.detach_dependent(writer, waiter);
+        }
+    }
+
     /// Writer still owed by an `Aborting` park. `None` once that writer is
     /// `Executed`/`Validated` or the park was cleared.
     #[inline]

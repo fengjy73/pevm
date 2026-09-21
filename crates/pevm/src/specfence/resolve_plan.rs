@@ -402,13 +402,19 @@ fn release_successors(ctx: &ApplyCtx<'_>, producer: crate::TxIdx) {
 }
 
 fn drain_wave_to_runnable(ctx: &ApplyCtx<'_>) {
+    let mut still_running = Vec::new();
     while let Some(t) = ctx.specfence.wave.pop_ready() {
         if ctx.scheduler.is_validated(t) {
             ctx.runnable.mark_done(t);
             continue;
         }
+        // Same rule as the worker drain: do not steal `ST_RUNNING`.
+        if ctx.runnable.is_running(t) {
+            still_running.push(t);
+            continue;
+        }
         if ctx.specfence.ready_edges.is_gated(t) && !ctx.specfence.ready_edges.may_execute(t) {
-            ctx.runnable.mark_wait(t);
+            ctx.runnable.note_wait_unless_running(t);
             continue;
         }
         let kind = if ctx.specfence.ready_edges.is_gated(t) {
@@ -416,7 +422,12 @@ fn drain_wave_to_runnable(ctx: &ApplyCtx<'_>) {
         } else {
             QueueKind::Indep
         };
-        ctx.runnable.force_push(t, kind);
+        if !ctx.runnable.wake_idle(t, kind) && ctx.runnable.is_running(t) {
+            still_running.push(t);
+        }
+    }
+    for t in still_running {
+        ctx.specfence.wave.push_ready(t);
     }
 }
 
@@ -439,7 +450,7 @@ fn enqueue_revalidate(ctx: &ApplyCtx<'_>, reader: crate::TxIdx) {
     // Demote before the worker loop samples all_validated, otherwise the
     // last Commit exits every core and the revalidate never runs.
     let _ = ctx.scheduler.prepare_revalidate(reader);
-    ctx.runnable.force_push(reader, QueueKind::Revalidate);
+    let _ = ctx.runnable.wake_idle(reader, QueueKind::Revalidate);
 }
 
 fn enqueue_higher_revalidate(ctx: &ApplyCtx<'_>, tx: crate::TxIdx) {
