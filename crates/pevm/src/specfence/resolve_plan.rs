@@ -214,20 +214,33 @@ fn plant_observed_waw(ctx: &ApplyCtx<'_>, f: &super::collateral::FirstConflict) 
     {
         return;
     }
-    ctx.specfence
-        .ready_edges
-        .note_consumer_on(tx, producer, Some(f.location));
-    // Sliding window: this abort must wait (stop ping-pong) but a fat
-    // token/storage fan must not serialize the block. Evict oldest.
     let w_max = ArmTable::w_max(ctx.scheduler.block_size(), 0, false) as usize;
-    for c in ctx
+    let queued = ctx.specfence.ready_edges.consumer_count_on(f.location);
+    if queued < w_max {
+        ctx.specfence
+            .ready_edges
+            .note_consumer_on(tx, producer, Some(f.location));
+        return;
+    }
+    // At w_max: fan-in to the window tip with an anonymous edge.
+    // Evict-to-Opt was a ~390% mill (19469101) — leftover writers
+    // re-FullReplay'd the same ℓ forever.
+    let tip = ctx
         .specfence
         .ready_edges
-        .evict_surplus_waiters(f.location, tx, w_max)
+        .consumers_queued_on(f.location)
+        .into_iter()
+        .rev()
+        .find(|&c| c < tx && !ctx.specfence.ready_edges.is_writer_done(c));
+    let pred = tip.unwrap_or(producer);
+    if ctx
+        .specfence
+        .ready_edges
+        .should_plant_observed_waw(tx, pred)
     {
-        if !ctx.scheduler.is_validated(c) {
-            ctx.runnable.force_push(c, QueueKind::Indep);
-        }
+        ctx.specfence
+            .ready_edges
+            .note_consumer_on(tx, pred, None);
     }
 }
 

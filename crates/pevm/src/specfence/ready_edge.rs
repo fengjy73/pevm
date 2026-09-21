@@ -1368,4 +1368,20 @@ mod tests {
         assert!(!t.may_execute(5));
         assert!(!t.may_execute(7));
     }
+
+    #[test]
+    fn anonymous_fan_in_does_not_grow_loc_wait_set() {
+        let t = ReadyEdgeTable::new();
+        t.note_consumer_on(3, 0, Some(0xabc));
+        t.note_consumer_on(5, 1, Some(0xabc));
+        assert_eq!(t.consumer_count_on(0xabc), 2);
+        t.note_consumer_on(7, 5, None);
+        assert_eq!(
+            t.consumer_count_on(0xabc),
+            2,
+            "anonymous fan-in must not grow loc wait-set"
+        );
+        assert!(!t.may_execute(7));
+        assert_eq!(t.blocking_producer(7), Some(5));
+    }
 }
