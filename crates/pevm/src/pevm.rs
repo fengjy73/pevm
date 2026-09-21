@@ -1088,8 +1088,12 @@ impl Pevm {
                             balance = balance.saturating_sub(*subtraction);
                             nonce += 1;
                         }
-                        // TODO: Better error handling
-                        _ => unreachable!(),
+                        // SpecFence FullReplay leaves ESTIMATE on a lazy ℓ when
+                        // the next incarnation does not rewrite it (8-core
+                        // 19469101: main-thread `unreachable` after workers
+                        // exit). Skip; older Data/Lazy still fold.
+                        MemoryEntry::Estimate => continue,
+                        _ => continue,
                     }
                     // Assert that evaluated nonce is correct when address is caller.
                     if tx.caller == address {

@@ -327,6 +327,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if !self.specfence.scheduler.is_validated(w_idx) {
             return None;
         }
+        let _nest = crate::mv_memory::DataNest::enter("try_ff_storage");
         let written = self.mv_memory.data.get(&location_hash)?;
         let MemoryEntry::Data(inc, MemoryValue::Storage(cur_v)) = written.get(&w_idx)? else {
             return None;
@@ -388,6 +389,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if !self.specfence.scheduler.is_validated(w_idx) {
             return None;
         }
+        let _nest = crate::mv_memory::DataNest::enter("try_ff_basic");
         let written = self.mv_memory.data.get(&location_hash)?;
         let MemoryEntry::Data(inc, MemoryValue::Basic(cur_b)) = written.get(&w_idx)? else {
             return None;
@@ -1539,12 +1541,15 @@ impl<'a, S: Storage> VmDb<'a, S> {
         // Try to read the latest code hash in [MvMemory]
         // TODO: Memoize read locations (expected to be small) here in [Vm] to avoid
         // contention in [MvMemory]
-        let closest = self.mv_memory.data.get(&location_hash).and_then(|written| {
-            written
-                .range(..self.tx_idx)
-                .next_back()
-                .map(|(idx, e)| (*idx, e.clone()))
-        });
+        let closest = {
+            let _nest = crate::mv_memory::DataNest::enter("get_code_hash");
+            self.mv_memory.data.get(&location_hash).and_then(|written| {
+                written
+                    .range(..self.tx_idx)
+                    .next_back()
+                    .map(|(idx, e)| (*idx, e.clone()))
+            })
+        };
         if let Some((tx_idx, MemoryEntry::Data(tx_incarnation, value))) = closest {
             if self
                 .mv_memory
@@ -1667,6 +1672,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
         // Snapshot then drop the DashMap guard before any other `data.get`
         // (same-shard re-entry corrupts the heap — 19807137).
         let history: Vec<(TxIdx, MemoryEntry)> = if self.tx_idx > 0 {
+            let _nest = crate::mv_memory::DataNest::enter("basic.history");
             self.mv_memory
                 .data
                 .get(&location_hash)
@@ -2019,6 +2025,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
             BadType,
         }
         let tip = if self.tx_idx > 0 {
+            let _nest = crate::mv_memory::DataNest::enter("storage.tip");
             self.mv_memory.data.get(&location_hash).and_then(|written| {
                 let (idx, entry) = written.range(..self.tx_idx).next_back()?;
                 match entry {
