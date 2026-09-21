@@ -789,11 +789,9 @@ impl ReadyEdgeTable {
         {
             return false;
         }
-        // Window: only wait on a producer that can run. A pred that is
-        // itself waiting would serialize ERC-20 / 19469101.
-        if self.is_gated(producer) && !self.may_execute(producer) {
-            return false;
-        }
+        // Always plant if the producer is unfinished. Skipping when the
+        // pred is itself waiting left leftover Opt writers ping-ponging
+        // (~390% on 19469101). Depth is capped by w_max + anonymous fan-in.
         true
     }
 
@@ -1344,13 +1342,13 @@ mod tests {
     }
 
     #[test]
-    fn plant_observed_waw_skips_when_producer_itself_waiting() {
+    fn plant_observed_waw_still_plants_when_producer_waiting() {
         let t = ReadyEdgeTable::new();
         t.note_consumer_on(5, 1, Some(0x32be));
         assert!(!t.may_execute(5));
         assert!(
-            !t.should_plant_observed_waw(8, 5),
-            "must not deepen a spine behind a blocked producer"
+            t.should_plant_observed_waw(8, 5),
+            "must plant leftover Opt writers even if pred is waiting"
         );
     }
 
