@@ -142,7 +142,14 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
             ctx.scheduler
                 .finish_validation_sf(ctx.tx_version, true, Some(tx + 1));
             ctx.specfence.ready_edges.clear_started(tx);
-            requeue(&ctx, tx, QueueKind::Ordered);
+            if ctx.specfence.ready_edges.is_gated(tx) && !ctx.specfence.ready_edges.may_execute(tx)
+            {
+                ctx.runnable.mark_wait(tx);
+            } else if ctx.specfence.ready_edges.is_gated(tx) || ctx.vis.needs_fence() {
+                requeue(&ctx, tx, QueueKind::Released);
+            } else {
+                requeue(&ctx, tx, QueueKind::Indep);
+            }
             enqueue_higher_revalidate(&ctx, tx);
         }
         ResolvePlan::FullReplay => {
@@ -308,6 +315,7 @@ fn seed_short_edge(
 
 fn abort_and_estimate(ctx: &ApplyCtx<'_>) {
     let tx = ctx.tx_version.tx_idx;
+    ctx.specfence.ready_edges.note_abort_reincarnate(tx);
     let aborted = ctx.scheduler.try_validation_abort(ctx.tx_version);
     if aborted {
         ctx.mv_memory.convert_writes_to_estimates(tx);
@@ -359,12 +367,9 @@ fn clear_retry(specfence: SpecFenceCtx<'_>, tx: crate::TxIdx) {
 }
 
 fn release_successors(ctx: &ApplyCtx<'_>, producer: crate::TxIdx) {
-    ctx.specfence.ready_edges.note_producer_done_stamp(producer);
-    if ctx.specfence.ready_edges.has_known_waiters(producer) {
-        ctx.specfence
-            .ready_edges
-            .note_producer_done(producer, ctx.specfence.wave);
-    }
+    ctx.specfence
+        .ready_edges
+        .note_producer_done(producer, ctx.specfence.wave);
     ctx.specfence.producer_stages.note_done(producer);
     drain_wave_to_runnable(ctx);
     // IntraPatch at the release boundary (same rule as pick): ≤1 / ℓ / block.
