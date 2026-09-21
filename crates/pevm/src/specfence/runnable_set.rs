@@ -357,9 +357,13 @@ impl RunnableSet {
         if (0..self.block_size).any(|t| self.state[t].load(Ordering::Acquire) == ST_RUNNING) {
             return 0;
         }
-        // Unfinished producers (incl. Aborting leftovers) stay live.
-        // Ungating their waiters into Q_indep is the incarnation++ mill.
-        let freed = ready.collapse_false_gates(|w| !scheduler.is_done(w));
+        // True idle only: a producer is live iff a worker still owns it.
+        // Heal (pending>0) must not ungate Aborting parks — that mills —
+        // but here queues are empty and nobody is ST_RUNNING, so leftover
+        // Detect waiters of a Ready/Aborting ghost must be freed (19469101).
+        let freed = ready.collapse_false_gates(|w| {
+            scheduler.is_executing(w) && self.state[w].load(Ordering::Acquire) == ST_RUNNING
+        });
         let mut n = 0;
         for tx in freed {
             if scheduler.is_aborting(tx) {
@@ -395,7 +399,7 @@ impl RunnableSet {
                 n += 1;
                 continue;
             }
-            if scheduler.is_ready(tx) && ready.may_execute(tx) {
+            if scheduler.is_ready(tx) && (ready.may_execute(tx) || ready.has_known_waiters(tx)) {
                 self.requeue_ready(tx, ready);
                 n += 1;
             }
@@ -877,6 +881,26 @@ mod tests {
             panic!("expected execute");
         };
         assert_eq!(tx, 4, "must skip gated !may_execute head 1");
+    }
+
+    #[test]
+    fn force_idle_recovers_waiter_of_ghost_ready_producer() {
+        let ready = ReadyEdgeTable::new();
+        let sched = Scheduler::new(4);
+        let r = RunnableSet::new(4, 1);
+        let _v0 = sched.try_execute_producer(0).unwrap();
+        // 0 stays Ready after a fake abort-ready; Detect still names it.
+        sched.recover_executing_waiter(0);
+        ready.note_consumer_on(2, 0, None);
+        r.mark_wait(2);
+        assert_eq!(r.pending_work(), 0);
+        assert!(!ready.may_execute(2));
+        let n = r.force_idle_recover(&ready, &sched);
+        assert!(
+            n >= 1,
+            "idle must free waiter of non-running producer, n={n}"
+        );
+        assert!(r.pending_work() > 0 || ready.may_execute(2) || sched.is_ready(0));
     }
 
     #[test]
