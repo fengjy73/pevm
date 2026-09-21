@@ -31,7 +31,18 @@ pub(crate) fn run_sf_block<F, V>(
     V: FnMut(&TxVersion, VisibilityPolicy) -> (super::ResolvePlan, Vec<crate::MemoryLocationHash>),
 {
     let metrics = specfence.metrics;
+    let mut spins = 0u64;
     loop {
+        spins += 1;
+        if spins.is_multiple_of(8_000) && std::env::var_os("SPECFENCE_HANG_TRACE").is_some() {
+            eprintln!(
+                "sf-hang-trace spins={spins} pending={} unfinished={} validated={} gated={}",
+                runnable.pending_work(),
+                scheduler.has_unfinished(),
+                scheduler.all_validated(),
+                specfence.ready_edges.has_any_gated(),
+            );
+        }
         if abort() {
             break;
         }
@@ -112,9 +123,7 @@ pub(crate) fn run_sf_block<F, V>(
                 specfence
                     .ready_edges
                     .heal_finished_preds(|w| scheduler.is_done(w));
-                let _ = specfence
-                    .ready_edges
-                    .wake_ready_sleepers(specfence.wave);
+                let _ = specfence.ready_edges.wake_ready_sleepers(specfence.wave);
                 let _ = runnable.heal(specfence.ready_edges, scheduler);
                 drain_wave(specfence, scheduler, runnable);
                 if scheduler.all_validated() && runnable.pending_work() == 0 {

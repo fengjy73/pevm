@@ -26,9 +26,8 @@ use crate::{
         AccessDecision, AccessMode, AccessVis, CheckpointKind, DecisionFeat, DecisionVerb, EdgeKey,
         EdgeKind, EdgeState, FfValue, OrderedAdmitSnapMode, ProcessReason, SpecFenceCtx,
         StorageWriteReplay, VisibilityPolicy, absolute_jump_eligible, arm_call_outcome_cache,
-        arm_ff_origin_seeds,
-        attach_current_live_snap, early_val_probability, jump_is_safe, jump_refuse_reason,
-        note_pending_effect_boundary, note_pending_ordered_admit_snap,
+        arm_ff_origin_seeds, attach_current_live_snap, early_val_probability, jump_is_safe,
+        jump_refuse_reason, note_pending_effect_boundary, note_pending_ordered_admit_snap,
         ordered_admit_snap_jump_enabled, ordered_admit_snap_mode, resume_was_applied,
         steps_this_run, suffix_repair_jump_env_ok, take_ff_origin_seeds,
         try_arm_safe_absolute_jump, try_arm_safe_absolute_jump_gated, with_ordered_admit_snap_tls,
@@ -1659,6 +1658,11 @@ impl<S: Storage> Database for VmDb<'_, S> {
         // The sign of [balance_addition] since it can be negative for lazy senders.
         let mut positive_addition = true;
         let mut nonce_addition = 0;
+        // WaitReleased may skip an Estimate tip to find older Data. If none
+        // exists, falling through to pre-state + LackOfFund/NonceTooHigh
+        // Blocking(tx-1) livelocks when tx-1 is already Validated (19469101
+        // 1-core: hang-trace silent, 100% CPU inside try_execute_sf).
+        let mut skipped_live_estimate: Option<TxIdx> = None;
 
         // Snapshot then drop the DashMap guard before any other `data.get`
         // (same-shard re-entry corrupts the heap — 19807137).
@@ -1699,6 +1703,10 @@ impl<S: Storage> Database for VmDb<'_, S> {
                                 // here — DashMap is not reentrant under this `get`.
                                 self.specfence.metrics.record_sf_mv_read(self.vis);
                             }
+                            if !self.specfence.scheduler.is_done(*blocking_idx) {
+                                skipped_live_estimate =
+                                    skipped_live_estimate.or(Some(*blocking_idx));
+                            }
                             continue;
                         }
                         if resolve {
@@ -1720,6 +1728,10 @@ impl<S: Storage> Database for VmDb<'_, S> {
                                 && nonce_addition == 0
                             {
                                 self.specfence.metrics.record_optimistic_read();
+                                if !self.specfence.scheduler.is_done(*closest_idx) {
+                                    skipped_live_estimate =
+                                        skipped_live_estimate.or(Some(*closest_idx));
+                                }
                                 continue;
                             }
                             if resolve {
@@ -1783,6 +1795,15 @@ impl<S: Storage> Database for VmDb<'_, S> {
 
         // Fall back to storage
         if final_account.is_none() {
+            if let Some(w) = skipped_live_estimate {
+                if resolve {
+                    self.promote_on_conflict(address, location_hash);
+                    self.note_sf_mv_read();
+                } else {
+                    self.note_unpublished_raw(location_hash, w);
+                }
+                return Err(self.park_estimate_blocking(location_hash, w));
+            }
             self.specfence.metrics.record_db_heavy_op();
             // Populate [Storage] on the first read
             if !has_prev_origins {
@@ -2099,8 +2120,14 @@ impl<S: Storage> Database for VmDb<'_, S> {
                         return Ok(v2);
                     }
                     if estimate {
-                        // No prior Data: fall through to storage (not BlockingOther).
+                        // No prior Data. A live Estimate writer is unpublished —
+                        // do not read pre-state (LackOfFund/NonceTooHigh then
+                        // Blocking(tx-1) livelocks when tx-1 is already done).
                         self.specfence.metrics.record_optimistic_read();
+                        if !self.specfence.scheduler.is_done(closest_idx) {
+                            self.promote_on_conflict(address, location_hash);
+                            return Err(self.park_estimate_blocking(location_hash, closest_idx));
+                        }
                     } else {
                         self.promote_on_conflict(address, location_hash);
                         return Err(self.park_estimate_blocking(location_hash, closest_idx));

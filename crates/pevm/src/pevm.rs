@@ -603,21 +603,12 @@ impl Pevm {
                             || self.abort_reason.get().is_some(),
                             |tx_version, vis| {
                                 self.try_execute_sf(
-                                    &mut vm,
-                                    &scheduler,
-                                    tx_version,
-                                    vis,
-                                    wave_ref,
-                                    &dag,
+                                    &mut vm, &scheduler, tx_version, vis, wave_ref, &dag,
                                 )
                             },
                             |tx_version, vis| {
                                 crate::specfence::validate_to_plan(
-                                    &mv_memory,
-                                    &scheduler,
-                                    tx_version,
-                                    specfence,
-                                    vis,
+                                    &mv_memory, &scheduler, tx_version, specfence, vis,
                                 )
                             },
                         );
@@ -674,9 +665,8 @@ impl Pevm {
                                 sched_t0 = profile.then(Instant::now);
                                 task = crate::specfence::next_occ_task(&scheduler);
                                 if let Some(t0) = sched_t0 {
-                                    metrics_inner.add_profile_scheduler_ns(
-                                        t0.elapsed().as_nanos() as u64,
-                                    );
+                                    metrics_inner
+                                        .add_profile_scheduler_ns(t0.elapsed().as_nanos() as u64);
                                 }
                             }
                         }
@@ -1291,11 +1281,20 @@ impl Pevm {
         dag: &crate::specfence::SpecDag,
     ) -> SfExec {
         let _ = vis;
+        // LackOfFund / NonceTooHigh / stale-Estimate Blocking on an already
+        // Executed|Validated pred makes add_dependency return false and the
+        // OCC-style `continue` re-enters execute forever (19469101 1-core:
+        // worker hang-trace never fires). Cap the same-thread retry.
+        let mut retry_n = 0u32;
         loop {
+            if retry_n > 16 {
+                return SfExec::Blocked;
+            }
             if let Some((blocking_tx_idx, address)) = vm.hinted_wait_blocker(tx_version.tx_idx) {
                 if !scheduler.add_dependency(tx_version.tx_idx, blocking_tx_idx)
                     && self.abort_reason.get().is_none()
                 {
+                    retry_n += 1;
                     continue;
                 }
                 vm.record_wait_admission(address);
@@ -1305,8 +1304,10 @@ impl Pevm {
                 vm.try_apply_park_resume(tx_version.tx_idx, wave);
             }
             let exec_t0 = (tx_version.tx_incarnation > 0).then(Instant::now);
-            return match vm.execute(&tx_version, self.execution_results.slot_mut(tx_version.tx_idx))
-            {
+            return match vm.execute(
+                &tx_version,
+                self.execution_results.slot_mut(tx_version.tx_idx),
+            ) {
                 Ok(flags) => {
                     if let Some(t0) = exec_t0 {
                         vm.note_hot_reexec_ns(tx_version.tx_idx, t0.elapsed().as_nanos() as u64);
@@ -1314,15 +1315,13 @@ impl Pevm {
                     let wrote_new_location =
                         flags.contains(crate::FinishExecFlags::WroteNewLocation);
                     let fence = crate::specfence::fence_for_mode(ConcurrencyMode::SpecFence, dag);
-                    let _ = scheduler.finish_execution_with_wave_fence(
-                        tx_version, flags, wave, fence,
-                    );
-                    SfExec::Executed {
-                        wrote_new_location,
-                    }
+                    let _ =
+                        scheduler.finish_execution_with_wave_fence(tx_version, flags, wave, fence);
+                    SfExec::Executed { wrote_new_location }
                 }
                 Err(VmExecutionError::Retry) => {
                     if self.abort_reason.get().is_none() {
+                        retry_n += 1;
                         continue;
                     }
                     SfExec::Fatal
@@ -1344,6 +1343,7 @@ impl Pevm {
                         scheduler.add_dependency(tx_version.tx_idx, blocking_tx_idx)
                     };
                     if !parked && self.abort_reason.get().is_none() {
+                        retry_n += 1;
                         continue;
                     }
                     // Soft=0: do not park the worker; pick another runnable.
