@@ -723,7 +723,6 @@ impl ReadyEdgeTable {
             if next != NONE {
                 self.global_leftover_chain.store(next, Ordering::Relaxed);
             }
-            self.flush_leftover_min_passed_pred();
             next
         } else {
             NONE
@@ -1286,10 +1285,8 @@ impl ReadyEdgeTable {
         );
         if next != NONE {
             self.global_leftover_chain.store(next, Ordering::Relaxed);
-            self.flush_leftover_min_passed_pred();
             Some(next)
         } else {
-            self.flush_leftover_min_passed_pred();
             None
         }
     }
