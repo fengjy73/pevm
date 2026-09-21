@@ -787,13 +787,6 @@ impl ReadyEdgeTable {
         if self.leftover_surplus(tx_idx) {
             return false;
         }
-        // leftover_min is the claim token. Detect-gating it on an unfinished
-        // surplus / tx-1 leftover deadlocked 19807137 (glob_min=448 Ready,
-        // pred=447, n_unf=268, then SIGSEGV mill). leftover_min must execute
-        // (WaitReleased + commit-on-done-writer). Not OCC pick.
-        if self.is_live_leftover_min(tx_idx) {
-            return true;
-        }
         if !self.is_gated(tx_idx) {
             return true;
         }
@@ -2094,19 +2087,6 @@ mod tests {
             "next leftover_min executes after the claim head commits"
         );
         assert!(t.leftover_surplus(60));
-    }
-
-    #[test]
-    fn leftover_min_may_execute_even_when_detect_gated() {
-        let t = ReadyEdgeTable::new();
-        assert!(!t.plant_global_leftover(20));
-        t.note_consumer_on(20, 10, None);
-        assert!(!t.is_writer_done(10), "pred 10 is still live");
-        assert!(
-            t.may_execute(20),
-            "leftover_min claim token must execute even if Detect names a live pred"
-        );
-        assert!(t.is_gated(20));
     }
 
     #[test]
