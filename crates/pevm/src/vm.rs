@@ -1901,9 +1901,10 @@ impl<S: Storage> Database for VmDb<'_, S> {
                     // leftover_min must commit on a done prefix. Blocking(tx-1)
                     // parks fail, leftover_min stays Executing, heal mills
                     // (19807137 leftover_min=514 n_unf=198).
-                } else if self.tx_idx > 0 && !pred_done {
-                    // TODO: Better retry strategy -- immediately, to the
-                    // closest sender tx, to the missing sender tx, etc.
+                } else if self.tx_idx > 0 {
+                    // Non-leftover still Blocks on tx-1 even when pred is
+                    // done (OCC). `!pred_done` here made tx 120 InvalidNonce
+                    // abort 19807137 first-SF.
                     self.promote_on_conflict(address, location_hash);
                     return Err(ReadError::Blocking(self.tx_idx - 1));
                 } else {
