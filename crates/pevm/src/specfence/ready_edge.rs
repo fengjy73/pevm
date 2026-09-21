@@ -7,8 +7,8 @@
 //!
 //! Ungated / A0-majority txs use an OCC-class `may_execute` (bitset; no DashMap).
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use dashmap::{DashMap, DashSet};
@@ -24,10 +24,6 @@ const GATED_WORDS: usize = 64;
 /// Cap the skip-sleeping set. Dual-path fetch_max must not park a
 /// thousands-wide RAW fan into an O(n) wake scan (ERC-20 livelock).
 const SLEEP_CAP: usize = 64;
-/// Concurrent leftover tips. Width 1 serialized 19807137 onto leftover_min=405
-/// (`n_run=1`, `n_unf=307`). Surplus chain onto a live tip `< consumer`,
-/// never star on leftover_min (that parks leftover_min on its own waiters).
-const LEFTOVER_W: usize = 8;
 
 /// `(consumer_t) ← producer_t` on PE / RAW class.
 #[derive(Debug)]
@@ -86,10 +82,6 @@ pub(crate) struct ReadyEdgeTable {
     /// tips milled each other (`live_wait=false`, pending≈23).
     global_leftover_min: AtomicUsize,
     global_leftover_chain: AtomicUsize,
-    /// Live leftover tips. Width 1 serialized 19807137 onto leftover_min=405
-    /// (`n_run=1`, `n_unf=307`). Cap at [`LEFTOVER_W`].
-    leftover_n: AtomicUsize,
-    leftover_ids: [AtomicUsize; LEFTOVER_W],
     /// Ordered-admit gated txs. Marked **before** the consumer map insert so
     /// an ungated steal cannot race past a newly created wait-for edge.
     gated_bits: [AtomicU64; GATED_WORDS],
@@ -137,8 +129,6 @@ impl Default for ReadyEdgeTable {
             leftover_min: DashMap::default(),
             global_leftover_min: AtomicUsize::new(NONE),
             global_leftover_chain: AtomicUsize::new(NONE),
-            leftover_n: AtomicUsize::new(0),
-            leftover_ids: std::array::from_fn(|_| AtomicUsize::new(NONE)),
             gated_bits: std::array::from_fn(|_| AtomicU64::new(0)),
             gated_n: AtomicUsize::new(0),
             pending_gated: AtomicUsize::new(0),
@@ -513,10 +503,6 @@ impl ReadyEdgeTable {
         if was_done && self.is_gated(writer) {
             self.pending_gated.fetch_add(1, Ordering::Relaxed);
         }
-        // FullReplay kept leftover_n at 8 forever (19807137 leftover_w=8
-        // n_unf=190 hang). The slot is only live while this incarnation
-        // may still Commit.
-        self.clear_leftover_slot(writer);
     }
 
     /// PC-5: force A0 on this consumer (execute anyway).
@@ -719,7 +705,6 @@ impl ReadyEdgeTable {
                 Ordering::Relaxed,
             );
         }
-        self.clear_leftover_slot(writer);
         self.mark_done(writer);
         if !self.has_any_gated() {
             return;
@@ -911,11 +896,10 @@ impl ReadyEdgeTable {
 
     /// Hang-trace: global leftover election (`NONE` → `usize::MAX`).
     #[inline]
-    pub(crate) fn hang_global_leftover(&self) -> (usize, usize, usize) {
+    pub(crate) fn hang_global_leftover(&self) -> (usize, usize) {
         (
             self.global_leftover_min.load(Ordering::Relaxed),
             self.global_leftover_chain.load(Ordering::Relaxed),
-            self.leftover_n.load(Ordering::Relaxed),
         )
     }
 
@@ -1190,124 +1174,62 @@ impl ReadyEdgeTable {
         }
     }
 
-    fn already_leftover_tip(&self, tx: TxIdx) -> bool {
-        self.leftover_ids
-            .iter()
-            .any(|s| s.load(Ordering::Relaxed) == tx)
-    }
-
-    fn try_claim_leftover_slot(&self, consumer: TxIdx) -> bool {
-        if self.already_leftover_tip(consumer) {
-            return true;
-        }
-        loop {
-            let cur = self.leftover_n.load(Ordering::Relaxed);
-            if cur >= LEFTOVER_W {
-                return false;
-            }
-            match self.leftover_n.compare_exchange_weak(
-                cur,
-                cur + 1,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    for slot in &self.leftover_ids {
-                        if slot
-                            .compare_exchange(NONE, consumer, Ordering::Release, Ordering::Relaxed)
-                            .is_ok()
-                        {
-                            return true;
-                        }
-                    }
-                    self.leftover_n.fetch_sub(1, Ordering::Relaxed);
-                    return false;
-                }
-                Err(_) => {}
-            }
-        }
-    }
-
-    fn clear_leftover_slot(&self, tx: TxIdx) {
-        for slot in &self.leftover_ids {
-            if slot
-                .compare_exchange(tx, NONE, Ordering::Release, Ordering::Relaxed)
-                .is_ok()
-            {
-                self.leftover_n.fetch_sub(1, Ordering::Relaxed);
-                return;
-            }
-        }
-    }
-
-    fn advance_leftover_chain(&self, consumer: TxIdx) {
-        loop {
+    /// One leftover writer executes at a time in the block. Per-ℓ election
+    /// left 19807137 with ~23 Q_released tips (`leftover_min=23`).
+    pub(crate) fn plant_global_leftover(&self, consumer: TxIdx) -> bool {
+        self.install_leftover_min(consumer);
+        let min = self.live_leftover_min();
+        let (pred, stolen_head) = loop {
             let cur = self.global_leftover_chain.load(Ordering::Relaxed);
-            if cur != NONE && cur >= consumer && !self.is_writer_done(cur) {
-                return;
+            if cur == consumer {
+                break (None, None);
             }
+            let cand = if cur != NONE && cur < consumer && !self.is_writer_done(cur) {
+                Some(cur)
+            } else if min < consumer && min != NONE && !self.is_writer_done(min) {
+                Some(min)
+            } else if cur != NONE && cur > consumer && !self.is_writer_done(cur) {
+                if min == consumer {
+                    None
+                } else if min < consumer && !self.is_writer_done(min) {
+                    Some(min)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             match self.global_leftover_chain.compare_exchange_weak(
                 cur,
                 consumer,
                 Ordering::Release,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return,
+                Ok(_) => {
+                    let stolen = if min == consumer
+                        && cur != NONE
+                        && cur > consumer
+                        && !self.is_writer_done(cur)
+                    {
+                        Some(cur)
+                    } else {
+                        None
+                    };
+                    break (cand, stolen);
+                }
                 Err(_) => {}
             }
+        };
+        if let Some(old) = stolen_head {
+            self.rebind_stolen_leftover_head(old, consumer);
         }
-    }
-
-    /// Newest live leftover tip with index `< consumer`. Overflow waits here,
-    /// not on leftover_min — starring 300 leftovers on leftover_min=405
-    /// let 405 `add_dependency` park on a waiter (19807137 n_unf=307 hang).
-    fn live_chain_before(&self, consumer: TxIdx) -> Option<TxIdx> {
-        let cur = self.global_leftover_chain.load(Ordering::Relaxed);
-        if cur != NONE && cur < consumer && !self.is_writer_done(cur) {
-            return Some(cur);
-        }
-        let mut best = NONE;
-        for slot in &self.leftover_ids {
-            let t = slot.load(Ordering::Relaxed);
-            if t != NONE && t < consumer && !self.is_writer_done(t) && (best == NONE || t > best) {
-                best = t;
+        match pred {
+            Some(p) if self.should_plant_observed_waw(consumer, p) => {
+                self.note_consumer_on(consumer, p, None);
+                true
             }
+            _ => stolen_head.is_some(),
         }
-        (best != NONE).then_some(best)
-    }
-
-    /// Drop leftover slots whose writers already published. leftover_n stuck
-    /// at 8 after Commit-without-clear blocked every later leftover.
-    pub(crate) fn reap_done_leftover_slots(&self) {
-        for slot in &self.leftover_ids {
-            let t = slot.load(Ordering::Relaxed);
-            if t != NONE && self.is_writer_done(t) {
-                self.clear_leftover_slot(t);
-            }
-        }
-    }
-
-    /// At most `LEFTOVER_W` leftover tips execute. Surplus chain onto a live
-    /// tip `< consumer`. A lower leftover that arrives after the window is
-    /// full executes as an extra tip — rebinding later tips onto leftover_min
-    /// recreated the 405↔waiter cycle.
-    pub(crate) fn plant_global_leftover(&self, consumer: TxIdx) -> bool {
-        if consumer == 0 || self.is_writer_done(consumer) {
-            return false;
-        }
-        if self.try_claim_leftover_slot(consumer) {
-            self.install_leftover_min(consumer);
-            self.advance_leftover_chain(consumer);
-            return false;
-        }
-        self.install_leftover_min(consumer);
-        self.advance_leftover_chain(consumer);
-        // Do not Detect-gate surplus. Overflow wait starred 19807137
-        // (leftover_w=8 n_unf=190/544) and DashMap-rebound complete_arch
-        // (`munmap_chunk` / `free(): invalid pointer`). Same-ℓ WAW stays
-        // on plant_observed_window. leftover_n still tracks 8 live tips
-        // so 6196166 does not reopen the full Released mill.
-        false
     }
 
     /// Keep at most `w_max` Detect waiters on `ℓ`. Evict oldest first,
@@ -2014,64 +1936,31 @@ mod tests {
             "next leftover must become the new live min, not wait on a done head"
         );
         assert!(t.may_execute(40));
-        for i in 0..7 {
-            assert!(
-                !t.plant_global_leftover(41 + i),
-                "width-8 leftover tips must execute"
-            );
-        }
-        assert!(
-            !t.plant_global_leftover(60),
-            "surplus leftover executes — no block-wide Detect star"
-        );
-        assert!(t.may_execute(60));
+        assert!(t.plant_global_leftover(60));
+        assert_eq!(t.blocking_producer(60), Some(40));
+        assert!(!t.may_execute(60));
     }
 
     #[test]
-    fn plant_global_leftover_lower_tip_executes_when_window_full() {
+    fn plant_global_leftover_rebinds_previous_tip_onto_new_min() {
         let t = ReadyEdgeTable::new();
         let wave = WaveParkTable::new();
         t.note_producer_done(0, &wave);
         assert!(
             !t.plant_global_leftover(40),
-            "first leftover is a global tip"
+            "first leftover is the global tip"
         );
         assert!(t.may_execute(40));
-        for i in 0..7 {
-            assert!(!t.plant_global_leftover(50 + i));
-        }
         assert!(
-            !t.plant_global_leftover(10),
-            "lower leftover must execute — not wait on later tips"
+            t.plant_global_leftover(10),
+            "lower leftover must steal and gate the previous tip"
         );
+        assert_eq!(t.blocking_producer(40), Some(10));
         assert!(t.may_execute(10));
         assert!(
-            t.may_execute(50),
-            "later slot holders stay Indep (no leftover_min steal-rebind)"
+            !t.may_execute(40),
+            "two leftover heads must not both execute"
         );
-        assert!(
-            !t.plant_global_leftover(70),
-            "surplus leftover executes — no block-wide Detect star"
-        );
-        assert!(t.may_execute(70));
-    }
-
-    #[test]
-    fn leftover_slot_frees_on_abort() {
-        let t = ReadyEdgeTable::new();
-        for i in 0..8 {
-            assert!(!t.plant_global_leftover(10 + i));
-        }
-        assert!(
-            !t.plant_global_leftover(30),
-            "ninth leftover still executes (no Detect overflow star)"
-        );
-        t.note_abort_reincarnate(10);
-        assert!(
-            !t.plant_global_leftover(40),
-            "FullReplay must free a leftover slot"
-        );
-        assert!(t.may_execute(40));
     }
 
     #[test]

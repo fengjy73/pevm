@@ -140,9 +140,9 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
                 break_replay_mill(&ctx, &f);
             }
             plant_invalid_locs(&ctx);
-            // Per-ℓ leftover can still leave many Released tips. Cap
-            // cross-ℓ leftovers that still may_execute. Do not drain-rebind
-            // first-wave onto leftover_min (6196166 heap).
+            // Per-ℓ leftover can still leave many Released tips (19807137
+            // ~40-head mill). Serialize only writers that may_execute after
+            // the loc plant — do not drain-rebind first-wave onto leftover_min.
             if ctx.specfence.ready_edges.may_execute(tx) {
                 let _ = ctx.specfence.ready_edges.plant_global_leftover(tx);
             }

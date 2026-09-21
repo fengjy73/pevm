@@ -5,12 +5,12 @@
 
 use std::time::Instant;
 
-use super::SpecFenceCtx;
-use super::VisibilityPolicy;
 use super::arm_table::ArmTable;
 use super::resolve_plan::{self, ApplyCtx};
 use super::runnable_set::RunnableSet;
 use super::schedule;
+use super::SpecFenceCtx;
+use super::VisibilityPolicy;
 use crate::mv_memory::MvMemory;
 use crate::scheduler::Scheduler;
 use crate::{Task, TxVersion};
@@ -36,13 +36,13 @@ pub(crate) fn run_sf_block<F, V>(
         spins += 1;
         if spins.is_multiple_of(8_000) && std::env::var_os("SPECFENCE_HANG_TRACE").is_some() {
             let (n_min, n_tip, n_ov) = specfence.ready_edges.hang_plant_n();
-            let (g_min, g_chain, leftover_w) = specfence.ready_edges.hang_global_leftover();
+            let (g_min, g_chain) = specfence.ready_edges.hang_global_leftover();
             let (min_done, min_run, min_pred) = specfence.ready_edges.hang_leftover_min_status();
             let n_unf = (0..scheduler.block_size())
                 .filter(|&t| !scheduler.is_validated(t))
                 .count();
             eprintln!(
-                "sf-hang-trace spins={spins} pending={} q_i/r/o/v={}/{}/{}/{} unfinished={} validated={} gated={} live_wait={} refuse={} leftover_min={} loc_tip={} overflow_tip={} glob_min={} glob_chain={} leftover_w={} min_done={} min_exec={} min_pred={} n_unf={} n_run={}",
+                "sf-hang-trace spins={spins} pending={} q_i/r/o/v={}/{}/{}/{} unfinished={} validated={} gated={} live_wait={} refuse={} leftover_min={} loc_tip={} overflow_tip={} glob_min={} glob_chain={} min_done={} min_exec={} min_pred={} n_unf={} n_run={}",
                 runnable.pending_work(),
                 runnable.q_indep_len(),
                 runnable.q_released_len(),
@@ -58,7 +58,6 @@ pub(crate) fn run_sf_block<F, V>(
                 n_ov,
                 g_min,
                 g_chain,
-                leftover_w,
                 min_done,
                 min_run,
                 min_pred,
@@ -119,12 +118,10 @@ pub(crate) fn run_sf_block<F, V>(
                                 specfence.ready_edges.note_consumer_on(tx_idx, w, None);
                             } else if specfence.ready_edges.detect_waits_on(w, tx_idx) {
                                 // Later leftover is Detect-gated on us; we
-                                // parked Aborting on them. Flush the leftover
-                                // pred only — `ungate` + recover_executing
-                                // double-freed. Recovering both sides here
-                                // incarnation++ milled 19807137 (n_unf=437).
+                                // parked Aborting on them (6196166 reuse
+                                // n_unf=44). Flush the leftover pred only —
+                                // `ungate` + recover_executing double-freed.
                                 specfence.ready_edges.flush_wait_on(w, tx_idx);
-                                let _ = scheduler.detach_dependent(w, tx_idx);
                                 if !runnable.is_running(w)
                                     && specfence.ready_edges.may_execute(w)
                                     && (scheduler.is_ready(w) || scheduler.is_executed(w))
@@ -181,7 +178,6 @@ pub(crate) fn run_sf_block<F, V>(
                 }
                 // Last-ditch: unfinished + empty queues + no live producer.
                 // Heal already ran; if still stuck, yield then retry heal.
-                specfence.ready_edges.reap_done_leftover_slots();
                 if runnable.pending_work() == 0
                     && scheduler.has_unfinished()
                     && !runnable.waiting_on_live_producer(specfence.ready_edges, scheduler)
