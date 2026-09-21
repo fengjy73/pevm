@@ -173,12 +173,10 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
             {
                 ctx.runnable.mark_wait(tx);
             } else {
-                // Location-admitted cohort stays Ordered (19469101 vis_opt
-                // mill when FullReplay dumped them Indep). Anonymous fan-in
-                // must not re-enter Q_ordered (19807137 OrderedTip mill).
-                let kind = if ctx.specfence.ready_edges.admitted_on_location(tx) {
-                    QueueKind::Ordered
-                } else if ctx.specfence.ready_edges.is_gated(tx) || ctx.vis.needs_fence() {
+                // Never Q_ordered from FullReplay: 19807137 milled ~43
+                // location-admitted OrderedTip heads (c5b6ce3/7e2dd73).
+                // Heal/drain may still Ordered a location cohort.
+                let kind = if ctx.specfence.ready_edges.is_gated(tx) || ctx.vis.needs_fence() {
                     QueueKind::Released
                 } else {
                     QueueKind::Indep
