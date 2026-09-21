@@ -82,6 +82,7 @@ pub(crate) fn run_sf_block<F, V>(
                     }
                     SfExec::Fatal => break,
                 }
+                metrics.add_worker_busy_ns(t0.elapsed().as_nanos() as u64);
             }
             Some(Task::Validation(tx_version)) => {
                 let vis = VisibilityPolicy::for_ready(specfence.ready_edges, tx_version.tx_idx);
@@ -100,6 +101,7 @@ pub(crate) fn run_sf_block<F, V>(
                         invalid: &invalid,
                     },
                 );
+                metrics.add_worker_busy_ns(t0.elapsed().as_nanos() as u64);
             }
             None => {
                 metrics.add_idle_core_ns(t0.elapsed().as_nanos() as u64);

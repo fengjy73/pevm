@@ -1678,6 +1678,12 @@ impl<S: Storage> Database for VmDb<'_, S> {
                             if self.specfence.mode == crate::ConcurrencyMode::SpecFence
                                 && self.vis.needs_fence()
                             {
+                                // Edged vis: SfMvMemory skips the Estimate tip.
+                                let _ = crate::specfence::SfMvMemory::new(self.mv_memory).read(
+                                    location_hash,
+                                    self.vis,
+                                    self.tx_idx,
+                                );
                                 self.specfence.metrics.record_sf_mv_read(self.vis);
                             }
                             continue;
