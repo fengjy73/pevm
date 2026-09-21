@@ -361,10 +361,15 @@ impl RunnableSet {
         if (0..self.block_size).any(|t| self.state[t].load(Ordering::Acquire) == ST_RUNNING) {
             return 0;
         }
-        // True idle: queues empty and nobody is ST_RUNNING. Nuclear-ungate
-        // leftover Detect bits — a gated !may_execute Indep refuse mill
-        // (19807137 pending=0/1, refuse=8) never reached Commit.
-        let freed = ready.collapse_false_gates(|_| false);
+        // Mid-block pending=0 must not nuclear-ungate (that re-armed a
+        // 49-head Q_released mill). After a real idle stretch the last
+        // gated Indep refuse mill (19807137 pending=0/1, refuse=8) is freed.
+        let nuclear = self.idle_spins.load(Ordering::Relaxed) >= 256;
+        let freed = ready.collapse_false_gates(|w| {
+            !nuclear
+                && scheduler.is_executing(w)
+                && self.state[w].load(Ordering::Acquire) == ST_RUNNING
+        });
         let mut n = 0;
         for tx in freed {
             if scheduler.is_aborting(tx) {
