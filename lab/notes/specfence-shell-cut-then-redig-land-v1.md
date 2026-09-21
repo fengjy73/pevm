@@ -11,10 +11,10 @@ Lazy-update chains stay **not** OrderedAdmit objects. Ungated OCC task selection
 
 | ID | Content |
 |----|---------|
-| **S1** | `skip_ungated_path_tax` is empty/short-chain wait-set on **every n** (thin included). `skip_ungated_tx_path_tax` is OCC-equivalent for every ungated tx. Leftover-long still keeps gated D1 / end_block. |
-| **S2** | Near-independent / lazy-update large: wait-set soft-cap 0; `skip_useless_cover_probe` bans cover plant / leftover-slide / pick-quantum flush. Thin `train_hat` stays `light_hat` (no 6137495 Win_16 climb). |
+| **S1** | `skip_ungated_tx_path_tax` is OCC-equivalent for every ungated tx (thin included). Block-level `skip_ungated_path_tax` stays mid/large — thin D1 / HotSet still walk (same-sender lazy has no wait-set). Leftover-long still keeps gated D1 / end_block. |
+| **S2** | Near-independent / lazy-update large: wait-set soft-cap 0; `skip_useless_cover_probe` bans cover plant / leftover-slide / pick-quantum flush. Thin `train_hat` stays ≤8 (no 6137495 Win_16 climb). |
 | **S3** | Order branches stay on gated txs. Ungated execute+validate is OCC-equivalent (`skip_ungated_tx_path_tax` + `is_gated`). Done-on-success always stamps (iter11 flush race). Engagement / kernel counters stay (test + reuse telemetry). |
-| **S4** | Thin reuse with empty/short-chain wait-set leans `end_block`. Thin / near-independent / lazy-update reuse skips writer-order snapshot, MV walk, and per-tx incarnation mutex walk. Mid-band real spines keep the walk so leftover unfenced still trains. |
+| **S4** | Mid/large empty/short-chain reuse leans `end_block`. Only large lazy-update reuse skips writer-order snapshot, MV walk, and per-tx incarnation mutex walk. Thin HotSet and mid-band leftover (p4) keep the walk. |
 | **S5** | lazy never OrderedAdmit; L1 controlled cover probe on mid-band real spines; Done-on-success when a plant can race; Soft=0; professional terms. |
 
 ## Invariants

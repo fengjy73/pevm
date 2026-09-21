@@ -36,8 +36,9 @@
 //! segment instead of total withdraw. Near-independent / lazy-update
 //! large blocks drop non-critical wait-set slots and skip useless
 //! cover probes. Ungated execute+validate is OCC-equivalent on every
-//! n (`skip_ungated_tx_path_tax`) whenever the wait-set is empty,
-//! short-chain, or the tx is ungated — thin included. Gates are
+//! n (`skip_ungated_tx_path_tax`) whenever the tx is ungated —
+//! thin included. Block-level path-tax skip stays mid/large so thin
+//! HotSet / D1 still walk. Gates are
 //! edge constraints (ungated_occ ≈ n − wait_set). Lazy-update /
 //! thousand-writer chains are never OrderedAdmit objects. Instant
 //! idle never enters ĉ. Soft=0.
@@ -1196,8 +1197,10 @@ impl CostPolicy {
     /// Large lazy-update / near-independent: drop ungated execute+validate
     /// path tax. Same-block reuse uses the process-persistent structure flag
     /// because `lazy_seen` is per-block. Must not disable ungated OCC pick.
-    /// Block-level: empty / short-chain wait-set — **thin included** (S1).
-    /// Lean `end_block`, after-publish D1 skip. Per-tx ungated skip is
+    /// Block-level: empty / short-chain wait-set on **mid/large** only
+    /// (lean `end_block`, after-publish D1 skip). Thin keeps the D1 /
+    /// HotSet walk — same-sender lazy is never OrderedAdmit, so an
+    /// empty wait-set is not "no structure". Per-tx ungated skip is
     /// [`skip_ungated_tx_path_tax`].
     #[inline]
     pub(crate) fn skip_ungated_path_tax(&self) -> bool {
@@ -1225,12 +1228,13 @@ impl CostPolicy {
             && (self.lazy_already_seen() || self.lazy_structure_seen.load(Ordering::Relaxed))
     }
 
-    /// S1: OCC-aligned Opt path tax — wait-set empty or only short-chain
-    /// (n_pairs ≤ `ORDER_WINDOW_K`). Thin included. A leftover-long plant
-    /// sets `wait_set_has_long` and clears the skip.
+    /// S1: OCC-aligned Opt path tax — mid/large wait-set empty or only
+    /// short-chain (n_pairs ≤ `ORDER_WINDOW_K`). Thin stays off: S1 on
+    /// thin is per-tx (`skip_ungated_tx_path_tax`), not end_block lean.
+    /// A leftover-long plant sets `wait_set_has_long` and clears the skip.
     #[inline]
     fn opt_aligned_path_tax(&self) -> bool {
-        !self.wait_set_has_long.load(Ordering::Relaxed)
+        self.block_n() > THIN_N_MAX && !self.wait_set_has_long.load(Ordering::Relaxed)
     }
 
     /// Begin-seed planted a leftover-long wait-for (not short-chain).
@@ -1364,54 +1368,32 @@ impl CostPolicy {
     /// Lean end_block: skip HotSet / inter-prior / sketch / MV merge.
     /// Mid-band reuse with stored D1 **or** already-seen conflict structure
     /// is the same lean as large+lazy-seen. First mid-band still persists.
-    /// S4: thin reuse with empty / short-chain wait-set leans too.
+    /// Thin never leans — same-sender lazy has no wait-set (S5) but still
+    /// needs the HotSet walk (mixed_hot / p1a).
     pub(crate) fn should_lean_end_block(&self, d1_stored: bool) -> bool {
         let n = self.block_n();
         if n >= LARGE_BLOCK_N && self.large_lazy_path_tax() {
             return true;
         }
-        let seq = self.block_seq.load(Ordering::Relaxed);
-        // S4: reuse + empty/short-chain wait-set leans — thin included.
-        // First thin still persists D1 (3356896 4→31). First mid-band
-        // after a thin block still persists (last_n ≤ THIN).
-        if self.skip_ungated_path_tax() && seq > 1 {
-            let last = self.last_block_n.load(Ordering::Relaxed);
-            if n <= THIN_N_MAX {
-                // Thin reuse leans only when the wait-set stayed empty and
-                // no short-chain structure remains (HotSet tests keep a walk).
-                return self.wait_set_n.load(Ordering::Relaxed) == 0
-                    && !self.conflict_structure_seen();
-            }
-            if last > THIN_N_MAX {
-                return true;
-            }
-        }
         if n <= THIN_N_MAX {
             return false;
+        }
+        // S4: mid/large empty/short-chain wait-set reuse leans. First mid
+        // after a thin block still persists D1.
+        if self.skip_ungated_path_tax()
+            && self.block_seq.load(Ordering::Relaxed) > 1
+            && self.last_block_n.load(Ordering::Relaxed) > THIN_N_MAX
+        {
+            return true;
         }
         d1_stored || self.should_reuse_stored_d1()
     }
 
-    /// S4: reuse + empty/short-chain wait-set on thin / near-independent /
-    /// lazy-update large — skip writer-order snapshot and incarnation walk.
-    /// Mid-band real spines keep the walk so leftover unfenced still trains.
+    /// S4: near-independent / lazy-update **large** reuse skips the
+    /// writer-order snapshot and incarnation walk. Thin HotSet and
+    /// mid-band leftover training keep the walk (p4 / mixed_hot).
     pub(crate) fn should_skip_end_block_walks(&self) -> bool {
-        if !self.skip_ungated_path_tax() {
-            return false;
-        }
-        let seq = self.block_seq.load(Ordering::Relaxed);
-        if seq <= 1 {
-            return false;
-        }
-        let n = self.block_n();
-        let last = self.last_block_n.load(Ordering::Relaxed);
-        if n <= THIN_N_MAX {
-            return last > 0
-                && last <= THIN_N_MAX
-                && self.wait_set_n.load(Ordering::Relaxed) == 0
-                && !self.conflict_structure_seen();
-        }
-        self.large_lazy_path_tax() || self.should_drop_noncritical_wait_set()
+        self.block_seq.load(Ordering::Relaxed) > 1 && self.large_lazy_path_tax()
     }
 
     /// S5: Done-on-success always stamps. A later pick-quantum flush
@@ -6209,12 +6191,12 @@ mod tests {
         );
         p.begin_block_with_cores(176, 8);
         assert!(
-            p.should_lean_end_block(false),
-            "S4: thin reuse with empty wait-set leans end_block"
+            !p.should_lean_end_block(false),
+            "thin reuse keeps HotSet / D1 walk (same-sender lazy has no wait-set)"
         );
         assert!(
-            p.should_skip_end_block_walks(),
-            "S4: thin reuse skips writer-order / incarnation walks"
+            !p.should_skip_end_block_walks(),
+            "thin reuse never skips writer-order / incarnation walks"
         );
         p.begin_block_with_cores(341, 8);
         assert!(
@@ -6343,8 +6325,8 @@ mod tests {
         );
         p.begin_block_with_cores(176, 8);
         assert!(
-            p.skip_ungated_path_tax(),
-            "S1: thin empty wait-set is OCC-aligned Opt path-tax skip"
+            !p.skip_ungated_path_tax(),
+            "S1: thin D1 / end_block stay; path-tax skip is mid/large"
         );
         assert!(
             p.skip_ungated_tx_path_tax(),
@@ -6683,8 +6665,8 @@ mod tests {
         let p = CostPolicy::new();
         p.begin_block_with_cores(108, 8);
         assert!(
-            p.skip_ungated_path_tax(),
-            "S1: thin empty wait-set skips block-level path tax"
+            !p.skip_ungated_path_tax(),
+            "S1: thin block-level D1 / HotSet stay (empty wait-set ≠ no structure)"
         );
         assert!(p.skip_ungated_tx_path_tax());
         assert!(
