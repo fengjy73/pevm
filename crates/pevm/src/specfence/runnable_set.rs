@@ -361,13 +361,10 @@ impl RunnableSet {
         if (0..self.block_size).any(|t| self.state[t].load(Ordering::Acquire) == ST_RUNNING) {
             return 0;
         }
-        // True idle only: a producer is live iff a worker still owns it.
-        // Heal (pending>0) must not ungate Aborting parks — that mills —
-        // but here queues are empty and nobody is ST_RUNNING, so leftover
-        // Detect waiters of a Ready/Aborting ghost must be freed (19469101).
-        let freed = ready.collapse_false_gates(|w| {
-            scheduler.is_executing(w) && self.state[w].load(Ordering::Acquire) == ST_RUNNING
-        });
+        // True idle: queues empty and nobody is ST_RUNNING. Nuclear-ungate
+        // leftover Detect bits — a gated !may_execute Indep refuse mill
+        // (19807137 pending=0/1, refuse=8) never reached Commit.
+        let freed = ready.collapse_false_gates(|_| false);
         let mut n = 0;
         for tx in freed {
             if scheduler.is_aborting(tx) {
