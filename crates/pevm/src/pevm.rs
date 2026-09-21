@@ -1305,7 +1305,8 @@ impl Pevm {
                 if leftover_min
                     && (blocking_tx_idx > tx_version.tx_idx
                         || scheduler.is_done(blocking_tx_idx)
-                        || scheduler.is_validated(blocking_tx_idx))
+                        || scheduler.is_validated(blocking_tx_idx)
+                        || vm.ready_edges().leftover_surplus(blocking_tx_idx))
                 {
                     retry_n += 1;
                     continue;
@@ -1365,7 +1366,8 @@ impl Pevm {
                     if leftover_min
                         && (blocking_tx_idx > tx_version.tx_idx
                             || scheduler.is_done(blocking_tx_idx)
-                            || scheduler.is_validated(blocking_tx_idx))
+                            || scheduler.is_validated(blocking_tx_idx)
+                            || vm.ready_edges().leftover_surplus(blocking_tx_idx))
                     {
                         retry_n += 1;
                         continue;
