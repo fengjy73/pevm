@@ -235,8 +235,8 @@ fn plant_observed_waw(ctx: &ApplyCtx<'_>, f: &super::collateral::FirstConflict) 
             .note_consumer_on(tx, producer, Some(f.location));
         return;
     }
-    // At w_max: chain onto the newest live waiter, not a star on the
-    // window tip. Fan-in woke ~40 leftover writers together (19807137).
+    // At w_max: anonymous edge onto the window tip. Chaining walked
+    // waiters DashMap in the FullReplay hot path and munmap'd 19807137.
     let tip = ctx
         .specfence
         .ready_edges
@@ -244,8 +244,7 @@ fn plant_observed_waw(ctx: &ApplyCtx<'_>, f: &super::collateral::FirstConflict) 
         .into_iter()
         .rev()
         .find(|&c| c < tx && !ctx.specfence.ready_edges.is_writer_done(c));
-    let start = tip.unwrap_or(producer);
-    let pred = ctx.specfence.ready_edges.chain_tip_before(start, tx);
+    let pred = tip.unwrap_or(producer);
     if ctx
         .specfence
         .ready_edges
@@ -273,16 +272,17 @@ fn break_replay_mill(ctx: &ApplyCtx<'_>, f: &super::collateral::FirstConflict) {
     if ctx.specfence.ready_edges.is_writer_done(producer) {
         return;
     }
-    let pred = ctx.specfence.ready_edges.chain_tip_before(producer, tx);
     if ctx
         .specfence
         .ready_edges
         .blocking_producer(tx)
-        .is_some_and(|w| w >= pred)
+        .is_some_and(|w| w >= producer)
     {
         return;
     }
-    ctx.specfence.ready_edges.note_consumer_on(tx, pred, None);
+    ctx.specfence
+        .ready_edges
+        .note_consumer_on(tx, producer, None);
 }
 
 fn seed_short_edge(
