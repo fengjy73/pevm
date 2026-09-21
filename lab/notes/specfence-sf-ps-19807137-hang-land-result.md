@@ -23,16 +23,18 @@ Same-ℓ `plant_observed_window` alone is not enough (drop `plant_global` hung `
 
 ---
 
-## Instant-off Soft=0 @8 (fill after runs)
+## Instant-off Soft=0 @8
 
 | Block | N | OCC med | SF cold | SF reuse | Soft | occ_picks | Status |
 |-------|--:|--------:|--------:|---------:|-----:|----------:|--------|
-| **19807137** | ≥3 | ~2.37 s | — | — | 0 | — | pending |
-| **6196166** | ≥3 | — | — | — | 0 | — | pending |
-| **19469101** | ≥3 | — | — | — | 0 | — | pending |
-| **3356896** | ≥3 | — | — | — | 0 | — | pending |
+| **19807137** | 1 | 2.373 s | hang | — | 0 | — | **open** — leftover_min walks (405→184→342→514) then ghost-Executing mill `min_st=exec n_run=0 n_unf=198` |
+| **3356896** | 1 | 1.526 | 2.221 | — | 0 | 0 | green smoke; Learn e1=220 e2=28 e6=1 explore=0 |
+| **6196166** | ≥3 | — | — | — | 0 | — | pending re-confirm |
+| **19469101** | ≥3 | — | — | — | 0 | — | pending re-confirm |
 | **14396881** | ≥3 | — | — | — | 0 | — | pending |
 | **14689597** | ≥3 | — | — | — | 0 | — | pending |
 | complete_arch Soft=0 | — | — | — | — | 0 | — | pending |
+
+Claim-only removed the 405 Detect-star hang. leftover_min now serializes leftovers but 514 stays `Executing` after a failed WaitForDependency/nonce park on a done writer (`add_dependency`/`add_wait_for_dependency` return false). Heal recovers the ghost; leftover_min re-parks. Not papered with OCC pick.
 
 Learn B1–B7 must hold. `occ_schedule_picks=0` on SF.

@@ -82,10 +82,9 @@ pub(crate) struct ReadyEdgeTable {
     /// tips milled each other (`live_wait=false`, pending≈23).
     global_leftover_min: AtomicUsize,
     global_leftover_chain: AtomicUsize,
-    /// Leftover writers that called `plant_global_leftover`. Claim-only:
-    /// surplus is pick-refused while leftover_min is live. Do **not**
-    /// Detect-star them onto leftover_min (19807137 leftover_min=405 hang).
-    leftover_claimed: DashSet<TxIdx, BuildIdentityHasher>,
+    /// Leftover writers that called `plant_global_leftover`. Bitset — DashSet
+    /// on the may_execute pick path heap-aborted 6196166 (`double free`).
+    leftover_bits: [AtomicU64; GATED_WORDS],
     /// Ordered-admit gated txs. Marked **before** the consumer map insert so
     /// an ungated steal cannot race past a newly created wait-for edge.
     gated_bits: [AtomicU64; GATED_WORDS],
@@ -133,7 +132,7 @@ impl Default for ReadyEdgeTable {
             leftover_min: DashMap::default(),
             global_leftover_min: AtomicUsize::new(NONE),
             global_leftover_chain: AtomicUsize::new(NONE),
-            leftover_claimed: DashSet::default(),
+            leftover_bits: std::array::from_fn(|_| AtomicU64::new(0)),
             gated_bits: std::array::from_fn(|_| AtomicU64::new(0)),
             gated_n: AtomicUsize::new(0),
             pending_gated: AtomicUsize::new(0),
@@ -696,7 +695,7 @@ impl ReadyEdgeTable {
         // leftover_min is a claim token, not a Detect wait-set. Elect the
         // next leftover from leftover_claimed — waiters of leftover_min
         // used to be surplus Detect-stars (19807137 leftover_min=405).
-        self.leftover_claimed.remove(&writer);
+        self.clear_leftover_claim(writer);
         let leftover_wake = if self.global_leftover_min.load(Ordering::Relaxed) == writer {
             let next = self.elect_next_leftover();
             let _ = self.global_leftover_min.compare_exchange(
@@ -1166,13 +1165,41 @@ impl ReadyEdgeTable {
         }
     }
 
+    fn leftover_claim_bit(tx: TxIdx) -> Option<(usize, u64)> {
+        let i = tx / 64;
+        (i < GATED_WORDS).then_some((i, 1u64 << (tx % 64)))
+    }
+
+    fn mark_leftover_claim(&self, tx: TxIdx) {
+        if let Some((i, bit)) = Self::leftover_claim_bit(tx) {
+            self.leftover_bits[i].fetch_or(bit, Ordering::Release);
+        }
+    }
+
+    fn clear_leftover_claim(&self, tx: TxIdx) {
+        if let Some((i, bit)) = Self::leftover_claim_bit(tx) {
+            self.leftover_bits[i].fetch_and(!bit, Ordering::Release);
+        }
+    }
+
+    fn leftover_claim_has(&self, tx: TxIdx) -> bool {
+        Self::leftover_claim_bit(tx)
+            .is_some_and(|(i, bit)| self.leftover_bits[i].load(Ordering::Acquire) & bit != 0)
+    }
+
     fn elect_next_leftover(&self) -> usize {
-        let claimed: Vec<TxIdx> = self.leftover_claimed.iter().map(|e| *e).collect();
-        claimed
-            .into_iter()
-            .filter(|&c| !self.is_writer_done(c))
-            .min()
-            .unwrap_or(NONE)
+        for (wi, word) in self.leftover_bits.iter().enumerate() {
+            let mut bits = word.load(Ordering::Acquire);
+            while bits != 0 {
+                let b = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let c = wi * 64 + b;
+                if !self.is_writer_done(c) {
+                    return c;
+                }
+            }
+        }
+        NONE
     }
 
     /// leftover_min stayed sticky after Commit when the wake was lost
@@ -1189,7 +1216,7 @@ impl ReadyEdgeTable {
         if !self.is_writer_done(min) && !finished(min) {
             return None;
         }
-        self.leftover_claimed.remove(&min);
+        self.clear_leftover_claim(min);
         if !self.is_writer_done(min) {
             self.mark_done(min);
         }
@@ -1218,12 +1245,12 @@ impl ReadyEdgeTable {
     #[inline]
     pub(crate) fn leftover_surplus(&self, tx: TxIdx) -> bool {
         let min = self.live_leftover_min();
-        min != NONE && min < tx && self.leftover_claimed.contains(&tx)
+        min != NONE && min < tx && self.leftover_claim_has(tx)
     }
 
     #[inline]
     pub(crate) fn is_leftover_claimed(&self, tx: TxIdx) -> bool {
-        self.leftover_claimed.contains(&tx)
+        self.leftover_claim_has(tx)
     }
 
     #[inline]
@@ -1266,7 +1293,7 @@ impl ReadyEdgeTable {
         if consumer == 0 || self.is_writer_done(consumer) {
             return false;
         }
-        self.leftover_claimed.insert(consumer);
+        self.mark_leftover_claim(consumer);
         self.install_leftover_min(consumer);
         self.leftover_surplus(consumer)
     }
