@@ -1221,16 +1221,11 @@ impl ReadyEdgeTable {
     /// (19807137 leftover_min=205 gated on 204) or leftover surplus.
     /// leftover_surplus is only `min < tx`; a leftover leftover_min walked
     /// past has `tx < min` so leftover_surplus(204) is false at leftover_min=205.
+    /// Do **not** skip a live leftover-claimed earlier writer — that is
+    /// leftover_min always-may_execute (6196166 / 3356896 first-SF heap).
     #[inline]
     pub(crate) fn leftover_min_skips_blocker(&self, writer: TxIdx) -> bool {
-        let min = self.live_leftover_min();
-        if writer == min {
-            return false;
-        }
-        self.leftover_surplus(writer)
-            || self.leftover_passed(writer)
-            || self.leftover_claim_has(writer)
-            || self.is_writer_done(writer)
+        self.leftover_surplus(writer) || self.leftover_passed(writer)
     }
 
     /// leftover_min Detect-gated on leftover leftover_min passed — flush so
@@ -2199,12 +2194,20 @@ mod tests {
         assert!(t.is_live_leftover_min(205));
         t.note_abort_reincarnate(204);
         assert!(
+            t.leftover_passed(204),
+            "leftover_min commit stamps leftover leftover_min passed"
+        );
+        assert!(
             t.leftover_min_skips_blocker(204),
             "leftover leftover_min passed must skip even when leftover_surplus is false"
         );
         assert!(
             !t.leftover_surplus(204),
             "leftover_surplus is only the later side"
+        );
+        assert!(
+            !t.leftover_claim_has(204),
+            "live leftover-claimed earlier is not skip — that heap-aborted 619 first-SF"
         );
         t.note_consumer_on(205, 204, None);
         assert!(!t.may_execute(205), "Detect-gate on reincarnated 204");
