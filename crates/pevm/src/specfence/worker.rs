@@ -41,8 +41,23 @@ pub(crate) fn run_sf_block<F, V>(
             let n_unf = (0..scheduler.block_size())
                 .filter(|&t| !scheduler.is_validated(t))
                 .count();
+            let min_st = if g_min == usize::MAX {
+                "none"
+            } else if scheduler.is_validated(g_min) {
+                "val"
+            } else if scheduler.is_executed(g_min) {
+                "exed"
+            } else if scheduler.is_executing(g_min) {
+                "exec"
+            } else if scheduler.is_aborting(g_min) {
+                "abt"
+            } else if scheduler.is_ready(g_min) {
+                "rdy"
+            } else {
+                "?"
+            };
             eprintln!(
-                "sf-hang-trace spins={spins} pending={} q_i/r/o/v={}/{}/{}/{} unfinished={} validated={} gated={} live_wait={} refuse={} leftover_min={} loc_tip={} overflow_tip={} glob_min={} glob_chain={} min_done={} min_exec={} min_pred={} n_unf={} n_run={}",
+                "sf-hang-trace spins={spins} pending={} q_i/r/o/v={}/{}/{}/{} unfinished={} validated={} gated={} live_wait={} refuse={} leftover_min={} loc_tip={} overflow_tip={} glob_min={} glob_chain={} min_done={} min_exec={} min_pred={} min_st={} n_unf={} n_run={}",
                 runnable.pending_work(),
                 runnable.q_indep_len(),
                 runnable.q_released_len(),
@@ -61,6 +76,7 @@ pub(crate) fn run_sf_block<F, V>(
                 min_done,
                 min_run,
                 min_pred,
+                min_st,
                 n_unf,
                 runnable.running_n(),
             );
@@ -87,7 +103,13 @@ pub(crate) fn run_sf_block<F, V>(
             Some(Task::Execution(tx_version)) => {
                 let tx_idx = tx_version.tx_idx;
                 specfence.ready_edges.note_started(tx_idx);
-                let vis = VisibilityPolicy::for_ready(specfence.ready_edges, tx_idx);
+                // leftover_min must skip Estimate tips (Opt mills on
+                // leftover FullReplay). WaitReleased is not OCC pick.
+                let vis = if specfence.ready_edges.is_live_leftover_min(tx_idx) {
+                    VisibilityPolicy::WaitReleased
+                } else {
+                    VisibilityPolicy::for_ready(specfence.ready_edges, tx_idx)
+                };
                 match execute(tx_version.clone(), vis) {
                     SfExec::Executed { wrote_new_location } => {
                         // finish_execution may have waved dependents — park them
@@ -167,7 +189,14 @@ pub(crate) fn run_sf_block<F, V>(
                 metrics.add_worker_busy_ns(t0.elapsed().as_nanos() as u64);
             }
             Some(Task::Validation(tx_version)) => {
-                let vis = VisibilityPolicy::for_ready(specfence.ready_edges, tx_version.tx_idx);
+                let vis = if specfence
+                    .ready_edges
+                    .is_live_leftover_min(tx_version.tx_idx)
+                {
+                    VisibilityPolicy::WaitReleased
+                } else {
+                    VisibilityPolicy::for_ready(specfence.ready_edges, tx_version.tx_idx)
+                };
                 let (plan, invalid) = validate_to_plan(&tx_version, vis);
                 resolve_plan::apply(
                     plan,
