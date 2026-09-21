@@ -135,6 +135,7 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
             }
             if let Some(f) = first {
                 plant_observed_waw(&ctx, &f);
+                break_replay_mill(&ctx, &f);
             }
             ctx.scheduler
                 .finish_validation_sf(ctx.tx_version, true, Some(tx + 1));
@@ -151,11 +152,13 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
                             seed_short_edge(ctx.specfence, p, tx, &f);
                         }
                         plant_observed_waw(&ctx, &f);
+                        break_replay_mill(&ctx, &f);
                     }
                     ConflictClass::LazyNoise | ConflictClass::CommuteCandidate => {
                         if let Some(p) = ctx.specfence.policy {
                             p.ignore_conflict(Some(f.location));
                         }
+                        break_replay_mill(&ctx, &f);
                     }
                 }
             }
@@ -242,6 +245,37 @@ fn plant_observed_waw(ctx: &ApplyCtx<'_>, f: &super::collateral::FirstConflict) 
             .ready_edges
             .note_consumer_on(tx, pred, None);
     }
+}
+
+/// Second+ incarnation FullReplay that is not EffectiveWAW still Opt-mills
+/// (19469101 ~390%). After one retry, raise an anonymous wait on the peer
+/// even if Learn classified LazyNoise / Commute.
+fn break_replay_mill(ctx: &ApplyCtx<'_>, f: &super::collateral::FirstConflict) {
+    if ctx.tx_version.tx_incarnation < 1 {
+        return;
+    }
+    let tx = ctx.tx_version.tx_idx;
+    let producer = f
+        .peer
+        .or_else(|| ctx.mv_memory.last_writer_before(f.location, tx))
+        .filter(|&w| w < tx);
+    let Some(producer) = producer else {
+        return;
+    };
+    if ctx.specfence.ready_edges.is_writer_done(producer) {
+        return;
+    }
+    if ctx
+        .specfence
+        .ready_edges
+        .blocking_producer(tx)
+        .is_some_and(|w| w >= producer)
+    {
+        return;
+    }
+    ctx.specfence
+        .ready_edges
+        .note_consumer_on(tx, producer, None);
 }
 
 fn seed_short_edge(
@@ -421,6 +455,10 @@ mod tests {
         assert!(
             code.contains("should_plant_observed_waw"),
             "mid-block WAW plant must stay windowed (no deep/fat spine)"
+        );
+        assert!(
+            code.contains("break_replay_mill"),
+            "incarnation≥1 FullReplay must not Opt-mill"
         );
     }
 }
