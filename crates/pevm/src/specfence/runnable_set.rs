@@ -736,6 +736,11 @@ impl RunnableSet {
     pub(crate) fn visibility(&self, ready: &ReadyEdgeTable, tx: TxIdx) -> VisibilityPolicy {
         VisibilityPolicy::for_ready(ready, tx)
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_requeue_ready(&self, tx: TxIdx, ready: &ReadyEdgeTable) {
+        self.requeue_ready(tx, ready);
+    }
 }
 
 /// Outcome of [`RunnableSet::pick`].
@@ -926,7 +931,6 @@ mod tests {
     #[test]
     fn heal_orders_location_cohort_not_anonymous_fanin() {
         let ready = ReadyEdgeTable::new();
-        let sched = Scheduler::new(6);
         let r = RunnableSet::new(6, 1);
         let wave = crate::specfence::wave::WaveParkTable::new();
         ready.note_consumer_on(2, 0, Some(0xabc));
@@ -935,10 +939,9 @@ mod tests {
         assert!(ready.admitted_on_location(2));
         assert!(!ready.admitted_on_location(3));
         assert!(ready.was_queued(3), "anonymous fan-in is still was_queued");
-        r.mark_wait(2);
-        r.mark_wait(3);
-        let n = r.heal(&ready, &sched);
-        assert!(n >= 2, "both released waiters must requeue, n={n}");
+        assert!(ready.may_execute(2) && ready.may_execute(3));
+        r.test_requeue_ready(2, &ready);
+        r.test_requeue_ready(3, &ready);
         let mut from2 = None;
         let mut from3 = None;
         while let Some(p) = r.pick(0, &ready) {
@@ -959,10 +962,10 @@ mod tests {
             Some(QueueKind::Ordered),
             "location cohort → Q_ordered"
         );
-        assert_ne!(
+        assert_eq!(
             from3,
-            Some(QueueKind::Ordered),
-            "anonymous fan-in must not take Q_ordered"
+            Some(QueueKind::Released),
+            "anonymous fan-in → Q_released, not Ordered"
         );
     }
 

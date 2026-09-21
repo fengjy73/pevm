@@ -91,6 +91,7 @@ mod tests {
         assert!(VisibilityPolicy::OrderedTip.needs_fence());
     }
 
+    #[test]
     fn released_anonymous_consumer_is_wait_released() {
         let ready = ReadyEdgeTable::new();
         let wave = super::super::wave::WaveParkTable::new();
