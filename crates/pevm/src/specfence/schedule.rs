@@ -10,7 +10,7 @@
 //! `refuse_admit` = wave-fill the next independent / released member of R.
 
 use super::metrics::MetricsInner;
-use super::policy::CostPolicy;
+use super::policy::{CostPolicy, LARGE_BLOCK_N, THIN_N_MAX};
 use super::producer_stage::ProducerStageTable;
 use super::ready_edge::ReadyEdgeTable;
 use super::runnable_set::RunnableSet;
@@ -58,7 +58,14 @@ pub(crate) fn pick(
     let ignore_leftover =
         policy.is_some_and(|p| p.ignore_leftover_reservations() || p.skip_reuse_leftover_flush());
     let empty_wait = !runnable.has_producer_work() && !ready.has_pending_gated();
-    if ignore_leftover || empty_wait {
+    // Mid-band leftover Detect bits (19469101) can stay pending_gated>0
+    // and refuse the collaborative index forever. Those leftover hops are
+    // not OrderedAdmit objects — pick the antichain (Avoid=noop).
+    let mid_leftover = policy.is_some_and(|p| {
+        let n = p.block_n();
+        n > THIN_N_MAX && n < LARGE_BLOCK_N
+    });
+    if ignore_leftover || empty_wait || mid_leftover {
         let task = scheduler.next_task_with_wave_ready(Some(wave), None);
         if let (Some(m), Some(Task::Execution(v))) = (metrics, &task) {
             m.record_visibility(runnable.visibility(v.tx_idx));
