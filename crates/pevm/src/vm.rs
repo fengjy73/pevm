@@ -1821,6 +1821,21 @@ impl<S: Storage> Database for VmDb<'_, S> {
             self.specfence.metrics.record_journal_ff_hit();
             self.read_accounts
                 .insert(location_hash, (account.clone(), code_hash));
+            // Re-snap FF basics into rem. Without this, a second fail after
+            // Rewind/ff_head leaves value_snap empty → full_from_0.
+            let snap_origin = match &origin {
+                ReadOrigin::MvMemory(v) => Some((v.tx_idx, v.tx_incarnation)),
+                ReadOrigin::Storage => None,
+            };
+            self.maybe_note_value(
+                location_hash,
+                FfValue::Basic {
+                    address,
+                    basic: account.clone(),
+                    code_hash,
+                    origin: snap_origin,
+                },
+            );
             let code = if let Some(code_hash) = &code_hash {
                 if let Some(code) = self.mv_memory.new_bytecodes.get(code_hash) {
                     Some(code.clone())

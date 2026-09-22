@@ -116,7 +116,9 @@ impl AccessArmTable {
         let mut snaps = Vec::new();
         for e in self.arms.iter() {
             let mut arm = e.arm;
-            if flipped && arm == AccessArm::WaitOnce && e.hits == 0 {
+            // Morph flip decays opportunistic WaitOnce (k==0, never reinforced).
+            // Early-WAW templates (k>0) stay — reuse must not re-Opt the same fail_k.
+            if flipped && arm == AccessArm::WaitOnce && e.hits == 0 && e.k == 0 {
                 arm = AccessArm::Opt;
             }
             if arm == AccessArm::Opt {
@@ -302,7 +304,8 @@ mod tests {
     #[test]
     fn morph_flip_decays_unreinforced_wait_once() {
         let prior = InterBlockPrior::new();
-        prior.pack_access_arms(vec![(11, 1, 5), (22, 2, 1)]);
+        // k=0 opportunistic WaitOnce decays; k=5 early-WAW template stays.
+        prior.pack_access_arms(vec![(11, 1, 0), (33, 1, 5), (22, 2, 1)]);
         prior.force_flipped_for_test();
         let t = AccessArmTable::new();
         t.begin_from_prior(&prior);
@@ -310,7 +313,11 @@ mod tests {
         let snaps = prior.access_arm_snapshot();
         assert!(
             snaps.iter().all(|&(loc, _, _)| loc != 11),
-            "unreinforced WaitOnce decays on morph flip"
+            "unreinforced k=0 WaitOnce decays on morph flip"
+        );
+        assert!(
+            snaps.iter().any(|&(loc, tag, k)| loc == 33 && tag == 1 && k == 5),
+            "early-WAW WaitOnce (k>0) survives morph flip"
         );
         assert!(
             snaps.iter().any(|&(loc, tag, _)| loc == 22 && tag == 2),

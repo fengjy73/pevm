@@ -457,8 +457,9 @@ pub(crate) fn try_early_waw_rewind(
     if specfence.access_arms.is_never(loc) || location_is_lazy(mv_memory, tx, loc) {
         return None;
     }
-    // Already RewindTo once this block — escalate to FullReplay.
-    if specfence.partial_retry.suffix_repair_depth(tx) != 0 {
+    // Two hang-free early Rewinds, then escalate. One Rewind + FullReplay
+    // without re-snapped FF basics was the full_from_0 mill on 15274915.
+    if specfence.partial_retry.suffix_repair_depth(tx) >= 2 {
         return None;
     }
     let k = specfence.access_log.first_k(tx, loc).filter(|&k| k > 1)?;
