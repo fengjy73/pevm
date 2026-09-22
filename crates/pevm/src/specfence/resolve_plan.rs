@@ -523,7 +523,7 @@ pub(crate) fn try_early_waw_rewind(
     Some(ResolvePlan::PartialAbortRewind)
 }
 
-/// Large sticky≥32: first conflict is crit ℓ and peer already ChainSpine
+/// Large sticky≥32: conflict includes crit ℓ and peer already ChainSpine
 /// Released / true_publish_ready → Prefer PartialAbortRewind (+ prefix) over
 /// FullReplay. Cuts chain_c wall; Avoid theater Opt→validate→FullReplay.
 pub(crate) fn try_chain_released_rewind(
@@ -532,7 +532,7 @@ pub(crate) fn try_chain_released_rewind(
     specfence: SpecFenceCtx<'_>,
     invalid: &[MemoryLocationHash],
 ) -> Option<ResolvePlan> {
-    if invalid.len() != 1 {
+    if invalid.is_empty() {
         return None;
     }
     // Thin: Rewind tax > FullReplay (same rule as try_early_waw_rewind).
@@ -540,11 +540,15 @@ pub(crate) fn try_chain_released_rewind(
         return None;
     }
     let tx = tx_version.tx_idx;
-    let loc = invalid[0];
     let arms = specfence.access_arms;
-    if !arms.is_crit_loc(loc) || arms.crit_chain_len() < 32 {
+    if arms.crit_chain_len() < 32 {
         return None;
     }
+    // Prefer crit ℓ even when multi-loc invalid (len==1 was under-firing).
+    let loc = invalid
+        .iter()
+        .copied()
+        .find(|&l| arms.is_crit_loc(l))?;
     if arms.is_never(loc) || location_is_lazy(mv_memory, tx, loc) {
         return None;
     }

@@ -293,21 +293,27 @@ impl AccessArmTable {
         out
     }
 
-    /// Cheap: this tx is a WaitOnce/crit consumer of some earlier peer.
-    /// Over-approximates "will read ℓ" — safe for OCC-shaped skip (false ⇒
-    /// keep full Avoid path).
+    /// Cheap: this tx is a WaitOnce consumer of some earlier peer.
+    /// Crit-spine membership alone must **not** gate OCC-shaped — thin Soft=0
+    /// crit consult is already a near-noop, and including `crit_pred` falsely
+    /// taxed ~every tx after the first sticky writer (~0.5 ms calm shell).
     #[inline]
     pub(crate) fn has_wait_once_peer_before(&self, tx: TxIdx) -> bool {
-        let crit = self.crit_loc.load(Ordering::Relaxed);
-        if crit != u64::MAX && self.crit_pred(tx, crit).is_some() {
-            return true;
-        }
         if !self.any_wait_once() {
             return false;
         }
-        self.arms
+        if self
+            .arms
             .iter()
             .any(|e| e.arm == AccessArm::WaitOnce && e.peer > 0 && e.peer < tx)
+        {
+            return true;
+        }
+        self.wait_edges
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|&(c, p, _)| c == tx && p > 0 && p < tx)
     }
 
     /// True when `tx` is a known WaitOnce/crit producer (tip install must stay).
@@ -529,11 +535,21 @@ mod tests {
     fn has_wait_once_peer_before_gates_occ_shaped() {
         let t = AccessArmTable::new();
         assert!(!t.has_wait_once_peer_before(40));
+        // Crit spine alone must not gate OCC-shaped.
+        t.install_crit_chain(99, &[1, 7, 20, 40]);
+        assert!(
+            !t.has_wait_once_peer_before(40),
+            "crit_pred alone must not block OCC-shaped"
+        );
         t.note_early_waw_peer(33, 5, 7);
         assert!(t.any_wait_once());
         assert!(t.has_wait_once_peer_before(40));
         assert!(!t.has_wait_once_peer_before(5), "peer must be before tx");
         assert!(t.is_wait_once_producer(7));
-        assert!(!t.is_wait_once_producer(40));
+        assert!(
+            t.is_wait_once_producer(40),
+            "crit writer stays a tip producer"
+        );
+        assert!(!t.is_wait_once_producer(99));
     }
 }
