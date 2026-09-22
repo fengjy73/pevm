@@ -217,7 +217,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.read_accounts.clear();
         self.pcc_armed.set(false);
         if let Some(fg) = self.specfence.finegrain {
-            fg.deep_begin_consumer(tx_idx, incarnation);
+            // OCC-shaped: no finegrain museum (no rem / consult grain).
+            if !self.sf_occ_shaped {
+                fg.deep_begin_consumer(tx_idx, incarnation);
+            }
         }
         if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
             // Every incarnation, including the thin ungated shell. Otherwise
@@ -246,9 +249,12 @@ impl<'a, S: Storage> VmDb<'a, S> {
         } else if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
             // Ungated shell still drops the previous incarnation's snaps.
             // ff_head (prefix keep) is not in that cell.
-            self.specfence
-                .partial_retry
-                .reset_incarnation(tx_idx, incarnation);
+            // OCC-shaped: no value_snap / rem grain this tx — skip reset.
+            if !self.sf_occ_shaped {
+                self.specfence
+                    .partial_retry
+                    .reset_incarnation(tx_idx, incarnation);
+            }
         }
         if let TxKind::Call(to) = tx.kind {
             self.to_code_hash = self.get_code_hash(to)?;
@@ -302,9 +308,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
     /// Returns Some when origin is unchanged — caller skips MV lazy walk.
 
     /// Record rem value_snap for value-stable RebindOnly at validate (and journal FF).
+    /// Thin OCC-shaped (no WaitOnce peer): rem unused — thin skips Rewind and
+    /// shaped txs do not arm prefix keep; snap inserts are pure shell tax.
     #[inline]
     fn maybe_note_value(&self, location_hash: MemoryLocationHash, value: FfValue) {
-        if self.specfence.mode != crate::ConcurrencyMode::SpecFence {
+        if self.specfence.mode != crate::ConcurrencyMode::SpecFence || self.sf_occ_shaped {
             return;
         }
         self.specfence
@@ -3972,13 +3980,14 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     }
                 }
 
-                let (is_lazy, optimistic_majority_lazy, read_set) = {
+                let (is_lazy, optimistic_majority_lazy, read_set, sf_occ_shaped) = {
                     let db = ctx.db_mut();
                     db.flush_access_census();
                     (
                         db.is_lazy,
                         db.optimistic_majority_lazy,
                         std::mem::take(&mut db.read_set),
+                        db.sf_occ_shaped,
                     )
                 };
 
@@ -4059,17 +4068,28 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 if optimistic_ungated {
                     // Light tip publish before record moves write_set (Released /
                     // ChainSpine so WaitOnce Avoid hits without spin/museum).
-                    let tip_locs: Vec<_> = write_set
-                        .iter()
-                        .map(|(loc, _)| *loc)
-                        .filter(|&loc| {
-                            self.specfence.sf_tips.is_chain_loc(loc)
-                                || (self.specfence.scheduler.block_size()
-                                    <= crate::specfence::THIN_SHELL_N
-                                    && (self.specfence.access_arms.is_crit_loc(loc)
-                                        || self.specfence.access_arms.is_wait_once(loc)))
-                        })
-                        .collect();
+                    // OCC-shaped non-producer: skip tip DashMap + promote museum
+                    // (install_version_tip already skipped at execute start).
+                    let shaped_skip_tip = sf_occ_shaped
+                        && !self
+                            .specfence
+                            .access_arms
+                            .is_wait_once_producer(tx_version.tx_idx);
+                    let tip_locs: Vec<_> = if shaped_skip_tip {
+                        Vec::new()
+                    } else {
+                        write_set
+                            .iter()
+                            .map(|(loc, _)| *loc)
+                            .filter(|&loc| {
+                                self.specfence.sf_tips.is_chain_loc(loc)
+                                    || (self.specfence.scheduler.block_size()
+                                        <= crate::specfence::THIN_SHELL_N
+                                        && (self.specfence.access_arms.is_crit_loc(loc)
+                                            || self.specfence.access_arms.is_wait_once(loc)))
+                            })
+                            .collect()
+                    };
                     let (wrote_new_location, contended) =
                         self.mv_memory.record(tx_version, read_set, write_set);
                     for loc in tip_locs {
@@ -4093,24 +4113,26 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     if wrote_new_location {
                         flags |= FinishExecFlags::WroteNewLocation;
                     }
-                    self.specfence
-                        .metrics
-                        .record_speculate(tx.caller, tx.kind.to().copied());
-                    for loc in contended {
-                        if loc == self.beneficiary_location_hash {
-                            continue;
+                    if !shaped_skip_tip {
+                        self.specfence
+                            .metrics
+                            .record_speculate(tx.caller, tx.kind.to().copied());
+                        for loc in contended {
+                            if loc == self.beneficiary_location_hash {
+                                continue;
+                            }
+                            let addr = if loc == from_hash {
+                                Some(tx.caller)
+                            } else if Some(loc) == to_hash {
+                                tx.kind.to().copied()
+                            } else {
+                                None
+                            };
+                            if addr == Some(self.specfence.beneficiary) {
+                                continue;
+                            }
+                            self.promote_region(loc, addr);
                         }
-                        let addr = if loc == from_hash {
-                            Some(tx.caller)
-                        } else if Some(loc) == to_hash {
-                            tx.kind.to().copied()
-                        } else {
-                            None
-                        };
-                        if addr == Some(self.specfence.beneficiary) {
-                            continue;
-                        }
-                        self.promote_region(loc, addr);
                     }
                     let receipt = receipt_from_revm(exec_result);
                     let state = state_transitions_from_revm(self.is_eip_161_enabled, state);

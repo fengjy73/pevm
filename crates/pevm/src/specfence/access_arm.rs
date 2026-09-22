@@ -320,6 +320,9 @@ impl AccessArmTable {
                 return true;
             }
         }
+        if !self.any_wait_once() {
+            return false;
+        }
         self.arms
             .iter()
             .any(|e| e.arm == AccessArm::WaitOnce && e.peer == tx)
