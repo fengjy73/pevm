@@ -982,8 +982,8 @@ impl Pevm {
             // Avoid/wall success: ChainSpine Suppresses Opt D1 notes → focus
             // chain_n collapses 62→4–5; Learn then sees short n_pairs and
             // demotes Win→Opt. Strong HOLD keeps ≥32 writers + refreshes D1.
-            let avoid_hold = sf_tips.chain_avoid_n() > 0
-                && sf_tips.chain_avoid_n() >= sf_tips.chain_late_n();
+            let avoid_hold =
+                sf_tips.chain_avoid_n() > 0 && sf_tips.chain_avoid_n() >= sf_tips.chain_late_n();
             let fresh = select_crit_chain(&self.last_location_writers, block_size, beneficiary);
             let prev = self.inter_prior.crit_chain();
             let packed = match (fresh, prev) {
@@ -1024,8 +1024,7 @@ impl Pevm {
                         *w = writers.clone();
                     }
                 } else {
-                    self.last_location_writers
-                        .push((*loc, writers.clone()));
+                    self.last_location_writers.push((*loc, writers.clone()));
                 }
             }
             self.inter_prior.pack_crit_chain(packed);
@@ -1512,6 +1511,15 @@ impl Pevm {
             if let Some(wave) = wave {
                 vm.try_apply_park_resume(tx_version.tx_idx, wave);
             }
+            // Known toucher of a protected ℓ: first interpreter entry sees
+            // the published tip. Parking here is not a mid-exec reexec.
+            if !leftover_min && let Some(pred) = vm.protected_admission_blocker(tx_version.tx_idx) {
+                let parked = scheduler.add_wait_for_dependency(tx_version.tx_idx, pred);
+                if parked {
+                    vm.record_wait_for_dependency();
+                    return SfExec::Blocked { on: Some(pred) };
+                }
+            }
             let exec_t0 = (tx_version.tx_incarnation > 0).then(Instant::now);
             return match vm.execute(
                 &tx_version,
@@ -1551,8 +1559,8 @@ impl Pevm {
                     // Protected unfinished-writer defer: same incarnation, no
                     // Aborting. Chain schedule-defer would drop the dependency
                     // and restart the reader immediately.
-                    let cheap_defer = park_kind == crate::specfence::ParkKind::WaitForDependency
-                        && park_k == 0;
+                    let cheap_defer =
+                        park_kind == crate::specfence::ParkKind::WaitForDependency && park_k == 0;
                     // leftover_min must commit when the blocker is already
                     // done (nonce / WaitForDependency on tx-1). Parking
                     // fails, leftover_min stays Executing, heal mills
@@ -2516,9 +2524,7 @@ fn try_validate(
             // Re-exec has not published. Readers of a protected ℓ must see this
             // writer, not only the last already-published MvMemory tip.
             for &loc in &occ_write_locs {
-                specfence
-                    .sf_tips
-                    .note_open_writer(loc, tx_version.tx_idx);
+                specfence.sf_tips.note_open_writer(loc, tx_version.tx_idx);
             }
             for &loc in &occ_write_locs {
                 specfence.sketch.push_spine(loc, tx_version.tx_idx);
