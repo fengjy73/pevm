@@ -425,6 +425,22 @@ pub struct SpecFenceMetrics {
     pub sf_avoid_publish_n: usize,
     /// Concurrent Resolve (c): after-fail FullReplay / Rewind (path-c dominate = incomplete).
     pub sf_resolve_after_fail_n: usize,
+    /// Four-class timely Avoid (b): RAW / WAR / WAW / Chain.
+    pub sf_raw_avoid_n: usize,
+    /// Four-class late Resolve (c): RAW.
+    pub sf_raw_late_n: usize,
+    /// Four-class timely Avoid (b): WAR (higher-revalidate on publish).
+    pub sf_war_avoid_n: usize,
+    /// Four-class late Resolve (c): WAR.
+    pub sf_war_late_n: usize,
+    /// Four-class timely Avoid (b): WAW (WaitOnce / OrderedTip).
+    pub sf_waw_avoid_n: usize,
+    /// Four-class late Resolve (c): WAW.
+    pub sf_waw_late_n: usize,
+    /// Four-class timely Avoid (b): long sticky ≥32 chain.
+    pub sf_chain_avoid_n: usize,
+    /// Four-class late Resolve (c): long sticky ≥32 chain.
+    pub sf_chain_late_n: usize,
     /// Must be 0 on Soft=0 SF: Estimate Block on SpecFence path.
     pub estimate_block_sf: usize,
 }
@@ -627,6 +643,14 @@ pub(crate) struct MetricsInner {
     sf_detect_before_n: AtomicUsize,
     sf_avoid_publish_n: AtomicUsize,
     sf_resolve_after_fail_n: AtomicUsize,
+    sf_raw_avoid_n: AtomicUsize,
+    sf_raw_late_n: AtomicUsize,
+    sf_war_avoid_n: AtomicUsize,
+    sf_war_late_n: AtomicUsize,
+    sf_waw_avoid_n: AtomicUsize,
+    sf_waw_late_n: AtomicUsize,
+    sf_chain_avoid_n: AtomicUsize,
+    sf_chain_late_n: AtomicUsize,
     estimate_block_sf: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -1390,7 +1414,7 @@ impl MetricsInner {
         self.prefix_resume_n.store(prefix_resume, Ordering::Relaxed);
     }
 
-    /// SfMvMemory tip-plane + Detect|Avoid|Resolve path census (end-of-block).
+    /// SfMvMemory tip-plane + Detect|Avoid|Resolve + four-class census (end-of-block).
     pub(crate) fn record_sf_mv_tips(
         &self,
         early_tip: usize,
@@ -1400,6 +1424,14 @@ impl MetricsInner {
         detect_before: usize,
         avoid_publish: usize,
         resolve_after_fail: usize,
+        raw_avoid: usize,
+        raw_late: usize,
+        war_avoid: usize,
+        war_late: usize,
+        waw_avoid: usize,
+        waw_late: usize,
+        chain_avoid: usize,
+        chain_late: usize,
     ) {
         self.sf_early_tip_n.store(early_tip, Ordering::Relaxed);
         self.sf_publish_wake_n
@@ -1414,6 +1446,14 @@ impl MetricsInner {
             .store(avoid_publish, Ordering::Relaxed);
         self.sf_resolve_after_fail_n
             .store(resolve_after_fail, Ordering::Relaxed);
+        self.sf_raw_avoid_n.store(raw_avoid, Ordering::Relaxed);
+        self.sf_raw_late_n.store(raw_late, Ordering::Relaxed);
+        self.sf_war_avoid_n.store(war_avoid, Ordering::Relaxed);
+        self.sf_war_late_n.store(war_late, Ordering::Relaxed);
+        self.sf_waw_avoid_n.store(waw_avoid, Ordering::Relaxed);
+        self.sf_waw_late_n.store(waw_late, Ordering::Relaxed);
+        self.sf_chain_avoid_n.store(chain_avoid, Ordering::Relaxed);
+        self.sf_chain_late_n.store(chain_late, Ordering::Relaxed);
     }
 
     pub(crate) fn record_prefix_resume(&self, _kept: usize) {
@@ -1801,6 +1841,14 @@ impl MetricsInner {
             sf_detect_before_n: self.sf_detect_before_n.load(Ordering::Relaxed),
             sf_avoid_publish_n: self.sf_avoid_publish_n.load(Ordering::Relaxed),
             sf_resolve_after_fail_n: self.sf_resolve_after_fail_n.load(Ordering::Relaxed),
+            sf_raw_avoid_n: self.sf_raw_avoid_n.load(Ordering::Relaxed),
+            sf_raw_late_n: self.sf_raw_late_n.load(Ordering::Relaxed),
+            sf_war_avoid_n: self.sf_war_avoid_n.load(Ordering::Relaxed),
+            sf_war_late_n: self.sf_war_late_n.load(Ordering::Relaxed),
+            sf_waw_avoid_n: self.sf_waw_avoid_n.load(Ordering::Relaxed),
+            sf_waw_late_n: self.sf_waw_late_n.load(Ordering::Relaxed),
+            sf_chain_avoid_n: self.sf_chain_avoid_n.load(Ordering::Relaxed),
+            sf_chain_late_n: self.sf_chain_late_n.load(Ordering::Relaxed),
             estimate_block_sf: self.estimate_block_sf.load(Ordering::Relaxed),
         }
     }

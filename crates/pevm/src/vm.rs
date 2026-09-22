@@ -543,6 +543,12 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if pred >= self.tx_idx {
             return Ok(());
         }
+        // Four-class: Chain (sticky≥32) | WAW (early-k) | RAW (else WaitOnce).
+        let class = crate::specfence::classify_wait_conflict(
+            self.specfence.access_arms.is_crit_loc(location_hash),
+            self.specfence.access_arms.crit_chain_len(),
+            self.specfence.access_arms.wait_once_k(location_hash),
+        );
         // (a) Detect before read — concurrent capability, not a later stage.
         self.specfence.sf_tips.record_detect_before();
         let finished =
@@ -551,6 +557,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if finished || sf.true_publish_ready(location_hash, pred) {
             // (b) Avoid at read via true publish / done.
             self.specfence.sf_tips.record_avoid_publish();
+            self.specfence.sf_tips.record_class_avoid(class);
             return Ok(());
         }
         let executing = self.specfence.scheduler.is_executing(pred);
@@ -580,6 +587,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                         || self.specfence.scheduler.is_validated(pred)
                     {
                         self.specfence.sf_tips.record_avoid_publish();
+                        self.specfence.sf_tips.record_class_avoid(class);
                         return Ok(());
                     }
                     if !self.specfence.scheduler.is_executing(pred) {
@@ -593,6 +601,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 || self.specfence.scheduler.is_validated(pred)
             {
                 self.specfence.sf_tips.record_avoid_publish();
+                self.specfence.sf_tips.record_class_avoid(class);
                 return Ok(());
             }
             // Exact waiter registered for publish wake metrics; no Blocking park.
@@ -2699,12 +2708,11 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         locs: &[crate::MemoryLocationHash],
     ) {
         for &loc in locs {
-            // Tip plane: thin WaitOnce/crit only (large sticky must not pay).
+            // Tip plane: thin WaitOnce/crit; large crit-only (sticky≥32 Chain).
             let thin = self.specfence.scheduler.block_size() <= crate::specfence::THIN_SHELL_N;
-            if thin
-                && (loc == self.specfence.access_arms.crit_loc_hash()
-                    || self.specfence.access_arms.is_wait_once(loc))
-            {
+            let tip_loc = self.specfence.access_arms.is_crit_loc(loc)
+                || (thin && self.specfence.access_arms.is_wait_once(loc));
+            if tip_loc {
                 let _exact = self
                     .specfence
                     .sf_tips
@@ -3001,16 +3009,17 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             ctx.journal_mut().clear();
         }
 
-        // SpecFence write path: early version tip + live_writer for thin Avoid
-        // (WaitOnce / crit only). Large sticky≥32 + fail_k Rewind must not pay
-        // tip-plane DashMap tax — SoT: thin wins from early tip; large keeps hold.
-        if self.specfence.mode == crate::ConcurrencyMode::SpecFence
-            && self.specfence.scheduler.block_size() <= crate::specfence::THIN_SHELL_N
-        {
+        // SpecFence write path: early version tip + live_writer.
+        // Thin: WaitOnce / crit. Large: crit-only (sticky≥32 Chain Avoid via
+        // SfMvMemory — not full-WS tip tax). SoT: redesign serves all four.
+        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            let thin = self.specfence.scheduler.block_size() <= crate::specfence::THIN_SHELL_N;
             let crit = self.specfence.access_arms.crit_loc_hash();
             let prior = self.mv_memory.write_locations(tx_version.tx_idx);
             for &loc in &prior {
-                if loc == crit || self.specfence.access_arms.is_wait_once(loc) {
+                let tip = self.specfence.access_arms.is_crit_loc(loc)
+                    || (thin && self.specfence.access_arms.is_wait_once(loc));
+                if tip {
                     self.specfence.sf_tips.install_version_tip(
                         loc,
                         tx_version.tx_idx,
@@ -3019,7 +3028,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 }
             }
             if crit != u64::MAX
-                && self.specfence.access_arms.is_wait_once(crit)
+                && (thin || self.specfence.access_arms.crit_chain_len() >= 32)
                 && !prior.iter().any(|&l| l == crit)
             {
                 self.specfence.sf_tips.install_version_tip(

@@ -276,7 +276,7 @@ pub(crate) use hotset::HotSet;
 pub(crate) use hotset::{H_A, H_W};
 pub use resolve_plan::ResolvePlan;
 pub(crate) use runnable_set::RunnableSet;
-pub(crate) use sf_mv::{SfMvMemory, SfTip, SfTipTable};
+pub(crate) use sf_mv::{SfConflictClass, SfMvMemory, SfTip, SfTipTable, classify_wait_conflict};
 pub use visibility::VisibilityPolicy;
 pub(crate) use worker::{SfExec, run_sf_block};
 // kernel.rs museum — tests only; rem-legal SoT is CertificateTable.

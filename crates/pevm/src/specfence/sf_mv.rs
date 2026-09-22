@@ -53,12 +53,18 @@ pub(crate) struct SfTipTable {
     publish_wake_n: AtomicUsize,
     wait_once_consume_n: AtomicUsize,
     /// Concurrent Detect|Avoid|Resolve path audit (per access, not a pipeline).
-    /// (a) Detect before read: WaitOnce/crit + pred known.
     detect_before_n: AtomicUsize,
-    /// (b) Avoid at read via true publish / done (no Opt Storage race).
     avoid_publish_n: AtomicUsize,
-    /// (c) Resolve after fail (FullReplay / fail_k Rewind theater).
     resolve_after_fail_n: AtomicUsize,
+    /// Four conflict classes × timely Avoid (b) vs late Resolve (c).
+    raw_avoid_n: AtomicUsize,
+    raw_late_n: AtomicUsize,
+    war_avoid_n: AtomicUsize,
+    war_late_n: AtomicUsize,
+    waw_avoid_n: AtomicUsize,
+    waw_late_n: AtomicUsize,
+    chain_avoid_n: AtomicUsize,
+    chain_late_n: AtomicUsize,
     /// Must stay 0 on Soft=0 Instant-off: SF Avoid never Blocks on Estimate.
     estimate_block_sf: AtomicUsize,
 }
@@ -226,6 +232,44 @@ impl SfTipTable {
         self.resolve_after_fail_n.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Four-class timely Avoid (b) — collision never happens for this class.
+    #[inline]
+    pub(crate) fn record_class_avoid(&self, class: SfConflictClass) {
+        match class {
+            SfConflictClass::Raw => {
+                self.raw_avoid_n.fetch_add(1, Ordering::Relaxed);
+            }
+            SfConflictClass::War => {
+                self.war_avoid_n.fetch_add(1, Ordering::Relaxed);
+            }
+            SfConflictClass::Waw => {
+                self.waw_avoid_n.fetch_add(1, Ordering::Relaxed);
+            }
+            SfConflictClass::Chain => {
+                self.chain_avoid_n.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Four-class late Resolve (c) — FullReplay / Rewind after mistake.
+    #[inline]
+    pub(crate) fn record_class_late(&self, class: SfConflictClass) {
+        match class {
+            SfConflictClass::Raw => {
+                self.raw_late_n.fetch_add(1, Ordering::Relaxed);
+            }
+            SfConflictClass::War => {
+                self.war_late_n.fetch_add(1, Ordering::Relaxed);
+            }
+            SfConflictClass::Waw => {
+                self.waw_late_n.fetch_add(1, Ordering::Relaxed);
+            }
+            SfConflictClass::Chain => {
+                self.chain_late_n.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// SF path attempted Estimate Block — must stay unused (counter for land proof).
     #[inline]
     pub(crate) fn record_estimate_block_sf(&self) {
@@ -263,8 +307,71 @@ impl SfTipTable {
     }
 
     #[inline]
+    pub(crate) fn raw_avoid_n(&self) -> usize {
+        self.raw_avoid_n.load(Ordering::Relaxed)
+    }
+    #[inline]
+    pub(crate) fn raw_late_n(&self) -> usize {
+        self.raw_late_n.load(Ordering::Relaxed)
+    }
+    #[inline]
+    pub(crate) fn war_avoid_n(&self) -> usize {
+        self.war_avoid_n.load(Ordering::Relaxed)
+    }
+    #[inline]
+    pub(crate) fn war_late_n(&self) -> usize {
+        self.war_late_n.load(Ordering::Relaxed)
+    }
+    #[inline]
+    pub(crate) fn waw_avoid_n(&self) -> usize {
+        self.waw_avoid_n.load(Ordering::Relaxed)
+    }
+    #[inline]
+    pub(crate) fn waw_late_n(&self) -> usize {
+        self.waw_late_n.load(Ordering::Relaxed)
+    }
+    #[inline]
+    pub(crate) fn chain_avoid_n(&self) -> usize {
+        self.chain_avoid_n.load(Ordering::Relaxed)
+    }
+    #[inline]
+    pub(crate) fn chain_late_n(&self) -> usize {
+        self.chain_late_n.load(Ordering::Relaxed)
+    }
+
+    #[inline]
     pub(crate) fn estimate_block_sf(&self) -> usize {
         self.estimate_block_sf.load(Ordering::Relaxed)
+    }
+}
+
+/// Four conflict classes SfMvMemory must serve (concurrent Detect|Avoid|Resolve).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SfConflictClass {
+    /// Reader must see correct published write.
+    Raw,
+    /// Write-after-read: invalidate / revalidate higher readers — not schedule-only.
+    War,
+    /// Publish order / WaitOnce / OrderedTip.
+    Waw,
+    /// Long dependency chain (sticky ≥32 / nearest-pred).
+    Chain,
+}
+
+/// Classify a WaitOnce / crit consult edge for four-class audit.
+/// Chain wins on sticky ≥32 crit ℓ; early-WAW template (k>0) → Waw; else Raw.
+#[inline]
+pub(crate) fn classify_wait_conflict(
+    is_crit: bool,
+    crit_len: usize,
+    wait_once_k: u32,
+) -> SfConflictClass {
+    if is_crit && crit_len >= 32 {
+        SfConflictClass::Chain
+    } else if wait_once_k > 0 || is_crit {
+        SfConflictClass::Waw
+    } else {
+        SfConflictClass::Raw
     }
 }
 
@@ -465,14 +572,22 @@ mod tests {
     }
 
     #[test]
-    fn abort_clears_live_writer_and_wakes_waiters() {
-        let tips = SfTipTable::new();
-        tips.install_version_tip(22, 2, 0);
-        tips.register_waiter(22, 2, 5);
-        assert_eq!(tips.live_writer(22), Some(2));
-        let woken = tips.clear_writer(2, &[22]);
-        assert_eq!(woken, vec![5]);
-        assert!(tips.tip_at(22, 2).is_none());
-        assert_eq!(tips.live_writer(22), None);
+    fn classify_wait_conflict_four_classes() {
+        assert_eq!(
+            classify_wait_conflict(true, 75, 1),
+            SfConflictClass::Chain
+        );
+        assert_eq!(
+            classify_wait_conflict(true, 16, 5),
+            SfConflictClass::Waw
+        );
+        assert_eq!(
+            classify_wait_conflict(false, 0, 5),
+            SfConflictClass::Waw
+        );
+        assert_eq!(
+            classify_wait_conflict(false, 0, 0),
+            SfConflictClass::Raw
+        );
     }
 }

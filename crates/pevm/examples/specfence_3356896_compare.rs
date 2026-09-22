@@ -305,7 +305,7 @@ fn print_focus(pevm: &Pevm, mode_name: &str, i: usize, n: usize, m: &pevm::SpecF
             .unwrap_or(0.0)
     };
     println!(
-        "  focus {mode_name}[{i}] full={} full_from_0={} prefix={} fail_k_n={} fail_k_min={} fail_k_max={} hist={} chain={loc:016x} chain_n={} head_tx={} head_ms={:.3} tail_tx={} tail_ms={:.3} corr={corr:.3} low_q_ms={:.3} high_q_ms={:.3} explore={} began_prior={} detect_a={} avoid_b={} resolve_c={} early_tip={} est_block={}",
+        "  focus {mode_name}[{i}] full={} full_from_0={} prefix={} fail_k_n={} fail_k_min={} fail_k_max={} hist={} chain={loc:016x} chain_n={} head_tx={} head_ms={:.3} tail_tx={} tail_ms={:.3} corr={corr:.3} low_q_ms={:.3} high_q_ms={:.3} explore={} began_prior={} detect_a={} avoid_b={} resolve_c={} early_tip={} est_block={} raw_ab={} raw_c={} war_ab={} war_c={} waw_ab={} waw_c={} chain_ab={} chain_c={}",
         m.resolve_full_replay,
         m.full_from_zero,
         m.prefix_resume_n,
@@ -326,7 +326,15 @@ fn print_focus(pevm: &Pevm, mode_name: &str, i: usize, n: usize, m: &pevm::SpecF
         m.sf_avoid_publish_n,
         m.sf_resolve_after_fail_n,
         m.sf_early_tip_n,
-        m.estimate_block_sf
+        m.estimate_block_sf,
+        m.sf_raw_avoid_n,
+        m.sf_raw_late_n,
+        m.sf_war_avoid_n,
+        m.sf_war_late_n,
+        m.sf_waw_avoid_n,
+        m.sf_waw_late_n,
+        m.sf_chain_avoid_n,
+        m.sf_chain_late_n,
     );
 }
 

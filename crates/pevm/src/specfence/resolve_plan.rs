@@ -5,13 +5,14 @@
 
 use crate::mv_memory::MvMemory;
 use crate::scheduler::Scheduler;
-use crate::{MemoryLocationHash, TxVersion};
+use crate::{MemoryLocationHash, MemoryValue, TxVersion};
 
 use super::SpecFenceCtx;
 use super::VisibilityPolicy;
 use super::arm_table::ArmTable;
 use super::collateral::{ConflictClass, classify_first_conflict, location_is_lazy};
 use super::runnable_set::{QueueKind, RunnableSet};
+use super::sf_mv::SfConflictClass;
 
 /// Structured validate outcome. Replaces “bool valid → abort” as the SF root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -106,6 +107,7 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
         ResolvePlan::PartialAbortRewind => {
             // (c) Resolve after fail — live mistake found; prefix from fail_k.
             ctx.specfence.sf_tips.record_resolve_after_fail();
+            record_four_class_late(&ctx, first.as_ref());
             ctx.specfence.metrics.record_partial_abort_attempt();
             if ctx.scheduler.try_validation_abort(ctx.tx_version) {
                 let write_locations = ctx.mv_memory.write_locations(tx);
@@ -188,6 +190,7 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
             // (c) Resolve after fail — Opt→validate→FullReplay theater when
             // Detect/Avoid did not keep the collision from happening.
             ctx.specfence.sf_tips.record_resolve_after_fail();
+            record_four_class_late(&ctx, first.as_ref());
             abort_and_estimate(&ctx);
             if let Some(f) = first {
                 match f.class {
@@ -363,8 +366,19 @@ fn abort_and_estimate(ctx: &ApplyCtx<'_>) {
     if aborted {
         let locs = ctx.mv_memory.write_locations(tx);
         ctx.mv_memory.convert_writes_to_estimates(tx);
-        if ctx.scheduler.block_size() <= super::THIN_SHELL_N {
-            let _ = ctx.specfence.sf_tips.clear_writer(tx, &locs);
+        // Clear SF tip + live_writer for any tip-plane ℓ (thin WaitOnce/crit;
+        // large crit sticky≥32). Stale Version tips must not park WaitOnce.
+        let thin = ctx.scheduler.block_size() <= super::THIN_SHELL_N;
+        let tip_locs: Vec<_> = locs
+            .iter()
+            .copied()
+            .filter(|&loc| {
+                ctx.specfence.access_arms.is_crit_loc(loc)
+                    || (thin && ctx.specfence.access_arms.is_wait_once(loc))
+            })
+            .collect();
+        if !tip_locs.is_empty() {
+            let _ = ctx.specfence.sf_tips.clear_writer(tx, &tip_locs);
         }
         ctx.specfence.metrics.record_occ_abort();
         ctx.specfence.metrics.record_full_abort_reexecute();
@@ -577,36 +591,102 @@ fn requeue(ctx: &ApplyCtx<'_>, tx: crate::TxIdx, kind: QueueKind) {
     }
 }
 
-fn enqueue_revalidate(ctx: &ApplyCtx<'_>, reader: crate::TxIdx) {
+fn enqueue_revalidate(ctx: &ApplyCtx<'_>, reader: crate::TxIdx) -> bool {
     if reader >= ctx.scheduler.block_size() {
-        return;
+        return false;
     }
     if !ctx.scheduler.is_executed(reader) && !ctx.scheduler.is_validated(reader) {
-        return;
+        return false;
     }
     // Skip readers whose read set still matches — avoids an O(n²) beneficiary
     // revalidate mill on independent raw transfers.
     if super::occ_read_set_valid(ctx.mv_memory, reader) {
-        return;
+        return false;
     }
     // Demote before the worker loop samples all_validated, otherwise the
     // last Commit exits every core and the revalidate never runs.
     let _ = ctx.scheduler.prepare_revalidate(reader);
     let _ = ctx.runnable.wake_idle(reader, QueueKind::Revalidate);
+    true
 }
 
+/// WAR Avoid (first-class): on publish/Commit, demote higher readers of
+/// written ℓ before they validate a stale read. Not schedule-only absorption —
+/// each successful demote is timely Avoid for write-after-read.
 fn enqueue_higher_revalidate(ctx: &ApplyCtx<'_>, tx: crate::TxIdx) {
     let writes = ctx.mv_memory.write_locations(tx);
     // Lazy beneficiary/sender writes still invalidate higher readers. Skipping
     // that fan-out on the thin shell (n≤176) committed a different account
     // balance than sequential on 3356896 while receipts matched.
     for loc in writes {
-        for reader in ctx.mv_memory.higher_readers_of(loc, tx) {
-            if reader > tx {
-                enqueue_revalidate(ctx, reader);
+        let readers = ctx.mv_memory.higher_readers_of(loc, tx);
+        if readers.is_empty() {
+            continue;
+        }
+        // (a) Detect WAR: higher readers of this published write exist.
+        ctx.specfence.sf_tips.record_detect_before();
+        let mut avoided = 0usize;
+        for reader in readers {
+            if reader > tx && enqueue_revalidate(ctx, reader) {
+                avoided += 1;
+            }
+        }
+        if avoided > 0 {
+            // (b) Avoid WAR: revalidate before stale Commit.
+            ctx.specfence.sf_tips.record_avoid_publish();
+            for _ in 0..avoided {
+                ctx.specfence
+                    .sf_tips
+                    .record_class_avoid(SfConflictClass::War);
             }
         }
     }
+}
+
+/// Four-class late Resolve (c): map first conflict → Raw|War|Waw|Chain.
+fn record_four_class_late(
+    ctx: &ApplyCtx<'_>,
+    first: Option<&super::collateral::FirstConflict>,
+) {
+    let Some(f) = first else {
+        // No classified ℓ — treat as WAW miss (common Opt→FullReplay theater).
+        ctx.specfence
+            .sf_tips
+            .record_class_late(SfConflictClass::Waw);
+        return;
+    };
+    let arms = ctx.specfence.access_arms;
+    if arms.is_crit_loc(f.location) && arms.crit_chain_len() >= 32 {
+        ctx.specfence
+            .sf_tips
+            .record_class_late(SfConflictClass::Chain);
+        return;
+    }
+    let class = match f.class {
+        ConflictClass::EffectiveWAW => {
+            match ctx
+                .mv_memory
+                .current_data_value(ctx.tx_version.tx_idx, f.location)
+            {
+                Some(MemoryValue::Storage(_)) => SfConflictClass::Raw,
+                _ => {
+                    // Basic WAW default. WAR late when peer already done and
+                    // WaitOnce was never armed (Opt read then write landed).
+                    if f.peer.is_some_and(|p| {
+                        ctx.scheduler.is_done(p) || ctx.scheduler.is_validated(p)
+                    }) && arms.wait_once_k(f.location) == 0
+                        && !arms.is_wait_once(f.location)
+                    {
+                        SfConflictClass::War
+                    } else {
+                        SfConflictClass::Waw
+                    }
+                }
+            }
+        }
+        ConflictClass::LazyNoise | ConflictClass::CommuteCandidate => SfConflictClass::War,
+    };
+    ctx.specfence.sf_tips.record_class_late(class);
 }
 
 #[cfg(test)]

@@ -1022,6 +1022,14 @@ impl Pevm {
                 sf_tips.detect_before_n(),
                 sf_tips.avoid_publish_n(),
                 sf_tips.resolve_after_fail_n(),
+                sf_tips.raw_avoid_n(),
+                sf_tips.raw_late_n(),
+                sf_tips.war_avoid_n(),
+                sf_tips.war_late_n(),
+                sf_tips.waw_avoid_n(),
+                sf_tips.waw_late_n(),
+                sf_tips.chain_avoid_n(),
+                sf_tips.chain_late_n(),
             );
             metrics_inner.set_true_spine_metrics(
                 runnable.steal_n(),
@@ -2411,11 +2419,18 @@ fn try_validate(
         if specfence.mode == ConcurrencyMode::SpecFence {
             // Drop SF version tip / live_writer so WaitOnce does not park on
             // a stale unpublished claim (SoT: Estimate is OCC-only).
-            // Thin tip plane only — skip walk when tips unused (large).
-            if scheduler.block_size() <= crate::specfence::THIN_SHELL_N {
-                let _ = specfence
-                    .sf_tips
-                    .clear_writer(tx_version.tx_idx, &occ_write_locs);
+            // Tip plane: thin WaitOnce/crit; large crit sticky≥32.
+            let thin = scheduler.block_size() <= crate::specfence::THIN_SHELL_N;
+            let tip_locs: Vec<_> = occ_write_locs
+                .iter()
+                .copied()
+                .filter(|&loc| {
+                    specfence.access_arms.is_crit_loc(loc)
+                        || (thin && specfence.access_arms.is_wait_once(loc))
+                })
+                .collect();
+            if !tip_locs.is_empty() {
+                let _ = specfence.sf_tips.clear_writer(tx_version.tx_idx, &tip_locs);
             }
             for &loc in &occ_write_locs {
                 specfence.sketch.push_spine(loc, tx_version.tx_idx);

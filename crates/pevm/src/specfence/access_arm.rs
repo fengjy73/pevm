@@ -213,6 +213,28 @@ impl AccessArmTable {
         self.crit_loc.load(Ordering::Relaxed)
     }
 
+    /// Learned sticky spine length (0 when no crit chain).
+    #[inline]
+    pub(crate) fn crit_chain_len(&self) -> usize {
+        if self.crit_loc.load(Ordering::Relaxed) == u64::MAX {
+            return 0;
+        }
+        self.crit_writers.lock().unwrap().len()
+    }
+
+    /// True when `loc` is the sticky ≥32 crit chain location.
+    #[inline]
+    pub(crate) fn is_crit_loc(&self, loc: MemoryLocationHash) -> bool {
+        let c = self.crit_loc.load(Ordering::Relaxed);
+        c != u64::MAX && c == loc
+    }
+
+    /// Early-WAW template k for `loc` (0 = opportunistic / RAW WaitOnce).
+    #[inline]
+    pub(crate) fn wait_once_k(&self, loc: MemoryLocationHash) -> u32 {
+        self.arms.get(&loc).map(|e| e.k).unwrap_or(0)
+    }
+
     /// Immediate prior writer on the learned chain, if `loc` is that chain.
     pub(crate) fn crit_pred(&self, tx: TxIdx, loc: MemoryLocationHash) -> Option<TxIdx> {
         if self.crit_loc.load(Ordering::Relaxed) != loc {
