@@ -173,21 +173,15 @@ impl RunnableSet {
             return;
         }
         // Learned WAW successor.
-        // Thin: off-queue until pred commits (short spine, no overlap slot).
-        // Large: only the immediate next hop is seeded. It runs non-chain
-        // work, then WaitOnce stalls that access until early Data — not the
-        // whole tx from admission. Further hops stay off this seed so they
-        // do not occupy cores; chain_release wakes the nearest one.
-        // Do not hold every sticky succ off Q_indep until pred done (land-v1).
-        if let Some(pred) = ready.blocking_producer(tx)
+        // Thin: seed off-queue (v4). Heal may put them back on the antichain.
+        // Large: stay on Q_indep. WaitOnce stalls only the chain access.
+        // Holding every succ off the queue until pred done was land-v1 (TPS 0.44).
+        if self.block_size <= crate::specfence::THIN_SHELL_N
+            && let Some(pred) = ready.blocking_producer(tx)
             && !ready.is_writer_done(pred)
         {
-            let immediate = self.block_size > crate::specfence::THIN_SHELL_N
-                && ready.blocking_producer(pred).is_none();
-            if !immediate {
-                self.mark_wait(tx);
-                return;
-            }
+            self.mark_wait(tx);
+            return;
         }
         self.push(tx, QueueKind::Indep);
     }
@@ -487,13 +481,6 @@ impl RunnableSet {
         }
         if ready.leftover_min_on_skippable_gate(tx) {
             let _ = self.wake_idle(tx, QueueKind::Indep);
-            return;
-        }
-        // Parked chain hop: heal must not push it back onto Q_indep before
-        // Data. Seed already admitted the immediate hop. Resume is
-        // `wake_idle` on chain_release, not this path.
-        if ready.blocking_producer(tx).is_some() {
-            self.note_wait_unless_running(tx);
             return;
         }
         if ready.leftover_surplus(tx) || (ready.is_gated(tx) && !ready.may_execute(tx)) {

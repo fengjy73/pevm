@@ -680,9 +680,13 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 self.specfence.sf_tips.record_class_avoid(class);
                 return Ok(());
             }
+            // Brief only. A multi-ms in-exec sleep serialized the hop and
+            // lost to OCC (large TPS ~0.50, under the v4 ~0.65 floor).
+            // Early Data still satisfies this window when the pred has
+            // already finalized the chain write.
             let claimed = executing && self.specfence.sf_tips.try_claim_overlap(self.tx_idx);
             if claimed {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_micros(400);
                 while !published(&sf) {
                     if !self.specfence.scheduler.is_executing(pred) && !has_sf_tip {
                         break;
@@ -692,7 +696,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     }
                     self.specfence
                         .sf_tips
-                        .wait_overlap_timeout(std::time::Duration::from_micros(200));
+                        .wait_overlap_timeout(std::time::Duration::from_micros(80));
                 }
                 self.specfence.sf_tips.release_overlap(self.tx_idx);
                 if published(&sf) {
