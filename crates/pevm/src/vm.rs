@@ -548,11 +548,13 @@ impl<'a, S: Storage> VmDb<'a, S> {
             .specfence
             .sf_tips
             .has_version_or_released(location_hash, pred);
-        // Thin: Avoid up front — do not Opt-read Storage while the true
-        // writer is unfinished. Spin briefly if Executing; else exact-waiter
-        // defer (publish-wait), never Estimate Block. Path (c) FullReplay
-        // after Opt is incomplete Detect→Avoid.
+        // Thin: Avoid when writer is live / SF-tipped. Do not Block a
+        // not-started pred (serialized the 15-writer spine). FullReplay
+        // plants ungated wait for the next pick (Detect→Avoid).
         if thin {
+            if !executing && !has_sf_tip {
+                return Ok(());
+            }
             self.specfence.sf_tips.record_wait_once_consume();
             if executing {
                 const SPIN: usize = 131_072;
@@ -583,8 +585,15 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 .note_ungated_wait_on(self.tx_idx, pred);
             return Err(self.park_publish_wait(location_hash, pred));
         }
-        // Large: park only when live or SF tip — not Estimate alone.
-        if !executing && !has_sf_tip {
+        // Large: park when live, SF tip, or (legacy) Estimate tip — Blocking
+        // goes through park_publish_wait so estimate_block_sf stays 0.
+        let live = executing
+            || has_sf_tip
+            || matches!(
+                self.mv_memory.entry_kind_at(location_hash, pred),
+                "estimate"
+            );
+        if !live {
             return Ok(());
         }
         self.specfence.sf_tips.record_wait_once_consume();
@@ -1857,8 +1866,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
 }
 
 /// Opt | WaitOnce | NeverWait. Not a method: callers hold `read_set`.
-/// SpecFence Soft=0: never Block on OCC Estimate alone — only WaitOnce /
-/// crit publish-wait (or leftover_min). Beneficiary / lazy = NeverWait Skip.
+/// SpecFence Soft=0 thin: never Block on OCC Estimate alone — WaitOnce
+/// consult owns thin consume. Large: AccessArm decide may Block once
+/// (publish-wait, not Estimate counter) to preserve sticky/Rewind wins.
 fn live_writer_act(
     specfence: &crate::specfence::SpecFenceCtx<'_>,
     tx_idx: TxIdx,
@@ -1878,31 +1888,24 @@ fn live_writer_act(
     }
     let never = address == specfence.beneficiary || is_lazy;
     let finished = specfence.scheduler.is_done(writer) || specfence.scheduler.is_validated(writer);
-    if never {
-        return specfence
-            .access_arms
-            .decide(tx_idx, location_hash, writer, true, finished);
-    }
-    if finished {
-        return crate::specfence::LiveAct::Retry;
-    }
-    let wait_once = specfence.access_arms.is_wait_once(location_hash)
-        || specfence.access_arms.crit_loc_hash() == location_hash;
-    // Thin ungated WaitOnce: consult_ungated_wait_once owns consume
-    // (spin / exact-waiter). Do not Block again from the MV Estimate walk.
-    if wait_once
+    let thin = specfence.scheduler.block_size() <= crate::specfence::THIN_SHELL_N;
+    // Thin ungated WaitOnce: consult_ungated_wait_once owns consume.
+    if !never
+        && !finished
+        && thin
         && !specfence.ready_edges.is_gated(tx_idx)
-        && specfence.scheduler.block_size() <= crate::specfence::THIN_SHELL_N
+        && (specfence.access_arms.is_wait_once(location_hash)
+            || specfence.access_arms.crit_loc_hash() == location_hash)
     {
         return crate::specfence::LiveAct::Skip;
     }
-    if wait_once {
-        return specfence
-            .access_arms
-            .decide(tx_idx, location_hash, writer, false, finished);
+    // Thin non-WaitOnce: Skip Estimate Block (OCC-baseline-only).
+    if !never && !finished && thin {
+        return crate::specfence::LiveAct::Skip;
     }
-    // SpecFence: unfinished writer without WaitOnce → Skip (no Estimate Block).
-    crate::specfence::LiveAct::Skip
+    specfence
+        .access_arms
+        .decide(tx_idx, location_hash, writer, never, finished)
 }
 
 impl<S: Storage> Database for VmDb<'_, S> {
