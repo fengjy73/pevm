@@ -8,9 +8,9 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 
-use crate::{MemoryLocationHash, TxIdx};
+use crate::{BuildIdentityHasher, MemoryLocationHash, TxIdx};
 
 use super::learner::InterBlockPrior;
 
@@ -80,6 +80,13 @@ pub(crate) struct AccessArmTable {
     prefix_keep_n: AtomicUsize,
     /// Fast Soft=0 Opt skip: any WaitOnce arm installed this block.
     any_wait_once: std::sync::atomic::AtomicBool,
+    /// Locations protected this block after the first hot conflict.
+    /// Later reads must WaitOnce before Opt-discovering ℓ again.
+    protected: DashSet<MemoryLocationHash, BuildIdentityHasher>,
+    protect_n: AtomicUsize,
+    protect_before_opt_n: AtomicUsize,
+    replay_after_protect_n: AtomicUsize,
+    protect_live: std::sync::atomic::AtomicBool,
     /// `u64::MAX` = no learned chain. Writers are for demand-driven WaitOnce.
     crit_loc: AtomicU64,
     crit_writers: Mutex<Vec<TxIdx>>,
@@ -105,6 +112,11 @@ impl AccessArmTable {
         self.prefix_resume.store(0, Ordering::Relaxed);
         self.prefix_keep_n.store(0, Ordering::Relaxed);
         self.any_wait_once.store(false, Ordering::Relaxed);
+        self.protected.clear();
+        self.protect_n.store(0, Ordering::Relaxed);
+        self.protect_before_opt_n.store(0, Ordering::Relaxed);
+        self.replay_after_protect_n.store(0, Ordering::Relaxed);
+        self.protect_live.store(false, Ordering::Relaxed);
         self.crit_loc.store(u64::MAX, Ordering::Relaxed);
         self.crit_writers.lock().unwrap().clear();
         self.wait_edges.lock().unwrap().clear();
@@ -149,7 +161,11 @@ impl AccessArmTable {
             let mut arm = e.arm;
             // Morph flip decays opportunistic WaitOnce (k==0, never reinforced).
             // Early-WAW templates (k>0) stay — reuse must not re-Opt the same fail_k.
-            if flipped && arm == AccessArm::WaitOnce && e.hits == 0 && e.k == 0 {
+            // Mid-block hot protect sticks for the rest of this block and the
+            // next prior. Learn must not demote it back to Opt.
+            if self.protected.contains(e.key()) && arm == AccessArm::WaitOnce {
+                // keep
+            } else if flipped && arm == AccessArm::WaitOnce && e.hits == 0 && e.k == 0 {
                 arm = AccessArm::Opt;
             }
             if arm == AccessArm::Opt {
@@ -338,6 +354,58 @@ impl AccessArmTable {
                 .unwrap()
                 .iter()
                 .any(|&(_, p, _)| p == tx)
+    }
+
+    /// First EffectiveWAW / hot conflict on `ℓ` this block. Remaining reads
+    /// of `ℓ` take WaitOnce (true tip), not another Opt→FullReplay.
+    /// Peer stays 0 so thin OCC-shaped txs that do not touch `ℓ` keep the
+    /// fast path; the protected-loc check is per access.
+    pub(crate) fn protect_hot(&self, loc: MemoryLocationHash) -> bool {
+        if self.is_never(loc) {
+            return false;
+        }
+        if !self.protected.insert(loc) {
+            return false;
+        }
+        self.note_early_waw(loc, 1);
+        self.protect_n.fetch_add(1, Ordering::Relaxed);
+        self.protect_live.store(true, Ordering::Relaxed);
+        true
+    }
+
+    #[inline]
+    pub(crate) fn is_protected(&self, loc: MemoryLocationHash) -> bool {
+        self.protected.contains(&loc)
+    }
+
+    #[inline]
+    pub(crate) fn protect_live(&self) -> bool {
+        self.protect_live.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn note_protect_before_opt(&self) {
+        self.protect_before_opt_n.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn note_replay_after_protect(&self) {
+        self.replay_after_protect_n.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn protect_n(&self) -> usize {
+        self.protect_n.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn protect_before_opt_n(&self) -> usize {
+        self.protect_before_opt_n.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn replay_after_protect_n(&self) -> usize {
+        self.replay_after_protect_n.load(Ordering::Relaxed)
     }
 
     /// Hot early basic/storage WAW template. The next read of `ℓ` waits
@@ -551,5 +619,22 @@ mod tests {
             "crit writer stays a tip producer"
         );
         assert!(!t.is_wait_once_producer(99));
+    }
+
+    #[test]
+    fn protect_hot_arms_wait_once_without_occ_shaped_peer() {
+        let t = AccessArmTable::new();
+        assert!(t.protect_hot(11));
+        assert!(!t.protect_hot(11), "one protect per location");
+        assert!(t.is_protected(11));
+        assert!(t.is_wait_once(11));
+        assert!(t.protect_live());
+        assert_eq!(t.protect_n(), 1);
+        // Peer stays 0 so unrelated later txs keep the OCC-shaped skip.
+        assert!(!t.has_wait_once_peer_before(40));
+        t.note_replay_after_protect();
+        t.note_protect_before_opt();
+        assert_eq!(t.replay_after_protect_n(), 1);
+        assert_eq!(t.protect_before_opt_n(), 1);
     }
 }

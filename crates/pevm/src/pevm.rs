@@ -1051,8 +1051,10 @@ impl Pevm {
                 self.cost_policy.end_block_learn();
             }
             arms.end_pack(&self.inter_prior, block_size);
-            // Sticky ≥32: Keep AccessArm WaitOnce across Learn (not LocStrategy
-            // Win — that prepaid was v5). Avoid is access-grain, not off-queue.
+            // Sticky ≥32: keep AccessArm WaitOnce across Learn. LocStrategy
+            // Win prepaid stays off (v5). Mid-block protect already stuck
+            // hot ℓ; this re-pins the learned spine so end_pack cannot
+            // demote it to Opt.
             if block_size > crate::specfence::THIN_SHELL_N {
                 if let Some((loc, writers)) = self.inter_prior.crit_chain() {
                     if writers.len() >= 32 {
@@ -1064,6 +1066,11 @@ impl Pevm {
                 }
             }
             access_arms.end_pack(&self.inter_prior);
+            metrics_inner.record_hot_protect(
+                access_arms.protect_n(),
+                access_arms.protect_before_opt_n(),
+                access_arms.replay_after_protect_n(),
+            );
             metrics_inner.record_access_avoid(
                 access_arms.wait_once(),
                 access_arms.wait_suppressed(),
@@ -1086,8 +1093,6 @@ impl Pevm {
                 sf_tips.waw_late_n(),
                 sf_tips.chain_avoid_n(),
                 sf_tips.chain_late_n(),
-                sf_tips.overlap_resume_n(),
-                sf_tips.overlap_fill_n(),
             );
             metrics_inner.set_true_spine_metrics(
                 runnable.steal_n(),

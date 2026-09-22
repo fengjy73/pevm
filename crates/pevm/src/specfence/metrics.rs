@@ -443,10 +443,12 @@ pub struct SpecFenceMetrics {
     pub sf_chain_late_n: usize,
     /// Must be 0 on Soft=0 SF: Estimate Block on SpecFence path.
     pub estimate_block_sf: usize,
-    /// In-exec chain WaitOnce resumed on early Data (same exec).
-    pub sf_overlap_resume_n: usize,
-    /// Picks of other txs while one chain hop held the overlap slot.
-    pub sf_overlap_fill_n: usize,
+    /// Locations armed WaitOnce after the first hot conflict this block.
+    pub sf_protect_n: usize,
+    /// OCC-shaped reads that consulted a protected ℓ instead of Opt.
+    pub sf_protect_before_opt_n: usize,
+    /// FullReplay on an ℓ that was already protected.
+    pub sf_replay_after_protect_n: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -656,8 +658,9 @@ pub(crate) struct MetricsInner {
     sf_chain_avoid_n: AtomicUsize,
     sf_chain_late_n: AtomicUsize,
     estimate_block_sf: AtomicUsize,
-    sf_overlap_resume_n: AtomicUsize,
-    sf_overlap_fill_n: AtomicUsize,
+    sf_protect_n: AtomicUsize,
+    sf_protect_before_opt_n: AtomicUsize,
+    sf_replay_after_protect_n: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -1420,6 +1423,15 @@ impl MetricsInner {
         self.prefix_resume_n.store(prefix_resume, Ordering::Relaxed);
     }
 
+    /// Mid-block hot-key protect census (end of block, not an increment).
+    pub(crate) fn record_hot_protect(&self, protect: usize, before_opt: usize, replay_after: usize) {
+        self.sf_protect_n.store(protect, Ordering::Relaxed);
+        self.sf_protect_before_opt_n
+            .store(before_opt, Ordering::Relaxed);
+        self.sf_replay_after_protect_n
+            .store(replay_after, Ordering::Relaxed);
+    }
+
     /// SfMvMemory tip-plane + Detect|Avoid|Resolve + four-class census (end-of-block).
     pub(crate) fn record_sf_mv_tips(
         &self,
@@ -1438,8 +1450,6 @@ impl MetricsInner {
         waw_late: usize,
         chain_avoid: usize,
         chain_late: usize,
-        overlap_resume: usize,
-        overlap_fill: usize,
     ) {
         self.sf_early_tip_n.store(early_tip, Ordering::Relaxed);
         self.sf_publish_wake_n
@@ -1462,10 +1472,6 @@ impl MetricsInner {
         self.sf_waw_late_n.store(waw_late, Ordering::Relaxed);
         self.sf_chain_avoid_n.store(chain_avoid, Ordering::Relaxed);
         self.sf_chain_late_n.store(chain_late, Ordering::Relaxed);
-        self.sf_overlap_resume_n
-            .store(overlap_resume, Ordering::Relaxed);
-        self.sf_overlap_fill_n
-            .store(overlap_fill, Ordering::Relaxed);
     }
 
     pub(crate) fn record_prefix_resume(&self, _kept: usize) {
@@ -1862,8 +1868,9 @@ impl MetricsInner {
             sf_chain_avoid_n: self.sf_chain_avoid_n.load(Ordering::Relaxed),
             sf_chain_late_n: self.sf_chain_late_n.load(Ordering::Relaxed),
             estimate_block_sf: self.estimate_block_sf.load(Ordering::Relaxed),
-            sf_overlap_resume_n: self.sf_overlap_resume_n.load(Ordering::Relaxed),
-            sf_overlap_fill_n: self.sf_overlap_fill_n.load(Ordering::Relaxed),
+            sf_protect_n: self.sf_protect_n.load(Ordering::Relaxed),
+            sf_protect_before_opt_n: self.sf_protect_before_opt_n.load(Ordering::Relaxed),
+            sf_replay_after_protect_n: self.sf_replay_after_protect_n.load(Ordering::Relaxed),
         }
     }
 }

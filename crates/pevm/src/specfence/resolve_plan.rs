@@ -83,6 +83,29 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
     let unfenced = !ctx.specfence.ready_edges.was_queued(tx)
         && matches!(plan, ResolvePlan::FullReplay | ResolvePlan::OrderedReplay);
 
+    // First hot conflict on ℓ: WaitOnce for every later read this block.
+    // Not a mutex and not Estimate Block — consult consumes the true tip.
+    if !matches!(
+        plan,
+        ResolvePlan::Commit | ResolvePlan::PartialAbortRebind
+    ) {
+        let full = matches!(plan, ResolvePlan::FullReplay);
+        for &loc in ctx.invalid {
+            if ctx.specfence.access_arms.is_never(loc)
+                || location_is_lazy(ctx.mv_memory, tx, loc)
+            {
+                continue;
+            }
+            if ctx.specfence.access_arms.is_protected(loc) {
+                if full {
+                    ctx.specfence.access_arms.note_replay_after_protect();
+                }
+            } else {
+                ctx.specfence.access_arms.protect_hot(loc);
+            }
+        }
+    }
+
     match plan {
         ResolvePlan::Commit | ResolvePlan::PartialAbortRebind => {
             if plan == ResolvePlan::PartialAbortRebind {

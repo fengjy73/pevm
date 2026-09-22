@@ -513,9 +513,16 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return Ok(());
         }
         // Thin Soft=0 OCC-shaped: no WaitOnce peer — zero consult tax (ordinals
-        // already noted by basic/storage).
-        if self.sf_occ_shaped {
+        // already noted by basic/storage). A mid-block protected ℓ is the
+        // exception: that access waits for the true tip instead of Opt.
+        if self.sf_occ_shaped
+            && !(self.specfence.access_arms.protect_live()
+                && self.specfence.access_arms.is_protected(location_hash))
+        {
             return Ok(());
+        }
+        if self.sf_occ_shaped {
+            self.specfence.access_arms.note_protect_before_opt();
         }
         // Soft=0 Opt: no WaitOnce and no crit → zero consult tax.
         if !self.specfence.access_arms.any_wait_once()
@@ -665,50 +672,40 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return Ok(());
         }
         self.specfence.sf_tips.record_wait_once_consume();
-        // Chain overlap: stall this access until true Data, then continue
-        // the same exec. One core may sleep on the hop; other workers keep
-        // picking antichain. Do not note_ungated_wait_on here — that plants
-        // a pick-time off-queue hold (serialize Avoid, falsified).
+        // ChainSpineTip: brief Released poll (not long busy-spin) before park.
         if self.specfence.sf_tips.is_chain_loc(location_hash) && (executing || has_sf_tip) {
-            let published = |sf: &crate::specfence::SfMvMemory<'_>| {
-                self.specfence.scheduler.is_done(pred)
+            const SPIN: usize = 512;
+            for i in 0..SPIN {
+                if self.specfence.scheduler.is_done(pred)
                     || self.specfence.scheduler.is_validated(pred)
-                    || sf.true_publish_ready(location_hash, pred)
-            };
-            if published(&sf) {
-                self.specfence.sf_tips.record_avoid_publish();
-                self.specfence.sf_tips.record_class_avoid(class);
-                return Ok(());
-            }
-            // Brief only. A multi-ms in-exec sleep serialized the hop and
-            // lost to OCC (large TPS ~0.50, under the v4 ~0.65 floor).
-            // Early Data still satisfies this window when the pred has
-            // already finalized the chain write.
-            let claimed = executing && self.specfence.sf_tips.try_claim_overlap(self.tx_idx);
-            if claimed {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_micros(400);
-                while !published(&sf) {
-                    if !self.specfence.scheduler.is_executing(pred) && !has_sf_tip {
-                        break;
-                    }
-                    if std::time::Instant::now() >= deadline {
-                        break;
-                    }
-                    self.specfence
-                        .sf_tips
-                        .wait_overlap_timeout(std::time::Duration::from_micros(80));
-                }
-                self.specfence.sf_tips.release_overlap(self.tx_idx);
-                if published(&sf) {
-                    self.specfence.sf_tips.record_overlap_resume();
+                    || (i % 16 == 0 && sf.true_publish_ready(location_hash, pred))
+                {
                     self.specfence.sf_tips.record_avoid_publish();
                     self.specfence.sf_tips.record_class_avoid(class);
                     return Ok(());
                 }
+                if !self.specfence.scheduler.is_executing(pred) {
+                    break;
+                }
+                std::hint::spin_loop();
             }
+            if sf.true_publish_ready(location_hash, pred)
+                || self.specfence.scheduler.is_done(pred)
+                || self.specfence.scheduler.is_validated(pred)
+            {
+                self.specfence.sf_tips.record_avoid_publish();
+                self.specfence.sf_tips.record_class_avoid(class);
+                return Ok(());
+            }
+            // Prefer schedule one-hop: plant waiters wake on chain_release →
+            // Q_released. Exact waiter covers opportunistic Version readers.
+            // Soft=0 try_execute_sf skips Aborting for chain (mark_wait only).
             self.specfence
                 .sf_tips
                 .register_waiter(location_hash, pred, self.tx_idx);
+            self.specfence
+                .ready_edges
+                .note_ungated_wait_on(self.tx_idx, pred);
             return Err(self.park_publish_wait(location_hash, pred));
         }
         match live_writer_act(
@@ -3988,35 +3985,6 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     } else {
                         write_set.push((recipient, MemoryValue::LazyRecipient(amount)));
                     }
-                }
-
-                // Final chain Data before museum / scheduler Commit so the
-                // in-exec WaitOnce hop can resume mid-pred-exec. Field borrows
-                // only — `ctx` still holds `self.evm`.
-                if self.specfence.mode == crate::ConcurrencyMode::SpecFence
-                    && let Some((loc, value)) = write_set
-                        .iter()
-                        .find(|(loc, _)| self.specfence.sf_tips.is_chain_loc(*loc))
-                {
-                    let loc = *loc;
-                    let value = value.clone();
-                    self.mv_memory.publish_location_data(
-                        tx_version.tx_idx,
-                        tx_version.tx_incarnation,
-                        loc,
-                        value,
-                    );
-                    let exact = self.specfence.sf_tips.publish_data(
-                        loc,
-                        tx_version.tx_idx,
-                        tx_version.tx_incarnation,
-                    );
-                    for c in exact {
-                        self.specfence.wave.push_ready(c);
-                    }
-                    self.specfence
-                        .ready_edges
-                        .wake_planted_on_publish(tx_version.tx_idx, self.specfence.wave);
                 }
 
                 let (is_lazy, optimistic_majority_lazy, read_set, sf_occ_shaped) = {

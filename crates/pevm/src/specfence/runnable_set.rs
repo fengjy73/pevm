@@ -172,12 +172,9 @@ impl RunnableSet {
             }
             return;
         }
-        // Learned WAW successor.
-        // Thin: seed off-queue (v4). Heal may put them back on the antichain.
-        // Large: stay on Q_indep. WaitOnce stalls only the chain access.
-        // Holding every succ off the queue until pred done was land-v1 (TPS 0.44).
-        if self.block_size <= crate::specfence::THIN_SHELL_N
-            && let Some(pred) = ready.blocking_producer(tx)
+        // Learned WAW successor: off-queue until the pred commits, still
+        // ungated so the resume stays on the Opt path.
+        if let Some(pred) = ready.blocking_producer(tx)
             && !ready.is_writer_done(pred)
         {
             self.mark_wait(tx);
@@ -372,8 +369,6 @@ impl RunnableSet {
         // Independents first (PC-3). Worker 0 used to prefer Ordered/Released
         // and 1-core starved Q_indep=29 behind one Released park-requeue
         // (19469101 pending=30 / live_wait=false).
-        // Do not prefer Released-only on large: that plus off-queue succs
-        // serialized the spine (Avoid land-v1, TPS 0.44).
         let prefer = match worker_i % 3 {
             0 => [QueueKind::Indep, QueueKind::Released, QueueKind::Ordered],
             1 => [QueueKind::Indep, QueueKind::Ordered, QueueKind::Released],

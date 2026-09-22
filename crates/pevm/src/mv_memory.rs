@@ -141,23 +141,6 @@ impl MvMemory {
 
     /// Residual write locations from the last aborted incarnation (Bohm-lite).
     #[allow(dead_code)]
-    /// Install one final Data value before the rest of Commit.
-    /// WaitOnce may read it as soon as the chain tip is Released.
-    /// `record` writes the same incarnation again.
-    pub(crate) fn publish_location_data(
-        &self,
-        tx_idx: TxIdx,
-        incarnation: TxIncarnation,
-        location: MemoryLocationHash,
-        value: MemoryValue,
-    ) {
-        let _nest = DataNest::enter("publish_location_data");
-        self.data.entry(location).or_default().insert(
-            tx_idx,
-            MemoryEntry::Data(incarnation, value),
-        );
-    }
-
     /// Data value still published by `tx_idx` at `location`, if any.
     pub(crate) fn published_data_value(
         &self,
