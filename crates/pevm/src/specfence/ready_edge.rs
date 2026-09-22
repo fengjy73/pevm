@@ -169,6 +169,22 @@ impl ReadyEdgeTable {
         }
     }
 
+    /// Reuse WAW: each writer after the first waits for the previous one
+    /// on `loc`. Forward only. The head stays ungated.
+    pub(crate) fn plant_nearest_preds(&self, loc: MemoryLocationHash, writers: &[TxIdx]) -> usize {
+        let mut n = 0;
+        for pair in writers.windows(2) {
+            let pred = pair[0];
+            let succ = pair[1];
+            if pred >= succ {
+                continue;
+            }
+            self.note_consumer_on(succ, pred, Some(loc));
+            n += 1;
+        }
+        n
+    }
+
     /// Register a **known** consumer (this reader hit unpublished RAW / aborted).
     ///
     /// Keeps the **latest** unfinished predecessor (WAW immediate pred). A

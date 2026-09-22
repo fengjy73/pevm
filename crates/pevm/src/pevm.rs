@@ -220,6 +220,36 @@ impl Default for Pevm {
     }
 }
 
+/// Longest non-beneficiary writer list that is still a chain, not the block.
+/// `len * 4 <= block` keeps a 77-of-1226 spine and refuses a near-total order.
+fn select_crit_chain(
+    orders: &[(u64, Vec<usize>)],
+    block_size: usize,
+    beneficiary: u64,
+) -> Option<(u64, Vec<usize>)> {
+    let mut best: Option<(u64, Vec<usize>)> = None;
+    for &(loc, ref writers) in orders {
+        if loc == beneficiary {
+            continue;
+        }
+        let mut w: Vec<usize> = writers
+            .iter()
+            .copied()
+            .filter(|&t| t < block_size)
+            .collect();
+        w.sort_unstable();
+        w.dedup();
+        if w.len() < 4 || w.len() * 4 > block_size.max(1) {
+            continue;
+        }
+        let replace = best.as_ref().is_none_or(|(_, prev)| w.len() > prev.len());
+        if replace {
+            best = Some((loc, w));
+        }
+    }
+    best
+}
+
 impl Pevm {
     /// Create an executor with a concurrency-control mode. Default is OCC.
     pub fn with_concurrency_mode(mode: ConcurrencyMode) -> Self {
@@ -545,8 +575,18 @@ impl Pevm {
             }
             // P3/P4: bag serves gated wake only. A0 never seeds the bag.
             // Do not sample block_size as ready_width when A1=0 (that read as 176).
+            // Reuse WAW: nearest pred on the learned chain, then pop that
+            // head before the low-index antichain.
+            let crit_head = self.inter_prior.crit_chain().and_then(|(loc, writers)| {
+                if writers.len() < 4 || writers.len() * 4 > block_size {
+                    return None;
+                }
+                access_arms.install_crit_chain(loc, &writers);
+                ready_edges.plant_nearest_preds(loc, &writers);
+                writers.first().copied()
+            });
             self.last_begin_blocked = ready_edges.blocked_consumers();
-            runnable.seed_begin(&ready_edges, &producer_stages, &scheduler);
+            runnable.seed_begin(&ready_edges, &producer_stages, &scheduler, crit_head);
             // P3: do not sample (n_tx − blocked) as ready_width (reads as 172).
             if quiet && !learner.has_any_predicted() {
                 let n = sketch.revoke_prior_fences_if_quiet(true);
@@ -915,6 +955,11 @@ impl Pevm {
                 }
             }
             self.last_location_writers = d1_orders;
+            self.inter_prior.pack_crit_chain(select_crit_chain(
+                &self.last_location_writers,
+                block_size,
+                beneficiary,
+            ));
             let ready_w = ready_edges.ready_width_mean();
             let idle = ready_edges.idle_core_ns();
             let refuse = ready_edges.refuse_count();

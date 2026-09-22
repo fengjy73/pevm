@@ -131,29 +131,47 @@ impl RunnableSet {
         ready: &ReadyEdgeTable,
         stages: &ProducerStageTable,
         scheduler: &Scheduler,
+        crit_head: Option<TxIdx>,
     ) {
-        // Longest remaining suffix first. Push high indices, then low, so
-        // the local LIFO pop takes the critical head. Steal pops the other
-        // end (antichain tail). Idle `pick` already steals that end.
+        // Index order is the suffix proxy. A learned crit head is pushed
+        // last so the local LIFO pop starts that chain before lower indices.
+        // Steal still pops the high-index end (antichain tail).
+        let head = crit_head.filter(|&tx| tx < self.block_size);
         for tx in (0..self.block_size).rev() {
-            if scheduler.is_done(tx) || scheduler.is_validated(tx) {
-                self.state[tx].store(ST_DONE, Ordering::Relaxed);
+            if Some(tx) == head {
                 continue;
             }
-            if stages.is_reserved(tx) && !scheduler.is_done(tx) && ready.may_execute(tx) {
+            self.seed_one(tx, ready, stages, scheduler);
+        }
+        if let Some(tx) = head {
+            self.seed_one(tx, ready, stages, scheduler);
+        }
+    }
+
+    fn seed_one(
+        &self,
+        tx: TxIdx,
+        ready: &ReadyEdgeTable,
+        stages: &ProducerStageTable,
+        scheduler: &Scheduler,
+    ) {
+        if scheduler.is_done(tx) || scheduler.is_validated(tx) {
+            self.state[tx].store(ST_DONE, Ordering::Relaxed);
+            return;
+        }
+        if stages.is_reserved(tx) && !scheduler.is_done(tx) && ready.may_execute(tx) {
+            self.push(tx, QueueKind::Released);
+            return;
+        }
+        if ready.is_gated(tx) {
+            if ready.may_execute(tx) {
                 self.push(tx, QueueKind::Released);
-                continue;
-            }
-            if ready.is_gated(tx) {
-                if ready.may_execute(tx) {
-                    self.push(tx, QueueKind::Released);
-                } else {
-                    ready.note_skip_gate(tx);
-                    self.mark_wait(tx);
-                }
             } else {
-                self.push(tx, QueueKind::Indep);
+                ready.note_skip_gate(tx);
+                self.mark_wait(tx);
             }
+        } else {
+            self.push(tx, QueueKind::Indep);
         }
     }
 
@@ -986,7 +1004,7 @@ mod tests {
         let sched = Scheduler::new(6);
         ready.note_consumer(3, 0);
         let r = RunnableSet::new(6, 2);
-        r.seed_begin(&ready, &stages, &sched);
+        r.seed_begin(&ready, &stages, &sched, None);
         assert!(r.q_indep_len() >= 4, "ungated antichain in Q_indep");
         assert_eq!(r.q_ordered_len(), 0, "no ordered tip until a window head");
         // Gated 3 is waiting, not on a Q.
@@ -997,6 +1015,22 @@ mod tests {
         assert_ne!(tx, 3, "refused consumer must not occupy a core");
         assert_eq!(vis, VisibilityPolicy::Opt);
         assert_eq!(tx, 0, "longest remaining suffix is the lowest index");
+    }
+
+    #[test]
+    fn crit_head_is_popped_before_lower_indices() {
+        let ready = ReadyEdgeTable::new();
+        let stages = ProducerStageTable::new();
+        let sched = Scheduler::new(8);
+        ready.plant_nearest_preds(0xabc, &[4, 6]);
+        let r = RunnableSet::new(8, 2);
+        r.seed_begin(&ready, &stages, &sched, Some(4));
+        let first = r.pick(0, &ready).expect("head");
+        let SfPick::Execute { tx, .. } = first else {
+            panic!("expected execute");
+        };
+        assert_eq!(tx, 4, "learned chain head starts before index 0");
+        assert!(ready.is_gated(6) && !ready.may_execute(6));
     }
 
     #[test]

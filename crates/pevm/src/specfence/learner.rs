@@ -265,6 +265,10 @@ pub(crate) struct InterBlockPrior {
     arm_snaps: Mutex<Vec<super::arm_table::ArmSnap>>,
     /// Per-access Avoid prior: `(ℓ, arm tag, k)`. Tag 1 = WaitOnce, 2 = NeverWait.
     access_arm_snaps: Mutex<Vec<(crate::MemoryLocationHash, u8, u32)>>,
+    /// Longest non-beneficiary writer chain from the last block. Reuse
+    /// plants nearest-pred gates so the next writer does not Opt-read
+    /// before this one publishes.
+    crit_chain: Mutex<Option<(crate::MemoryLocationHash, Vec<crate::TxIdx>)>>,
 }
 
 impl InterBlockPrior {
@@ -327,6 +331,7 @@ impl InterBlockPrior {
         self.last_flipped.store(0, Ordering::Relaxed);
         self.arm_snaps.lock().unwrap().clear();
         self.access_arm_snaps.lock().unwrap().clear();
+        *self.crit_chain.lock().unwrap() = None;
     }
 
     /// Begin-block ArmTable restore.
@@ -341,6 +346,18 @@ impl InterBlockPrior {
 
     pub(crate) fn pack_access_arms(&self, snaps: Vec<(crate::MemoryLocationHash, u8, u32)>) {
         *self.access_arm_snaps.lock().unwrap() = snaps;
+    }
+
+    /// Remember one WAW chain for the next block. `writers` is sorted, unique.
+    pub(crate) fn pack_crit_chain(
+        &self,
+        chain: Option<(crate::MemoryLocationHash, Vec<crate::TxIdx>)>,
+    ) {
+        *self.crit_chain.lock().unwrap() = chain;
+    }
+
+    pub(crate) fn crit_chain(&self) -> Option<(crate::MemoryLocationHash, Vec<crate::TxIdx>)> {
+        self.crit_chain.lock().unwrap().clone()
     }
 
     /// Morph flip from the last `end_block`, without consuming it.

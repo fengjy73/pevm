@@ -1687,6 +1687,37 @@ impl<S: Storage> Database for VmDb<'_, S> {
         let location_hash = self.hash_basic(&address);
         if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
             let _ = self.specfence.access_log.note(self.tx_idx, location_hash);
+            // Learned chain: if the nearest pred is already executing, wait
+            // once. A pred that has not started is the scheduler's job
+            // (nearest-pred gate); parking here would stall every core.
+            if !self.is_lazy
+                && address != self.specfence.beneficiary
+                && let Some(pred) = self
+                    .specfence
+                    .access_arms
+                    .crit_pred(self.tx_idx, location_hash)
+            {
+                let finished = self.specfence.scheduler.is_done(pred)
+                    || self.specfence.scheduler.is_validated(pred);
+                if !finished && self.specfence.scheduler.is_executing(pred) {
+                    match live_writer_act(
+                        &self.specfence,
+                        self.tx_idx,
+                        self.is_lazy,
+                        address,
+                        location_hash,
+                        pred,
+                    ) {
+                        crate::specfence::LiveAct::Block => {
+                            return Err(self.park_estimate_blocking(location_hash, pred));
+                        }
+                        crate::specfence::LiveAct::Retry => {
+                            return Err(ReadError::InconsistentRead);
+                        }
+                        crate::specfence::LiveAct::Skip => {}
+                    }
+                }
+            }
         }
         self.maybe_wait(address, location_hash, false)?;
         let resolve = self.resolve_read_overlay();
