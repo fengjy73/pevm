@@ -366,19 +366,9 @@ fn abort_and_estimate(ctx: &ApplyCtx<'_>) {
     if aborted {
         let locs = ctx.mv_memory.write_locations(tx);
         ctx.mv_memory.convert_writes_to_estimates(tx);
-        // Clear SF tip + live_writer for any tip-plane ℓ (thin WaitOnce/crit;
-        // large crit sticky≥32). Stale Version tips must not park WaitOnce.
-        let thin = ctx.scheduler.block_size() <= super::THIN_SHELL_N;
-        let tip_locs: Vec<_> = locs
-            .iter()
-            .copied()
-            .filter(|&loc| {
-                ctx.specfence.access_arms.is_crit_loc(loc)
-                    || (thin && ctx.specfence.access_arms.is_wait_once(loc))
-            })
-            .collect();
-        if !tip_locs.is_empty() {
-            let _ = ctx.specfence.sf_tips.clear_writer(tx, &tip_locs);
+        // Clear SF tip + live_writer (thin tip plane only).
+        if ctx.scheduler.block_size() <= super::THIN_SHELL_N {
+            let _ = ctx.specfence.sf_tips.clear_writer(tx, &locs);
         }
         ctx.specfence.metrics.record_occ_abort();
         ctx.specfence.metrics.record_full_abort_reexecute();

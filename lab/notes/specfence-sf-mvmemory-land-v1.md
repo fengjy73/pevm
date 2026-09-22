@@ -1,8 +1,8 @@
 # SpecFence SfMvMemory land v1
 
 **Date:** 2026-09-22  
-**Tip:** `5e88d67` on `cursor/specfence-sf-ps-true-spine-d6e8` (PR #45)  
-**Harness:** Soft=0 Instant-off, 8 cores, `SPECFENCE_COMPARE_CHECK=1`, N=5 both  
+**Tip:** `801c525+` on `cursor/specfence-sf-ps-true-spine-d6e8` (PR #45)  
+**Harness:** Soft=0 Instant-off (`env -u SPECFENCE_HANG_TRACE`), 8 cores, `SPECFENCE_COMPARE_CHECK=1`, N=5 both  
 **SoT:** [`specfence-sf-mvmemory-redesign-v1.md`](specfence-sf-mvmemory-redesign-v1.md), [`specfence-thin-avoid-no-estimate-v1.md`](specfence-thin-avoid-no-estimate-v1.md)  
 **Acceptance:** **TPS SF/OCC ≥ 1.5** both `3356896` and `15274915`, Soft=0 Instant-off N≥5.  
 **Co-author:** `0xstride <fengjy73@users.noreply.github.com>`
@@ -11,54 +11,81 @@
 
 ## Verdict
 
-**Did not meet TPS ≥ 1.5.** SpecFence-native `SfMvMemory` + concurrent Detect|Avoid|Resolve path counters landed. Soft=0 Instant-off N≥5 both: `seq=par`, `occ_picks=0`, `estimate_block_sf=0`. Best calm TPS this host ≈ **0.78** (3356896, path-c=0 reuse) / ≈ **0.67** (15274915 sticky) — still ≪ **1.5**. Path **(c)** still fires on noisy reuse / cold; even when (c)=0, SF scaffolding tax keeps TPS below OCC.
+**Did not meet TPS ≥ 1.5.** Four-class Detect|Avoid|Resolve audit landed (RAW / WAR / WAW / Chain). Soft=0 Instant-off N≥5 both: `seq=par`, `occ_picks=0`, `estimate_block_sf=0`, `soft_wait_arms=0`. Best thin calm TPS ≈ **0.84** (reuse, path-c=0); reuse median ≈ **0.72**. Large reuse median ≈ **0.48** — Chain late ≈ Chain avoid; sticky Hold still incomplete vs ≥1.5.
 
-Detect→Avoid→Resolve are **concurrent capabilities per access**, not a sequential pipeline.
-
----
-
-## Concurrent Detect | Avoid | Resolve (semantic)
-
-| Capability | When | SpecFence verb |
-|------------|------|----------------|
-| **(a) Detect** | Structure/prior says conflict coming — **before** the read | AccessArm WaitOnce + peer / wait edges / crit pred |
-| **(b) Avoid** | Up front so collision never happens | WaitOnce + SfMvMemory true publish / done; thin spin; large park_publish_wait |
-| **(c) Resolve** | Only when a **live mistake** is found | Prefix from fail_k (large Rewind); FullReplay if Avoid missed |
-
-**Not:** Opt → validate → FullReplay theater as the common path.  
-**Path (c) dominating = incomplete.** SfMvMemory redesign must make **(a)/(b)** the common path.
-
-Counters (per block, Soft=0): `sf_detect_before_n`, `sf_avoid_publish_n`, `sf_resolve_after_fail_n` (+ `early_tip`, `est_block`).
+Detect|Avoid|Resolve remain **concurrent capabilities per access across all four classes**, not a pipeline and not early-WAW-only.
 
 ---
 
-## Early-WAW basic audit (focus ℓ)
+## Four conflict classes (semantic)
 
-### 3356896 — ℓ `dff71d59d972d654` (fail_k 5/6, RAW=0 pure WAW)
+| Class | Detect (a) | Avoid (b) timely | Late Resolve (c) |
+|-------|------------|------------------|------------------|
+| **RAW** | WaitOnce pred before storage read | true publish / done → read published write | FullReplay/Rewind when Opt saw Storage pre-state |
+| **WAR** | higher readers of published ℓ | `enqueue_higher_revalidate` demote before stale Commit | FullReplay when write landed after Opt read without demote |
+| **WAW** | WaitOnce / early-k / OrderedTip | tip Released + spin/park_publish_wait | Opt→FullReplay at fail_k |
+| **Chain** | sticky≥32 crit nearest-pred | WaitOnce on crit + antichain fill | FullReplay/Rewind along spine when Avoid miss |
 
-Soft=0 Instant-off N=5 @8, tip `5e88d67` (pass with best thin TPS):
+**Not:** fold WAR into schedule-only absorption.  
+**Not:** Opt→FullReplay theater as the common path for any class.  
+**Path (c) dominating a class = incomplete for that class.**
 
-| Iter | FullReplay | **(a)** detect | **(b)** avoid | **(c)** resolve | early_tip | est_block | Read |
-|-----:|-----------:|---------------:|--------------:|----------------:|----------:|----------:|:-----|
-| 0 cold | 9 | 20 | 19 | 9 | 9 | 0 | (c) ≈ FullReplay; (a)/(b) partially fire |
-| 1 reuse | **0** | 18 | **18** | **0** | 0 | 0 | **(a)=(b), (c)=0** — Avoid held |
-| 2 | 8 | 26 | 24 | 8 | 8 | 0 | (c) matches FullReplay |
-| 3 | 8 | 28 | 25 | 8 | 8 | 0 | (c) matches FullReplay |
-| 4 reuse | **0** | 20 | **20** | **0** | 0 | 0 | **(a)=(b), (c)=0** |
+---
 
-**Thin summary:** On calm reuse, Detect+Avoid succeed and **(c)=0**. Noisy reuse still takes Opt→FullReplay **(c)** at fail_k 5/6 (~8–24). **(c) does not dominate calm reuse**, but still dominates cold and noisy iters. Prefer ≥1.5 needs (c)≈0 **and** SF wall ≤ ~OCC/1.5 (calm SF ~1.41 vs OCC ~1.10 → TPS ~0.78 even with (c)=0).
+## Four-class audit (Soft=0 Instant-off N=5 @8)
 
-### 15274915 — sticky spine ℓ `abd6bb3978815b97` (≥32)
+### 3356896 — thin WAW spine ℓ `dff71d59d972d654` (RAW≈0)
 
-| Iter | FullReplay | **(a)** | **(b)** | **(c)** | early_tip | est_block | Read |
-|-----:|-----------:|--------:|--------:|--------:|----------:|----------:|:-----|
-| 0 | 80 | 852 | 215 | 155 | 0 | 0 | (a)≫(b); (c) ≃ Full+Rewind |
-| 1 | 64 | 309 | 215 | 130 | 0 | 0 | (c) still large |
-| 2 | 76 | 335 | 203 | 148 | 0 | 0 | incomplete vs (a)/(b)-common |
-| 3 | 70 | 358 | 238 | 141 | 0 | 0 | Rewind salvage ⊂ (c) |
-| 4 | 90 | 365 | 232 | 169 | 0 | 0 | (c) still common |
+| Iter | Full | (a) | (b) | (c) | raw_ab/c | war_ab/c | waw_ab/c | chain_ab/c | early_tip | est | TPS |
+|-----:|-----:|----:|----:|----:|---------:|---------:|---------:|-----------:|----------:|----:|----:|
+| 0 | 17 | 51 | 25 | 17 | 0/0 | 4/2 | 21/15 | 0/0 | 17 | 0 | 0.79 |
+| 1 | 1 | 21 | 20 | 1 | 0/0 | 1/0 | 19/1 | 0/0 | 1 | 0 | 0.67 |
+| 2 | 16 | 61 | 48 | 16 | 0/0 | 18/0 | 31/16 | 0/0 | 16 | 0 | 0.72 |
+| 3 | **0** | 18 | **18** | **0** | 0/0 | 0/0 | **18/0** | 0/0 | 0 | 0 | 0.57 |
+| 4 | **0** | 19 | 18 | **0** | 0/0 | 0/0 | **18/0** | 0/0 | 0 | 0 | **0.84** |
 
-**Large summary:** Detect (a) fires heavily (WaitOnce/crit consult). Avoid (b) via publish/done is real but **(c) Resolve-after-fail remains common** (FullReplay 64–90 + Rewind). Tip plane thin-only (`early_tip=0`). Sticky ≥32 + fail_k Rewind intact. **Path (c) still too common → incomplete for ≥1.5.**
+**Thin read:** Class mass is **WAW**. Calm reuse: `waw_ab=waw_c+detect`, **(c)=0**, WAR Avoid fires on noisy Commit. RAW/Chain idle (no sticky≥32). Even with (c)=0, SF wall ≳ OCC → TPS≪1.5 (scaffolding tax).
+
+### 15274915 — sticky≥32 Chain ℓ `abd6bb3978815b97`
+
+| Iter | Full | (a) | (b) | (c) | raw_ab/c | war_ab/c | waw_ab/c | chain_ab/c | early_tip | est | TPS |
+|-----:|-----:|----:|----:|----:|---------:|---------:|---------:|-----------:|----------:|----:|----:|
+| 0 | 48 | 385 | 224 | 75 | 5/0 | 102/2 | 148/73 | 0/0 | 0 | 0 | 0.65 |
+| 1 | 92 | 739 | 373 | 175 | 16/1 | **218/1** | 16/6 | **177/167** | 0 | 0 | 0.49 |
+| 2 | 83 | 644 | 336 | 159 | 19/2 | 147/0 | 18/8 | 166/149 | 0 | 0 | 0.46 |
+| 3 | 178 | 1273 | 675 | 343 | 22/0 | **403/0** | 24/10 | 300/333 | 0 | 0 | 0.43 |
+| 4 | 102 | 742 | 414 | 190 | 15/1 | 206/0 | 18/4 | 203/185 | 0 | 0 | 0.49 |
+
+**Large read:** All four classes fire. **WAR Avoid is first-class** (`war_ab≫war_c`). **Chain late ≈ Chain avoid** — sticky nearest-pred helps but does not make (b) dominate. Tip plane stays thin-only (large crit tip tax regressed wall; Chain Avoid via park_publish_wait + nearest-pred). Path (c) still common → incomplete for ≥1.5.
+
+---
+
+## Call-graph (four-class × Detect|Avoid|Resolve)
+
+```
+RAW
+  Detect: consult_ungated_wait_once (WaitOnce, k==0, not crit≥32)
+  Avoid:  true_publish_ready / done → record_class_avoid(Raw)
+  Late:   FullReplay Storage EffectiveWAW → record_class_late(Raw)
+
+WAR  (NOT schedule-only absorption)
+  Detect: Commit/publish → higher_readers_of(ℓ) nonempty
+  Avoid:  prepare_revalidate + wake Revalidate → record_class_avoid(War)
+  Late:   Opt read then peer-done without WaitOnce → record_class_late(War)
+
+WAW
+  Detect: WaitOnce early-k / crit <32 / OrderedTip
+  Avoid:  tip Released (thin) / park_publish_wait (large) → class_avoid(Waw)
+  Late:   FullReplay/Rewind Basic EffectiveWAW → class_late(Waw)
+
+Chain (sticky≥32)
+  Detect: install_crit_chain + plant_nearest_preds; consult crit_pred
+  Avoid:  WaitOnce on crit + antichain fill remaining cores
+  Late:   FullReplay/Rewind on crit ℓ → class_late(Chain)
+  Tip:    thin WaitOnce/crit only (large tip DashMap tax discarded)
+
+OCC baseline only: Estimate tip / park_estimate_blocking (estimate_block_sf≡0)
+```
 
 ---
 
@@ -66,15 +93,12 @@ Soft=0 Instant-off N=5 @8, tip `5e88d67` (pass with best thin TPS):
 
 TPS SF/OCC = OCC_wall / SF_wall. **Hard bar ≥1.5: NOT MET.**
 
-### Paired Soft=0 Instant-off N=5 @8 (tip `5e88d67`)
+### Paired Soft=0 Instant-off N=5 @8 (post four-class tip)
 
-| Pass | 3356896 OCC / SF / **TPS** | 15274915 OCC / SF / **TPS** | vs ≥1.5 |
-|-----:|---------------------------:|----------------------------:|:-------:|
-| 0 | 1.018 / 1.545 / **0.659** | 5.318 / 8.343 / **0.637** | gap ~2.3× |
-| 1 | 0.915 / 1.632 / **0.561** | 5.651 / 14.954 / **0.378** | gap ~2.7–4× |
-| 2 | 1.099 / 1.414 / **0.777** | 5.860 / 8.736 / **0.671** | gap ~1.9–2.2× |
-
-Med TPS ≈ **0.66** / **0.64**. Best thin calm with (c)=0 still ≈ **0.78**. Target SF for ≥1.5: thin ≲0.67 ms, large ≲3.9 ms on this host — not reached.
+| Block | OCC med / SF reuse med / **TPS** | vs ≥1.5 |
+|------:|---------------------------------:|:-------:|
+| 3356896 | 1.501 / 1.965 / **0.76** (best calm **0.84**) | gap ~1.8–2× |
+| 15274915 | 7.589 / 15.851 / **0.48** | gap ~3× |
 
 ### Invariants
 
@@ -85,52 +109,30 @@ Med TPS ≈ **0.66** / **0.64**. Best thin calm with (c)=0 still ≈ **0.78**. T
 | soft_wait_arms | 0 | 0 |
 | explore (reuse) | 0 | 0 |
 | estimate_block_sf | **0** | **0** |
-| sticky ≥32 + Rewind | n/a | intact (Rewind≫0) |
+| sticky ≥32 + Rewind | n/a | intact (Rewind≫0; chain_ab>0) |
 
 ---
 
-## Call-graph (SF never Blocks on Estimate)
+## What shipped (this land)
 
-```
-Detect (a) — concurrent, before read
-  prior AccessArm WaitOnce + peer (now packed)
-  plant_wait_edges → note_ungated_wait_on (thin begin)
-  consult_ungated_wait_once → record_detect_before
-
-Avoid (b) — concurrent, at read
-  true_publish_ready / done → record_avoid_publish
-  thin: Executing micro-spin; no Blocking park
-  large: park_publish_wait (not estimate_block_sf)
-  SfMvMemory WaitReleased|OrderedTip skip Estimate tips
-
-Resolve (c) — only on live mistake
-  FullReplay / PartialAbortRewind → record_resolve_after_fail
-  large fail_k Rewind + prefix; thin Prefer Avoid-before-FullReplay
-
-OCC baseline only: Estimate tip / park_estimate_blocking
-```
-
----
-
-## What shipped
-
-1. `SfTipTable` / `SfMvMemory`: version tip, live_writer, exact wake, thin-only tip plane  
-2. WaitOnce **peer persisted** in AccessArm prior (Detect before read on reuse)  
-3. Path counters **(a)/(b)/(c)** + harness focus print  
-4. Thin spin-only WaitOnce; large sticky hold (no equal-ℓ hop) + Rewind  
-5. `estimate_block_sf=0`
+1. `SfConflictClass` + per-class avoid/late counters on `SfTipTable`  
+2. Consult classifies WaitOnce → Raw|Waw|Chain; Resolve late maps FullReplay/Rewind  
+3. **WAR Avoid first-class** in `enqueue_higher_revalidate` (Detect higher readers → demote)  
+4. Harness focus print: `raw_ab/c war_ab/c waw_ab/c chain_ab/c`  
+5. Tip plane remains thin WaitOnce/crit (large Chain via nearest-pred + park)  
+6. `estimate_block_sf=0`
 
 ---
 
 ## Remaining gaps blocking TPS ≥ 1.5
 
-1. **(c) still common** on thin noisy reuse and large sticky (FullReplay tens–hundreds).  
-2. **Even (c)=0 thin reuse** TPS ~0.78 — SF scaffolding tax > OCC remaining abort cost.  
-3. Large tip plane off (protect sticky) → less SfMvMemory (b) on spine; park/Rewind carry Avoid/Resolve.  
-4. Next levers (still no Estimate Block / thin Rewind / 15-hold / mark_gated / broad plant): stronger (a) edge coverage without serializing thin WAW; cut Soft=0 hot-path DashMap/metrics tax; optional narrow Data publish earlier for WaitOnce ℓ.
+1. **Thin:** calm (c)=0 still TPS ~0.7–0.8 — SF scaffolding tax > OCC abort cost.  
+2. **Large:** Chain late ≈ avoid; FullReplay tens–hundreds; wall ~2× OCC.  
+3. **RAW** volume low on focus pair (thin pure WAW; large RAW ab≪Chain/WAR) — redesign served, not the TPS bottleneck.  
+4. Next levers (still no Estimate Block / thin Rewind / 15-hold / mark_gated / broad plant): raise Chain (b)/(c) ratio without tip tax; cut Soft=0 DashMap/metrics hot-path; keep WAR demote but coalesce fan-out.
 
 ---
 
 ## Discarded (still)
 
-Estimate Block as Avoid, thin Rewind/checkpoints, 15-writer hold, `mark_gated` broad plant, one-shot InconsistentRead, tip-install on large full WS, thin Blocking park.
+Estimate Block as Avoid, thin Rewind/checkpoints, 15-writer hold, `mark_gated` broad plant, one-shot InconsistentRead, tip-install on large full WS / large crit tip plane (tax), thin Blocking park.

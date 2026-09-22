@@ -2419,18 +2419,11 @@ fn try_validate(
         if specfence.mode == ConcurrencyMode::SpecFence {
             // Drop SF version tip / live_writer so WaitOnce does not park on
             // a stale unpublished claim (SoT: Estimate is OCC-only).
-            // Tip plane: thin WaitOnce/crit; large crit sticky≥32.
-            let thin = scheduler.block_size() <= crate::specfence::THIN_SHELL_N;
-            let tip_locs: Vec<_> = occ_write_locs
-                .iter()
-                .copied()
-                .filter(|&loc| {
-                    specfence.access_arms.is_crit_loc(loc)
-                        || (thin && specfence.access_arms.is_wait_once(loc))
-                })
-                .collect();
-            if !tip_locs.is_empty() {
-                let _ = specfence.sf_tips.clear_writer(tx_version.tx_idx, &tip_locs);
+            // Thin tip plane only — large Chain Avoid is nearest-pred + park.
+            if scheduler.block_size() <= crate::specfence::THIN_SHELL_N {
+                let _ = specfence
+                    .sf_tips
+                    .clear_writer(tx_version.tx_idx, &occ_write_locs);
             }
             for &loc in &occ_write_locs {
                 specfence.sketch.push_spine(loc, tx_version.tx_idx);
