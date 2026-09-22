@@ -2504,6 +2504,13 @@ fn try_validate(
             {
                 specfence.sf_tips.chain_clear(tx_version.tx_idx);
             }
+            // Re-exec has not published. Readers of a protected ℓ must see this
+            // writer, not only the last already-published MvMemory tip.
+            for &loc in &occ_write_locs {
+                specfence
+                    .sf_tips
+                    .note_open_writer(loc, tx_version.tx_idx);
+            }
             for &loc in &occ_write_locs {
                 specfence.sketch.push_spine(loc, tx_version.tx_idx);
                 if specfence.sketch.broadcast_avoid(loc, tx_version.tx_idx) {

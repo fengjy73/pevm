@@ -289,6 +289,30 @@ impl AccessArmTable {
         self.arms.get(&loc).map(|e| e.k).unwrap_or(0)
     }
 
+    /// Learned chain/prior location this tx is known to touch, if any.
+    pub(crate) fn known_toucher_loc(&self, tx: TxIdx) -> Option<MemoryLocationHash> {
+        let crit = self.crit_loc.load(Ordering::Relaxed);
+        if crit != u64::MAX && self.crit_writers.lock().unwrap().iter().any(|&w| w == tx) {
+            return Some(crit);
+        }
+        let prior = self.prior_loc.load(Ordering::Relaxed);
+        if prior != u64::MAX && self.prior_writers.lock().unwrap().iter().any(|&w| w == tx) {
+            return Some(prior);
+        }
+        None
+    }
+
+    /// Sorted known writers of `loc` (crit chain, else prior-block touchers).
+    pub(crate) fn known_writer_indexes(&self, loc: MemoryLocationHash) -> Option<Vec<TxIdx>> {
+        if self.crit_loc.load(Ordering::Relaxed) == loc {
+            return Some(self.crit_writers.lock().unwrap().clone());
+        }
+        if self.prior_loc.load(Ordering::Relaxed) == loc {
+            return Some(self.prior_writers.lock().unwrap().clone());
+        }
+        None
+    }
+
     /// Immediate prior writer on the learned chain, if `loc` is that chain.
     pub(crate) fn crit_pred(&self, tx: TxIdx, loc: MemoryLocationHash) -> Option<TxIdx> {
         if self.crit_loc.load(Ordering::Relaxed) != loc {

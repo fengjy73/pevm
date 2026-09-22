@@ -61,6 +61,10 @@ pub(crate) struct SfTipTable {
     chain_flags: DashMap<TxIdx, AtomicU8>,
     /// Highest unfinished chain writer claim (`usize::MAX` = none).
     chain_live: AtomicUsize,
+    /// Writers that have started (or been aborted for re-exec) on ℓ and have
+    /// not published true Data. A protected read parks on the nearest one
+    /// below it, including a toucher the last MvMemory tip does not name.
+    open_writers: DashMap<MemoryLocationHash, Vec<TxIdx>>,
     early_tip_n: AtomicUsize,
     publish_wake_n: AtomicUsize,
     wait_once_consume_n: AtomicUsize,
@@ -90,6 +94,7 @@ impl Default for SfTipTable {
             chain_loc: AtomicU64::new(u64::MAX),
             chain_flags: DashMap::new(),
             chain_live: AtomicUsize::new(usize::MAX),
+            open_writers: DashMap::new(),
             early_tip_n: AtomicUsize::new(0),
             publish_wake_n: AtomicUsize::new(0),
             wait_once_consume_n: AtomicUsize::new(0),
@@ -164,6 +169,7 @@ impl SfTipTable {
         writer: TxIdx,
         incarnation: TxIncarnation,
     ) -> Vec<TxIdx> {
+        self.close_open_writer(location, writer);
         if self.is_chain_loc(location) {
             self.chain_release(writer, incarnation);
             return self.wake_exact(location, writer);
@@ -250,6 +256,45 @@ impl SfTipTable {
         })
     }
 
+    /// This incarnation will write `location` and has not published Data yet.
+    pub(crate) fn note_open_writer(&self, location: MemoryLocationHash, writer: TxIdx) {
+        let mut v = self.open_writers.entry(location).or_default();
+        if v.binary_search(&writer).is_err() {
+            v.push(writer);
+            v.sort_unstable();
+        }
+    }
+
+    /// True Data is visible (or this writer will not rewrite ℓ).
+    pub(crate) fn close_open_writer(&self, location: MemoryLocationHash, writer: TxIdx) {
+        let Some(mut v) = self.open_writers.get_mut(&location) else {
+            return;
+        };
+        if let Ok(i) = v.binary_search(&writer) {
+            v.remove(i);
+        }
+    }
+
+    /// Drop every open claim for `writer` (successful finish of locs they did not rewrite).
+    pub(crate) fn close_open_writer_tx(&self, writer: TxIdx) {
+        for mut e in self.open_writers.iter_mut() {
+            if let Ok(i) = e.binary_search(&writer) {
+                e.remove(i);
+            }
+        }
+    }
+
+    /// Highest open writer strictly below `tx`, if any.
+    pub(crate) fn nearest_open_before(
+        &self,
+        location: MemoryLocationHash,
+        tx: TxIdx,
+    ) -> Option<TxIdx> {
+        self.open_writers.get(&location).and_then(|v| {
+            v.iter().rev().copied().find(|&w| w < tx)
+        })
+    }
+
     /// True unpublished writer of ℓ (structure RAW/WAW), if any.
     #[inline]
     pub(crate) fn live_writer(&self, location: MemoryLocationHash) -> Option<TxIdx> {
@@ -270,6 +315,11 @@ impl SfTipTable {
         let mut woken = Vec::new();
         if self.chain_loc.load(Ordering::Relaxed) != u64::MAX {
             self.chain_clear(writer);
+        }
+        // Abort drops the published bytes. The re-exec is an unfinished writer
+        // until the next true Data publish — readers must see it.
+        for &loc in locations {
+            self.note_open_writer(loc, writer);
         }
         for &loc in locations {
             if self.is_chain_loc(loc) {
@@ -661,6 +711,19 @@ mod tests {
             SfRead::Estimate { writer } => assert_eq!(writer, 0),
             other => panic!("Opt may see Estimate: {other:?}"),
         }
+    }
+
+    #[test]
+    fn open_writer_is_visible_until_publish() {
+        let tips = SfTipTable::new();
+        tips.note_open_writer(7, 4);
+        tips.note_open_writer(7, 9);
+        assert_eq!(tips.nearest_open_before(7, 8), Some(4));
+        assert_eq!(tips.nearest_open_before(7, 20), Some(9));
+        tips.close_open_writer(7, 9);
+        assert_eq!(tips.nearest_open_before(7, 20), Some(4));
+        tips.publish_data(7, 4, 0);
+        assert_eq!(tips.nearest_open_before(7, 20), None);
     }
 
     #[test]

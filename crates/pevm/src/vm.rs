@@ -496,6 +496,46 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.pcc_armed.set(false);
     }
 
+    /// Nearest writer of `loc` below this tx who has not published true Data.
+    /// Known chain/prior touchers and in-flight open claims both count.
+    /// A lower writer does not block once a higher one has already finished:
+    /// the read origin is the higher tip.
+    fn unfinished_writer_before(&self, location_hash: MemoryLocationHash) -> Option<TxIdx> {
+        let tx = self.tx_idx;
+        let sf = crate::specfence::SfMvMemory::new(self.mv_memory, self.specfence.sf_tips);
+        let closed = |w: TxIdx| {
+            self.specfence.scheduler.is_done(w)
+                || self.specfence.scheduler.is_validated(w)
+                || sf.true_publish_ready(location_hash, w)
+        };
+        let mut floor = 0;
+        let mut best: Option<TxIdx> = None;
+        if let Some(known) = self.specfence.access_arms.known_writer_indexes(location_hash) {
+            for &w in known.iter().rev() {
+                if w >= tx {
+                    continue;
+                }
+                if closed(w) {
+                    floor = w;
+                    break;
+                }
+                best = Some(w);
+                break;
+            }
+        }
+        if let Some(w) = self
+            .specfence
+            .sf_tips
+            .nearest_open_before(location_hash, tx)
+            && w > floor
+            && !closed(w)
+            && best.is_none_or(|b| w > b)
+        {
+            best = Some(w);
+        }
+        best
+    }
+
     /// Learned WaitOnce on the ungated Opt path. Consume via SfMvMemory
     /// read-after-true-publish (version tip / Data) — never Estimate Block.
     /// Large: park a live / SF-tipped unfinished pred without mark_gated.
@@ -551,10 +591,18 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if !wait {
             return Ok(());
         }
-        let Some(pred) = self
-            .specfence
-            .access_arms
-            .wait_once_pred(self.tx_idx, location_hash)
+        // Protected ℓ: an unfinished writer between the last published tip and
+        // this read is the WaitOnce pred. Last MvMemory Data is not enough.
+        let unfinished = if protected {
+            self.unfinished_writer_before(location_hash)
+        } else {
+            None
+        };
+        let Some(pred) = unfinished.or_else(|| {
+            self.specfence
+                .access_arms
+                .wait_once_pred(self.tx_idx, location_hash)
+        })
             .or_else(|| {
                 self.specfence
                     .access_arms
@@ -659,6 +707,19 @@ impl<'a, S: Storage> VmDb<'a, S> {
             // Soft=0 thin: no Blocking park; Opt-fallthrough (Learn raises Avoid).
             // Do not register_waiter — ungated finish never wakes DashMap waiters.
             return Ok(());
+        }
+        // Protected read found an unfinished writer the last published tip
+        // does not name. Park until that writer publishes true Data.
+        // decide()'s once-only Skip would Opt-read and FullReplay again.
+        if unfinished.is_some() {
+            self.specfence.sf_tips.record_wait_once_consume();
+            self.specfence
+                .sf_tips
+                .register_waiter(location_hash, pred, self.tx_idx);
+            self.specfence
+                .ready_edges
+                .note_ungated_wait_on(self.tx_idx, pred);
+            return Err(self.park_publish_wait(location_hash, pred));
         }
         // Large: park when Executing / SF tip / live_writer. Estimate tip is
         // OCC residue used only as a *liveness* hint after abort cleared the
@@ -3177,6 +3238,22 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     tx_version.tx_incarnation,
                 );
             }
+            let tx = tx_version.tx_idx;
+            let track = |loc: crate::MemoryLocationHash| {
+                self.specfence.access_arms.is_protected(loc)
+                    || self.specfence.access_arms.is_wait_once(loc)
+                    || self.specfence.access_arms.is_crit_loc(loc)
+            };
+            for loc in self.mv_memory.write_locations(tx) {
+                if track(loc) {
+                    self.specfence.sf_tips.note_open_writer(loc, tx);
+                }
+            }
+            if let Some(loc) = self.specfence.access_arms.known_toucher_loc(tx)
+                && track(loc)
+            {
+                self.specfence.sf_tips.note_open_writer(loc, tx);
+            }
         }
 
         // SpecFence-native resume: RewindTo (SuffixRepair / SoftWait wake) takes the
@@ -4129,6 +4206,9 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                             );
                         }
                     }
+                    self.specfence
+                        .sf_tips
+                        .close_open_writer_tx(tx_version.tx_idx);
                     if wrote_new_location {
                         flags |= FinishExecFlags::WroteNewLocation;
                     }
@@ -4245,6 +4325,11 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 }
                 let (wrote_new_location, contended) =
                     self.mv_memory.record(tx_version, read_set, write_set);
+                if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+                    self.specfence
+                        .sf_tips
+                        .close_open_writer_tx(tx_version.tx_idx);
+                }
                 // M3: learn process WŜ from this incarnation's writes (no residual publish).
                 // R1/R3: feed HotSet writer counts (H_w) from non-lazy writes only.
                 let _ = optimistic_majority_lazy;

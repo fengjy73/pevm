@@ -402,6 +402,9 @@ fn abort_and_estimate(ctx: &ApplyCtx<'_>) {
         ) {
             ctx.specfence.sf_tips.chain_clear(tx);
         }
+        for &loc in &locs {
+            ctx.specfence.sf_tips.note_open_writer(loc, tx);
+        }
         ctx.specfence.metrics.record_occ_abort();
         ctx.specfence.metrics.record_full_abort_reexecute();
     }
