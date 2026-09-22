@@ -430,10 +430,9 @@ fn keep_single_invalid_prefix(ctx: &ApplyCtx<'_>) -> bool {
     ctx.specfence
         .access_arms
         .note_early_waw_edge(tx, loc, k, peer);
-    // Thin: ungated publish-order Avoid — no mark_gated.
-    if peer > 0 && ctx.scheduler.block_size() <= super::THIN_SHELL_N {
-        ctx.specfence.ready_edges.note_ungated_wait_on(tx, peer);
-    }
+    // Thin mid-block ungated plant cascades (cold FullReplay hundreds,
+    // rset_w collapse). Detect(a) plant is at begin from packed edges;
+    // within-block Avoid stays consult WaitOnce + SfMvMemory.
     let prefix = ctx.specfence.access_log.prefix_before(tx, k);
     let mut n = ctx
         .specfence
