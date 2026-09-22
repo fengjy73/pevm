@@ -173,7 +173,8 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
             if ctx.specfence.ready_edges.leftover_surplus(tx)
                 || (ctx.specfence.ready_edges.is_gated(tx)
                     && !ctx.specfence.ready_edges.may_execute(tx))
-                || (!ctx.specfence.ready_edges.is_gated(tx)
+                || (ctx.scheduler.block_size() <= super::THIN_SHELL_N
+                    && !ctx.specfence.ready_edges.is_gated(tx)
                     && ctx
                         .specfence
                         .ready_edges
@@ -223,12 +224,14 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
             }
             enqueue_higher_revalidate(&ctx, tx);
             // Observed WAW: wait for the producer instead of Opt ping-pong.
-            // Ungated publish-order (thin note_ungated_wait_on) also parks —
-            // release_owner would ignore blocking_producer and Opt-mill again.
+            // Thin ungated publish-order also parks — release_owner would
+            // ignore blocking_producer and Opt-mill again. Large blocks keep
+            // the prior gated / leftover path (chain hold is separate).
             if ctx.specfence.ready_edges.leftover_surplus(tx)
                 || (ctx.specfence.ready_edges.is_gated(tx)
                     && !ctx.specfence.ready_edges.may_execute(tx))
-                || (!ctx.specfence.ready_edges.is_gated(tx)
+                || (ctx.scheduler.block_size() <= super::THIN_SHELL_N
+                    && !ctx.specfence.ready_edges.is_gated(tx)
                     && ctx
                         .specfence
                         .ready_edges
@@ -293,7 +296,9 @@ fn plant_observed_waw(ctx: &ApplyCtx<'_>, f: &super::collateral::FirstConflict) 
 }
 
 /// Thin Soft=0: ungated publish-order on the nearest unfinished tip (Opt
-/// resume, no mark_gated). Large blocks keep the gated observed window.
+/// resume, no mark_gated). Only after the first FullReplay (inc≥1) so the
+/// cold antichain is not drained by speculative waits. Large blocks keep
+/// the gated observed window.
 fn plant_pair_after_replay(
     ctx: &ApplyCtx<'_>,
     consumer: crate::TxIdx,
@@ -304,6 +309,9 @@ fn plant_pair_after_replay(
         return;
     }
     if ctx.scheduler.block_size() <= super::THIN_SHELL_N {
+        if ctx.tx_version.tx_incarnation < 1 {
+            return;
+        }
         plant_thin_ungated_wait(ctx, consumer, producer, loc);
         return;
     }
@@ -340,7 +348,12 @@ fn plant_thin_ungated_wait(
 /// even if Learn classified LazyNoise / Commute.
 /// Plant every non-lazy invalid ℓ, not only FirstConflict. Shared storage
 /// slots that are not the first fail still Opt-mill (19807137 ~30 heads).
+/// Thin Soft=0: skip — multi-ℓ ungated waits emptied the antichain (rset_w
+/// collapse). Pair order comes only from EffectiveWAW first-conflict.
 fn plant_invalid_locs(ctx: &ApplyCtx<'_>) {
+    if ctx.scheduler.block_size() <= super::THIN_SHELL_N {
+        return;
+    }
     let tx = ctx.tx_version.tx_idx;
     for &loc in ctx.invalid {
         if location_is_lazy(ctx.mv_memory, tx, loc) {
@@ -357,6 +370,11 @@ fn plant_invalid_locs(ctx: &ApplyCtx<'_>) {
 
 fn break_replay_mill(ctx: &ApplyCtx<'_>, f: &super::collateral::FirstConflict) {
     if ctx.tx_version.tx_incarnation < 1 {
+        return;
+    }
+    // Thin: first-conflict ungated wait is enough; deepening on every
+    // reincarnation serialized the short spine.
+    if ctx.scheduler.block_size() <= super::THIN_SHELL_N {
         return;
     }
     let tx = ctx.tx_version.tx_idx;

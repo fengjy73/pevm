@@ -1762,8 +1762,8 @@ fn live_writer_act(
     }
     let never = address == specfence.beneficiary || is_lazy;
     let finished = specfence.scheduler.is_done(writer) || specfence.scheduler.is_validated(writer);
-    // Thin ungated: WaitOnce is consult+checkpoint only. Blocking on a live
-    // Estimate tip serialized the short WAW spine and raised the wall.
+    // Thin ungated: WaitOnce is consult-only. Blocking on a live Estimate tip
+    // serialized the short WAW spine and raised the wall (opt-v3 discard).
     if !never
         && !finished
         && !specfence.ready_edges.is_gated(tx_idx)
