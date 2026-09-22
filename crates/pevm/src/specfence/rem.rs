@@ -1038,6 +1038,33 @@ impl PartialRetryTable {
         n
     }
 
+    /// Fallback when access_log prefix has no rem snaps: keep every snap
+    /// except the failed location.
+    pub(crate) fn arm_prefix_keep_all_except(
+        &self,
+        tx_idx: TxIdx,
+        fail_loc: MemoryLocationHash,
+    ) -> usize {
+        if tx_idx >= self.states.len() {
+            return 0;
+        }
+        let mut kept = HashMap::with_hasher(BuildIdentityHasher::default());
+        {
+            let st = unsafe { self.state_ref(tx_idx) };
+            for (loc, v) in &st.value_snap {
+                if *loc != fail_loc {
+                    kept.insert(*loc, v.clone());
+                }
+            }
+        }
+        if kept.is_empty() {
+            return 0;
+        }
+        let n = kept.len();
+        self.ff_head.insert(tx_idx, kept);
+        n
+    }
+
     pub(crate) fn note_value(&self, tx_idx: TxIdx, location: MemoryLocationHash, value: FfValue) {
         if tx_idx < self.states.len() {
             // SAFETY: single-executor invariant
@@ -1449,6 +1476,22 @@ impl PartialRetryTable {
         kind: CheckpointKind,
     ) -> Option<CheckpointId> {
         self.push_checkpoint_with_boundary(tx_idx, kind, None)
+    }
+
+    /// Checkpoint at a known access-log \(k\) (ungated path never bumps rem.k).
+    pub(crate) fn push_checkpoint_at_k(
+        &self,
+        tx_idx: TxIdx,
+        k: usize,
+        kind: CheckpointKind,
+    ) -> Option<CheckpointId> {
+        if tx_idx >= self.states.len() || k == 0 {
+            return None;
+        }
+        // SAFETY: single-executor invariant
+        let st = unsafe { self.state_mut(tx_idx) };
+        st.k = st.k.max(k);
+        Some(st.push_checkpoint(tx_idx, kind))
     }
 
     pub(crate) fn push_checkpoint_with_boundary(

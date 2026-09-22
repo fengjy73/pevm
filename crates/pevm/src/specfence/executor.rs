@@ -11,7 +11,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::ConcurrencyMode;
 use super::LeanAbortRepair;
-use super::ResolvePlan;
 use super::SpecFenceCtx;
 use super::VisibilityPolicy;
 use super::certificate::CertificateTable;
@@ -22,6 +21,7 @@ use super::collateral::{
 use super::dag::FenceGraph;
 use super::learner::LiveLearner;
 use super::repair::{RepairGrain, repair_grain};
+use super::resolve_plan::{ResolvePlan, try_early_waw_rewind};
 use super::wave::WaveParkTable;
 use crate::mv_memory::MvMemory;
 use crate::scheduler::Scheduler;
@@ -555,8 +555,11 @@ pub(crate) fn validate_to_plan(
         return (ResolvePlan::PartialAbortRebind, invalid);
     }
     if vis.is_opt() {
-        // One invalid read at a known k keeps its prefix (ff_head) inside
-        // FullReplay apply. OrderedReplay-from-k=0 is not salvage.
+        // Early-k WAW: a mid-tx checkpoint before fail_k arms hang-free
+        // RewindTo (Indep, no live_capture). Otherwise FullReplay + ff_head.
+        if let Some(plan) = try_early_waw_rewind(mv_memory, tx_version, specfence, &invalid) {
+            return (plan, invalid);
+        }
         return (ResolvePlan::FullReplay, invalid);
     }
 

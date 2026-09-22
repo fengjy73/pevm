@@ -203,6 +203,30 @@ impl ReadyEdgeTable {
         n
     }
 
+    /// Demand-driven WaitOnce: park `consumer` on `producer` without
+    /// `mark_gated`. The resume stays on the Opt path after the publish.
+    pub(crate) fn note_ungated_wait_on(&self, consumer: TxIdx, producer: TxIdx) {
+        if producer >= consumer || self.is_writer_done(producer) {
+            return;
+        }
+        self.consumers
+            .entry(consumer)
+            .or_insert_with(|| AtomicUsize::new(producer));
+        let e = self.consumers.get(&consumer).unwrap();
+        let mut cur = e.load(Ordering::Relaxed);
+        while cur == NONE || (producer > cur && producer < consumer) {
+            match e.compare_exchange_weak(cur, producer, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(v) => cur = v,
+            }
+        }
+        drop(e);
+        let mut w = self.waiters.entry(producer).or_default();
+        if !w.iter().any(|&c| c == consumer) {
+            w.push(consumer);
+        }
+    }
+
     /// Register a **known** consumer (this reader hit unpublished RAW / aborted).
     ///
     /// Keeps the **latest** unfinished predecessor (WAW immediate pred). A

@@ -239,9 +239,9 @@ fn select_crit_chain(
             .collect();
         w.sort_unstable();
         w.dedup();
-        // Under 32 writers the serial wait costs more than the replay
-        // it removes (3356896, chain ~15). 15274915's chain is ~60.
-        if w.len() < 32 || w.len() * 4 > block_size.max(1) {
+        // Pack any real chain (≥4). Begin holds only the long ones (≥32).
+        // Short spines still get head-first + demand-driven WaitOnce.
+        if w.len() < 4 || w.len() * 4 > block_size.max(1) {
             continue;
         }
         let replace = best.as_ref().is_none_or(|(_, prev)| w.len() > prev.len());
@@ -583,12 +583,10 @@ impl Pevm {
                 if writers.len() < 4 || writers.len() * 4 > block_size {
                     return None;
                 }
-                access_arms.install_crit_chain(loc);
+                access_arms.install_crit_chain(loc, &writers);
                 // Hold successors off the queue only for a long spine.
                 // 3356896's ~15-writer chain serialized slower than the
-                // replays (reuse SF/OCC 1.42 vs census 1.28). 15274915's
-                // ~60-writer chain is the one that pays for itself.
-                // The head is popped first. Successors stay ungated.
+                // replays. Short spines consult WaitOnce at the read.
                 if writers.len() >= 32 {
                     ready_edges.plant_nearest_preds(loc, &writers);
                 }

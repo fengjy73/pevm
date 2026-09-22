@@ -476,6 +476,69 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.pcc_armed.set(false);
     }
 
+    /// Learned WaitOnce on the ungated Opt path. Park once for the nearest
+    /// unfinished pred without mark_gated. A pred that has not started is
+    /// woken when it commits (`note_ungated_wait_on`); parking every core
+    /// on a seed-held short chain is not this path.
+    fn consult_ungated_wait_once(
+        &self,
+        address: Address,
+        location_hash: MemoryLocationHash,
+        access_k: u32,
+    ) -> Result<(), ReadError> {
+        if self.specfence.mode != crate::ConcurrencyMode::SpecFence {
+            return Ok(());
+        }
+        if self.is_lazy || address == self.specfence.beneficiary {
+            return Ok(());
+        }
+        if !self.specfence.access_arms.is_wait_once(location_hash) {
+            return Ok(());
+        }
+        // Prefix checkpoint before this read so fail_k can RewindTo.
+        if access_k > 1 {
+            let _ = self.specfence.partial_retry.push_checkpoint_at_k(
+                self.tx_idx,
+                (access_k - 1) as usize,
+                crate::specfence::CheckpointKind::EffectBoundary,
+            );
+        }
+        let Some(pred) = self
+            .specfence
+            .access_arms
+            .crit_pred(self.tx_idx, location_hash)
+            .or_else(|| {
+                self.mv_memory
+                    .last_writer_before(location_hash, self.tx_idx)
+            })
+        else {
+            return Ok(());
+        };
+        if pred >= self.tx_idx {
+            return Ok(());
+        }
+        let finished =
+            self.specfence.scheduler.is_done(pred) || self.specfence.scheduler.is_validated(pred);
+        if finished {
+            // Data should be visible; fall through to the MV walk.
+            return Ok(());
+        }
+        match live_writer_act(
+            &self.specfence,
+            self.tx_idx,
+            self.is_lazy,
+            address,
+            location_hash,
+            pred,
+        ) {
+            crate::specfence::LiveAct::Block => {
+                Err(self.park_estimate_blocking(location_hash, pred))
+            }
+            crate::specfence::LiveAct::Retry => Err(ReadError::InconsistentRead),
+            crate::specfence::LiveAct::Skip => Ok(()),
+        }
+    }
+
     /// Mode dispatch. OCC is `Ok(())` with **zero** SpecFence calls.
     /// SpecFence OptimisticRead compiles to the same OCC proceed (`occ_optimistic_read`).
     fn maybe_wait(
@@ -860,7 +923,8 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 .specfence
                 .ready_edges
                 .predicted_producer(location_hash)
-                .is_some();
+                .is_some()
+            || self.specfence.access_arms.is_wait_once(location_hash);
         let mut kind = crate::specfence::ordered_admit_act::estimate_park_kind(pe_known);
         let access_k = self
             .specfence
@@ -1685,9 +1749,12 @@ impl<S: Storage> Database for VmDb<'_, S> {
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         let location_hash = self.hash_basic(&address);
-        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
-            let _ = self.specfence.access_log.note(self.tx_idx, location_hash);
-        }
+        let access_k = if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            self.specfence.access_log.note(self.tx_idx, location_hash)
+        } else {
+            0
+        };
+        self.consult_ungated_wait_once(address, location_hash, access_k)?;
         self.maybe_wait(address, location_hash, false)?;
         let resolve = self.resolve_read_overlay();
 
@@ -2130,9 +2197,12 @@ impl<S: Storage> Database for VmDb<'_, S> {
 
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
         let location_hash = hash_deterministic(MemoryLocation::Storage(address, index));
-        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
-            let _ = self.specfence.access_log.note(self.tx_idx, location_hash);
-        }
+        let access_k = if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            self.specfence.access_log.note(self.tx_idx, location_hash)
+        } else {
+            0
+        };
+        self.consult_ungated_wait_once(address, location_hash, access_k)?;
         self.maybe_wait(address, location_hash, true)?;
         let resolve = self.resolve_read_overlay();
 

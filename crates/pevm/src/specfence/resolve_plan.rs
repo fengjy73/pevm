@@ -119,7 +119,18 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
                 ctx.specfence.metrics.record_partial_abort_win();
                 ctx.specfence.metrics.record_rewind_to_cp();
                 ctx.specfence.metrics.record_partial_retry();
-                ctx.specfence.partial_retry.mark_needs_live_capture(tx);
+                // Early-k WAW Soft=0: RewindTo + ff_head, Indep requeue.
+                // needs_live_capture + Released was the 19807137 hang class.
+                let early_ungated =
+                    ctx.invalid.len() == 1 && !ctx.specfence.ready_edges.is_gated(tx);
+                if early_ungated {
+                    // try_early_waw_rewind already installed ff_head + RewindTo.
+                    if !ctx.specfence.partial_retry.has_ff_head(tx) {
+                        let _ = keep_single_invalid_prefix(&ctx);
+                    }
+                } else {
+                    ctx.specfence.partial_retry.mark_needs_live_capture(tx);
+                }
             }
             // Partial rewind drops the publish. Leaving the edge done-bit set
             // made `note_consumer_on` bail (`is_writer_done`) while
@@ -129,7 +140,12 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
             ctx.scheduler
                 .finish_validation_sf(ctx.tx_version, true, Some(tx + 1));
             ctx.specfence.ready_edges.clear_started(tx);
-            requeue(&ctx, tx, QueueKind::Released);
+            let early_ungated = ctx.invalid.len() == 1 && !ctx.specfence.ready_edges.is_gated(tx);
+            if early_ungated {
+                requeue(&ctx, tx, QueueKind::Indep);
+            } else {
+                requeue(&ctx, tx, QueueKind::Released);
+            }
             enqueue_higher_revalidate(&ctx, tx);
         }
         ResolvePlan::OrderedReplay => {
@@ -400,10 +416,18 @@ fn keep_single_invalid_prefix(ctx: &ApplyCtx<'_>) -> bool {
     };
     ctx.specfence.access_arms.note_early_waw(loc, k);
     let prefix = ctx.specfence.access_log.prefix_before(tx, k);
-    let n = ctx
+    let mut n = ctx
         .specfence
         .partial_retry
         .arm_prefix_keep(tx, loc, k, &prefix);
+    // Ungated early reads sometimes leave access_log prefix without rem
+    // snaps (code_hash / None basic). Keep every snap except the fail loc.
+    if n == 0 {
+        n = ctx
+            .specfence
+            .partial_retry
+            .arm_prefix_keep_all_except(tx, loc);
+    }
     if n > 0 {
         ctx.specfence.access_arms.note_prefix_resume(n);
         ctx.specfence.metrics.record_prefix_resume(n);
@@ -412,6 +436,51 @@ fn keep_single_invalid_prefix(ctx: &ApplyCtx<'_>) -> bool {
     } else {
         false
     }
+}
+
+/// Opt early-WAW: mid-tx checkpoint before fail_k → hang-free RewindTo.
+pub(crate) fn try_early_waw_rewind(
+    mv_memory: &MvMemory,
+    tx_version: &TxVersion,
+    specfence: SpecFenceCtx<'_>,
+    invalid: &[MemoryLocationHash],
+) -> Option<ResolvePlan> {
+    if invalid.len() != 1 {
+        return None;
+    }
+    let tx = tx_version.tx_idx;
+    let loc = invalid[0];
+    if specfence.access_arms.is_never(loc) || location_is_lazy(mv_memory, tx, loc) {
+        return None;
+    }
+    // Already RewindTo once this block — escalate to FullReplay.
+    if specfence.partial_retry.suffix_repair_depth(tx) != 0 {
+        return None;
+    }
+    let k = specfence.access_log.first_k(tx, loc).filter(|&k| k > 1)?;
+    let k_fail = k as usize;
+    let cp = specfence.partial_retry.last_checkpoint_before(tx, k_fail)?;
+    if cp.k == 0 || cp.k >= k_fail {
+        return None;
+    }
+    let prefix = specfence.access_log.prefix_before(tx, k);
+    let mut n = specfence.partial_retry.arm_prefix_keep(tx, loc, k, &prefix);
+    if n == 0 {
+        n = specfence.partial_retry.arm_prefix_keep_all_except(tx, loc);
+    }
+    if n == 0 {
+        return None;
+    }
+    let certified: Vec<_> = prefix.iter().map(|(l, _)| *l).collect();
+    specfence
+        .partial_retry
+        .arm_rewind_to(tx, cp, k_fail, certified, Vec::new(), Vec::new());
+    specfence.partial_retry.note_suffix_repair(tx);
+    specfence.access_arms.note_early_waw(loc, k);
+    specfence.access_arms.note_prefix_resume(n);
+    specfence.metrics.record_prefix_resume(n);
+    specfence.metrics.record_fail_k(k);
+    Some(ResolvePlan::PartialAbortRewind)
 }
 
 fn clear_retry(specfence: SpecFenceCtx<'_>, tx: crate::TxIdx) {

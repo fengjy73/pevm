@@ -233,7 +233,13 @@ pub(crate) fn run_sf_block<F, V>(
                         // (incarnation++ mill — 6196166 reuse 206k / 19807137).
                         if let Some(w) = on {
                             if w < tx_idx {
-                                specfence.ready_edges.note_consumer_on(tx_idx, w, None);
+                                // AccessArm WaitOnce on an ungated tx must not
+                                // mark_gated — that left the fast Opt path.
+                                if specfence.ready_edges.is_gated(tx_idx) {
+                                    specfence.ready_edges.note_consumer_on(tx_idx, w, None);
+                                } else {
+                                    specfence.ready_edges.note_ungated_wait_on(tx_idx, w);
+                                }
                                 runnable.mark_wait(tx_idx);
                             } else if specfence.ready_edges.is_live_leftover_min(tx_idx)
                                 || specfence.ready_edges.is_leftover_claimed(tx_idx)
