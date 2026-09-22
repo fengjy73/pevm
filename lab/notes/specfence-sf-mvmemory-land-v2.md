@@ -88,10 +88,13 @@ Thin Avoid tax cut
 ChainSpineTip (large sticky≥32)
   begin: bind_chain_spine(loc, writers) after plant_nearest_preds
   execute: chain_claim(writer) — AtomicU8 flag, not BTreeMap tips
-  Data: publish_data → chain_release + wake_exact
+  Data: publish_data → chain_release + wake_exact + wake_planted_on_publish
+  drain_wave: wave bag → Q_released (one-hop schedule Avoid)
+  Soft=0 chain consult miss: register exact + note_ungated_wait; recover_executing
+    (no Aborting BlockingOther) — wake on chain_release, not writer-done
   abort: chain_clear
   consult: has_released / live_writer / true_publish_ready hit flags
-  brief Released-poll then park_publish_wait
+  brief Released-poll then schedule-defer (not Blocking park)
 ```
 
 ---
