@@ -1,7 +1,7 @@
 # SpecFence SfMvMemory land v1
 
 **Date:** 2026-09-22  
-**Tip:** `a8c8b49` on `cursor/specfence-sf-ps-true-spine-d6e8` (PR #45)  
+**Tip:** `2b95a78` on `cursor/specfence-sf-ps-true-spine-d6e8` (PR #45)  
 **Harness:** Soft=0 Instant-off, 8 cores, `SPECFENCE_COMPARE_CHECK=1`, N=5 both  
 **SoT:** [`specfence-sf-mvmemory-redesign-v1.md`](specfence-sf-mvmemory-redesign-v1.md), [`specfence-thin-avoid-no-estimate-v1.md`](specfence-thin-avoid-no-estimate-v1.md)  
 **Hard acceptance:** **TPS SF/OCC ≥ 1.5** both blocks (user 2026-09-22).  
@@ -11,7 +11,7 @@
 
 ## Verdict
 
-**Did not meet TPS ≥ 1.5.** SpecFence-native `SfMvMemory` / `SfTipTable` landed (version tip + publish wake + WaitOnce consume without Estimate Block). Soft=0 Instant-off N≥5 both: `seq=par`, `occ_picks=0`, `soft_wait_arms=0`, `explore=0`. Tip `65b85eb`. Best measured TPS this host ≈ **0.60** (3356896) / ≈ **0.70** (15274915 on noisy OCC) — still incomplete vs 1.5 bar. Path **(c)** Opt→FullReplay still dominates early-WAW basics. Ship tip + honest gaps.
+**Did not meet TPS ≥ 1.5.** SpecFence-native `SfMvMemory` / `SfTipTable` landed (version tip + publish wake + WaitOnce consume without Estimate Block). Soft=0 Instant-off N≥5 both: `seq=par`, `occ_picks=0`, `soft_wait_arms=0`, `explore=0`. Tip `2b95a78`. Best measured TPS this host ≈ **0.85** (3356896 reuse after Detect(a) edge plant) / ≈ **0.61** (15274915 after publish_data gate); still ≪ **1.5** — still incomplete vs 1.5 bar. Path **(c)** Opt→FullReplay still dominates early-WAW basics. Ship tip + honest gaps.
 
 ---
 
