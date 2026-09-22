@@ -520,6 +520,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     .crit_pred(self.tx_idx, location_hash)
             })
             .or_else(|| {
+                // Thin Soft=0: Learn peer + crit are enough — skip MvMemory /
+                // writers_of alloc ladder (scaffolding tax when Avoid already works).
+                if thin {
+                    return None;
+                }
                 self.mv_memory
                     .last_writer_before(location_hash, self.tx_idx)
             })
@@ -530,6 +535,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     .filter(|&w| w < self.tx_idx)
             })
             .or_else(|| {
+                if thin {
+                    return None;
+                }
                 self.specfence
                     .ready_edges
                     .writers_of(location_hash)
@@ -570,22 +578,24 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 .sf_tips
                 .live_writer(location_hash)
                 .is_some_and(|w| w == pred);
-        // Thin: Avoid = short spin while Executing + read-after-true-publish.
-        // SoT thin-avoid forbids Blocking park / mark_gated / Rewind / Estimate
-        // Block. If tip not Released after spin, Opt-fallthrough (path c) —
-        // next Learn + early tip raise Avoid hit rate without serial park.
+        // Thin: cheap scheduler-first spin; tip/Data probe every 64 iters.
+        // Soft=0 forbids Blocking park / Estimate Block / Rewind.
         if thin {
             if !executing && !has_sf_tip {
                 return Ok(());
             }
             self.specfence.sf_tips.record_wait_once_consume();
             if executing {
-                const SPIN: usize = 131_072;
-                for _ in 0..SPIN {
-                    if sf.true_publish_ready(location_hash, pred)
-                        || self.specfence.scheduler.is_done(pred)
+                const SPIN: usize = 4_096;
+                for i in 0..SPIN {
+                    if self.specfence.scheduler.is_done(pred)
                         || self.specfence.scheduler.is_validated(pred)
                     {
+                        self.specfence.sf_tips.record_avoid_publish();
+                        self.specfence.sf_tips.record_class_avoid(class);
+                        return Ok(());
+                    }
+                    if i % 64 == 0 && sf.true_publish_ready(location_hash, pred) {
                         self.specfence.sf_tips.record_avoid_publish();
                         self.specfence.sf_tips.record_class_avoid(class);
                         return Ok(());
@@ -604,10 +614,8 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 self.specfence.sf_tips.record_class_avoid(class);
                 return Ok(());
             }
-            // Exact waiter registered for publish wake metrics; no Blocking park.
-            self.specfence
-                .sf_tips
-                .register_waiter(location_hash, pred, self.tx_idx);
+            // Soft=0 thin: no Blocking park; Opt-fallthrough (Learn raises Avoid).
+            // Do not register_waiter — ungated finish never wakes DashMap waiters.
             return Ok(());
         }
         // Large: park when Executing / SF tip / live_writer. Estimate tip is
@@ -2708,13 +2716,17 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         locs: &[crate::MemoryLocationHash],
     ) {
         for &loc in locs {
-            // Tip plane: thin WaitOnce/crit only. Large sticky≥32 keeps
-            // nearest-pred + park_publish_wait (Chain Avoid) without tip tax.
             let thin = self.specfence.scheduler.block_size() <= crate::specfence::THIN_SHELL_N;
+            // Thin WaitOnce/crit DashMap tip; large ChainSpineTip only.
             if thin
                 && (self.specfence.access_arms.is_crit_loc(loc)
                     || self.specfence.access_arms.is_wait_once(loc))
             {
+                let _exact = self
+                    .specfence
+                    .sf_tips
+                    .publish_data(loc, writer, incarnation);
+            } else if self.specfence.sf_tips.is_chain_loc(loc) {
                 let _exact = self
                     .specfence
                     .sf_tips
@@ -3011,31 +3023,37 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             ctx.journal_mut().clear();
         }
 
-        // SpecFence write path: early version tip + live_writer for thin Avoid
-        // (WaitOnce / crit). Large sticky≥32 + fail_k Rewind: Chain Avoid via
-        // nearest-pred + park_publish_wait — tip DashMap tax regressed wall.
-        if self.specfence.mode == crate::ConcurrencyMode::SpecFence
-            && self.specfence.scheduler.block_size() <= crate::specfence::THIN_SHELL_N
-        {
+        // SpecFence write path: early version tip + live_writer.
+        // Thin: DashMap WaitOnce/crit. Large: ChainSpineTip only (sticky≥32).
+        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            let thin = self.specfence.scheduler.block_size() <= crate::specfence::THIN_SHELL_N;
             let crit = self.specfence.access_arms.crit_loc_hash();
-            let prior = self.mv_memory.write_locations(tx_version.tx_idx);
-            for &loc in &prior {
-                if self.specfence.access_arms.is_crit_loc(loc)
-                    || self.specfence.access_arms.is_wait_once(loc)
+            if thin {
+                let prior = self.mv_memory.write_locations(tx_version.tx_idx);
+                for &loc in &prior {
+                    if self.specfence.access_arms.is_crit_loc(loc)
+                        || self.specfence.access_arms.is_wait_once(loc)
+                    {
+                        self.specfence.sf_tips.install_version_tip(
+                            loc,
+                            tx_version.tx_idx,
+                            tx_version.tx_incarnation,
+                        );
+                    }
+                }
+                if crit != u64::MAX
+                    && self.specfence.access_arms.is_wait_once(crit)
+                    && !prior.iter().any(|&l| l == crit)
                 {
                     self.specfence.sf_tips.install_version_tip(
-                        loc,
+                        crit,
                         tx_version.tx_idx,
                         tx_version.tx_incarnation,
                     );
                 }
-            }
-            if crit != u64::MAX
-                && self.specfence.access_arms.is_wait_once(crit)
-                && !prior.iter().any(|&l| l == crit)
-            {
-                self.specfence.sf_tips.install_version_tip(
-                    crit,
+            } else if self.specfence.sf_tips.is_chain_loc(crit) {
+                // ChainSpineTip claim — O(1) flag, not WaitOnce DashMap mill.
+                self.specfence.sf_tips.chain_claim(
                     tx_version.tx_idx,
                     tx_version.tx_incarnation,
                 );
@@ -3946,8 +3964,28 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 // insert races seq≡par (iter9 / mixed SIGSEGV). C1/L2 seed
                 // at begin (hint / prior) or on the next block after promote.
                 if optimistic_ungated {
+                    // Light tip publish before record moves write_set (Released /
+                    // ChainSpine so WaitOnce Avoid hits without spin/museum).
+                    let tip_locs: Vec<_> = write_set
+                        .iter()
+                        .map(|(loc, _)| *loc)
+                        .filter(|&loc| {
+                            self.specfence.sf_tips.is_chain_loc(loc)
+                                || (self.specfence.scheduler.block_size()
+                                    <= crate::specfence::THIN_SHELL_N
+                                    && (self.specfence.access_arms.is_crit_loc(loc)
+                                        || self.specfence.access_arms.is_wait_once(loc)))
+                        })
+                        .collect();
                     let (wrote_new_location, contended) =
                         self.mv_memory.record(tx_version, read_set, write_set);
+                    for loc in tip_locs {
+                        let _ = self.specfence.sf_tips.publish_data(
+                            loc,
+                            tx_version.tx_idx,
+                            tx_version.tx_incarnation,
+                        );
+                    }
                     if wrote_new_location {
                         flags |= FinishExecFlags::WroteNewLocation;
                     }

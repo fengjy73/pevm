@@ -592,6 +592,8 @@ impl Pevm {
                 }
                 access_arms.install_crit_chain(loc, &writers);
                 ready_edges.plant_nearest_preds(loc, &writers);
+                // ChainSpineTip: light true-publish plane (not DashMap WaitOnce tips).
+                sf_tips.bind_chain_spine(loc, &writers);
                 writers.first().copied()
             });
             self.last_begin_blocked = ready_edges.blocked_consumers();
@@ -2419,11 +2421,16 @@ fn try_validate(
         if specfence.mode == ConcurrencyMode::SpecFence {
             // Drop SF version tip / live_writer so WaitOnce does not park on
             // a stale unpublished claim (SoT: Estimate is OCC-only).
-            // Thin tip plane only — large Chain Avoid is nearest-pred + park.
+            // Thin DashMap tip plane; large ChainSpineTip clear only.
             if scheduler.block_size() <= crate::specfence::THIN_SHELL_N {
                 let _ = specfence
                     .sf_tips
                     .clear_writer(tx_version.tx_idx, &occ_write_locs);
+            } else if specfence
+                .sf_tips
+                .is_chain_loc(specfence.access_arms.crit_loc_hash())
+            {
+                specfence.sf_tips.chain_clear(tx_version.tx_idx);
             }
             for &loc in &occ_write_locs {
                 specfence.sketch.push_spine(loc, tx_version.tx_idx);

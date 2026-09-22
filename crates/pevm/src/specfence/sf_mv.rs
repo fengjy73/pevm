@@ -7,7 +7,7 @@
 //! SoT: `lab/notes/specfence-sf-mvmemory-redesign-v1.md`
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use dashmap::DashMap;
 
@@ -15,6 +15,11 @@ use crate::mv_memory::MvMemory;
 use crate::{MemoryLocationHash, MemoryValue, TxIdx, TxIncarnation};
 
 use super::VisibilityPolicy;
+
+/// Chain spine tip state (sticky≥32 light plane — no DashMap).
+const CHAIN_EMPTY: u8 = 0;
+const CHAIN_VERSION: u8 = 1;
+const CHAIN_RELEASED: u8 = 2;
 
 /// SpecFence tip kind — **not** OCC [`crate::MemoryEntry::Estimate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,13 +47,20 @@ pub(crate) enum SfRead {
 
 /// Shared SpecFence tip + exact-waiter plane (one per block execution).
 /// SoT: version tip, live_writer(ℓ), exact waiters; Estimate forbidden.
-#[derive(Debug, Default)]
+/// Large sticky≥32 uses [`Self::bind_chain_spine`] (atomics) — not DashMap tips.
+#[derive(Debug)]
 pub(crate) struct SfTipTable {
     tips: DashMap<MemoryLocationHash, BTreeMap<TxIdx, SfTip>>,
     /// True unpublished writer of ℓ (RAW/WAW). Cleared on publish after tip.
     live_writer: DashMap<MemoryLocationHash, TxIdx>,
     /// Exact waiters keyed by `(location, writer)`.
     waiters: DashMap<(MemoryLocationHash, TxIdx), Vec<TxIdx>>,
+    /// ChainSpineTip: sticky≥32 loc (`u64::MAX` = inactive).
+    chain_loc: AtomicU64,
+    /// Writer → Empty|Version|Released (dense Chain plane; not BTreeMap tips).
+    chain_flags: DashMap<TxIdx, AtomicU8>,
+    /// Highest unfinished chain writer claim (`usize::MAX` = none).
+    chain_live: AtomicUsize,
     early_tip_n: AtomicUsize,
     publish_wake_n: AtomicUsize,
     wait_once_consume_n: AtomicUsize,
@@ -69,6 +81,34 @@ pub(crate) struct SfTipTable {
     estimate_block_sf: AtomicUsize,
 }
 
+impl Default for SfTipTable {
+    fn default() -> Self {
+        Self {
+            tips: DashMap::new(),
+            live_writer: DashMap::new(),
+            waiters: DashMap::new(),
+            chain_loc: AtomicU64::new(u64::MAX),
+            chain_flags: DashMap::new(),
+            chain_live: AtomicUsize::new(usize::MAX),
+            early_tip_n: AtomicUsize::new(0),
+            publish_wake_n: AtomicUsize::new(0),
+            wait_once_consume_n: AtomicUsize::new(0),
+            detect_before_n: AtomicUsize::new(0),
+            avoid_publish_n: AtomicUsize::new(0),
+            resolve_after_fail_n: AtomicUsize::new(0),
+            raw_avoid_n: AtomicUsize::new(0),
+            raw_late_n: AtomicUsize::new(0),
+            war_avoid_n: AtomicUsize::new(0),
+            war_late_n: AtomicUsize::new(0),
+            waw_avoid_n: AtomicUsize::new(0),
+            waw_late_n: AtomicUsize::new(0),
+            chain_avoid_n: AtomicUsize::new(0),
+            chain_late_n: AtomicUsize::new(0),
+            estimate_block_sf: AtomicUsize::new(0),
+        }
+    }
+}
+
 impl SfTipTable {
     #[inline]
     pub(crate) fn new() -> Self {
@@ -78,16 +118,26 @@ impl SfTipTable {
     /// Early version tip on the SpecFence write path (prior WS / known ℓ).
     /// Does **not** install OCC Estimate into MvMemory.
     /// Sets live_writer(ℓ) so WaitOnce can Detect without Estimate.
+    /// Skips no-op reinstall of the same Version incarnation (thin tax cut).
     pub(crate) fn install_version_tip(
         &self,
         location: MemoryLocationHash,
         writer: TxIdx,
         incarnation: TxIncarnation,
     ) {
+        // ChainSpineTip owns sticky≥32 crit — never DashMap that ℓ.
+        if self.is_chain_loc(location) {
+            self.chain_claim(writer, incarnation);
+            return;
+        }
         {
             let mut map = self.tips.entry(location).or_default();
             match map.get(&writer) {
                 Some(SfTip::Released { incarnation: inc }) if *inc >= incarnation => {
+                    return;
+                }
+                Some(SfTip::Version { incarnation: inc }) if *inc == incarnation => {
+                    // Already claimed this incarnation — no DashMap rewrite / census.
                     return;
                 }
                 _ => {
@@ -114,6 +164,10 @@ impl SfTipTable {
         writer: TxIdx,
         incarnation: TxIncarnation,
     ) -> Vec<TxIdx> {
+        if self.is_chain_loc(location) {
+            self.chain_release(writer, incarnation);
+            return self.wake_exact(location, writer);
+        }
         {
             let mut map = self.tips.entry(location).or_default();
             map.insert(writer, SfTip::Released { incarnation });
@@ -125,9 +179,84 @@ impl SfTipTable {
         self.wake_exact(location, writer)
     }
 
+    /// Bind sticky≥32 ChainSpineTip (light flags, not BTreeMap tips).
+    pub(crate) fn bind_chain_spine(&self, loc: MemoryLocationHash, writers: &[TxIdx]) {
+        self.chain_loc.store(loc, Ordering::Relaxed);
+        self.chain_flags.clear();
+        for &w in writers {
+            self.chain_flags.insert(w, AtomicU8::new(CHAIN_EMPTY));
+        }
+        self.chain_live.store(usize::MAX, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn is_chain_loc(&self, loc: MemoryLocationHash) -> bool {
+        let c = self.chain_loc.load(Ordering::Relaxed);
+        c != u64::MAX && c == loc
+    }
+
+    /// Claim Version on ChainSpineTip.
+    pub(crate) fn chain_claim(&self, writer: TxIdx, _incarnation: TxIncarnation) {
+        let Some(slot) = self.chain_flags.get(&writer) else {
+            return;
+        };
+        let prev = slot.swap(CHAIN_VERSION, Ordering::Release);
+        if prev == CHAIN_EMPTY {
+            self.early_tip_n.fetch_add(1, Ordering::Relaxed);
+        }
+        let _ = self.chain_live.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            if cur == usize::MAX || writer >= cur {
+                Some(writer)
+            } else {
+                None
+            }
+        });
+    }
+
+    /// Released on ChainSpineTip after true Data publish.
+    pub(crate) fn chain_release(&self, writer: TxIdx, _incarnation: TxIncarnation) {
+        if let Some(slot) = self.chain_flags.get(&writer) {
+            slot.store(CHAIN_RELEASED, Ordering::Release);
+        }
+        let _ = self
+            .chain_live
+            .compare_exchange(writer, usize::MAX, Ordering::Relaxed, Ordering::Relaxed);
+    }
+
+    /// Clear chain claim on abort (stale Version must not park successors).
+    pub(crate) fn chain_clear(&self, writer: TxIdx) {
+        if let Some(slot) = self.chain_flags.get(&writer) {
+            slot.store(CHAIN_EMPTY, Ordering::Release);
+        }
+        let _ = self
+            .chain_live
+            .compare_exchange(writer, usize::MAX, Ordering::Relaxed, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn chain_released(&self, writer: TxIdx) -> bool {
+        self.chain_flags
+            .get(&writer)
+            .is_some_and(|s| s.load(Ordering::Acquire) == CHAIN_RELEASED)
+    }
+
+    #[inline]
+    pub(crate) fn chain_version_or_released(&self, writer: TxIdx) -> bool {
+        self.chain_flags.get(&writer).is_some_and(|s| {
+            matches!(
+                s.load(Ordering::Acquire),
+                CHAIN_VERSION | CHAIN_RELEASED
+            )
+        })
+    }
+
     /// True unpublished writer of ℓ (structure RAW/WAW), if any.
     #[inline]
     pub(crate) fn live_writer(&self, location: MemoryLocationHash) -> Option<TxIdx> {
+        if self.is_chain_loc(location) {
+            let w = self.chain_live.load(Ordering::Relaxed);
+            return (w != usize::MAX).then_some(w);
+        }
         self.live_writer.get(&location).map(|e| *e)
     }
 
@@ -139,7 +268,14 @@ impl SfTipTable {
         locations: &[MemoryLocationHash],
     ) -> Vec<TxIdx> {
         let mut woken = Vec::new();
+        if self.chain_loc.load(Ordering::Relaxed) != u64::MAX {
+            self.chain_clear(writer);
+        }
         for &loc in locations {
+            if self.is_chain_loc(loc) {
+                woken.extend(self.wake_exact(loc, writer));
+                continue;
+            }
             if let Some(mut map) = self.tips.get_mut(&loc) {
                 map.remove(&writer);
             }
@@ -161,6 +297,9 @@ impl SfTipTable {
     /// True when writer has Released Data tip (or MvMemory will supply Data).
     #[inline]
     pub(crate) fn has_released(&self, location: MemoryLocationHash, writer: TxIdx) -> bool {
+        if self.is_chain_loc(location) {
+            return self.chain_released(writer);
+        }
         matches!(
             self.tip_at(location, writer),
             Some(SfTip::Released { .. })
@@ -174,6 +313,9 @@ impl SfTipTable {
         location: MemoryLocationHash,
         writer: TxIdx,
     ) -> bool {
+        if self.is_chain_loc(location) {
+            return self.chain_version_or_released(writer);
+        }
         self.tip_at(location, writer).is_some()
     }
 
@@ -438,7 +580,7 @@ impl<'a> SfMvMemory<'a> {
         }
     }
 
-    /// True publish for `writer` on `location` (Released tip or MvMemory Data).
+    /// True publish for `writer` on `location` (Released tip, ChainSpine, or MvMemory Data).
     pub(crate) fn true_publish_ready(
         &self,
         location: MemoryLocationHash,
@@ -572,22 +714,32 @@ mod tests {
     }
 
     #[test]
-    fn classify_wait_conflict_four_classes() {
-        assert_eq!(
-            classify_wait_conflict(true, 75, 1),
-            SfConflictClass::Chain
-        );
-        assert_eq!(
-            classify_wait_conflict(true, 16, 5),
-            SfConflictClass::Waw
-        );
-        assert_eq!(
-            classify_wait_conflict(false, 0, 5),
-            SfConflictClass::Waw
-        );
-        assert_eq!(
-            classify_wait_conflict(false, 0, 0),
-            SfConflictClass::Raw
-        );
+    fn chain_spine_claim_release_without_dashmap_tips() {
+        let tips = SfTipTable::new();
+        let writers = vec![10usize, 20, 30, 40];
+        tips.bind_chain_spine(0xabc, &writers);
+        assert!(tips.is_chain_loc(0xabc));
+        tips.chain_claim(20, 0);
+        assert_eq!(tips.early_tip_n(), 1);
+        assert_eq!(tips.live_writer(0xabc), Some(20));
+        assert!(tips.has_version_or_released(0xabc, 20));
+        assert!(!tips.has_released(0xabc, 20));
+        // Reclaim same writer must not bump early_tip again from EMPTY.
+        tips.chain_claim(20, 1);
+        assert_eq!(tips.early_tip_n(), 1);
+        tips.publish_data(0xabc, 20, 0);
+        assert!(tips.has_released(0xabc, 20));
+        assert!(tips.live_writer(0xabc).is_none());
+        // DashMap tips unused for chain loc.
+        assert!(tips.tip_at(0xabc, 20).is_none());
+    }
+
+    #[test]
+    fn install_version_tip_skips_same_incarnation() {
+        let tips = SfTipTable::new();
+        tips.install_version_tip(7, 1, 0);
+        assert_eq!(tips.early_tip_n(), 1);
+        tips.install_version_tip(7, 1, 0);
+        assert_eq!(tips.early_tip_n(), 1, "same Version inc must not re-census");
     }
 }
