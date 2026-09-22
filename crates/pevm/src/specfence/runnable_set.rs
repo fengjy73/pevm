@@ -369,10 +369,20 @@ impl RunnableSet {
         // Independents first (PC-3). Worker 0 used to prefer Ordered/Released
         // and 1-core starved Q_indep=29 behind one Released park-requeue
         // (19469101 pending=30 / live_wait=false).
-        let prefer = match worker_i % 3 {
-            0 => [QueueKind::Indep, QueueKind::Released, QueueKind::Ordered],
-            1 => [QueueKind::Indep, QueueKind::Ordered, QueueKind::Released],
-            _ => [QueueKind::Released, QueueKind::Indep, QueueKind::Ordered],
+        // Large sticky spine: prefer Q_released (unlock the next hop) then
+        // Q_indep (fill antichain). Thin keeps Indep-first width.
+        let prefer = if self.block_size > crate::specfence::THIN_SHELL_N {
+            [
+                QueueKind::Released,
+                QueueKind::Indep,
+                QueueKind::Ordered,
+            ]
+        } else {
+            match worker_i % 3 {
+                0 => [QueueKind::Indep, QueueKind::Released, QueueKind::Ordered],
+                1 => [QueueKind::Indep, QueueKind::Ordered, QueueKind::Released],
+                _ => [QueueKind::Released, QueueKind::Indep, QueueKind::Ordered],
+            }
         };
         // One gated !may_execute head must not hide a later runnable in the
         // same deque (19469101: pending=30 stuck, schedule broke on first None).
@@ -403,6 +413,12 @@ impl RunnableSet {
         kind: QueueKind,
         ready: &ReadyEdgeTable,
     ) -> Option<SfPick> {
+        // Schedule-native Avoid: sticky-chain successor stays off the
+        // Opt abort train until pred is done. Not Win OrderedAdmit / mark_gated.
+        if let Some(_pred) = ready.blocking_producer(tx) {
+            self.mark_wait(tx);
+            return None;
+        }
         if !ready.leftover_min_on_skippable_gate(tx)
             && (ready.leftover_surplus(tx) || (ready.is_gated(tx) && !ready.may_execute(tx)))
         {
@@ -476,6 +492,12 @@ impl RunnableSet {
         }
         if ready.leftover_min_on_skippable_gate(tx) {
             let _ = self.wake_idle(tx, QueueKind::Indep);
+            return;
+        }
+        // Ungated chain successor: heal must not push Q_indep before pred
+        // Released (that race is the Opt→FullReplay train).
+        if ready.blocking_producer(tx).is_some() {
+            self.note_wait_unless_running(tx);
             return;
         }
         if ready.leftover_surplus(tx) || (ready.is_gated(tx) && !ready.may_execute(tx)) {
