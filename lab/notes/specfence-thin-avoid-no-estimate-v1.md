@@ -226,3 +226,12 @@ Open cut (opt-v3): **execute plane must consume WaitOnce** without those taxes �
 - Restoring pe-without-Avoid / sticky Opt as Learn output  
 - Editing pevm from the note author agent; CloudAgent lands separately  
 
+
+---
+
+## 10. Write/read plane SoT → SfMvMemory redesign
+
+**Primary SoT for SpecFence write/read plane** (early Data/version tip, WaitReleased/OrderedTip, exact waiter wake, Estimate OCC-only):  
+[`specfence-sf-mvmemory-redesign-v1.md`](specfence-sf-mvmemory-redesign-v1.md).
+
+This thin-avoid note keeps §4 Avoid rules and §7 land checklist for scheduler/Avoid taxes; **do not duplicate** the full `SfMvMemory` / shared-vs-private / publish-order design here. Land priority: SfMvMemory early tip + exact wake is the primary speed lever; thin scheduler options (i)/(ii) are assists only after the plane exists.
