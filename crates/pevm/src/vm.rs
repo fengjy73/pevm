@@ -640,23 +640,19 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return Ok(());
         }
         self.specfence.sf_tips.record_wait_once_consume();
+        // ChainSpineTip: brief Released poll (not long busy-spin) before park.
         if self.specfence.sf_tips.is_chain_loc(location_hash) && (executing || has_sf_tip) {
-            const SPIN: usize = 8_192;
+            const SPIN: usize = 512;
             for i in 0..SPIN {
                 if self.specfence.scheduler.is_done(pred)
                     || self.specfence.scheduler.is_validated(pred)
-                    || (i % 32 == 0 && sf.true_publish_ready(location_hash, pred))
+                    || (i % 16 == 0 && sf.true_publish_ready(location_hash, pred))
                 {
                     self.specfence.sf_tips.record_avoid_publish();
                     self.specfence.sf_tips.record_class_avoid(class);
                     return Ok(());
                 }
-                if !self.specfence.scheduler.is_executing(pred)
-                    && !self
-                        .specfence
-                        .sf_tips
-                        .has_version_or_released(location_hash, pred)
-                {
+                if !self.specfence.scheduler.is_executing(pred) {
                     break;
                 }
                 std::hint::spin_loop();
@@ -1987,15 +1983,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         let location_hash = self.hash_basic(&address);
         let access_k = if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
-            // Soft=0 Opt: skip ordinal HashMap unless WaitOnce/crit consult.
-            let arms = self.specfence.access_arms;
-            if arms.any_wait_once()
-                && (arms.is_wait_once(location_hash) || arms.crit_loc_hash() == location_hash)
-            {
-                self.specfence.access_log.note(self.tx_idx, location_hash)
-            } else {
-                0
-            }
+            self.specfence.access_log.note(self.tx_idx, location_hash)
         } else {
             0
         };
@@ -2458,14 +2446,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
         let location_hash = hash_deterministic(MemoryLocation::Storage(address, index));
         let access_k = if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
-            let arms = self.specfence.access_arms;
-            if arms.any_wait_once()
-                && (arms.is_wait_once(location_hash) || arms.crit_loc_hash() == location_hash)
-            {
-                self.specfence.access_log.note(self.tx_idx, location_hash)
-            } else {
-                0
-            }
+            self.specfence.access_log.note(self.tx_idx, location_hash)
         } else {
             0
         };
