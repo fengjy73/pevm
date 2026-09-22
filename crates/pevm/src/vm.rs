@@ -559,9 +559,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 .sf_tips
                 .live_writer(location_hash)
                 .is_some_and(|w| w == pred);
-        // Thin: Avoid when writer is live / SF-tipped. Do not Block a
-        // not-started pred (serialized the 15-writer spine). FullReplay
-        // plants ungated wait for the next pick (Detect→Avoid).
+        // Thin: Avoid = short spin while Executing + read-after-true-publish.
+        // SoT thin-avoid forbids Blocking park / mark_gated / Rewind / Estimate
+        // Block. If tip not Released after spin, Opt-fallthrough (path c) —
+        // next Learn + early tip raise Avoid hit rate without serial park.
         if thin {
             if !executing && !has_sf_tip {
                 return Ok(());
@@ -581,20 +582,18 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     }
                     std::hint::spin_loop();
                 }
-                if sf.true_publish_ready(location_hash, pred)
-                    || self.specfence.scheduler.is_done(pred)
-                    || self.specfence.scheduler.is_validated(pred)
-                {
-                    return Ok(());
-                }
             }
+            if sf.true_publish_ready(location_hash, pred)
+                || self.specfence.scheduler.is_done(pred)
+                || self.specfence.scheduler.is_validated(pred)
+            {
+                return Ok(());
+            }
+            // Exact waiter registered for publish wake metrics; no Blocking park.
             self.specfence
                 .sf_tips
                 .register_waiter(location_hash, pred, self.tx_idx);
-            self.specfence
-                .ready_edges
-                .note_ungated_wait_on(self.tx_idx, pred);
-            return Err(self.park_publish_wait(location_hash, pred));
+            return Ok(());
         }
         // Large: park when Executing / SF tip / live_writer. Estimate tip is
         // OCC residue used only as a *liveness* hint after abort cleared the
