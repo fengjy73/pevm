@@ -533,6 +533,7 @@ impl Pevm {
         let arms = ArmTable::new();
         // Shared waiter / AccessArm. Private state is the per-worker Vm.
         let access_arms = crate::specfence::AccessArmTable::new();
+        let sf_tips = crate::specfence::SfTipTable::new();
         let lanes = crate::specfence::LaneTable::new();
         let edges = EdgeTable::new();
         let sketch = HotSketch::new();
@@ -640,6 +641,7 @@ impl Pevm {
             policy: (self.concurrency_mode == ConcurrencyMode::SpecFence)
                 .then_some(&self.cost_policy),
             access_arms: &access_arms,
+            sf_tips: &sf_tips,
             tx_first_start: &tx_first_start,
             exec_origin: &exec_origin,
         };
@@ -1003,6 +1005,12 @@ impl Pevm {
                 access_arms.wait_suppressed(),
                 access_arms.never_wait(),
                 access_arms.prefix_resume(),
+            );
+            metrics_inner.record_sf_mv_tips(
+                sf_tips.early_tip_n(),
+                sf_tips.publish_wake_n(),
+                sf_tips.wait_once_consume_n(),
+                sf_tips.estimate_block_sf(),
             );
             metrics_inner.set_true_spine_metrics(
                 runnable.steal_n(),

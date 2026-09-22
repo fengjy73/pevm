@@ -276,7 +276,7 @@ pub(crate) use hotset::HotSet;
 pub(crate) use hotset::{H_A, H_W};
 pub use resolve_plan::ResolvePlan;
 pub(crate) use runnable_set::RunnableSet;
-pub(crate) use sf_mv::SfMvMemory;
+pub(crate) use sf_mv::{SfMvMemory, SfTip, SfTipTable};
 pub use visibility::VisibilityPolicy;
 pub(crate) use worker::{SfExec, run_sf_block};
 // kernel.rs museum — tests only; rem-legal SoT is CertificateTable.
@@ -731,6 +731,8 @@ pub(crate) struct SpecFenceCtx<'a> {
     pub policy: Option<&'a CostPolicy>,
     /// Per-access Opt | WaitOnce | NeverWait. Shared waiter.
     pub access_arms: &'a crate::specfence::AccessArmTable,
+    /// SpecFence-native version tips + exact waiters (not OCC Estimate).
+    pub sf_tips: &'a crate::specfence::SfTipTable,
     /// First Execution-pick elapsed ns from `exec_origin`. 0 = not started. Shared.
     pub tx_first_start: &'a [std::sync::atomic::AtomicU64],
     /// Parallel phase origin for `tx_first_start`.

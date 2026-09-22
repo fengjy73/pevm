@@ -413,6 +413,14 @@ pub struct SpecFenceMetrics {
     pub fail_k_max: usize,
     /// v3: `fail_k` histogram. Index `k` for `1..=31`; index 31 also holds `k >= 31`.
     pub fail_k_hist: [usize; 32],
+    /// SfMvMemory: early version tips installed this block.
+    pub sf_early_tip_n: usize,
+    /// SfMvMemory: exact waiters woken on Data publish.
+    pub sf_publish_wake_n: usize,
+    /// SfMvMemory: WaitOnce consume hits (spin / defer).
+    pub sf_wait_once_consume_n: usize,
+    /// Must be 0 on Soft=0 SF: Estimate Block on SpecFence path.
+    pub estimate_block_sf: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -607,6 +615,10 @@ pub(crate) struct MetricsInner {
     fail_k_min: AtomicUsize,
     fail_k_max: AtomicUsize,
     fail_k_hist: [AtomicUsize; 32],
+    sf_early_tip_n: AtomicUsize,
+    sf_publish_wake_n: AtomicUsize,
+    sf_wait_once_consume_n: AtomicUsize,
+    estimate_block_sf: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -1369,6 +1381,23 @@ impl MetricsInner {
         self.prefix_resume_n.store(prefix_resume, Ordering::Relaxed);
     }
 
+    /// SfMvMemory tip-plane census (end-of-block).
+    pub(crate) fn record_sf_mv_tips(
+        &self,
+        early_tip: usize,
+        publish_wake: usize,
+        wait_once_consume: usize,
+        estimate_block_sf: usize,
+    ) {
+        self.sf_early_tip_n.store(early_tip, Ordering::Relaxed);
+        self.sf_publish_wake_n
+            .store(publish_wake, Ordering::Relaxed);
+        self.sf_wait_once_consume_n
+            .store(wait_once_consume, Ordering::Relaxed);
+        self.estimate_block_sf
+            .store(estimate_block_sf, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_prefix_resume(&self, _kept: usize) {
         self.prefix_resume_n.fetch_add(1, Ordering::Relaxed);
     }
@@ -1748,6 +1777,10 @@ impl MetricsInner {
             fail_k_min: self.fail_k_min.load(Ordering::Relaxed),
             fail_k_max: self.fail_k_max.load(Ordering::Relaxed),
             fail_k_hist: std::array::from_fn(|i| self.fail_k_hist[i].load(Ordering::Relaxed)),
+            sf_early_tip_n: self.sf_early_tip_n.load(Ordering::Relaxed),
+            sf_publish_wake_n: self.sf_publish_wake_n.load(Ordering::Relaxed),
+            sf_wait_once_consume_n: self.sf_wait_once_consume_n.load(Ordering::Relaxed),
+            estimate_block_sf: self.estimate_block_sf.load(Ordering::Relaxed),
         }
     }
 }

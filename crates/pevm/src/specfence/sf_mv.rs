@@ -1,13 +1,29 @@
-//! SfMvMemory — SpecFence visibility-aware version plane (SF-PS T2).
+//! SfMvMemory — SpecFence-native version plane (SF-PS redesign v1).
 //!
-//! `read(ℓ, vis)` is the SpecFence read API. Occupied OCC keeps walking
-//! `MvMemory` without a policy. Edged SpecFence txs must not enter that
-//! default OCC tip walk.
+//! OCC [`MvMemory`] + [`MemoryEntry::Estimate`] stay baseline-only. SpecFence
+//! installs **version tips** and reads via [`VisibilityPolicy`]; WaitOnce
+//! consumes true Data publish — never Estimate Block.
+//!
+//! SoT: `lab/notes/specfence-sf-mvmemory-redesign-v1.md`
+
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use dashmap::DashMap;
 
 use crate::mv_memory::MvMemory;
 use crate::{MemoryLocationHash, MemoryValue, TxIdx, TxIncarnation};
 
 use super::VisibilityPolicy;
+
+/// SpecFence tip kind — **not** OCC [`crate::MemoryEntry::Estimate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SfTip {
+    /// Writer claimed `ℓ` for this incarnation (early tip; value not yet Data).
+    Version { incarnation: TxIncarnation },
+    /// True Data is published in MvMemory for this writer/incarnation.
+    Released { incarnation: TxIncarnation },
+}
 
 /// Result of a visibility-aware read.
 #[derive(Debug, Clone)]
@@ -24,20 +40,177 @@ pub(crate) enum SfRead {
     Storage,
 }
 
-/// SpecFence version plane. Wraps [`MvMemory`]; does not replace the OCC store.
+/// Shared SpecFence tip + exact-waiter plane (one per block execution).
+#[derive(Debug, Default)]
+pub(crate) struct SfTipTable {
+    tips: DashMap<MemoryLocationHash, BTreeMap<TxIdx, SfTip>>,
+    /// Exact waiters keyed by `(location, writer)`.
+    waiters: DashMap<(MemoryLocationHash, TxIdx), Vec<TxIdx>>,
+    early_tip_n: AtomicUsize,
+    publish_wake_n: AtomicUsize,
+    wait_once_consume_n: AtomicUsize,
+    /// Must stay 0 on Soft=0 Instant-off: SF Avoid never Blocks on Estimate.
+    estimate_block_sf: AtomicUsize,
+}
+
+impl SfTipTable {
+    #[inline]
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Early version tip on the SpecFence write path (prior WS / known ℓ).
+    /// Does **not** install OCC Estimate into MvMemory.
+    pub(crate) fn install_version_tip(
+        &self,
+        location: MemoryLocationHash,
+        writer: TxIdx,
+        incarnation: TxIncarnation,
+    ) {
+        let mut map = self.tips.entry(location).or_default();
+        match map.get(&writer) {
+            Some(SfTip::Released { incarnation: inc }) if *inc >= incarnation => {}
+            _ => {
+                map.insert(writer, SfTip::Version { incarnation });
+                self.early_tip_n.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// True Data landed in MvMemory — mark Released and wake exact waiters.
+    pub(crate) fn publish_data(
+        &self,
+        location: MemoryLocationHash,
+        writer: TxIdx,
+        incarnation: TxIncarnation,
+    ) -> Vec<TxIdx> {
+        {
+            let mut map = self.tips.entry(location).or_default();
+            map.insert(writer, SfTip::Released { incarnation });
+        }
+        self.wake_exact(location, writer)
+    }
+
+    /// Clear tips for an aborted writer reincarnation.
+    pub(crate) fn clear_writer(&self, writer: TxIdx, locations: &[MemoryLocationHash]) {
+        for &loc in locations {
+            if let Some(mut map) = self.tips.get_mut(&loc) {
+                map.remove(&writer);
+            }
+            self.waiters.remove(&(loc, writer));
+        }
+    }
+
+    #[inline]
+    pub(crate) fn tip_at(&self, location: MemoryLocationHash, writer: TxIdx) -> Option<SfTip> {
+        self.tips
+            .get(&location)
+            .and_then(|m| m.get(&writer).copied())
+    }
+
+    /// True when writer has Released Data tip (or MvMemory will supply Data).
+    #[inline]
+    pub(crate) fn has_released(&self, location: MemoryLocationHash, writer: TxIdx) -> bool {
+        matches!(
+            self.tip_at(location, writer),
+            Some(SfTip::Released { .. })
+        )
+    }
+
+    /// True when a SpecFence version tip exists (Claimed or Released).
+    #[inline]
+    pub(crate) fn has_version_or_released(
+        &self,
+        location: MemoryLocationHash,
+        writer: TxIdx,
+    ) -> bool {
+        self.tip_at(location, writer).is_some()
+    }
+
+    pub(crate) fn register_waiter(
+        &self,
+        location: MemoryLocationHash,
+        writer: TxIdx,
+        consumer: TxIdx,
+    ) {
+        if consumer <= writer {
+            return;
+        }
+        let mut w = self.waiters.entry((location, writer)).or_default();
+        if !w.iter().any(|&c| c == consumer) {
+            w.push(consumer);
+        }
+    }
+
+    pub(crate) fn wake_exact(
+        &self,
+        location: MemoryLocationHash,
+        writer: TxIdx,
+    ) -> Vec<TxIdx> {
+        let woken = self
+            .waiters
+            .remove(&(location, writer))
+            .map(|(_, v)| v)
+            .unwrap_or_default();
+        if !woken.is_empty() {
+            self.publish_wake_n
+                .fetch_add(woken.len(), Ordering::Relaxed);
+        }
+        woken
+    }
+
+    #[inline]
+    pub(crate) fn record_wait_once_consume(&self) {
+        self.wait_once_consume_n.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// SF path attempted Estimate Block — must stay unused (counter for land proof).
+    #[inline]
+    pub(crate) fn record_estimate_block_sf(&self) {
+        self.estimate_block_sf.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn early_tip_n(&self) -> usize {
+        self.early_tip_n.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn publish_wake_n(&self) -> usize {
+        self.publish_wake_n.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn wait_once_consume_n(&self) -> usize {
+        self.wait_once_consume_n.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn estimate_block_sf(&self) -> usize {
+        self.estimate_block_sf.load(Ordering::Relaxed)
+    }
+}
+
+/// SpecFence version plane. Wraps [`MvMemory`] + [`SfTipTable`].
 pub(crate) struct SfMvMemory<'a> {
     inner: &'a MvMemory,
+    tips: &'a SfTipTable,
 }
 
 impl<'a> SfMvMemory<'a> {
     #[inline]
-    pub(crate) fn new(inner: &'a MvMemory) -> Self {
-        Self { inner }
+    pub(crate) fn new(inner: &'a MvMemory, tips: &'a SfTipTable) -> Self {
+        Self { inner, tips }
     }
 
     #[inline]
     pub(crate) fn inner(&self) -> &'a MvMemory {
         self.inner
+    }
+
+    #[inline]
+    pub(crate) fn tips(&self) -> &'a SfTipTable {
+        self.tips
     }
 
     /// Read `location` for `tx` under `vis`.
@@ -79,6 +252,21 @@ impl<'a> SfMvMemory<'a> {
             } => Some((writer, incarnation)),
             _ => None,
         }
+    }
+
+    /// True publish for `writer` on `location` (Released tip or MvMemory Data).
+    pub(crate) fn true_publish_ready(
+        &self,
+        location: MemoryLocationHash,
+        writer: TxIdx,
+    ) -> bool {
+        if self.tips.has_released(location, writer) {
+            return true;
+        }
+        matches!(
+            self.inner.entry_kind_at(location, writer),
+            "data"
+        )
     }
 
     fn read_opt(&self, location: MemoryLocationHash, tx: TxIdx) -> SfRead {
@@ -129,11 +317,12 @@ mod tests {
     #[test]
     fn edged_read_skips_estimate_tip() {
         let mv = empty_mv(3);
+        let tips = SfTipTable::new();
         mv.data
             .entry(7)
             .or_default()
             .insert(0, MemoryEntry::Estimate);
-        let sf = SfMvMemory::new(&mv);
+        let sf = SfMvMemory::new(&mv, &tips);
         match sf.read(7, VisibilityPolicy::WaitReleased, 2) {
             SfRead::Storage => {}
             other => panic!("WaitReleased must not return Estimate tip: {other:?}"),
@@ -151,6 +340,7 @@ mod tests {
     #[test]
     fn ordered_tip_reads_installed_data() {
         let mv = empty_mv(3);
+        let tips = SfTipTable::new();
         let ver = TxVersion {
             tx_idx: 0,
             tx_incarnation: 0,
@@ -161,7 +351,8 @@ mod tests {
             crate::MemoryValue::Storage(alloy_primitives::U256::from(42u64)),
         ));
         mv.record(&ver, crate::ReadSet::default(), ws);
-        let sf = SfMvMemory::new(&mv);
+        tips.publish_data(9, 0, 0);
+        let sf = SfMvMemory::new(&mv, &tips);
         match sf.read(9, VisibilityPolicy::OrderedTip, 2) {
             SfRead::Data {
                 writer,
@@ -173,5 +364,24 @@ mod tests {
             }
             other => panic!("expected Data, got {other:?}"),
         }
+        assert!(sf.true_publish_ready(9, 0));
+    }
+
+    #[test]
+    fn version_tip_is_not_estimate_and_wakes_exact() {
+        let tips = SfTipTable::new();
+        tips.install_version_tip(11, 1, 0);
+        assert!(matches!(
+            tips.tip_at(11, 1),
+            Some(SfTip::Version { incarnation: 0 })
+        ));
+        tips.register_waiter(11, 1, 3);
+        tips.register_waiter(11, 1, 4);
+        let woken = tips.publish_data(11, 1, 0);
+        assert_eq!(woken, vec![3, 4]);
+        assert!(tips.has_released(11, 1));
+        assert_eq!(tips.estimate_block_sf(), 0);
+        assert_eq!(tips.early_tip_n(), 1);
+        assert_eq!(tips.publish_wake_n(), 2);
     }
 }
