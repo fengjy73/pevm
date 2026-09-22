@@ -513,10 +513,23 @@ impl<'a, S: Storage> VmDb<'a, S> {
         let Some(pred) = self
             .specfence
             .access_arms
-            .crit_pred(self.tx_idx, location_hash)
+            .wait_once_pred(self.tx_idx, location_hash)
+            .or_else(|| {
+                self.specfence
+                    .access_arms
+                    .crit_pred(self.tx_idx, location_hash)
+            })
             .or_else(|| {
                 self.mv_memory
                     .last_writer_before(location_hash, self.tx_idx)
+            })
+            .or_else(|| {
+                self.specfence
+                    .ready_edges
+                    .writers_of(location_hash)
+                    .into_iter()
+                    .rev()
+                    .find(|&w| w < self.tx_idx)
             })
         else {
             return Ok(());
@@ -535,11 +548,14 @@ impl<'a, S: Storage> VmDb<'a, S> {
             .specfence
             .sf_tips
             .has_version_or_released(location_hash, pred);
-        // Thin: micro-spin for true Data. Never Block on OCC Estimate.
+        // Thin: Avoid up front — do not Opt-read Storage while the true
+        // writer is unfinished. Spin briefly if Executing; else exact-waiter
+        // defer (publish-wait), never Estimate Block. Path (c) FullReplay
+        // after Opt is incomplete Detect→Avoid.
         if thin {
-            if executing || has_sf_tip {
-                self.specfence.sf_tips.record_wait_once_consume();
-                const SPIN: usize = 65_536;
+            self.specfence.sf_tips.record_wait_once_consume();
+            if executing {
+                const SPIN: usize = 131_072;
                 for _ in 0..SPIN {
                     if sf.true_publish_ready(location_hash, pred)
                         || self.specfence.scheduler.is_done(pred)
@@ -547,12 +563,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     {
                         return Ok(());
                     }
-                    if !self.specfence.scheduler.is_executing(pred)
-                        && !self
-                            .specfence
-                            .sf_tips
-                            .has_version_or_released(location_hash, pred)
-                    {
+                    if !self.specfence.scheduler.is_executing(pred) {
                         break;
                     }
                     std::hint::spin_loop();
@@ -563,14 +574,14 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 {
                     return Ok(());
                 }
-                if executing || has_sf_tip {
-                    self.specfence
-                        .sf_tips
-                        .register_waiter(location_hash, pred, self.tx_idx);
-                    return Err(self.park_publish_wait(location_hash, pred));
-                }
             }
-            return Ok(());
+            self.specfence
+                .sf_tips
+                .register_waiter(location_hash, pred, self.tx_idx);
+            self.specfence
+                .ready_edges
+                .note_ungated_wait_on(self.tx_idx, pred);
+            return Err(self.park_publish_wait(location_hash, pred));
         }
         // Large: park only when live or SF tip — not Estimate alone.
         if !executing && !has_sf_tip {

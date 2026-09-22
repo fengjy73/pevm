@@ -414,7 +414,26 @@ fn keep_single_invalid_prefix(ctx: &ApplyCtx<'_>) -> bool {
     let Some(k) = ctx.specfence.access_log.first_k(tx, loc).filter(|k| *k > 0) else {
         return false;
     };
-    ctx.specfence.access_arms.note_early_waw(loc, k);
+    let peer = ctx
+        .mv_memory
+        .last_writer_before(loc, tx)
+        .filter(|&w| w < tx)
+        .or_else(|| {
+            ctx.specfence
+                .ready_edges
+                .writers_of(loc)
+                .into_iter()
+                .rev()
+                .find(|&w| w < tx)
+        })
+        .unwrap_or(0);
+    ctx.specfence
+        .access_arms
+        .note_early_waw_peer(loc, k, peer);
+    // Thin: ungated publish-order Avoid — no mark_gated.
+    if peer > 0 && ctx.scheduler.block_size() <= super::THIN_SHELL_N {
+        ctx.specfence.ready_edges.note_ungated_wait_on(tx, peer);
+    }
     let prefix = ctx.specfence.access_log.prefix_before(tx, k);
     let mut n = ctx
         .specfence

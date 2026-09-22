@@ -64,6 +64,8 @@ struct ArmRec {
     k: u32,
     /// Reinforced this block (early WAW or an actual wait).
     hits: u32,
+    /// Last observed unfinished pred for this ℓ (Avoid-up-front).
+    peer: TxIdx,
 }
 
 /// Shared waiter + per-location arm. Not a per-worker copy.
@@ -105,7 +107,7 @@ impl AccessArmTable {
             if arm == AccessArm::Opt {
                 continue;
             }
-            self.arms.insert(loc, ArmRec { arm, k, hits: 0 });
+            self.arms.insert(loc, ArmRec { arm, k, hits: 0, peer: 0 });
         }
     }
 
@@ -166,9 +168,25 @@ impl AccessArmTable {
         if i == 0 { None } else { Some(writers[i - 1]) }
     }
 
+    /// Avoid-up-front pred for a WaitOnce ℓ: crit chain, else last noted peer.
+    pub(crate) fn wait_once_pred(&self, tx: TxIdx, loc: MemoryLocationHash) -> Option<TxIdx> {
+        if let Some(p) = self.crit_pred(tx, loc) {
+            return Some(p);
+        }
+        self.arms.get(&loc).and_then(|e| {
+            let p = e.peer;
+            (p > 0 && p < tx).then_some(p)
+        })
+    }
+
     /// Hot early basic/storage WAW template. The next read of `ℓ` waits
     /// once for a live writer instead of Opt-then-full-replay.
     pub(crate) fn note_early_waw(&self, loc: MemoryLocationHash, k: u32) {
+        self.note_early_waw_peer(loc, k, 0);
+    }
+
+    /// Same as [`Self::note_early_waw`] with an observed producer peer.
+    pub(crate) fn note_early_waw_peer(&self, loc: MemoryLocationHash, k: u32, peer: TxIdx) {
         if k == 0 {
             return;
         }
@@ -179,12 +197,16 @@ impl AccessArmTable {
                     e.arm = AccessArm::WaitOnce;
                     e.k = k;
                     e.hits = e.hits.saturating_add(1);
+                    if peer > 0 {
+                        e.peer = peer;
+                    }
                 }
             })
             .or_insert(ArmRec {
                 arm: AccessArm::WaitOnce,
                 k,
                 hits: 1,
+                peer,
             });
     }
 
@@ -211,6 +233,7 @@ impl AccessArmTable {
                     arm: AccessArm::NeverWait,
                     k: 1,
                     hits: 1,
+                    peer: 0,
                 },
             );
             return LiveAct::Skip;
@@ -241,11 +264,15 @@ impl AccessArmTable {
                         .and_modify(|e| {
                             e.arm = AccessArm::WaitOnce;
                             e.hits = e.hits.saturating_add(1);
+                            if writer > 0 {
+                                e.peer = writer;
+                            }
                         })
                         .or_insert(ArmRec {
                             arm: AccessArm::WaitOnce,
                             k: 0,
                             hits: 1,
+                            peer: writer,
                         });
                 }
                 LiveAct::Block
