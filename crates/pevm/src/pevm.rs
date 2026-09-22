@@ -2406,9 +2406,12 @@ fn try_validate(
         if specfence.mode == ConcurrencyMode::SpecFence {
             // Drop SF version tip / live_writer so WaitOnce does not park on
             // a stale unpublished claim (SoT: Estimate is OCC-only).
-            let _ = specfence
-                .sf_tips
-                .clear_writer(tx_version.tx_idx, &occ_write_locs);
+            // Thin tip plane only — skip walk when tips unused (large).
+            if scheduler.block_size() <= crate::specfence::THIN_SHELL_N {
+                let _ = specfence
+                    .sf_tips
+                    .clear_writer(tx_version.tx_idx, &occ_write_locs);
+            }
             for &loc in &occ_write_locs {
                 specfence.sketch.push_spine(loc, tx_version.tx_idx);
                 if specfence.sketch.broadcast_avoid(loc, tx_version.tx_idx) {
