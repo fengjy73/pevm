@@ -523,6 +523,89 @@ pub(crate) fn try_early_waw_rewind(
     Some(ResolvePlan::PartialAbortRewind)
 }
 
+/// Large sticky≥32: first conflict is crit ℓ and peer already ChainSpine
+/// Released / true_publish_ready → Prefer PartialAbortRewind (+ prefix) over
+/// FullReplay. Cuts chain_c wall; Avoid theater Opt→validate→FullReplay.
+pub(crate) fn try_chain_released_rewind(
+    mv_memory: &MvMemory,
+    tx_version: &TxVersion,
+    specfence: SpecFenceCtx<'_>,
+    invalid: &[MemoryLocationHash],
+) -> Option<ResolvePlan> {
+    if invalid.len() != 1 {
+        return None;
+    }
+    // Thin: Rewind tax > FullReplay (same rule as try_early_waw_rewind).
+    if specfence.scheduler.block_size() <= super::THIN_SHELL_N {
+        return None;
+    }
+    let tx = tx_version.tx_idx;
+    let loc = invalid[0];
+    let arms = specfence.access_arms;
+    if !arms.is_crit_loc(loc) || arms.crit_chain_len() < 32 {
+        return None;
+    }
+    if arms.is_never(loc) || location_is_lazy(mv_memory, tx, loc) {
+        return None;
+    }
+    if specfence.partial_retry.suffix_repair_depth(tx) != 0 {
+        return None;
+    }
+    let peer = mv_memory
+        .last_writer_before(loc, tx)
+        .filter(|&w| w < tx)
+        .or_else(|| arms.crit_pred(tx, loc))
+        .or_else(|| {
+            specfence
+                .ready_edges
+                .writers_of(loc)
+                .into_iter()
+                .rev()
+                .find(|&w| w < tx)
+        })?;
+    let sf = super::sf_mv::SfMvMemory::new(mv_memory, specfence.sf_tips);
+    let released = specfence.sf_tips.chain_released(peer)
+        || sf.true_publish_ready(loc, peer)
+        || specfence.scheduler.is_done(peer)
+        || specfence.scheduler.is_validated(peer);
+    if !released {
+        return None;
+    }
+    // Checkpoint path first (hang-free RewindTo).
+    if let Some(plan) = try_early_waw_rewind(mv_memory, tx_version, specfence, invalid) {
+        return Some(plan);
+    }
+    // No checkpoint: still Prefer Rewind — apply's early_ungated arm installs
+    // keep_single_invalid_prefix (fail_k snaps) instead of full_from_0.
+    let k = specfence.access_log.first_k(tx, loc).filter(|&k| k > 0)?;
+    let prefix = specfence.access_log.prefix_before(tx, k);
+    let mut n = specfence.partial_retry.arm_prefix_keep(tx, loc, k, &prefix);
+    if n == 0 {
+        n = specfence.partial_retry.arm_prefix_keep_all_except(tx, loc);
+    }
+    if n == 0 {
+        return None;
+    }
+    // Synthetic RewindTo head at fail_k when no mid-tx checkpoint existed.
+    if let Some(cp) = specfence.partial_retry.last_checkpoint_before(tx, k as usize) {
+        let certified: Vec<_> = prefix.iter().map(|(l, _)| *l).collect();
+        specfence.partial_retry.arm_rewind_to(
+            tx,
+            cp,
+            k as usize,
+            certified,
+            Vec::new(),
+            Vec::new(),
+        );
+        specfence.partial_retry.note_suffix_repair(tx);
+    }
+    arms.note_early_waw(loc, k);
+    arms.note_prefix_resume(n);
+    specfence.metrics.record_prefix_resume(n);
+    specfence.metrics.record_fail_k(k);
+    Some(ResolvePlan::PartialAbortRewind)
+}
+
 fn clear_retry(specfence: SpecFenceCtx<'_>, tx: crate::TxIdx) {
     specfence.partial_retry.clear_force_ordered_admit(tx);
     specfence.partial_retry.clear_force_writers(tx);
@@ -712,6 +795,10 @@ mod tests {
         assert!(
             code.contains("break_replay_mill"),
             "incarnation≥1 FullReplay must not Opt-mill"
+        );
+        assert!(
+            include_str!("resolve_plan.rs").contains("try_chain_released_rewind"),
+            "ChainSpine Released peer must Prefer Rewind over FullReplay"
         );
     }
 }

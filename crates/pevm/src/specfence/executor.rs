@@ -21,7 +21,7 @@ use super::collateral::{
 use super::dag::FenceGraph;
 use super::learner::LiveLearner;
 use super::repair::{RepairGrain, repair_grain};
-use super::resolve_plan::{ResolvePlan, try_early_waw_rewind};
+use super::resolve_plan::{ResolvePlan, try_chain_released_rewind, try_early_waw_rewind};
 use super::wave::WaveParkTable;
 use crate::mv_memory::MvMemory;
 use crate::scheduler::Scheduler;
@@ -560,6 +560,11 @@ pub(crate) fn validate_to_plan(
         if let Some(plan) = try_early_waw_rewind(mv_memory, tx_version, specfence, &invalid) {
             return (plan, invalid);
         }
+        // Sticky≥32: peer already ChainSpine Released → Prefer Rewind/prefix
+        // over Opt→FullReplay theater (raise chain_ab/c, cut FullReplay wall).
+        if let Some(plan) = try_chain_released_rewind(mv_memory, tx_version, specfence, &invalid) {
+            return (plan, invalid);
+        }
         return (ResolvePlan::FullReplay, invalid);
     }
 
@@ -646,7 +651,13 @@ pub(crate) fn validate_to_plan(
         if specfence.ready_edges.was_queued(tx_version.tx_idx)
             || first.is_some_and(|f| f.class == ConflictClass::EffectiveWAW)
         {
-            // Same rule as Opt: do not restart this read as Ordered-from-0.
+            // Same rule as Opt: Prefer ChainSpine Released Rewind before
+            // restarting this read as Ordered-from-0 / FullReplay.
+            if let Some(plan) =
+                try_chain_released_rewind(mv_memory, tx_version, specfence, &invalid)
+            {
+                return (plan, invalid);
+            }
             return (ResolvePlan::FullReplay, invalid);
         }
     }

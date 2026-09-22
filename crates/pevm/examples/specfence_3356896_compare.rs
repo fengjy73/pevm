@@ -291,10 +291,14 @@ fn print_focus(pevm: &Pevm, mode_name: &str, i: usize, n: usize, m: &pevm::SpecF
         }
     }
     let (loc, chain) = pevm
-        .last_location_writers()
-        .iter()
-        .max_by_key(|(_, w)| w.len())
-        .map(|(h, w)| (*h, w.clone()))
+        .sticky_crit_chain()
+        .filter(|(_, w)| w.len() >= 32)
+        .or_else(|| {
+            pevm.last_location_writers()
+                .iter()
+                .max_by_key(|(_, w)| w.len())
+                .map(|(h, w)| (*h, w.clone()))
+        })
         .unwrap_or((0, Vec::new()));
     let head = chain.iter().copied().min();
     let tail = chain.iter().copied().max();

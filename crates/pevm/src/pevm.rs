@@ -370,8 +370,15 @@ impl Pevm {
     }
 
     /// Location writer total order after write-set Detect (D1).
+    /// After sticky≥32 HOLD, includes the held crit spine even when Avoid
+    /// quieted live D1 notes (focus chain_n must not collapse 62→4).
     pub fn last_location_writers(&self) -> &[(u64, Vec<usize>)] {
         &self.last_location_writers
+    }
+
+    /// Sticky crit chain packed for the next reuse begin (`None` if unset).
+    pub fn sticky_crit_chain(&self) -> Option<(u64, Vec<usize>)> {
+        self.inter_prior.crit_chain()
     }
 
     /// ReadyEdge consumers blocked at begin_block (PC tax snapshot).
@@ -971,20 +978,55 @@ impl Pevm {
             // is short and would drop the hold. Keep the longer chain.
             // Do not replace a ≥32 hold with a different ℓ of equal length —
             // that hopped sticky off abd6bb… onto short quiet spines (TPS↓).
+            // Avoid/wall success: ChainSpine Suppresses Opt D1 notes → focus
+            // chain_n collapses 62→4–5; Learn then sees short n_pairs and
+            // demotes Win→Opt. Strong HOLD keeps ≥32 writers + refreshes D1.
+            let avoid_hold = sf_tips.chain_avoid_n() > 0
+                && sf_tips.chain_avoid_n() >= sf_tips.chain_late_n();
             let fresh = select_crit_chain(&self.last_location_writers, block_size, beneficiary);
             let prev = self.inter_prior.crit_chain();
             let packed = match (fresh, prev) {
                 (Some((loc, w)), Some((pl, pw))) if loc == pl && w.len() < pw.len() => {
                     Some((pl, pw))
                 }
-                (f, Some((pl, pw))) if pw.len() >= 32 => match &f {
-                    Some((loc, w)) if *loc == pl && w.len() >= pw.len() => f,
-                    Some((_, w)) if w.len() > pw.len() => f,
-                    _ => Some((pl, pw)),
-                },
+                (f, Some((pl, pw))) if pw.len() >= 32 => {
+                    if avoid_hold {
+                        // Wall/Avoid working: only upgrade to a strictly longer
+                        // spine; never hop ℓ or shrink (abd6bb sticky HOLD).
+                        match &f {
+                            Some((loc, w)) if *loc == pl && w.len() > pw.len() => f,
+                            Some((_, w)) if w.len() > pw.len() => f,
+                            _ => Some((pl, pw)),
+                        }
+                    } else {
+                        match &f {
+                            Some((loc, w)) if *loc == pl && w.len() >= pw.len() => f,
+                            Some((_, w)) if w.len() > pw.len() => f,
+                            _ => Some((pl, pw)),
+                        }
+                    }
+                }
                 (None, Some(p)) => Some(p),
                 (f, _) => f,
             };
+            // Reflect sticky ≥32 into last_location_writers so lean_end /
+            // focus / next select_crit_chain do not observe Avoid-quiet 4–5.
+            if let Some((loc, writers)) = &packed
+                && writers.len() >= 32
+            {
+                if let Some((_, w)) = self
+                    .last_location_writers
+                    .iter_mut()
+                    .find(|(l, _)| *l == *loc)
+                {
+                    if w.len() < writers.len() {
+                        *w = writers.clone();
+                    }
+                } else {
+                    self.last_location_writers
+                        .push((*loc, writers.clone()));
+                }
+            }
             self.inter_prior.pack_crit_chain(packed);
             let ready_w = ready_edges.ready_width_mean();
             let idle = ready_edges.idle_core_ns();
