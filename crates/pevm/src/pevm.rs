@@ -967,15 +967,17 @@ impl Pevm {
             self.last_location_writers = d1_orders;
             // A held spine records fewer conflicts, so the next snapshot
             // is short and would drop the hold. Keep the longer chain.
+            // Do not replace a ≥32 hold with a different ℓ of equal length —
+            // that hopped sticky off abd6bb… onto short quiet spines (TPS↓).
             let fresh = select_crit_chain(&self.last_location_writers, block_size, beneficiary);
             let prev = self.inter_prior.crit_chain();
             let packed = match (fresh, prev) {
                 (Some((loc, w)), Some((pl, pw))) if loc == pl && w.len() < pw.len() => {
                     Some((pl, pw))
                 }
-                // Hold spine: quiet snapshot must not drop a ≥32 chain.
                 (f, Some((pl, pw))) if pw.len() >= 32 => match &f {
-                    Some((_, w)) if w.len() >= pw.len() => f,
+                    Some((loc, w)) if *loc == pl && w.len() >= pw.len() => f,
+                    Some((_, w)) if w.len() > pw.len() => f,
                     _ => Some((pl, pw)),
                 },
                 (None, Some(p)) => Some(p),
