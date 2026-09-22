@@ -709,17 +709,41 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return Ok(());
         }
         // Protected read found an unfinished writer the last published tip
-        // does not name. Park until that writer publishes true Data.
-        // decide()'s once-only Skip would Opt-read and FullReplay again.
+        // does not name. Short poll continues this execution if Data lands.
+        // Otherwise same-incarnation WaitForDependency: not Aborting, so
+        // higher txs are not reexecuted. armed_at_k=0 skips rem ResumeAtK
+        // (k<8 prefix tax). The worker steals the writer (help-release).
         if unfinished.is_some() {
             self.specfence.sf_tips.record_wait_once_consume();
-            self.specfence
-                .sf_tips
-                .register_waiter(location_hash, pred, self.tx_idx);
-            self.specfence
-                .ready_edges
-                .note_ungated_wait_on(self.tx_idx, pred);
-            return Err(self.park_publish_wait(location_hash, pred));
+            const SPIN: usize = 4_096;
+            for i in 0..SPIN {
+                if self.specfence.scheduler.is_done(pred)
+                    || self.specfence.scheduler.is_validated(pred)
+                    || (i % 32 == 0 && sf.true_publish_ready(location_hash, pred))
+                {
+                    self.specfence.sf_tips.record_avoid_publish();
+                    self.specfence.sf_tips.record_class_avoid(class);
+                    return Ok(());
+                }
+                if !self.specfence.scheduler.is_executing(pred) && i > 64 {
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+            if sf.true_publish_ready(location_hash, pred)
+                || self.specfence.scheduler.is_done(pred)
+                || self.specfence.scheduler.is_validated(pred)
+            {
+                self.specfence.sf_tips.record_avoid_publish();
+                self.specfence.sf_tips.record_class_avoid(class);
+                return Ok(());
+            }
+            self.specfence.wave.set_pending_park(
+                location_hash,
+                0,
+                crate::specfence::ParkKind::WaitForDependency,
+            );
+            return Err(ReadError::Blocking(pred));
         }
         // Large: park when Executing / SF tip / live_writer. Estimate tip is
         // OCC residue used only as a *liveness* hint after abort cleared the
