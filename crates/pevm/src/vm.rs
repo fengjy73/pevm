@@ -206,9 +206,14 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 .access_arms
                 .has_wait_once_peer_before(tx_idx);
         self.vis = if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
-            // leftover_min → WaitReleased (for_ready). Worker vis was
-            // discarded here and leftover_min stayed Opt (19807137 ghost).
-            VisibilityPolicy::for_ready(self.specfence.ready_edges, tx_idx)
+            // OCC-shaped: Opt only — skip ReadyEdge for_ready DashMap.
+            if self.sf_occ_shaped {
+                VisibilityPolicy::Opt
+            } else {
+                // leftover_min → WaitReleased (for_ready). Worker vis was
+                // discarded here and leftover_min stayed Opt (19807137 ghost).
+                VisibilityPolicy::for_ready(self.specfence.ready_edges, tx_idx)
+            }
         } else {
             VisibilityPolicy::Opt
         };
@@ -665,23 +670,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return Ok(());
         }
         self.specfence.sf_tips.record_wait_once_consume();
-        // ChainSpineTip: brief Released poll (not long busy-spin) before park.
+        // ChainSpineTip: Soft=0 Prefer schedule one-hop over long Released-spin.
+        // Version tip → plant waiter + Blocking → pevm schedule-defer (no Aborting).
+        // Claim-wake already pushed planted succ into Q_released.
         if self.specfence.sf_tips.is_chain_loc(location_hash) && (executing || has_sf_tip) {
-            const SPIN: usize = 512;
-            for i in 0..SPIN {
-                if self.specfence.scheduler.is_done(pred)
-                    || self.specfence.scheduler.is_validated(pred)
-                    || (i % 16 == 0 && sf.true_publish_ready(location_hash, pred))
-                {
-                    self.specfence.sf_tips.record_avoid_publish();
-                    self.specfence.sf_tips.record_class_avoid(class);
-                    return Ok(());
-                }
-                if !self.specfence.scheduler.is_executing(pred) {
-                    break;
-                }
-                std::hint::spin_loop();
-            }
             if sf.true_publish_ready(location_hash, pred)
                 || self.specfence.scheduler.is_done(pred)
                 || self.specfence.scheduler.is_validated(pred)
@@ -690,9 +682,21 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 self.specfence.sf_tips.record_class_avoid(class);
                 return Ok(());
             }
-            // Prefer schedule one-hop: plant waiters wake on chain_release →
-            // Q_released. Exact waiter covers opportunistic Version readers.
-            // Soft=0 try_execute_sf skips Aborting for chain (mark_wait only).
+            // Brief poll only when peer is past claim (Released race).
+            if self.specfence.sf_tips.chain_released(pred) {
+                const SPIN: usize = 64;
+                for _ in 0..SPIN {
+                    if sf.true_publish_ready(location_hash, pred)
+                        || self.specfence.scheduler.is_done(pred)
+                        || self.specfence.scheduler.is_validated(pred)
+                    {
+                        self.specfence.sf_tips.record_avoid_publish();
+                        self.specfence.sf_tips.record_class_avoid(class);
+                        return Ok(());
+                    }
+                    std::hint::spin_loop();
+                }
+            }
             self.specfence
                 .sf_tips
                 .register_waiter(location_hash, pred, self.tx_idx);
@@ -1229,8 +1233,12 @@ impl<'a, S: Storage> VmDb<'a, S> {
     /// Resolve-read overlay: PCC Fire **or** PrefixSkip/FF resume (PartialAbortRewind).
     /// First-incarnation OptimisticRead stays OCC (no FF / OrderedDirtyRead).
     /// Edged SpecFence vis skips ESTIMATE tips via [`crate::specfence::sf_mv`].
+    /// OCC-shaped: rem unused (no value_snap / Rewind) — skip DashMap probes.
     #[inline]
     fn resolve_read_overlay(&self) -> bool {
+        if self.sf_occ_shaped {
+            return self.pcc_armed.get() || self.sf_skip_estimate();
+        }
         self.pcc_armed.get()
             || self.specfence.partial_retry.is_rewind_resume(self.tx_idx)
             || self.specfence.partial_retry.has_ff_head(self.tx_idx)
@@ -3153,9 +3161,15 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 }
             } else if !thin && self.specfence.sf_tips.is_chain_loc(crit) {
                 // ChainSpineTip claim — O(1) flag, not WaitOnce DashMap mill.
+                // Soft=0 one-hop: wake planted succ into Q_released at Version
+                // claim (not only Data publish) so Avoid races Opt theater.
                 self.specfence.sf_tips.chain_claim(
                     tx_version.tx_idx,
                     tx_version.tx_incarnation,
+                );
+                self.specfence.ready_edges.wake_planted_on_publish(
+                    tx_version.tx_idx,
+                    self.specfence.wave,
                 );
             }
         }
@@ -3180,7 +3194,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 .partial_retry
                 .is_rewind_resume(tx_version.tx_idx)
                 || self.specfence.partial_retry.has_ff_head(tx_version.tx_idx));
-        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+        if self.specfence.mode == crate::ConcurrencyMode::SpecFence && !sf_occ_shaped {
             if repair_armed {
                 self.specfence.metrics.record_pcc_kernel_exec();
             } else {
@@ -3195,7 +3209,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         if rewind_resume {
             // M1b/M1d: journal FF in set_tx; optional live PC arm inside inspect_run.
             self.specfence.metrics.record_resume();
-        } else if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+        } else if self.specfence.mode == crate::ConcurrencyMode::SpecFence && !sf_occ_shaped {
             self.specfence.metrics.record_evm_entry();
             if repair_armed {
                 let _ = self
