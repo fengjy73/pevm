@@ -212,7 +212,10 @@ impl ReadyEdgeTable {
         self.consumers
             .entry(consumer)
             .or_insert_with(|| AtomicUsize::new(producer));
-        let e = self.consumers.get(&consumer).unwrap();
+        // Another worker can drop the entry between insert and get.
+        let Some(e) = self.consumers.get(&consumer) else {
+            return;
+        };
         let mut cur = e.load(Ordering::Relaxed);
         while cur == NONE || (producer > cur && producer < consumer) {
             match e.compare_exchange_weak(cur, producer, Ordering::Relaxed, Ordering::Relaxed) {

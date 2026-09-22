@@ -1547,6 +1547,12 @@ impl Pevm {
                         .map(|p| p.kind)
                         .unwrap_or(crate::specfence::ParkKind::BlockingOther);
                     let park_loc = pending.map(|p| p.location).unwrap_or(0);
+                    let park_k = pending.map(|p| p.armed_at_k).unwrap_or(0);
+                    // Protected unfinished-writer defer: same incarnation, no
+                    // Aborting. Chain schedule-defer would drop the dependency
+                    // and restart the reader immediately.
+                    let cheap_defer = park_kind == crate::specfence::ParkKind::WaitForDependency
+                        && park_k == 0;
                     // leftover_min must commit when the blocker is already
                     // done (nonce / WaitForDependency on tx-1). Parking
                     // fails, leftover_min stays Executing, heal mills
@@ -1564,13 +1570,16 @@ impl Pevm {
                     // ChainSpine one-hop: Soft=0 schedule defer — plant /
                     // exact waiters wake on chain_release → Q_released.
                     // No Aborting (BlockingOther) and no writer-done WFD park.
-                    if vm.chain_spine_schedule_defer(park_loc) {
+                    if !cheap_defer && vm.chain_spine_schedule_defer(park_loc) {
                         let _ = scheduler.recover_executing_waiter(tx_version.tx_idx);
                         return SfExec::Blocked {
                             on: Some(blocking_tx_idx),
                         };
                     }
                     let parked = if park_kind == crate::specfence::ParkKind::WaitForDependency {
+                        if cheap_defer {
+                            vm.record_wait_for_dependency();
+                        }
                         scheduler.add_wait_for_dependency(tx_version.tx_idx, blocking_tx_idx)
                     } else {
                         scheduler.add_dependency(tx_version.tx_idx, blocking_tx_idx)
