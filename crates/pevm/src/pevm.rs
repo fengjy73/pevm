@@ -483,6 +483,8 @@ impl Pevm {
         let producer_stages = crate::specfence::ProducerStageTable::new();
         let runnable = RunnableSet::new(block_size, concurrency_level.get());
         let arms = ArmTable::new();
+        // Shared waiter / AccessArm. Private state is the per-worker Vm.
+        let access_arms = crate::specfence::AccessArmTable::new();
         let lanes = crate::specfence::LaneTable::new();
         let edges = EdgeTable::new();
         let sketch = HotSketch::new();
@@ -496,6 +498,7 @@ impl Pevm {
             self.cost_policy
                 .begin_block_with_cores(block_size, concurrency_level.get());
             arms.begin_from_prior(&self.inter_prior, self.cost_policy.is_reuse_block());
+            access_arms.begin_from_prior(&self.inter_prior);
             // B4: Prior → CostPolicy.block_arm before admit_seed so wave-1
             // hops_to_admit / Detect.G match ArmTable (not a cold re-select).
             let _ = arms.install_prior_into_policy(&self.cost_policy, block_size);
@@ -578,6 +581,7 @@ impl Pevm {
             finegrain: finegrain_ref,
             policy: (self.concurrency_mode == ConcurrencyMode::SpecFence)
                 .then_some(&self.cost_policy),
+            access_arms: &access_arms,
         };
 
         // TODO: Better thread handling
@@ -916,6 +920,13 @@ impl Pevm {
                 self.cost_policy.end_block_learn();
             }
             arms.end_pack(&self.inter_prior, block_size);
+            access_arms.end_pack(&self.inter_prior);
+            metrics_inner.record_access_avoid(
+                access_arms.wait_once(),
+                access_arms.wait_suppressed(),
+                access_arms.never_wait(),
+                access_arms.prefix_resume(),
+            );
             metrics_inner.set_true_spine_metrics(
                 runnable.steal_n(),
                 runnable.refuse_fill_n(),

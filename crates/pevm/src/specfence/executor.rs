@@ -555,25 +555,8 @@ pub(crate) fn validate_to_plan(
         return (ResolvePlan::PartialAbortRebind, invalid);
     }
     if vis.is_opt() {
-        // Non-lazy WAW whose peer has executed or is still executing:
-        // OrderedReplay instead of an unfenced FullReplay. Value-stable
-        // rebind was already refused. No begin-block OrderedAdmit.
-        if let Some(f) = classify_first_conflict(
-            specfence.hints,
-            mv_memory,
-            specfence.beneficiary,
-            tx_version.tx_idx,
-            &invalid,
-        ) {
-            if f.class == ConflictClass::EffectiveWAW
-                && !f.lazy
-                && f.peer.is_some_and(|w| {
-                    w < tx_version.tx_idx && (scheduler.is_executing(w) || scheduler.is_executed(w))
-                })
-            {
-                return (ResolvePlan::OrderedReplay, invalid);
-            }
-        }
+        // One invalid read at a known k keeps its prefix (ff_head) inside
+        // FullReplay apply. OrderedReplay-from-k=0 is not salvage.
         return (ResolvePlan::FullReplay, invalid);
     }
 
@@ -660,7 +643,8 @@ pub(crate) fn validate_to_plan(
         if specfence.ready_edges.was_queued(tx_version.tx_idx)
             || first.is_some_and(|f| f.class == ConflictClass::EffectiveWAW)
         {
-            return (ResolvePlan::OrderedReplay, invalid);
+            // Same rule as Opt: do not restart this read as Ordered-from-0.
+            return (ResolvePlan::FullReplay, invalid);
         }
     }
     (ResolvePlan::FullReplay, invalid)

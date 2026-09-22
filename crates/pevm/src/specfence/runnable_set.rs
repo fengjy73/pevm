@@ -132,7 +132,10 @@ impl RunnableSet {
         stages: &ProducerStageTable,
         scheduler: &Scheduler,
     ) {
-        for tx in 0..self.block_size {
+        // Longest remaining suffix first. Push high indices, then low, so
+        // the local LIFO pop takes the critical head. Steal pops the other
+        // end (antichain tail). Idle `pick` already steals that end.
+        for tx in (0..self.block_size).rev() {
             if scheduler.is_done(tx) || scheduler.is_validated(tx) {
                 self.state[tx].store(ST_DONE, Ordering::Relaxed);
                 continue;
@@ -993,6 +996,7 @@ mod tests {
         };
         assert_ne!(tx, 3, "refused consumer must not occupy a core");
         assert_eq!(vis, VisibilityPolicy::Opt);
+        assert_eq!(tx, 0, "longest remaining suffix is the lowest index");
     }
 
     #[test]

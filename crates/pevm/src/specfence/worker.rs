@@ -282,6 +282,8 @@ pub(crate) fn run_sf_block<F, V>(
                 metrics.add_worker_busy_ns(t0.elapsed().as_nanos() as u64);
             }
             None => {
+                // Idle: `pick` already stole the antichain tail. Help release
+                // is heal of writers that have published.
                 metrics.add_idle_core_ns(t0.elapsed().as_nanos() as u64);
                 runnable.note_idle_spin();
                 if abort() {

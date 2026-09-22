@@ -263,6 +263,8 @@ pub(crate) struct InterBlockPrior {
     last_flipped: AtomicUsize,
     /// SF-PS: packed ArmTable at last end_block (begin restores it).
     arm_snaps: Mutex<Vec<super::arm_table::ArmSnap>>,
+    /// Per-access Avoid prior: `(ℓ, arm tag, k)`. Tag 1 = WaitOnce, 2 = NeverWait.
+    access_arm_snaps: Mutex<Vec<(crate::MemoryLocationHash, u8, u32)>>,
 }
 
 impl InterBlockPrior {
@@ -324,11 +326,31 @@ impl InterBlockPrior {
         self.flip_count.store(0, Ordering::Relaxed);
         self.last_flipped.store(0, Ordering::Relaxed);
         self.arm_snaps.lock().unwrap().clear();
+        self.access_arm_snaps.lock().unwrap().clear();
     }
 
     /// Begin-block ArmTable restore.
     pub(crate) fn arm_snapshot(&self) -> Vec<super::arm_table::ArmSnap> {
         self.arm_snaps.lock().unwrap().clone()
+    }
+
+    /// Access-arm prior `(ℓ, tag, k)` from the last end_pack.
+    pub(crate) fn access_arm_snapshot(&self) -> Vec<(crate::MemoryLocationHash, u8, u32)> {
+        self.access_arm_snaps.lock().unwrap().clone()
+    }
+
+    pub(crate) fn pack_access_arms(&self, snaps: Vec<(crate::MemoryLocationHash, u8, u32)>) {
+        *self.access_arm_snaps.lock().unwrap() = snaps;
+    }
+
+    /// Morph flip from the last `end_block`, without consuming it.
+    pub(crate) fn last_flipped_peek(&self) -> bool {
+        self.last_flipped.load(Ordering::Relaxed) != 0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_flipped_for_test(&self) {
+        self.last_flipped.store(1, Ordering::Relaxed);
     }
 
     /// End-block pack. Morph flip decays sticky on the snapshot.

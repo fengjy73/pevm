@@ -333,6 +333,15 @@ fn run_once(
                 m.resolve_full_replay,
                 m.runnable_set_width_mean
             );
+            println!(
+                "  v3 {mode_name}[{i}] wait_once={} wait_suppressed={} never_wait={} prefix_resume={} journal_ff_hits={} resolve_rewind={}",
+                m.access_wait_once,
+                m.access_wait_suppressed,
+                m.access_never_wait,
+                m.prefix_resume_n,
+                m.journal_ff_hits,
+                m.resolve_partial_rewind
+            );
             IterRow {
                 mode: mode_name.to_string(),
                 i,

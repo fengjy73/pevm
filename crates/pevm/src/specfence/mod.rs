@@ -169,6 +169,7 @@ use crate::{
 use alloy_primitives::Address;
 use hashbrown::HashMap;
 
+mod access_arm;
 mod access_log;
 mod access_policy;
 mod access_vis;
@@ -213,6 +214,7 @@ mod visibility;
 mod wave;
 mod worker;
 
+pub(crate) use access_arm::{AccessArmTable, LiveAct};
 pub(crate) use access_log::AccessOrdinalLog;
 pub(crate) use access_policy::{
     AccessDecision, AccessVis, decide as decide_access, decide_queried as decide_access_queried,
@@ -727,6 +729,8 @@ pub(crate) struct SpecFenceCtx<'a> {
     pub finegrain: Option<&'a crate::specfence::FineGrainCollector>,
     /// B3/B2 cost-aware A0 vs A1 policy (Soft=0).
     pub policy: Option<&'a CostPolicy>,
+    /// Per-access Opt | WaitOnce | NeverWait. Shared waiter.
+    pub access_arms: &'a crate::specfence::AccessArmTable,
 }
 
 impl<'a> SpecFenceCtx<'a> {

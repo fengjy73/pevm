@@ -395,6 +395,14 @@ pub struct SpecFenceMetrics {
     pub explore_n: usize,
     /// SF-PS: begin restored ArmTable from inter-block prior.
     pub began_from_prior: bool,
+    /// v3: first WaitOnce parks this block. Same `(tx, ℓ, w)` is not counted twice.
+    pub access_wait_once: usize,
+    /// v3: a second Blocking of the same `(tx, ℓ, w)` was refused.
+    pub access_wait_suppressed: usize,
+    /// v3: beneficiary / basic-lazy reads that skipped a live writer.
+    pub access_never_wait: usize,
+    /// v3: single-invalid validates that installed a prefix keep (`k < fail_k`).
+    pub prefix_resume_n: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -579,6 +587,10 @@ pub(crate) struct MetricsInner {
     sf_mv_ordered_tip_reads: AtomicUsize,
     explore_n: AtomicUsize,
     began_from_prior: AtomicUsize,
+    access_wait_once: AtomicUsize,
+    access_wait_suppressed: AtomicUsize,
+    access_never_wait: AtomicUsize,
+    prefix_resume_n: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -1326,6 +1338,25 @@ impl MetricsInner {
         self.journal_ff_hits.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Store the block's Avoid counters (not an increment — end-of-block census).
+    pub(crate) fn record_access_avoid(
+        &self,
+        wait_once: usize,
+        suppressed: usize,
+        never_wait: usize,
+        prefix_resume: usize,
+    ) {
+        self.access_wait_once.store(wait_once, Ordering::Relaxed);
+        self.access_wait_suppressed
+            .store(suppressed, Ordering::Relaxed);
+        self.access_never_wait.store(never_wait, Ordering::Relaxed);
+        self.prefix_resume_n.store(prefix_resume, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_prefix_resume(&self, _kept: usize) {
+        self.prefix_resume_n.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_value_stable_ff_hit(&self) {
         self.value_stable_ff_hits.fetch_add(1, Ordering::Relaxed);
     }
@@ -1659,6 +1690,10 @@ impl MetricsInner {
             sf_mv_ordered_tip_reads: self.sf_mv_ordered_tip_reads.load(Ordering::Relaxed),
             explore_n: self.explore_n.load(Ordering::Relaxed),
             began_from_prior: self.began_from_prior.load(Ordering::Relaxed) != 0,
+            access_wait_once: self.access_wait_once.load(Ordering::Relaxed),
+            access_wait_suppressed: self.access_wait_suppressed.load(Ordering::Relaxed),
+            access_never_wait: self.access_never_wait.load(Ordering::Relaxed),
+            prefix_resume_n: self.prefix_resume_n.load(Ordering::Relaxed),
         }
     }
 }

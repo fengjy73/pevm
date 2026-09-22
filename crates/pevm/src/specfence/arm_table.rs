@@ -181,18 +181,20 @@ impl ArmTable {
         self.begin_from_prior
             .store(if snaps.is_empty() { 0 } else { 1 }, Ordering::Relaxed);
         for snap in snaps {
-            let explore = if reuse && snap.sticky { 0 } else { 1 };
+            // Sticky Opt is retired. A Win may stay sticky; Opt does not.
+            let sticky = snap.sticky && !matches!(snap.arm, ArmKind::Opt);
+            let explore = if reuse && sticky { 0 } else { 1 };
             self.entries
                 .entry(snap.location)
                 .and_modify(|e| {
                     e.arm = snap.arm;
-                    e.sticky = snap.sticky;
+                    e.sticky = sticky;
                     e.under_covered = snap.under_covered;
                     e.explore_budget.store(explore, Ordering::Relaxed);
                 })
                 .or_insert_with(|| ArmEntry {
                     arm: snap.arm,
-                    sticky: snap.sticky,
+                    sticky,
                     n_pull: AtomicUsize::new(0),
                     n_reward: AtomicUsize::new(0),
                     ema_wall_ns: AtomicU64::new(0),
@@ -267,10 +269,11 @@ impl ArmTable {
             if e.lazy {
                 arm = ArmKind::Opt;
             }
+            let sticky = e.sticky && !matches!(arm, ArmKind::Opt);
             snaps.push(ArmSnap {
                 location: *e.key(),
                 arm,
-                sticky: e.sticky,
+                sticky,
                 under_covered: e.under_covered,
             });
         }
@@ -336,6 +339,8 @@ impl ArmTable {
             ResolvePlan::PartialAbortRebind | ResolvePlan::PartialAbortRewind => {
                 self.e3_n.fetch_add(1, Ordering::Relaxed);
                 self.reward(loc, true, tick);
+                // IntraPatch at the next pick: the failed ℓ, not a tx-sticky Opt.
+                self.maybe_queue_promote(loc, block_n, chain_len);
             }
             ResolvePlan::OrderedReplay => {
                 self.reward(loc, true, tick);
@@ -386,18 +391,18 @@ impl ArmTable {
             .and_modify(|e| {
                 e.arm = ArmKind::Opt;
                 e.lazy = lazy;
-                e.sticky = true;
-                e.explore_budget.store(0, Ordering::Relaxed);
+                e.sticky = false;
+                e.explore_budget.store(1, Ordering::Relaxed);
             })
             .or_insert_with(|| ArmEntry {
                 arm: ArmKind::Opt,
-                sticky: true,
+                sticky: false,
                 n_pull: AtomicUsize::new(0),
                 n_reward: AtomicUsize::new(0),
                 ema_wall_ns: AtomicU64::new(0),
                 ema_abort_cf_ns: AtomicU64::new(0),
                 last_update_tick: AtomicU64::new(0),
-                explore_budget: AtomicUsize::new(0),
+                explore_budget: AtomicUsize::new(1),
                 under_covered: false,
                 lazy,
             });
@@ -409,12 +414,12 @@ impl ArmTable {
             .and_modify(|e| {
                 e.under_covered = true;
                 e.arm = ArmKind::Opt;
-                e.sticky = true;
-                e.explore_budget.store(0, Ordering::Relaxed);
+                e.sticky = false;
+                e.explore_budget.store(1, Ordering::Relaxed);
             })
             .or_insert_with(|| ArmEntry {
                 arm: ArmKind::Opt,
-                sticky: true,
+                sticky: false,
                 n_pull: AtomicUsize::new(0),
                 n_reward: AtomicUsize::new(0),
                 ema_wall_ns: AtomicU64::new(0),

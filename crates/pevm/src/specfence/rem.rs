@@ -1004,6 +1004,40 @@ impl PartialRetryTable {
         }
     }
 
+    /// Keep value snaps for reads strictly before `fail_k`. The failed
+    /// location is not kept. Returns how many prefix reads were installed
+    /// into `ff_head` for the next incarnation. Empty when there is no snap.
+    pub(crate) fn arm_prefix_keep(
+        &self,
+        tx_idx: TxIdx,
+        fail_loc: MemoryLocationHash,
+        fail_k: u32,
+        prefix: &[(MemoryLocationHash, u32)],
+    ) -> usize {
+        if tx_idx >= self.states.len() || fail_k == 0 {
+            return 0;
+        }
+        let mut kept = HashMap::with_hasher(BuildIdentityHasher::default());
+        {
+            // SAFETY: validate runs after this tx's executor returned.
+            let st = unsafe { self.state_ref(tx_idx) };
+            for &(loc, k) in prefix {
+                if k == 0 || k >= fail_k || loc == fail_loc {
+                    continue;
+                }
+                if let Some(v) = st.value_snap.get(&loc) {
+                    kept.insert(loc, v.clone());
+                }
+            }
+        }
+        if kept.is_empty() {
+            return 0;
+        }
+        let n = kept.len();
+        self.ff_head.insert(tx_idx, kept);
+        n
+    }
+
     pub(crate) fn note_value(&self, tx_idx: TxIdx, location: MemoryLocationHash, value: FfValue) {
         if tx_idx < self.states.len() {
             // SAFETY: single-executor invariant

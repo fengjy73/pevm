@@ -207,6 +207,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if let Some(fg) = self.specfence.finegrain {
             fg.deep_begin_consumer(tx_idx, incarnation);
         }
+        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            // Every incarnation, including the thin ungated shell. Otherwise
+            // fail_k is unknown and prefix keep cannot see this read.
+            self.specfence.access_log.begin_incarnation(tx_idx);
+        }
         if self.specfence.mode == crate::ConcurrencyMode::SpecFence && !self.optimistic_skip_gate {
             // repair_armed covers_all only with real FF values. WaitForDependency ResumeAtK
             // with empty FF must not pretend sibling optimistic_read is certified (Iter26).
@@ -216,7 +221,6 @@ impl<'a, S: Storage> VmDb<'a, S> {
             self.specfence
                 .certificates
                 .begin_execute(tx_idx, repair_armed, incarnation);
-            self.specfence.access_log.begin_incarnation(tx_idx);
             self.specfence
                 .partial_retry
                 .reset_incarnation(tx_idx, incarnation);
@@ -227,6 +231,12 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     self.specfence.metrics.record_journal_ff_entries(n);
                 }
             }
+        } else if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            // Ungated shell still drops the previous incarnation's snaps.
+            // ff_head (prefix keep) is not in that cell.
+            self.specfence
+                .partial_retry
+                .reset_incarnation(tx_idx, incarnation);
         }
         if let TxKind::Call(to) = tx.kind {
             self.to_code_hash = self.get_code_hash(to)?;
@@ -547,8 +557,15 @@ impl<'a, S: Storage> VmDb<'a, S> {
         ) {
             return Ok(());
         }
-        // PE-on: true stream \(k\). Empty-PE never reaches HashMap note.
-        let access_k = self.specfence.access_log.note(self.tx_idx, location_hash);
+        // basic/storage already recorded this k. Do not note again.
+        let access_k = self
+            .specfence
+            .access_log
+            .first_k(self.tx_idx, location_hash)
+            .unwrap_or(0);
+        if self.specfence.access_arms.is_never(location_hash) {
+            return Ok(());
+        }
         if !self.specfence.learner.location_predicted(location_hash) {
             // Do **not** clone Basic(addr) PE onto every Storage(addr,slot).
             // That opened WaitFor/ESTIMATE on the first SLOAD of a hint-fan
@@ -1020,6 +1037,12 @@ impl<'a, S: Storage> VmDb<'a, S> {
             crate::specfence::ordered_admit_act::OrderedAdmitAct::WaitForDependency {
                 writer: _,
             } => {}
+        }
+        // WaitOnce: the same (tx, ℓ, w) does not enter the park body again.
+        match live_writer_act(&self.specfence, self.tx_idx, self.is_lazy, address, location_hash, w) {
+            crate::specfence::LiveAct::Block => {}
+            crate::specfence::LiveAct::Retry => return Err(ReadError::InconsistentRead),
+            crate::specfence::LiveAct::Skip => return self.occ_optimistic_read(),
         }
         let prefix = self
             .specfence
@@ -1551,6 +1574,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
 
     fn get_code_hash(&mut self, address: Address) -> Result<Option<B256>, ReadError> {
         let location_hash = hash_deterministic(MemoryLocation::CodeHash(address));
+        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            let _ = self.specfence.access_log.note(self.tx_idx, location_hash);
+        }
         let read_origins = self.read_set.entry(location_hash).or_default();
 
         // Try to read the latest code hash in [MvMemory]
@@ -1570,26 +1596,35 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 .mv_memory
                 .is_aborted_incarnation(tx_idx, tx_incarnation)
             {
-                return Err(ReadError::Blocking(tx_idx));
-            }
-            match value {
-                MemoryValue::SelfDestructed => {
-                    return Err(ReadError::SelfDestructedAccount);
+                match live_writer_act(&self.specfence, self.tx_idx, self.is_lazy, address, location_hash, tx_idx) {
+                    crate::specfence::LiveAct::Skip => {}
+                    crate::specfence::LiveAct::Retry => {
+                        return Err(ReadError::InconsistentRead);
+                    }
+                    crate::specfence::LiveAct::Block => {
+                        return Err(ReadError::Blocking(tx_idx));
+                    }
                 }
-                MemoryValue::CodeHash(code_hash) => {
-                    let origin = ReadOrigin::MvMemory(TxVersion {
-                        tx_idx,
-                        tx_incarnation,
-                    });
-                    Self::push_origin(read_origins, origin.clone())?;
-                    self.deep_trace_read(
-                        location_hash,
-                        crate::specfence::LocationKind::CodeHash,
-                        Some(&origin),
-                    );
-                    return Ok(Some(code_hash));
+            } else {
+                match value {
+                    MemoryValue::SelfDestructed => {
+                        return Err(ReadError::SelfDestructedAccount);
+                    }
+                    MemoryValue::CodeHash(code_hash) => {
+                        let origin = ReadOrigin::MvMemory(TxVersion {
+                            tx_idx,
+                            tx_incarnation,
+                        });
+                        Self::push_origin(read_origins, origin.clone())?;
+                        self.deep_trace_read(
+                            location_hash,
+                            crate::specfence::LocationKind::CodeHash,
+                            Some(&origin),
+                        );
+                        return Ok(Some(code_hash));
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
 
@@ -1606,11 +1641,40 @@ impl<'a, S: Storage> VmDb<'a, S> {
     }
 }
 
+/// Opt | WaitOnce | NeverWait. Not a method: callers hold `read_set`.
+fn live_writer_act(
+    specfence: &crate::specfence::SpecFenceCtx<'_>,
+    tx_idx: TxIdx,
+    is_lazy: bool,
+    address: Address,
+    location_hash: MemoryLocationHash,
+    writer: TxIdx,
+) -> crate::specfence::LiveAct {
+    if specfence.mode != crate::ConcurrencyMode::SpecFence {
+        return crate::specfence::LiveAct::Block;
+    }
+    if specfence.ready_edges.is_live_leftover_min(tx_idx)
+        && address != specfence.beneficiary
+        && !is_lazy
+    {
+        return crate::specfence::LiveAct::Block;
+    }
+    let never = address == specfence.beneficiary || is_lazy;
+    let finished =
+        specfence.scheduler.is_done(writer) || specfence.scheduler.is_validated(writer);
+    specfence
+        .access_arms
+        .decide(tx_idx, location_hash, writer, never, finished)
+}
+
 impl<S: Storage> Database for VmDb<'_, S> {
     type Error = ReadError;
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         let location_hash = self.hash_basic(&address);
+        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            let _ = self.specfence.access_log.note(self.tx_idx, location_hash);
+        }
         self.maybe_wait(address, location_hash, false)?;
         let resolve = self.resolve_read_overlay();
 
@@ -1730,13 +1794,23 @@ impl<S: Storage> Database for VmDb<'_, S> {
                             }
                             continue;
                         }
-                        if resolve {
-                            self.promote_on_conflict(address, location_hash);
-                            self.note_sf_mv_read();
-                        } else {
-                            self.note_unpublished_raw(location_hash, *blocking_idx);
+                        match live_writer_act(&self.specfence, self.tx_idx, self.is_lazy, address, location_hash, *blocking_idx) {
+                            crate::specfence::LiveAct::Skip => continue,
+                            crate::specfence::LiveAct::Retry => {
+                                return Err(ReadError::InconsistentRead);
+                            }
+                            crate::specfence::LiveAct::Block => {
+                                if resolve {
+                                    self.promote_on_conflict(address, location_hash);
+                                    self.note_sf_mv_read();
+                                } else {
+                                    self.note_unpublished_raw(location_hash, *blocking_idx);
+                                }
+                                return Err(
+                                    self.park_estimate_blocking(location_hash, *blocking_idx)
+                                );
+                            }
                         }
-                        return Err(self.park_estimate_blocking(location_hash, *blocking_idx));
                     }
                     Some((closest_idx, MemoryEntry::Data(tx_incarnation, value))) => {
                         if self
@@ -1755,10 +1829,20 @@ impl<S: Storage> Database for VmDb<'_, S> {
                                 }
                                 continue;
                             }
-                            if resolve {
-                                self.promote_on_conflict(address, location_hash);
+                            match live_writer_act(&self.specfence, self.tx_idx, self.is_lazy, address, location_hash, *closest_idx) {
+                                crate::specfence::LiveAct::Skip => continue,
+                                crate::specfence::LiveAct::Retry => {
+                                    return Err(ReadError::InconsistentRead);
+                                }
+                                crate::specfence::LiveAct::Block => {
+                                    if resolve {
+                                        self.promote_on_conflict(address, location_hash);
+                                    }
+                                    return Err(
+                                        self.park_estimate_blocking(location_hash, *closest_idx)
+                                    );
+                                }
                             }
-                            return Err(self.park_estimate_blocking(location_hash, *closest_idx));
                         }
                         self.specfence.metrics.record_db_heavy_op();
                         // About to push a new origin
@@ -1817,13 +1901,21 @@ impl<S: Storage> Database for VmDb<'_, S> {
         // Fall back to storage
         if final_account.is_none() {
             if let Some(w) = skipped_live_estimate {
-                if resolve {
-                    self.promote_on_conflict(address, location_hash);
-                    self.note_sf_mv_read();
-                } else {
-                    self.note_unpublished_raw(location_hash, w);
+                match live_writer_act(&self.specfence, self.tx_idx, self.is_lazy, address, location_hash, w) {
+                    crate::specfence::LiveAct::Skip => {}
+                    crate::specfence::LiveAct::Retry => {
+                        return Err(ReadError::InconsistentRead);
+                    }
+                    crate::specfence::LiveAct::Block => {
+                        if resolve {
+                            self.promote_on_conflict(address, location_hash);
+                            self.note_sf_mv_read();
+                        } else {
+                            self.note_unpublished_raw(location_hash, w);
+                        }
+                        return Err(self.park_estimate_blocking(location_hash, w));
+                    }
                 }
-                return Err(self.park_estimate_blocking(location_hash, w));
             }
             self.specfence.metrics.record_db_heavy_op();
             // Populate [Storage] on the first read
@@ -2004,6 +2096,9 @@ impl<S: Storage> Database for VmDb<'_, S> {
 
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
         let location_hash = hash_deterministic(MemoryLocation::Storage(address, index));
+        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            let _ = self.specfence.access_log.note(self.tx_idx, location_hash);
+        }
         self.maybe_wait(address, location_hash, true)?;
         let resolve = self.resolve_read_overlay();
 
@@ -2158,21 +2253,57 @@ impl<S: Storage> Database for VmDb<'_, S> {
                         // No prior Data. A live Estimate writer is unpublished —
                         // do not read pre-state (LackOfFund/NonceTooHigh then
                         // Blocking(tx-1) livelocks when tx-1 is already done).
+                        // NeverWait / a second WaitOnce may fall through; leftover
+                        // still parks (`live_writer_act`).
                         self.specfence.metrics.record_optimistic_read();
                         if !self.specfence.scheduler.is_done(closest_idx) {
-                            self.promote_on_conflict(address, location_hash);
-                            return Err(self.park_estimate_blocking(location_hash, closest_idx));
+                            match live_writer_act(&self.specfence, self.tx_idx, self.is_lazy, address, location_hash, closest_idx) {
+                                crate::specfence::LiveAct::Skip => {}
+                                crate::specfence::LiveAct::Retry => {
+                                    return Err(ReadError::InconsistentRead);
+                                }
+                                crate::specfence::LiveAct::Block => {
+                                    self.promote_on_conflict(address, location_hash);
+                                    return Err(
+                                        self.park_estimate_blocking(location_hash, closest_idx)
+                                    );
+                                }
+                            }
                         }
                     } else {
-                        self.promote_on_conflict(address, location_hash);
-                        return Err(self.park_estimate_blocking(location_hash, closest_idx));
+                        match live_writer_act(&self.specfence, self.tx_idx, self.is_lazy, address, location_hash, closest_idx) {
+                            crate::specfence::LiveAct::Skip => {}
+                            crate::specfence::LiveAct::Retry => {
+                                return Err(ReadError::InconsistentRead);
+                            }
+                            crate::specfence::LiveAct::Block => {
+                                self.promote_on_conflict(address, location_hash);
+                                return Err(self.park_estimate_blocking(location_hash, closest_idx));
+                            }
+                        }
                     }
                 } else if estimate {
-                    self.promote_on_conflict(address, location_hash);
-                    self.note_unpublished_raw(location_hash, closest_idx);
-                    return Err(self.park_estimate_blocking(location_hash, closest_idx));
+                    match live_writer_act(&self.specfence, self.tx_idx, self.is_lazy, address, location_hash, closest_idx) {
+                        crate::specfence::LiveAct::Skip => {}
+                        crate::specfence::LiveAct::Retry => {
+                            return Err(ReadError::InconsistentRead);
+                        }
+                        crate::specfence::LiveAct::Block => {
+                            self.promote_on_conflict(address, location_hash);
+                            self.note_unpublished_raw(location_hash, closest_idx);
+                            return Err(self.park_estimate_blocking(location_hash, closest_idx));
+                        }
+                    }
                 } else {
-                    return Err(self.park_estimate_blocking(location_hash, closest_idx));
+                    match live_writer_act(&self.specfence, self.tx_idx, self.is_lazy, address, location_hash, closest_idx) {
+                        crate::specfence::LiveAct::Skip => {}
+                        crate::specfence::LiveAct::Retry => {
+                            return Err(ReadError::InconsistentRead);
+                        }
+                        crate::specfence::LiveAct::Block => {
+                            return Err(self.park_estimate_blocking(location_hash, closest_idx));
+                        }
+                    }
                 }
             }
             Some(StorageTip::BadType) => return Err(ReadError::InvalidMemoryValueType),
