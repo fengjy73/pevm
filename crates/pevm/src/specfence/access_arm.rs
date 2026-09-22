@@ -293,6 +293,44 @@ impl AccessArmTable {
         out
     }
 
+    /// Cheap: this tx is a WaitOnce/crit consumer of some earlier peer.
+    /// Over-approximates "will read ℓ" — safe for OCC-shaped skip (false ⇒
+    /// keep full Avoid path).
+    #[inline]
+    pub(crate) fn has_wait_once_peer_before(&self, tx: TxIdx) -> bool {
+        let crit = self.crit_loc.load(Ordering::Relaxed);
+        if crit != u64::MAX && self.crit_pred(tx, crit).is_some() {
+            return true;
+        }
+        if !self.any_wait_once() {
+            return false;
+        }
+        self.arms
+            .iter()
+            .any(|e| e.arm == AccessArm::WaitOnce && e.peer > 0 && e.peer < tx)
+    }
+
+    /// True when `tx` is a known WaitOnce/crit producer (tip install must stay).
+    #[inline]
+    pub(crate) fn is_wait_once_producer(&self, tx: TxIdx) -> bool {
+        let crit = self.crit_loc.load(Ordering::Relaxed);
+        if crit != u64::MAX {
+            let writers = self.crit_writers.lock().unwrap();
+            if writers.iter().any(|&w| w == tx) {
+                return true;
+            }
+        }
+        self.arms
+            .iter()
+            .any(|e| e.arm == AccessArm::WaitOnce && e.peer == tx)
+            || self
+                .wait_edges
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|&(_, p, _)| p == tx)
+    }
+
     /// Hot early basic/storage WAW template. The next read of `ℓ` waits
     /// once for a live writer instead of Opt-then-full-replay.
     pub(crate) fn note_early_waw(&self, loc: MemoryLocationHash, k: u32) {
@@ -482,5 +520,17 @@ mod tests {
             snaps.iter().any(|&(loc, tag, _, _)| loc == 22 && tag == 2),
             "NeverWait prior stays"
         );
+    }
+
+    #[test]
+    fn has_wait_once_peer_before_gates_occ_shaped() {
+        let t = AccessArmTable::new();
+        assert!(!t.has_wait_once_peer_before(40));
+        t.note_early_waw_peer(33, 5, 7);
+        assert!(t.any_wait_once());
+        assert!(t.has_wait_once_peer_before(40));
+        assert!(!t.has_wait_once_peer_before(5), "peer must be before tx");
+        assert!(t.is_wait_once_producer(7));
+        assert!(!t.is_wait_once_producer(40));
     }
 }

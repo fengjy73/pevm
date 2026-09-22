@@ -151,6 +151,9 @@ pub(crate) struct VmDb<'a, S: Storage> {
     optimistic_majority_lazy: bool,
     /// A1=0 ungated: skip access-gate / rem / ReadyEdge (P3 ≡ OCC).
     optimistic_skip_gate: bool,
+    /// Thin Soft=0: no WaitOnce peer before this tx → OCC-shaped execute
+    /// (skip consult body / engagement / museum; keep access_log ordinals).
+    sf_occ_shaped: bool,
     /// SpecFence visibility for this incarnation (Opt / WaitReleased / OrderedTip).
     vis: VisibilityPolicy,
     /// PCC overlay armed for the current access (PE ∩ ROI). OptimisticRead = OCC read.
@@ -193,6 +196,15 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 .policy
                 .is_some_and(|p| p.skip_ungated_tx_path_tax())
             && !self.specfence.ready_edges.is_gated(tx_idx);
+        // Thin Soft=0 OCC-shaped: no WaitOnce peer before this tx → skip consult
+        // body / engagement / museum. Keep access_log.note (fail_k). Tip install
+        // still runs if this tx is a WaitOnce/crit producer.
+        self.sf_occ_shaped = self.specfence.mode == crate::ConcurrencyMode::SpecFence
+            && self.specfence.scheduler.block_size() <= crate::specfence::THIN_SHELL_N
+            && !self
+                .specfence
+                .access_arms
+                .has_wait_once_peer_before(tx_idx);
         self.vis = if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
             // leftover_min → WaitReleased (for_ready). Worker vis was
             // discarded here and leftover_min stayed Opt (19807137 ghost).
@@ -490,6 +502,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return Ok(());
         }
         if self.is_lazy || address == self.specfence.beneficiary {
+            return Ok(());
+        }
+        // Thin Soft=0 OCC-shaped: no WaitOnce peer — zero consult tax (ordinals
+        // already noted by basic/storage).
+        if self.sf_occ_shaped {
             return Ok(());
         }
         // Soft=0 Opt: no WaitOnce and no crit → zero consult tax.
@@ -2829,6 +2846,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             is_lazy: false,
             optimistic_majority_lazy: false,
             optimistic_skip_gate: false,
+            sf_occ_shaped: false,
             vis: VisibilityPolicy::Opt,
             pcc_armed: Cell::new(false),
             optimistic_read_this_tx: Cell::new(0),
@@ -3054,7 +3072,6 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         let full_tx = unsafe { self.txs.get_unchecked(tx_version.tx_idx) };
         let tx = self.chain.tx_env(full_tx);
 
-        self.note_execute_edge(tx_version.tx_idx);
         let from_hash = hash_deterministic(MemoryLocation::Basic(tx.caller));
         let to_hash = tx
             .kind
@@ -3085,12 +3102,25 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             ctx.journal_mut().clear();
         }
 
+        let sf_occ_shaped = self.evm.ctx().db().sf_occ_shaped;
+        // Museum / tip only when this tx is a WaitOnce consumer or producer.
+        if !sf_occ_shaped {
+            self.note_execute_edge(tx_version.tx_idx);
+        }
+
         // SpecFence write path: early version tip + live_writer.
-        // Thin: DashMap WaitOnce/crit. Large: ChainSpineTip only (sticky≥32).
+        // Thin: DashMap WaitOnce/crit (skip when OCC-shaped non-producer).
+        // Large: ChainSpineTip only (sticky≥32).
         if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
             let thin = self.specfence.scheduler.block_size() <= crate::specfence::THIN_SHELL_N;
             let crit = self.specfence.access_arms.crit_loc_hash();
-            if thin {
+            let install_tip = thin
+                && (!sf_occ_shaped
+                    || self
+                        .specfence
+                        .access_arms
+                        .is_wait_once_producer(tx_version.tx_idx));
+            if install_tip {
                 let prior = self.mv_memory.write_locations(tx_version.tx_idx);
                 for &loc in &prior {
                     if self.specfence.access_arms.is_crit_loc(loc)
@@ -3113,7 +3143,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         tx_version.tx_incarnation,
                     );
                 }
-            } else if self.specfence.sf_tips.is_chain_loc(crit) {
+            } else if !thin && self.specfence.sf_tips.is_chain_loc(crit) {
                 // ChainSpineTip claim — O(1) flag, not WaitOnce DashMap mill.
                 self.specfence.sf_tips.chain_claim(
                     tx_version.tx_idx,
@@ -3132,8 +3162,9 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 .policy
                 .is_some_and(|p| p.skip_ungated_tx_path_tax())
             && !self.specfence.ready_edges.is_gated(tx_version.tx_idx);
+        // OCC-shaped thin: force lean without engagement atomics.
         let lean = self.specfence.mode == crate::ConcurrencyMode::SpecFence
-            && self.specfence.engagement.begin_tx(tx_version.tx_idx);
+            && (sf_occ_shaped || self.specfence.engagement.begin_tx(tx_version.tx_idx));
         let repair_armed = self.specfence.mode == crate::ConcurrencyMode::SpecFence
             && !optimistic_ungated_exec
             && (self
