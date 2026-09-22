@@ -548,6 +548,8 @@ impl Pevm {
                 .begin_block_with_cores(block_size, concurrency_level.get());
             arms.begin_from_prior(&self.inter_prior, self.cost_policy.is_reuse_block());
             access_arms.begin_from_prior(&self.inter_prior);
+            // Detect (a): restore WaitOnce edges as ungated waits before pick.
+            let _planted = access_arms.plant_wait_edges(&ready_edges);
             // B4: Prior → CostPolicy.block_arm before admit_seed so wave-1
             // hops_to_admit / Detect.G match ArmTable (not a cold re-select).
             let _ = arms.install_prior_into_policy(&self.cost_policy, block_size);

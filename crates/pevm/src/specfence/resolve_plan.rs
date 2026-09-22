@@ -429,7 +429,7 @@ fn keep_single_invalid_prefix(ctx: &ApplyCtx<'_>) -> bool {
         .unwrap_or(0);
     ctx.specfence
         .access_arms
-        .note_early_waw_peer(loc, k, peer);
+        .note_early_waw_edge(tx, loc, k, peer);
     // Thin: ungated publish-order Avoid — no mark_gated.
     if peer > 0 && ctx.scheduler.block_size() <= super::THIN_SHELL_N {
         ctx.specfence.ready_edges.note_ungated_wait_on(tx, peer);

@@ -265,6 +265,8 @@ pub(crate) struct InterBlockPrior {
     arm_snaps: Mutex<Vec<super::arm_table::ArmSnap>>,
     /// Per-access Avoid prior: `(ℓ, arm tag, k)`. Tag 1 = WaitOnce, 2 = NeverWait.
     access_arm_snaps: Mutex<Vec<(crate::MemoryLocationHash, u8, u32)>>,
+    /// Thin/reuse WaitOnce edges: `(consumer, producer, ℓ)` for ungated plant.
+    access_wait_edges: Mutex<Vec<(crate::TxIdx, crate::TxIdx, crate::MemoryLocationHash)>>,
     /// Longest non-beneficiary writer chain from the last block. Reuse
     /// plants nearest-pred gates so the next writer does not Opt-read
     /// before this one publishes.
@@ -331,6 +333,7 @@ impl InterBlockPrior {
         self.last_flipped.store(0, Ordering::Relaxed);
         self.arm_snaps.lock().unwrap().clear();
         self.access_arm_snaps.lock().unwrap().clear();
+        self.access_wait_edges.lock().unwrap().clear();
         *self.crit_chain.lock().unwrap() = None;
     }
 
@@ -346,6 +349,19 @@ impl InterBlockPrior {
 
     pub(crate) fn pack_access_arms(&self, snaps: Vec<(crate::MemoryLocationHash, u8, u32)>) {
         *self.access_arm_snaps.lock().unwrap() = snaps;
+    }
+
+    pub(crate) fn access_wait_edge_snapshot(
+        &self,
+    ) -> Vec<(crate::TxIdx, crate::TxIdx, crate::MemoryLocationHash)> {
+        self.access_wait_edges.lock().unwrap().clone()
+    }
+
+    pub(crate) fn pack_access_wait_edges(
+        &self,
+        edges: Vec<(crate::TxIdx, crate::TxIdx, crate::MemoryLocationHash)>,
+    ) {
+        *self.access_wait_edges.lock().unwrap() = edges;
     }
 
     /// Remember one WAW chain for the next block. `writers` is sorted, unique.

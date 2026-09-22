@@ -81,6 +81,8 @@ pub(crate) struct AccessArmTable {
     /// `u64::MAX` = no learned chain. Writers are for demand-driven WaitOnce.
     crit_loc: AtomicU64,
     crit_writers: Mutex<Vec<TxIdx>>,
+    /// Detect (a) edges for next pick / next block: (consumer, producer, ℓ).
+    wait_edges: Mutex<Vec<(TxIdx, TxIdx, MemoryLocationHash)>>,
 }
 
 impl AccessArmTable {
@@ -102,6 +104,7 @@ impl AccessArmTable {
         self.prefix_keep_n.store(0, Ordering::Relaxed);
         self.crit_loc.store(u64::MAX, Ordering::Relaxed);
         self.crit_writers.lock().unwrap().clear();
+        self.wait_edges.lock().unwrap().clear();
         for (loc, tag, k) in prior.access_arm_snapshot() {
             let arm = AccessArm::from_tag(tag);
             if arm == AccessArm::Opt {
@@ -109,6 +112,7 @@ impl AccessArmTable {
             }
             self.arms.insert(loc, ArmRec { arm, k, hits: 0, peer: 0 });
         }
+        *self.wait_edges.lock().unwrap() = prior.access_wait_edge_snapshot();
     }
 
     /// Pack prior. Morph flip decays WaitOnce that this block did not
@@ -129,6 +133,38 @@ impl AccessArmTable {
             snaps.push((*e.key(), arm.tag(), e.k));
         }
         prior.pack_access_arms(snaps);
+        let edges = self.wait_edges.lock().unwrap().clone();
+        prior.pack_access_wait_edges(edges);
+    }
+
+    /// Record a WaitOnce consumer→producer edge for Detect (a) plant.
+    pub(crate) fn note_wait_edge(
+        &self,
+        consumer: TxIdx,
+        producer: TxIdx,
+        loc: MemoryLocationHash,
+    ) {
+        if producer == 0 || producer >= consumer {
+            return;
+        }
+        let mut edges = self.wait_edges.lock().unwrap();
+        if !edges
+            .iter()
+            .any(|&(c, p, l)| c == consumer && p == producer && l == loc)
+        {
+            edges.push((consumer, producer, loc));
+        }
+    }
+
+    /// Plant restored WaitOnce edges without mark_gated (thin Avoid).
+    pub(crate) fn plant_wait_edges(&self, ready: &super::ReadyEdgeTable) -> usize {
+        let edges = self.wait_edges.lock().unwrap().clone();
+        let mut n = 0;
+        for (consumer, producer, _loc) in edges {
+            ready.note_ungated_wait_on(consumer, producer);
+            n += 1;
+        }
+        n
     }
 
     #[inline]
@@ -233,6 +269,18 @@ impl AccessArmTable {
                 hits: 1,
                 peer,
             });
+    }
+
+    /// WaitOnce + peer for consumer `tx` (Detect before next pick / block).
+    pub(crate) fn note_early_waw_edge(
+        &self,
+        consumer: TxIdx,
+        loc: MemoryLocationHash,
+        k: u32,
+        peer: TxIdx,
+    ) {
+        self.note_early_waw_peer(loc, k, peer);
+        self.note_wait_edge(consumer, peer, loc);
     }
 
     pub(crate) fn note_prefix_resume(&self, kept: usize) {
