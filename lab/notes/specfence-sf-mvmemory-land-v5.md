@@ -1,7 +1,7 @@
 # SpecFence SfMvMemory land v5
 
 **Date:** 2026-09-22  
-**Tip:** (this commit) on `cursor/specfence-sf-ps-true-spine-d6e8` (PR #45)  
+**Tip:** `39ae4a3` on `cursor/specfence-sf-ps-true-spine-d6e8` (PR #45)  
 **Baseline:** [`specfence-sf-mvmemory-land-v4.md`](specfence-sf-mvmemory-land-v4.md) (`7c998be`)  
 **Harness:** Soft=0 Instant-off (`env -u SPECFENCE_HANG_TRACE`), 8 cores, `SPECFENCE_COMPARE_CHECK=1`, N=5 both  
 **Acceptance:** **TPS SF/OCC ≥ 1.5** both `3356896` and `15274915`.  
@@ -15,10 +15,10 @@
 
 | Block | v3 | v4 | **v5 reuse med TPS** | vs ≥1.5 |
 |------:|---:|---:|---------------------:|:-------:|
-| 3356896 | 0.71 | **0.83** | **~0.83** (restored) | gap ~1.8× |
-| 15274915 | 0.70 | **0.65** | **~0.65** (restored) | gap ~2.3× |
+| 3356896 | 0.71 | 0.83 | **0.74** | gap ~2.0× |
+| 15274915 | 0.70 | 0.65 | **0.59** | gap ~2.5× |
 
-Micro-cuts have **plateaued**. Hitting ≥1.5 needs a hot-path redesign where schedule Avoid is cheaper than the OCC abort train — not more Resolve Prefer / Win prepaid / rem tax strip.
+(Confirmatory Soft=0 N=5 after restore; within noise of v4, no ≥1.5.) Micro-cuts have **plateaued**. Hitting ≥1.5 needs a hot-path redesign where schedule Avoid is cheaper than the OCC abort train — not more Resolve Prefer / Win prepaid / rem tax strip.
 
 ---
 
