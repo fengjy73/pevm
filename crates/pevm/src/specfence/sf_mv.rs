@@ -41,9 +41,12 @@ pub(crate) enum SfRead {
 }
 
 /// Shared SpecFence tip + exact-waiter plane (one per block execution).
+/// SoT: version tip, live_writer(ℓ), exact waiters; Estimate forbidden.
 #[derive(Debug, Default)]
 pub(crate) struct SfTipTable {
     tips: DashMap<MemoryLocationHash, BTreeMap<TxIdx, SfTip>>,
+    /// True unpublished writer of ℓ (RAW/WAW). Cleared on publish after tip.
+    live_writer: DashMap<MemoryLocationHash, TxIdx>,
     /// Exact waiters keyed by `(location, writer)`.
     waiters: DashMap<(MemoryLocationHash, TxIdx), Vec<TxIdx>>,
     early_tip_n: AtomicUsize,
@@ -61,23 +64,37 @@ impl SfTipTable {
 
     /// Early version tip on the SpecFence write path (prior WS / known ℓ).
     /// Does **not** install OCC Estimate into MvMemory.
+    /// Sets live_writer(ℓ) so WaitOnce can Detect without Estimate.
     pub(crate) fn install_version_tip(
         &self,
         location: MemoryLocationHash,
         writer: TxIdx,
         incarnation: TxIncarnation,
     ) {
-        let mut map = self.tips.entry(location).or_default();
-        match map.get(&writer) {
-            Some(SfTip::Released { incarnation: inc }) if *inc >= incarnation => {}
-            _ => {
-                map.insert(writer, SfTip::Version { incarnation });
-                self.early_tip_n.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut map = self.tips.entry(location).or_default();
+            match map.get(&writer) {
+                Some(SfTip::Released { incarnation: inc }) if *inc >= incarnation => {
+                    return;
+                }
+                _ => {
+                    map.insert(writer, SfTip::Version { incarnation });
+                    self.early_tip_n.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
+        // live_writer: keep the latest (highest) unfinished writer claim.
+        self.live_writer
+            .entry(location)
+            .and_modify(|w| {
+                if writer >= *w {
+                    *w = writer;
+                }
+            })
+            .or_insert(writer);
     }
 
-    /// True Data landed in MvMemory — mark Released and wake exact waiters.
+    /// SoT publish order: tip Released → clear live_writer → wake exact waiters.
     pub(crate) fn publish_data(
         &self,
         location: MemoryLocationHash,
@@ -88,17 +105,37 @@ impl SfTipTable {
             let mut map = self.tips.entry(location).or_default();
             map.insert(writer, SfTip::Released { incarnation });
         }
+        // Clear live_writer only when this writer still owns the claim.
+        let _ = self
+            .live_writer
+            .remove_if(&location, |_, w| *w == writer);
         self.wake_exact(location, writer)
     }
 
-    /// Clear tips for an aborted writer reincarnation.
-    pub(crate) fn clear_writer(&self, writer: TxIdx, locations: &[MemoryLocationHash]) {
+    /// True unpublished writer of ℓ (structure RAW/WAW), if any.
+    #[inline]
+    pub(crate) fn live_writer(&self, location: MemoryLocationHash) -> Option<TxIdx> {
+        self.live_writer.get(&location).map(|e| *e)
+    }
+
+    /// Abort / reincarnation: drop version tip + live_writer, wake exact waiters.
+    /// Callers must not leave a stale Version tip that parks WaitOnce forever.
+    pub(crate) fn clear_writer(
+        &self,
+        writer: TxIdx,
+        locations: &[MemoryLocationHash],
+    ) -> Vec<TxIdx> {
+        let mut woken = Vec::new();
         for &loc in locations {
             if let Some(mut map) = self.tips.get_mut(&loc) {
                 map.remove(&writer);
             }
-            self.waiters.remove(&(loc, writer));
+            let _ = self
+                .live_writer
+                .remove_if(&loc, |_, w| *w == writer);
+            woken.extend(self.wake_exact(loc, writer));
         }
+        woken
     }
 
     #[inline]
@@ -375,13 +412,27 @@ mod tests {
             tips.tip_at(11, 1),
             Some(SfTip::Version { incarnation: 0 })
         ));
+        assert_eq!(tips.live_writer(11), Some(1));
         tips.register_waiter(11, 1, 3);
         tips.register_waiter(11, 1, 4);
         let woken = tips.publish_data(11, 1, 0);
         assert_eq!(woken, vec![3, 4]);
         assert!(tips.has_released(11, 1));
+        assert_eq!(tips.live_writer(11), None);
         assert_eq!(tips.estimate_block_sf(), 0);
         assert_eq!(tips.early_tip_n(), 1);
         assert_eq!(tips.publish_wake_n(), 2);
+    }
+
+    #[test]
+    fn abort_clears_live_writer_and_wakes_waiters() {
+        let tips = SfTipTable::new();
+        tips.install_version_tip(22, 2, 0);
+        tips.register_waiter(22, 2, 5);
+        assert_eq!(tips.live_writer(22), Some(2));
+        let woken = tips.clear_writer(2, &[22]);
+        assert_eq!(woken, vec![5]);
+        assert!(tips.tip_at(22, 2).is_none());
+        assert_eq!(tips.live_writer(22), None);
     }
 }

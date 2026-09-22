@@ -2404,6 +2404,11 @@ fn try_validate(
         mv_memory.convert_writes_to_estimates(tx_version.tx_idx);
         // A2: ESTIMATE is a confirmed wr — flip Avoid in-batch for later readers.
         if specfence.mode == ConcurrencyMode::SpecFence {
+            // Drop SF version tip / live_writer so WaitOnce does not park on
+            // a stale unpublished claim (SoT: Estimate is OCC-only).
+            let _ = specfence
+                .sf_tips
+                .clear_writer(tx_version.tx_idx, &occ_write_locs);
             for &loc in &occ_write_locs {
                 specfence.sketch.push_spine(loc, tx_version.tx_idx);
                 if specfence.sketch.broadcast_avoid(loc, tx_version.tx_idx) {

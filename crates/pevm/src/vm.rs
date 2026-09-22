@@ -525,6 +525,12 @@ impl<'a, S: Storage> VmDb<'a, S> {
             })
             .or_else(|| {
                 self.specfence
+                    .sf_tips
+                    .live_writer(location_hash)
+                    .filter(|&w| w < self.tx_idx)
+            })
+            .or_else(|| {
+                self.specfence
                     .ready_edges
                     .writers_of(location_hash)
                     .into_iter()
@@ -547,7 +553,12 @@ impl<'a, S: Storage> VmDb<'a, S> {
         let has_sf_tip = self
             .specfence
             .sf_tips
-            .has_version_or_released(location_hash, pred);
+            .has_version_or_released(location_hash, pred)
+            || self
+                .specfence
+                .sf_tips
+                .live_writer(location_hash)
+                .is_some_and(|w| w == pred);
         // Thin: Avoid when writer is live / SF-tipped. Do not Block a
         // not-started pred (serialized the 15-writer spine). FullReplay
         // plants ungated wait for the next pick (Detect→Avoid).
@@ -585,14 +596,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 .note_ungated_wait_on(self.tx_idx, pred);
             return Err(self.park_publish_wait(location_hash, pred));
         }
-        // Large: park when live, SF tip, or (legacy) Estimate tip — Blocking
-        // goes through park_publish_wait so estimate_block_sf stays 0.
-        let live = executing
-            || has_sf_tip
-            || matches!(
-                self.mv_memory.entry_kind_at(location_hash, pred),
-                "estimate"
-            );
+        // Large: park on Executing / SF tip / live_writer — never Estimate.
+        // Blocking goes through park_publish_wait so estimate_block_sf stays 0.
+        let live = executing || has_sf_tip;
         if !live {
             return Ok(());
         }

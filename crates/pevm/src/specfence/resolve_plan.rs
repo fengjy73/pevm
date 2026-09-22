@@ -356,7 +356,9 @@ fn abort_and_estimate(ctx: &ApplyCtx<'_>) {
     let tx = ctx.tx_version.tx_idx;
     let aborted = ctx.scheduler.try_validation_abort(ctx.tx_version);
     if aborted {
+        let locs = ctx.mv_memory.write_locations(tx);
         ctx.mv_memory.convert_writes_to_estimates(tx);
+        let _ = ctx.specfence.sf_tips.clear_writer(tx, &locs);
         ctx.specfence.metrics.record_occ_abort();
         ctx.specfence.metrics.record_full_abort_reexecute();
     }
