@@ -2977,18 +2977,26 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         }
 
         // SpecFence write path: install version tips early from prior WS
-        // (not OCC Estimate). WaitOnce readers key off these + true Data.
+        // for WaitOnce / crit locs only (not every write — large-block tax).
+        // Tip is SpecFence-native, not OCC Estimate.
         if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            let crit = self.specfence.access_arms.crit_loc_hash();
             let prior = self.mv_memory.write_locations(tx_version.tx_idx);
             for &loc in &prior {
-                self.specfence.sf_tips.install_version_tip(
-                    loc,
-                    tx_version.tx_idx,
-                    tx_version.tx_incarnation,
-                );
+                if loc == crit
+                    || self.specfence.access_arms.is_wait_once(loc)
+                    || self.specfence.access_arms.is_never(loc)
+                {
+                    if self.specfence.access_arms.is_never(loc) {
+                        continue;
+                    }
+                    self.specfence.sf_tips.install_version_tip(
+                        loc,
+                        tx_version.tx_idx,
+                        tx_version.tx_incarnation,
+                    );
+                }
             }
-            // Crit / WaitOnce chain: claim tip even on first incarnation.
-            let crit = self.specfence.access_arms.crit_loc_hash();
             if crit != u64::MAX
                 && self.specfence.access_arms.is_wait_once(crit)
                 && !prior.iter().any(|&l| l == crit)
