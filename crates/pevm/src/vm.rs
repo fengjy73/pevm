@@ -497,9 +497,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if !wait && !crit {
             return Ok(());
         }
-        // Checkpoint before this read so fail_k can RewindTo (crit loc on
-        // cold; WaitOnce on reuse).
-        if access_k > 1 {
+        let thin = self.specfence.scheduler.block_size() <= crate::specfence::THIN_SHELL_N;
+        // Checkpoint before this read so fail_k can RewindTo (large blocks).
+        // Thin shell skips RewindTo — do not pay rem tax for unused cps.
+        if !thin && access_k > 1 {
             let _ = self.specfence.partial_retry.push_checkpoint_at_k(
                 self.tx_idx,
                 (access_k - 1) as usize,
@@ -509,9 +510,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if !wait {
             return Ok(());
         }
-        // Thin shell: consult + checkpoint only. Parking a live pred here
+        // Thin shell: consult only (AccessArm seen). Parking a live pred here
         // serialized the 15-writer spine and raised the wall.
-        if self.specfence.scheduler.block_size() <= crate::specfence::THIN_SHELL_N {
+        if thin {
             return Ok(());
         }
         let Some(pred) = self
