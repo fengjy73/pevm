@@ -552,6 +552,24 @@ impl MvMemory {
             .and_then(|written| written.range(..tx_idx).next_back().map(|(idx, _)| *idx))
     }
 
+    /// Nearest unfinished writer below `tx_idx` on `location` (Estimate or Data).
+    /// Thin Soft=0 publish-order: wait on this tip without mark_gated.
+    pub(crate) fn last_unfinished_writer_before(
+        &self,
+        location: MemoryLocationHash,
+        tx_idx: TxIdx,
+        is_done: impl Fn(TxIdx) -> bool,
+    ) -> Option<TxIdx> {
+        let _nest = DataNest::enter("last_unfinished_writer_before");
+        let written = self.data.get(&location)?;
+        for (idx, _) in written.range(..tx_idx).rev() {
+            if !is_done(*idx) {
+                return Some(*idx);
+            }
+        }
+        None
+    }
+
     /// Research: MV entry kind for a concrete writer at `location` (`data`/`estimate`/`absent`).
     pub(crate) fn entry_kind_at(
         &self,

@@ -173,6 +173,12 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
             if ctx.specfence.ready_edges.leftover_surplus(tx)
                 || (ctx.specfence.ready_edges.is_gated(tx)
                     && !ctx.specfence.ready_edges.may_execute(tx))
+                || (!ctx.specfence.ready_edges.is_gated(tx)
+                    && ctx
+                        .specfence
+                        .ready_edges
+                        .blocking_producer(tx)
+                        .is_some())
             {
                 ctx.runnable.mark_wait(tx);
             } else if ctx.specfence.ready_edges.is_gated(tx) || ctx.vis.needs_fence() {
@@ -217,9 +223,17 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
             }
             enqueue_higher_revalidate(&ctx, tx);
             // Observed WAW: wait for the producer instead of Opt ping-pong.
+            // Ungated publish-order (thin note_ungated_wait_on) also parks —
+            // release_owner would ignore blocking_producer and Opt-mill again.
             if ctx.specfence.ready_edges.leftover_surplus(tx)
                 || (ctx.specfence.ready_edges.is_gated(tx)
                     && !ctx.specfence.ready_edges.may_execute(tx))
+                || (!ctx.specfence.ready_edges.is_gated(tx)
+                    && ctx
+                        .specfence
+                        .ready_edges
+                        .blocking_producer(tx)
+                        .is_some())
             {
                 ctx.runnable.mark_wait(tx);
             } else {
@@ -275,13 +289,50 @@ fn plant_observed_waw(ctx: &ApplyCtx<'_>, f: &super::collateral::FirstConflict) 
     let Some(producer) = f.peer.filter(|&w| w < tx) else {
         return;
     };
+    plant_pair_after_replay(ctx, tx, producer, f.location);
+}
+
+/// Thin Soft=0: ungated publish-order on the nearest unfinished tip (Opt
+/// resume, no mark_gated). Large blocks keep the gated observed window.
+fn plant_pair_after_replay(
+    ctx: &ApplyCtx<'_>,
+    consumer: crate::TxIdx,
+    producer: crate::TxIdx,
+    loc: MemoryLocationHash,
+) {
+    if producer >= consumer {
+        return;
+    }
+    if ctx.scheduler.block_size() <= super::THIN_SHELL_N {
+        plant_thin_ungated_wait(ctx, consumer, producer, loc);
+        return;
+    }
     // Width 1: ArmTable::w_max is admit_seed cover. A window of 4 on one
-    // register is the 19807137 Released mill. Do not skip when `producer`
-    // is already done — leftover writers must elect/chain.
+    // register is the 19807137 Released mill.
     let _ = ctx
         .specfence
         .ready_edges
-        .plant_observed_window(tx, producer, f.location, 1);
+        .plant_observed_window(consumer, producer, loc, 1);
+}
+
+/// Pair-local start-order without leaving the Opt path. Whole-spine hold
+/// and mid-read WaitOnce Block stay discarded on thin.
+fn plant_thin_ungated_wait(
+    ctx: &ApplyCtx<'_>,
+    consumer: crate::TxIdx,
+    producer: crate::TxIdx,
+    loc: MemoryLocationHash,
+) {
+    let ready = ctx.specfence.ready_edges;
+    let tip = ctx
+        .mv_memory
+        .last_unfinished_writer_before(loc, consumer, |w| ready.is_writer_done(w));
+    let p = tip.or_else(|| {
+        (!ready.is_writer_done(producer) && producer < consumer).then_some(producer)
+    });
+    if let Some(p) = p {
+        ready.note_ungated_wait_on(consumer, p);
+    }
 }
 
 /// Second+ incarnation FullReplay that is not EffectiveWAW still Opt-mills
@@ -300,10 +351,7 @@ fn plant_invalid_locs(ctx: &ApplyCtx<'_>) {
             .last_writer_before(loc, tx)
             .filter(|&w| w < tx)
             .unwrap_or(tx);
-        let _ = ctx
-            .specfence
-            .ready_edges
-            .plant_observed_window(tx, producer, loc, 1);
+        plant_pair_after_replay(ctx, tx, producer, loc);
     }
 }
 
@@ -317,10 +365,7 @@ fn break_replay_mill(ctx: &ApplyCtx<'_>, f: &super::collateral::FirstConflict) {
         .or_else(|| ctx.mv_memory.last_writer_before(f.location, tx))
         .filter(|&w| w < tx)
         .unwrap_or(tx);
-    let _ = ctx
-        .specfence
-        .ready_edges
-        .plant_observed_window(tx, producer, f.location, 1);
+    plant_pair_after_replay(ctx, tx, producer, f.location);
 }
 
 fn seed_short_edge(
