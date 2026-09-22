@@ -1,7 +1,7 @@
 # SpecFence SfMvMemory land v1
 
 **Date:** 2026-09-22  
-**Tip:** `7595ef5` on `cursor/specfence-sf-ps-true-spine-d6e8` (PR #45)  
+**Tip:** `65b85eb` on `cursor/specfence-sf-ps-true-spine-d6e8` (PR #45)  
 **Harness:** Soft=0 Instant-off, 8 cores, `SPECFENCE_COMPARE_CHECK=1`, N=5 both  
 **SoT:** [`specfence-sf-mvmemory-redesign-v1.md`](specfence-sf-mvmemory-redesign-v1.md), [`specfence-thin-avoid-no-estimate-v1.md`](specfence-thin-avoid-no-estimate-v1.md)  
 **Hard acceptance:** **TPS SF/OCC ≥ 1.5** both blocks (user 2026-09-22).  
@@ -21,10 +21,12 @@ TPS SF/OCC = OCC_wall / SF_wall (higher better). Wall SF/OCC inverse.
 
 **Hard bar ≥1.5: NOT MET.** Best Soft=0 Instant-off N≥5 this session:
 
-| Block | Best OCC ms | Best SF primary ms | **Best TPS** | vs ≥1.5 |
-|------:|------------:|-------------------:|-------------:|:-------:|
-| 3356896 | 1.017 | 1.680 | **0.605** | gap ~2.5× |
-| 15274915 | 5.724 | 10.216 | **0.560** | gap ~2.7× |
+| Block | Best OCC ms | Best SF primary ms | **Best TPS** | Final tip `65b85eb` TPS | vs ≥1.5 |
+|------:|------------:|-------------------:|-------------:|------------------------:|:-------:|
+| 3356896 | 1.017 | 1.680 | **0.605** | 1.471/2.653 ≈ **0.55** | gap ~2.5× |
+| 15274915 | 5.724 | 10.216 | **0.560** | 8.398/12.047 ≈ **0.70**† | gap ~2.1× |
+
+† Host OCC noise high on large (OCC median swung 5–9 ms); absolute SF still above opt-v2 ~8.44 ms calm.
 
 ### 3356896 (n=176 thin)
 
@@ -88,17 +90,26 @@ mode==SpecFence. SF callers use park_live_writer → park_publish_wait.
 
 ---
 
-## Detect→Avoid→Resolve audit (concurrent capabilities)
+## Detect→Avoid→Resolve audit (concurrent capabilities, four classes)
 
-Early-WAW basic (3356896 ℓ `dff71d59d972…`, fail_k ~5/6; 15274915 sticky chain `abd6bb…`):
+Detect | Avoid | Resolve are **concurrent per access**, not a pipeline. Soft=0 Instant-off reuse counts below are indicative (host noise); path **(c)** dominating any class = incomplete.
 
-| Path | Meaning | Observation this land |
-|------|---------|------------------------|
-| **(a)** Detect before read | prior/AccessArm WaitOnce + peer known before basic | Armed after FullReplay / prior pack; cold still blind |
+| Class | Detect (a) | Avoid (b) via SfMvMemory | Resolve (c) when mistake | This land |
+|-------|------------|--------------------------|--------------------------|-----------|
+| **RAW** | Learn / AccessArm WaitOnce on reader ℓ; peer writer | WaitReleased / OrderedTip after true Data publish; WaitOnce spin/defer | Prefix redo / fail_k Rewind (large); FullReplay if Opt read Storage | Thin: often (c) — WaitOnce armed late; reader hits Storage pre-publish. Large: WaitOnce parks + Rewind salvage; still Full≪0 but ≫0 |
+| **WAR** | Reader→later writer on same ℓ (must not fold as schedule-only) | Writer must not publish past live readers without validate; VisibilityPolicy tip | Invalidate higher readers on write (`enqueue_higher_revalidate`); FullReplay if validation fails | Partially schedule/validate; **no WAR-specific SfMvMemory Avoid**. Risk: WAR treated as incidental revalidate — incomplete vs SoT |
+| **WAW** | EffectiveWAW / early-waw peer on AccessArm; sticky chain ≥32 | Version tip + publish order; WaitOnce read-after-true-publish; nearest-pred plant | FullReplay (thin) / fail_k Rewind (large) | Thin early-WAW `dff71d59…`: **(c) dominates** (~17–25 FullReplay/reuse). Large sticky: Rewind≫0, full_from_0 low — better (b)/(c) mix, TPS still ≪1.5 |
+| **Long chains** | `select_crit_chain` ≥32; `plant_nearest_preds` hop-1 | Head-first LIFO antichain fill; WaitOnce on spine | Rewind along chain; refuse leftover mill | Sticky path intact; antichain fill OK when plant sticks. Thin short spine (~15) must **not** full-plant (serial wall↑) — leaves (c) |
+
+Per-path on early-WAW basics (user audit):
+
+| Path | Meaning | Observation |
+|------|---------|-------------|
+| **(a)** Detect before read | prior/AccessArm WaitOnce + peer before basic | Armed after FullReplay / prior pack; cold blind; WAR under-detected |
 | **(b)** Avoid at read via true publish | WaitOnce + SfMvMemory tip/Data before Opt Storage | Spin/defer only when Executing or SF tip; often miss → Storage |
-| **(c)** Resolve after fail | Opt → validate → FullReplay / fail_k Rewind | **Still dominates** thin FullReplay ~17–25/reuse; large Full ~60–130 with Rewind salvage |
+| **(c)** Resolve after fail | Opt → validate → FullReplay / fail_k Rewind | **Still dominates** thin WAW/RAW; large salvages more via Rewind |
 
-**Path (c) dominating = incomplete.** SfMvMemory tip plane is necessary but not sufficient: writer Data still lands at `record`; early tip without final value cannot satisfy WaitReleased reads; thin cannot Block not-started preds without serializing the short spine.
+**Path (c) dominating = incomplete.** SfMvMemory must serve all four classes; this land is WAW-tip–heavy and under-serves WAR / early RAW Detect.
 
 ---
 
