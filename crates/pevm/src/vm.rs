@@ -596,9 +596,16 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 .note_ungated_wait_on(self.tx_idx, pred);
             return Err(self.park_publish_wait(location_hash, pred));
         }
-        // Large: park on Executing / SF tip / live_writer — never Estimate.
-        // Blocking goes through park_publish_wait so estimate_block_sf stays 0.
-        let live = executing || has_sf_tip;
+        // Large: park when Executing / SF tip / live_writer. Estimate tip is
+        // OCC residue used only as a *liveness* hint after abort cleared the
+        // SF tip — Blocking still goes through park_publish_wait so
+        // estimate_block_sf stays 0 (SoT: no Estimate Block on SF path).
+        let live = executing
+            || has_sf_tip
+            || matches!(
+                self.mv_memory.entry_kind_at(location_hash, pred),
+                "estimate"
+            );
         if !live {
             return Ok(());
         }
