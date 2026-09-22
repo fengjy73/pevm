@@ -665,6 +665,16 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 self.specfence.sf_tips.record_class_avoid(class);
                 return Ok(());
             }
+            // Prefer schedule one-hop: plant waiters wake on chain_release →
+            // Q_released. Exact waiter covers opportunistic Version readers.
+            // Soft=0 try_execute_sf skips Aborting for chain (mark_wait only).
+            self.specfence
+                .sf_tips
+                .register_waiter(location_hash, pred, self.tx_idx);
+            self.specfence
+                .ready_edges
+                .note_ungated_wait_on(self.tx_idx, pred);
+            return Err(self.park_publish_wait(location_hash, pred));
         }
         match live_writer_act(
             &self.specfence,
@@ -2743,6 +2753,8 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
     /// Ready transition stays in `finish_execution` (dependents drain) — do not
     /// `try_ready` here or release builds double-incarnate and corrupt.
     /// SfMvMemory: mark Released tips and wake exact WaitOnce waiters.
+    /// ChainSpine: also wake planted nearest succ into wave → `Q_released`
+    /// (schedule Avoid on Released — no Blocking park).
     fn wake_on_data_publish(
         &self,
         writer: crate::TxIdx,
@@ -2756,15 +2768,24 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 && (self.specfence.access_arms.is_crit_loc(loc)
                     || self.specfence.access_arms.is_wait_once(loc))
             {
-                let _exact = self
+                let exact = self
                     .specfence
                     .sf_tips
                     .publish_data(loc, writer, incarnation);
+                for c in exact {
+                    self.specfence.wave.push_ready(c);
+                }
             } else if self.specfence.sf_tips.is_chain_loc(loc) {
-                let _exact = self
+                let exact = self
                     .specfence
                     .sf_tips
                     .publish_data(loc, writer, incarnation);
+                for c in exact {
+                    self.specfence.wave.push_ready(c);
+                }
+                self.specfence
+                    .ready_edges
+                    .wake_planted_on_publish(writer, self.specfence.wave);
             }
             self.specfence.sketch.push_spine(loc, writer);
             self.specfence.ready_edges.note_published(loc, writer);
@@ -2774,6 +2795,13 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             let _ = self.specfence.dag.wake_on_data(loc, writer);
             self.specfence.metrics.record_data_publish_wake();
         }
+    }
+
+    /// True when Soft=0 ChainSpine should schedule-defer instead of Aborting.
+    #[inline]
+    pub(crate) fn chain_spine_schedule_defer(&self, location: MemoryLocationHash) -> bool {
+        self.specfence.mode == crate::ConcurrencyMode::SpecFence
+            && self.specfence.sf_tips.is_chain_loc(location)
     }
 
     pub(crate) fn new(
@@ -4014,11 +4042,22 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     let (wrote_new_location, contended) =
                         self.mv_memory.record(tx_version, read_set, write_set);
                     for loc in tip_locs {
-                        let _ = self.specfence.sf_tips.publish_data(
+                        let exact = self.specfence.sf_tips.publish_data(
                             loc,
                             tx_version.tx_idx,
                             tx_version.tx_incarnation,
                         );
+                        // ChainSpine one-hop: schedule wake planted succ + exact
+                        // waiters into Q_released (Avoid on Released, not park).
+                        if self.specfence.sf_tips.is_chain_loc(loc) {
+                            for c in exact {
+                                self.specfence.wave.push_ready(c);
+                            }
+                            self.specfence.ready_edges.wake_planted_on_publish(
+                                tx_version.tx_idx,
+                                self.specfence.wave,
+                            );
+                        }
                     }
                     if wrote_new_location {
                         flags |= FinishExecFlags::WroteNewLocation;

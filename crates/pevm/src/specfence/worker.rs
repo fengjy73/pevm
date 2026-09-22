@@ -396,11 +396,10 @@ fn drain_wave(specfence: SpecFenceCtx<'_>, scheduler: &Scheduler, runnable: &Run
             runnable.note_wait_unless_running(t);
             continue;
         }
-        let kind = if specfence.ready_edges.is_gated(t) {
-            super::runnable_set::QueueKind::Released
-        } else {
-            super::runnable_set::QueueKind::Indep
-        };
+        // Wave bag is publish / producer-done wake only (not antichain seed).
+        // ChainSpine one-hop and gated release both land on Q_released so
+        // Avoid is schedule-on-Released; Indep stays for seed antichain fill.
+        let kind = super::runnable_set::QueueKind::Released;
         if !runnable.wake_idle(t, kind) && runnable.is_running(t) {
             still_executing.push(t);
         }

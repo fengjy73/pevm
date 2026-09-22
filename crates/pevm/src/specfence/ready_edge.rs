@@ -719,6 +719,32 @@ impl ReadyEdgeTable {
         }
     }
 
+    /// ChainSpine one-hop: Data/`chain_release` woke — push planted nearest
+    /// successors into the wave bag (→ `Q_released`). Does **not** `mark_done`
+    /// (writer may still be Executing); `note_producer_done` still runs at
+    /// Commit. Keeps consumer bits so abort reincarnation re-blocks.
+    ///
+    /// Prefer this over `Blocking` park: Avoid is schedule-on-Released.
+    pub(crate) fn wake_planted_on_publish(&self, writer: TxIdx, wave: &WaveParkTable) {
+        let Some(cs) = self.waiters.get(&writer) else {
+            return;
+        };
+        if cs.is_empty() {
+            return;
+        }
+        let woken: Vec<TxIdx> = cs.iter().copied().collect();
+        drop(cs);
+        for c in woken {
+            let mine = self
+                .consumers
+                .get(&c)
+                .is_some_and(|e| e.load(Ordering::Relaxed) == writer);
+            if mine {
+                wave.push_ready(c);
+            }
+        }
+    }
+
     /// Abort / HotSet RAW producer identity for OrderedAdmit-rare tip check.
     #[inline]
     pub(crate) fn note_raw_producer(&self, location: MemoryLocationHash, writer: TxIdx) {
@@ -1690,6 +1716,27 @@ mod tests {
         let wave = WaveParkTable::new();
         t.note_producer_done(1, &wave);
         assert!(t.may_execute(3));
+    }
+
+    #[test]
+    fn wake_planted_on_publish_pushes_nearest_succ() {
+        let t = ReadyEdgeTable::new();
+        let wave = WaveParkTable::new();
+        t.plant_nearest_preds(0xabc, &[10, 20, 30]);
+        assert_eq!(t.blocking_producer(20), Some(10));
+        assert_eq!(t.blocking_producer(30), Some(20));
+        // Publish by 10 wakes only nearest succ 20 — not transitive 30.
+        t.wake_planted_on_publish(10, &wave);
+        assert_eq!(wave.pop_ready(), Some(20));
+        assert!(wave.pop_ready().is_none(), "one-hop only");
+        // Consumer bit kept for abort re-block; producer_done still clears.
+        assert_eq!(t.blocking_producer(20), Some(10));
+        t.note_producer_done(10, &wave);
+        assert!(t.blocking_producer(20).is_none());
+        // Double-wake from producer_done is ok (already None consumer).
+        while wave.pop_ready().is_some() {}
+        t.wake_planted_on_publish(20, &wave);
+        assert_eq!(wave.pop_ready(), Some(30));
     }
 
     #[test]

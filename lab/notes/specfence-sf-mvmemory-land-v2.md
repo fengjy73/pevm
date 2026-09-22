@@ -103,8 +103,8 @@ ChainSpineTip (large sticky≥32)
 1. **OCC-shaped thin Soft=0 kernel when PE empty / WaitOnce ℓ unused this tx**  
    Byte-identical `basic`/`storage` to OCC (no AccessArm DashMap, no engagement, no tip) except the WaitOnce ℓ consult. Preserves ordinals only for WaitOnce/crit reads (narrower than the discarded global Opt skip). Target: SF wall ≤ OCC when `(c)=0`.
 
-2. **ChainSpine exact one-hop wake into RunnableSet without Blocking park**  
-   On `chain_release`, push nearest succ to `Q_released` (plant already recorded waiters) so Avoid is schedule-publish, not park/spin. Keep antichain fill for non-succ. Goal: `chain_ab ≥ 3× chain_c` and SF wall ≤ ~6 ms on this host.
+2. **ChainSpine exact one-hop wake into RunnableSet without Blocking park** — **SHIPPED this land**  
+   On `chain_release` / ungated `publish_data`, `ready_edges.wake_planted_on_publish` pushes nearest plant succ into the wave bag; `drain_wave` always lands wave wakes on `Q_released`. Exact `sf_tips` waiters also `push_ready`. Soft=0 chain consult after brief Released-poll schedule-defers (`recover_executing` + `mark_wait`) — no Aborting `BlockingOther`. Keep antichain fill for non-succ. Goal: `chain_ab ≥ 3× chain_c` and SF wall ≤ ~6 ms on this host.
 
 3. **Do not:** Estimate Block, thin Rewind, 15-hold, broad mark_gated, re-enable WaitOnce DashMap tip on large, skip all `access_log` notes.
 
