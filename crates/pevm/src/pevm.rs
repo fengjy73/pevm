@@ -1052,7 +1052,7 @@ impl Pevm {
             }
             arms.end_pack(&self.inter_prior, block_size);
             // Sticky ≥32: Keep AccessArm WaitOnce across Learn (not LocStrategy
-            // Win — that prepaid was v5). Schedule plant is the Avoid vehicle.
+            // Win — that prepaid was v5). Avoid is access-grain, not off-queue.
             if block_size > crate::specfence::THIN_SHELL_N {
                 if let Some((loc, writers)) = self.inter_prior.crit_chain() {
                     if writers.len() >= 32 {
@@ -1086,6 +1086,8 @@ impl Pevm {
                 sf_tips.waw_late_n(),
                 sf_tips.chain_avoid_n(),
                 sf_tips.chain_late_n(),
+                sf_tips.overlap_resume_n(),
+                sf_tips.overlap_fill_n(),
             );
             metrics_inner.set_true_spine_metrics(
                 runnable.steal_n(),

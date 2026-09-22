@@ -443,6 +443,10 @@ pub struct SpecFenceMetrics {
     pub sf_chain_late_n: usize,
     /// Must be 0 on Soft=0 SF: Estimate Block on SpecFence path.
     pub estimate_block_sf: usize,
+    /// In-exec chain WaitOnce resumed on early Data (same exec).
+    pub sf_overlap_resume_n: usize,
+    /// Picks of other txs while one chain hop held the overlap slot.
+    pub sf_overlap_fill_n: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -652,6 +656,8 @@ pub(crate) struct MetricsInner {
     sf_chain_avoid_n: AtomicUsize,
     sf_chain_late_n: AtomicUsize,
     estimate_block_sf: AtomicUsize,
+    sf_overlap_resume_n: AtomicUsize,
+    sf_overlap_fill_n: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -1432,6 +1438,8 @@ impl MetricsInner {
         waw_late: usize,
         chain_avoid: usize,
         chain_late: usize,
+        overlap_resume: usize,
+        overlap_fill: usize,
     ) {
         self.sf_early_tip_n.store(early_tip, Ordering::Relaxed);
         self.sf_publish_wake_n
@@ -1454,6 +1462,10 @@ impl MetricsInner {
         self.sf_waw_late_n.store(waw_late, Ordering::Relaxed);
         self.sf_chain_avoid_n.store(chain_avoid, Ordering::Relaxed);
         self.sf_chain_late_n.store(chain_late, Ordering::Relaxed);
+        self.sf_overlap_resume_n
+            .store(overlap_resume, Ordering::Relaxed);
+        self.sf_overlap_fill_n
+            .store(overlap_fill, Ordering::Relaxed);
     }
 
     pub(crate) fn record_prefix_resume(&self, _kept: usize) {
@@ -1850,6 +1862,8 @@ impl MetricsInner {
             sf_chain_avoid_n: self.sf_chain_avoid_n.load(Ordering::Relaxed),
             sf_chain_late_n: self.sf_chain_late_n.load(Ordering::Relaxed),
             estimate_block_sf: self.estimate_block_sf.load(Ordering::Relaxed),
+            sf_overlap_resume_n: self.sf_overlap_resume_n.load(Ordering::Relaxed),
+            sf_overlap_fill_n: self.sf_overlap_fill_n.load(Ordering::Relaxed),
         }
     }
 }

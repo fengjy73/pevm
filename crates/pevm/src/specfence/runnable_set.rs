@@ -172,13 +172,22 @@ impl RunnableSet {
             }
             return;
         }
-        // Learned WAW successor: off-queue until the pred commits, still
-        // ungated so the resume stays on the Opt path.
+        // Learned WAW successor.
+        // Thin: off-queue until pred commits (short spine, no overlap slot).
+        // Large: only the immediate next hop is seeded. It runs non-chain
+        // work, then WaitOnce stalls that access until early Data — not the
+        // whole tx from admission. Further hops stay off this seed so they
+        // do not occupy cores; chain_release wakes the nearest one.
+        // Do not hold every sticky succ off Q_indep until pred done (land-v1).
         if let Some(pred) = ready.blocking_producer(tx)
             && !ready.is_writer_done(pred)
         {
-            self.mark_wait(tx);
-            return;
+            let immediate = self.block_size > crate::specfence::THIN_SHELL_N
+                && ready.blocking_producer(pred).is_none();
+            if !immediate {
+                self.mark_wait(tx);
+                return;
+            }
         }
         self.push(tx, QueueKind::Indep);
     }
@@ -369,20 +378,12 @@ impl RunnableSet {
         // Independents first (PC-3). Worker 0 used to prefer Ordered/Released
         // and 1-core starved Q_indep=29 behind one Released park-requeue
         // (19469101 pending=30 / live_wait=false).
-        // Large sticky spine: prefer Q_released (unlock the next hop) then
-        // Q_indep (fill antichain). Thin keeps Indep-first width.
-        let prefer = if self.block_size > crate::specfence::THIN_SHELL_N {
-            [
-                QueueKind::Released,
-                QueueKind::Indep,
-                QueueKind::Ordered,
-            ]
-        } else {
-            match worker_i % 3 {
-                0 => [QueueKind::Indep, QueueKind::Released, QueueKind::Ordered],
-                1 => [QueueKind::Indep, QueueKind::Ordered, QueueKind::Released],
-                _ => [QueueKind::Released, QueueKind::Indep, QueueKind::Ordered],
-            }
+        // Do not prefer Released-only on large: that plus off-queue succs
+        // serialized the spine (Avoid land-v1, TPS 0.44).
+        let prefer = match worker_i % 3 {
+            0 => [QueueKind::Indep, QueueKind::Released, QueueKind::Ordered],
+            1 => [QueueKind::Indep, QueueKind::Ordered, QueueKind::Released],
+            _ => [QueueKind::Released, QueueKind::Indep, QueueKind::Ordered],
         };
         // One gated !may_execute head must not hide a later runnable in the
         // same deque (19469101: pending=30 stuck, schedule broke on first None).
@@ -413,12 +414,6 @@ impl RunnableSet {
         kind: QueueKind,
         ready: &ReadyEdgeTable,
     ) -> Option<SfPick> {
-        // Schedule-native Avoid: sticky-chain successor stays off the
-        // Opt abort train until pred is done. Not Win OrderedAdmit / mark_gated.
-        if let Some(_pred) = ready.blocking_producer(tx) {
-            self.mark_wait(tx);
-            return None;
-        }
         if !ready.leftover_min_on_skippable_gate(tx)
             && (ready.leftover_surplus(tx) || (ready.is_gated(tx) && !ready.may_execute(tx)))
         {
@@ -494,8 +489,9 @@ impl RunnableSet {
             let _ = self.wake_idle(tx, QueueKind::Indep);
             return;
         }
-        // Ungated chain successor: heal must not push Q_indep before pred
-        // Released (that race is the Opt→FullReplay train).
+        // Parked chain hop: heal must not push it back onto Q_indep before
+        // Data. Seed already admitted the immediate hop. Resume is
+        // `wake_idle` on chain_release, not this path.
         if ready.blocking_producer(tx).is_some() {
             self.note_wait_unless_running(tx);
             return;

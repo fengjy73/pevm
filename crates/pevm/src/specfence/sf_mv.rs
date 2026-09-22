@@ -8,6 +8,8 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 use dashmap::DashMap;
 
@@ -79,6 +81,14 @@ pub(crate) struct SfTipTable {
     chain_late_n: AtomicUsize,
     /// Must stay 0 on Soft=0 Instant-off: SF Avoid never Blocks on Estimate.
     estimate_block_sf: AtomicUsize,
+    /// In-exec WaitOnce resumed after early Data (same exec, not a restart).
+    overlap_resume_n: AtomicUsize,
+    /// Other txs picked while one hop holds the overlap wait slot.
+    overlap_fill_n: AtomicUsize,
+    /// `usize::MAX` = no in-exec chain waiter. At most one core blocks.
+    overlap_slot: AtomicUsize,
+    overlap_mu: Mutex<()>,
+    overlap_cv: Condvar,
 }
 
 impl Default for SfTipTable {
@@ -105,6 +115,11 @@ impl Default for SfTipTable {
             chain_avoid_n: AtomicUsize::new(0),
             chain_late_n: AtomicUsize::new(0),
             estimate_block_sf: AtomicUsize::new(0),
+            overlap_resume_n: AtomicUsize::new(0),
+            overlap_fill_n: AtomicUsize::new(0),
+            overlap_slot: AtomicUsize::new(usize::MAX),
+            overlap_mu: Mutex::new(()),
+            overlap_cv: Condvar::new(),
         }
     }
 }
@@ -165,7 +180,12 @@ impl SfTipTable {
         incarnation: TxIncarnation,
     ) -> Vec<TxIdx> {
         if self.is_chain_loc(location) {
-            self.chain_release(writer, incarnation);
+            // Data must already be in MvMemory. Release then wake the in-exec
+            // hop so WaitOnce can finish before scheduler Commit.
+            if self.chain_release(writer, incarnation) {
+                self.early_tip_n.fetch_add(1, Ordering::Relaxed);
+            }
+            self.notify_overlap();
             return self.wake_exact(location, writer);
         }
         {
@@ -214,13 +234,18 @@ impl SfTipTable {
     }
 
     /// Released on ChainSpineTip after true Data publish.
-    pub(crate) fn chain_release(&self, writer: TxIdx, _incarnation: TxIncarnation) {
-        if let Some(slot) = self.chain_flags.get(&writer) {
-            slot.store(CHAIN_RELEASED, Ordering::Release);
-        }
+    /// Returns whether this call performed the Empty|Version → Released transition.
+    pub(crate) fn chain_release(&self, writer: TxIdx, _incarnation: TxIncarnation) -> bool {
+        let transitioned = if let Some(slot) = self.chain_flags.get(&writer) {
+            let prev = slot.swap(CHAIN_RELEASED, Ordering::Release);
+            prev != CHAIN_RELEASED
+        } else {
+            false
+        };
         let _ = self
             .chain_live
             .compare_exchange(writer, usize::MAX, Ordering::Relaxed, Ordering::Relaxed);
+        transitioned
     }
 
     /// Clear chain claim on abort (stale Version must not park successors).
@@ -416,6 +441,73 @@ impl SfTipTable {
     #[inline]
     pub(crate) fn record_estimate_block_sf(&self) {
         self.estimate_block_sf.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One core may block inside the chain access. Other picks stay free.
+    #[inline]
+    pub(crate) fn try_claim_overlap(&self, tx: TxIdx) -> bool {
+        self.overlap_slot
+            .compare_exchange(usize::MAX, tx, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    #[inline]
+    pub(crate) fn release_overlap(&self, tx: TxIdx) {
+        let _ = self.overlap_slot.compare_exchange(
+            tx,
+            usize::MAX,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// True when some other tx holds the in-exec chain wait.
+    #[inline]
+    pub(crate) fn overlap_armed_other(&self, tx: TxIdx) -> bool {
+        let slot = self.overlap_slot.load(Ordering::Acquire);
+        slot != usize::MAX && slot != tx
+    }
+
+    #[inline]
+    pub(crate) fn record_overlap_resume(&self) {
+        self.overlap_resume_n.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn record_overlap_fill(&self) {
+        self.overlap_fill_n.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn overlap_resume_n(&self) -> usize {
+        self.overlap_resume_n.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn overlap_fill_n(&self) -> usize {
+        self.overlap_fill_n.load(Ordering::Relaxed)
+    }
+
+    /// Wake in-exec chain waiters. Does not take DashMap locks.
+    pub(crate) fn notify_overlap(&self) {
+        let guard = self
+            .overlap_mu
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.overlap_cv.notify_all();
+        drop(guard);
+    }
+
+    /// Sleep until [`Self::notify_overlap`] or `timeout`. Caller rechecks Data.
+    pub(crate) fn wait_overlap_timeout(&self, timeout: Duration) {
+        let guard = self
+            .overlap_mu
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ = self
+            .overlap_cv
+            .wait_timeout(guard, timeout)
+            .unwrap_or_else(|e| e.into_inner());
     }
 
     #[inline]

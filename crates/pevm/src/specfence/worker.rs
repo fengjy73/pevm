@@ -198,6 +198,9 @@ pub(crate) fn run_sf_block<F, V>(
                     }
                 }
                 specfence.ready_edges.note_started(tx_idx);
+                if specfence.sf_tips.overlap_armed_other(tx_idx) {
+                    specfence.sf_tips.record_overlap_fill();
+                }
                 // leftover_min must skip Estimate tips so nonce/fund
                 // Blocking(tx-1) on a done writer cannot ghost-Executing mill
                 // (19807137 leftover_min=514 n_unf=198). Not OCC pick.

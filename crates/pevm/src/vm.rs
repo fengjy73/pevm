@@ -665,40 +665,46 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return Ok(());
         }
         self.specfence.sf_tips.record_wait_once_consume();
-        // ChainSpineTip: brief Released poll (not long busy-spin) before park.
+        // Chain overlap: stall this access until true Data, then continue
+        // the same exec. One core may sleep on the hop; other workers keep
+        // picking antichain. Do not note_ungated_wait_on here — that plants
+        // a pick-time off-queue hold (serialize Avoid, falsified).
         if self.specfence.sf_tips.is_chain_loc(location_hash) && (executing || has_sf_tip) {
-            const SPIN: usize = 512;
-            for i in 0..SPIN {
-                if self.specfence.scheduler.is_done(pred)
+            let published = |sf: &crate::specfence::SfMvMemory<'_>| {
+                self.specfence.scheduler.is_done(pred)
                     || self.specfence.scheduler.is_validated(pred)
-                    || (i % 16 == 0 && sf.true_publish_ready(location_hash, pred))
-                {
-                    self.specfence.sf_tips.record_avoid_publish();
-                    self.specfence.sf_tips.record_class_avoid(class);
-                    return Ok(());
-                }
-                if !self.specfence.scheduler.is_executing(pred) {
-                    break;
-                }
-                std::hint::spin_loop();
-            }
-            if sf.true_publish_ready(location_hash, pred)
-                || self.specfence.scheduler.is_done(pred)
-                || self.specfence.scheduler.is_validated(pred)
-            {
+                    || sf.true_publish_ready(location_hash, pred)
+            };
+            if published(&sf) {
                 self.specfence.sf_tips.record_avoid_publish();
                 self.specfence.sf_tips.record_class_avoid(class);
                 return Ok(());
             }
-            // Prefer schedule one-hop: plant waiters wake on chain_release →
-            // Q_released. Exact waiter covers opportunistic Version readers.
-            // Soft=0 try_execute_sf skips Aborting for chain (mark_wait only).
+            let claimed = executing && self.specfence.sf_tips.try_claim_overlap(self.tx_idx);
+            if claimed {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+                while !published(&sf) {
+                    if !self.specfence.scheduler.is_executing(pred) && !has_sf_tip {
+                        break;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    self.specfence
+                        .sf_tips
+                        .wait_overlap_timeout(std::time::Duration::from_micros(200));
+                }
+                self.specfence.sf_tips.release_overlap(self.tx_idx);
+                if published(&sf) {
+                    self.specfence.sf_tips.record_overlap_resume();
+                    self.specfence.sf_tips.record_avoid_publish();
+                    self.specfence.sf_tips.record_class_avoid(class);
+                    return Ok(());
+                }
+            }
             self.specfence
                 .sf_tips
                 .register_waiter(location_hash, pred, self.tx_idx);
-            self.specfence
-                .ready_edges
-                .note_ungated_wait_on(self.tx_idx, pred);
             return Err(self.park_publish_wait(location_hash, pred));
         }
         match live_writer_act(
@@ -3978,6 +3984,35 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     } else {
                         write_set.push((recipient, MemoryValue::LazyRecipient(amount)));
                     }
+                }
+
+                // Final chain Data before museum / scheduler Commit so the
+                // in-exec WaitOnce hop can resume mid-pred-exec. Field borrows
+                // only — `ctx` still holds `self.evm`.
+                if self.specfence.mode == crate::ConcurrencyMode::SpecFence
+                    && let Some((loc, value)) = write_set
+                        .iter()
+                        .find(|(loc, _)| self.specfence.sf_tips.is_chain_loc(*loc))
+                {
+                    let loc = *loc;
+                    let value = value.clone();
+                    self.mv_memory.publish_location_data(
+                        tx_version.tx_idx,
+                        tx_version.tx_incarnation,
+                        loc,
+                        value,
+                    );
+                    let exact = self.specfence.sf_tips.publish_data(
+                        loc,
+                        tx_version.tx_idx,
+                        tx_version.tx_incarnation,
+                    );
+                    for c in exact {
+                        self.specfence.wave.push_ready(c);
+                    }
+                    self.specfence
+                        .ready_edges
+                        .wake_planted_on_publish(tx_version.tx_idx, self.specfence.wave);
                 }
 
                 let (is_lazy, optimistic_majority_lazy, read_set, sf_occ_shaped) = {
