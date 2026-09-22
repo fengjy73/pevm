@@ -239,9 +239,9 @@ fn select_crit_chain(
             .collect();
         w.sort_unstable();
         w.dedup();
-        // Pack any real chain (≥4). Begin holds only the long ones (≥32).
-        // Short spines still get head-first + demand-driven WaitOnce.
-        if w.len() < 4 || w.len() * 4 > block_size.max(1) {
+        // Under 32 writers the serial wait / WaitOnce park costs more than
+        // the replay it removes (3356896, chain ~15). 15274915 is ~60.
+        if w.len() < 32 || w.len() * 4 > block_size.max(1) {
             continue;
         }
         let replace = best.as_ref().is_none_or(|(_, prev)| w.len() > prev.len());
@@ -580,16 +580,11 @@ impl Pevm {
             // Reuse WAW: nearest pred on the learned chain, then pop that
             // head before the low-index antichain.
             let crit_head = self.inter_prior.crit_chain().and_then(|(loc, writers)| {
-                if writers.len() < 4 || writers.len() * 4 > block_size {
+                if writers.len() < 32 || writers.len() * 4 > block_size {
                     return None;
                 }
                 access_arms.install_crit_chain(loc, &writers);
-                // Hold successors off the queue only for a long spine.
-                // 3356896's ~15-writer chain serialized slower than the
-                // replays. Short spines consult WaitOnce at the read.
-                if writers.len() >= 32 {
-                    ready_edges.plant_nearest_preds(loc, &writers);
-                }
+                ready_edges.plant_nearest_preds(loc, &writers);
                 writers.first().copied()
             });
             self.last_begin_blocked = ready_edges.blocked_consumers();
@@ -966,12 +961,17 @@ impl Pevm {
             // is short and would drop the hold. Keep the longer chain.
             let fresh = select_crit_chain(&self.last_location_writers, block_size, beneficiary);
             let prev = self.inter_prior.crit_chain();
-            let packed = match (&fresh, prev) {
-                (Some((loc, w)), Some((pl, pw))) if *loc == pl && w.len() < pw.len() => {
+            let packed = match (fresh, prev) {
+                (Some((loc, w)), Some((pl, pw))) if loc == pl && w.len() < pw.len() => {
                     Some((pl, pw))
                 }
-                (None, Some(prev)) => Some(prev),
-                _ => fresh,
+                // Hold spine: quiet snapshot must not drop a ≥32 chain.
+                (f, Some((pl, pw))) if pw.len() >= 32 => match &f {
+                    Some((_, w)) if w.len() >= pw.len() => f,
+                    _ => Some((pl, pw)),
+                },
+                (None, Some(p)) => Some(p),
+                (f, _) => f,
             };
             self.inter_prior.pack_crit_chain(packed);
             let ready_w = ready_edges.ready_width_mean();

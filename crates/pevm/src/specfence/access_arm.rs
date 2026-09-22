@@ -149,6 +149,11 @@ impl AccessArmTable {
         self.note_early_waw(loc, 1);
     }
 
+    #[inline]
+    pub(crate) fn crit_loc_hash(&self) -> MemoryLocationHash {
+        self.crit_loc.load(Ordering::Relaxed)
+    }
+
     /// Immediate prior writer on the learned chain, if `loc` is that chain.
     pub(crate) fn crit_pred(&self, tx: TxIdx, loc: MemoryLocationHash) -> Option<TxIdx> {
         if self.crit_loc.load(Ordering::Relaxed) != loc {

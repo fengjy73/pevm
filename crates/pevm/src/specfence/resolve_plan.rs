@@ -448,6 +448,10 @@ pub(crate) fn try_early_waw_rewind(
     if invalid.len() != 1 {
         return None;
     }
+    // Thin shell: RewindTo tax exceeds the FullReplay it removes (3356896).
+    if specfence.scheduler.block_size() <= super::THIN_SHELL_N {
+        return None;
+    }
     let tx = tx_version.tx_idx;
     let loc = invalid[0];
     if specfence.access_arms.is_never(loc) || location_is_lazy(mv_memory, tx, loc) {

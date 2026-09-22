@@ -492,16 +492,27 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if self.is_lazy || address == self.specfence.beneficiary {
             return Ok(());
         }
-        if !self.specfence.access_arms.is_wait_once(location_hash) {
+        let wait = self.specfence.access_arms.is_wait_once(location_hash);
+        let crit = self.specfence.access_arms.crit_loc_hash() == location_hash;
+        if !wait && !crit {
             return Ok(());
         }
-        // Prefix checkpoint before this read so fail_k can RewindTo.
+        // Checkpoint before this read so fail_k can RewindTo (crit loc on
+        // cold; WaitOnce on reuse).
         if access_k > 1 {
             let _ = self.specfence.partial_retry.push_checkpoint_at_k(
                 self.tx_idx,
                 (access_k - 1) as usize,
                 crate::specfence::CheckpointKind::EffectBoundary,
             );
+        }
+        if !wait {
+            return Ok(());
+        }
+        // Thin shell: consult + checkpoint only. Parking a live pred here
+        // serialized the 15-writer spine and raised the wall.
+        if self.specfence.scheduler.block_size() <= crate::specfence::THIN_SHELL_N {
+            return Ok(());
         }
         let Some(pred) = self
             .specfence
@@ -521,6 +532,17 @@ impl<'a, S: Storage> VmDb<'a, S> {
             self.specfence.scheduler.is_done(pred) || self.specfence.scheduler.is_validated(pred);
         if finished {
             // Data should be visible; fall through to the MV walk.
+            return Ok(());
+        }
+        // Park only when the pred is already live. A not-started pred on a
+        // short chain serializes the spine (wall↑ on 3356896). Checkpoint
+        // above still arms RewindTo if this Opt read FullReplays.
+        let live = self.specfence.scheduler.is_executing(pred)
+            || matches!(
+                self.mv_memory.entry_kind_at(location_hash, pred),
+                "estimate"
+            );
+        if !live {
             return Ok(());
         }
         match live_writer_act(
@@ -1739,6 +1761,16 @@ fn live_writer_act(
     }
     let never = address == specfence.beneficiary || is_lazy;
     let finished = specfence.scheduler.is_done(writer) || specfence.scheduler.is_validated(writer);
+    // Thin ungated: WaitOnce is consult+checkpoint only. Blocking on a live
+    // Estimate tip serialized the short WAW spine and raised the wall.
+    if !never
+        && !finished
+        && !specfence.ready_edges.is_gated(tx_idx)
+        && specfence.scheduler.block_size() <= crate::specfence::THIN_SHELL_N
+        && specfence.access_arms.is_wait_once(location_hash)
+    {
+        return crate::specfence::LiveAct::Skip;
+    }
     specfence
         .access_arms
         .decide(tx_idx, location_hash, writer, never, finished)

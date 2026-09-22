@@ -286,7 +286,7 @@ pub(crate) use metrics::MetricsInner;
 pub use metrics::SpecFenceMetrics;
 pub use policy::LearnReport;
 #[allow(unused_imports)]
-pub(crate) use policy::{AdmitAction, CohortKind, CostPolicy};
+pub(crate) use policy::{AdmitAction, CohortKind, CostPolicy, THIN_SHELL_N};
 pub(crate) use prior::RwPriorMap;
 pub(crate) use process::ProcessTrace;
 pub use process::{ExecProcessSnapshot, LocProcessSnap, PerTxProcessSnap, ProcessReason};
