@@ -239,9 +239,9 @@ fn select_crit_chain(
             .collect();
         w.sort_unstable();
         w.dedup();
-        // A near-total order is the block, not a chain. Short spines are
-        // still packed: begin holds only the long ones.
-        if w.len() < 4 || w.len() * 4 > block_size.max(1) {
+        // Under 32 writers the serial wait costs more than the replay
+        // it removes (3356896, chain ~15). 15274915's chain is ~60.
+        if w.len() < 32 || w.len() * 4 > block_size.max(1) {
             continue;
         }
         let replace = best.as_ref().is_none_or(|(_, prev)| w.len() > prev.len());
@@ -588,8 +588,7 @@ impl Pevm {
                 // 3356896's ~15-writer chain serialized slower than the
                 // replays (reuse SF/OCC 1.42 vs census 1.28). 15274915's
                 // ~60-writer chain is the one that pays for itself.
-                // Both still pop the head first. A short spine re-reads
-                // once when the pred's Data lands, and stays ungated.
+                // The head is popped first. Successors stay ungated.
                 if writers.len() >= 32 {
                     ready_edges.plant_nearest_preds(loc, &writers);
                 }
@@ -965,11 +964,18 @@ impl Pevm {
                 }
             }
             self.last_location_writers = d1_orders;
-            self.inter_prior.pack_crit_chain(select_crit_chain(
-                &self.last_location_writers,
-                block_size,
-                beneficiary,
-            ));
+            // A held spine records fewer conflicts, so the next snapshot
+            // is short and would drop the hold. Keep the longer chain.
+            let fresh = select_crit_chain(&self.last_location_writers, block_size, beneficiary);
+            let prev = self.inter_prior.crit_chain();
+            let packed = match (&fresh, prev) {
+                (Some((loc, w)), Some((pl, pw))) if *loc == pl && w.len() < pw.len() => {
+                    Some((pl, pw))
+                }
+                (None, Some(prev)) => Some(prev),
+                _ => fresh,
+            };
+            self.inter_prior.pack_crit_chain(packed);
             let ready_w = ready_edges.ready_width_mean();
             let idle = ready_edges.idle_core_ns();
             let refuse = ready_edges.refuse_count();

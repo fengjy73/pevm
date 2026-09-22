@@ -5,7 +5,7 @@
 //! is done. A second Blocking of the same triple is refused. Beneficiary and
 //! basic-lazy are NeverWait. Sticky Opt is not an arm.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use dashmap::DashMap;
 
@@ -75,16 +75,11 @@ pub(crate) struct AccessArmTable {
     never_wait: AtomicUsize,
     prefix_resume: AtomicUsize,
     prefix_keep_n: AtomicUsize,
-    /// `u64::MAX` = no learned chain. Set before workers start.
-    crit_loc: AtomicU64,
 }
 
 impl AccessArmTable {
     pub(crate) fn new() -> Self {
-        let t = Self::default();
-        // Default atomic is 0, which is a real location hash.
-        t.crit_loc.store(u64::MAX, Ordering::Relaxed);
-        t
+        Self::default()
     }
 
     /// Install the previous block's arms. A morph flip already decayed
@@ -97,7 +92,6 @@ impl AccessArmTable {
         self.never_wait.store(0, Ordering::Relaxed);
         self.prefix_resume.store(0, Ordering::Relaxed);
         self.prefix_keep_n.store(0, Ordering::Relaxed);
-        self.crit_loc.store(u64::MAX, Ordering::Relaxed);
         for (loc, tag, k) in prior.access_arm_snapshot() {
             let arm = AccessArm::from_tag(tag);
             if arm == AccessArm::Opt {
@@ -134,13 +128,7 @@ impl AccessArmTable {
 
     /// Reuse: the shared basic the longest writer chain publishes.
     pub(crate) fn install_crit_chain(&self, loc: MemoryLocationHash) {
-        self.crit_loc.store(loc, Ordering::Relaxed);
         self.note_early_waw(loc, 1);
-    }
-
-    #[inline]
-    pub(crate) fn crit_loc_hash(&self) -> MemoryLocationHash {
-        self.crit_loc.load(Ordering::Relaxed)
     }
 
     /// Hot early basic/storage WAW template. The next read of `ℓ` waits

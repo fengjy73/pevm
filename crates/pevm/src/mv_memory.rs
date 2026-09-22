@@ -540,18 +540,6 @@ impl MvMemory {
         Some(origins)
     }
 
-    /// A strictly earlier writer has already published Data (not Estimate).
-    pub(crate) fn lower_data_before(&self, location: MemoryLocationHash, tx_idx: TxIdx) -> bool {
-        let _nest = DataNest::enter("lower_data_before");
-        let Some(written) = self.data.get(&location) else {
-            return false;
-        };
-        matches!(
-            written.range(..tx_idx).next_back(),
-            Some((_, MemoryEntry::Data(_, _)))
-        )
-    }
-
     /// Last writer with index strictly below `tx_idx`, if any.
     pub(crate) fn last_writer_before(
         &self,
