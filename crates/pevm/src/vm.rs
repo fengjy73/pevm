@@ -509,6 +509,58 @@ impl<'a, S: Storage> VmDb<'a, S> {
         unfinished_writer_of(self.mv_memory, &self.specfence, location_hash, tx)
     }
 
+    /// Protected region: record the read only after `pred` is validated.
+    /// Execution-done Data can still abort; reading it is the FullReplay
+    /// train. Spin only across the validation window (the executor is
+    /// another worker). If `pred` is not running, park WaitForDependency
+    /// (k=0, same incarnation) and free this core for the antichain.
+    fn wait_protected_commit(
+        &self,
+        location_hash: MemoryLocationHash,
+        pred: TxIdx,
+        class: crate::specfence::SfConflictClass,
+    ) -> Result<(), ReadError> {
+        self.specfence.sf_tips.record_detect_before();
+        // WAR: a later learned writer exists. This read must keep the
+        // earlier version (index < tx). Do not schedule-absorb that edge.
+        if self
+            .specfence
+            .access_arms
+            .known_writer_indexes(location_hash)
+            .is_some_and(|ws| ws.iter().any(|&w| w > self.tx_idx))
+        {
+            self.specfence
+                .sf_tips
+                .record_class_avoid(crate::specfence::SfConflictClass::War);
+        }
+        if self.specfence.scheduler.is_validated(pred) {
+            self.specfence.sf_tips.record_avoid_publish();
+            self.specfence.sf_tips.record_class_avoid(class);
+            return Ok(());
+        }
+        if self.specfence.scheduler.is_done(pred) {
+            let started = Instant::now();
+            while !self.specfence.scheduler.is_validated(pred)
+                && self.specfence.scheduler.is_done(pred)
+                && started.elapsed() < std::time::Duration::from_millis(4)
+            {
+                std::hint::spin_loop();
+            }
+            if self.specfence.scheduler.is_validated(pred) {
+                self.specfence.sf_tips.record_avoid_publish();
+                self.specfence.sf_tips.record_class_avoid(class);
+                return Ok(());
+            }
+        }
+        self.specfence.sf_tips.record_wait_once_consume();
+        self.specfence.wave.set_pending_park(
+            location_hash,
+            0,
+            crate::specfence::ParkKind::WaitForDependency,
+        );
+        Err(ReadError::Blocking(pred))
+    }
+
     /// Learned WaitOnce on the ungated Opt path. Consume via SfMvMemory
     /// read-after-true-publish (version tip / Data) — never Estimate Block.
     /// Large: park a live / SF-tipped unfinished pred without mark_gated.
@@ -621,6 +673,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
             self.specfence.access_arms.crit_chain_len(),
             self.specfence.access_arms.wait_once_k(location_hash),
         );
+        // Region Avoid: validated commit only. is_done / Estimate tip is
+        // not a version the successor may record.
+        if protected {
+            return self.wait_protected_commit(location_hash, pred, class);
+        }
         // (a) Detect before read — concurrent capability, not a later stage.
         self.specfence.sf_tips.record_detect_before();
         let finished =
@@ -2079,6 +2136,15 @@ fn live_writer_act(
     }
     let never = address == specfence.beneficiary || is_lazy;
     let finished = specfence.scheduler.is_done(writer) || specfence.scheduler.is_validated(writer);
+    // Protected region: do not Skip an unvalidated writer into a Storage
+    // origin. That Opt read is the FullReplay train. Validation-commit is
+    // the version the successor may record.
+    if !never
+        && specfence.access_arms.is_protected(location_hash)
+        && !specfence.scheduler.is_validated(writer)
+    {
+        return crate::specfence::LiveAct::Block;
+    }
     let thin = specfence.scheduler.block_size() <= crate::specfence::THIN_SHELL_N;
     // Thin ungated WaitOnce: consult_ungated_wait_once owns consume.
     if !never
