@@ -549,7 +549,11 @@ impl Pevm {
             arms.begin_from_prior(&self.inter_prior, self.cost_policy.is_reuse_block());
             access_arms.begin_from_prior(&self.inter_prior);
             // Detect (a): restore WaitOnce edges as ungated waits before pick.
-            let _planted = access_arms.plant_wait_edges(&ready_edges);
+            // Thin only — large sticky≥32 plant already orders long chains;
+            // packing every abort edge into begin wait collapsed large TPS.
+            if block_size <= crate::specfence::THIN_SHELL_N {
+                let _planted = access_arms.plant_wait_edges(&ready_edges);
+            }
             // B4: Prior → CostPolicy.block_arm before admit_seed so wave-1
             // hops_to_admit / Detect.G match ArmTable (not a cold re-select).
             let _ = arms.install_prior_into_policy(&self.cost_policy, block_size);

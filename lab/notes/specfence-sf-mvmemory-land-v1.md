@@ -1,7 +1,7 @@
 # SpecFence SfMvMemory land v1
 
 **Date:** 2026-09-22  
-**Tip:** `65b85eb` on `cursor/specfence-sf-ps-true-spine-d6e8` (PR #45)  
+**Tip:** `a8c8b49` on `cursor/specfence-sf-ps-true-spine-d6e8` (PR #45)  
 **Harness:** Soft=0 Instant-off, 8 cores, `SPECFENCE_COMPARE_CHECK=1`, N=5 both  
 **SoT:** [`specfence-sf-mvmemory-redesign-v1.md`](specfence-sf-mvmemory-redesign-v1.md), [`specfence-thin-avoid-no-estimate-v1.md`](specfence-thin-avoid-no-estimate-v1.md)  
 **Hard acceptance:** **TPS SF/OCC ≥ 1.5** both blocks (user 2026-09-22).  
@@ -25,6 +25,8 @@ TPS SF/OCC = OCC_wall / SF_wall (higher better). Wall SF/OCC inverse.
 |------:|------------:|-------------------:|-------------:|------------------------:|:-------:|
 | 3356896 | 1.017 | 1.680 | **0.605** | 1.471/2.653 ≈ **0.55** | gap ~2.5× |
 | 15274915 | 5.724 | 10.216 | **0.560** | 8.398/12.047 ≈ **0.70**† | gap ~2.1× |
+
+Detect(a) thin WaitOnce edge plant (`0a0d5f6`/`a8c8b49`): 3356896 reuse median **TPS≈0.72** (FullReplay→0 on calm reuse); still ≪1.5. Large begin-plant gated thin-only.
 
 † Host OCC noise high on large (OCC median swung 5–9 ms); absolute SF still above opt-v2 ~8.44 ms calm.
 
