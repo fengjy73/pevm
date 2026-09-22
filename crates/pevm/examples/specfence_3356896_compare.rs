@@ -305,7 +305,7 @@ fn print_focus(pevm: &Pevm, mode_name: &str, i: usize, n: usize, m: &pevm::SpecF
             .unwrap_or(0.0)
     };
     println!(
-        "  focus {mode_name}[{i}] full={} full_from_0={} prefix={} fail_k_n={} fail_k_min={} fail_k_max={} hist={} chain={loc:016x} chain_n={} head_tx={} head_ms={:.3} tail_tx={} tail_ms={:.3} corr={corr:.3} low_q_ms={:.3} high_q_ms={:.3} explore={} began_prior={}",
+        "  focus {mode_name}[{i}] full={} full_from_0={} prefix={} fail_k_n={} fail_k_min={} fail_k_max={} hist={} chain={loc:016x} chain_n={} head_tx={} head_ms={:.3} tail_tx={} tail_ms={:.3} corr={corr:.3} low_q_ms={:.3} high_q_ms={:.3} explore={} began_prior={} detect_a={} avoid_b={} resolve_c={} early_tip={} est_block={}",
         m.resolve_full_replay,
         m.full_from_zero,
         m.prefix_resume_n,
@@ -321,7 +321,12 @@ fn print_focus(pevm: &Pevm, mode_name: &str, i: usize, n: usize, m: &pevm::SpecF
         median_ms(&mut low),
         median_ms(&mut high),
         m.explore_n,
-        m.began_from_prior as u8
+        m.began_from_prior as u8,
+        m.sf_detect_before_n,
+        m.sf_avoid_publish_n,
+        m.sf_resolve_after_fail_n,
+        m.sf_early_tip_n,
+        m.estimate_block_sf
     );
 }
 

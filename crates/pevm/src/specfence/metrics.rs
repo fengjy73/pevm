@@ -419,6 +419,12 @@ pub struct SpecFenceMetrics {
     pub sf_publish_wake_n: usize,
     /// SfMvMemory: WaitOnce consume hits (spin / defer).
     pub sf_wait_once_consume_n: usize,
+    /// Concurrent Detect (a): WaitOnce/crit + pred known before read.
+    pub sf_detect_before_n: usize,
+    /// Concurrent Avoid (b): true publish / done — collision never happens.
+    pub sf_avoid_publish_n: usize,
+    /// Concurrent Resolve (c): after-fail FullReplay / Rewind (path-c dominate = incomplete).
+    pub sf_resolve_after_fail_n: usize,
     /// Must be 0 on Soft=0 SF: Estimate Block on SpecFence path.
     pub estimate_block_sf: usize,
 }
@@ -618,6 +624,9 @@ pub(crate) struct MetricsInner {
     sf_early_tip_n: AtomicUsize,
     sf_publish_wake_n: AtomicUsize,
     sf_wait_once_consume_n: AtomicUsize,
+    sf_detect_before_n: AtomicUsize,
+    sf_avoid_publish_n: AtomicUsize,
+    sf_resolve_after_fail_n: AtomicUsize,
     estimate_block_sf: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -1381,13 +1390,16 @@ impl MetricsInner {
         self.prefix_resume_n.store(prefix_resume, Ordering::Relaxed);
     }
 
-    /// SfMvMemory tip-plane census (end-of-block).
+    /// SfMvMemory tip-plane + Detect|Avoid|Resolve path census (end-of-block).
     pub(crate) fn record_sf_mv_tips(
         &self,
         early_tip: usize,
         publish_wake: usize,
         wait_once_consume: usize,
         estimate_block_sf: usize,
+        detect_before: usize,
+        avoid_publish: usize,
+        resolve_after_fail: usize,
     ) {
         self.sf_early_tip_n.store(early_tip, Ordering::Relaxed);
         self.sf_publish_wake_n
@@ -1396,6 +1408,12 @@ impl MetricsInner {
             .store(wait_once_consume, Ordering::Relaxed);
         self.estimate_block_sf
             .store(estimate_block_sf, Ordering::Relaxed);
+        self.sf_detect_before_n
+            .store(detect_before, Ordering::Relaxed);
+        self.sf_avoid_publish_n
+            .store(avoid_publish, Ordering::Relaxed);
+        self.sf_resolve_after_fail_n
+            .store(resolve_after_fail, Ordering::Relaxed);
     }
 
     pub(crate) fn record_prefix_resume(&self, _kept: usize) {
@@ -1780,6 +1798,9 @@ impl MetricsInner {
             sf_early_tip_n: self.sf_early_tip_n.load(Ordering::Relaxed),
             sf_publish_wake_n: self.sf_publish_wake_n.load(Ordering::Relaxed),
             sf_wait_once_consume_n: self.sf_wait_once_consume_n.load(Ordering::Relaxed),
+            sf_detect_before_n: self.sf_detect_before_n.load(Ordering::Relaxed),
+            sf_avoid_publish_n: self.sf_avoid_publish_n.load(Ordering::Relaxed),
+            sf_resolve_after_fail_n: self.sf_resolve_after_fail_n.load(Ordering::Relaxed),
             estimate_block_sf: self.estimate_block_sf.load(Ordering::Relaxed),
         }
     }

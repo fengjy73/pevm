@@ -105,14 +105,33 @@ impl AccessArmTable {
         self.crit_loc.store(u64::MAX, Ordering::Relaxed);
         self.crit_writers.lock().unwrap().clear();
         self.wait_edges.lock().unwrap().clear();
-        for (loc, tag, k) in prior.access_arm_snapshot() {
+        for (loc, tag, k, peer) in prior.access_arm_snapshot() {
             let arm = AccessArm::from_tag(tag);
             if arm == AccessArm::Opt {
                 continue;
             }
-            self.arms.insert(loc, ArmRec { arm, k, hits: 0, peer: 0 });
+            self.arms.insert(
+                loc,
+                ArmRec {
+                    arm,
+                    k,
+                    hits: 0,
+                    peer,
+                },
+            );
         }
         *self.wait_edges.lock().unwrap() = prior.access_wait_edge_snapshot();
+        // Detect(a): edges refresh peer so WaitOnce pred is known before read.
+        for &(_c, p, loc) in self.wait_edges.lock().unwrap().iter() {
+            if p == 0 {
+                continue;
+            }
+            if let Some(mut e) = self.arms.get_mut(&loc) {
+                if e.arm == AccessArm::WaitOnce && p > e.peer {
+                    e.peer = p;
+                }
+            }
+        }
     }
 
     /// Pack prior. Morph flip decays WaitOnce that this block did not
@@ -130,7 +149,7 @@ impl AccessArmTable {
             if arm == AccessArm::Opt {
                 continue;
             }
-            snaps.push((*e.key(), arm.tag(), e.k));
+            snaps.push((*e.key(), arm.tag(), e.k, e.peer));
         }
         prior.pack_access_arms(snaps);
         let edges = self.wait_edges.lock().unwrap().clone();
@@ -405,22 +424,26 @@ mod tests {
     fn morph_flip_decays_unreinforced_wait_once() {
         let prior = InterBlockPrior::new();
         // k=0 opportunistic WaitOnce decays; k=5 early-WAW template stays.
-        prior.pack_access_arms(vec![(11, 1, 0), (33, 1, 5), (22, 2, 1)]);
+        // peer=7 on early-WAW so Detect(a) restores pred before read.
+        prior.pack_access_arms(vec![(11, 1, 0, 0), (33, 1, 5, 7), (22, 2, 1, 0)]);
         prior.force_flipped_for_test();
         let t = AccessArmTable::new();
         t.begin_from_prior(&prior);
+        assert_eq!(t.wait_once_pred(40, 33), Some(7));
         t.end_pack(&prior);
         let snaps = prior.access_arm_snapshot();
         assert!(
-            snaps.iter().all(|&(loc, _, _)| loc != 11),
+            snaps.iter().all(|&(loc, _, _, _)| loc != 11),
             "unreinforced k=0 WaitOnce decays on morph flip"
         );
         assert!(
-            snaps.iter().any(|&(loc, tag, k)| loc == 33 && tag == 1 && k == 5),
-            "early-WAW WaitOnce (k>0) survives morph flip"
+            snaps
+                .iter()
+                .any(|&(loc, tag, k, peer)| loc == 33 && tag == 1 && k == 5 && peer == 7),
+            "early-WAW WaitOnce (k>0) + peer survives morph flip"
         );
         assert!(
-            snaps.iter().any(|&(loc, tag, _)| loc == 22 && tag == 2),
+            snaps.iter().any(|&(loc, tag, _, _)| loc == 22 && tag == 2),
             "NeverWait prior stays"
         );
     }

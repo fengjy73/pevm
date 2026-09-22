@@ -263,8 +263,9 @@ pub(crate) struct InterBlockPrior {
     last_flipped: AtomicUsize,
     /// SF-PS: packed ArmTable at last end_block (begin restores it).
     arm_snaps: Mutex<Vec<super::arm_table::ArmSnap>>,
-    /// Per-access Avoid prior: `(ℓ, arm tag, k)`. Tag 1 = WaitOnce, 2 = NeverWait.
-    access_arm_snaps: Mutex<Vec<(crate::MemoryLocationHash, u8, u32)>>,
+    /// Per-access Avoid prior: `(ℓ, arm tag, k, peer)`. Tag 1 = WaitOnce, 2 = NeverWait.
+    /// `peer` is the Detect(a) producer so reuse Avoid does not start peer=0 Opt-blind.
+    access_arm_snaps: Mutex<Vec<(crate::MemoryLocationHash, u8, u32, crate::TxIdx)>>,
     /// Thin/reuse WaitOnce edges: `(consumer, producer, ℓ)` for ungated plant.
     access_wait_edges: Mutex<Vec<(crate::TxIdx, crate::TxIdx, crate::MemoryLocationHash)>>,
     /// Longest non-beneficiary writer chain from the last block. Reuse
@@ -342,12 +343,17 @@ impl InterBlockPrior {
         self.arm_snaps.lock().unwrap().clone()
     }
 
-    /// Access-arm prior `(ℓ, tag, k)` from the last end_pack.
-    pub(crate) fn access_arm_snapshot(&self) -> Vec<(crate::MemoryLocationHash, u8, u32)> {
+    /// Access-arm prior `(ℓ, tag, k, peer)` from the last end_pack.
+    pub(crate) fn access_arm_snapshot(
+        &self,
+    ) -> Vec<(crate::MemoryLocationHash, u8, u32, crate::TxIdx)> {
         self.access_arm_snaps.lock().unwrap().clone()
     }
 
-    pub(crate) fn pack_access_arms(&self, snaps: Vec<(crate::MemoryLocationHash, u8, u32)>) {
+    pub(crate) fn pack_access_arms(
+        &self,
+        snaps: Vec<(crate::MemoryLocationHash, u8, u32, crate::TxIdx)>,
+    ) {
         *self.access_arm_snaps.lock().unwrap() = snaps;
     }
 

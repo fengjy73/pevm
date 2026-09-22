@@ -52,6 +52,13 @@ pub(crate) struct SfTipTable {
     early_tip_n: AtomicUsize,
     publish_wake_n: AtomicUsize,
     wait_once_consume_n: AtomicUsize,
+    /// Concurrent Detect|Avoid|Resolve path audit (per access, not a pipeline).
+    /// (a) Detect before read: WaitOnce/crit + pred known.
+    detect_before_n: AtomicUsize,
+    /// (b) Avoid at read via true publish / done (no Opt Storage race).
+    avoid_publish_n: AtomicUsize,
+    /// (c) Resolve after fail (FullReplay / fail_k Rewind theater).
+    resolve_after_fail_n: AtomicUsize,
     /// Must stay 0 on Soft=0 Instant-off: SF Avoid never Blocks on Estimate.
     estimate_block_sf: AtomicUsize,
 }
@@ -201,6 +208,24 @@ impl SfTipTable {
         self.wait_once_consume_n.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// (a) Detect before read — structure/prior says conflict coming.
+    #[inline]
+    pub(crate) fn record_detect_before(&self) {
+        self.detect_before_n.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// (b) Avoid at read — true publish / done; collision never happens.
+    #[inline]
+    pub(crate) fn record_avoid_publish(&self) {
+        self.avoid_publish_n.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// (c) Resolve after fail — Opt→validate→FullReplay / Rewind.
+    #[inline]
+    pub(crate) fn record_resolve_after_fail(&self) {
+        self.resolve_after_fail_n.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// SF path attempted Estimate Block — must stay unused (counter for land proof).
     #[inline]
     pub(crate) fn record_estimate_block_sf(&self) {
@@ -220,6 +245,21 @@ impl SfTipTable {
     #[inline]
     pub(crate) fn wait_once_consume_n(&self) -> usize {
         self.wait_once_consume_n.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn detect_before_n(&self) -> usize {
+        self.detect_before_n.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn avoid_publish_n(&self) -> usize {
+        self.avoid_publish_n.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn resolve_after_fail_n(&self) -> usize {
+        self.resolve_after_fail_n.load(Ordering::Relaxed)
     }
 
     #[inline]

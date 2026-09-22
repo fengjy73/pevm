@@ -104,6 +104,8 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
             ctx.runnable.mark_done(tx);
         }
         ResolvePlan::PartialAbortRewind => {
+            // (c) Resolve after fail — live mistake found; prefix from fail_k.
+            ctx.specfence.sf_tips.record_resolve_after_fail();
             ctx.specfence.metrics.record_partial_abort_attempt();
             if ctx.scheduler.try_validation_abort(ctx.tx_version) {
                 let write_locations = ctx.mv_memory.write_locations(tx);
@@ -183,6 +185,9 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
             enqueue_higher_revalidate(&ctx, tx);
         }
         ResolvePlan::FullReplay => {
+            // (c) Resolve after fail — Opt→validate→FullReplay theater when
+            // Detect/Avoid did not keep the collision from happening.
+            ctx.specfence.sf_tips.record_resolve_after_fail();
             abort_and_estimate(&ctx);
             if let Some(f) = first {
                 match f.class {

@@ -543,10 +543,14 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if pred >= self.tx_idx {
             return Ok(());
         }
+        // (a) Detect before read — concurrent capability, not a later stage.
+        self.specfence.sf_tips.record_detect_before();
         let finished =
             self.specfence.scheduler.is_done(pred) || self.specfence.scheduler.is_validated(pred);
         let sf = crate::specfence::SfMvMemory::new(self.mv_memory, self.specfence.sf_tips);
         if finished || sf.true_publish_ready(location_hash, pred) {
+            // (b) Avoid at read via true publish / done.
+            self.specfence.sf_tips.record_avoid_publish();
             return Ok(());
         }
         let executing = self.specfence.scheduler.is_executing(pred);
@@ -575,6 +579,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                         || self.specfence.scheduler.is_done(pred)
                         || self.specfence.scheduler.is_validated(pred)
                     {
+                        self.specfence.sf_tips.record_avoid_publish();
                         return Ok(());
                     }
                     if !self.specfence.scheduler.is_executing(pred) {
@@ -587,6 +592,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 || self.specfence.scheduler.is_done(pred)
                 || self.specfence.scheduler.is_validated(pred)
             {
+                self.specfence.sf_tips.record_avoid_publish();
                 return Ok(());
             }
             // Exact waiter registered for publish wake metrics; no Blocking park.

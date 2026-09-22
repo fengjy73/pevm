@@ -1019,6 +1019,9 @@ impl Pevm {
                 sf_tips.publish_wake_n(),
                 sf_tips.wait_once_consume_n(),
                 sf_tips.estimate_block_sf(),
+                sf_tips.detect_before_n(),
+                sf_tips.avoid_publish_n(),
+                sf_tips.resolve_after_fail_n(),
             );
             metrics_inner.set_true_spine_metrics(
                 runnable.steal_n(),
