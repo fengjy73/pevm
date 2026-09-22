@@ -197,6 +197,17 @@ pub(crate) fn run_sf_block<F, V>(
                         );
                     }
                 }
+                // Detect→Avoid before execute: ungated WaitOnce / sticky plant
+                // left a live producer (blocking_producer). Defer without
+                // Opt→Storage — may_execute is true for ungated, so check peer.
+                if let Some(_pred) = specfence.ready_edges.blocking_producer(tx_idx) {
+                    if !specfence.ready_edges.is_live_leftover_min(tx_idx) {
+                        runnable.mark_wait(tx_idx);
+                        drain_wave(specfence, scheduler, runnable);
+                        metrics.add_worker_busy_ns(t0.elapsed().as_nanos() as u64);
+                        continue;
+                    }
+                }
                 specfence.ready_edges.note_started(tx_idx);
                 // leftover_min must skip Estimate tips so nonce/fund
                 // Blocking(tx-1) on a done writer cannot ghost-Executing mill

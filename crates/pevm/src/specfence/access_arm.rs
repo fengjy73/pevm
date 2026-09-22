@@ -179,6 +179,31 @@ impl AccessArmTable {
         })
     }
 
+    /// All WaitOnce (loc, peer) pairs with `peer < tx` — Detect before execute.
+    pub(crate) fn wait_once_peers_before(&self, tx: TxIdx) -> Vec<(MemoryLocationHash, TxIdx)> {
+        let mut out = Vec::new();
+        let crit = self.crit_loc.load(Ordering::Relaxed);
+        if crit != u64::MAX
+            && let Some(p) = self.crit_pred(tx, crit)
+        {
+            out.push((crit, p));
+        }
+        for e in self.arms.iter() {
+            if e.arm != AccessArm::WaitOnce {
+                continue;
+            }
+            let loc = *e.key();
+            let p = e.peer;
+            if p > 0 && p < tx {
+                if out.iter().any(|&(l, _)| l == loc) {
+                    continue;
+                }
+                out.push((loc, p));
+            }
+        }
+        out
+    }
+
     /// Hot early basic/storage WAW template. The next read of `ℓ` waits
     /// once for a live writer instead of Opt-then-full-replay.
     pub(crate) fn note_early_waw(&self, loc: MemoryLocationHash, k: u32) {
