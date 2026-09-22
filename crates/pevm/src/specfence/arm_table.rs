@@ -239,19 +239,9 @@ impl ArmTable {
             }
             // Under-covered / thin long spine: Prior must not nail a begin
             // wait-set. Mid-block plant_observed_waw still raises real edges.
-            // Soft=0 sticky≥32 HOLD: keep light Win_2 — Opt nail was collapsing
-            // chain_ab/c (Learn demote → Opt theater → FullReplay wall).
             let n_pairs = policy.pairs_of(loc).len();
             if arm.is_ordered() && n_pairs > w_cap as usize {
-                if block_n > THIN_SHELL_N && (n_pairs >= 32 || e.sticky) {
-                    arm = LocStrategy::win(2.min(w_cap as usize).max(1));
-                    // Bypass yield_to_occ_abort — sticky HOLD must survive begin.
-                    policy.remember_arm_force(loc, arm);
-                    planted += 1;
-                    continue;
-                } else {
-                    arm = LocStrategy::OptimisticRead;
-                }
+                arm = LocStrategy::OptimisticRead;
             }
             policy.remember_arm(loc, arm);
             // Remember only — do not promote_short_edge here. admit_seed
@@ -614,33 +604,6 @@ impl ArmTable {
     }
 
     #[inline]
-    /// Soft=0 sticky≥32 HOLD: pin Win_w sticky so end_pack / next begin
-    /// install_prior keep light Detect (not Opt theater).
-    pub(crate) fn force_sticky_win(&self, loc: MemoryLocationHash, w: u8) {
-        let w = w.max(1);
-        let arm = ArmKind::Win { w };
-        self.entries
-            .entry(loc)
-            .and_modify(|e| {
-                e.arm = arm;
-                e.sticky = true;
-                e.under_covered = false;
-                e.explore_budget.store(0, Ordering::Relaxed);
-            })
-            .or_insert_with(|| ArmEntry {
-                arm,
-                sticky: true,
-                n_pull: AtomicUsize::new(0),
-                n_reward: AtomicUsize::new(0),
-                ema_wall_ns: AtomicU64::new(0),
-                ema_abort_cf_ns: AtomicU64::new(0),
-                last_update_tick: AtomicU64::new(0),
-                explore_budget: AtomicUsize::new(0),
-                under_covered: false,
-                lazy: false,
-            });
-    }
-
     pub(crate) fn arm_of(&self, loc: MemoryLocationHash) -> Option<ArmKind> {
         self.entries.get(&loc).map(|e| e.arm)
     }

@@ -1027,7 +1027,7 @@ impl Pevm {
                         .push((*loc, writers.clone()));
                 }
             }
-            self.inter_prior.pack_crit_chain(packed.clone());
+            self.inter_prior.pack_crit_chain(packed);
             let ready_w = ready_edges.ready_width_mean();
             let idle = ready_edges.idle_core_ns();
             let refuse = ready_edges.refuse_count();
@@ -1049,23 +1049,6 @@ impl Pevm {
                 self.cost_policy.end_block_learn_stable_d1();
             } else {
                 self.cost_policy.end_block_learn();
-            }
-            // Soft=0 sticky≥32 HOLD: pin light Win after Learn demote so next
-            // begin Detect/Avoid survives (Opt nail was chain_ab/c ~1.5×).
-            // Thin stays off — Win prepaid is the 3356896 shell.
-            if avoid_hold && block_size > crate::specfence::THIN_SHELL_N {
-                if let Some((loc, writers)) = &packed {
-                    if writers.len() >= 32 {
-                        for w in writers.windows(2) {
-                            self.cost_policy.note_short_pair(*loc, w[0], w[1]);
-                        }
-                        self.cost_policy.remember_arm_force(
-                            *loc,
-                            crate::specfence::LocStrategy::win(2),
-                        );
-                        arms.force_sticky_win(*loc, 2);
-                    }
-                }
             }
             arms.end_pack(&self.inter_prior, block_size);
             access_arms.end_pack(&self.inter_prior);

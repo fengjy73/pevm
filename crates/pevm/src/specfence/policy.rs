@@ -1940,30 +1940,6 @@ impl CostPolicy {
         self.remember_arm(location, strategy);
     }
 
-    /// Persist arm without `yield_to_occ_abort` demotion. Soft=0 sticky≥32
-    /// HOLD: keep light Win so Detect/Avoid survives Learn Opt theater.
-    pub(crate) fn remember_arm_force(&self, location: MemoryLocationHash, arm: LocStrategy) {
-        let n_pairs = self
-            .short_chain
-            .get(&location)
-            .map(|c| c.len())
-            .unwrap_or(0);
-        self.block_arm.insert(location, arm);
-        let mut e = self
-            .promoted
-            .entry(location)
-            .or_insert_with(|| self.new_promoted_seeded(location, n_pairs));
-        e.decision = arm;
-        e.hits = e.hits.max(1);
-        e.cover_wall_lost = false;
-        if let LocStrategy::OrderedWindow { w } = arm {
-            e.w_star = w;
-        }
-        if let LocStrategy::Segmented { seg_len } = arm {
-            e.seg_star = seg_len;
-        }
-    }
-
     /// Persist the committed arm so DeferPlant survives the next begin.
     pub(crate) fn remember_arm(&self, location: MemoryLocationHash, arm: LocStrategy) {
         let n_pairs = self
