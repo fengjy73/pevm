@@ -261,6 +261,17 @@ pub(crate) struct InterBlockPrior {
     flip_count: AtomicUsize,
     /// A6: last `end_block` saw a morphology flip (warm-start decay).
     last_flipped: AtomicUsize,
+    /// SF-PS: packed ArmTable at last end_block (begin restores it).
+    arm_snaps: Mutex<Vec<super::arm_table::ArmSnap>>,
+    /// Per-access Avoid prior: `(ℓ, arm tag, k, peer)`. Tag 1 = WaitOnce, 2 = NeverWait.
+    /// `peer` is the Detect(a) producer so reuse Avoid does not start peer=0 Opt-blind.
+    access_arm_snaps: Mutex<Vec<(crate::MemoryLocationHash, u8, u32, crate::TxIdx)>>,
+    /// Thin/reuse WaitOnce edges: `(consumer, producer, ℓ)` for ungated plant.
+    access_wait_edges: Mutex<Vec<(crate::TxIdx, crate::TxIdx, crate::MemoryLocationHash)>>,
+    /// Longest non-beneficiary writer chain from the last block. Reuse
+    /// plants nearest-pred gates so the next writer does not Opt-read
+    /// before this one publishes.
+    crit_chain: Mutex<Option<(crate::MemoryLocationHash, Vec<crate::TxIdx>)>>,
 }
 
 impl InterBlockPrior {
@@ -321,6 +332,74 @@ impl InterBlockPrior {
         *self.last_morph_hat.lock().unwrap() = MorphWeights::default();
         self.flip_count.store(0, Ordering::Relaxed);
         self.last_flipped.store(0, Ordering::Relaxed);
+        self.arm_snaps.lock().unwrap().clear();
+        self.access_arm_snaps.lock().unwrap().clear();
+        self.access_wait_edges.lock().unwrap().clear();
+        *self.crit_chain.lock().unwrap() = None;
+    }
+
+    /// Begin-block ArmTable restore.
+    pub(crate) fn arm_snapshot(&self) -> Vec<super::arm_table::ArmSnap> {
+        self.arm_snaps.lock().unwrap().clone()
+    }
+
+    /// Access-arm prior `(ℓ, tag, k, peer)` from the last end_pack.
+    pub(crate) fn access_arm_snapshot(
+        &self,
+    ) -> Vec<(crate::MemoryLocationHash, u8, u32, crate::TxIdx)> {
+        self.access_arm_snaps.lock().unwrap().clone()
+    }
+
+    pub(crate) fn pack_access_arms(
+        &self,
+        snaps: Vec<(crate::MemoryLocationHash, u8, u32, crate::TxIdx)>,
+    ) {
+        *self.access_arm_snaps.lock().unwrap() = snaps;
+    }
+
+    pub(crate) fn access_wait_edge_snapshot(
+        &self,
+    ) -> Vec<(crate::TxIdx, crate::TxIdx, crate::MemoryLocationHash)> {
+        self.access_wait_edges.lock().unwrap().clone()
+    }
+
+    pub(crate) fn pack_access_wait_edges(
+        &self,
+        edges: Vec<(crate::TxIdx, crate::TxIdx, crate::MemoryLocationHash)>,
+    ) {
+        *self.access_wait_edges.lock().unwrap() = edges;
+    }
+
+    /// Remember one WAW chain for the next block. `writers` is sorted, unique.
+    pub(crate) fn pack_crit_chain(
+        &self,
+        chain: Option<(crate::MemoryLocationHash, Vec<crate::TxIdx>)>,
+    ) {
+        *self.crit_chain.lock().unwrap() = chain;
+    }
+
+    pub(crate) fn crit_chain(&self) -> Option<(crate::MemoryLocationHash, Vec<crate::TxIdx>)> {
+        self.crit_chain.lock().unwrap().clone()
+    }
+
+    /// Morph flip from the last `end_block`, without consuming it.
+    pub(crate) fn last_flipped_peek(&self) -> bool {
+        self.last_flipped.load(Ordering::Relaxed) != 0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_flipped_for_test(&self) {
+        self.last_flipped.store(1, Ordering::Relaxed);
+    }
+
+    /// End-block pack. Morph flip decays sticky on the snapshot.
+    pub(crate) fn pack_arm_snapshot(&self, mut snaps: Vec<super::arm_table::ArmSnap>) {
+        if self.last_flipped.load(Ordering::Relaxed) != 0 {
+            for s in &mut snaps {
+                s.sticky = false;
+            }
+        }
+        *self.arm_snaps.lock().unwrap() = snaps;
     }
 }
 

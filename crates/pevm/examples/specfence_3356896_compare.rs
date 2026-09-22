@@ -1,4 +1,4 @@
-//! SpecFence (OptimisticRead / OrderedAdmit on one Block-STM spine) vs harness OCC
+//! SpecFence Parallel Spine (SF-PS) vs harness OCC
 //! baseline on Ethereum mainnet block 3356896 (Soft=0). Compare is measurement
 //! only — not a protocol fork.
 //!
@@ -153,6 +153,31 @@ struct IterRow {
     sys_reexec_n: usize,
     covering_n: usize,
     chosen_cover_window: u8,
+    sf_schedule_picks: usize,
+    occ_schedule_picks: usize,
+    visibility_opt: usize,
+    visibility_wait_released: usize,
+    visibility_ordered_tip: usize,
+    resolve_commit: usize,
+    resolve_partial_rebind: usize,
+    resolve_partial_rewind: usize,
+    resolve_ordered_replay: usize,
+    resolve_full_replay: usize,
+    runnable_set_width_mean: f64,
+    steal_n: usize,
+    refuse_fill_n: usize,
+    idle_core_frac: f64,
+    resolve_apply_n: usize,
+    mid_promote_n: usize,
+    mid_promote_veto_n: usize,
+    learn_e1_n: usize,
+    learn_e2_n: usize,
+    learn_e3_n: usize,
+    learn_e4_n: usize,
+    learn_e5_n: usize,
+    learn_e6_n: usize,
+    prior_plant_n: usize,
+    began_from_prior: bool,
     begin_blocked: Vec<usize>,
     taxed_indep_blocked: Vec<usize>,
     main_inc_gt0: Vec<usize>,
@@ -189,6 +214,135 @@ fn writers_have_4_31(orders: &[(u64, Vec<usize>)]) -> bool {
             _ => false,
         }
     })
+}
+
+fn pearson(xs: &[f64], ys: &[f64]) -> f64 {
+    let n = xs.len();
+    if n < 2 {
+        return 0.0;
+    }
+    let nf = n as f64;
+    let mx = xs.iter().sum::<f64>() / nf;
+    let my = ys.iter().sum::<f64>() / nf;
+    let mut num = 0.0;
+    let mut dx = 0.0;
+    let mut dy = 0.0;
+    for i in 0..n {
+        let a = xs[i] - mx;
+        let b = ys[i] - my;
+        num += a * b;
+        dx += a * a;
+        dy += b * b;
+    }
+    let den = (dx * dy).sqrt();
+    if den == 0.0 { 0.0 } else { num / den }
+}
+
+fn median_ms(vals: &mut [u64]) -> f64 {
+    if vals.is_empty() {
+        return 0.0;
+    }
+    vals.sort_unstable();
+    vals[vals.len() / 2] as f64 / 1e6
+}
+
+fn hist_compact(hist: &[usize; 32]) -> String {
+    let mut s = String::new();
+    for (k, &n) in hist.iter().enumerate() {
+        if n == 0 || k == 0 {
+            continue;
+        }
+        if !s.is_empty() {
+            s.push(',');
+        }
+        if k == 31 {
+            s.push_str(&format!(">={k}:{n}"));
+        } else {
+            s.push_str(&format!("{k}:{n}"));
+        }
+    }
+    if s.is_empty() { "-".to_string() } else { s }
+}
+
+/// Longest writer list is the shared-location chain. Head is its smallest index.
+fn print_focus(pevm: &Pevm, mode_name: &str, i: usize, n: usize, m: &pevm::SpecFenceMetrics) {
+    let starts = pevm.last_tx_first_start();
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    for (tx, &ns) in starts.iter().enumerate() {
+        if ns > 0 {
+            xs.push(tx as f64);
+            ys.push(ns as f64);
+        }
+    }
+    let corr = pearson(&xs, &ys);
+    let q = (n / 10).max(1);
+    let mut low = Vec::new();
+    let mut high = Vec::new();
+    for (tx, &ns) in starts.iter().enumerate() {
+        if ns == 0 {
+            continue;
+        }
+        if tx < q {
+            low.push(ns);
+        }
+        if tx + q >= n {
+            high.push(ns);
+        }
+    }
+    let (loc, chain) = pevm
+        .sticky_crit_chain()
+        .filter(|(_, w)| w.len() >= 32)
+        .or_else(|| {
+            pevm.last_location_writers()
+                .iter()
+                .max_by_key(|(_, w)| w.len())
+                .map(|(h, w)| (*h, w.clone()))
+        })
+        .unwrap_or((0, Vec::new()));
+    let head = chain.iter().copied().min();
+    let tail = chain.iter().copied().max();
+    let start_ms = |tx: Option<usize>| {
+        tx.and_then(|t| starts.get(t).copied())
+            .filter(|ns| *ns > 0)
+            .map(|ns| ns as f64 / 1e6)
+            .unwrap_or(0.0)
+    };
+    println!(
+        "  focus {mode_name}[{i}] full={} full_from_0={} prefix={} fail_k_n={} fail_k_min={} fail_k_max={} hist={} chain={loc:016x} chain_n={} head_tx={} head_ms={:.3} tail_tx={} tail_ms={:.3} corr={corr:.3} low_q_ms={:.3} high_q_ms={:.3} explore={} began_prior={} detect_a={} avoid_b={} resolve_c={} early_tip={} est_block={} raw_ab={} raw_c={} war_ab={} war_c={} waw_ab={} waw_c={} chain_ab={} chain_c={} protect={} pbo={} replay_after={}",
+        m.resolve_full_replay,
+        m.full_from_zero,
+        m.prefix_resume_n,
+        m.fail_k_n,
+        m.fail_k_min,
+        m.fail_k_max,
+        hist_compact(&m.fail_k_hist),
+        chain.len(),
+        head.unwrap_or(0),
+        start_ms(head),
+        tail.unwrap_or(0),
+        start_ms(tail),
+        median_ms(&mut low),
+        median_ms(&mut high),
+        m.explore_n,
+        m.began_from_prior as u8,
+        m.sf_detect_before_n,
+        m.sf_avoid_publish_n,
+        m.sf_resolve_after_fail_n,
+        m.sf_early_tip_n,
+        m.estimate_block_sf,
+        m.sf_raw_avoid_n,
+        m.sf_raw_late_n,
+        m.sf_war_avoid_n,
+        m.sf_war_late_n,
+        m.sf_waw_avoid_n,
+        m.sf_waw_late_n,
+        m.sf_chain_avoid_n,
+        m.sf_chain_late_n,
+        m.sf_protect_n,
+        m.sf_protect_before_opt_n,
+        m.sf_replay_after_protect_n,
+    );
 }
 
 fn run_once(
@@ -228,7 +382,7 @@ fn run_once(
                 .map(|(t, _)| t)
                 .collect();
             println!(
-                "  {mode_name}[{i}] ok wall_ms={wall_ms:.3} tps={:.0} occ_aborts={} inc>0={} reexec={} refuse_admit={} wait_for_dependency={} soft_wait_arms={} idle_ns={} ready_width={:.2} ordered_admit={} optimistic_read={} edge_oa={} edge_or={} refuse_ns={} reexec_ns={} ordered_ns={} prepaid_ns={} abort_cf_ns={} prior_decay={} opt_maj={} ev_keep={} ev_demote={} commute={} batch={} d1_prom={} d1_ign={} taxed_begin={} edge_4_31={} unfenced_reexec={} double_charge={} sys_reexec={} covering={} cover_window={} learn={} win_w={} w_cap={} seg_len={} uniq_w/s={}/{} expl_bud={} win1/2/3/seg/full/defer={}/{}/{}/{}/{}/{} arms={} switch={} explore={} win2_dev={} c_opt/w1/w2/w3/def={:.0}/{:.0}/{:.0}/{:.0}/{:.0} main_inc={:?} storage_inc={:?} admit_seed_ns={} end_block_ns={} opt_path_tax_ns={} ungated_occ={} pick_gate={} skip_gate={} ungated_occ_while_gated={} yield_ns={} gate_stall_ns={} busy_ns={}",
+                "  {mode_name}[{i}] ok wall_ms={wall_ms:.3} tps={:.0} occ_aborts={} inc>0={} reexec={} refuse_admit={} wait_for_dependency={} soft_wait_arms={} idle_ns={} ready_width={:.2} ordered_admit={} optimistic_read={} edge_oa={} edge_or={} refuse_ns={} reexec_ns={} ordered_ns={} prepaid_ns={} abort_cf_ns={} prior_decay={} opt_maj={} ev_keep={} ev_demote={} commute={} batch={} d1_prom={} d1_ign={} taxed_begin={} edge_4_31={} unfenced_reexec={} double_charge={} sys_reexec={} covering={} cover_window={} learn={} win_w={} w_cap={} seg_len={} uniq_w/s={}/{} expl_bud={} win1/2/3/seg/full/defer={}/{}/{}/{}/{}/{} arms={} switch={} explore={} win2_dev={} c_opt/w1/w2/w3/def={:.0}/{:.0}/{:.0}/{:.0}/{:.0} main_inc={:?} storage_inc={:?} admit_seed_ns={} end_block_ns={} opt_path_tax_ns={} ungated_occ={} pick_gate={} skip_gate={} ungated_occ_while_gated={} yield_ns={} gate_stall_ns={} busy_ns={} sf_picks={} occ_picks={} vis_opt/wait/tip={}/{}/{} resolve_c/rebind/rewind/ord/full={}/{}/{}/{}/{} rset_w={:.2}",
                 n as f64 / (wall_ms / 1000.0),
                 m.occ_aborts,
                 m.incarnation_gt0,
@@ -295,8 +449,31 @@ fn run_once(
                 learn.ungated_occ_while_gated,
                 learn.yield_ns,
                 learn.gate_stall_ns,
-                learn.worker_busy_ns
+                learn.worker_busy_ns,
+                m.sf_schedule_picks,
+                m.occ_schedule_picks,
+                m.visibility_opt,
+                m.visibility_wait_released,
+                m.visibility_ordered_tip,
+                m.resolve_commit,
+                m.resolve_partial_rebind,
+                m.resolve_partial_rewind,
+                m.resolve_ordered_replay,
+                m.resolve_full_replay,
+                m.runnable_set_width_mean
             );
+            println!(
+                "  v3 {mode_name}[{i}] wait_once={} wait_suppressed={} never_wait={} prefix_resume={} journal_ff_hits={} resolve_rewind={}",
+                m.access_wait_once,
+                m.access_wait_suppressed,
+                m.access_never_wait,
+                m.prefix_resume_n,
+                m.journal_ff_hits,
+                m.resolve_partial_rewind
+            );
+            if mode_name == "specfence" {
+                print_focus(pevm, mode_name, i, n, &m);
+            }
             IterRow {
                 mode: mode_name.to_string(),
                 i,
@@ -364,6 +541,31 @@ fn run_once(
                 sys_reexec_n: learn.sys_reexec_n,
                 covering_n: learn.covering_n,
                 chosen_cover_window: learn.chosen_cover_window,
+                sf_schedule_picks: m.sf_schedule_picks,
+                occ_schedule_picks: m.occ_schedule_picks,
+                visibility_opt: m.visibility_opt,
+                visibility_wait_released: m.visibility_wait_released,
+                visibility_ordered_tip: m.visibility_ordered_tip,
+                resolve_commit: m.resolve_commit,
+                resolve_partial_rebind: m.resolve_partial_rebind,
+                resolve_partial_rewind: m.resolve_partial_rewind,
+                resolve_ordered_replay: m.resolve_ordered_replay,
+                resolve_full_replay: m.resolve_full_replay,
+                runnable_set_width_mean: m.runnable_set_width_mean,
+                steal_n: m.steal_n,
+                refuse_fill_n: m.refuse_fill_n,
+                idle_core_frac: m.idle_core_frac,
+                resolve_apply_n: m.resolve_apply_n,
+                mid_promote_n: m.mid_promote_n,
+                mid_promote_veto_n: m.mid_promote_veto_n,
+                learn_e1_n: m.learn_e1_n,
+                learn_e2_n: m.learn_e2_n,
+                learn_e3_n: m.learn_e3_n,
+                learn_e4_n: m.learn_e4_n,
+                learn_e5_n: m.learn_e5_n,
+                learn_e6_n: m.learn_e6_n,
+                prior_plant_n: m.prior_plant_n,
+                began_from_prior: m.began_from_prior,
                 begin_blocked: begin,
                 taxed_indep_blocked: taxed,
                 main_inc_gt0: inc_gt0_in(&incs, MAIN_CHAIN),
@@ -472,6 +674,20 @@ fn main() {
             sf_row.admit_seed_begin_ns,
             sf_row.unfenced_reexec,
             sf_row.ordered_admit_cohorts,
+            sf_row.learn_e1_n,
+            sf_row.learn_e2_n,
+            sf_row.learn_e3_n,
+            sf_row.learn_e4_n,
+            sf_row.learn_e5_n,
+            sf_row.learn_e6_n,
+            sf_row.mid_promote_n,
+            sf_row.mid_promote_veto_n,
+            sf_row.prior_plant_n,
+            sf_row.began_from_prior,
+            sf_row.steal_n,
+            sf_row.refuse_fill_n,
+            sf_row.resolve_apply_n,
+            sf_row.explore_n,
         ));
         rows.push(sf_row);
     }
@@ -519,6 +735,10 @@ fn main() {
             m.14,
             m.15
         );
+        println!(
+            "  learn e1={} e2={} e3={} e4={} e5={} e6={} mid_promote={} mid_promote_veto={} prior_plant={} began_from_prior={} steal={} refuse_fill={} resolve_apply={} explore_n={}",
+            m.16, m.17, m.18, m.19, m.20, m.21, m.22, m.23, m.24, m.25, m.26, m.27, m.28, m.29
+        );
     }
 
     println!(
@@ -543,6 +763,21 @@ fn main() {
         soft: 0,
     };
 
+    if std::env::var("SPECFENCE_COMPARE_CHECK").is_ok() {
+        let mut checker = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
+        let par = checker
+            .execute(&chain, &storage, &block, cores_nz, false)
+            .expect("parallel");
+        let seq = checker
+            .execute(&chain, &storage, &block, cores_nz, true)
+            .expect("sequential");
+        if par != seq {
+            eprintln!("seq!=par block={block_no} n={n}");
+            std::process::exit(2);
+        }
+        println!("seq=par ok block={block_no}");
+    }
+
     if let Ok(path) = std::env::var("SPECFENCE_COMPARE_JSON") {
         let f = File::create(&path).expect("compare json");
         serde_json::to_writer_pretty(
@@ -554,7 +789,7 @@ fn main() {
                 "summary": summary
             }),
         )
-            .expect("write json");
+        .expect("write json");
         println!("wrote {path}");
     } else {
         println!(

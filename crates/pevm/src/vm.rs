@@ -25,9 +25,9 @@ use crate::{
     specfence::{
         AccessDecision, AccessMode, AccessVis, CheckpointKind, DecisionFeat, DecisionVerb, EdgeKey,
         EdgeKind, EdgeState, FfValue, OrderedAdmitSnapMode, ProcessReason, SpecFenceCtx,
-        StorageWriteReplay, absolute_jump_eligible, arm_call_outcome_cache, arm_ff_origin_seeds,
-        attach_current_live_snap, early_val_probability, jump_is_safe, jump_refuse_reason,
-        note_pending_effect_boundary, note_pending_ordered_admit_snap,
+        StorageWriteReplay, VisibilityPolicy, absolute_jump_eligible, arm_call_outcome_cache,
+        arm_ff_origin_seeds, attach_current_live_snap, early_val_probability, jump_is_safe,
+        jump_refuse_reason, note_pending_effect_boundary, note_pending_ordered_admit_snap,
         ordered_admit_snap_jump_enabled, ordered_admit_snap_mode, resume_was_applied,
         steps_this_run, suffix_repair_jump_env_ok, take_ff_origin_seeds,
         try_arm_safe_absolute_jump, try_arm_safe_absolute_jump_gated, with_ordered_admit_snap_tls,
@@ -151,6 +151,11 @@ pub(crate) struct VmDb<'a, S: Storage> {
     optimistic_majority_lazy: bool,
     /// A1=0 ungated: skip access-gate / rem / ReadyEdge (P3 ≡ OCC).
     optimistic_skip_gate: bool,
+    /// Thin Soft=0: no WaitOnce peer before this tx → OCC-shaped execute
+    /// (skip consult body / engagement / museum; keep access_log ordinals).
+    sf_occ_shaped: bool,
+    /// SpecFence visibility for this incarnation (Opt / WaitReleased / OrderedTip).
+    vis: VisibilityPolicy,
     /// PCC overlay armed for the current access (PE ∩ ROI). OptimisticRead = OCC read.
     pcc_armed: Cell<bool>,
     /// OptimisticRead accesses this incarnation (end-tx process flush; no DashMap).
@@ -191,12 +196,33 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 .policy
                 .is_some_and(|p| p.skip_ungated_tx_path_tax())
             && !self.specfence.ready_edges.is_gated(tx_idx);
+        // Thin Soft=0 OCC-shaped: no WaitOnce peer before this tx → skip consult
+        // body / engagement / museum. Keep access_log.note (fail_k). Tip install
+        // still runs if this tx is a WaitOnce/crit producer.
+        self.sf_occ_shaped = self.specfence.mode == crate::ConcurrencyMode::SpecFence
+            && self.specfence.scheduler.block_size() <= crate::specfence::THIN_SHELL_N
+            && !self.specfence.access_arms.has_wait_once_peer_before(tx_idx);
+        self.vis = if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            // leftover_min → WaitReleased (for_ready). Worker vis was
+            // discarded here and leftover_min stayed Opt (19807137 ghost).
+            VisibilityPolicy::for_ready(self.specfence.ready_edges, tx_idx)
+        } else {
+            VisibilityPolicy::Opt
+        };
         self.has_nonce = has_nonce;
         self.read_set.clear();
         self.read_accounts.clear();
         self.pcc_armed.set(false);
         if let Some(fg) = self.specfence.finegrain {
-            fg.deep_begin_consumer(tx_idx, incarnation);
+            // OCC-shaped: no finegrain museum (no rem / consult grain).
+            if !self.sf_occ_shaped {
+                fg.deep_begin_consumer(tx_idx, incarnation);
+            }
+        }
+        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            // Every incarnation, including the thin ungated shell. Otherwise
+            // fail_k is unknown and prefix keep cannot see this read.
+            self.specfence.access_log.begin_incarnation(tx_idx);
         }
         if self.specfence.mode == crate::ConcurrencyMode::SpecFence && !self.optimistic_skip_gate {
             // repair_armed covers_all only with real FF values. WaitForDependency ResumeAtK
@@ -207,7 +233,6 @@ impl<'a, S: Storage> VmDb<'a, S> {
             self.specfence
                 .certificates
                 .begin_execute(tx_idx, repair_armed, incarnation);
-            self.specfence.access_log.begin_incarnation(tx_idx);
             self.specfence
                 .partial_retry
                 .reset_incarnation(tx_idx, incarnation);
@@ -217,6 +242,15 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 if n > 0 {
                     self.specfence.metrics.record_journal_ff_entries(n);
                 }
+            }
+        } else if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            // Ungated shell still drops the previous incarnation's snaps.
+            // ff_head (prefix keep) is not in that cell.
+            // OCC-shaped: no value_snap / rem grain this tx — skip reset.
+            if !self.sf_occ_shaped {
+                self.specfence
+                    .partial_retry
+                    .reset_incarnation(tx_idx, incarnation);
             }
         }
         if let TxKind::Call(to) = tx.kind {
@@ -249,7 +283,13 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     self.specfence.ready_edges.was_queued(tx_idx),
                 );
             self.optimistic_majority_lazy = optimistic_majority_lazy;
-            self.is_lazy = already || optimistic_majority_lazy;
+            // Detect same-to fan-in (≥2) is lazy even when the majority-block
+            // flag is still cold. Otherwise a higher-idx first-touch Basic
+            // resets the lazy evaluation chain (iter11 24×hot).
+            let to_fanin = eoa
+                && self.specfence.mode == crate::ConcurrencyMode::SpecFence
+                && self.specfence.hints.to_txs(&to).len() >= 2;
+            self.is_lazy = already || optimistic_majority_lazy || to_fanin;
             if optimistic_majority_lazy && self.specfence.hints.prev(&tx.caller, tx_idx).is_some() {
                 self.specfence.metrics.record_commute_skip();
                 if let Some(p) = self.specfence.policy {
@@ -265,9 +305,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
     /// Returns Some when origin is unchanged — caller skips MV lazy walk.
 
     /// Record rem value_snap for value-stable RebindOnly at validate (and journal FF).
+    /// Thin OCC-shaped (no WaitOnce peer): rem unused — thin skips Rewind and
+    /// shaped txs do not arm prefix keep; snap inserts are pure shell tax.
     #[inline]
     fn maybe_note_value(&self, location_hash: MemoryLocationHash, value: FfValue) {
-        if self.specfence.mode != crate::ConcurrencyMode::SpecFence {
+        if self.specfence.mode != crate::ConcurrencyMode::SpecFence || self.sf_occ_shaped {
             return;
         }
         self.specfence
@@ -314,6 +356,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if !self.specfence.scheduler.is_validated(w_idx) {
             return None;
         }
+        let _nest = crate::mv_memory::DataNest::enter("try_ff_storage");
         let written = self.mv_memory.data.get(&location_hash)?;
         let MemoryEntry::Data(inc, MemoryValue::Storage(cur_v)) = written.get(&w_idx)? else {
             return None;
@@ -375,6 +418,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if !self.specfence.scheduler.is_validated(w_idx) {
             return None;
         }
+        let _nest = crate::mv_memory::DataNest::enter("try_ff_basic");
         let written = self.mv_memory.data.get(&location_hash)?;
         let MemoryEntry::Data(inc, MemoryValue::Basic(cur_b)) = written.get(&w_idx)? else {
             return None;
@@ -447,6 +491,328 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.optimistic_read_this_tx.set(0);
         self.pcc_this_tx.set(0);
         self.pcc_armed.set(false);
+    }
+
+    /// Nearest writer of `loc` below this tx who has not published true Data.
+    /// Known chain/prior touchers and in-flight open claims both count.
+    /// A lower writer does not block once a higher one has already finished:
+    /// the read origin is the higher tip.
+    fn unfinished_writer_before(&self, location_hash: MemoryLocationHash) -> Option<TxIdx> {
+        self.unfinished_writer_before_tx(location_hash, self.tx_idx)
+    }
+
+    fn unfinished_writer_before_tx(
+        &self,
+        location_hash: MemoryLocationHash,
+        tx: TxIdx,
+    ) -> Option<TxIdx> {
+        unfinished_writer_of(self.mv_memory, &self.specfence, location_hash, tx)
+    }
+
+    /// Learned WaitOnce on the ungated Opt path. Consume via SfMvMemory
+    /// read-after-true-publish (version tip / Data) — never Estimate Block.
+    /// Large: park a live / SF-tipped unfinished pred without mark_gated.
+    /// Thin: micro-spin while Executing; exact-waiter defer only on SF tip.
+    fn consult_ungated_wait_once(
+        &self,
+        address: Address,
+        location_hash: MemoryLocationHash,
+        access_k: u32,
+    ) -> Result<(), ReadError> {
+        if self.specfence.mode != crate::ConcurrencyMode::SpecFence {
+            return Ok(());
+        }
+        if self.is_lazy || address == self.specfence.beneficiary {
+            return Ok(());
+        }
+        // Thin Soft=0 OCC-shaped: no WaitOnce peer — zero consult tax (ordinals
+        // already noted by basic/storage). A mid-block protected ℓ is the
+        // exception: that access waits for the true tip instead of Opt.
+        if self.sf_occ_shaped
+            && !(self.specfence.access_arms.protect_live()
+                && self.specfence.access_arms.is_protected(location_hash))
+        {
+            return Ok(());
+        }
+        let protected = self.specfence.access_arms.is_protected(location_hash);
+        // Before the Opt read. Large is not OCC-shaped, so this cannot sit
+        // behind the thin shaped check.
+        if protected {
+            self.specfence.access_arms.note_protect_before_opt();
+        }
+        // Soft=0 Opt: no WaitOnce and no crit → zero consult tax.
+        if !self.specfence.access_arms.any_wait_once()
+            && self.specfence.access_arms.crit_loc_hash() == u64::MAX
+        {
+            return Ok(());
+        }
+        let wait = self.specfence.access_arms.is_wait_once(location_hash);
+        let crit = self.specfence.access_arms.crit_loc_hash() == location_hash;
+        if !wait && !crit {
+            return Ok(());
+        }
+        let thin = self.specfence.scheduler.block_size() <= crate::specfence::THIN_SHELL_N;
+        // Checkpoint before this read so fail_k can RewindTo (large blocks).
+        // Thin shell skips RewindTo — do not pay rem tax for unused cps.
+        if !thin && access_k > 1 {
+            let _ = self.specfence.partial_retry.push_checkpoint_at_k(
+                self.tx_idx,
+                (access_k - 1) as usize,
+                crate::specfence::CheckpointKind::EffectBoundary,
+            );
+        }
+        if !wait {
+            return Ok(());
+        }
+        // Protected ℓ: an unfinished writer between the last published tip and
+        // this read is the WaitOnce pred. Last MvMemory Data is not enough.
+        let unfinished = if protected {
+            self.unfinished_writer_before(location_hash)
+        } else {
+            None
+        };
+        let Some(pred) = unfinished
+            .or_else(|| {
+                self.specfence
+                    .access_arms
+                    .wait_once_pred(self.tx_idx, location_hash)
+            })
+            .or_else(|| {
+                self.specfence
+                    .access_arms
+                    .crit_pred(self.tx_idx, location_hash)
+            })
+            .or_else(|| {
+                // Thin Soft=0: Learn peer + crit are enough — skip MvMemory /
+                // writers_of alloc ladder (scaffolding tax when Avoid already works).
+                // A protected ℓ has peer 0; the ordered writer is the true tip.
+                if thin && !protected {
+                    return None;
+                }
+                self.mv_memory
+                    .last_writer_before(location_hash, self.tx_idx)
+            })
+            .or_else(|| {
+                self.specfence
+                    .sf_tips
+                    .live_writer(location_hash)
+                    .filter(|&w| w < self.tx_idx)
+            })
+            .or_else(|| {
+                if thin && !protected {
+                    return None;
+                }
+                self.specfence
+                    .ready_edges
+                    .writers_of(location_hash)
+                    .into_iter()
+                    .rev()
+                    .find(|&w| w < self.tx_idx)
+            })
+        else {
+            return Ok(());
+        };
+        if pred >= self.tx_idx {
+            return Ok(());
+        }
+        // Four-class: Chain (sticky≥32) | WAW (early-k) | RAW (else WaitOnce).
+        let class = crate::specfence::classify_wait_conflict(
+            self.specfence.access_arms.is_crit_loc(location_hash),
+            self.specfence.access_arms.crit_chain_len(),
+            self.specfence.access_arms.wait_once_k(location_hash),
+        );
+        // (a) Detect before read — concurrent capability, not a later stage.
+        self.specfence.sf_tips.record_detect_before();
+        let finished =
+            self.specfence.scheduler.is_done(pred) || self.specfence.scheduler.is_validated(pred);
+        let sf = crate::specfence::SfMvMemory::new(self.mv_memory, self.specfence.sf_tips);
+        if finished || sf.true_publish_ready(location_hash, pred) {
+            // (b) Avoid at read via true publish / done.
+            self.specfence.sf_tips.record_avoid_publish();
+            self.specfence.sf_tips.record_class_avoid(class);
+            return Ok(());
+        }
+        let executing = self.specfence.scheduler.is_executing(pred);
+        let has_sf_tip = self
+            .specfence
+            .sf_tips
+            .has_version_or_released(location_hash, pred)
+            || self
+                .specfence
+                .sf_tips
+                .live_writer(location_hash)
+                .is_some_and(|w| w == pred);
+        // Thin: cheap scheduler-first spin; tip/Data probe every 64 iters.
+        // Soft=0 forbids Blocking park / Estimate Block / Rewind.
+        if thin {
+            if !executing && !has_sf_tip {
+                return Ok(());
+            }
+            self.specfence.sf_tips.record_wait_once_consume();
+            if executing {
+                const SPIN: usize = 4_096;
+                for i in 0..SPIN {
+                    if self.specfence.scheduler.is_done(pred)
+                        || self.specfence.scheduler.is_validated(pred)
+                    {
+                        self.specfence.sf_tips.record_avoid_publish();
+                        self.specfence.sf_tips.record_class_avoid(class);
+                        return Ok(());
+                    }
+                    if i % 64 == 0 && sf.true_publish_ready(location_hash, pred) {
+                        self.specfence.sf_tips.record_avoid_publish();
+                        self.specfence.sf_tips.record_class_avoid(class);
+                        return Ok(());
+                    }
+                    if !self.specfence.scheduler.is_executing(pred) {
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+            }
+            if sf.true_publish_ready(location_hash, pred)
+                || self.specfence.scheduler.is_done(pred)
+                || self.specfence.scheduler.is_validated(pred)
+            {
+                self.specfence.sf_tips.record_avoid_publish();
+                self.specfence.sf_tips.record_class_avoid(class);
+                return Ok(());
+            }
+            // Soft=0 thin: no Blocking park; Opt-fallthrough (Learn raises Avoid).
+            // Do not register_waiter — ungated finish never wakes DashMap waiters.
+            return Ok(());
+        }
+        // Protected read found an unfinished writer the last published tip
+        // does not name. Stay in this interpreter frame until Data lands
+        // so the prefix is the live execution, not a k=0 re-entry.
+        // ResumeAtK rem is off for k<8 (tax) and does not jump the PC.
+        if unfinished.is_some() {
+            self.specfence.sf_tips.record_wait_once_consume();
+            let started = Instant::now();
+            let mut i = 0u32;
+            let mut executing = true;
+            loop {
+                if self.specfence.scheduler.is_done(pred)
+                    || self.specfence.scheduler.is_validated(pred)
+                    || (i % 32 == 0 && sf.true_publish_ready(location_hash, pred))
+                {
+                    self.specfence.sf_tips.record_avoid_publish();
+                    self.specfence.sf_tips.record_class_avoid(class);
+                    return Ok(());
+                }
+                if i % 32 == 0 {
+                    executing = self.specfence.scheduler.is_executing(pred);
+                }
+                let elapsed = started.elapsed();
+                // Status can stay Executing after the worker has left.
+                // A live writer keeps this frame; a ghost must release it.
+                if executing {
+                    if elapsed > std::time::Duration::from_millis(12) {
+                        break;
+                    }
+                } else if i > 32 && elapsed > std::time::Duration::from_millis(1) {
+                    break;
+                }
+                if i % 64 == 0 {
+                    std::thread::yield_now();
+                } else {
+                    std::hint::spin_loop();
+                }
+                i = i.wrapping_add(1);
+            }
+            if sf.true_publish_ready(location_hash, pred)
+                || self.specfence.scheduler.is_done(pred)
+                || self.specfence.scheduler.is_validated(pred)
+            {
+                self.specfence.sf_tips.record_avoid_publish();
+                self.specfence.sf_tips.record_class_avoid(class);
+                return Ok(());
+            }
+            // Writer left without publishing. Release the core. Same
+            // incarnation, not Aborting. Admission is what keeps the
+            // known chain from entering early enough to hit this.
+            self.specfence.wave.set_pending_park(
+                location_hash,
+                0,
+                crate::specfence::ParkKind::WaitForDependency,
+            );
+            return Err(ReadError::Blocking(pred));
+        }
+        // Large: park when Executing / SF tip / live_writer. Estimate tip is
+        // OCC residue used only as a *liveness* hint after abort cleared the
+        // SF tip — Blocking still goes through park_publish_wait so
+        // estimate_block_sf stays 0 (SoT: no Estimate Block on SF path).
+        // ChainSpineTip: prefer short Released-spin before Blocking park so
+        // true publish Avoid does not serialize the sticky spine.
+        let live = executing
+            || has_sf_tip
+            || matches!(
+                self.mv_memory.entry_kind_at(location_hash, pred),
+                "estimate"
+            );
+        if !live {
+            // Protected ℓ: do not Opt-fall into another FullReplay. Park on
+            // the ordered pred until the true tip is published (scheduler
+            // dependency, not an Estimate mutex and not a core-pinning spin).
+            let unpublished = protected && !finished && !sf.true_publish_ready(location_hash, pred);
+            if !unpublished {
+                return Ok(());
+            }
+        }
+        self.specfence.sf_tips.record_wait_once_consume();
+        // ChainSpineTip: brief Released poll (not long busy-spin) before park.
+        if self.specfence.sf_tips.is_chain_loc(location_hash) && (executing || has_sf_tip) {
+            const SPIN: usize = 512;
+            for i in 0..SPIN {
+                if self.specfence.scheduler.is_done(pred)
+                    || self.specfence.scheduler.is_validated(pred)
+                    || (i % 16 == 0 && sf.true_publish_ready(location_hash, pred))
+                {
+                    self.specfence.sf_tips.record_avoid_publish();
+                    self.specfence.sf_tips.record_class_avoid(class);
+                    return Ok(());
+                }
+                if !self.specfence.scheduler.is_executing(pred) {
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+            if sf.true_publish_ready(location_hash, pred)
+                || self.specfence.scheduler.is_done(pred)
+                || self.specfence.scheduler.is_validated(pred)
+            {
+                self.specfence.sf_tips.record_avoid_publish();
+                self.specfence.sf_tips.record_class_avoid(class);
+                return Ok(());
+            }
+            // Prefer schedule one-hop: plant waiters wake on chain_release →
+            // Q_released. Exact waiter covers opportunistic Version readers.
+            // Soft=0 try_execute_sf skips Aborting for chain (mark_wait only).
+            self.specfence
+                .sf_tips
+                .register_waiter(location_hash, pred, self.tx_idx);
+            self.specfence
+                .ready_edges
+                .note_ungated_wait_on(self.tx_idx, pred);
+            return Err(self.park_publish_wait(location_hash, pred));
+        }
+        match live_writer_act(
+            &self.specfence,
+            self.tx_idx,
+            self.is_lazy,
+            address,
+            location_hash,
+            pred,
+        ) {
+            crate::specfence::LiveAct::Block => {
+                self.specfence
+                    .sf_tips
+                    .register_waiter(location_hash, pred, self.tx_idx);
+                Err(self.park_publish_wait(location_hash, pred))
+            }
+            crate::specfence::LiveAct::Retry => Err(ReadError::InconsistentRead),
+            crate::specfence::LiveAct::Skip => Ok(()),
+        }
     }
 
     /// Mode dispatch. OCC is `Ok(())` with **zero** SpecFence calls.
@@ -530,8 +896,15 @@ impl<'a, S: Storage> VmDb<'a, S> {
         ) {
             return Ok(());
         }
-        // PE-on: true stream \(k\). Empty-PE never reaches HashMap note.
-        let access_k = self.specfence.access_log.note(self.tx_idx, location_hash);
+        // basic/storage already recorded this k. Do not note again.
+        let access_k = self
+            .specfence
+            .access_log
+            .first_k(self.tx_idx, location_hash)
+            .unwrap_or(0);
+        if self.specfence.access_arms.is_never(location_hash) {
+            return Ok(());
+        }
         if !self.specfence.learner.location_predicted(location_hash) {
             // Do **not** clone Basic(addr) PE onto every Storage(addr,slot).
             // That opened WaitFor/ESTIMATE on the first SLOAD of a hint-fan
@@ -803,17 +1176,35 @@ impl<'a, S: Storage> VmDb<'a, S> {
 
     /// ESTIMATE / aborted-incarnation Blocking: PE-known RAW → WaitForDependency;
     /// unknown ESTIMATE stays BlockingOther (true OCC).
+    /// SpecFence Soft=0 must not land here — use [`Self::park_publish_wait`].
     fn park_estimate_blocking(
         &self,
         location_hash: MemoryLocationHash,
         writer: TxIdx,
     ) -> ReadError {
+        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            self.specfence.sf_tips.record_estimate_block_sf();
+        }
+        // leftover_min must not ghost-park on a done / later writer.
+        // InconsistentRead → Retry so the incarnation re-reads Data.
+        if self.specfence.ready_edges.is_live_leftover_min(self.tx_idx)
+            && (writer > self.tx_idx
+                || self.specfence.scheduler.is_done(writer)
+                || self.specfence.scheduler.is_validated(writer)
+                || self
+                    .specfence
+                    .ready_edges
+                    .leftover_min_skips_blocker(writer))
+        {
+            return ReadError::InconsistentRead;
+        }
         let pe_known = self.specfence.learner.location_predicted(location_hash)
             || self
                 .specfence
                 .ready_edges
                 .predicted_producer(location_hash)
-                .is_some();
+                .is_some()
+            || self.specfence.access_arms.is_wait_once(location_hash);
         let mut kind = crate::specfence::ordered_admit_act::estimate_park_kind(pe_known);
         let access_k = self
             .specfence
@@ -851,6 +1242,63 @@ impl<'a, S: Storage> VmDb<'a, S> {
         ReadError::Blocking(writer)
     }
 
+    /// SpecFence WaitOnce publish-wait: park until true Data, not Estimate.
+    /// Does **not** increment `estimate_block_sf`.
+    fn park_publish_wait(&self, location_hash: MemoryLocationHash, writer: TxIdx) -> ReadError {
+        if self.specfence.ready_edges.is_live_leftover_min(self.tx_idx)
+            && (writer > self.tx_idx
+                || self.specfence.scheduler.is_done(writer)
+                || self.specfence.scheduler.is_validated(writer)
+                || self
+                    .specfence
+                    .ready_edges
+                    .leftover_min_skips_blocker(writer))
+        {
+            return ReadError::InconsistentRead;
+        }
+        let access_k = self
+            .specfence
+            .access_log
+            .first_k(self.tx_idx, location_hash)
+            .unwrap_or_else(|| self.specfence.partial_retry.current_k(self.tx_idx) as u32);
+        let prefix = self
+            .specfence
+            .access_log
+            .prefix_before(self.tx_idx, access_k);
+        let armed = self
+            .specfence
+            .partial_retry
+            .arm_wait_for_dependency_checkpoint(
+                self.tx_idx,
+                location_hash,
+                access_k.max(1),
+                &prefix,
+            );
+        let (kind, armed_at_k) =
+            if crate::specfence::ordered_admit_act::wait_for_resume_armed(armed) {
+                (crate::specfence::ParkKind::WaitForDependency, armed)
+            } else {
+                (
+                    crate::specfence::ParkKind::BlockingOther,
+                    self.specfence.partial_retry.current_k(self.tx_idx) as u64,
+                )
+            };
+        self.specfence
+            .wave
+            .set_pending_park(location_hash, armed_at_k, kind);
+        ReadError::Blocking(writer)
+    }
+
+    /// SF → publish-wait (no Estimate Block counter); OCC → estimate park.
+    #[inline]
+    fn park_live_writer(&self, location_hash: MemoryLocationHash, writer: TxIdx) -> ReadError {
+        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            self.park_publish_wait(location_hash, writer)
+        } else {
+            self.park_estimate_blocking(location_hash, writer)
+        }
+    }
+
     /// Shared OCC proceed: no rem journal / first_k / Edge / process / Detect DashMap.
     /// PrefixSkip / FF-head resume is Resolve (not OptimisticRead) — `pcc_armed` stays
     /// false so first-incarnation ¬PE still uses OCC ESTIMATE→Blocking.
@@ -867,11 +1315,26 @@ impl<'a, S: Storage> VmDb<'a, S> {
 
     /// Resolve-read overlay: PCC Fire **or** PrefixSkip/FF resume (PartialAbortRewind).
     /// First-incarnation OptimisticRead stays OCC (no FF / OrderedDirtyRead).
+    /// Edged SpecFence vis skips ESTIMATE tips via [`crate::specfence::sf_mv`].
     #[inline]
     fn resolve_read_overlay(&self) -> bool {
         self.pcc_armed.get()
             || self.specfence.partial_retry.is_rewind_resume(self.tx_idx)
             || self.specfence.partial_retry.has_ff_head(self.tx_idx)
+            || self.sf_skip_estimate()
+    }
+
+    /// WaitReleased / OrderedTip: never consume the OCC race Estimate tip.
+    #[inline]
+    fn sf_skip_estimate(&self) -> bool {
+        self.specfence.mode == crate::ConcurrencyMode::SpecFence && self.vis.needs_fence()
+    }
+
+    #[inline]
+    fn note_sf_mv_read(&self) {
+        if self.sf_skip_estimate() {
+            self.specfence.metrics.record_sf_mv_read(self.vis);
+        }
     }
 
     #[allow(dead_code)]
@@ -975,6 +1438,19 @@ impl<'a, S: Storage> VmDb<'a, S> {
             crate::specfence::ordered_admit_act::OrderedAdmitAct::WaitForDependency {
                 writer: _,
             } => {}
+        }
+        // WaitOnce: the same (tx, ℓ, w) does not enter the park body again.
+        match live_writer_act(
+            &self.specfence,
+            self.tx_idx,
+            self.is_lazy,
+            address,
+            location_hash,
+            w,
+        ) {
+            crate::specfence::LiveAct::Block => {}
+            crate::specfence::LiveAct::Retry => return Err(ReadError::InconsistentRead),
+            crate::specfence::LiveAct::Skip => return self.occ_optimistic_read(),
         }
         let prefix = self
             .specfence
@@ -1506,41 +1982,66 @@ impl<'a, S: Storage> VmDb<'a, S> {
 
     fn get_code_hash(&mut self, address: Address) -> Result<Option<B256>, ReadError> {
         let location_hash = hash_deterministic(MemoryLocation::CodeHash(address));
+        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            let _ = self.specfence.access_log.note(self.tx_idx, location_hash);
+        }
         let read_origins = self.read_set.entry(location_hash).or_default();
 
         // Try to read the latest code hash in [MvMemory]
         // TODO: Memoize read locations (expected to be small) here in [Vm] to avoid
         // contention in [MvMemory]
-        if let Some(written_transactions) = self.mv_memory.data.get(&location_hash)
-            && let Some((tx_idx, MemoryEntry::Data(tx_incarnation, value))) =
-                written_transactions.range(..self.tx_idx).next_back()
-        {
+        let closest = {
+            let _nest = crate::mv_memory::DataNest::enter("get_code_hash");
+            self.mv_memory.data.get(&location_hash).and_then(|written| {
+                written
+                    .range(..self.tx_idx)
+                    .next_back()
+                    .map(|(idx, e)| (*idx, e.clone()))
+            })
+        };
+        if let Some((tx_idx, MemoryEntry::Data(tx_incarnation, value))) = closest {
             if self
                 .mv_memory
-                .is_aborted_incarnation(*tx_idx, *tx_incarnation)
+                .is_aborted_incarnation(tx_idx, tx_incarnation)
             {
-                return Err(ReadError::Blocking(*tx_idx));
-            }
-            match value {
-                MemoryValue::SelfDestructed => {
-                    return Err(ReadError::SelfDestructedAccount);
+                match live_writer_act(
+                    &self.specfence,
+                    self.tx_idx,
+                    self.is_lazy,
+                    address,
+                    location_hash,
+                    tx_idx,
+                ) {
+                    crate::specfence::LiveAct::Skip => {}
+                    crate::specfence::LiveAct::Retry => {
+                        return Err(ReadError::InconsistentRead);
+                    }
+                    crate::specfence::LiveAct::Block => {
+                        return Err(ReadError::Blocking(tx_idx));
+                    }
                 }
-                MemoryValue::CodeHash(code_hash) => {
-                    let origin = ReadOrigin::MvMemory(TxVersion {
-                        tx_idx: *tx_idx,
-                        tx_incarnation: *tx_incarnation,
-                    });
-                    Self::push_origin(read_origins, origin.clone())?;
-                    self.deep_trace_read(
-                        location_hash,
-                        crate::specfence::LocationKind::CodeHash,
-                        Some(&origin),
-                    );
-                    return Ok(Some(*code_hash));
+            } else {
+                match value {
+                    MemoryValue::SelfDestructed => {
+                        return Err(ReadError::SelfDestructedAccount);
+                    }
+                    MemoryValue::CodeHash(code_hash) => {
+                        let origin = ReadOrigin::MvMemory(TxVersion {
+                            tx_idx,
+                            tx_incarnation,
+                        });
+                        Self::push_origin(read_origins, origin.clone())?;
+                        self.deep_trace_read(
+                            location_hash,
+                            crate::specfence::LocationKind::CodeHash,
+                            Some(&origin),
+                        );
+                        return Ok(Some(code_hash));
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
-        };
+        }
 
         // Fallback to storage
         Self::push_origin(read_origins, ReadOrigin::Storage)?;
@@ -1555,11 +2056,60 @@ impl<'a, S: Storage> VmDb<'a, S> {
     }
 }
 
+/// Opt | WaitOnce | NeverWait. Not a method: callers hold `read_set`.
+/// SpecFence Soft=0 thin: never Block on OCC Estimate alone — WaitOnce
+/// consult owns thin consume. Large: AccessArm decide may Block once
+/// (publish-wait, not Estimate counter) to preserve sticky/Rewind wins.
+fn live_writer_act(
+    specfence: &crate::specfence::SpecFenceCtx<'_>,
+    tx_idx: TxIdx,
+    is_lazy: bool,
+    address: Address,
+    location_hash: MemoryLocationHash,
+    writer: TxIdx,
+) -> crate::specfence::LiveAct {
+    if specfence.mode != crate::ConcurrencyMode::SpecFence {
+        return crate::specfence::LiveAct::Block;
+    }
+    if specfence.ready_edges.is_live_leftover_min(tx_idx)
+        && address != specfence.beneficiary
+        && !is_lazy
+    {
+        return crate::specfence::LiveAct::Block;
+    }
+    let never = address == specfence.beneficiary || is_lazy;
+    let finished = specfence.scheduler.is_done(writer) || specfence.scheduler.is_validated(writer);
+    let thin = specfence.scheduler.block_size() <= crate::specfence::THIN_SHELL_N;
+    // Thin ungated WaitOnce: consult_ungated_wait_once owns consume.
+    if !never
+        && !finished
+        && thin
+        && !specfence.ready_edges.is_gated(tx_idx)
+        && (specfence.access_arms.is_wait_once(location_hash)
+            || specfence.access_arms.crit_loc_hash() == location_hash)
+    {
+        return crate::specfence::LiveAct::Skip;
+    }
+    // Thin non-WaitOnce: Skip Estimate Block (OCC-baseline-only).
+    if !never && !finished && thin {
+        return crate::specfence::LiveAct::Skip;
+    }
+    specfence
+        .access_arms
+        .decide(tx_idx, location_hash, writer, never, finished)
+}
+
 impl<S: Storage> Database for VmDb<'_, S> {
     type Error = ReadError;
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         let location_hash = self.hash_basic(&address);
+        let access_k = if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            self.specfence.access_log.note(self.tx_idx, location_hash)
+        } else {
+            0
+        };
+        self.consult_ungated_wait_once(address, location_hash, access_k)?;
         self.maybe_wait(address, location_hash, false)?;
         let resolve = self.resolve_read_overlay();
 
@@ -1594,6 +2144,21 @@ impl<S: Storage> Database for VmDb<'_, S> {
             self.specfence.metrics.record_journal_ff_hit();
             self.read_accounts
                 .insert(location_hash, (account.clone(), code_hash));
+            // Re-snap FF basics into rem. Without this, a second fail after
+            // Rewind/ff_head leaves value_snap empty → full_from_0.
+            let snap_origin = match &origin {
+                ReadOrigin::MvMemory(v) => Some((v.tx_idx, v.tx_incarnation)),
+                ReadOrigin::Storage => None,
+            };
+            self.maybe_note_value(
+                location_hash,
+                FfValue::Basic {
+                    address,
+                    basic: account.clone(),
+                    code_hash,
+                    origin: snap_origin,
+                },
+            );
             let code = if let Some(code_hash) = &code_hash {
                 if let Some(code) = self.mv_memory.new_bytecodes.get(code_hash) {
                     Some(code.clone())
@@ -1627,16 +2192,35 @@ impl<S: Storage> Database for VmDb<'_, S> {
         // The sign of [balance_addition] since it can be negative for lazy senders.
         let mut positive_addition = true;
         let mut nonce_addition = 0;
+        // WaitReleased may skip an Estimate tip to find older Data. If none
+        // exists, falling through to pre-state + LackOfFund/NonceTooHigh
+        // Blocking(tx-1) livelocks when tx-1 is already Validated (19469101
+        // 1-core: hang-trace silent, 100% CPU inside try_execute_sf).
+        let mut skipped_live_estimate: Option<TxIdx> = None;
 
-        // Try reading from multi-version data
-        if self.tx_idx > 0
-            && let Some(written_transactions) = self.mv_memory.data.get(&location_hash)
-        {
-            let mut iter = written_transactions.range(..self.tx_idx);
+        // Snapshot then drop the DashMap guard before any other `data.get`
+        // (same-shard re-entry corrupts the heap — 19807137).
+        let history: Vec<(TxIdx, MemoryEntry)> = if self.tx_idx > 0 {
+            let _nest = crate::mv_memory::DataNest::enter("basic.history");
+            self.mv_memory
+                .data
+                .get(&location_hash)
+                .map(|written| {
+                    written
+                        .range(..self.tx_idx)
+                        .map(|(k, v)| (*k, v.clone()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if !history.is_empty() {
+            let mut iter = history.iter().rev();
 
             // Fully evaluate lazy updates
             loop {
-                match iter.next_back() {
+                match iter.next() {
                     Some((blocking_idx, MemoryEntry::Estimate)) => {
                         // PCC / PrefixSkip OrderedDirtyRead. First-incarnation
                         // OptimisticRead/OCC Block on ESTIMATE (Block-STM).
@@ -1646,14 +2230,42 @@ impl<S: Storage> Database for VmDb<'_, S> {
                             && nonce_addition == 0
                         {
                             self.specfence.metrics.record_optimistic_read();
+                            if self.specfence.mode == crate::ConcurrencyMode::SpecFence
+                                && self.vis.needs_fence()
+                            {
+                                // Equivalent to SfMvMemory::read(WaitReleased|OrderedTip):
+                                // skip the Estimate tip. Do not call SfMvMemory::read
+                                // here — DashMap is not reentrant under this `get`.
+                                self.specfence.metrics.record_sf_mv_read(self.vis);
+                            }
+                            if !self.specfence.scheduler.is_done(*blocking_idx) {
+                                skipped_live_estimate =
+                                    skipped_live_estimate.or(Some(*blocking_idx));
+                            }
                             continue;
                         }
-                        if resolve {
-                            self.promote_on_conflict(address, location_hash);
-                        } else {
-                            self.note_unpublished_raw(location_hash, *blocking_idx);
+                        match live_writer_act(
+                            &self.specfence,
+                            self.tx_idx,
+                            self.is_lazy,
+                            address,
+                            location_hash,
+                            *blocking_idx,
+                        ) {
+                            crate::specfence::LiveAct::Skip => continue,
+                            crate::specfence::LiveAct::Retry => {
+                                return Err(ReadError::InconsistentRead);
+                            }
+                            crate::specfence::LiveAct::Block => {
+                                if resolve {
+                                    self.promote_on_conflict(address, location_hash);
+                                    self.note_sf_mv_read();
+                                } else {
+                                    self.note_unpublished_raw(location_hash, *blocking_idx);
+                                }
+                                return Err(self.park_live_writer(location_hash, *blocking_idx));
+                            }
                         }
-                        return Err(self.park_estimate_blocking(location_hash, *blocking_idx));
                     }
                     Some((closest_idx, MemoryEntry::Data(tx_incarnation, value))) => {
                         if self
@@ -1666,12 +2278,31 @@ impl<S: Storage> Database for VmDb<'_, S> {
                                 && nonce_addition == 0
                             {
                                 self.specfence.metrics.record_optimistic_read();
+                                if !self.specfence.scheduler.is_done(*closest_idx) {
+                                    skipped_live_estimate =
+                                        skipped_live_estimate.or(Some(*closest_idx));
+                                }
                                 continue;
                             }
-                            if resolve {
-                                self.promote_on_conflict(address, location_hash);
+                            match live_writer_act(
+                                &self.specfence,
+                                self.tx_idx,
+                                self.is_lazy,
+                                address,
+                                location_hash,
+                                *closest_idx,
+                            ) {
+                                crate::specfence::LiveAct::Skip => continue,
+                                crate::specfence::LiveAct::Retry => {
+                                    return Err(ReadError::InconsistentRead);
+                                }
+                                crate::specfence::LiveAct::Block => {
+                                    if resolve {
+                                        self.promote_on_conflict(address, location_hash);
+                                    }
+                                    return Err(self.park_live_writer(location_hash, *closest_idx));
+                                }
                             }
-                            return Err(self.park_estimate_blocking(location_hash, *closest_idx));
                         }
                         self.specfence.metrics.record_db_heavy_op();
                         // About to push a new origin
@@ -1729,6 +2360,30 @@ impl<S: Storage> Database for VmDb<'_, S> {
 
         // Fall back to storage
         if final_account.is_none() {
+            if let Some(w) = skipped_live_estimate {
+                match live_writer_act(
+                    &self.specfence,
+                    self.tx_idx,
+                    self.is_lazy,
+                    address,
+                    location_hash,
+                    w,
+                ) {
+                    crate::specfence::LiveAct::Skip => {}
+                    crate::specfence::LiveAct::Retry => {
+                        return Err(ReadError::InconsistentRead);
+                    }
+                    crate::specfence::LiveAct::Block => {
+                        if resolve {
+                            self.promote_on_conflict(address, location_hash);
+                            self.note_sf_mv_read();
+                        } else {
+                            self.note_unpublished_raw(location_hash, w);
+                        }
+                        return Err(self.park_live_writer(location_hash, w));
+                    }
+                }
+            }
             self.specfence.metrics.record_db_heavy_op();
             // Populate [Storage] on the first read
             if !has_prev_origins {
@@ -1802,14 +2457,27 @@ impl<S: Storage> Database for VmDb<'_, S> {
             // Check sender nonce
             account.nonce += nonce_addition;
             if self.has_nonce && location_hash == self.from_hash && self.tx.nonce != account.nonce {
-                return if self.tx_idx > 0 {
-                    // TODO: Better retry strategy -- immediately, to the
-                    // closest sender tx, to the missing sender tx, etc.
+                let pred_done =
+                    self.tx_idx > 0 && self.specfence.scheduler.is_done(self.tx_idx - 1);
+                let leftover_min = self.specfence.ready_edges.is_live_leftover_min(self.tx_idx);
+                let pred_passed = self.tx_idx > 0
+                    && self
+                        .specfence
+                        .ready_edges
+                        .leftover_min_skips_blocker(self.tx_idx - 1);
+                if leftover_min && (pred_done || pred_passed) {
+                    // leftover_min must commit on a done prefix. Blocking(tx-1)
+                    // parks fail, leftover_min stays Executing, heal mills
+                    // (19807137 leftover_min=514 n_unf=198).
+                } else if self.tx_idx > 0 {
+                    // Non-leftover still Blocks on tx-1 even when pred is
+                    // done (OCC). `!pred_done` here made tx 120 InvalidNonce
+                    // abort 19807137 first-SF.
                     self.promote_on_conflict(address, location_hash);
-                    Err(ReadError::Blocking(self.tx_idx - 1))
+                    return Err(ReadError::Blocking(self.tx_idx - 1));
                 } else {
-                    Err(ReadError::InvalidNonce(self.tx_idx))
-                };
+                    return Err(ReadError::InvalidNonce(self.tx_idx));
+                }
             }
 
             // Fully evaluate the account and register it to read cache
@@ -1895,6 +2563,12 @@ impl<S: Storage> Database for VmDb<'_, S> {
 
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
         let location_hash = hash_deterministic(MemoryLocation::Storage(address, index));
+        let access_k = if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            self.specfence.access_log.note(self.tx_idx, location_hash)
+        } else {
+            0
+        };
+        self.consult_ungated_wait_once(address, location_hash, access_k)?;
         self.maybe_wait(address, location_hash, true)?;
         let resolve = self.resolve_read_overlay();
 
@@ -1927,128 +2601,209 @@ impl<S: Storage> Database for VmDb<'_, S> {
 
         let read_origins = self.read_set.entry(location_hash).or_default();
 
-        // Try reading from multi-version data
-        if self.tx_idx > 0
-            && let Some(written_transactions) = self.mv_memory.data.get(&location_hash)
-            && let Some((closest_idx, entry)) =
-                written_transactions.range(..self.tx_idx).next_back()
-        {
-            match entry {
-                MemoryEntry::Data(tx_incarnation, MemoryValue::Storage(value)) => {
-                    if self
-                        .mv_memory
-                        .is_aborted_incarnation(*closest_idx, *tx_incarnation)
-                    {
-                        // PCC OrderedDirtyRead only. OptimisticRead/OCC Block (Block-STM).
-                        if resolve {
-                            if let Some((idx, inc)) =
-                                self.mv_memory.last_data_before(location_hash, self.tx_idx)
-                            {
-                                if let Some(written) = self.mv_memory.data.get(&location_hash)
-                                    && let Some(MemoryEntry::Data(i2, MemoryValue::Storage(v2))) =
-                                        written.get(&idx)
-                                    && *i2 == inc
-                                {
-                                    self.specfence.metrics.record_optimistic_read();
-                                    self.specfence.metrics.record_db_heavy_op();
-                                    let origin = ReadOrigin::MvMemory(TxVersion {
-                                        tx_idx: idx,
-                                        tx_incarnation: inc,
-                                    });
-                                    Self::push_origin(read_origins, origin.clone())?;
-                                    self.deep_trace_read(
-                                        location_hash,
-                                        crate::specfence::LocationKind::Storage,
-                                        Some(&origin),
-                                    );
-                                    self.maybe_note_value(
-                                        location_hash,
-                                        FfValue::Storage {
-                                            address,
-                                            slot: index,
-                                            value: *v2,
-                                            origin: Some((idx, inc)),
-                                        },
-                                    );
-                                    self.maybe_early_val(address, location_hash)?;
-                                    return Ok(*v2);
+        // Snapshot the closest prior entry under one `data.get`, then drop
+        // the DashMap guard before `last_data_before` / `maybe_early_val`
+        // (same-map re-entry is the 19807137 `double free or corruption`).
+        enum StorageTip {
+            Live {
+                idx: TxIdx,
+                inc: crate::TxIncarnation,
+                value: U256,
+            },
+            SkipTo {
+                closest_idx: TxIdx,
+                prior: Option<(TxIdx, crate::TxIncarnation, U256)>,
+                estimate: bool,
+            },
+            BadType,
+        }
+        let tip = if self.tx_idx > 0 {
+            let _nest = crate::mv_memory::DataNest::enter("storage.tip");
+            self.mv_memory.data.get(&location_hash).and_then(|written| {
+                let (idx, entry) = written.range(..self.tx_idx).next_back()?;
+                match entry {
+                    MemoryEntry::Data(inc, MemoryValue::Storage(v)) => {
+                        if self.mv_memory.is_aborted_incarnation(*idx, *inc) {
+                            let prior = crate::mv_memory::MvMemory::last_live_storage_in(
+                                &written,
+                                self.tx_idx,
+                                |i, inc| self.mv_memory.is_aborted_incarnation(i, inc),
+                            );
+                            Some(StorageTip::SkipTo {
+                                closest_idx: *idx,
+                                prior,
+                                estimate: false,
+                            })
+                        } else {
+                            Some(StorageTip::Live {
+                                idx: *idx,
+                                inc: *inc,
+                                value: *v,
+                            })
+                        }
+                    }
+                    MemoryEntry::Estimate => {
+                        let prior = crate::mv_memory::MvMemory::last_live_storage_in(
+                            &written,
+                            self.tx_idx,
+                            |i, inc| self.mv_memory.is_aborted_incarnation(i, inc),
+                        );
+                        Some(StorageTip::SkipTo {
+                            closest_idx: *idx,
+                            prior,
+                            estimate: true,
+                        })
+                    }
+                    _ => Some(StorageTip::BadType),
+                }
+            })
+        } else {
+            None
+        };
+
+        match tip {
+            Some(StorageTip::Live { idx, inc, value }) => {
+                self.specfence.metrics.record_db_heavy_op();
+                let origin = ReadOrigin::MvMemory(TxVersion {
+                    tx_idx: idx,
+                    tx_incarnation: inc,
+                });
+                Self::push_origin(read_origins, origin.clone())?;
+                self.deep_trace_read(
+                    location_hash,
+                    crate::specfence::LocationKind::Storage,
+                    Some(&origin),
+                );
+                self.maybe_note_value(
+                    location_hash,
+                    FfValue::Storage {
+                        address,
+                        slot: index,
+                        value,
+                        origin: Some((idx, inc)),
+                    },
+                );
+                if resolve {
+                    self.maybe_early_val(address, location_hash)?;
+                }
+                return Ok(value);
+            }
+            Some(StorageTip::SkipTo {
+                closest_idx,
+                prior,
+                estimate,
+            }) => {
+                if resolve {
+                    if let Some((idx, inc, v2)) = prior {
+                        self.specfence.metrics.record_optimistic_read();
+                        self.specfence.metrics.record_db_heavy_op();
+                        let origin = ReadOrigin::MvMemory(TxVersion {
+                            tx_idx: idx,
+                            tx_incarnation: inc,
+                        });
+                        Self::push_origin(read_origins, origin.clone())?;
+                        self.deep_trace_read(
+                            location_hash,
+                            crate::specfence::LocationKind::Storage,
+                            Some(&origin),
+                        );
+                        self.maybe_note_value(
+                            location_hash,
+                            FfValue::Storage {
+                                address,
+                                slot: index,
+                                value: v2,
+                                origin: Some((idx, inc)),
+                            },
+                        );
+                        self.maybe_early_val(address, location_hash)?;
+                        return Ok(v2);
+                    }
+                    if estimate {
+                        // No prior Data. A live Estimate writer is unpublished —
+                        // do not read pre-state (LackOfFund/NonceTooHigh then
+                        // Blocking(tx-1) livelocks when tx-1 is already done).
+                        // NeverWait / a second WaitOnce may fall through; leftover
+                        // still parks (`live_writer_act`).
+                        self.specfence.metrics.record_optimistic_read();
+                        if !self.specfence.scheduler.is_done(closest_idx) {
+                            match live_writer_act(
+                                &self.specfence,
+                                self.tx_idx,
+                                self.is_lazy,
+                                address,
+                                location_hash,
+                                closest_idx,
+                            ) {
+                                crate::specfence::LiveAct::Skip => {}
+                                crate::specfence::LiveAct::Retry => {
+                                    return Err(ReadError::InconsistentRead);
+                                }
+                                crate::specfence::LiveAct::Block => {
+                                    self.promote_on_conflict(address, location_hash);
+                                    return Err(self.park_live_writer(location_hash, closest_idx));
                                 }
                             }
-                            self.promote_on_conflict(address, location_hash);
                         }
-                        return Err(self.park_estimate_blocking(location_hash, *closest_idx));
-                    }
-                    self.specfence.metrics.record_db_heavy_op();
-                    let origin = ReadOrigin::MvMemory(TxVersion {
-                        tx_idx: *closest_idx,
-                        tx_incarnation: *tx_incarnation,
-                    });
-                    Self::push_origin(read_origins, origin.clone())?;
-                    self.deep_trace_read(
-                        location_hash,
-                        crate::specfence::LocationKind::Storage,
-                        Some(&origin),
-                    );
-                    self.maybe_note_value(
-                        location_hash,
-                        FfValue::Storage {
+                    } else {
+                        match live_writer_act(
+                            &self.specfence,
+                            self.tx_idx,
+                            self.is_lazy,
                             address,
-                            slot: index,
-                            value: *value,
-                            origin: Some((*closest_idx, *tx_incarnation)),
-                        },
-                    );
-                    if resolve {
-                        self.maybe_early_val(address, location_hash)?;
-                    }
-                    return Ok(*value);
-                }
-                MemoryEntry::Estimate => {
-                    // PCC may skip ESTIMATE → prior Data. OptimisticRead/OCC Block.
-                    if resolve {
-                        if let Some((idx, inc)) =
-                            self.mv_memory.last_data_before(location_hash, self.tx_idx)
-                        {
-                            if let Some(written) = self.mv_memory.data.get(&location_hash)
-                                && let Some(MemoryEntry::Data(i2, MemoryValue::Storage(v2))) =
-                                    written.get(&idx)
-                                && *i2 == inc
-                            {
-                                self.specfence.metrics.record_optimistic_read();
-                                self.specfence.metrics.record_db_heavy_op();
-                                let origin = ReadOrigin::MvMemory(TxVersion {
-                                    tx_idx: idx,
-                                    tx_incarnation: inc,
-                                });
-                                Self::push_origin(read_origins, origin.clone())?;
-                                self.deep_trace_read(
-                                    location_hash,
-                                    crate::specfence::LocationKind::Storage,
-                                    Some(&origin),
-                                );
-                                self.maybe_note_value(
-                                    location_hash,
-                                    FfValue::Storage {
-                                        address,
-                                        slot: index,
-                                        value: *v2,
-                                        origin: Some((idx, inc)),
-                                    },
-                                );
-                                self.maybe_early_val(address, location_hash)?;
-                                return Ok(*v2);
+                            location_hash,
+                            closest_idx,
+                        ) {
+                            crate::specfence::LiveAct::Skip => {}
+                            crate::specfence::LiveAct::Retry => {
+                                return Err(ReadError::InconsistentRead);
+                            }
+                            crate::specfence::LiveAct::Block => {
+                                self.promote_on_conflict(address, location_hash);
+                                return Err(self.park_live_writer(location_hash, closest_idx));
                             }
                         }
-                        // No prior Data: fall through to storage (not BlockingOther).
-                        self.specfence.metrics.record_optimistic_read();
-                    } else {
-                        self.promote_on_conflict(address, location_hash);
-                        self.note_unpublished_raw(location_hash, *closest_idx);
-                        return Err(self.park_estimate_blocking(location_hash, *closest_idx));
+                    }
+                } else if estimate {
+                    match live_writer_act(
+                        &self.specfence,
+                        self.tx_idx,
+                        self.is_lazy,
+                        address,
+                        location_hash,
+                        closest_idx,
+                    ) {
+                        crate::specfence::LiveAct::Skip => {}
+                        crate::specfence::LiveAct::Retry => {
+                            return Err(ReadError::InconsistentRead);
+                        }
+                        crate::specfence::LiveAct::Block => {
+                            self.promote_on_conflict(address, location_hash);
+                            self.note_unpublished_raw(location_hash, closest_idx);
+                            return Err(self.park_live_writer(location_hash, closest_idx));
+                        }
+                    }
+                } else {
+                    match live_writer_act(
+                        &self.specfence,
+                        self.tx_idx,
+                        self.is_lazy,
+                        address,
+                        location_hash,
+                        closest_idx,
+                    ) {
+                        crate::specfence::LiveAct::Skip => {}
+                        crate::specfence::LiveAct::Retry => {
+                            return Err(ReadError::InconsistentRead);
+                        }
+                        crate::specfence::LiveAct::Block => {
+                            return Err(self.park_live_writer(location_hash, closest_idx));
+                        }
                     }
                 }
-                _ => return Err(ReadError::InvalidMemoryValueType),
             }
+            Some(StorageTip::BadType) => return Err(ReadError::InvalidMemoryValueType),
+            None => {}
         }
 
         // Fall back to storage
@@ -2085,6 +2840,45 @@ impl<S: Storage> Database for VmDb<'_, S> {
     }
 }
 
+/// Nearest writer of `loc` below `tx` who has not published true Data.
+/// A lower writer does not block once a higher one has already finished.
+fn unfinished_writer_of(
+    mv_memory: &MvMemory,
+    specfence: &SpecFenceCtx<'_>,
+    location_hash: MemoryLocationHash,
+    tx: TxIdx,
+) -> Option<TxIdx> {
+    let sf = crate::specfence::SfMvMemory::new(mv_memory, specfence.sf_tips);
+    let closed = |w: TxIdx| {
+        specfence.scheduler.is_done(w)
+            || specfence.scheduler.is_validated(w)
+            || sf.true_publish_ready(location_hash, w)
+    };
+    let mut floor = 0;
+    let mut best: Option<TxIdx> = None;
+    if let Some(known) = specfence.access_arms.known_writer_indexes(location_hash) {
+        for &w in known.iter().rev() {
+            if w >= tx {
+                continue;
+            }
+            if closed(w) {
+                floor = w;
+                break;
+            }
+            best = Some(w);
+            break;
+        }
+    }
+    if let Some(w) = specfence.sf_tips.nearest_open_before(location_hash, tx)
+        && w > floor
+        && !closed(w)
+        && best.is_none_or(|b| w > b)
+    {
+        best = Some(w);
+    }
+    best
+}
+
 // Per-worker execution VM. Holds all block-level state and a reusable EVM.
 pub(crate) struct Vm<'a, S: Storage, C: PevmChain> {
     // Shared block-level state
@@ -2103,8 +2897,41 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
     /// A2 progressive DAG: published Data notifies Blocking waiters (not SoftWait Soft).
     /// Ready transition stays in `finish_execution` (dependents drain) — do not
     /// `try_ready` here or release builds double-incarnate and corrupt.
-    fn wake_on_data_publish(&self, writer: crate::TxIdx, locs: &[crate::MemoryLocationHash]) {
+    /// SfMvMemory: mark Released tips and wake exact WaitOnce waiters.
+    /// ChainSpine: also wake planted nearest succ into wave → `Q_released`
+    /// (schedule Avoid on Released — no Blocking park).
+    fn wake_on_data_publish(
+        &self,
+        writer: crate::TxIdx,
+        incarnation: crate::TxIncarnation,
+        locs: &[crate::MemoryLocationHash],
+    ) {
         for &loc in locs {
+            let thin = self.specfence.scheduler.block_size() <= crate::specfence::THIN_SHELL_N;
+            // Thin WaitOnce/crit DashMap tip; large ChainSpineTip only.
+            if thin
+                && (self.specfence.access_arms.is_crit_loc(loc)
+                    || self.specfence.access_arms.is_wait_once(loc))
+            {
+                let exact = self
+                    .specfence
+                    .sf_tips
+                    .publish_data(loc, writer, incarnation);
+                for c in exact {
+                    self.specfence.wave.push_ready(c);
+                }
+            } else if self.specfence.sf_tips.is_chain_loc(loc) {
+                let exact = self
+                    .specfence
+                    .sf_tips
+                    .publish_data(loc, writer, incarnation);
+                for c in exact {
+                    self.specfence.wave.push_ready(c);
+                }
+                self.specfence
+                    .ready_edges
+                    .wake_planted_on_publish(writer, self.specfence.wave);
+            }
             self.specfence.sketch.push_spine(loc, writer);
             self.specfence.ready_edges.note_published(loc, writer);
             let k = self.specfence.learner.dominant_k(loc);
@@ -2113,6 +2940,13 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             let _ = self.specfence.dag.wake_on_data(loc, writer);
             self.specfence.metrics.record_data_publish_wake();
         }
+    }
+
+    /// True when Soft=0 ChainSpine should schedule-defer instead of Aborting.
+    #[inline]
+    pub(crate) fn chain_spine_schedule_defer(&self, location: MemoryLocationHash) -> bool {
+        self.specfence.mode == crate::ConcurrencyMode::SpecFence
+            && self.specfence.sf_tips.is_chain_loc(location)
     }
 
     pub(crate) fn new(
@@ -2140,6 +2974,8 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             is_lazy: false,
             optimistic_majority_lazy: false,
             optimistic_skip_gate: false,
+            sf_occ_shaped: false,
+            vis: VisibilityPolicy::Opt,
             pcc_armed: Cell::new(false),
             optimistic_read_this_tx: Cell::new(0),
             pcc_this_tx: Cell::new(0),
@@ -2243,6 +3079,24 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
 
     pub(crate) fn record_wait_for_dependency(&self) {
         self.specfence.metrics.record_wait_for_dependency();
+    }
+
+    /// Large protected ℓ: do not enter the interpreter while a nearer
+    /// known writer is still unpublished. The first `execute` then reads
+    /// the true tip. Not `mark_gated` and not every higher tx — only a
+    /// learned toucher of this location. Thin stays on the OCC-shaped path.
+    pub(crate) fn protected_admission_blocker(&self, tx: TxIdx) -> Option<TxIdx> {
+        if tx == 0 || self.specfence.scheduler.block_size() <= crate::specfence::THIN_SHELL_N {
+            return None;
+        }
+        if !self.specfence.access_arms.protect_live() {
+            return None;
+        }
+        let loc = self.specfence.access_arms.known_toucher_loc(tx)?;
+        if !self.specfence.access_arms.is_protected(loc) {
+            return None;
+        }
+        unfinished_writer_of(self.mv_memory, &self.specfence, loc, tx)
     }
 
     pub(crate) fn record_wait_for_full_abort(&self) {
@@ -2364,7 +3218,6 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         let full_tx = unsafe { self.txs.get_unchecked(tx_version.tx_idx) };
         let tx = self.chain.tx_env(full_tx);
 
-        self.note_execute_edge(tx_version.tx_idx);
         let from_hash = hash_deterministic(MemoryLocation::Basic(tx.caller));
         let to_hash = tx
             .kind
@@ -2395,6 +3248,71 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             ctx.journal_mut().clear();
         }
 
+        let sf_occ_shaped = self.evm.ctx().db().sf_occ_shaped;
+        // Museum / tip only when this tx is a WaitOnce consumer or producer.
+        if !sf_occ_shaped {
+            self.note_execute_edge(tx_version.tx_idx);
+        }
+
+        // SpecFence write path: early version tip + live_writer.
+        // Thin: DashMap WaitOnce/crit (skip when OCC-shaped non-producer).
+        // Large: ChainSpineTip only (sticky≥32).
+        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            let thin = self.specfence.scheduler.block_size() <= crate::specfence::THIN_SHELL_N;
+            let crit = self.specfence.access_arms.crit_loc_hash();
+            let install_tip = thin
+                && (!sf_occ_shaped
+                    || self
+                        .specfence
+                        .access_arms
+                        .is_wait_once_producer(tx_version.tx_idx));
+            if install_tip {
+                let prior = self.mv_memory.write_locations(tx_version.tx_idx);
+                for &loc in &prior {
+                    if self.specfence.access_arms.is_crit_loc(loc)
+                        || self.specfence.access_arms.is_wait_once(loc)
+                    {
+                        self.specfence.sf_tips.install_version_tip(
+                            loc,
+                            tx_version.tx_idx,
+                            tx_version.tx_incarnation,
+                        );
+                    }
+                }
+                if crit != u64::MAX
+                    && self.specfence.access_arms.is_wait_once(crit)
+                    && !prior.iter().any(|&l| l == crit)
+                {
+                    self.specfence.sf_tips.install_version_tip(
+                        crit,
+                        tx_version.tx_idx,
+                        tx_version.tx_incarnation,
+                    );
+                }
+            } else if !thin && self.specfence.sf_tips.is_chain_loc(crit) {
+                // ChainSpineTip claim — O(1) flag, not WaitOnce DashMap mill.
+                self.specfence
+                    .sf_tips
+                    .chain_claim(tx_version.tx_idx, tx_version.tx_incarnation);
+            }
+            let tx = tx_version.tx_idx;
+            let track = |loc: crate::MemoryLocationHash| {
+                self.specfence.access_arms.is_protected(loc)
+                    || self.specfence.access_arms.is_wait_once(loc)
+                    || self.specfence.access_arms.is_crit_loc(loc)
+            };
+            for loc in self.mv_memory.write_locations(tx) {
+                if track(loc) {
+                    self.specfence.sf_tips.note_open_writer(loc, tx);
+                }
+            }
+            if let Some(loc) = self.specfence.access_arms.known_toucher_loc(tx)
+                && track(loc)
+            {
+                self.specfence.sf_tips.note_open_writer(loc, tx);
+            }
+        }
+
         // SpecFence-native resume: RewindTo (SuffixRepair / SoftWait wake) takes the
         // resume path on Lean too — do NOT gate on `!lean`. Journal FF (`try_ff_*`)
         // already keys off table `is_rewind_resume`; this also seeds read origins,
@@ -2405,8 +3323,9 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 .policy
                 .is_some_and(|p| p.skip_ungated_tx_path_tax())
             && !self.specfence.ready_edges.is_gated(tx_version.tx_idx);
+        // OCC-shaped thin: force lean without engagement atomics.
         let lean = self.specfence.mode == crate::ConcurrencyMode::SpecFence
-            && self.specfence.engagement.begin_tx(tx_version.tx_idx);
+            && (sf_occ_shaped || self.specfence.engagement.begin_tx(tx_version.tx_idx));
         let repair_armed = self.specfence.mode == crate::ConcurrencyMode::SpecFence
             && !optimistic_ungated_exec
             && (self
@@ -3214,13 +4133,14 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     }
                 }
 
-                let (is_lazy, optimistic_majority_lazy, read_set) = {
+                let (is_lazy, optimistic_majority_lazy, read_set, sf_occ_shaped) = {
                     let db = ctx.db_mut();
                     db.flush_access_census();
                     (
                         db.is_lazy,
                         db.optimistic_majority_lazy,
                         std::mem::take(&mut db.read_set),
+                        db.sf_occ_shaped,
                     )
                 };
 
@@ -3299,29 +4219,75 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 // insert races seq≡par (iter9 / mixed SIGSEGV). C1/L2 seed
                 // at begin (hint / prior) or on the next block after promote.
                 if optimistic_ungated {
+                    // Light tip publish before record moves write_set (Released /
+                    // ChainSpine so WaitOnce Avoid hits without spin/museum).
+                    // OCC-shaped non-producer: skip tip DashMap + promote museum
+                    // (install_version_tip already skipped at execute start).
+                    let shaped_skip_tip = sf_occ_shaped
+                        && !self
+                            .specfence
+                            .access_arms
+                            .is_wait_once_producer(tx_version.tx_idx);
+                    let tip_locs: Vec<_> = if shaped_skip_tip {
+                        Vec::new()
+                    } else {
+                        write_set
+                            .iter()
+                            .map(|(loc, _)| *loc)
+                            .filter(|&loc| {
+                                self.specfence.sf_tips.is_chain_loc(loc)
+                                    || (self.specfence.scheduler.block_size()
+                                        <= crate::specfence::THIN_SHELL_N
+                                        && (self.specfence.access_arms.is_crit_loc(loc)
+                                            || self.specfence.access_arms.is_wait_once(loc)))
+                            })
+                            .collect()
+                    };
                     let (wrote_new_location, contended) =
                         self.mv_memory.record(tx_version, read_set, write_set);
+                    for loc in tip_locs {
+                        let exact = self.specfence.sf_tips.publish_data(
+                            loc,
+                            tx_version.tx_idx,
+                            tx_version.tx_incarnation,
+                        );
+                        // ChainSpine one-hop: schedule wake planted succ + exact
+                        // waiters into Q_released (Avoid on Released, not park).
+                        if self.specfence.sf_tips.is_chain_loc(loc) {
+                            for c in exact {
+                                self.specfence.wave.push_ready(c);
+                            }
+                            self.specfence
+                                .ready_edges
+                                .wake_planted_on_publish(tx_version.tx_idx, self.specfence.wave);
+                        }
+                    }
+                    self.specfence
+                        .sf_tips
+                        .close_open_writer_tx(tx_version.tx_idx);
                     if wrote_new_location {
                         flags |= FinishExecFlags::WroteNewLocation;
                     }
-                    self.specfence
-                        .metrics
-                        .record_speculate(tx.caller, tx.kind.to().copied());
-                    for loc in contended {
-                        if loc == self.beneficiary_location_hash {
-                            continue;
+                    if !shaped_skip_tip {
+                        self.specfence
+                            .metrics
+                            .record_speculate(tx.caller, tx.kind.to().copied());
+                        for loc in contended {
+                            if loc == self.beneficiary_location_hash {
+                                continue;
+                            }
+                            let addr = if loc == from_hash {
+                                Some(tx.caller)
+                            } else if Some(loc) == to_hash {
+                                tx.kind.to().copied()
+                            } else {
+                                None
+                            };
+                            if addr == Some(self.specfence.beneficiary) {
+                                continue;
+                            }
+                            self.promote_region(loc, addr);
                         }
-                        let addr = if loc == from_hash {
-                            Some(tx.caller)
-                        } else if Some(loc) == to_hash {
-                            tx.kind.to().copied()
-                        } else {
-                            None
-                        };
-                        if addr == Some(self.specfence.beneficiary) {
-                            continue;
-                        }
-                        self.promote_region(loc, addr);
                     }
                     let receipt = receipt_from_revm(exec_result);
                     let state = state_transitions_from_revm(self.is_eip_161_enabled, state);
@@ -3415,6 +4381,11 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 }
                 let (wrote_new_location, contended) =
                     self.mv_memory.record(tx_version, read_set, write_set);
+                if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+                    self.specfence
+                        .sf_tips
+                        .close_open_writer_tx(tx_version.tx_idx);
+                }
                 // M3: learn process WŜ from this incarnation's writes (no residual publish).
                 // R1/R3: feed HotSet writer counts (H_w) from non-lazy writes only.
                 let _ = optimistic_majority_lazy;
@@ -3438,7 +4409,11 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         }
                         // A2: progressive DAG — Data is visible; wake Blocking waiters
                         // before is_done (SoftWait Soft stays 0).
-                        self.wake_on_data_publish(tx_version.tx_idx, &locs);
+                        self.wake_on_data_publish(
+                            tx_version.tx_idx,
+                            tx_version.tx_incarnation,
+                            &locs,
+                        );
                     } else {
                         self.specfence
                             .rw_prior
@@ -3467,7 +4442,11 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                                         self.specfence.metrics.record_avoid_broadcast();
                                     }
                                 }
-                                self.wake_on_data_publish(tx_version.tx_idx, &pe_locs);
+                                self.wake_on_data_publish(
+                                    tx_version.tx_idx,
+                                    tx_version.tx_incarnation,
+                                    &pe_locs,
+                                );
                             }
                         }
                     }
@@ -3556,7 +4535,22 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         )
                     )
                 {
-                    Err(VmExecutionError::Blocking(tx_version.tx_idx - 1))
+                    let pred_done = self.specfence.scheduler.is_done(tx_version.tx_idx - 1);
+                    let pred_passed = self
+                        .specfence
+                        .ready_edges
+                        .leftover_min_skips_blocker(tx_version.tx_idx - 1);
+                    if self
+                        .specfence
+                        .ready_edges
+                        .is_live_leftover_min(tx_version.tx_idx)
+                        && (pred_done || pred_passed)
+                    {
+                        // leftover_min + done prefix: do not ghost-park.
+                        Err(VmExecutionError::Retry)
+                    } else {
+                        Err(VmExecutionError::Blocking(tx_version.tx_idx - 1))
+                    }
                 } else {
                     Err(VmExecutionError::ExecutionError(err))
                 }

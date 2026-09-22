@@ -118,12 +118,30 @@ where
             conc,
         )
         .expect("parallel");
-    assert_eq!(
-        sequential,
-        parallel,
-        "committed state must match sequential; metrics={:?}",
-        pevm.last_specfence_metrics()
-    );
+    if sequential != parallel {
+        for (i, (s, p)) in sequential.iter().zip(parallel.iter()).enumerate() {
+            if s != p {
+                let mut diffs = Vec::new();
+                for (addr, sv) in &s.state {
+                    let pv = p.state.get(addr);
+                    if pv != Some(sv) {
+                        diffs.push(format!("{addr:?} seq={sv:?} par={pv:?}"));
+                    }
+                }
+                for (addr, pv) in &p.state {
+                    if !s.state.contains_key(addr) {
+                        diffs.push(format!("{addr:?} seq=None par={pv:?}"));
+                    }
+                }
+                panic!(
+                    "tx {i} seq≠par gas {} vs {}; diffs={diffs:?}; metrics={:?}",
+                    s.receipt.cumulative_gas_used,
+                    p.receipt.cumulative_gas_used,
+                    pevm.last_specfence_metrics()
+                );
+            }
+        }
+    }
     let metrics = pevm.last_specfence_metrics().clone();
     (parallel, metrics, pevm)
 }
@@ -146,6 +164,139 @@ fn specfence_independent_raw_transfers() {
         "independent txs must speculate: {sf_metrics:?}"
     );
     assert_eq!(occ_metrics.wait_admissions, 0);
+    assert_eq!(
+        sf_metrics.occ_schedule_picks, 0,
+        "SF-PS: SpecFence pick must not enter next_occ_task: {sf_metrics:?}"
+    );
+    assert!(
+        sf_metrics.sf_schedule_picks > 0,
+        "SF-PS: Schedule.pick must run: {sf_metrics:?}"
+    );
+    assert!(
+        sf_metrics.visibility_opt > 0,
+        "independent set is Avoid=noop Opt, not OCC mode: {sf_metrics:?}"
+    );
+    assert!(
+        sf_metrics.resolve_commit + sf_metrics.resolve_full_replay > 0,
+        "SF-PS ResolvePlan must fire on independents: {sf_metrics:?}"
+    );
+}
+
+/// SF-PS call-graph: SpecFence main pick never increments next_occ_task.
+#[test]
+fn specfence_sf_ps_pick_never_calls_next_occ_task() {
+    let n = 32;
+    let txs: Vec<TxEnv> = (1..=n)
+        .map(|i| self_transfer(Address::from(U160::from(i)), 1))
+        .collect();
+    let storage = storage_for(n);
+    let (_, occ, _) = run_mode(ConcurrencyMode::Occ, &storage, txs.clone());
+    assert!(
+        occ.occ_schedule_picks > 0,
+        "OCC contrast engine must use next_occ_task: {occ:?}"
+    );
+    let (_, sf, _) = run_mode(ConcurrencyMode::SpecFence, &storage, txs);
+    assert_eq!(sf.soft_wait_arms, 0, "Soft=0: {sf:?}");
+    assert_eq!(
+        sf.occ_schedule_picks, 0,
+        "SF-PS pick must not call next_occ_task: sf_picks={} {sf:?}",
+        sf.sf_schedule_picks
+    );
+    assert!(sf.sf_schedule_picks > 0);
+    assert!(
+        sf.visibility_opt + sf.visibility_wait_released + sf.visibility_ordered_tip > 0,
+        "VisibilityPolicy must be recorded: {sf:?}"
+    );
+    assert!(sf.resolve_apply_n > 0, "ResolvePlan.apply must run: {sf:?}");
+}
+
+/// True-spine call-graph: SF sources never mention Block-STM next_task*.
+#[test]
+fn specfence_true_spine_sources_never_call_next_task() {
+    let files = [
+        include_str!("../src/specfence/schedule.rs"),
+        include_str!("../src/specfence/runnable_set.rs"),
+        include_str!("../src/specfence/worker.rs"),
+        include_str!("../src/specfence/resolve_plan.rs"),
+        include_str!("../src/specfence/sf_mv.rs"),
+        include_str!("../src/specfence/arm_table.rs"),
+    ];
+    for src in files {
+        let code = src.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            !code.contains("next_task_with_wave_ready("),
+            "true spine must not call next_task_with_wave_ready"
+        );
+        assert!(
+            !code.contains(".next_task("),
+            "true spine must not call Scheduler::next_task"
+        );
+        assert!(
+            !code.contains("validate_occ_stage("),
+            "true spine must not call validate_occ_stage"
+        );
+    }
+    let pevm = include_str!("../src/pevm.rs");
+    assert!(
+        pevm.contains("run_sf_block"),
+        "pevm SpecFence worker must be the RunnableSet ring"
+    );
+    assert!(
+        !pevm.contains("next_sf_task"),
+        "pevm must not call the PR44 next_sf_task wrapper"
+    );
+}
+
+/// B1–B7 call-graph: Learn outputs G / ArmTable / release / explore only.
+#[test]
+fn specfence_learn_wiring_is_first_class() {
+    let pevm = include_str!("../src/pevm.rs");
+    let resolve = include_str!("../src/specfence/resolve_plan.rs");
+    let schedule = include_str!("../src/specfence/schedule.rs");
+    let arms = include_str!("../src/specfence/arm_table.rs");
+    let resolve_code = resolve.split("#[cfg(test)]").next().unwrap();
+    let schedule_code = schedule.split("#[cfg(test)]").next().unwrap();
+    let arms_code = arms.split("#[cfg(test)]").next().unwrap();
+    assert!(
+        resolve_code.contains("arms.observe("),
+        "B1: Resolve.apply must observe E1–E6"
+    );
+    assert!(
+        resolve_code.contains("demote_lazy_graph"),
+        "B7: E6 must ungate lazy consumers"
+    );
+    assert!(
+        resolve_code.contains("apply_pending_patches"),
+        "B2/B3: IntraPatch at release_successors"
+    );
+    assert!(
+        schedule_code.contains("apply_pending_patches"),
+        "B2: IntraPatch at pick boundary"
+    );
+    assert!(
+        schedule_code.contains("note_e4"),
+        "B1: refuse_fill is Learn E4"
+    );
+    assert!(
+        pevm.contains("install_prior_into_policy"),
+        "B4: begin_from_prior must seed CostPolicy before admit_seed"
+    );
+    assert!(
+        pevm.contains("arms.begin_from_prior"),
+        "B4: begin installs ArmTable from Prior"
+    );
+    assert!(
+        pevm.contains("arms.end_pack"),
+        "B5: end_pack writes InterBlockPrior"
+    );
+    assert!(
+        arms_code.contains("under_covered") && arms_code.contains("ArmKind::Opt"),
+        "B5: under-covered never sticky Full"
+    );
+    assert!(
+        arms_code.contains("explore_budget.store(0"),
+        "B6: reuse sticky explore_budget=0"
+    );
 }
 
 /// Same sender, increasing nonces: sender location WW promotes Wait (observed).

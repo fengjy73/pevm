@@ -27,7 +27,8 @@
 //! Independent txs stay ungated (S1). Under-covered conflict spines
 //! (L≫64: cover_window cannot absorb leftover) stay sticky
 //! OptimisticRead — never Full/Seg hard-order, never empty Win_1
-//! churn, never learn-uphill. Mid-band real Basic/storage
+//! churn, never learn-uphill. Thin (n≤176) never learns Win_8.
+//! Mid-band real Basic/storage
 //! (L∈[20,64], plus real Basic up to the under-covered floor) may
 //! **probe** a short segmented/sliding `cover_window` on cold/crisis;
 //! sticky only on wall success vs the OCC abort counterfactual, else
@@ -35,11 +36,9 @@
 //! decoupled from cover depth: at-cap leftover deepens the next
 //! segment instead of total withdraw. Near-independent / lazy-update
 //! large blocks drop non-critical wait-set slots and skip useless
-//! cover probes. Ungated execute+validate is OCC-equivalent on every
-//! n (`skip_ungated_tx_path_tax`) whenever the tx is ungated —
-//! thin included. Block-level path-tax skip stays mid/large so thin
-//! HotSet / D1 still walk. Gates are
-//! edge constraints (ungated_occ ≈ n − wait_set). Lazy-update /
+//! cover probes. Ungated execute+validate is SpecFence Avoid=noop
+//! (VisibilityPolicy::Opt) — not an OCC-engine retreat and not a
+//! learning target. Gates are edge constraints. Lazy-update /
 //! thousand-writer chains are never OrderedAdmit objects. Instant
 //! idle never enters ĉ. Soft=0.
 
@@ -69,6 +68,8 @@ pub(crate) const LARGE_BLOCK_N: usize = 512;
 /// Thin vs mid-band cut. Mid-band (`THIN_N_MAX < n < LARGE_BLOCK_N`) still
 /// pays over-admission OrderedAdmit unless the wait-set is soft-capped.
 pub(crate) const THIN_N_MAX: usize = 256;
+/// Thin-shell n (3356896-class). SF-PS: never learn Win_8 on this size.
+pub(crate) const THIN_SHELL_N: usize = 176;
 /// Unknown long chain on a large block with no EffectiveWAW → lazy-update.
 const LAZY_CHAIN_PAIR_FLOOR: usize = 32;
 /// Storage spine whose cover_window cannot absorb leftover (19807137-class).
@@ -1035,8 +1036,13 @@ impl CostPolicy {
             .store(c_opt.to_bits(), Ordering::Relaxed);
         self.c_ord_snap_bits
             .store(c_ord.to_bits(), Ordering::Relaxed);
-        self.explore_budget_left
-            .store(self.explore_budget(), Ordering::Relaxed);
+        // Reuse (2+ block): sticky hot path explore_n = 0. Cold ℓ stay greedy.
+        if self.block_seq.load(Ordering::Relaxed) > 1 {
+            self.explore_budget_left.store(0, Ordering::Relaxed);
+        } else {
+            self.explore_budget_left
+                .store(self.explore_budget(), Ordering::Relaxed);
+        }
         for mut e in self.promoted.iter_mut() {
             e.prev_decision = e.decision;
             e.block_reexec_ns = 0;
@@ -1207,9 +1213,9 @@ impl CostPolicy {
         self.large_lazy_path_tax() || self.opt_aligned_path_tax()
     }
 
-    /// S1: ungated execute+validate is OCC-equivalent on every n
-    /// (thin included). Gated txs (`was_queued` / `is_gated`) still
-    /// take the SpecFence path. Callers check `is_gated`.
+    /// Compat: ungated txs take VisibilityPolicy::Opt (Avoid=noop).
+    /// **Not** an architecture lever or Learn target — do not use this
+    /// as “pretend OCC-equivalent” to beat OCC.
     #[inline]
     pub(crate) fn skip_ungated_tx_path_tax(&self) -> bool {
         true
@@ -1674,10 +1680,13 @@ impl CostPolicy {
         }
         let n = self.block_n();
         let cores = self.cores();
-        // S2: thin leftover-train may exceed light (3356896 Win_2→8) but
-        // never a mid-band 16-wide plant (6137495 Win_16).
+        // SF-PS: n≤176 must not learn Win_8. Stay at light cover (Win_2-class).
+        // Thin-above-shell (176 < n ≤ THIN_N_MAX) still must not mill to 8.
+        if n <= THIN_SHELL_N {
+            return light;
+        }
         if n <= THIN_N_MAX {
-            return cores.max(4).min(8).min(full).max(light);
+            return light.max(cores.max(2).min(4)).min(full);
         }
         let cap = if n_pairs >= MIDBAND_COVER_MIN && n < LARGE_BLOCK_N {
             // C4: one segment first, room to deepen a second segment.
@@ -2643,7 +2652,12 @@ impl CostPolicy {
         }
     }
 
+    /// True on the 2nd+ Pevm block (inter-block reuse).
     #[inline]
+    pub(crate) fn is_reuse_block(&self) -> bool {
+        self.block_seq.load(Ordering::Relaxed) > 1
+    }
+
     pub(crate) fn block_n(&self) -> usize {
         self.block_n.load(Ordering::Relaxed)
     }
@@ -3510,6 +3524,15 @@ impl CostPolicy {
             if under_covered {
                 e.last_sys_reexec = false;
                 e.last_crisis = false;
+                // SF-PS: under-covered spine must not leak Full/Seg as success.
+                if matches!(
+                    e.decision,
+                    LocStrategy::FullChain | LocStrategy::Segmented { .. }
+                ) {
+                    e.decision = LocStrategy::OptimisticRead;
+                    e.last_cover_ok = false;
+                    e.cover_window = 0;
+                }
             } else if capped_lose && midband {
                 // C4: deepen cover by a segment; do not zero cover_window.
                 let cur = (e.cover_window as usize)
@@ -3539,7 +3562,10 @@ impl CostPolicy {
                 } else {
                     planted.max(1)
                 };
-                let grow = if midband {
+                let grow = if self.block_n() <= THIN_SHELL_N {
+                    // SF-PS: thin never climbs Win_2 → Win_8.
+                    light.max(cur).min(train)
+                } else if midband {
                     (cur + COVER_SEGMENT_GROW).max(cur.max(planted) + 1)
                 } else {
                     leftover_hops.min(train).max(cur.max(planted) + 1)
@@ -3598,12 +3624,15 @@ impl CostPolicy {
                 || sys_now
                 || detect_resolve_double_charge_now
                 || light_quiet;
-            if n_pairs > ORDER_WINDOW_K
+            if under_covered && e.decision == LocStrategy::FullChain {
+                e.last_cover_ok = false;
+            } else if n_pairs > ORDER_WINDOW_K
                 && is_covering(e.decision, n_pairs, self.seg_cap(), need_now)
                 && e.block_reexec_n < 2
                 && unfenced < 4
                 && absorbed_train
                 && !e.cover_wall_lost
+                && !under_covered
             {
                 e.last_cover_ok = true;
             } else if e.block_reexec_n >= 2 || unfenced >= 4 || e.cover_wall_lost {
@@ -5690,13 +5719,8 @@ mod tests {
                 "U: leftover train on hat-width Win_2 is under-cover, not T3-only"
             );
             assert!(
-                (e.cover_window as usize) > 2,
-                "U: leftover train grows cover_window past oversub hat 2, got {}",
-                e.cover_window
-            );
-            assert!(
-                (e.cover_window as usize) <= 8,
-                "U: grow is train_hat (cores-scaled), not n_pairs−1, got {}",
+                (e.cover_window as usize) <= p.light_hat(8),
+                "SF-PS: thin n=176 must not climb Win_2→Win_8, got {}",
                 e.cover_window
             );
         }
@@ -5704,17 +5728,18 @@ mod tests {
         p.block_arm.clear();
         let need = p.loc_cover_window(0x32be, 8);
         assert!(
-            need > 2 && need <= 8,
-            "U: loc_cover_window must not re-clamp stored need to light_hat=2, need={need}"
+            need <= p.light_hat(8),
+            "SF-PS: thin loc_cover_window stays at light cover, need={need}"
         );
         let (arm, _, _) = p.select_arm(0x32be, 8);
         assert!(
-            !leaves_occ_tail(arm, 8, p.seg_cap(), need),
-            "U/D: grown need must not schedule OCC tail, got {arm:?} need={need}"
+            hops_for_strategy(arm, 8, p.seg_cap()) <= need.max(2),
+            "SF-PS: thin arm stays light, got {arm:?} need={need}"
         );
-        assert!(
-            hops_for_strategy(arm, 8, p.seg_cap()) < 8,
-            "U: still not a full-spine nail, got {arm:?}"
+        assert_ne!(
+            arm,
+            LocStrategy::win(8),
+            "SF-PS: thin must not select Win_8, got {arm:?}"
         );
     }
 
@@ -5930,13 +5955,13 @@ mod tests {
         assert_eq!(p.light_hat(8), 2, "176@8 first cover stays Win_2-class");
         assert_eq!(
             p.train_hat(8),
-            7,
-            "U: leftover-train ceiling is cores-scaled ∩ n_pairs−1, not hat=2"
+            p.light_hat(8),
+            "SF-PS: n≤176 never learns Win_8; train_hat stays light"
         );
         assert_eq!(
             p.train_hat(16),
-            8,
-            "U: longer spine can grow to cores, still not full cover"
+            p.light_hat(16),
+            "SF-PS: thin leftover-train must not mill to Win_8"
         );
         p.begin_block_with_cores(800, 8);
         assert!(

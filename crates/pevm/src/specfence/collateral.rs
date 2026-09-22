@@ -197,9 +197,15 @@ pub(crate) fn optimistic_majority_hinted_lazy(
     if (2..SHORT_SPINE).contains(&n_from) {
         return true;
     }
+    if n_from >= SHORT_SPINE {
+        return false;
+    }
     if let Some(to) = to {
         let n_to = hints.to_txs(&to).len();
-        if (2..SHORT_SPINE).contains(&n_to) {
+        // Recipient spines have no nonce WAW. Long same-to (iter11 24×hot)
+        // must stay lazy so a higher-idx first-touch Basic cannot reset
+        // the lazy evaluation chain.
+        if n_to >= 2 {
             return true;
         }
     }
@@ -293,6 +299,20 @@ mod tests {
         assert!(
             !optimistic_majority_hinted_lazy(&h32, from, Some(to), true, true, true, false),
             "n_from=32 ≥ SHORT_SPINE must not force-lazy"
+        );
+        let hot = Address::repeat_byte(0x2a);
+        let fan = crate::specfence::AccountHints::from_call_to_txs(hot, (0..24).collect());
+        assert!(
+            optimistic_majority_hinted_lazy(
+                &fan,
+                Address::repeat_byte(0x99),
+                Some(hot),
+                true,
+                true,
+                true,
+                false
+            ),
+            "long same-to fan-in must lazy-accumulate"
         );
     }
 }
