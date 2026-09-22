@@ -492,6 +492,12 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if self.is_lazy || address == self.specfence.beneficiary {
             return Ok(());
         }
+        // Soft=0 Opt: no WaitOnce and no crit → zero consult tax.
+        if !self.specfence.access_arms.any_wait_once()
+            && self.specfence.access_arms.crit_loc_hash() == u64::MAX
+        {
+            return Ok(());
+        }
         let wait = self.specfence.access_arms.is_wait_once(location_hash);
         let crit = self.specfence.access_arms.crit_loc_hash() == location_hash;
         if !wait && !crit {
@@ -622,6 +628,8 @@ impl<'a, S: Storage> VmDb<'a, S> {
         // OCC residue used only as a *liveness* hint after abort cleared the
         // SF tip — Blocking still goes through park_publish_wait so
         // estimate_block_sf stays 0 (SoT: no Estimate Block on SF path).
+        // ChainSpineTip: prefer short Released-spin before Blocking park so
+        // true publish Avoid does not serialize the sticky spine.
         let live = executing
             || has_sf_tip
             || matches!(
@@ -632,6 +640,36 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return Ok(());
         }
         self.specfence.sf_tips.record_wait_once_consume();
+        if self.specfence.sf_tips.is_chain_loc(location_hash) && (executing || has_sf_tip) {
+            const SPIN: usize = 8_192;
+            for i in 0..SPIN {
+                if self.specfence.scheduler.is_done(pred)
+                    || self.specfence.scheduler.is_validated(pred)
+                    || (i % 32 == 0 && sf.true_publish_ready(location_hash, pred))
+                {
+                    self.specfence.sf_tips.record_avoid_publish();
+                    self.specfence.sf_tips.record_class_avoid(class);
+                    return Ok(());
+                }
+                if !self.specfence.scheduler.is_executing(pred)
+                    && !self
+                        .specfence
+                        .sf_tips
+                        .has_version_or_released(location_hash, pred)
+                {
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+            if sf.true_publish_ready(location_hash, pred)
+                || self.specfence.scheduler.is_done(pred)
+                || self.specfence.scheduler.is_validated(pred)
+            {
+                self.specfence.sf_tips.record_avoid_publish();
+                self.specfence.sf_tips.record_class_avoid(class);
+                return Ok(());
+            }
+        }
         match live_writer_act(
             &self.specfence,
             self.tx_idx,
@@ -1949,7 +1987,15 @@ impl<S: Storage> Database for VmDb<'_, S> {
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         let location_hash = self.hash_basic(&address);
         let access_k = if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
-            self.specfence.access_log.note(self.tx_idx, location_hash)
+            // Soft=0 Opt: skip ordinal HashMap unless WaitOnce/crit consult.
+            let arms = self.specfence.access_arms;
+            if arms.any_wait_once()
+                && (arms.is_wait_once(location_hash) || arms.crit_loc_hash() == location_hash)
+            {
+                self.specfence.access_log.note(self.tx_idx, location_hash)
+            } else {
+                0
+            }
         } else {
             0
         };
@@ -2412,7 +2458,14 @@ impl<S: Storage> Database for VmDb<'_, S> {
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
         let location_hash = hash_deterministic(MemoryLocation::Storage(address, index));
         let access_k = if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
-            self.specfence.access_log.note(self.tx_idx, location_hash)
+            let arms = self.specfence.access_arms;
+            if arms.any_wait_once()
+                && (arms.is_wait_once(location_hash) || arms.crit_loc_hash() == location_hash)
+            {
+                self.specfence.access_log.note(self.tx_idx, location_hash)
+            } else {
+                0
+            }
         } else {
             0
         };

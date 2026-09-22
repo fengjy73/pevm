@@ -78,6 +78,8 @@ pub(crate) struct AccessArmTable {
     never_wait: AtomicUsize,
     prefix_resume: AtomicUsize,
     prefix_keep_n: AtomicUsize,
+    /// Fast Soft=0 Opt skip: any WaitOnce arm installed this block.
+    any_wait_once: std::sync::atomic::AtomicBool,
     /// `u64::MAX` = no learned chain. Writers are for demand-driven WaitOnce.
     crit_loc: AtomicU64,
     crit_writers: Mutex<Vec<TxIdx>>,
@@ -102,6 +104,7 @@ impl AccessArmTable {
         self.never_wait.store(0, Ordering::Relaxed);
         self.prefix_resume.store(0, Ordering::Relaxed);
         self.prefix_keep_n.store(0, Ordering::Relaxed);
+        self.any_wait_once.store(false, Ordering::Relaxed);
         self.crit_loc.store(u64::MAX, Ordering::Relaxed);
         self.crit_writers.lock().unwrap().clear();
         self.wait_edges.lock().unwrap().clear();
@@ -109,6 +112,9 @@ impl AccessArmTable {
             let arm = AccessArm::from_tag(tag);
             if arm == AccessArm::Opt {
                 continue;
+            }
+            if arm == AccessArm::WaitOnce {
+                self.any_wait_once.store(true, Ordering::Relaxed);
             }
             self.arms.insert(
                 loc,
@@ -198,6 +204,12 @@ impl AccessArmTable {
         self.arms
             .get(&loc)
             .is_some_and(|e| e.arm == AccessArm::WaitOnce)
+    }
+
+    /// Soft=0 Opt fast path: no WaitOnce arm in this block.
+    #[inline]
+    pub(crate) fn any_wait_once(&self) -> bool {
+        self.any_wait_once.load(Ordering::Relaxed)
     }
 
     /// Reuse: shared basic + ascending writers. Nearest pred is the publish
@@ -310,6 +322,7 @@ impl AccessArmTable {
                 hits: 1,
                 peer,
             });
+        self.any_wait_once.store(true, Ordering::Relaxed);
     }
 
     /// WaitOnce + peer for consumer `tx` (Detect before next pick / block).
@@ -389,6 +402,7 @@ impl AccessArmTable {
                             peer: writer,
                         });
                 }
+                self.any_wait_once.store(true, Ordering::Relaxed);
                 LiveAct::Block
             }
         }
