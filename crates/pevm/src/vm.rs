@@ -2681,10 +2681,15 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         locs: &[crate::MemoryLocationHash],
     ) {
         for &loc in locs {
-            let _exact = self
-                .specfence
-                .sf_tips
-                .publish_data(loc, writer, incarnation);
+            // Tip plane only for WaitOnce / crit — full WS publish_data taxed large.
+            if loc == self.specfence.access_arms.crit_loc_hash()
+                || self.specfence.access_arms.is_wait_once(loc)
+            {
+                let _exact = self
+                    .specfence
+                    .sf_tips
+                    .publish_data(loc, writer, incarnation);
+            }
             self.specfence.sketch.push_spine(loc, writer);
             self.specfence.ready_edges.note_published(loc, writer);
             let k = self.specfence.learner.dominant_k(loc);
