@@ -11,7 +11,7 @@
 
 ## Verdict
 
-**Did not meet TPS ≥ 1.5.** SpecFence-native `SfMvMemory` / `SfTipTable` landed (version tip + publish wake + WaitOnce consume without Estimate Block). Soft=0 Instant-off N≥5 both: `seq=par`, `occ_picks=0`, `soft_wait_arms=0`, `explore=0`. Best measured TPS this host ≈ **0.58** (3356896) / ≈ **0.56** (15274915) — incomplete vs 1.5 bar. Path **(c)** Opt→FullReplay still dominates early-WAW basics. Ship tip + honest gaps; continue full-batch.
+**Did not meet TPS ≥ 1.5.** SpecFence-native `SfMvMemory` / `SfTipTable` landed (version tip + publish wake + WaitOnce consume without Estimate Block). Soft=0 Instant-off N≥5 both: `seq=par`, `occ_picks=0`, `soft_wait_arms=0`, `explore=0`. Tip `65b85eb`. Best measured TPS this host ≈ **0.60** (3356896) / ≈ **0.70** (15274915 on noisy OCC) — still incomplete vs 1.5 bar. Path **(c)** Opt→FullReplay still dominates early-WAW basics. Ship tip + honest gaps.
 
 ---
 
