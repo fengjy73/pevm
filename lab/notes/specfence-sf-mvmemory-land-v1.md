@@ -19,6 +19,13 @@
 
 TPS SF/OCC = OCC_wall / SF_wall (higher better). Wall SF/OCC inverse.
 
+**Hard bar ≥1.5: NOT MET.** Best Soft=0 Instant-off N≥5 this session:
+
+| Block | Best OCC ms | Best SF primary ms | **Best TPS** | vs ≥1.5 |
+|------:|------------:|-------------------:|-------------:|:-------:|
+| 3356896 | 1.017 | 1.680 | **0.605** | gap ~2.5× |
+| 15274915 | 5.724 | 10.216 | **0.560** | gap ~2.7× |
+
 ### 3356896 (n=176 thin)
 
 | Round (tip) | OCC median ms | SF primary ms | **TPS SF/OCC** | wall SF/OCC |
@@ -26,18 +33,18 @@ TPS SF/OCC = OCC_wall / SF_wall (higher better). Wall SF/OCC inverse.
 | redesign+Avoid peer (`b8296be`) | 1.017 | 1.680 | **0.605** | 1.65 |
 | large-path restore (`fd4991d`) | 0.910 | 1.580 | **0.576** | 1.74 |
 | tip-install narrow (`7595ef5`) | 0.965 | 2.078 | **0.465** | 2.15 |
+| worker defer (reverted) | 1.384 | 3.000 | **0.461** | 2.17 |
 
-Target ≥1.5 ⇒ SF wall ≤ ~0.67×OCC (~0.61–0.68 ms on this host). Gap ≈ **2.5–3.5×** SF speedup still required.
+Target ≥1.5 ⇒ SF wall ≤ ~0.67×OCC (~0.61–0.68 ms on this host).
 
 ### 15274915 (n=1226 large)
 
 | Round (tip) | OCC median ms | SF primary ms | **TPS SF/OCC** | wall SF/OCC | notes |
 |-------------|--------------:|--------------:|---------------:|------------:|-------|
-| Avoid peer (regressed) | 5.492 | 12.461 | **0.441** | 2.27 | tip tax on all WS |
 | tip-install narrow (`7595ef5`) | 5.724 | 10.216 | **0.560** | 1.78 | rewind≫0, full_from_0 low |
 | opt-v2 calm (prior note) | ~5.35 | ~8.44 | **≈0.63** | ~1.58 | sticky≥32 hold |
 
-Target ≥1.5 ⇒ SF ≤ ~3.8 ms. Gap ≈ **2.7×**. Sticky Rewind intact (`resolve_rewind` 50–98; `full_from_0` mostly ≤11); not yet back to opt-v2 TPS 0.63 stably.
+Target ≥1.5 ⇒ SF ≤ ~3.8 ms. Sticky Rewind intact; TPS not stably back to opt-v2 0.63.
 
 ### Invariants (both, Soft=0 Instant-off N≥5)
 
