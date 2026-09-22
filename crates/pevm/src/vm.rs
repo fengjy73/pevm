@@ -1039,7 +1039,14 @@ impl<'a, S: Storage> VmDb<'a, S> {
             } => {}
         }
         // WaitOnce: the same (tx, ℓ, w) does not enter the park body again.
-        match live_writer_act(&self.specfence, self.tx_idx, self.is_lazy, address, location_hash, w) {
+        match live_writer_act(
+            &self.specfence,
+            self.tx_idx,
+            self.is_lazy,
+            address,
+            location_hash,
+            w,
+        ) {
             crate::specfence::LiveAct::Block => {}
             crate::specfence::LiveAct::Retry => return Err(ReadError::InconsistentRead),
             crate::specfence::LiveAct::Skip => return self.occ_optimistic_read(),
@@ -1596,7 +1603,14 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 .mv_memory
                 .is_aborted_incarnation(tx_idx, tx_incarnation)
             {
-                match live_writer_act(&self.specfence, self.tx_idx, self.is_lazy, address, location_hash, tx_idx) {
+                match live_writer_act(
+                    &self.specfence,
+                    self.tx_idx,
+                    self.is_lazy,
+                    address,
+                    location_hash,
+                    tx_idx,
+                ) {
                     crate::specfence::LiveAct::Skip => {}
                     crate::specfence::LiveAct::Retry => {
                         return Err(ReadError::InconsistentRead);
@@ -1660,8 +1674,7 @@ fn live_writer_act(
         return crate::specfence::LiveAct::Block;
     }
     let never = address == specfence.beneficiary || is_lazy;
-    let finished =
-        specfence.scheduler.is_done(writer) || specfence.scheduler.is_validated(writer);
+    let finished = specfence.scheduler.is_done(writer) || specfence.scheduler.is_validated(writer);
     specfence
         .access_arms
         .decide(tx_idx, location_hash, writer, never, finished)
@@ -1794,7 +1807,14 @@ impl<S: Storage> Database for VmDb<'_, S> {
                             }
                             continue;
                         }
-                        match live_writer_act(&self.specfence, self.tx_idx, self.is_lazy, address, location_hash, *blocking_idx) {
+                        match live_writer_act(
+                            &self.specfence,
+                            self.tx_idx,
+                            self.is_lazy,
+                            address,
+                            location_hash,
+                            *blocking_idx,
+                        ) {
                             crate::specfence::LiveAct::Skip => continue,
                             crate::specfence::LiveAct::Retry => {
                                 return Err(ReadError::InconsistentRead);
@@ -1829,7 +1849,14 @@ impl<S: Storage> Database for VmDb<'_, S> {
                                 }
                                 continue;
                             }
-                            match live_writer_act(&self.specfence, self.tx_idx, self.is_lazy, address, location_hash, *closest_idx) {
+                            match live_writer_act(
+                                &self.specfence,
+                                self.tx_idx,
+                                self.is_lazy,
+                                address,
+                                location_hash,
+                                *closest_idx,
+                            ) {
                                 crate::specfence::LiveAct::Skip => continue,
                                 crate::specfence::LiveAct::Retry => {
                                     return Err(ReadError::InconsistentRead);
@@ -1901,7 +1928,14 @@ impl<S: Storage> Database for VmDb<'_, S> {
         // Fall back to storage
         if final_account.is_none() {
             if let Some(w) = skipped_live_estimate {
-                match live_writer_act(&self.specfence, self.tx_idx, self.is_lazy, address, location_hash, w) {
+                match live_writer_act(
+                    &self.specfence,
+                    self.tx_idx,
+                    self.is_lazy,
+                    address,
+                    location_hash,
+                    w,
+                ) {
                     crate::specfence::LiveAct::Skip => {}
                     crate::specfence::LiveAct::Retry => {
                         return Err(ReadError::InconsistentRead);
@@ -2257,7 +2291,14 @@ impl<S: Storage> Database for VmDb<'_, S> {
                         // still parks (`live_writer_act`).
                         self.specfence.metrics.record_optimistic_read();
                         if !self.specfence.scheduler.is_done(closest_idx) {
-                            match live_writer_act(&self.specfence, self.tx_idx, self.is_lazy, address, location_hash, closest_idx) {
+                            match live_writer_act(
+                                &self.specfence,
+                                self.tx_idx,
+                                self.is_lazy,
+                                address,
+                                location_hash,
+                                closest_idx,
+                            ) {
                                 crate::specfence::LiveAct::Skip => {}
                                 crate::specfence::LiveAct::Retry => {
                                     return Err(ReadError::InconsistentRead);
@@ -2271,7 +2312,14 @@ impl<S: Storage> Database for VmDb<'_, S> {
                             }
                         }
                     } else {
-                        match live_writer_act(&self.specfence, self.tx_idx, self.is_lazy, address, location_hash, closest_idx) {
+                        match live_writer_act(
+                            &self.specfence,
+                            self.tx_idx,
+                            self.is_lazy,
+                            address,
+                            location_hash,
+                            closest_idx,
+                        ) {
                             crate::specfence::LiveAct::Skip => {}
                             crate::specfence::LiveAct::Retry => {
                                 return Err(ReadError::InconsistentRead);
@@ -2283,7 +2331,14 @@ impl<S: Storage> Database for VmDb<'_, S> {
                         }
                     }
                 } else if estimate {
-                    match live_writer_act(&self.specfence, self.tx_idx, self.is_lazy, address, location_hash, closest_idx) {
+                    match live_writer_act(
+                        &self.specfence,
+                        self.tx_idx,
+                        self.is_lazy,
+                        address,
+                        location_hash,
+                        closest_idx,
+                    ) {
                         crate::specfence::LiveAct::Skip => {}
                         crate::specfence::LiveAct::Retry => {
                             return Err(ReadError::InconsistentRead);
@@ -2295,7 +2350,14 @@ impl<S: Storage> Database for VmDb<'_, S> {
                         }
                     }
                 } else {
-                    match live_writer_act(&self.specfence, self.tx_idx, self.is_lazy, address, location_hash, closest_idx) {
+                    match live_writer_act(
+                        &self.specfence,
+                        self.tx_idx,
+                        self.is_lazy,
+                        address,
+                        location_hash,
+                        closest_idx,
+                    ) {
                         crate::specfence::LiveAct::Skip => {}
                         crate::specfence::LiveAct::Retry => {
                             return Err(ReadError::InconsistentRead);

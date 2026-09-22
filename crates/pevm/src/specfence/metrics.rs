@@ -403,6 +403,16 @@ pub struct SpecFenceMetrics {
     pub access_never_wait: usize,
     /// v3: single-invalid validates that installed a prefix keep (`k < fail_k`).
     pub prefix_resume_n: usize,
+    /// v3: FullReplay applies that did not install a prefix keep (restart from k=0).
+    pub full_from_zero: usize,
+    /// v3: prefix-keep events with a known `fail_k > 0`.
+    pub fail_k_n: usize,
+    /// v3: smallest `fail_k` among prefix keeps. 0 when `fail_k_n` is 0.
+    pub fail_k_min: usize,
+    /// v3: largest `fail_k` among prefix keeps.
+    pub fail_k_max: usize,
+    /// v3: `fail_k` histogram. Index `k` for `1..=31`; index 31 also holds `k >= 31`.
+    pub fail_k_hist: [usize; 32],
 }
 
 /// Shared counters written by worker threads.
@@ -591,6 +601,12 @@ pub(crate) struct MetricsInner {
     access_wait_suppressed: AtomicUsize,
     access_never_wait: AtomicUsize,
     prefix_resume_n: AtomicUsize,
+    full_from_zero: AtomicUsize,
+    fail_k_sum: AtomicU64,
+    fail_k_n: AtomicUsize,
+    fail_k_min: AtomicUsize,
+    fail_k_max: AtomicUsize,
+    fail_k_hist: [AtomicUsize; 32],
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -1357,6 +1373,39 @@ impl MetricsInner {
         self.prefix_resume_n.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One prefix keep at a known `fail_k > 0`.
+    pub(crate) fn record_fail_k(&self, k: u32) {
+        let k = k as usize;
+        if k == 0 {
+            return;
+        }
+        self.fail_k_sum.fetch_add(k as u64, Ordering::Relaxed);
+        self.fail_k_n.fetch_add(1, Ordering::Relaxed);
+        self.fail_k_max.fetch_max(k, Ordering::Relaxed);
+        self.fail_k_hist[k.min(31)].fetch_add(1, Ordering::Relaxed);
+        let mut cur = self.fail_k_min.load(Ordering::Relaxed);
+        loop {
+            if cur != 0 && cur <= k {
+                break;
+            }
+            let next = if cur == 0 { k } else { cur.min(k) };
+            match self.fail_k_min.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(seen) => cur = seen,
+            }
+        }
+    }
+
+    /// FullReplay that did not install prefix snaps. The next incarnation starts at k=0.
+    pub(crate) fn record_full_from_zero(&self) {
+        self.full_from_zero.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_value_stable_ff_hit(&self) {
         self.value_stable_ff_hits.fetch_add(1, Ordering::Relaxed);
     }
@@ -1694,6 +1743,11 @@ impl MetricsInner {
             access_wait_suppressed: self.access_wait_suppressed.load(Ordering::Relaxed),
             access_never_wait: self.access_never_wait.load(Ordering::Relaxed),
             prefix_resume_n: self.prefix_resume_n.load(Ordering::Relaxed),
+            full_from_zero: self.full_from_zero.load(Ordering::Relaxed),
+            fail_k_n: self.fail_k_n.load(Ordering::Relaxed),
+            fail_k_min: self.fail_k_min.load(Ordering::Relaxed),
+            fail_k_max: self.fail_k_max.load(Ordering::Relaxed),
+            fail_k_hist: std::array::from_fn(|i| self.fail_k_hist[i].load(Ordering::Relaxed)),
         }
     }
 }

@@ -3,6 +3,7 @@
 //! This is the product loop. It must not call `Scheduler::next_task*` or
 //! the OCC-stage validate entry. OCC contrast stays in `pevm.rs`.
 
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use super::SpecFenceCtx;
@@ -185,6 +186,17 @@ pub(crate) fn run_sf_block<F, V>(
         match task {
             Some(Task::Execution(tx_version)) => {
                 let tx_idx = tx_version.tx_idx;
+                if let Some(slot) = specfence.tx_first_start.get(tx_idx) {
+                    if slot.load(Ordering::Relaxed) == 0 {
+                        let ns = specfence.exec_origin.elapsed().as_nanos() as u64;
+                        let _ = slot.compare_exchange(
+                            0,
+                            ns.max(1),
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        );
+                    }
+                }
                 specfence.ready_edges.note_started(tx_idx);
                 // leftover_min must skip Estimate tips so nonce/fund
                 // Blocking(tx-1) on a done writer cannot ghost-Executing mill

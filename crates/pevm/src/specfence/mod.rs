@@ -731,6 +731,10 @@ pub(crate) struct SpecFenceCtx<'a> {
     pub policy: Option<&'a CostPolicy>,
     /// Per-access Opt | WaitOnce | NeverWait. Shared waiter.
     pub access_arms: &'a crate::specfence::AccessArmTable,
+    /// First Execution-pick elapsed ns from `exec_origin`. 0 = not started. Shared.
+    pub tx_first_start: &'a [std::sync::atomic::AtomicU64],
+    /// Parallel phase origin for `tx_first_start`.
+    pub exec_origin: &'a std::time::Instant,
 }
 
 impl<'a> SpecFenceCtx<'a> {

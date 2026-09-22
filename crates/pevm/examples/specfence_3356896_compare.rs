@@ -216,6 +216,115 @@ fn writers_have_4_31(orders: &[(u64, Vec<usize>)]) -> bool {
     })
 }
 
+fn pearson(xs: &[f64], ys: &[f64]) -> f64 {
+    let n = xs.len();
+    if n < 2 {
+        return 0.0;
+    }
+    let nf = n as f64;
+    let mx = xs.iter().sum::<f64>() / nf;
+    let my = ys.iter().sum::<f64>() / nf;
+    let mut num = 0.0;
+    let mut dx = 0.0;
+    let mut dy = 0.0;
+    for i in 0..n {
+        let a = xs[i] - mx;
+        let b = ys[i] - my;
+        num += a * b;
+        dx += a * a;
+        dy += b * b;
+    }
+    let den = (dx * dy).sqrt();
+    if den == 0.0 { 0.0 } else { num / den }
+}
+
+fn median_ms(vals: &mut [u64]) -> f64 {
+    if vals.is_empty() {
+        return 0.0;
+    }
+    vals.sort_unstable();
+    vals[vals.len() / 2] as f64 / 1e6
+}
+
+fn hist_compact(hist: &[usize; 32]) -> String {
+    let mut s = String::new();
+    for (k, &n) in hist.iter().enumerate() {
+        if n == 0 || k == 0 {
+            continue;
+        }
+        if !s.is_empty() {
+            s.push(',');
+        }
+        if k == 31 {
+            s.push_str(&format!(">={k}:{n}"));
+        } else {
+            s.push_str(&format!("{k}:{n}"));
+        }
+    }
+    if s.is_empty() { "-".to_string() } else { s }
+}
+
+/// Longest writer list is the shared-location chain. Head is its smallest index.
+fn print_focus(pevm: &Pevm, mode_name: &str, i: usize, n: usize, m: &pevm::SpecFenceMetrics) {
+    let starts = pevm.last_tx_first_start();
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    for (tx, &ns) in starts.iter().enumerate() {
+        if ns > 0 {
+            xs.push(tx as f64);
+            ys.push(ns as f64);
+        }
+    }
+    let corr = pearson(&xs, &ys);
+    let q = (n / 10).max(1);
+    let mut low = Vec::new();
+    let mut high = Vec::new();
+    for (tx, &ns) in starts.iter().enumerate() {
+        if ns == 0 {
+            continue;
+        }
+        if tx < q {
+            low.push(ns);
+        }
+        if tx + q >= n {
+            high.push(ns);
+        }
+    }
+    let (loc, chain) = pevm
+        .last_location_writers()
+        .iter()
+        .max_by_key(|(_, w)| w.len())
+        .map(|(h, w)| (*h, w.clone()))
+        .unwrap_or((0, Vec::new()));
+    let head = chain.iter().copied().min();
+    let tail = chain.iter().copied().max();
+    let start_ms = |tx: Option<usize>| {
+        tx.and_then(|t| starts.get(t).copied())
+            .filter(|ns| *ns > 0)
+            .map(|ns| ns as f64 / 1e6)
+            .unwrap_or(0.0)
+    };
+    println!(
+        "  focus {mode_name}[{i}] full={} full_from_0={} prefix={} fail_k_n={} fail_k_min={} fail_k_max={} hist={} chain={loc:016x} chain_n={} head_tx={} head_ms={:.3} tail_tx={} tail_ms={:.3} corr={corr:.3} low_q_ms={:.3} high_q_ms={:.3} explore={} began_prior={}",
+        m.resolve_full_replay,
+        m.full_from_zero,
+        m.prefix_resume_n,
+        m.fail_k_n,
+        m.fail_k_min,
+        m.fail_k_max,
+        hist_compact(&m.fail_k_hist),
+        chain.len(),
+        head.unwrap_or(0),
+        start_ms(head),
+        tail.unwrap_or(0),
+        start_ms(tail),
+        median_ms(&mut low),
+        median_ms(&mut high),
+        m.explore_n,
+        m.began_from_prior as u8
+    );
+}
+
 fn run_once(
     pevm: &mut Pevm,
     mode_name: &str,
@@ -342,6 +451,9 @@ fn run_once(
                 m.journal_ff_hits,
                 m.resolve_partial_rewind
             );
+            if mode_name == "specfence" {
+                print_focus(pevm, mode_name, i, n, &m);
+            }
             IterRow {
                 mode: mode_name.to_string(),
                 i,

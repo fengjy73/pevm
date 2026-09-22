@@ -195,7 +195,10 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
             // abort_and_estimate cleared ff_head. Install prefix snaps now,
             // before the next incarnation's reset, so reads with k < fail_k
             // are served from ff_head. The failed location is not in the set.
-            keep_single_invalid_prefix(&ctx);
+            // A miss is a true restart from k=0.
+            if !keep_single_invalid_prefix(&ctx) {
+                ctx.specfence.metrics.record_full_from_zero();
+            }
             enqueue_higher_revalidate(&ctx, tx);
             // Observed WAW: wait for the producer instead of Opt ping-pong.
             if ctx.specfence.ready_edges.leftover_surplus(tx)
@@ -382,17 +385,18 @@ fn abort_and_estimate(ctx: &ApplyCtx<'_>) {
 }
 
 /// n_invalid = 1 at a known k: keep snaps for k' < fail_k. Not Ordered-from-0.
-fn keep_single_invalid_prefix(ctx: &ApplyCtx<'_>) {
+/// Returns whether a prefix was installed.
+fn keep_single_invalid_prefix(ctx: &ApplyCtx<'_>) -> bool {
     if ctx.invalid.len() != 1 {
-        return;
+        return false;
     }
     let tx = ctx.tx_version.tx_idx;
     let loc = ctx.invalid[0];
     if ctx.specfence.access_arms.is_never(loc) || location_is_lazy(ctx.mv_memory, tx, loc) {
-        return;
+        return false;
     }
     let Some(k) = ctx.specfence.access_log.first_k(tx, loc).filter(|k| *k > 0) else {
-        return;
+        return false;
     };
     ctx.specfence.access_arms.note_early_waw(loc, k);
     let prefix = ctx.specfence.access_log.prefix_before(tx, k);
@@ -403,6 +407,10 @@ fn keep_single_invalid_prefix(ctx: &ApplyCtx<'_>) {
     if n > 0 {
         ctx.specfence.access_arms.note_prefix_resume(n);
         ctx.specfence.metrics.record_prefix_resume(n);
+        ctx.specfence.metrics.record_fail_k(k);
+        true
+    } else {
+        false
     }
 }
 

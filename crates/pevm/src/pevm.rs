@@ -3,7 +3,11 @@ use std::{
     cell::UnsafeCell,
     fmt::Debug,
     num::NonZeroUsize,
-    sync::{OnceLock, mpsc},
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     thread,
 };
 
@@ -177,6 +181,8 @@ pub struct Pevm {
     last_incarnations: Vec<usize>,
     last_location_writers: Vec<(u64, Vec<usize>)>,
     last_begin_blocked: Vec<usize>,
+    /// First Execution-pick elapsed ns. 0 = that tx never started. SpecFence only.
+    last_tx_first_start: Vec<u64>,
     last_initial_wait_accounts: std::collections::HashSet<alloy_primitives::Address>,
     /// M4: abort rate from the previous SpecFence block (`occ_aborts / n_tx`).
     last_abort_rate: f64,
@@ -205,6 +211,7 @@ impl Default for Pevm {
             last_incarnations: Vec::new(),
             last_location_writers: Vec::new(),
             last_begin_blocked: Vec::new(),
+            last_tx_first_start: Vec::new(),
             last_initial_wait_accounts: std::collections::HashSet::new(),
             last_abort_rate: 0.0,
             finegrain_enabled: false,
@@ -340,6 +347,12 @@ impl Pevm {
         &self.last_begin_blocked
     }
 
+    /// Elapsed ns from the parallel-phase origin to each tx's first Execution pick.
+    /// `0` means that index never started. SpecFence fills this; OCC leaves it empty.
+    pub fn last_tx_first_start(&self) -> &[u64] {
+        &self.last_tx_first_start
+    }
+
     /// G7: InterBlockPrior flip-α events observed since last reset.
     pub fn inter_prior_flip_count(&self) -> usize {
         self.inter_prior.flip_count()
@@ -431,6 +444,9 @@ impl Pevm {
         }
 
         let block_size = txs.len();
+        self.last_tx_first_start.clear();
+        let tx_first_start: Vec<AtomicU64> = (0..block_size).map(|_| AtomicU64::new(0)).collect();
+        let exec_origin = Instant::now();
         let scheduler = Scheduler::new(block_size);
 
         let mv_memory = chain.build_mv_memory(&block_env, &txs);
@@ -582,6 +598,8 @@ impl Pevm {
             policy: (self.concurrency_mode == ConcurrencyMode::SpecFence)
                 .then_some(&self.cost_policy),
             access_arms: &access_arms,
+            tx_first_start: &tx_first_start,
+            exec_origin: &exec_origin,
         };
 
         // TODO: Better thread handling
@@ -988,6 +1006,7 @@ impl Pevm {
             self.last_incarnations.clear();
             self.last_location_writers.clear();
             self.last_begin_blocked.clear();
+            self.last_tx_first_start.clear();
         }
         metrics_inner.set_engagement_metrics(
             engagement.lean_mode_txs(),
@@ -996,6 +1015,12 @@ impl Pevm {
             self.hotset.location_hot_resolves(),
             self.hotset.len(),
         );
+        if self.concurrency_mode == ConcurrencyMode::SpecFence {
+            self.last_tx_first_start = tx_first_start
+                .iter()
+                .map(|slot| slot.load(Ordering::Relaxed))
+                .collect();
+        }
         self.last_metrics = metrics_inner.snapshot(
             wave_id,
             mean_wait,
