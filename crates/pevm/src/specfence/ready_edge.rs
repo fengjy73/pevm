@@ -1112,9 +1112,14 @@ impl ReadyEdgeTable {
                 if cur == consumer {
                     break None;
                 }
-                let cand = if cur != NONE && cur < consumer && !self.is_writer_done(cur) {
-                    Some(cur)
-                } else if loc_tip < consumer && !self.is_writer_done(loc_tip) {
+                // One live overflow hop is enough. Extending it serializes
+                // every later writer of ℓ (gate_stall longer than OCC) while
+                // the antichain was already running. Later writers stay
+                // ungated and resolve by rebind / one replay.
+                if cur != NONE && cur < consumer && !self.is_writer_done(cur) {
+                    break None;
+                }
+                let cand = if loc_tip < consumer && !self.is_writer_done(loc_tip) {
                     Some(loc_tip)
                 } else if fallback < consumer && !self.is_writer_done(fallback) {
                     Some(fallback)
@@ -1992,23 +1997,26 @@ mod tests {
         assert!(t.admitted_on_location(1));
         assert!(t.admitted_on_location(2));
         assert!(t.plant_observed_window(3, 0, loc, 2));
-        assert!(t.plant_observed_window(4, 0, loc, 2));
-        assert!(t.plant_observed_window(5, 0, loc, 2));
+        assert!(
+            !t.plant_observed_window(4, 0, loc, 2),
+            "second overflow must not extend the Detect chain"
+        );
+        assert!(!t.plant_observed_window(5, 0, loc, 2));
         assert!(!t.admitted_on_location(3));
         assert_eq!(t.consumer_count_on(loc), 2, "atomic cap, not racy walk");
         assert_eq!(t.blocking_producer(3), Some(2));
-        assert_eq!(t.blocking_producer(4), Some(3));
-        assert_eq!(t.blocking_producer(5), Some(4));
+        assert_eq!(t.blocking_producer(4), None);
+        assert_eq!(t.blocking_producer(5), None);
         t.note_producer_done(0, &wave);
         assert!(t.may_execute(1), "window waiter of 0 wakes");
         assert!(t.may_execute(2), "window waiter of 0 wakes");
+        assert!(!t.may_execute(3), "the one overflow hop still waits");
         assert!(
-            !t.may_execute(3) && !t.may_execute(5),
-            "overflow must not stampede with the window tip"
+            t.may_execute(4) && t.may_execute(5),
+            "later writers stay in the antichain"
         );
         t.note_producer_done(2, &wave);
         assert!(t.may_execute(3));
-        assert!(!t.may_execute(4), "chain continues after loc-tip Commit");
     }
 
     #[test]

@@ -345,10 +345,11 @@ impl ArmTable {
                 self.reward(loc, false, tick);
                 if unfenced_storm {
                     self.e5_n.fetch_add(1, Ordering::Relaxed);
-                    self.mark_under_covered(loc);
-                } else {
-                    self.maybe_queue_promote(loc, block_n, chain_len);
+                    // P2: a storm is not an Opt failure sink. Queue one
+                    // IntraPatch (≤1/ℓ via promoted_this_block); PC may veto.
+                    // Do not sticky-Opt or zero explore.
                 }
+                self.maybe_queue_promote(loc, block_n, chain_len);
             }
         }
     }
@@ -439,7 +440,11 @@ impl ArmTable {
         let cap = Self::w_max(block_n, chain_len, false);
         let cur = self.entries.get(&loc).map(|e| e.arm.window()).unwrap_or(0);
         let next = (cur.saturating_add(1)).min(cap).max(1);
-        self.pending.lock().unwrap().push(IntraPatch {
+        let mut pending = self.pending.lock().unwrap();
+        if pending.iter().any(|p| p.location == loc) {
+            return;
+        }
+        pending.push(IntraPatch {
             location: loc,
             new_arm: ArmKind::Win { w: next },
         });
@@ -492,15 +497,21 @@ impl ArmTable {
                 }
             }
             self.promoted_this_block.insert(p.location);
+            // Useful Win sticks for the next block. Opt is not a failure sink.
+            let stick = matches!(p.new_arm, ArmKind::Win { .. });
             self.entries
                 .entry(p.location)
                 .and_modify(|e| {
                     e.arm = p.new_arm;
-                    e.sticky = false;
+                    e.sticky = stick;
+                    e.under_covered = false;
+                    if stick {
+                        e.explore_budget.store(0, Ordering::Relaxed);
+                    }
                 })
                 .or_insert_with(|| ArmEntry {
                     arm: p.new_arm,
-                    sticky: false,
+                    sticky: stick,
                     n_pull: AtomicUsize::new(0),
                     n_reward: AtomicUsize::new(0),
                     ema_wall_ns: AtomicU64::new(0),
@@ -510,8 +521,13 @@ impl ArmTable {
                     under_covered: false,
                     lazy: false,
                 });
-            if let Some(pol) = policy {
-                pol.promote_short_edge(p.location, 0);
+            // Thin high-indep shell (n≤176): stick the Win in the arm table
+            // but do not promote an OrderedAdmit edge. That prepaid is the
+            // 3356896 shell. Wider blocks still publish the one patch.
+            if block_n > THIN_SHELL_N {
+                if let Some(pol) = policy {
+                    pol.promote_short_edge(p.location, 0);
+                }
             }
             self.mid_promote_n.fetch_add(1, Ordering::Relaxed);
             applied += 1;
@@ -615,6 +631,20 @@ mod tests {
         let e = t.entries.get(&11).expect("prior arm");
         assert_eq!(e.explore_budget.load(Ordering::Relaxed), 0);
         assert!(e.sticky);
+    }
+
+    #[test]
+    fn storm_queues_one_win_and_does_not_sticky_opt() {
+        let t = ArmTable::new();
+        t.observe(ResolvePlan::FullReplay, Some(11), false, true, 400, 4);
+        t.observe(ResolvePlan::FullReplay, Some(11), false, true, 400, 4);
+        let pending = t.pending.lock().unwrap().len();
+        assert_eq!(pending, 1, "≤1 IntraPatch per location");
+        let e = t.entries.get(&11).expect("arm");
+        assert!(!e.sticky, "storm must not sticky Opt");
+        assert!(!e.under_covered);
+        assert!(matches!(e.arm, ArmKind::Opt));
+        assert_eq!(t.e5_n(), 2);
     }
 
     #[test]

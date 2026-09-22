@@ -432,7 +432,11 @@ fn drain_wave_to_runnable(ctx: &ApplyCtx<'_>) {
 }
 
 fn requeue(ctx: &ApplyCtx<'_>, tx: crate::TxIdx, kind: QueueKind) {
-    ctx.runnable.force_push(tx, kind);
+    // Owner holds ST_RUNNING from the pick. CAS it onto the queue.
+    // force_push would also overwrite a claim another worker already took.
+    if !ctx.runnable.release_owner(tx, kind) {
+        let _ = ctx.runnable.wake_idle(tx, kind);
+    }
 }
 
 fn enqueue_revalidate(ctx: &ApplyCtx<'_>, reader: crate::TxIdx) {
@@ -455,6 +459,9 @@ fn enqueue_revalidate(ctx: &ApplyCtx<'_>, reader: crate::TxIdx) {
 
 fn enqueue_higher_revalidate(ctx: &ApplyCtx<'_>, tx: crate::TxIdx) {
     let writes = ctx.mv_memory.write_locations(tx);
+    // Lazy beneficiary/sender writes still invalidate higher readers. Skipping
+    // that fan-out on the thin shell (n≤176) committed a different account
+    // balance than sequential on 3356896 while receipts matched.
     for loc in writes {
         for reader in ctx.mv_memory.higher_readers_of(loc, tx) {
             if reader > tx {

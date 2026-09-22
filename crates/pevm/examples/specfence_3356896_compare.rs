@@ -622,6 +622,21 @@ fn main() {
         soft: 0,
     };
 
+    if std::env::var("SPECFENCE_COMPARE_CHECK").is_ok() {
+        let mut checker = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
+        let par = checker
+            .execute(&chain, &storage, &block, cores_nz, false)
+            .expect("parallel");
+        let seq = checker
+            .execute(&chain, &storage, &block, cores_nz, true)
+            .expect("sequential");
+        if par != seq {
+            eprintln!("seq!=par block={block_no} n={n}");
+            std::process::exit(2);
+        }
+        println!("seq=par ok block={block_no}");
+    }
+
     if let Ok(path) = std::env::var("SPECFENCE_COMPARE_JSON") {
         let f = File::create(&path).expect("compare json");
         serde_json::to_writer_pretty(

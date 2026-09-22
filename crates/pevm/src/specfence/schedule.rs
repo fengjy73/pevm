@@ -6,6 +6,7 @@
 use super::arm_table::ArmTable;
 use super::metrics::MetricsInner;
 use super::policy::CostPolicy;
+use super::policy::THIN_SHELL_N;
 use super::producer_stage::ProducerStageTable;
 use super::ready_edge::ReadyEdgeTable;
 use super::runnable_set::{RunnableSet, SfPick};
@@ -30,7 +31,13 @@ pub(crate) fn pick(
     if let Some(p) = policy
         && p.has_pending_idle()
     {
-        if p.skip_useless_cover_probe() || p.skip_reuse_leftover_flush() {
+        // P5: thin high-indep blocks already match OCC on CPU. Flushing
+        // idle edges plants OrderedAdmit and is schedule meta. Drop the
+        // pending set; do not add prepaid.
+        if scheduler.block_size() <= THIN_SHELL_N
+            || p.skip_useless_cover_probe()
+            || p.skip_reuse_leftover_flush()
+        {
             let _ = p.take_pending_idle();
         } else {
             let _ = crate::specfence::admit::flush_pending_idle_edges(ready, p);
@@ -69,8 +76,8 @@ pub(crate) fn pick(
                         }
                         return Some(Task::Validation(v));
                     }
-                    runnable.force_push(tx, super::runnable_set::QueueKind::Revalidate);
-                    continue;
+                    let _ = runnable.release_owner(tx, super::runnable_set::QueueKind::Revalidate);
+                    break;
                 }
                 if scheduler.is_aborting(tx) && ready.may_execute(tx) {
                     let _ = scheduler.recover_aborting(tx);
@@ -88,16 +95,17 @@ pub(crate) fn pick(
                     return Some(Task::Execution(tx_version));
                 }
                 if scheduler.is_ready(tx) {
-                    // Race: still Ready but claim failed — owner requeue.
-                    runnable.force_push(tx, super::runnable_set::QueueKind::Indep);
-                    continue;
+                    // Owner only. Do not tight-loop the same Ready claim
+                    // (narrow-tail pick churn). Another worker may steal it.
+                    let _ = runnable.release_owner(tx, super::runnable_set::QueueKind::Indep);
+                    break;
                 }
                 if scheduler.is_executed(tx) {
                     if let Some(v) = scheduler.prepare_revalidate(tx) {
                         return Some(Task::Validation(v));
                     }
-                    runnable.force_push(tx, super::runnable_set::QueueKind::Revalidate);
-                    continue;
+                    let _ = runnable.release_owner(tx, super::runnable_set::QueueKind::Revalidate);
+                    break;
                 }
                 // try_execute missed (Executing leftover / Aborting).
                 // Leaving ST_RUNNING here blocked force_idle_recover
@@ -119,9 +127,9 @@ pub(crate) fn pick(
                     if let Some(tx_version) = scheduler.try_execute_producer(tx) {
                         return Some(Task::Execution(tx_version));
                     }
-                    runnable.force_push(tx, super::runnable_set::QueueKind::Indep);
+                    let _ = runnable.release_owner(tx, super::runnable_set::QueueKind::Indep);
                 } else if scheduler.is_executed(tx) {
-                    runnable.force_push(tx, super::runnable_set::QueueKind::Revalidate);
+                    let _ = runnable.release_owner(tx, super::runnable_set::QueueKind::Revalidate);
                 } else {
                     runnable.release_running(tx);
                 }

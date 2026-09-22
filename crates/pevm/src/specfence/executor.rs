@@ -507,6 +507,29 @@ pub(crate) fn validate_occ_kernel(
     )
 }
 
+/// Same-output invalid reads can be patched in place. Refuses Estimate and
+/// any location whose published data does not match the read the tx took.
+fn salvage_value_stable_rebind(
+    mv_memory: &MvMemory,
+    specfence: SpecFenceCtx<'_>,
+    tx_idx: TxIdx,
+    invalid: &[MemoryLocationHash],
+) -> bool {
+    if invalid.is_empty() {
+        return false;
+    }
+    let value_stable = invalid.iter().all(|&loc| {
+        let Some(cur) = mv_memory.current_data_value(tx_idx, loc) else {
+            return false;
+        };
+        specfence
+            .partial_retry
+            .identity_stable_match(tx_idx, loc, &cur)
+            || mv_memory.prior_read_value_stable(tx_idx, loc)
+    });
+    value_stable && mv_memory.try_rebind_invalid_reads_value_stable(tx_idx, invalid)
+}
+
 /// Validate → [`ResolvePlan`]. Does **not** abort or finish validation.
 /// Edged paths never call [`validate_occ_kernel`] / [`validate_occ_stage`].
 pub(crate) fn validate_to_plan(
@@ -526,7 +549,31 @@ pub(crate) fn validate_to_plan(
     if note_and_try_commute(specfence, mv_memory, tx_version.tx_idx, &invalid) {
         return (ResolvePlan::Commit, invalid);
     }
+    // P1: value-stable rebind is salvage on Opt and edged paths. It commits
+    // this incarnation instead of an unfenced FullReplay.
+    if salvage_value_stable_rebind(mv_memory, specfence, tx_version.tx_idx, &invalid) {
+        return (ResolvePlan::PartialAbortRebind, invalid);
+    }
     if vis.is_opt() {
+        // Non-lazy WAW whose peer has executed or is still executing:
+        // OrderedReplay instead of an unfenced FullReplay. Value-stable
+        // rebind was already refused. No begin-block OrderedAdmit.
+        if let Some(f) = classify_first_conflict(
+            specfence.hints,
+            mv_memory,
+            specfence.beneficiary,
+            tx_version.tx_idx,
+            &invalid,
+        ) {
+            if f.class == ConflictClass::EffectiveWAW
+                && !f.lazy
+                && f.peer.is_some_and(|w| {
+                    w < tx_version.tx_idx && (scheduler.is_executing(w) || scheduler.is_executed(w))
+                })
+            {
+                return (ResolvePlan::OrderedReplay, invalid);
+            }
+        }
         return (ResolvePlan::FullReplay, invalid);
     }
 

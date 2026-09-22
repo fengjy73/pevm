@@ -173,6 +173,25 @@ impl RunnableSet {
         self.q(kind).push_local(tx);
     }
 
+    /// Owner finished a failed claim. Only the worker that holds
+    /// `ST_RUNNING` may publish the tx back. A swap would steal another
+    /// worker's running bit (double execute).
+    #[inline]
+    pub(crate) fn release_owner(&self, tx: TxIdx, kind: QueueKind) -> bool {
+        if tx >= self.block_size {
+            return false;
+        }
+        let tag = kind.tag();
+        if self.state[tx]
+            .compare_exchange(ST_RUNNING, tag, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return false;
+        }
+        self.q(kind).push_local(tx);
+        true
+    }
+
     /// Owner requeue: this worker is done with the claim (failed pick or
     /// validate requeue). Swaps `ST_RUNNING` onto the queue.
     #[inline]
