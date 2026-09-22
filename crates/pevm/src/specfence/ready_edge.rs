@@ -169,8 +169,10 @@ impl ReadyEdgeTable {
         }
     }
 
-    /// Reuse WAW: each writer after the first waits for the previous one
-    /// on `loc`. Forward only. The head stays ungated.
+    /// Reuse WAW: each later writer waits for the previous one on `loc`.
+    /// Not `mark_gated`: a gated tx leaves the fast Opt path, and that
+    /// raised FullReplay on the thin block. The successor stays off the
+    /// queue until the pred commits, then runs ungated on the publish.
     pub(crate) fn plant_nearest_preds(&self, loc: MemoryLocationHash, writers: &[TxIdx]) -> usize {
         let mut n = 0;
         for pair in writers.windows(2) {
@@ -179,7 +181,23 @@ impl ReadyEdgeTable {
             if pred >= succ {
                 continue;
             }
-            self.note_consumer_on(succ, pred, Some(loc));
+            self.consumers
+                .entry(succ)
+                .or_insert_with(|| AtomicUsize::new(pred));
+            let e = self.consumers.get(&succ).unwrap();
+            let mut cur = e.load(Ordering::Relaxed);
+            while cur == NONE || (pred > cur && pred < succ) {
+                match e.compare_exchange_weak(cur, pred, Ordering::Relaxed, Ordering::Relaxed) {
+                    Ok(_) => break,
+                    Err(v) => cur = v,
+                }
+            }
+            drop(e);
+            let mut w = self.waiters.entry(pred).or_default();
+            if !w.iter().any(|&c| c == succ) {
+                w.push(succ);
+            }
+            let _ = loc;
             n += 1;
         }
         n
@@ -741,7 +759,10 @@ impl ReadyEdgeTable {
         if leftover_wake != NONE && leftover_wake != writer && self.may_execute(leftover_wake) {
             wave.push_ready(leftover_wake);
         }
-        if !self.has_any_gated() {
+        // No gated set and no held successors: nothing to wake.
+        // Held WAW successors are not gated; dropping `cs` here left
+        // them in ST_WAIT forever.
+        if !self.has_any_gated() && cs.is_empty() {
             return;
         }
         if !had_waiters && !self.was_queued(writer) && self.deferred_n.load(Ordering::Relaxed) == 0

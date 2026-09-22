@@ -239,6 +239,8 @@ fn select_crit_chain(
             .collect();
         w.sort_unstable();
         w.dedup();
+        // A near-total order is the block, not a chain. Short spines are
+        // still packed: begin holds only the long ones.
         if w.len() < 4 || w.len() * 4 > block_size.max(1) {
             continue;
         }
@@ -581,8 +583,16 @@ impl Pevm {
                 if writers.len() < 4 || writers.len() * 4 > block_size {
                     return None;
                 }
-                access_arms.install_crit_chain(loc, &writers);
-                ready_edges.plant_nearest_preds(loc, &writers);
+                access_arms.install_crit_chain(loc);
+                // Hold successors off the queue only for a long spine.
+                // 3356896's ~15-writer chain serialized slower than the
+                // replays (reuse SF/OCC 1.42 vs census 1.28). 15274915's
+                // ~60-writer chain is the one that pays for itself.
+                // Both still pop the head first. A short spine re-reads
+                // once when the pred's Data lands, and stays ungated.
+                if writers.len() >= 32 {
+                    ready_edges.plant_nearest_preds(loc, &writers);
+                }
                 writers.first().copied()
             });
             self.last_begin_blocked = ready_edges.blocked_consumers();

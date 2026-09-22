@@ -158,6 +158,12 @@ pub(crate) struct VmDb<'a, S: Storage> {
     /// OptimisticRead accesses this incarnation (end-tx process flush; no DashMap).
     optimistic_read_this_tx: Cell<u32>,
     pcc_this_tx: Cell<u32>,
+    /// One same-incarnation re-read after the learned location is published over.
+    /// Reset when `(tx, incarnation)` changes. A second hit falls through so
+    /// the retry cap cannot park the tx with nobody to wake it.
+    crit_retry_tx: Cell<TxIdx>,
+    crit_retry_inc: Cell<crate::TxIncarnation>,
+    crit_retry_left: Cell<u8>,
     // Whether to enforce the sender-nonce ordering check for this transaction.
     // False for transaction types with no nonce (e.g. OP deposits).
     has_nonce: bool,
@@ -204,6 +210,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.read_set.clear();
         self.read_accounts.clear();
         self.pcc_armed.set(false);
+        if self.crit_retry_tx.get() != tx_idx || self.crit_retry_inc.get() != incarnation {
+            self.crit_retry_tx.set(tx_idx);
+            self.crit_retry_inc.set(incarnation);
+            self.crit_retry_left.set(1);
+        }
         if let Some(fg) = self.specfence.finegrain {
             fg.deep_begin_consumer(tx_idx, incarnation);
         }
@@ -474,6 +485,31 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.optimistic_read_this_tx.set(0);
         self.pcc_this_tx.set(0);
         self.pcc_armed.set(false);
+    }
+
+    /// Learned WAW: the read already took pre-state, and a lower writer has
+    /// since published Data. One same-incarnation retry. A second sighting
+    /// falls through; validation still FullReplays. Not a park — a park
+    /// `note_consumer_on`s and mark_gates the tx.
+    fn retry_if_crit_published_over(&mut self) -> Result<(), ReadError> {
+        if self.crit_retry_left.get() == 0 || self.is_lazy {
+            return Ok(());
+        }
+        let loc = self.specfence.access_arms.crit_loc_hash();
+        if loc == u64::MAX {
+            return Ok(());
+        }
+        let Some(origins) = self.read_set.get(&loc) else {
+            return Ok(());
+        };
+        if origins.last() != Some(&ReadOrigin::Storage) {
+            return Ok(());
+        }
+        if !self.mv_memory.lower_data_before(loc, self.tx_idx) {
+            return Ok(());
+        }
+        self.crit_retry_left.set(0);
+        Err(ReadError::InconsistentRead)
     }
 
     /// Mode dispatch. OCC is `Ok(())` with **zero** SpecFence calls.
@@ -1583,6 +1619,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
         let location_hash = hash_deterministic(MemoryLocation::CodeHash(address));
         if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
             let _ = self.specfence.access_log.note(self.tx_idx, location_hash);
+            self.retry_if_crit_published_over()?;
         }
         let read_origins = self.read_set.entry(location_hash).or_default();
 
@@ -1687,37 +1724,10 @@ impl<S: Storage> Database for VmDb<'_, S> {
         let location_hash = self.hash_basic(&address);
         if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
             let _ = self.specfence.access_log.note(self.tx_idx, location_hash);
-            // Learned chain: if the nearest pred is already executing, wait
-            // once. A pred that has not started is the scheduler's job
-            // (nearest-pred gate); parking here would stall every core.
-            if !self.is_lazy
-                && address != self.specfence.beneficiary
-                && let Some(pred) = self
-                    .specfence
-                    .access_arms
-                    .crit_pred(self.tx_idx, location_hash)
-            {
-                let finished = self.specfence.scheduler.is_done(pred)
-                    || self.specfence.scheduler.is_validated(pred);
-                if !finished && self.specfence.scheduler.is_executing(pred) {
-                    match live_writer_act(
-                        &self.specfence,
-                        self.tx_idx,
-                        self.is_lazy,
-                        address,
-                        location_hash,
-                        pred,
-                    ) {
-                        crate::specfence::LiveAct::Block => {
-                            return Err(self.park_estimate_blocking(location_hash, pred));
-                        }
-                        crate::specfence::LiveAct::Retry => {
-                            return Err(ReadError::InconsistentRead);
-                        }
-                        crate::specfence::LiveAct::Skip => {}
-                    }
-                }
-            }
+            // A Storage read of the learned location is already stale once a
+            // lower writer publishes Data. Re-read once, still ungated.
+            // Blocking here would mark_gated and leave the fast path.
+            self.retry_if_crit_published_over()?;
         }
         self.maybe_wait(address, location_hash, false)?;
         let resolve = self.resolve_read_overlay();
@@ -2163,6 +2173,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
         let location_hash = hash_deterministic(MemoryLocation::Storage(address, index));
         if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
             let _ = self.specfence.access_log.note(self.tx_idx, location_hash);
+            self.retry_if_crit_published_over()?;
         }
         self.maybe_wait(address, location_hash, true)?;
         let resolve = self.resolve_read_overlay();
@@ -2496,6 +2507,9 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             pcc_armed: Cell::new(false),
             optimistic_read_this_tx: Cell::new(0),
             pcc_this_tx: Cell::new(0),
+            crit_retry_tx: Cell::new(usize::MAX),
+            crit_retry_inc: Cell::new(0),
+            crit_retry_left: Cell::new(0),
             has_nonce: true,
             // Unless it is a raw transfer that is lazy updated, we'll
             // read at least from the sender and recipient accounts.

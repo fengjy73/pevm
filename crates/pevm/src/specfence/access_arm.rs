@@ -5,7 +5,6 @@
 //! is done. A second Blocking of the same triple is refused. Beneficiary and
 //! basic-lazy are NeverWait. Sticky Opt is not an arm.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use dashmap::DashMap;
@@ -78,12 +77,14 @@ pub(crate) struct AccessArmTable {
     prefix_keep_n: AtomicUsize,
     /// `u64::MAX` = no learned chain. Set before workers start.
     crit_loc: AtomicU64,
-    crit_writers: Mutex<Vec<TxIdx>>,
 }
 
 impl AccessArmTable {
     pub(crate) fn new() -> Self {
-        Self::default()
+        let t = Self::default();
+        // Default atomic is 0, which is a real location hash.
+        t.crit_loc.store(u64::MAX, Ordering::Relaxed);
+        t
     }
 
     /// Install the previous block's arms. A morph flip already decayed
@@ -97,7 +98,6 @@ impl AccessArmTable {
         self.prefix_resume.store(0, Ordering::Relaxed);
         self.prefix_keep_n.store(0, Ordering::Relaxed);
         self.crit_loc.store(u64::MAX, Ordering::Relaxed);
-        self.crit_writers.lock().unwrap().clear();
         for (loc, tag, k) in prior.access_arm_snapshot() {
             let arm = AccessArm::from_tag(tag);
             if arm == AccessArm::Opt {
@@ -132,22 +132,15 @@ impl AccessArmTable {
             .is_some_and(|e| e.arm == AccessArm::NeverWait)
     }
 
-    /// Reuse: this location's writers, ascending. Nearest pred is the
-    /// publish the next writer must see.
-    pub(crate) fn install_crit_chain(&self, loc: MemoryLocationHash, writers: &[TxIdx]) {
+    /// Reuse: the shared basic the longest writer chain publishes.
+    pub(crate) fn install_crit_chain(&self, loc: MemoryLocationHash) {
         self.crit_loc.store(loc, Ordering::Relaxed);
-        *self.crit_writers.lock().unwrap() = writers.to_vec();
         self.note_early_waw(loc, 1);
     }
 
-    /// Immediate prior writer on the learned chain, if `loc` is that chain.
-    pub(crate) fn crit_pred(&self, tx: TxIdx, loc: MemoryLocationHash) -> Option<TxIdx> {
-        if self.crit_loc.load(Ordering::Relaxed) != loc {
-            return None;
-        }
-        let writers = self.crit_writers.lock().unwrap();
-        let i = writers.partition_point(|&w| w < tx);
-        if i == 0 { None } else { Some(writers[i - 1]) }
+    #[inline]
+    pub(crate) fn crit_loc_hash(&self) -> MemoryLocationHash {
+        self.crit_loc.load(Ordering::Relaxed)
     }
 
     /// Hot early basic/storage WAW template. The next read of `ℓ` waits

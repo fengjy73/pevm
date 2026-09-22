@@ -170,9 +170,17 @@ impl RunnableSet {
                 ready.note_skip_gate(tx);
                 self.mark_wait(tx);
             }
-        } else {
-            self.push(tx, QueueKind::Indep);
+            return;
         }
+        // Learned WAW successor: off-queue until the pred commits, still
+        // ungated so the resume stays on the Opt path.
+        if let Some(pred) = ready.blocking_producer(tx)
+            && !ready.is_writer_done(pred)
+        {
+            self.mark_wait(tx);
+            return;
+        }
+        self.push(tx, QueueKind::Indep);
     }
 
     #[inline]
@@ -1030,7 +1038,8 @@ mod tests {
             panic!("expected execute");
         };
         assert_eq!(tx, 4, "learned chain head starts before index 0");
-        assert!(ready.is_gated(6) && !ready.may_execute(6));
+        assert!(!ready.is_gated(6), "successor stays on the Opt path");
+        assert_eq!(ready.blocking_producer(6), Some(4));
     }
 
     #[test]
