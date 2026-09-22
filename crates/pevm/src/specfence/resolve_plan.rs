@@ -100,8 +100,13 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
                 if full {
                     ctx.specfence.access_arms.note_replay_after_protect();
                 }
-            } else {
-                ctx.specfence.access_arms.protect_hot(loc);
+            } else if ctx.specfence.access_arms.protect_hot(loc) {
+                // Writers already observed this block. Prior-chain touchers
+                // are edged inside protect_hot. Arm peer stays 0.
+                let seen = ctx.specfence.ready_edges.writers_of(loc);
+                for w in seen.windows(2) {
+                    ctx.specfence.access_arms.note_wait_edge(w[1], w[0], loc);
+                }
             }
         }
     }

@@ -90,6 +90,9 @@ pub(crate) struct AccessArmTable {
     /// `u64::MAX` = no learned chain. Writers are for demand-driven WaitOnce.
     crit_loc: AtomicU64,
     crit_writers: Mutex<Vec<TxIdx>>,
+    /// Prior-block touchers, not armed until the first hot conflict on `ℓ`.
+    prior_loc: AtomicU64,
+    prior_writers: Mutex<Vec<TxIdx>>,
     /// Detect (a) edges for next pick / next block: (consumer, producer, ℓ).
     wait_edges: Mutex<Vec<(TxIdx, TxIdx, MemoryLocationHash)>>,
 }
@@ -98,6 +101,7 @@ impl AccessArmTable {
     pub(crate) fn new() -> Self {
         let t = Self::default();
         t.crit_loc.store(u64::MAX, Ordering::Relaxed);
+        t.prior_loc.store(u64::MAX, Ordering::Relaxed);
         t
     }
 
@@ -119,6 +123,8 @@ impl AccessArmTable {
         self.protect_live.store(false, Ordering::Relaxed);
         self.crit_loc.store(u64::MAX, Ordering::Relaxed);
         self.crit_writers.lock().unwrap().clear();
+        self.prior_loc.store(u64::MAX, Ordering::Relaxed);
+        self.prior_writers.lock().unwrap().clear();
         self.wait_edges.lock().unwrap().clear();
         for (loc, tag, k, peer) in prior.access_arm_snapshot() {
             let arm = AccessArm::from_tag(tag);
@@ -228,6 +234,26 @@ impl AccessArmTable {
         self.any_wait_once.load(Ordering::Relaxed)
     }
 
+    /// Remember who touched `ℓ` last block. WaitOnce edges are installed
+    /// only when this block's first hot conflict protects `ℓ`.
+    pub(crate) fn note_prior_touchers(&self, loc: MemoryLocationHash, writers: &[TxIdx]) {
+        self.prior_loc.store(loc, Ordering::Relaxed);
+        *self.prior_writers.lock().unwrap() = writers.to_vec();
+    }
+
+    fn install_protect_edges(&self, loc: MemoryLocationHash) {
+        let writers = if self.crit_loc.load(Ordering::Relaxed) == loc {
+            self.crit_writers.lock().unwrap().clone()
+        } else if self.prior_loc.load(Ordering::Relaxed) == loc {
+            self.prior_writers.lock().unwrap().clone()
+        } else {
+            return;
+        };
+        for w in writers.windows(2) {
+            self.note_wait_edge(w[1], w[0], loc);
+        }
+    }
+
     /// Reuse: shared basic + ascending writers. Nearest pred is the publish
     /// the next writer must see. Hold is planted separately for long spines.
     pub(crate) fn install_crit_chain(&self, loc: MemoryLocationHash, writers: &[TxIdx]) {
@@ -273,15 +299,32 @@ impl AccessArmTable {
         if i == 0 { None } else { Some(writers[i - 1]) }
     }
 
-    /// Avoid-up-front pred for a WaitOnce ℓ: crit chain, else last noted peer.
+    /// Avoid-up-front pred for a WaitOnce ℓ: crit chain, arm peer, else the
+    /// per-consumer edge. Arm peer stays 0 for mid-block protect so unrelated
+    /// txs keep the thin OCC-shaped skip; the edge names only that toucher.
     pub(crate) fn wait_once_pred(&self, tx: TxIdx, loc: MemoryLocationHash) -> Option<TxIdx> {
         if let Some(p) = self.crit_pred(tx, loc) {
             return Some(p);
         }
-        self.arms.get(&loc).and_then(|e| {
+        if let Some(p) = self.arms.get(&loc).and_then(|e| {
             let p = e.peer;
             (p > 0 && p < tx).then_some(p)
-        })
+        }) {
+            return Some(p);
+        }
+        self.nearest_edge_pred(tx, loc)
+    }
+
+    /// Latest producer this consumer was told to wait for on `loc`.
+    fn nearest_edge_pred(&self, tx: TxIdx, loc: MemoryLocationHash) -> Option<TxIdx> {
+        let edges = self.wait_edges.lock().unwrap();
+        let mut best: Option<TxIdx> = None;
+        for &(c, p, l) in edges.iter() {
+            if c == tx && l == loc && p > 0 && p < tx {
+                best = Some(best.map_or(p, |b| b.max(p)));
+            }
+        }
+        best
     }
 
     /// All WaitOnce (loc, peer) pairs with `peer < tx` — Detect before execute.
@@ -368,6 +411,7 @@ impl AccessArmTable {
             return false;
         }
         self.note_early_waw(loc, 1);
+        self.install_protect_edges(loc);
         self.protect_n.fetch_add(1, Ordering::Relaxed);
         self.protect_live.store(true, Ordering::Relaxed);
         true
@@ -624,14 +668,20 @@ mod tests {
     #[test]
     fn protect_hot_arms_wait_once_without_occ_shaped_peer() {
         let t = AccessArmTable::new();
+        t.note_prior_touchers(11, &[3, 7, 40]);
         assert!(t.protect_hot(11));
+        assert_eq!(t.wait_once_pred(40, 11), Some(7));
+        assert_eq!(t.wait_once_pred(7, 11), Some(3));
+        assert!(!t.has_wait_once_peer_before(4));
         assert!(!t.protect_hot(11), "one protect per location");
         assert!(t.is_protected(11));
         assert!(t.is_wait_once(11));
         assert!(t.protect_live());
         assert_eq!(t.protect_n(), 1);
-        // Peer stays 0 so unrelated later txs keep the OCC-shaped skip.
-        assert!(!t.has_wait_once_peer_before(40));
+        // Arm peer stays 0. Only the prior touchers gain a WaitOnce edge.
+        assert!(!t.has_wait_once_peer_before(2));
+        assert!(t.has_wait_once_peer_before(40));
+        assert!(!t.has_wait_once_peer_before(6));
         t.note_replay_after_protect();
         t.note_protect_before_opt();
         assert_eq!(t.replay_after_protect_n(), 1);

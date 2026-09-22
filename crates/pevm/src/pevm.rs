@@ -594,6 +594,7 @@ impl Pevm {
             // Reuse WAW: nearest pred on the learned chain, then pop that
             // head before the low-index antichain.
             let crit_head = self.inter_prior.crit_chain().and_then(|(loc, writers)| {
+                access_arms.note_prior_touchers(loc, &writers);
                 if writers.len() < 32 || writers.len() * 4 > block_size {
                     return None;
                 }

@@ -521,7 +521,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
         {
             return Ok(());
         }
-        if self.sf_occ_shaped {
+        let protected = self.specfence.access_arms.is_protected(location_hash);
+        // Before the Opt read. Large is not OCC-shaped, so this cannot sit
+        // behind the thin shaped check.
+        if protected {
             self.specfence.access_arms.note_protect_before_opt();
         }
         // Soft=0 Opt: no WaitOnce and no crit → zero consult tax.
@@ -560,7 +563,8 @@ impl<'a, S: Storage> VmDb<'a, S> {
             .or_else(|| {
                 // Thin Soft=0: Learn peer + crit are enough — skip MvMemory /
                 // writers_of alloc ladder (scaffolding tax when Avoid already works).
-                if thin {
+                // A protected ℓ has peer 0; the ordered writer is the true tip.
+                if thin && !protected {
                     return None;
                 }
                 self.mv_memory
@@ -573,7 +577,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     .filter(|&w| w < self.tx_idx)
             })
             .or_else(|| {
-                if thin {
+                if thin && !protected {
                     return None;
                 }
                 self.specfence
@@ -669,7 +673,15 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 "estimate"
             );
         if !live {
-            return Ok(());
+            // Protected ℓ: do not Opt-fall into another FullReplay. Park on
+            // the ordered pred until the true tip is published (scheduler
+            // dependency, not an Estimate mutex and not a core-pinning spin).
+            let unpublished = protected
+                && !finished
+                && !sf.true_publish_ready(location_hash, pred);
+            if !unpublished {
+                return Ok(());
+            }
         }
         self.specfence.sf_tips.record_wait_once_consume();
         // ChainSpineTip: brief Released poll (not long busy-spin) before park.
