@@ -373,6 +373,8 @@ fn run_mode(
     let mut walls = Vec::with_capacity(iters);
     let mut tpss = Vec::with_capacity(iters);
     let mut last_metrics = None;
+    let mut occ_pick_iters: Vec<usize> = Vec::new();
+    let mut soft_iters: Vec<usize> = Vec::new();
     let mut last_process = None;
     let mut last_learn = None;
     let mut last_wait_set_n = 0usize;
@@ -433,6 +435,10 @@ fn run_mode(
                         last_learn = Some(learn);
                     }
                 }
+                if mode == "specfence" {
+                    occ_pick_iters.push(m.occ_schedule_picks);
+                    soft_iters.push(m.soft_wait_arms);
+                }
                 last_metrics = Some(m);
             }
             Err(e) => {
@@ -443,6 +449,18 @@ fn run_mode(
         }
     }
 
+    // Cold is iter 0. Reuse median is iters 1.. — same index rule as
+    // `specfence_3356896_compare` (`sorted[len/2]`). Snapshot before
+    // `summarize_f64`, which sorts in place.
+    let wall_iters = walls.clone();
+    let wall_cold = walls.first().copied();
+    let reuse_med = if walls.len() >= 2 {
+        let mut rest = walls[1..].to_vec();
+        rest.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        Some(rest[rest.len() / 2])
+    } else {
+        None
+    };
     let (wall_med, wall_p90, wall_min, wall_mean) = if walls.is_empty() {
         (0.0, 0.0, 0.0, 0.0)
     } else {
@@ -458,12 +476,6 @@ fn run_mode(
         .as_ref()
         .map(|m| metrics_json(m, n))
         .unwrap_or_else(|| serde_json::json!({}));
-    let reuse_med = if walls.len() >= 2 {
-        let mut rest = walls[1..].to_vec();
-        Some(summarize_f64(&mut rest).0)
-    } else {
-        None
-    };
     let mut row = serde_json::json!({
         "block": loaded.number,
         "mode": mode,
@@ -483,7 +495,10 @@ fn run_mode(
         "wall_ms_p90": wall_p90,
         "wall_ms_min": wall_min,
         "wall_ms_mean": wall_mean,
-        "wall_ms_cold": walls.first().copied(),
+        "wall_ms_cold": wall_cold,
+        "wall_ms_iters": wall_iters,
+        "occ_schedule_picks_iters": occ_pick_iters,
+        "soft_wait_arms_iters": soft_iters,
         "wall_ms_reuse_median": reuse_med,
         "metrics": metrics,
         "arm_cold": first_arm,
@@ -593,10 +608,14 @@ fn main() {
                 for mode in ["occ", "specfence"] {
                     let row = run_mode(&chain, &loaded, mode, 8, iters, false, reuse);
                     eprintln!(
-                        "  {mode:10} ok={} tps={:.0} wall_ms={:.1} reuse_med={} arm={}→{} unf={} double_charge={} sys={} cover={} w={} cover_window={} wait_set={} end_block_us={} soft={} aborts={} ordered_admit={} wait={} rewind={} rebind={} full={}",
+                        "  {mode:10} ok={} tps={:.0} wall_ms={:.1} cold={} reuse_med={} arm={}→{} unf={} double_charge={} sys={} cover={} w={} cover_window={} wait_set={} end_block_us={} soft={} occ_picks={} aborts={} ordered_admit={} wait={} rewind={} rebind={} full={}",
                         row["ok"],
                         row["tps"].as_f64().unwrap_or(0.0),
                         row["wall_ms"].as_f64().unwrap_or(0.0),
+                        row["wall_ms_cold"]
+                            .as_f64()
+                            .map(|v| format!("{v:.1}"))
+                            .unwrap_or_else(|| "-".into()),
                         row["wall_ms_reuse_median"]
                             .as_f64()
                             .map(|v| format!("{v:.1}"))
@@ -614,6 +633,7 @@ fn main() {
                         row["learn"]["wait_set_n"].as_u64().unwrap_or(0),
                         row["learn"]["end_block_ns"].as_u64().unwrap_or(0) as f64 / 1000.0,
                         row["metrics"]["soft_wait_arms"].as_u64().unwrap_or(0),
+                        row["metrics"]["occ_schedule_picks"].as_u64().unwrap_or(0),
                         row["metrics"]["occ_aborts"].as_u64().unwrap_or(0),
                         row["metrics"]["edge_ordered_admit"].as_u64().unwrap_or(0),
                         row["metrics"]["edge_wait_for"].as_u64().unwrap_or(0),
@@ -733,6 +753,13 @@ fn main() {
                     "end_block_ns": sf["learn"]["end_block_ns"],
                     "selected_arms": sf["learn"]["selected_arms"],
                     "sf_reuse_wall_ms": sf["wall_ms_reuse_median"],
+                    "sf_cold_wall_ms": sf["wall_ms_cold"],
+                    "occ_cold_wall_ms": occ["wall_ms_cold"],
+                    "occ_reuse_wall_ms": occ["wall_ms_reuse_median"],
+                    "sf_wall_iters": sf["wall_ms_iters"],
+                    "occ_wall_iters": occ["wall_ms_iters"],
+                    "occ_schedule_picks": sf["metrics"]["occ_schedule_picks"],
+                    "sf_schedule_picks": sf["metrics"]["sf_schedule_picks"],
                 }));
             }
             _ => {}

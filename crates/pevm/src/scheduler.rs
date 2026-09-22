@@ -68,6 +68,10 @@ pub(crate) struct Scheduler {
     // The list of dependent transactions to resume when the
     // key transaction is re-executed.
     transactions_dependents: Vec<Mutex<SmallVec<[TxIdx; 1]>>>,
+    /// `add_dependency` target while status is `Aborting`. `usize::MAX` if none.
+    /// Heal must not `recover_aborting` (incarnation++) while this writer is
+    /// still unpublished — that mill hit 19807137 (`root_inc` tens of thousands).
+    blocked_on: Vec<AtomicUsize>,
     /// wait_for_dependency waiters: park without `Aborting`; wake keeps incarnation.
     wait_for_dependency_waiters: Vec<Mutex<SmallVec<[TxIdx; 1]>>>,
     // The next transaction to try and execute.
@@ -107,6 +111,9 @@ impl Scheduler {
             done_flags: (0..block_size).map(|_| AtomicBool::new(false)).collect(),
             validated_flags: (0..block_size).map(|_| AtomicBool::new(false)).collect(),
             transactions_dependents: (0..block_size).map(|_| Mutex::default()).collect(),
+            blocked_on: (0..block_size)
+                .map(|_| AtomicUsize::new(usize::MAX))
+                .collect(),
             wait_for_dependency_waiters: (0..block_size).map(|_| Mutex::default()).collect(),
             // We won't validate until we find the first non-lazy transaction that
             // needs to read explicit values. We also skip the first transaction.
@@ -524,6 +531,8 @@ impl Scheduler {
         debug_assert_eq!(tx.status, IncarnationStatus::Executing);
         tx.status = IncarnationStatus::Aborting;
         self.set_done_flag(tx_idx, false);
+        drop(tx);
+        self.blocked_on[tx_idx].store(blocking_tx_idx, Ordering::Release);
 
         let mut blocking_dependents = index_mutex!(self.transactions_dependents, blocking_tx_idx);
         blocking_dependents.push(tx_idx);
@@ -669,6 +678,39 @@ impl Scheduler {
         tx.status = IncarnationStatus::ReadyToExecute;
         tx.incarnation += 1;
         self.set_done_flag(tx_idx, false);
+        drop(tx);
+        self.blocked_on[tx_idx].store(usize::MAX, Ordering::Release);
+    }
+
+    /// Drop a scheduler park. Used when the writer is `leftover_passed`
+    /// and not inside execute — the claim already committed, so the
+    /// waiter must not stay `Aborting` on it.
+    pub(crate) fn clear_stale_block(&self, waiter: TxIdx, writer: TxIdx) {
+        if waiter >= self.block_size {
+            return;
+        }
+        let cur = self.blocked_on[waiter].load(Ordering::Acquire);
+        if cur == writer {
+            self.blocked_on[waiter].store(usize::MAX, Ordering::Release);
+        }
+        if writer < self.block_size {
+            let _ = self.detach_dependent(writer, waiter);
+        }
+    }
+
+    /// Writer still owed by an `Aborting` park. `None` once that writer is
+    /// `Executed`/`Validated` or the park was cleared.
+    #[inline]
+    pub(crate) fn live_block(&self, tx_idx: TxIdx) -> Option<TxIdx> {
+        if tx_idx >= self.block_size {
+            return None;
+        }
+        let b = self.blocked_on[tx_idx].load(Ordering::Acquire);
+        if b >= self.block_size || self.is_done(b) {
+            None
+        } else {
+            Some(b)
+        }
     }
 
     /// A1/D6: pull the spine writer into the ready queue so WaitFor targets
@@ -750,6 +792,87 @@ impl Scheduler {
         (0..self.block_size).any(|i| !self.is_done(i) && !self.is_validated(i))
     }
 
+    /// Public unfinished probe for the SpecFence RunnableSet worker.
+    #[inline]
+    pub(crate) fn has_unfinished(&self) -> bool {
+        self.has_undone()
+    }
+
+    /// True when this incarnation is `Executed` (needs validate / revalidate).
+    #[inline]
+    pub(crate) fn is_executed(&self, tx_idx: TxIdx) -> bool {
+        if tx_idx >= self.block_size {
+            return false;
+        }
+        let tx = index_mutex!(self.transactions_status, tx_idx);
+        tx.status == IncarnationStatus::Executed
+    }
+
+    /// Current incarnation version (ledger, not a pick).
+    #[inline]
+    pub(crate) fn current_version(&self, tx_idx: TxIdx) -> Option<TxVersion> {
+        if tx_idx >= self.block_size {
+            return None;
+        }
+        let tx = index_mutex!(self.transactions_status, tx_idx);
+        Some(TxVersion {
+            tx_idx,
+            tx_incarnation: tx.incarnation,
+        })
+    }
+
+    /// Demote Validated → Executed so Resolve can re-check the read set.
+    pub(crate) fn prepare_revalidate(&self, tx_idx: TxIdx) -> Option<TxVersion> {
+        if tx_idx >= self.block_size {
+            return None;
+        }
+        let mut tx = index_mutex!(self.transactions_status, tx_idx);
+        if tx.status == IncarnationStatus::Validated {
+            tx.status = IncarnationStatus::Executed;
+            self.num_validated.fetch_sub(1, Ordering::Relaxed);
+            self.set_validated_flag(tx_idx, false);
+        }
+        if tx.status == IncarnationStatus::Executed {
+            Some(TxVersion {
+                tx_idx,
+                tx_incarnation: tx.incarnation,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// All txs have a Validated stamp (SF block-complete).
+    #[inline]
+    pub(crate) fn all_validated(&self) -> bool {
+        self.num_validated.load(Ordering::Relaxed) >= self.block_size
+            || (0..self.block_size).all(|i| self.is_validated(i))
+    }
+
+    /// SpecFence validation finish: never returns a Block-STM next task.
+    /// Abort leaves the tx Ready; the caller requeues on RunnableSet.
+    pub(crate) fn finish_validation_sf(
+        &self,
+        tx_version: &TxVersion,
+        aborted: bool,
+        rewind_to: Option<TxIdx>,
+    ) {
+        if aborted {
+            self.set_ready_status(tx_version.tx_idx);
+            if let Some(to) = rewind_to {
+                let to = to.clamp(tx_version.tx_idx + 1, self.block_size);
+                self.validation_idx.fetch_min(to, Ordering::Relaxed);
+            }
+            return;
+        }
+        let mut tx = index_mutex!(self.transactions_status, tx_version.tx_idx);
+        if tx.status == IncarnationStatus::Executed {
+            tx.status = IncarnationStatus::Validated;
+            self.num_validated.fetch_add(1, Ordering::Relaxed);
+            self.set_validated_flag(tx_version.tx_idx, true);
+        }
+    }
+
     /// True when the incarnation is queued `ReadyToExecute` (S1 prefer-admit).
     #[inline]
     pub(crate) fn is_ready(&self, tx_idx: TxIdx) -> bool {
@@ -783,6 +906,8 @@ impl Scheduler {
         tx.status = IncarnationStatus::ReadyToExecute;
         tx.incarnation += 1;
         self.set_done_flag(tx_idx, false);
+        drop(tx);
+        self.blocked_on[tx_idx].store(usize::MAX, Ordering::Release);
         true
     }
 
@@ -960,6 +1085,9 @@ impl Scheduler {
         if aborting {
             tx.status = IncarnationStatus::Aborting;
             self.set_done_flag(tx_version.tx_idx, false);
+            drop(tx);
+            // Validation abort is not an `add_dependency` park.
+            self.blocked_on[tx_version.tx_idx].store(usize::MAX, Ordering::Release);
         }
         aborting
     }
@@ -1002,6 +1130,63 @@ impl Scheduler {
         }
         let tx = index_mutex!(self.transactions_status, tx_idx);
         tx.status == IncarnationStatus::Aborting
+    }
+
+    /// Hang-trace: incarnation and scheduler deps that name `waiter`.
+    pub(crate) fn hang_dep_of(&self, waiter: TxIdx) -> (usize, usize, usize) {
+        if waiter >= self.block_size {
+            return (0, usize::MAX, usize::MAX);
+        }
+        let inc = {
+            let tx = index_mutex!(self.transactions_status, waiter);
+            tx.incarnation
+        };
+        let mut dep = usize::MAX;
+        let mut wfd = usize::MAX;
+        for b in 0..self.block_size {
+            if dep == usize::MAX {
+                let deps = index_mutex!(self.transactions_dependents, b);
+                if deps.iter().any(|&t| t == waiter) {
+                    dep = b;
+                }
+            }
+            if wfd == usize::MAX {
+                let waits = index_mutex!(self.wait_for_dependency_waiters, b);
+                if waits.iter().any(|&t| t == waiter) {
+                    wfd = b;
+                }
+            }
+            if dep != usize::MAX && wfd != usize::MAX {
+                break;
+            }
+        }
+        (inc, dep, wfd)
+    }
+
+    /// Lost-wakeup recover: `Aborting` → Ready (incarnation++).
+    #[inline]
+    pub(crate) fn recover_aborting(&self, tx_idx: TxIdx) -> bool {
+        if tx_idx >= self.block_size || !self.is_aborting(tx_idx) {
+            return false;
+        }
+        self.set_ready_status(tx_idx);
+        self.is_ready(tx_idx)
+    }
+
+    /// WaitForDependency leftover: status stayed `Executing` after the worker
+    /// returned `Blocked`. Same incarnation → Ready.
+    #[inline]
+    pub(crate) fn recover_executing_waiter(&self, tx_idx: TxIdx) -> bool {
+        if tx_idx >= self.block_size {
+            return false;
+        }
+        let mut tx = index_mutex!(self.transactions_status, tx_idx);
+        if tx.status != IncarnationStatus::Executing {
+            return false;
+        }
+        tx.status = IncarnationStatus::ReadyToExecute;
+        self.set_done_flag(tx_idx, false);
+        true
     }
 
     #[inline]

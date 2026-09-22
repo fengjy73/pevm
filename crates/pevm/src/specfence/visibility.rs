@@ -34,6 +34,13 @@ impl VisibilityPolicy {
     /// location queue, else [`Self::WaitReleased`].
     #[inline]
     pub(crate) fn for_ready(ready: &ReadyEdgeTable, tx: TxIdx) -> Self {
+        // leftover_min is a claim token, often ungated. Opt raced Estimate
+        // tips then nonce / WaitForDependency Blocking(tx-1) on a writer
+        // already done — leftover_min stayed Executing (19807137 n_unf=198).
+        // WaitReleased skips Estimate; leftover_min can commit. Not OCC pick.
+        if ready.is_live_leftover_min(tx) {
+            return Self::WaitReleased;
+        }
         if !ready.is_gated(tx) {
             return Self::Opt;
         }
@@ -75,6 +82,26 @@ mod tests {
         );
         assert!(VisibilityPolicy::Opt.is_opt());
         assert!(!VisibilityPolicy::Opt.needs_fence());
+    }
+
+    #[test]
+    fn leftover_min_is_wait_released_even_when_ungated() {
+        let ready = ReadyEdgeTable::new();
+        assert!(!ready.plant_global_leftover(20));
+        assert!(ready.is_live_leftover_min(20));
+        assert!(
+            !ready.is_gated(20),
+            "leftover_min claim token is not Detect-starred"
+        );
+        assert_eq!(
+            VisibilityPolicy::for_ready(&ready, 20),
+            VisibilityPolicy::WaitReleased
+        );
+        assert_eq!(
+            VisibilityPolicy::for_ready(&ready, 3),
+            VisibilityPolicy::Opt,
+            "non-leftover stays Avoid=noop"
+        );
     }
 
     #[test]

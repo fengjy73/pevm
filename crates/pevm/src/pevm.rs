@@ -3,7 +3,11 @@ use std::{
     cell::UnsafeCell,
     fmt::Debug,
     num::NonZeroUsize,
-    sync::{OnceLock, mpsc},
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     thread,
 };
 
@@ -29,12 +33,13 @@ use crate::{
     mv_memory::MvMemory,
     scheduler::Scheduler,
     specfence::{
-        AccountHints, AdaptiveEngagement, AdaptiveParams, BayesMap, ConcurrencyMode, CostPolicy,
-        DEFAULT_TAU, EdgeTable, ExecProcessSnapshot, FineGrainCollector, FineGrainSnapshot,
-        HeatMap, HotSet, HotSketch, InterBlockPrior, LeanAbortRepair, LearnReport, LiveLearner,
-        MetricsInner, PartialRetryTable, ProcessTrace, RemCounters, ResearchAbortRepair,
-        RwPriorMap, SpecDag, SpecFenceCtx, SpecFenceMetrics, WaveParkTable, seed_wait_regions,
-        update_bayes, update_heat, update_rw_prior,
+        AccountHints, AdaptiveEngagement, AdaptiveParams, ArmTable, BayesMap, ConcurrencyMode,
+        CostPolicy, DEFAULT_TAU, EdgeTable, ExecProcessSnapshot, FineGrainCollector,
+        FineGrainSnapshot, HeatMap, HotSet, HotSketch, InterBlockPrior, LeanAbortRepair,
+        LearnReport, LiveLearner, MetricsInner, PartialRetryTable, ProcessTrace, RemCounters,
+        ResearchAbortRepair, RunnableSet, RwPriorMap, SfExec, SpecDag, SpecFenceCtx,
+        SpecFenceMetrics, VisibilityPolicy, WaveParkTable, seed_wait_regions, update_bayes,
+        update_heat, update_rw_prior,
     },
     storage::StorageWrapper,
     vm::{
@@ -176,6 +181,8 @@ pub struct Pevm {
     last_incarnations: Vec<usize>,
     last_location_writers: Vec<(u64, Vec<usize>)>,
     last_begin_blocked: Vec<usize>,
+    /// First Execution-pick elapsed ns. 0 = that tx never started. SpecFence only.
+    last_tx_first_start: Vec<u64>,
     last_initial_wait_accounts: std::collections::HashSet<alloy_primitives::Address>,
     /// M4: abort rate from the previous SpecFence block (`occ_aborts / n_tx`).
     last_abort_rate: f64,
@@ -204,12 +211,45 @@ impl Default for Pevm {
             last_incarnations: Vec::new(),
             last_location_writers: Vec::new(),
             last_begin_blocked: Vec::new(),
+            last_tx_first_start: Vec::new(),
             last_initial_wait_accounts: std::collections::HashSet::new(),
             last_abort_rate: 0.0,
             finegrain_enabled: false,
             finegrain: FineGrainCollector::new(),
         }
     }
+}
+
+/// Longest non-beneficiary writer list that is still a chain, not the block.
+/// `len * 4 <= block` keeps a 77-of-1226 spine and refuses a near-total order.
+fn select_crit_chain(
+    orders: &[(u64, Vec<usize>)],
+    block_size: usize,
+    beneficiary: u64,
+) -> Option<(u64, Vec<usize>)> {
+    let mut best: Option<(u64, Vec<usize>)> = None;
+    for &(loc, ref writers) in orders {
+        if loc == beneficiary {
+            continue;
+        }
+        let mut w: Vec<usize> = writers
+            .iter()
+            .copied()
+            .filter(|&t| t < block_size)
+            .collect();
+        w.sort_unstable();
+        w.dedup();
+        // Under 32 writers the serial wait / WaitOnce park costs more than
+        // the replay it removes (3356896, chain ~15). 15274915 is ~60.
+        if w.len() < 32 || w.len() * 4 > block_size.max(1) {
+            continue;
+        }
+        let replace = best.as_ref().is_none_or(|(_, prev)| w.len() > prev.len());
+        if replace {
+            best = Some((loc, w));
+        }
+    }
+    best
 }
 
 impl Pevm {
@@ -330,13 +370,26 @@ impl Pevm {
     }
 
     /// Location writer total order after write-set Detect (D1).
+    /// After sticky≥32 HOLD, includes the held crit spine even when Avoid
+    /// quieted live D1 notes (focus chain_n must not collapse 62→4).
     pub fn last_location_writers(&self) -> &[(u64, Vec<usize>)] {
         &self.last_location_writers
+    }
+
+    /// Sticky crit chain packed for the next reuse begin (`None` if unset).
+    pub fn sticky_crit_chain(&self) -> Option<(u64, Vec<usize>)> {
+        self.inter_prior.crit_chain()
     }
 
     /// ReadyEdge consumers blocked at begin_block (PC tax snapshot).
     pub fn last_begin_blocked(&self) -> &[usize] {
         &self.last_begin_blocked
+    }
+
+    /// Elapsed ns from the parallel-phase origin to each tx's first Execution pick.
+    /// `0` means that index never started. SpecFence fills this; OCC leaves it empty.
+    pub fn last_tx_first_start(&self) -> &[u64] {
+        &self.last_tx_first_start
     }
 
     /// G7: InterBlockPrior flip-α events observed since last reset.
@@ -430,6 +483,9 @@ impl Pevm {
         }
 
         let block_size = txs.len();
+        self.last_tx_first_start.clear();
+        let tx_first_start: Vec<AtomicU64> = (0..block_size).map(|_| AtomicU64::new(0)).collect();
+        let exec_origin = Instant::now();
         let scheduler = Scheduler::new(block_size);
 
         let mv_memory = chain.build_mv_memory(&block_env, &txs);
@@ -480,6 +536,11 @@ impl Pevm {
         let certificates = crate::specfence::CertificateTable::new(block_size);
         let ready_edges = crate::specfence::ReadyEdgeTable::new();
         let producer_stages = crate::specfence::ProducerStageTable::new();
+        let runnable = RunnableSet::new(block_size, concurrency_level.get());
+        let arms = ArmTable::new();
+        // Shared waiter / AccessArm. Private state is the per-worker Vm.
+        let access_arms = crate::specfence::AccessArmTable::new();
+        let sf_tips = crate::specfence::SfTipTable::new();
         let lanes = crate::specfence::LaneTable::new();
         let edges = EdgeTable::new();
         let sketch = HotSketch::new();
@@ -492,6 +553,17 @@ impl Pevm {
             // PE even on quiet morph (M4). Truly cold seeds nothing.
             self.cost_policy
                 .begin_block_with_cores(block_size, concurrency_level.get());
+            arms.begin_from_prior(&self.inter_prior, self.cost_policy.is_reuse_block());
+            access_arms.begin_from_prior(&self.inter_prior);
+            // Detect (a): restore WaitOnce edges as ungated waits before pick.
+            // Thin only — large sticky≥32 plant already orders long chains;
+            // packing every abort edge into begin wait collapsed large TPS.
+            if block_size <= crate::specfence::THIN_SHELL_N {
+                let _planted = access_arms.plant_wait_edges(&ready_edges);
+            }
+            // B4: Prior → CostPolicy.block_arm before admit_seed so wave-1
+            // hops_to_admit / Detect.G match ArmTable (not a cold re-select).
+            let _ = arms.install_prior_into_policy(&self.cost_policy, block_size);
             // Thin CallWaw chain needs hints only (P2: skip contract walk).
             // PROFILE Instant only (product path must not pay begin Instant).
             {
@@ -519,7 +591,21 @@ impl Pevm {
             }
             // P3/P4: bag serves gated wake only. A0 never seeds the bag.
             // Do not sample block_size as ready_width when A1=0 (that read as 176).
+            // Reuse WAW: nearest pred on the learned chain, then pop that
+            // head before the low-index antichain.
+            let crit_head = self.inter_prior.crit_chain().and_then(|(loc, writers)| {
+                access_arms.note_prior_touchers(loc, &writers);
+                if writers.len() < 32 || writers.len() * 4 > block_size {
+                    return None;
+                }
+                access_arms.install_crit_chain(loc, &writers);
+                ready_edges.plant_nearest_preds(loc, &writers);
+                // ChainSpineTip: light true-publish plane (not DashMap WaitOnce tips).
+                sf_tips.bind_chain_spine(loc, &writers);
+                writers.first().copied()
+            });
             self.last_begin_blocked = ready_edges.blocked_consumers();
+            runnable.seed_begin(&ready_edges, &producer_stages, &scheduler, crit_head);
             // P3: do not sample (n_tx − blocked) as ready_width (reads as 172).
             if quiet && !learner.has_any_predicted() {
                 let n = sketch.revoke_prior_fences_if_quiet(true);
@@ -570,163 +656,104 @@ impl Pevm {
             finegrain: finegrain_ref,
             policy: (self.concurrency_mode == ConcurrencyMode::SpecFence)
                 .then_some(&self.cost_policy),
+            access_arms: &access_arms,
+            sf_tips: &sf_tips,
+            tx_first_start: &tx_first_start,
+            exec_origin: &exec_origin,
         };
 
         // TODO: Better thread handling
+        let sf_worker_seq = std::sync::atomic::AtomicUsize::new(0);
         thread::scope(|scope| {
-            for _ in 0..concurrency_level.into() {
-                scope.spawn(|| {
-                    let mut vm = Vm::new(
-                        chain, spec_id, &block_env, &txs, storage, &mv_memory, specfence,
-                    );
-                    let profile = crate::specfence::profile_timing_enabled();
-                    // SF-PS: SpecFence pick is Schedule.pick(RunnableSet).
-                    // Occupied OCC / PCC keep `next_occ_task` as the contrast
-                    // computer. SpecFence never falls back to it.
-                    let occ_mode = self.concurrency_mode == ConcurrencyMode::Occ;
-                    let mut sched_t0 = profile.then(Instant::now);
-                    let mut task = if occ_mode {
-                        crate::specfence::next_occ_task(&scheduler)
-                    } else if self.concurrency_mode == ConcurrencyMode::SpecFence {
-                        crate::specfence::next_sf_task(
+            if self.concurrency_mode == ConcurrencyMode::SpecFence {
+                // True SF-PS ring: RunnableSet.pick → Execute(vis) → Resolve.apply.
+                // Zero calls to Scheduler::next_task* / validate_occ_stage.
+                for _ in 0..concurrency_level.into() {
+                    scope.spawn(|| {
+                        let mut vm = Vm::new(
+                            chain, spec_id, &block_env, &txs, storage, &mv_memory, specfence,
+                        );
+                        let worker_i =
+                            sf_worker_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        crate::specfence::run_sf_block(
                             &scheduler,
-                            specfence.wave,
-                            specfence.ready_edges,
-                            specfence.producer_stages,
-                            specfence.policy,
-                            Some(&metrics_inner),
-                        )
-                    } else {
-                        crate::specfence::next_occ_task(&scheduler)
-                    };
-                    if let Some(t0) = sched_t0 {
-                        metrics_inner.add_profile_scheduler_ns(t0.elapsed().as_nanos() as u64);
-                    }
-                    while task.is_some() {
-                        task = match task.unwrap() {
-                            Task::Execution(tx_version) => {
-                                let sf = self.concurrency_mode == ConcurrencyMode::SpecFence;
-                                // Detect-gated / pending hops: stamp started so a
-                                // later flush cannot refuse an in-flight tx.
-                                if sf
-                                    && (specfence.ready_edges.is_gated(tx_version.tx_idx)
-                                        || specfence.ready_edges.has_pending_gated()
-                                        || specfence.policy.is_some_and(|p| p.has_pending_idle()))
-                                {
-                                    specfence.ready_edges.note_started(tx_version.tx_idx);
-                                }
-                                // SpecFence: VisibilityPolicy chooses the execute
-                                // wrap. Opt = Avoid=noop independent set (no fence
-                                // wrap) — not a switch to ConcurrencyMode::Occ.
-                                let vis = if sf {
-                                    crate::specfence::VisibilityPolicy::for_ready(
-                                        specfence.ready_edges,
-                                        tx_version.tx_idx,
-                                    )
-                                } else {
-                                    crate::specfence::VisibilityPolicy::Opt
-                                };
-                                let occ_exec = occ_mode || (sf && vis.is_opt());
-                                if occ_exec {
-                                    let done_idx = tx_version.tx_idx;
-                                    let next = self
-                                        .try_execute(&mut vm, &scheduler, tx_version, None, None);
-                                    if sf && scheduler.is_done(done_idx) {
-                                        // S5: Done-on-success always stamps.
-                                        // O5 skip-when-!has_any_gated livelocked
-                                        // iter11 (~400% spin) when a later flush
-                                        // planted consumer→pred with done=false.
-                                        specfence.ready_edges.note_producer_done_stamp(done_idx);
-                                        if specfence.ready_edges.has_known_waiters(done_idx)
-                                            && let Some(w) = wave_ref
-                                        {
-                                            specfence.ready_edges.note_producer_done(done_idx, w);
-                                        }
-                                    }
-                                    next
-                                } else {
-                                    let done_idx = tx_version.tx_idx;
+                            &mv_memory,
+                            specfence,
+                            &runnable,
+                            &arms,
+                            worker_i,
+                            || self.abort_reason.get().is_some(),
+                            |tx_version, vis| {
+                                self.try_execute_sf(
+                                    &mut vm, &scheduler, tx_version, vis, wave_ref, &dag,
+                                )
+                            },
+                            |tx_version, vis| {
+                                crate::specfence::validate_to_plan(
+                                    &mv_memory, &scheduler, tx_version, specfence, vis,
+                                )
+                            },
+                        );
+                    });
+                }
+            } else {
+                for _ in 0..concurrency_level.into() {
+                    scope.spawn(|| {
+                        let mut vm = Vm::new(
+                            chain, spec_id, &block_env, &txs, storage, &mv_memory, specfence,
+                        );
+                        let profile = crate::specfence::profile_timing_enabled();
+                        let occ_mode = self.concurrency_mode == ConcurrencyMode::Occ;
+                        let mut sched_t0 = profile.then(Instant::now);
+                        let mut task = crate::specfence::next_occ_task(&scheduler);
+                        if let Some(t0) = sched_t0 {
+                            metrics_inner.add_profile_scheduler_ns(t0.elapsed().as_nanos() as u64);
+                        }
+                        while task.is_some() {
+                            task = match task.unwrap() {
+                                Task::Execution(tx_version) => {
                                     let fence_ref = crate::specfence::fence_for_mode(
                                         self.concurrency_mode,
                                         &dag,
                                     );
-                                    let next = self.try_execute(
+                                    self.try_execute(
                                         &mut vm, &scheduler, tx_version, wave_ref, fence_ref,
-                                    );
-                                    if scheduler.is_done(done_idx) {
-                                        specfence.ready_edges.note_producer_done_stamp(done_idx);
-                                        if specfence.ready_edges.has_known_waiters(done_idx)
-                                            && let Some(w) = wave_ref
-                                        {
-                                            specfence.ready_edges.note_producer_done(done_idx, w);
-                                        }
+                                    )
+                                }
+                                Task::Validation(tx_version) => {
+                                    let v0 = profile.then(Instant::now);
+                                    let next = if occ_mode {
+                                        crate::specfence::validate_occ_stage(
+                                            &mv_memory,
+                                            &scheduler,
+                                            &tx_version,
+                                            Some(&metrics_inner),
+                                        )
+                                    } else {
+                                        try_validate(&mv_memory, &scheduler, &tx_version, specfence)
+                                    };
+                                    if let Some(t0) = v0 {
+                                        metrics_inner.add_profile_validate_ns(
+                                            t0.elapsed().as_nanos() as u64,
+                                        );
                                     }
                                     next
                                 }
-                            }
-                            Task::Validation(tx_version) => {
-                                let v0 = profile.then(Instant::now);
-                                // SF-PS: SpecFence always Validate.to_resolve
-                                // (Opt Avoid=noop or edged ResolvePlan).
-                                // OCC contrast stays on validate_occ_stage.
-                                let next = if occ_mode {
-                                    crate::specfence::validate_occ_stage(
-                                        &mv_memory,
-                                        &scheduler,
-                                        &tx_version,
-                                        Some(&metrics_inner),
-                                    )
-                                } else if specfence.mode == ConcurrencyMode::SpecFence {
-                                    crate::specfence::validate_specfence(
-                                        &mv_memory,
-                                        &scheduler,
-                                        &tx_version,
-                                        specfence,
-                                    )
-                                } else {
-                                    try_validate(&mv_memory, &scheduler, &tx_version, specfence)
-                                };
-                                if let Some(t0) = v0 {
-                                    metrics_inner
-                                        .add_profile_validate_ns(t0.elapsed().as_nanos() as u64);
-                                }
-                                next
-                            }
-                        };
-
-                        // TODO: Have different functions or an enum for the caller to choose
-                        // the handling behaviour when a transaction's EVM execution fails.
-                        // Parallel block builders would like to exclude such transaction,
-                        // verifiers may want to exit early to save CPU cycles, while testers
-                        // may want to collect all execution results. We are exiting early as
-                        // the default behaviour for now.
-                        if self.abort_reason.get().is_some() {
-                            break;
-                        }
-
-                        if task.is_none() {
-                            sched_t0 = profile.then(Instant::now);
-                            task = if occ_mode {
-                                crate::specfence::next_occ_task(&scheduler)
-                            } else if self.concurrency_mode == ConcurrencyMode::SpecFence {
-                                crate::specfence::next_sf_task(
-                                    &scheduler,
-                                    specfence.wave,
-                                    specfence.ready_edges,
-                                    specfence.producer_stages,
-                                    specfence.policy,
-                                    Some(&metrics_inner),
-                                )
-                            } else {
-                                crate::specfence::next_occ_task(&scheduler)
                             };
-                            if let Some(t0) = sched_t0 {
-                                metrics_inner
-                                    .add_profile_scheduler_ns(t0.elapsed().as_nanos() as u64);
+                            if self.abort_reason.get().is_some() {
+                                break;
+                            }
+                            if task.is_none() {
+                                sched_t0 = profile.then(Instant::now);
+                                task = crate::specfence::next_occ_task(&scheduler);
+                                if let Some(t0) = sched_t0 {
+                                    metrics_inner
+                                        .add_profile_scheduler_ns(t0.elapsed().as_nanos() as u64);
+                                }
                             }
                         }
-                    }
-                });
+                    });
+                }
             }
         });
 
@@ -948,6 +975,59 @@ impl Pevm {
                 }
             }
             self.last_location_writers = d1_orders;
+            // A held spine records fewer conflicts, so the next snapshot
+            // is short and would drop the hold. Keep the longer chain.
+            // Do not replace a ≥32 hold with a different ℓ of equal length —
+            // that hopped sticky off abd6bb… onto short quiet spines (TPS↓).
+            // Avoid/wall success: ChainSpine Suppresses Opt D1 notes → focus
+            // chain_n collapses 62→4–5; Learn then sees short n_pairs and
+            // demotes Win→Opt. Strong HOLD keeps ≥32 writers + refreshes D1.
+            let avoid_hold =
+                sf_tips.chain_avoid_n() > 0 && sf_tips.chain_avoid_n() >= sf_tips.chain_late_n();
+            let fresh = select_crit_chain(&self.last_location_writers, block_size, beneficiary);
+            let prev = self.inter_prior.crit_chain();
+            let packed = match (fresh, prev) {
+                (Some((loc, w)), Some((pl, pw))) if loc == pl && w.len() < pw.len() => {
+                    Some((pl, pw))
+                }
+                (f, Some((pl, pw))) if pw.len() >= 32 => {
+                    if avoid_hold {
+                        // Wall/Avoid working: only upgrade to a strictly longer
+                        // spine; never hop ℓ or shrink (abd6bb sticky HOLD).
+                        match &f {
+                            Some((loc, w)) if *loc == pl && w.len() > pw.len() => f,
+                            Some((_, w)) if w.len() > pw.len() => f,
+                            _ => Some((pl, pw)),
+                        }
+                    } else {
+                        match &f {
+                            Some((loc, w)) if *loc == pl && w.len() >= pw.len() => f,
+                            Some((_, w)) if w.len() > pw.len() => f,
+                            _ => Some((pl, pw)),
+                        }
+                    }
+                }
+                (None, Some(p)) => Some(p),
+                (f, _) => f,
+            };
+            // Reflect sticky ≥32 into last_location_writers so lean_end /
+            // focus / next select_crit_chain do not observe Avoid-quiet 4–5.
+            if let Some((loc, writers)) = &packed
+                && writers.len() >= 32
+            {
+                if let Some((_, w)) = self
+                    .last_location_writers
+                    .iter_mut()
+                    .find(|(l, _)| *l == *loc)
+                {
+                    if w.len() < writers.len() {
+                        *w = writers.clone();
+                    }
+                } else {
+                    self.last_location_writers.push((*loc, writers.clone()));
+                }
+            }
+            self.inter_prior.pack_crit_chain(packed);
             let ready_w = ready_edges.ready_width_mean();
             let idle = ready_edges.idle_core_ns();
             let refuse = ready_edges.refuse_count();
@@ -970,6 +1050,66 @@ impl Pevm {
             } else {
                 self.cost_policy.end_block_learn();
             }
+            arms.end_pack(&self.inter_prior, block_size);
+            // Sticky ≥32: keep AccessArm WaitOnce across Learn. LocStrategy
+            // Win prepaid stays off (v5). Mid-block protect already stuck
+            // hot ℓ; this re-pins the learned spine so end_pack cannot
+            // demote it to Opt.
+            if block_size > crate::specfence::THIN_SHELL_N {
+                if let Some((loc, writers)) = self.inter_prior.crit_chain() {
+                    if writers.len() >= 32 {
+                        access_arms.note_early_waw(loc, 1);
+                        for w in writers.windows(2) {
+                            access_arms.note_wait_edge(w[1], w[0], loc);
+                        }
+                    }
+                }
+            }
+            access_arms.end_pack(&self.inter_prior);
+            metrics_inner.record_hot_protect(
+                access_arms.protect_n(),
+                access_arms.protect_before_opt_n(),
+                access_arms.replay_after_protect_n(),
+            );
+            metrics_inner.record_access_avoid(
+                access_arms.wait_once(),
+                access_arms.wait_suppressed(),
+                access_arms.never_wait(),
+                access_arms.prefix_resume(),
+            );
+            metrics_inner.record_sf_mv_tips(
+                sf_tips.early_tip_n(),
+                sf_tips.publish_wake_n(),
+                sf_tips.wait_once_consume_n(),
+                sf_tips.estimate_block_sf(),
+                sf_tips.detect_before_n(),
+                sf_tips.avoid_publish_n(),
+                sf_tips.resolve_after_fail_n(),
+                sf_tips.raw_avoid_n(),
+                sf_tips.raw_late_n(),
+                sf_tips.war_avoid_n(),
+                sf_tips.war_late_n(),
+                sf_tips.waw_avoid_n(),
+                sf_tips.waw_late_n(),
+                sf_tips.chain_avoid_n(),
+                sf_tips.chain_late_n(),
+            );
+            metrics_inner.set_true_spine_metrics(
+                runnable.steal_n(),
+                runnable.refuse_fill_n(),
+                arms.mid_promote_n(),
+                arms.mid_promote_veto_n(),
+                arms.explore_n(),
+                arms.began_from_prior(),
+                arms.e1_n(),
+                arms.e2_n(),
+                arms.e3_n(),
+                arms.e4_n(),
+                arms.e5_n(),
+                arms.e6_n(),
+                arms.prior_plant_n(),
+            );
+            metrics_inner.add_idle_core_ns(ready_edges.idle_core_ns());
             let mut report = self.cost_policy.take_report(ready_w, idle);
             report.end_block_ns = end_t0.elapsed().as_nanos() as u64;
             report.ungated_occ_n = ready_edges.pick_occ_n();
@@ -1015,6 +1155,7 @@ impl Pevm {
             self.last_incarnations.clear();
             self.last_location_writers.clear();
             self.last_begin_blocked.clear();
+            self.last_tx_first_start.clear();
         }
         metrics_inner.set_engagement_metrics(
             engagement.lean_mode_txs(),
@@ -1023,6 +1164,12 @@ impl Pevm {
             self.hotset.location_hot_resolves(),
             self.hotset.len(),
         );
+        if self.concurrency_mode == ConcurrencyMode::SpecFence {
+            self.last_tx_first_start = tx_first_start
+                .iter()
+                .map(|slot| slot.load(Ordering::Relaxed))
+                .collect();
+        }
         self.last_metrics = metrics_inner.snapshot(
             wave_id,
             mean_wait,
@@ -1126,8 +1273,12 @@ impl Pevm {
                             balance = balance.saturating_sub(*subtraction);
                             nonce += 1;
                         }
-                        // TODO: Better error handling
-                        _ => unreachable!(),
+                        // SpecFence FullReplay leaves ESTIMATE on a lazy ℓ when
+                        // the next incarnation does not rewrite it (8-core
+                        // 19469101: main-thread `unreachable` after workers
+                        // exit). Skip; older Data/Lazy still fold.
+                        MemoryEntry::Estimate => continue,
+                        _ => continue,
                     }
                     // Assert that evaluated nonce is correct when address is caller.
                     if tx.caller == address {
@@ -1303,6 +1454,160 @@ impl Pevm {
                     self.abort_reason
                         .get_or_init(|| AbortReason::ExecutionError(err));
                     None
+                }
+            };
+        }
+    }
+
+    /// SpecFence execute: same EVM as OCC, but never steals via `next_task*`.
+    fn try_execute_sf<'a, S: Storage, C: PevmChain>(
+        &self,
+        vm: &mut Vm<'a, S, C>,
+        scheduler: &Scheduler,
+        tx_version: TxVersion,
+        vis: VisibilityPolicy,
+        wave: Option<&WaveParkTable>,
+        dag: &crate::specfence::SpecDag,
+    ) -> SfExec {
+        let _ = vis;
+        // LackOfFund / NonceTooHigh / stale-Estimate Blocking on an already
+        // Executed|Validated pred makes add_dependency return false and the
+        // OCC-style `continue` re-enters execute forever (19469101 1-core:
+        // worker hang-trace never fires). Cap the same-thread retry.
+        let mut retry_n = 0u32;
+        let leftover_min = vm.ready_edges().is_live_leftover_min(tx_version.tx_idx);
+        loop {
+            if retry_n > 16 {
+                // leftover_min park-failed on a done writer and stayed
+                // Executing (19807137 ghost mill n_unf=198). Ready it so
+                // heal cannot incarnation++ a leftover Executing leftover.
+                if leftover_min {
+                    let _ = scheduler.recover_executing_waiter(tx_version.tx_idx);
+                }
+                return SfExec::Blocked { on: None };
+            }
+            if let Some((blocking_tx_idx, address)) = vm.hinted_wait_blocker(tx_version.tx_idx) {
+                if (leftover_min
+                    && (blocking_tx_idx > tx_version.tx_idx
+                        || scheduler.is_done(blocking_tx_idx)
+                        || scheduler.is_validated(blocking_tx_idx)
+                        || vm.ready_edges().leftover_min_skips_blocker(blocking_tx_idx)))
+                    || vm.ready_edges().leftover_passed(blocking_tx_idx)
+                {
+                    retry_n += 1;
+                    continue;
+                }
+                if !scheduler.add_dependency(tx_version.tx_idx, blocking_tx_idx)
+                    && self.abort_reason.get().is_none()
+                {
+                    retry_n += 1;
+                    continue;
+                }
+                vm.record_wait_admission(address);
+                return SfExec::Blocked {
+                    on: Some(blocking_tx_idx),
+                };
+            }
+            if let Some(wave) = wave {
+                vm.try_apply_park_resume(tx_version.tx_idx, wave);
+            }
+            // Known toucher of a protected ℓ: first interpreter entry sees
+            // the published tip. Parking here is not a mid-exec reexec.
+            if !leftover_min && let Some(pred) = vm.protected_admission_blocker(tx_version.tx_idx) {
+                let parked = scheduler.add_wait_for_dependency(tx_version.tx_idx, pred);
+                if parked {
+                    vm.record_wait_for_dependency();
+                    return SfExec::Blocked { on: Some(pred) };
+                }
+            }
+            let exec_t0 = (tx_version.tx_incarnation > 0).then(Instant::now);
+            return match vm.execute(
+                &tx_version,
+                self.execution_results.slot_mut(tx_version.tx_idx),
+            ) {
+                Ok(flags) => {
+                    if let Some(t0) = exec_t0 {
+                        vm.note_hot_reexec_ns(tx_version.tx_idx, t0.elapsed().as_nanos() as u64);
+                    }
+                    let wrote_new_location =
+                        flags.contains(crate::FinishExecFlags::WroteNewLocation);
+                    let fence = crate::specfence::fence_for_mode(ConcurrencyMode::SpecFence, dag);
+                    let _ =
+                        scheduler.finish_execution_with_wave_fence(tx_version, flags, wave, fence);
+                    SfExec::Executed { wrote_new_location }
+                }
+                Err(VmExecutionError::Retry) => {
+                    if self.abort_reason.get().is_none() {
+                        retry_n += 1;
+                        continue;
+                    }
+                    SfExec::Fatal
+                }
+                Err(VmExecutionError::FallbackToSequential) => {
+                    scheduler.abort();
+                    self.abort_reason
+                        .get_or_init(|| AbortReason::FallbackToSequential);
+                    SfExec::Fatal
+                }
+                Err(VmExecutionError::Blocking(blocking_tx_idx)) => {
+                    let pending = vm.take_pending_park();
+                    let park_kind = pending
+                        .map(|p| p.kind)
+                        .unwrap_or(crate::specfence::ParkKind::BlockingOther);
+                    let park_loc = pending.map(|p| p.location).unwrap_or(0);
+                    let park_k = pending.map(|p| p.armed_at_k).unwrap_or(0);
+                    // Protected unfinished-writer defer: same incarnation, no
+                    // Aborting. Chain schedule-defer would drop the dependency
+                    // and restart the reader immediately.
+                    let cheap_defer =
+                        park_kind == crate::specfence::ParkKind::WaitForDependency && park_k == 0;
+                    // leftover_min must commit when the blocker is already
+                    // done (nonce / WaitForDependency on tx-1). Parking
+                    // fails, leftover_min stays Executing, heal mills
+                    // (19807137 leftover_min=514). Do not recover later.
+                    if (leftover_min
+                        && (blocking_tx_idx > tx_version.tx_idx
+                            || scheduler.is_done(blocking_tx_idx)
+                            || scheduler.is_validated(blocking_tx_idx)
+                            || vm.ready_edges().leftover_min_skips_blocker(blocking_tx_idx)))
+                        || vm.ready_edges().leftover_passed(blocking_tx_idx)
+                    {
+                        retry_n += 1;
+                        continue;
+                    }
+                    // ChainSpine one-hop: Soft=0 schedule defer — plant /
+                    // exact waiters wake on chain_release → Q_released.
+                    // No Aborting (BlockingOther) and no writer-done WFD park.
+                    if !cheap_defer && vm.chain_spine_schedule_defer(park_loc) {
+                        let _ = scheduler.recover_executing_waiter(tx_version.tx_idx);
+                        return SfExec::Blocked {
+                            on: Some(blocking_tx_idx),
+                        };
+                    }
+                    let parked = if park_kind == crate::specfence::ParkKind::WaitForDependency {
+                        if cheap_defer {
+                            vm.record_wait_for_dependency();
+                        }
+                        scheduler.add_wait_for_dependency(tx_version.tx_idx, blocking_tx_idx)
+                    } else {
+                        scheduler.add_dependency(tx_version.tx_idx, blocking_tx_idx)
+                    };
+                    if !parked && self.abort_reason.get().is_none() {
+                        retry_n += 1;
+                        continue;
+                    }
+                    // Soft=0: do not park the worker; pick another runnable.
+                    // Carry the producer so the worker plants Detect (heal
+                    // must not incarnation++ this Aborting into Q_indep).
+                    SfExec::Blocked {
+                        on: Some(blocking_tx_idx),
+                    }
+                }
+                Err(VmExecutionError::ExecutionError(err)) => {
+                    scheduler.abort();
+                    self.abort_reason
+                        .get_or_init(|| AbortReason::ExecutionError(err));
+                    SfExec::Fatal
                 }
             };
         }
@@ -2203,6 +2508,24 @@ fn try_validate(
         mv_memory.convert_writes_to_estimates(tx_version.tx_idx);
         // A2: ESTIMATE is a confirmed wr — flip Avoid in-batch for later readers.
         if specfence.mode == ConcurrencyMode::SpecFence {
+            // Drop SF version tip / live_writer so WaitOnce does not park on
+            // a stale unpublished claim (SoT: Estimate is OCC-only).
+            // Thin DashMap tip plane; large ChainSpineTip clear only.
+            if scheduler.block_size() <= crate::specfence::THIN_SHELL_N {
+                let _ = specfence
+                    .sf_tips
+                    .clear_writer(tx_version.tx_idx, &occ_write_locs);
+            } else if specfence
+                .sf_tips
+                .is_chain_loc(specfence.access_arms.crit_loc_hash())
+            {
+                specfence.sf_tips.chain_clear(tx_version.tx_idx);
+            }
+            // Re-exec has not published. Readers of a protected ℓ must see this
+            // writer, not only the last already-published MvMemory tip.
+            for &loc in &occ_write_locs {
+                specfence.sf_tips.note_open_writer(loc, tx_version.tx_idx);
+            }
             for &loc in &occ_write_locs {
                 specfence.sketch.push_spine(loc, tx_version.tx_idx);
                 if specfence.sketch.broadcast_avoid(loc, tx_version.tx_idx) {

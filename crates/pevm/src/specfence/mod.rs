@@ -12,10 +12,11 @@
 //! `ConcurrencyMode::Occ` is pristine Block-STM (**zero** SpecFence ticks) —
 //! contrast engine only.
 //! `ConcurrencyMode::SpecFence` is a **different protocol**: ready = Detect
-//! antichain ∪ released dependents; read = VisibilityPolicy; validate
-//! produces ResolvePlan. Independent txs may use Opt visibility
-//! (Avoid=noop). That is **not** a retreat to the OCC computer and
-//! **must not** call `next_occ_task` as the main pick.
+//! antichain ∪ released dependents on real `Q_indep`/`Q_released`/`Q_ordered`;
+//! read = `SfMvMemory.read(ℓ, vis)`; validate produces ResolvePlan and
+//! `ResolvePlan.apply` mutates certificates/queues. Independent txs may use
+//! Opt visibility (Avoid=noop). SpecFence **must not** call
+//! `Scheduler::next_task` / wave-ready next-task / OCC-stage validate.
 //!
 //! Soft=0. seq≡par. Lazy-update / near-independent are never OrderedAdmit
 //! objects. Thin (n≤176) must not learn Win_8. Under-covered spines must
@@ -168,10 +169,12 @@ use crate::{
 use alloy_primitives::Address;
 use hashbrown::HashMap;
 
+mod access_arm;
 mod access_log;
 mod access_policy;
 mod access_vis;
 pub(crate) mod admit;
+mod arm_table;
 mod bayes;
 mod boundary;
 mod certificate;
@@ -205,15 +208,19 @@ mod resolve;
 mod resolve_plan;
 mod runnable_set;
 mod schedule;
+mod sf_mv;
 mod sketch;
 mod visibility;
 mod wave;
+mod worker;
 
+pub(crate) use access_arm::{AccessArmTable, LiveAct};
 pub(crate) use access_log::AccessOrdinalLog;
 pub(crate) use access_policy::{
     AccessDecision, AccessVis, decide as decide_access, decide_queried as decide_access_queried,
 };
 pub(crate) use access_vis::compose_unfinished;
+pub(crate) use arm_table::ArmTable;
 pub(crate) use bayes::BayesAccessQuery;
 pub(crate) use bayes::{BayesMap, DEFAULT_TAU};
 pub use boundary::SpecFenceInspector;
@@ -240,7 +247,6 @@ pub(crate) use collateral::{
     ConflictClass, FirstConflict, classify_first_conflict, commute_ok, envelopes_disjoint,
     is_value_transfer, location_is_lazy, optimistic_majority_hinted_lazy,
 };
-pub(crate) use computer::next_sf_task;
 pub(crate) use dag::{FenceGraph, SpecDag};
 pub(crate) use decision_field::{DecisionFeat, DecisionVerb};
 pub use decision_field::{DecisionFieldSnap, QualityProxies, VerbHist};
@@ -254,7 +260,7 @@ pub(crate) use executor::{
     reset_occ_pick_calls, specfence_access_is_occ, specfence_cost_class_spec,
     specfence_partial_abort_validate, specfence_plant_is_occ, uses_specfence_resolve,
     validate_occ_kernel, validate_occ_stage, validate_optimistic_fast, validate_specfence,
-    wave_for_mode,
+    validate_to_plan, wave_for_mode,
 };
 pub use finegrain::{
     AbortEvent, AccountGrainObserve, ConsumerFirstCross, DagStats, EffectClass, EffectLogEntry,
@@ -270,7 +276,9 @@ pub(crate) use hotset::HotSet;
 pub(crate) use hotset::{H_A, H_W};
 pub use resolve_plan::ResolvePlan;
 pub(crate) use runnable_set::RunnableSet;
+pub(crate) use sf_mv::{SfConflictClass, SfMvMemory, SfTip, SfTipTable, classify_wait_conflict};
 pub use visibility::VisibilityPolicy;
+pub(crate) use worker::{SfExec, run_sf_block};
 // kernel.rs museum — tests only; rem-legal SoT is CertificateTable.
 pub(crate) use lane::LaneTable;
 pub(crate) use learner::{AdaptiveParams, InterBlockPrior, LiveLearner};
@@ -278,7 +286,7 @@ pub(crate) use metrics::MetricsInner;
 pub use metrics::SpecFenceMetrics;
 pub use policy::LearnReport;
 #[allow(unused_imports)]
-pub(crate) use policy::{AdmitAction, CohortKind, CostPolicy};
+pub(crate) use policy::{AdmitAction, CohortKind, CostPolicy, THIN_SHELL_N};
 pub(crate) use prior::RwPriorMap;
 pub(crate) use process::ProcessTrace;
 pub use process::{ExecProcessSnapshot, LocProcessSnap, PerTxProcessSnap, ProcessReason};
@@ -721,6 +729,14 @@ pub(crate) struct SpecFenceCtx<'a> {
     pub finegrain: Option<&'a crate::specfence::FineGrainCollector>,
     /// B3/B2 cost-aware A0 vs A1 policy (Soft=0).
     pub policy: Option<&'a CostPolicy>,
+    /// Per-access Opt | WaitOnce | NeverWait. Shared waiter.
+    pub access_arms: &'a crate::specfence::AccessArmTable,
+    /// SpecFence-native version tips + exact waiters (not OCC Estimate).
+    pub sf_tips: &'a crate::specfence::SfTipTable,
+    /// First Execution-pick elapsed ns from `exec_origin`. 0 = not started. Shared.
+    pub tx_first_start: &'a [std::sync::atomic::AtomicU64],
+    /// Parallel phase origin for `tx_first_start`.
+    pub exec_origin: &'a std::time::Instant,
 }
 
 impl<'a> SpecFenceCtx<'a> {

@@ -11,7 +11,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::ConcurrencyMode;
 use super::LeanAbortRepair;
-use super::ResolvePlan;
 use super::SpecFenceCtx;
 use super::VisibilityPolicy;
 use super::certificate::CertificateTable;
@@ -22,10 +21,11 @@ use super::collateral::{
 use super::dag::FenceGraph;
 use super::learner::LiveLearner;
 use super::repair::{RepairGrain, repair_grain};
+use super::resolve_plan::{ResolvePlan, try_chain_released_rewind, try_early_waw_rewind};
 use super::wave::WaveParkTable;
 use crate::mv_memory::MvMemory;
 use crate::scheduler::Scheduler;
-use crate::{MemoryLocationHash, Task, TxIdx, TxVersion};
+use crate::{MemoryEntry, MemoryLocationHash, MemoryValue, Task, TxIdx, TxVersion};
 
 /// OCC schedule / execute / validate never take wave or fence handles.
 #[inline]
@@ -142,12 +142,29 @@ pub(crate) fn validate_occ_stage(
 
 /// C1+C2: record first conflict ℓ and accept a commute without incarnation++.
 /// Accept path is a single `last_locations` lock (no collect Vec + rebind).
+/// A first-touch absolute Basic on a shared ℓ resets later lazy evaluation
+/// (higher-idx Basic after lower LazyRecipient). Commute must not keep it.
+fn wrote_shared_absolute_basic(mv_memory: &MvMemory, tx_idx: TxIdx) -> bool {
+    mv_memory.write_locations(tx_idx).iter().any(|&loc| {
+        let Some(written) = mv_memory.data.get(&loc) else {
+            return false;
+        };
+        matches!(
+            written.get(&tx_idx),
+            Some(MemoryEntry::Data(_, MemoryValue::Basic(_)))
+        ) && written.keys().any(|&w| w != tx_idx)
+    })
+}
+
 fn note_and_try_commute(
     specfence: SpecFenceCtx<'_>,
     mv_memory: &MvMemory,
     tx_idx: TxIdx,
     invalid: &[MemoryLocationHash],
 ) -> bool {
+    if wrote_shared_absolute_basic(mv_memory, tx_idx) {
+        return false;
+    }
     if is_value_transfer(specfence.hints, tx_idx)
         && mv_memory.try_commute_rebind_invalid(tx_idx, |loc| {
             commute_location_ok(
@@ -490,6 +507,163 @@ pub(crate) fn validate_occ_kernel(
     )
 }
 
+/// Same-output invalid reads can be patched in place. Refuses Estimate and
+/// any location whose published data does not match the read the tx took.
+fn salvage_value_stable_rebind(
+    mv_memory: &MvMemory,
+    specfence: SpecFenceCtx<'_>,
+    tx_idx: TxIdx,
+    invalid: &[MemoryLocationHash],
+) -> bool {
+    if invalid.is_empty() {
+        return false;
+    }
+    let value_stable = invalid.iter().all(|&loc| {
+        let Some(cur) = mv_memory.current_data_value(tx_idx, loc) else {
+            return false;
+        };
+        specfence
+            .partial_retry
+            .identity_stable_match(tx_idx, loc, &cur)
+            || mv_memory.prior_read_value_stable(tx_idx, loc)
+    });
+    value_stable && mv_memory.try_rebind_invalid_reads_value_stable(tx_idx, invalid)
+}
+
+/// Validate → [`ResolvePlan`]. Does **not** abort or finish validation.
+/// Edged paths never call [`validate_occ_kernel`] / [`validate_occ_stage`].
+pub(crate) fn validate_to_plan(
+    mv_memory: &MvMemory,
+    scheduler: &Scheduler,
+    tx_version: &TxVersion,
+    specfence: SpecFenceCtx<'_>,
+    vis: VisibilityPolicy,
+) -> (ResolvePlan, Vec<MemoryLocationHash>) {
+    if occ_read_set_valid(mv_memory, tx_version.tx_idx) {
+        return (ResolvePlan::Commit, Vec::new());
+    }
+    if note_and_try_commute(specfence, mv_memory, tx_version.tx_idx, &[]) {
+        return (ResolvePlan::Commit, Vec::new());
+    }
+    let invalid = mv_memory.collect_invalid_reads(tx_version.tx_idx);
+    if note_and_try_commute(specfence, mv_memory, tx_version.tx_idx, &invalid) {
+        return (ResolvePlan::Commit, invalid);
+    }
+    // P1: value-stable rebind is salvage on Opt and edged paths. It commits
+    // this incarnation instead of an unfenced FullReplay.
+    if salvage_value_stable_rebind(mv_memory, specfence, tx_version.tx_idx, &invalid) {
+        return (ResolvePlan::PartialAbortRebind, invalid);
+    }
+    if vis.is_opt() {
+        // Early-k WAW: a mid-tx checkpoint before fail_k arms hang-free
+        // RewindTo (Indep, no live_capture). Otherwise FullReplay + ff_head.
+        if let Some(plan) = try_early_waw_rewind(mv_memory, tx_version, specfence, &invalid) {
+            return (plan, invalid);
+        }
+        // Sticky≥32: peer already ChainSpine Released → Prefer Rewind/prefix
+        // over Opt→FullReplay theater (raise chain_ab/c, cut FullReplay wall).
+        if let Some(plan) = try_chain_released_rewind(mv_memory, tx_version, specfence, &invalid) {
+            return (plan, invalid);
+        }
+        return (ResolvePlan::FullReplay, invalid);
+    }
+
+    // Edged: Resolve first. No OCC-kernel fallback.
+    if !invalid.is_empty() {
+        let grain = repair_grain(specfence.certificates, tx_version.tx_idx, &invalid);
+        let covers = grain == RepairGrain::PartialAbort;
+        let selective: Vec<_> = if covers {
+            Vec::new()
+        } else {
+            invalid
+                .iter()
+                .copied()
+                .filter(|&loc| specfence.certificates.covers(tx_version.tx_idx, loc))
+                .collect()
+        };
+        let fenced: &[MemoryLocationHash] = if covers { &invalid } else { &selective };
+        let bayes_q = invalid.first().copied().map(|loc| {
+            let w_exec = mv_memory
+                .last_writer_before(loc, tx_version.tx_idx)
+                .is_some_and(|w| scheduler.is_executing(w));
+            specfence
+                .bayes
+                .query_validate(loc, !fenced.is_empty(), w_exec)
+        });
+        if !fenced.is_empty() {
+            let estimate_cleared = fenced.iter().all(|&loc| {
+                mv_memory
+                    .current_data_value(tx_version.tx_idx, loc)
+                    .is_some()
+            });
+            let identity_held = specfence
+                .partial_retry
+                .identity_held(tx_version.tx_idx, fenced);
+            let value_stable = estimate_cleared
+                && fenced.iter().all(|&loc| {
+                    let Some(cur) = mv_memory.current_data_value(tx_version.tx_idx, loc) else {
+                        return false;
+                    };
+                    specfence
+                        .partial_retry
+                        .identity_stable_match(tx_version.tx_idx, loc, &cur)
+                        || mv_memory.prior_read_value_stable(tx_version.tx_idx, loc)
+                });
+            if identity_held {
+                specfence.learner.note_identity_hit();
+            }
+            let partial_abort_rebind = value_stable
+                && mv_memory.try_rebind_invalid_reads_value_stable(tx_version.tx_idx, fenced)
+                && (fenced.len() == invalid.len()
+                    || occ_read_set_valid(mv_memory, tx_version.tx_idx));
+            if partial_abort_rebind {
+                return (ResolvePlan::PartialAbortRebind, invalid);
+            }
+            let strip_covers = specfence
+                .certificates
+                .covers_strips_all(tx_version.tx_idx, &invalid);
+            let rewind_ev =
+                bayes_q.is_none_or(|q| q.depth_frac >= 0.50 || q.ev_ordered_admit_beats_full_abort);
+            if strip_covers && rewind_ev {
+                let read_locations = mv_memory.read_locations(tx_version.tx_idx);
+                let write_locations = mv_memory.write_locations(tx_version.tx_idx);
+                if specfence
+                    .partial_retry
+                    .try_arm_partial_abort_rewind(
+                        tx_version.tx_idx,
+                        &read_locations,
+                        &invalid,
+                        &write_locations,
+                    )
+                    .is_some()
+                {
+                    return (ResolvePlan::PartialAbortRewind, invalid);
+                }
+            }
+        }
+        let first = classify_first_conflict(
+            specfence.hints,
+            mv_memory,
+            specfence.beneficiary,
+            tx_version.tx_idx,
+            &invalid,
+        );
+        if specfence.ready_edges.was_queued(tx_version.tx_idx)
+            || first.is_some_and(|f| f.class == ConflictClass::EffectiveWAW)
+        {
+            // Same rule as Opt: Prefer ChainSpine Released Rewind before
+            // restarting this read as Ordered-from-0 / FullReplay.
+            if let Some(plan) =
+                try_chain_released_rewind(mv_memory, tx_version, specfence, &invalid)
+            {
+                return (plan, invalid);
+            }
+            return (ResolvePlan::FullReplay, invalid);
+        }
+    }
+    (ResolvePlan::FullReplay, invalid)
+}
+
 /// Validate.to_resolve → Resolve.apply. SpecFence product validate entry.
 ///
 /// Opt / independent: Avoid=noop optimistic validate (Commit | FullReplay).
@@ -689,6 +863,23 @@ mod tests {
             0,
             &[7, 9]
         ));
+    }
+
+    #[test]
+    fn validate_to_plan_source_never_falls_back_to_occ_kernel() {
+        let src = include_str!("executor.rs");
+        let before_specfence = src
+            .split("pub(crate) fn validate_specfence")
+            .next()
+            .unwrap();
+        let to_plan = before_specfence
+            .split("pub(crate) fn validate_to_plan")
+            .nth(1)
+            .expect("validate_to_plan present");
+        assert!(
+            !to_plan.contains("validate_occ_kernel") && !to_plan.contains("validate_occ_stage"),
+            "edged/opt to_plan must not fallback to OCC validate"
+        );
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     collections::{BTreeMap, BTreeSet, HashSet},
     sync::Mutex,
 };
@@ -22,6 +23,33 @@ struct LastLocations {
 }
 
 type LazyAddresses = HashSet<Address, BuildSuffixHasher>;
+
+thread_local! {
+    static DATA_NEST: Cell<u32> = const { Cell::new(0) };
+}
+
+/// DashMap is not reentrant. Same-thread nested `data.get` is the
+/// 19807137 / 19469101 `munmap_chunk` / `double free`.
+pub(crate) struct DataNest(&'static str);
+
+impl DataNest {
+    pub(crate) fn enter(what: &'static str) -> Self {
+        DATA_NEST.with(|c| {
+            let n = c.get();
+            if n > 0 {
+                panic!("MvMemory.data re-enter via {what} nest={n}");
+            }
+            c.set(n + 1);
+        });
+        Self(what)
+    }
+}
+
+impl Drop for DataNest {
+    fn drop(&mut self) {
+        DATA_NEST.with(|c| c.set(c.get().saturating_sub(1)));
+    }
+}
 
 /// The `MvMemory` contains shared memory in a form of a multi-version data
 /// structure for values written and read by different transactions. It stores
@@ -119,6 +147,7 @@ impl MvMemory {
         tx_idx: TxIdx,
         location: MemoryLocationHash,
     ) -> Option<crate::MemoryValue> {
+        let _nest = DataNest::enter("published_data_value");
         let written = self.data.get(&location)?;
         match written.get(&tx_idx)? {
             MemoryEntry::Data(_, value) => Some(value.clone()),
@@ -200,6 +229,7 @@ impl MvMemory {
 
         // TODO: Group updates by shard to avoid locking operations.
         // Remove old locations that aren't written to anymore.
+        let _nest = DataNest::enter("record");
         let mut last_location_idx = 0;
         while last_location_idx < last_locations.write.len() {
             let prev_location = unsafe { last_locations.write.get_unchecked(last_location_idx) };
@@ -281,6 +311,7 @@ impl MvMemory {
         location: MemoryLocationHash,
         prior_origins: &crate::ReadOrigins,
     ) -> bool {
+        let _nest = DataNest::enter("origin_still_valid");
         if let Some(written_transactions) = self.data.get(&location) {
             let mut iter = written_transactions.range(..tx_idx);
             for prior_origin in prior_origins {
@@ -467,6 +498,7 @@ impl MvMemory {
         tx_idx: TxIdx,
         location: MemoryLocationHash,
     ) -> Option<crate::MemoryValue> {
+        let _nest = DataNest::enter("current_data_value");
         let written = self.data.get(&location)?;
         match written.range(..tx_idx).next_back()? {
             (idx, MemoryEntry::Data(inc, val)) => {
@@ -514,6 +546,7 @@ impl MvMemory {
         location: MemoryLocationHash,
         tx_idx: TxIdx,
     ) -> Option<TxIdx> {
+        let _nest = DataNest::enter("last_writer_before");
         self.data
             .get(&location)
             .and_then(|written| written.range(..tx_idx).next_back().map(|(idx, _)| *idx))
@@ -535,13 +568,35 @@ impl MvMemory {
         }
     }
 
+    /// Last live Storage Data below `tx_idx` inside an already-held location map.
+    /// Callers that hold `data.get(location)` must use this instead of
+    /// [`last_data_before`] — DashMap is not reentrant.
+    pub(crate) fn last_live_storage_in(
+        written: &BTreeMap<TxIdx, MemoryEntry>,
+        tx_idx: TxIdx,
+        is_aborted: impl Fn(TxIdx, TxIncarnation) -> bool,
+    ) -> Option<(TxIdx, TxIncarnation, alloy_primitives::U256)> {
+        for (idx, entry) in written.range(..tx_idx).rev() {
+            if let MemoryEntry::Data(inc, MemoryValue::Storage(v)) = entry
+                && !is_aborted(*idx, *inc)
+            {
+                return Some((*idx, *inc, *v));
+            }
+        }
+        None
+    }
+
     /// Last non-ESTIMATE Data version strictly below `tx_idx` (OrderedDirtyRead).
     /// Skips ESTIMATE markers and aborted incarnations (continue past both).
+    ///
+    /// Must not be called while the caller holds `data.get` on the same
+    /// location (DashMap is not reentrant — 19807137 `double free`).
     pub(crate) fn last_data_before(
         &self,
         location: MemoryLocationHash,
         tx_idx: TxIdx,
     ) -> Option<(TxIdx, TxIncarnation)> {
+        let _nest = DataNest::enter("last_data_before");
         let written = self.data.get(&location)?;
         for (idx, entry) in written.range(..tx_idx).rev() {
             match entry {

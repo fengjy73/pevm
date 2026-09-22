@@ -361,6 +361,94 @@ pub struct SpecFenceMetrics {
     /// OCC `next_occ_task` picks observed this process (must be 0 on SF blocks
     /// after [`crate::specfence::executor::reset_occ_pick_calls`]).
     pub occ_schedule_picks: usize,
+    /// SF-PS: work-steal count across the three queues.
+    pub steal_n: usize,
+    /// SF-PS: Detect refuse that immediately filled from Q_indep (PC-2).
+    pub refuse_fill_n: usize,
+    /// SF-PS: mid-block IntraPatch promotes (≤1 per ℓ per block).
+    pub mid_promote_n: usize,
+    /// SF-PS: IntraPatch promotes vetoed by PC (width would collapse).
+    pub mid_promote_veto_n: usize,
+    /// Learn E1: Commit on an edged location.
+    pub learn_e1_n: usize,
+    /// Learn E2: FullReplay / systematic reexec.
+    pub learn_e2_n: usize,
+    /// Learn E3: PartialAbort success.
+    pub learn_e3_n: usize,
+    /// Learn E4: refuse_fill that immediately ran an independent.
+    pub learn_e4_n: usize,
+    /// Learn E5: unfenced storm after prepaid → under-covered.
+    pub learn_e5_n: usize,
+    /// Learn E6: lazy / near-indep immediate Opt demote.
+    pub learn_e6_n: usize,
+    /// B4: ordered prior arms planted into CostPolicy before admit_seed.
+    pub prior_plant_n: usize,
+    /// SF-PS: idle_core_ns / (idle_core_ns + worker_busy_ns).
+    pub idle_core_frac: f64,
+    /// SF-PS: ResolvePlan.apply invocations (must change queues/certs).
+    pub resolve_apply_n: usize,
+    /// SF-PS: SfMvMemory WaitReleased reads.
+    pub sf_mv_wait_released_reads: usize,
+    /// SF-PS: SfMvMemory OrderedTip reads.
+    pub sf_mv_ordered_tip_reads: usize,
+    /// SF-PS: explore pulls this block (reuse sticky must be 0).
+    pub explore_n: usize,
+    /// SF-PS: begin restored ArmTable from inter-block prior.
+    pub began_from_prior: bool,
+    /// v3: first WaitOnce parks this block. Same `(tx, ℓ, w)` is not counted twice.
+    pub access_wait_once: usize,
+    /// v3: a second Blocking of the same `(tx, ℓ, w)` was refused.
+    pub access_wait_suppressed: usize,
+    /// v3: beneficiary / basic-lazy reads that skipped a live writer.
+    pub access_never_wait: usize,
+    /// v3: single-invalid validates that installed a prefix keep (`k < fail_k`).
+    pub prefix_resume_n: usize,
+    /// v3: FullReplay applies that did not install a prefix keep (restart from k=0).
+    pub full_from_zero: usize,
+    /// v3: prefix-keep events with a known `fail_k > 0`.
+    pub fail_k_n: usize,
+    /// v3: smallest `fail_k` among prefix keeps. 0 when `fail_k_n` is 0.
+    pub fail_k_min: usize,
+    /// v3: largest `fail_k` among prefix keeps.
+    pub fail_k_max: usize,
+    /// v3: `fail_k` histogram. Index `k` for `1..=31`; index 31 also holds `k >= 31`.
+    pub fail_k_hist: [usize; 32],
+    /// SfMvMemory: early version tips installed this block.
+    pub sf_early_tip_n: usize,
+    /// SfMvMemory: exact waiters woken on Data publish.
+    pub sf_publish_wake_n: usize,
+    /// SfMvMemory: WaitOnce consume hits (spin / defer).
+    pub sf_wait_once_consume_n: usize,
+    /// Concurrent Detect (a): WaitOnce/crit + pred known before read.
+    pub sf_detect_before_n: usize,
+    /// Concurrent Avoid (b): true publish / done — collision never happens.
+    pub sf_avoid_publish_n: usize,
+    /// Concurrent Resolve (c): after-fail FullReplay / Rewind (path-c dominate = incomplete).
+    pub sf_resolve_after_fail_n: usize,
+    /// Four-class timely Avoid (b): RAW / WAR / WAW / Chain.
+    pub sf_raw_avoid_n: usize,
+    /// Four-class late Resolve (c): RAW.
+    pub sf_raw_late_n: usize,
+    /// Four-class timely Avoid (b): WAR (higher-revalidate on publish).
+    pub sf_war_avoid_n: usize,
+    /// Four-class late Resolve (c): WAR.
+    pub sf_war_late_n: usize,
+    /// Four-class timely Avoid (b): WAW (WaitOnce / OrderedTip).
+    pub sf_waw_avoid_n: usize,
+    /// Four-class late Resolve (c): WAW.
+    pub sf_waw_late_n: usize,
+    /// Four-class timely Avoid (b): long sticky ≥32 chain.
+    pub sf_chain_avoid_n: usize,
+    /// Four-class late Resolve (c): long sticky ≥32 chain.
+    pub sf_chain_late_n: usize,
+    /// Must be 0 on Soft=0 SF: Estimate Block on SpecFence path.
+    pub estimate_block_sf: usize,
+    /// Locations armed WaitOnce after the first hot conflict this block.
+    pub sf_protect_n: usize,
+    /// OCC-shaped reads that consulted a protected ℓ instead of Opt.
+    pub sf_protect_before_opt_n: usize,
+    /// FullReplay on an ℓ that was already protected.
+    pub sf_replay_after_protect_n: usize,
 }
 
 /// Shared counters written by worker threads.
@@ -529,6 +617,50 @@ pub(crate) struct MetricsInner {
     resolve_ordered_replay: AtomicUsize,
     resolve_full_replay: AtomicUsize,
     sf_schedule_picks: AtomicUsize,
+    steal_n: AtomicUsize,
+    refuse_fill_n: AtomicUsize,
+    mid_promote_n: AtomicUsize,
+    mid_promote_veto_n: AtomicUsize,
+    learn_e1_n: AtomicUsize,
+    learn_e2_n: AtomicUsize,
+    learn_e3_n: AtomicUsize,
+    learn_e4_n: AtomicUsize,
+    learn_e5_n: AtomicUsize,
+    learn_e6_n: AtomicUsize,
+    prior_plant_n: AtomicUsize,
+    resolve_apply_n: AtomicUsize,
+    sf_mv_wait_released_reads: AtomicUsize,
+    sf_mv_ordered_tip_reads: AtomicUsize,
+    explore_n: AtomicUsize,
+    began_from_prior: AtomicUsize,
+    access_wait_once: AtomicUsize,
+    access_wait_suppressed: AtomicUsize,
+    access_never_wait: AtomicUsize,
+    prefix_resume_n: AtomicUsize,
+    full_from_zero: AtomicUsize,
+    fail_k_sum: AtomicU64,
+    fail_k_n: AtomicUsize,
+    fail_k_min: AtomicUsize,
+    fail_k_max: AtomicUsize,
+    fail_k_hist: [AtomicUsize; 32],
+    sf_early_tip_n: AtomicUsize,
+    sf_publish_wake_n: AtomicUsize,
+    sf_wait_once_consume_n: AtomicUsize,
+    sf_detect_before_n: AtomicUsize,
+    sf_avoid_publish_n: AtomicUsize,
+    sf_resolve_after_fail_n: AtomicUsize,
+    sf_raw_avoid_n: AtomicUsize,
+    sf_raw_late_n: AtomicUsize,
+    sf_war_avoid_n: AtomicUsize,
+    sf_war_late_n: AtomicUsize,
+    sf_waw_avoid_n: AtomicUsize,
+    sf_waw_late_n: AtomicUsize,
+    sf_chain_avoid_n: AtomicUsize,
+    sf_chain_late_n: AtomicUsize,
+    estimate_block_sf: AtomicUsize,
+    sf_protect_n: AtomicUsize,
+    sf_protect_before_opt_n: AtomicUsize,
+    sf_replay_after_protect_n: AtomicUsize,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -1040,6 +1172,75 @@ impl MetricsInner {
     }
 
     #[inline]
+    pub(crate) fn record_refuse_fill(&self, n: usize) {
+        if n > 0 {
+            self.refuse_fill_n.fetch_add(n, Ordering::Relaxed);
+            self.refuse_admit.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn record_resolve_apply(&self) {
+        self.resolve_apply_n.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn add_idle_core_ns(&self, ns: u64) {
+        if ns > 0 {
+            self.idle_core_ns.fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn record_sf_mv_read(&self, vis: super::VisibilityPolicy) {
+        match vis {
+            super::VisibilityPolicy::WaitReleased => {
+                self.sf_mv_wait_released_reads
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            super::VisibilityPolicy::OrderedTip => {
+                self.sf_mv_ordered_tip_reads.fetch_add(1, Ordering::Relaxed);
+            }
+            super::VisibilityPolicy::Opt => {}
+        }
+    }
+
+    #[inline]
+    pub(crate) fn set_true_spine_metrics(
+        &self,
+        steal_n: usize,
+        refuse_fill_n: usize,
+        mid_promote_n: usize,
+        mid_promote_veto_n: usize,
+        explore_n: usize,
+        began_from_prior: bool,
+        e1_n: usize,
+        e2_n: usize,
+        e3_n: usize,
+        e4_n: usize,
+        e5_n: usize,
+        e6_n: usize,
+        prior_plant_n: usize,
+    ) {
+        self.steal_n.store(steal_n, Ordering::Relaxed);
+        self.refuse_fill_n
+            .fetch_add(refuse_fill_n, Ordering::Relaxed);
+        self.mid_promote_n.store(mid_promote_n, Ordering::Relaxed);
+        self.mid_promote_veto_n
+            .store(mid_promote_veto_n, Ordering::Relaxed);
+        self.explore_n.store(explore_n, Ordering::Relaxed);
+        self.began_from_prior
+            .store(usize::from(began_from_prior), Ordering::Relaxed);
+        self.learn_e1_n.store(e1_n, Ordering::Relaxed);
+        self.learn_e2_n.store(e2_n, Ordering::Relaxed);
+        self.learn_e3_n.store(e3_n, Ordering::Relaxed);
+        self.learn_e4_n.store(e4_n, Ordering::Relaxed);
+        self.learn_e5_n.store(e5_n, Ordering::Relaxed);
+        self.learn_e6_n.store(e6_n, Ordering::Relaxed);
+        self.prior_plant_n.store(prior_plant_n, Ordering::Relaxed);
+    }
+
+    #[inline]
     pub(crate) fn sample_runnable_width(&self, width: usize) {
         self.runnable_width_sum
             .fetch_add(width as u64, Ordering::Relaxed);
@@ -1205,6 +1406,109 @@ impl MetricsInner {
 
     pub(crate) fn record_journal_ff_hit(&self) {
         self.journal_ff_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Store the block's Avoid counters (not an increment — end-of-block census).
+    pub(crate) fn record_access_avoid(
+        &self,
+        wait_once: usize,
+        suppressed: usize,
+        never_wait: usize,
+        prefix_resume: usize,
+    ) {
+        self.access_wait_once.store(wait_once, Ordering::Relaxed);
+        self.access_wait_suppressed
+            .store(suppressed, Ordering::Relaxed);
+        self.access_never_wait.store(never_wait, Ordering::Relaxed);
+        self.prefix_resume_n.store(prefix_resume, Ordering::Relaxed);
+    }
+
+    /// Mid-block hot-key protect census (end of block, not an increment).
+    pub(crate) fn record_hot_protect(&self, protect: usize, before_opt: usize, replay_after: usize) {
+        self.sf_protect_n.store(protect, Ordering::Relaxed);
+        self.sf_protect_before_opt_n
+            .store(before_opt, Ordering::Relaxed);
+        self.sf_replay_after_protect_n
+            .store(replay_after, Ordering::Relaxed);
+    }
+
+    /// SfMvMemory tip-plane + Detect|Avoid|Resolve + four-class census (end-of-block).
+    pub(crate) fn record_sf_mv_tips(
+        &self,
+        early_tip: usize,
+        publish_wake: usize,
+        wait_once_consume: usize,
+        estimate_block_sf: usize,
+        detect_before: usize,
+        avoid_publish: usize,
+        resolve_after_fail: usize,
+        raw_avoid: usize,
+        raw_late: usize,
+        war_avoid: usize,
+        war_late: usize,
+        waw_avoid: usize,
+        waw_late: usize,
+        chain_avoid: usize,
+        chain_late: usize,
+    ) {
+        self.sf_early_tip_n.store(early_tip, Ordering::Relaxed);
+        self.sf_publish_wake_n
+            .store(publish_wake, Ordering::Relaxed);
+        self.sf_wait_once_consume_n
+            .store(wait_once_consume, Ordering::Relaxed);
+        self.estimate_block_sf
+            .store(estimate_block_sf, Ordering::Relaxed);
+        self.sf_detect_before_n
+            .store(detect_before, Ordering::Relaxed);
+        self.sf_avoid_publish_n
+            .store(avoid_publish, Ordering::Relaxed);
+        self.sf_resolve_after_fail_n
+            .store(resolve_after_fail, Ordering::Relaxed);
+        self.sf_raw_avoid_n.store(raw_avoid, Ordering::Relaxed);
+        self.sf_raw_late_n.store(raw_late, Ordering::Relaxed);
+        self.sf_war_avoid_n.store(war_avoid, Ordering::Relaxed);
+        self.sf_war_late_n.store(war_late, Ordering::Relaxed);
+        self.sf_waw_avoid_n.store(waw_avoid, Ordering::Relaxed);
+        self.sf_waw_late_n.store(waw_late, Ordering::Relaxed);
+        self.sf_chain_avoid_n.store(chain_avoid, Ordering::Relaxed);
+        self.sf_chain_late_n.store(chain_late, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_prefix_resume(&self, _kept: usize) {
+        self.prefix_resume_n.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One prefix keep at a known `fail_k > 0`.
+    pub(crate) fn record_fail_k(&self, k: u32) {
+        let k = k as usize;
+        if k == 0 {
+            return;
+        }
+        self.fail_k_sum.fetch_add(k as u64, Ordering::Relaxed);
+        self.fail_k_n.fetch_add(1, Ordering::Relaxed);
+        self.fail_k_max.fetch_max(k, Ordering::Relaxed);
+        self.fail_k_hist[k.min(31)].fetch_add(1, Ordering::Relaxed);
+        let mut cur = self.fail_k_min.load(Ordering::Relaxed);
+        loop {
+            if cur != 0 && cur <= k {
+                break;
+            }
+            let next = if cur == 0 { k } else { cur.min(k) };
+            match self.fail_k_min.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(seen) => cur = seen,
+            }
+        }
+    }
+
+    /// FullReplay that did not install prefix snaps. The next incarnation starts at k=0.
+    pub(crate) fn record_full_from_zero(&self) {
+        self.full_from_zero.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_value_stable_ff_hit(&self) {
@@ -1514,6 +1818,59 @@ impl MetricsInner {
             resolve_full_replay: self.resolve_full_replay.load(Ordering::Relaxed),
             sf_schedule_picks: self.sf_schedule_picks.load(Ordering::Relaxed),
             occ_schedule_picks: crate::specfence::executor::occ_pick_calls(),
+            steal_n: self.steal_n.load(Ordering::Relaxed),
+            refuse_fill_n: self.refuse_fill_n.load(Ordering::Relaxed),
+            mid_promote_n: self.mid_promote_n.load(Ordering::Relaxed),
+            mid_promote_veto_n: self.mid_promote_veto_n.load(Ordering::Relaxed),
+            learn_e1_n: self.learn_e1_n.load(Ordering::Relaxed),
+            learn_e2_n: self.learn_e2_n.load(Ordering::Relaxed),
+            learn_e3_n: self.learn_e3_n.load(Ordering::Relaxed),
+            learn_e4_n: self.learn_e4_n.load(Ordering::Relaxed),
+            learn_e5_n: self.learn_e5_n.load(Ordering::Relaxed),
+            learn_e6_n: self.learn_e6_n.load(Ordering::Relaxed),
+            prior_plant_n: self.prior_plant_n.load(Ordering::Relaxed),
+            idle_core_frac: {
+                let idle = self.idle_core_ns.load(Ordering::Relaxed);
+                let busy = self.worker_busy_ns.load(Ordering::Relaxed);
+                let den = idle.saturating_add(busy);
+                if den == 0 {
+                    0.0
+                } else {
+                    idle as f64 / den as f64
+                }
+            },
+            resolve_apply_n: self.resolve_apply_n.load(Ordering::Relaxed),
+            sf_mv_wait_released_reads: self.sf_mv_wait_released_reads.load(Ordering::Relaxed),
+            sf_mv_ordered_tip_reads: self.sf_mv_ordered_tip_reads.load(Ordering::Relaxed),
+            explore_n: self.explore_n.load(Ordering::Relaxed),
+            began_from_prior: self.began_from_prior.load(Ordering::Relaxed) != 0,
+            access_wait_once: self.access_wait_once.load(Ordering::Relaxed),
+            access_wait_suppressed: self.access_wait_suppressed.load(Ordering::Relaxed),
+            access_never_wait: self.access_never_wait.load(Ordering::Relaxed),
+            prefix_resume_n: self.prefix_resume_n.load(Ordering::Relaxed),
+            full_from_zero: self.full_from_zero.load(Ordering::Relaxed),
+            fail_k_n: self.fail_k_n.load(Ordering::Relaxed),
+            fail_k_min: self.fail_k_min.load(Ordering::Relaxed),
+            fail_k_max: self.fail_k_max.load(Ordering::Relaxed),
+            fail_k_hist: std::array::from_fn(|i| self.fail_k_hist[i].load(Ordering::Relaxed)),
+            sf_early_tip_n: self.sf_early_tip_n.load(Ordering::Relaxed),
+            sf_publish_wake_n: self.sf_publish_wake_n.load(Ordering::Relaxed),
+            sf_wait_once_consume_n: self.sf_wait_once_consume_n.load(Ordering::Relaxed),
+            sf_detect_before_n: self.sf_detect_before_n.load(Ordering::Relaxed),
+            sf_avoid_publish_n: self.sf_avoid_publish_n.load(Ordering::Relaxed),
+            sf_resolve_after_fail_n: self.sf_resolve_after_fail_n.load(Ordering::Relaxed),
+            sf_raw_avoid_n: self.sf_raw_avoid_n.load(Ordering::Relaxed),
+            sf_raw_late_n: self.sf_raw_late_n.load(Ordering::Relaxed),
+            sf_war_avoid_n: self.sf_war_avoid_n.load(Ordering::Relaxed),
+            sf_war_late_n: self.sf_war_late_n.load(Ordering::Relaxed),
+            sf_waw_avoid_n: self.sf_waw_avoid_n.load(Ordering::Relaxed),
+            sf_waw_late_n: self.sf_waw_late_n.load(Ordering::Relaxed),
+            sf_chain_avoid_n: self.sf_chain_avoid_n.load(Ordering::Relaxed),
+            sf_chain_late_n: self.sf_chain_late_n.load(Ordering::Relaxed),
+            estimate_block_sf: self.estimate_block_sf.load(Ordering::Relaxed),
+            sf_protect_n: self.sf_protect_n.load(Ordering::Relaxed),
+            sf_protect_before_opt_n: self.sf_protect_before_opt_n.load(Ordering::Relaxed),
+            sf_replay_after_protect_n: self.sf_replay_after_protect_n.load(Ordering::Relaxed),
         }
     }
 }
