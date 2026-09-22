@@ -239,9 +239,42 @@ fn select_crit_chain(
             .collect();
         w.sort_unstable();
         w.dedup();
-        // Under 32 writers the serial wait / WaitOnce park costs more than
-        // the replay it removes (3356896, chain ~15). 15274915 is ~60.
+        // Under 32 writers: not this sticky hold. The short region
+        // (`select_short_region_avoid`) still learns that hop as Avoid.
         if w.len() < 32 || w.len() * 4 > block_size.max(1) {
+            continue;
+        }
+        let replace = best.as_ref().is_none_or(|(_, prev)| w.len() > prev.len());
+        if replace {
+            best = Some((loc, w));
+        }
+    }
+    best
+}
+
+/// Longest basic/storage WAW region the ≥32 crit filter drops.
+/// Thin focus spine (~17 on 3356896) is Avoid, not “too short to learn”.
+/// Under 12 writers a one-hop arm is not this region.
+fn select_short_region_avoid(
+    orders: &[(u64, Vec<usize>)],
+    block_size: usize,
+    beneficiary: u64,
+) -> Option<(u64, Vec<usize>)> {
+    let mut best: Option<(u64, Vec<usize>)> = None;
+    for &(loc, ref writers) in orders {
+        if loc == beneficiary {
+            continue;
+        }
+        let mut w: Vec<usize> = writers
+            .iter()
+            .copied()
+            .filter(|&t| t < block_size)
+            .collect();
+        w.sort_unstable();
+        w.dedup();
+        // 12..=31: thin focus spine (~17). Shorter side chains (large n=8)
+        // are not this region — planting them raised wait_for_dependency.
+        if !(12..32).contains(&w.len()) || w.len() * 4 > block_size.max(1) {
             continue;
         }
         let replace = best.as_ref().is_none_or(|(_, prev)| w.len() > prev.len());
@@ -604,6 +637,13 @@ impl Pevm {
                 sf_tips.bind_chain_spine(loc, &writers);
                 writers.first().copied()
             });
+            // Short WAW region (thin spine). Operation = Avoid at the read:
+            // one-hop pred must be validated before the origin is recorded.
+            // Do not plant_nearest_preds — holding the whole tx off Q_* made
+            // the calm shell slower than the OCC abort it replaced.
+            if let Some((loc, writers)) = self.inter_prior.region_avoid() {
+                access_arms.install_region_avoid(loc, &writers);
+            }
             self.last_begin_blocked = ready_edges.blocked_consumers();
             runnable.seed_begin(&ready_edges, &producer_stages, &scheduler, crit_head);
             // P3: do not sample (n_tx − blocked) as ready_width (reads as 172).
@@ -1028,6 +1068,17 @@ impl Pevm {
                 }
             }
             self.inter_prior.pack_crit_chain(packed);
+            let fresh_short =
+                select_short_region_avoid(&self.last_location_writers, block_size, beneficiary);
+            let prev_short = self.inter_prior.region_avoid();
+            let packed_short = match (fresh_short, prev_short) {
+                (Some((loc, w)), Some((pl, pw))) if loc == pl && w.len() < pw.len() => {
+                    Some((pl, pw))
+                }
+                (None, Some(p)) if p.1.len() >= 12 => Some(p),
+                (f, _) => f,
+            };
+            self.inter_prior.pack_region_avoid(packed_short);
             let ready_w = ready_edges.ready_width_mean();
             let idle = ready_edges.idle_core_ns();
             let refuse = ready_edges.refuse_count();

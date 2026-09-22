@@ -1,0 +1,58 @@
+{
+  "block": 15274915,
+  "soft": 0,
+  "exclude_beneficiary": true,
+  "exclude_basic_lazy": true,
+  "n": 1226,
+  "C": 8,
+  "counts": {
+    "RAW": 35,
+    "WAW": 120,
+    "WAR": 107,
+    "edges": null,
+    "L_hop": 77,
+    "L_crit_ms": 1.19,
+    "W_lvl": 1120,
+    "LB_ms": 1.19,
+    "ideal_makespan_ms": 1.19,
+    "work_sum_ms": 3.02,
+    "work_over_C_ms": 0.38
+  },
+  "nodes": [],
+  "edges": [],
+  "spines": {
+    "waw_hop": {
+      "loc": "abd6bb397881",
+      "loc_kind": "basic",
+      "writers": [],
+      "writers_note": "L=77; fragments only in notes (116, 122, …). Not invented.",
+      "earliest_k": [3],
+      "L": 77
+    },
+    "work_weighted": {
+      "txs": [],
+      "head": 0,
+      "tail": 102,
+      "n": 13,
+      "L_crit_ms": 1.19
+    },
+    "raw": [],
+    "war_note": "access-grain WAR=107; endpoints not regenerated"
+  },
+  "antichain_proxy": {
+    "W_lvl": 1120,
+    "clean_sample_n": 1111,
+    "fills_C": true
+  },
+  "side_observed_not_armed": {
+    "loc": "0x483a65c8273c8219",
+    "n": 8,
+    "why": "below the short-region scope floor of 12; planting it raised wait_for_dependency"
+  },
+  "provenance": {
+    "engine": "129bbd0a678d51030673b032f835562e87166f72",
+    "trace": "not a full dependency_edges dump",
+    "method": "notes counts; full writer list not emitted"
+  },
+  "known_from_notes_only": true
+}

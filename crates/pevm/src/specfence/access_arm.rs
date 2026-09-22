@@ -241,6 +241,26 @@ impl AccessArmTable {
         *self.prior_writers.lock().unwrap() = writers.to_vec();
     }
 
+    /// Region Learn operation: this ℓ is Avoid for the whole block.
+    /// Remaining writers take one-hop WaitOnce before Opt. Peer on the
+    /// arm stays 0 so txs that do not touch `ℓ` keep the OCC-shaped skip;
+    /// `wait_edges` name only the learned touchers.
+    pub(crate) fn install_region_avoid(&self, loc: MemoryLocationHash, writers: &[TxIdx]) {
+        if writers.len() < 2 || self.is_never(loc) {
+            return;
+        }
+        self.prior_loc.store(loc, Ordering::Relaxed);
+        *self.prior_writers.lock().unwrap() = writers.to_vec();
+        self.note_early_waw(loc, 1);
+        for w in writers.windows(2) {
+            self.note_wait_edge(w[1], w[0], loc);
+        }
+        if self.protected.insert(loc) {
+            self.protect_n.fetch_add(1, Ordering::Relaxed);
+        }
+        self.protect_live.store(true, Ordering::Relaxed);
+    }
+
     fn install_protect_edges(&self, loc: MemoryLocationHash) {
         let writers = if self.crit_loc.load(Ordering::Relaxed) == loc {
             self.crit_writers.lock().unwrap().clone()
@@ -710,5 +730,21 @@ mod tests {
         t.note_protect_before_opt();
         assert_eq!(t.replay_after_protect_n(), 1);
         assert_eq!(t.protect_before_opt_n(), 1);
+    }
+
+    #[test]
+    fn region_avoid_edges_named_touchers_only() {
+        let t = AccessArmTable::new();
+        t.install_region_avoid(11, &[4, 31, 66]);
+        assert!(t.is_protected(11));
+        assert!(t.protect_live());
+        assert_eq!(t.wait_once_pred(31, 11), Some(4));
+        assert_eq!(t.wait_once_pred(66, 11), Some(31));
+        assert!(
+            !t.has_wait_once_peer_before(5),
+            "antichain tx must stay OCC-shaped"
+        );
+        assert!(t.has_wait_once_peer_before(66));
+        assert_eq!(t.known_writer_indexes(11).unwrap(), vec![4, 31, 66]);
     }
 }

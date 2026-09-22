@@ -272,6 +272,9 @@ pub(crate) struct InterBlockPrior {
     /// plants nearest-pred gates so the next writer does not Opt-read
     /// before this one publishes.
     crit_chain: Mutex<Option<(crate::MemoryLocationHash, Vec<crate::TxIdx>)>>,
+    /// Short WAW region the ≥32 crit filter drops (thin hop, 3356896).
+    /// Operation is Avoid: one-hop WaitOnce before later Opt of this ℓ.
+    region_avoid: Mutex<Option<(crate::MemoryLocationHash, Vec<crate::TxIdx>)>>,
 }
 
 impl InterBlockPrior {
@@ -336,6 +339,7 @@ impl InterBlockPrior {
         self.access_arm_snaps.lock().unwrap().clear();
         self.access_wait_edges.lock().unwrap().clear();
         *self.crit_chain.lock().unwrap() = None;
+        *self.region_avoid.lock().unwrap() = None;
     }
 
     /// Begin-block ArmTable restore.
@@ -380,6 +384,18 @@ impl InterBlockPrior {
 
     pub(crate) fn crit_chain(&self) -> Option<(crate::MemoryLocationHash, Vec<crate::TxIdx>)> {
         self.crit_chain.lock().unwrap().clone()
+    }
+
+    /// Learned short-region Avoid list (sorted writers). `None` if unset.
+    pub(crate) fn region_avoid(&self) -> Option<(crate::MemoryLocationHash, Vec<crate::TxIdx>)> {
+        self.region_avoid.lock().unwrap().clone()
+    }
+
+    pub(crate) fn pack_region_avoid(
+        &self,
+        region: Option<(crate::MemoryLocationHash, Vec<crate::TxIdx>)>,
+    ) {
+        *self.region_avoid.lock().unwrap() = region;
     }
 
     /// Morph flip from the last `end_block`, without consuming it.

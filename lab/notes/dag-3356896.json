@@ -1,0 +1,51 @@
+{
+  "block": 3356896,
+  "soft": 0,
+  "exclude_beneficiary": true,
+  "exclude_basic_lazy": true,
+  "n": 176,
+  "C": 8,
+  "counts": {
+    "RAW": 0,
+    "WAW": 22,
+    "WAR": 18,
+    "edges": null,
+    "L_hop": 17,
+    "L_crit_ms": 0.031,
+    "W_lvl": 154,
+    "LB_ms": 0.031,
+    "ideal_makespan_ms": 0.031,
+    "work_sum_ms": 0.18,
+    "work_over_C_ms": 0.023
+  },
+  "nodes": [],
+  "edges": [],
+  "spines": {
+    "waw_hop": {
+      "loc": "dff71d59d972",
+      "loc_observed": "0xdff71d59d972d654",
+      "loc_kind": "basic",
+      "writers": [4, 31, 66, 67, 69, 70, 93, 96, 103, 115, 131, 132, 135, 138, 141, 166, 171],
+      "earliest_k": [5, 6],
+      "L": 17,
+      "runtime_confirm": "reuse region_avoid n=17 head=4 tail=171 on this tip"
+    },
+    "work_weighted": {
+      "txs": [4, 31, 66, 67, 69, 70, 93, 96, 103, 115, 131, 132, 135, 138, 141, 166, 171],
+      "L_crit_ms": 0.031
+    },
+    "raw": [],
+    "war_note": "access-grain WAR=18; endpoints not regenerated this iteration"
+  },
+  "antichain_proxy": {
+    "W_lvl": 154,
+    "clean_sample_n": 153,
+    "fills_C": true
+  },
+  "provenance": {
+    "engine": "129bbd0a678d51030673b032f835562e87166f72",
+    "trace": "not a full dependency_edges dump",
+    "method": "notes writer list + runtime region_avoid loc/n/head/tail; counts from access-grain / per-tx-vs-bound"
+  },
+  "known_from_notes_only": true
+}
