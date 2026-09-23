@@ -74,6 +74,11 @@ impl Deque {
     }
 
     #[inline]
+    fn push_front(&self, tx: TxIdx) {
+        self.inner.lock().push_front(tx);
+    }
+
+    #[inline]
     fn try_pop_local(&self) -> Option<TxIdx> {
         self.inner.lock().pop_back()
     }
@@ -263,10 +268,11 @@ impl RunnableSet {
             self.locals[w].push_local(tx);
             self.local_queued.fetch_add(1, Ordering::Relaxed);
         }
-        // Highest index first, so pop_back is the chain head.
+        // Highest index first, so the shared LIFO back is the chain head.
+        // The tail stays on this deque; width cores steal locals, not this.
         for tx in chain.into_iter().rev() {
             if self.state[tx].load(Ordering::Acquire) == ST_INDEP {
-                self.spine_q.push_local(tx);
+                self.q_indep.push_local(tx);
             }
         }
     }
@@ -276,14 +282,42 @@ impl RunnableSet {
         tx < self.block_size && self.chain_bit[tx].load(Ordering::Acquire) == 1
     }
 
-    fn place(&self, tx: TxIdx, kind: QueueKind) {
-        // Chain hops never join a width deque: steal would pop the tail.
-        // Do not offer_spine here. A failed `try_execute` re-offered into the
-        // slot pinned every pick on that hop.
-        if kind == QueueKind::Indep && self.is_chain_member(tx) {
-            self.spine_q.push_local(tx);
+    fn chain_owner_running(&self) -> bool {
+        let cur = self.spine_owner_tx.load(Ordering::Acquire);
+        cur < self.block_size && self.state[cur].load(Ordering::Acquire) == ST_RUNNING
+    }
+
+    /// `pop_kind` already moved `tx` to `ST_RUNNING`. Put it back on the
+    /// shared back (it is the next hop, not a stolen tail).
+    fn return_chain_hop(&self, tx: TxIdx) {
+        self.requeue_chain(tx, false);
+    }
+
+    /// Steal popped the front, which is the chain tail. Restore that end.
+    fn restore_chain_front(&self, tx: TxIdx) {
+        self.requeue_chain(tx, true);
+    }
+
+    fn requeue_chain(&self, tx: TxIdx, front: bool) {
+        self.release_running(tx);
+        let st = self.state[tx].load(Ordering::Acquire);
+        if st == ST_DONE || st == ST_RUNNING {
             return;
         }
+        if st != ST_INDEP {
+            let _ =
+                self.state[tx].compare_exchange(st, ST_INDEP, Ordering::AcqRel, Ordering::Relaxed);
+        }
+        if front {
+            self.q_indep.push_front(tx);
+        } else {
+            self.q_indep.push_local(tx);
+        }
+    }
+
+    fn place(&self, tx: TxIdx, kind: QueueKind) {
+        // Back on the shared deque. `spine_q` is not a second home: a hop
+        // parked only there was invisible once a successor held ST_RUNNING.
         self.q(kind).push_local(tx);
     }
 
@@ -590,16 +624,25 @@ impl RunnableSet {
             }
             self.clear_spine_claim(tx);
         }
-        if let Some(tx) = self.pop_spine_hop() {
-            if let Some(p) = self.admit_or_refuse(tx, QueueKind::Indep, ready) {
-                if matches!(p, SfPick::Execute { tx: got, .. } if got == tx) {
-                    self.note_spine_claim(worker, tx);
+        // One chain hop from the shared back, and only when none is running.
+        // Popping the tail while the head waits made every reader hit the
+        // 15ms YieldWait valve.
+        if !self.chain_owner_running()
+            && let Some(tx) = self.pop_kind(QueueKind::Indep)
+        {
+            if self.is_chain_member(tx) {
+                if let Some(p) = self.admit_or_refuse(tx, QueueKind::Indep, ready) {
+                    if matches!(p, SfPick::Execute { tx: got, .. } if got == tx) {
+                        self.note_spine_claim(worker, tx);
+                        return Some(p);
+                    }
+                    self.clear_spine_claim(tx);
                     return Some(p);
                 }
                 self.clear_spine_claim(tx);
+            } else if let Some(p) = self.admit_or_refuse(tx, QueueKind::Indep, ready) {
                 return Some(p);
             }
-            self.clear_spine_claim(tx);
         }
 
         if let Some(tx) = self.pop_batch(worker) {
@@ -633,12 +676,13 @@ impl RunnableSet {
             }
         }
 
-        // Global backup. A chain hop that landed here goes back to spine_q.
+        // Global backup. Never steal a chain hop off the front: that is the
+        // tail. Put it back and leave it for the single back-pop above.
         if worker == 0 {
             while let Some(tx) = self.pop_kind(QueueKind::Indep) {
                 if self.is_chain_member(tx) {
-                    self.defer_ordered(tx);
-                    continue;
+                    self.return_chain_hop(tx);
+                    break;
                 }
                 if let Some(p) = self.admit_or_refuse(tx, QueueKind::Indep, ready) {
                     return Some(p);
@@ -647,8 +691,8 @@ impl RunnableSet {
         } else {
             while let Some(tx) = self.steal_kind(QueueKind::Indep) {
                 if self.is_chain_member(tx) {
-                    self.defer_ordered(tx);
-                    continue;
+                    self.restore_chain_front(tx);
+                    break;
                 }
                 if let Some(p) = self.admit_or_refuse(tx, QueueKind::Indep, ready) {
                     return Some(p);
@@ -659,8 +703,8 @@ impl RunnableSet {
         for kind in [QueueKind::Released, QueueKind::Ordered] {
             while let Some(tx) = self.pop_kind(kind) {
                 if self.is_chain_member(tx) {
-                    self.defer_ordered(tx);
-                    continue;
+                    self.return_chain_hop(tx);
+                    break;
                 }
                 if let Some(p) = self.admit_or_refuse(tx, kind, ready) {
                     return Some(p);
@@ -668,8 +712,8 @@ impl RunnableSet {
             }
             while let Some(tx) = self.steal_kind(kind) {
                 if self.is_chain_member(tx) {
-                    self.defer_ordered(tx);
-                    continue;
+                    self.restore_chain_front(tx);
+                    break;
                 }
                 if let Some(p) = self.admit_or_refuse(tx, kind, ready) {
                     return Some(p);
@@ -691,13 +735,6 @@ impl RunnableSet {
         }
     }
 
-    /// True only while the owned hop is still inside execute. A owner left
-    /// on a requeued tx must not freeze the chain.
-    fn spine_busy(&self) -> bool {
-        let cur = self.spine_owner_tx.load(Ordering::Acquire);
-        cur < self.block_size && self.state[cur].load(Ordering::Acquire) == ST_RUNNING
-    }
-
     fn release_spine_lock(&self) {
         let _ = self.spine_owner_tx.compare_exchange(
             SPINE_LOCK,
@@ -707,14 +744,16 @@ impl RunnableSet {
         );
     }
 
-    /// Exclusive right to pull one ordered hop. Stale owners are cleared.
+    /// Mutex for one `spine_q` pop. A live `ST_RUNNING` hop keeps the tail
+    /// on the queue. Slot claim does not use this lock: a predecessor sitting
+    /// in the slot must still start while a successor waits.
     fn lock_spine(&self) -> bool {
         loop {
-            if self.spine_busy() {
-                return false;
-            }
             let cur = self.spine_owner_tx.load(Ordering::Acquire);
             if cur == SPINE_LOCK {
+                return false;
+            }
+            if cur < self.block_size && self.state[cur].load(Ordering::Acquire) == ST_RUNNING {
                 return false;
             }
             if cur == usize::MAX {
@@ -722,9 +761,6 @@ impl RunnableSet {
                     .spine_owner_tx
                     .compare_exchange(usize::MAX, SPINE_LOCK, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok();
-            }
-            if cur < self.block_size && self.state[cur].load(Ordering::Acquire) == ST_RUNNING {
-                return false;
             }
             if self
                 .spine_owner_tx
@@ -779,9 +815,6 @@ impl RunnableSet {
     }
 
     fn claim_spine(&self) -> Option<TxIdx> {
-        if self.spine_busy() {
-            return None;
-        }
         let tx = self.spine_slot.swap(usize::MAX, Ordering::AcqRel);
         if tx == usize::MAX || tx >= self.block_size {
             return None;
@@ -817,25 +850,11 @@ impl RunnableSet {
         }
     }
 
-    /// Install `tx` as the spine owner. Fails only when another hop is
-    /// `ST_RUNNING`. A stale owner (requeued, waiting, done) is replaced.
+    /// Install `tx` as the spine owner. Overwrites a stale or waiting owner
+    /// so the predecessor can start while a successor sits in WaitTrueVersion.
     fn own_spine(&self, tx: TxIdx) -> bool {
-        loop {
-            let cur = self.spine_owner_tx.load(Ordering::Acquire);
-            if cur == tx {
-                return true;
-            }
-            if cur < self.block_size && self.state[cur].load(Ordering::Acquire) == ST_RUNNING {
-                return false;
-            }
-            if self
-                .spine_owner_tx
-                .compare_exchange(cur, tx, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                return true;
-            }
-        }
+        self.spine_owner_tx.store(tx, Ordering::Release);
+        true
     }
 
     fn pop_batch(&self, worker: usize) -> Option<TxIdx> {

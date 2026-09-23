@@ -105,7 +105,9 @@ pub(crate) fn pick(
                 if spine
                     .successor_blocked(tx, |w| scheduler.is_done(w) || scheduler.is_validated(w))
                 {
-                    runnable.defer_ordered(tx);
+                    // WAIT, not a private spine queue. Heal requeues onto Indep
+                    // once the predecessor has published.
+                    runnable.release_running(tx);
                     spine.note_ordered_defer();
                     continue;
                 }
