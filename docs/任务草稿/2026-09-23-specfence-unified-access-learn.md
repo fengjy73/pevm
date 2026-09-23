@@ -33,9 +33,10 @@
 
    墙时：薄块 SF 1.459 / OCC 1.006 ms；大块 SF 7.542 / OCC 5.332 ms。末轮薄块链跨度约 0.42 ms。`est_block=0`，`soft=0`，`occ_picks=0`。下一刀是反链调度税，不是第四原语。
 
-6. **进行中 — T0–T6 压反链调度税（同一 PR #48，不做 T7）。** 基线 tax ≈ +1.0 / +6.1 ms，ratio 0.690 / 0.707。
+6. **已测 — T0–T6 未把税压下去（同一 PR #48，不做 T7）。** 基线 tax ≈ +1.0 / +6.1 ms，ratio 0.690 / 0.707。`69ec72b` N=5：3356896 ratio **0.050**（SF 18.637 / OCC 0.937 ms；reuse 墙时 18.637、5384.339、1.658、16.800；seq=par）。15274915 ratio **0.619**（SF 9.927 / OCC 6.149，tax 8.238，span 1.689，**seq≠par**）。`gated_pick=0`，`spine_cores=2`。私有 `spine_q` 加 owner 位曾让薄块 reuse 到 19.9 s（`yield_deadlock=1329`）。
 
    - **目标：** Soft=0 Instant-off，N≥5，焦点 3356896 + 15274915。主指标 TPS SF/OCC（目标 ≥1.5，未达标如实）。辅：`tax_ms = SF_wall − chain_span` 相对长链刀后基线是否下降。计数 idle / steal / refuse_gated / gated_pick / spine_cores。
    - **机制：** 反链进每核本地队列，只偷队头；链跳只在 `spine_q` / `spine_slot`，不进可偷 deque。任一空闲核可认领唯一槽。发布 handoff 不进 Indep LIFO。前驱未发布则 `defer_ordered` 放回 `spine_q`（禁止 `ST_CHAIN` 离队）。Indep 空且前驱已发布时 help-release。`batch_pop` K=4。
    - **已测一轮（链堆在 worker 0，队头被偷）：** 3356896 ratio 0.618（SF 1.763 / OCC 1.090，tax 0.716，span 1.047，seq=par）；15274915 ratio 0.516（SF 10.726 / OCC 5.539，tax 9.254，span 1.472，**seq!=par**）。`gated_pick=0`，`spine_cores=2`。相对长链基线 0.690 / 0.707 退步。原因是链尾在可偷 deque 上，defer 后停在 `ST_CHAIN`。
-   - **状态：** 链与反链已拆开，待重测 N=5。
+   - **落地形态：** 反链在每核本地队列，只偷队头，`batch_pop` K=4。链留在共享 Indep，一次只领一个正在跑的跳；发布 handoff 进 `spine_slot`。不把链放进私有队列。
+   - **状态：** 已测完。未达 1.5，税相对长链刀没有下降。不做 T7。
