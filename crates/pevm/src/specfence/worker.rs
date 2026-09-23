@@ -309,15 +309,12 @@ pub(crate) fn run_sf_block<F, V>(
                     break;
                 }
                 if runnable.spine_slot_empty()
-                    && let Some(tx) = specfence.spine.help_next_hop()
+                    && let Some(tx) = specfence
+                        .spine
+                        .help_next_hop(|w| scheduler.is_done(w) || scheduler.is_validated(w))
                     && runnable.offer_spine(tx)
                 {
                     runnable.note_help_release();
-                    // Only the spine owner should retry without a yield. Width
-                    // cores fall through and steal or park.
-                    if worker_i % runnable.cores() == 0 {
-                        continue;
-                    }
                 }
                 specfence
                     .ready_edges

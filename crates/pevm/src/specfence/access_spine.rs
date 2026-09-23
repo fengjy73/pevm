@@ -386,17 +386,23 @@ impl AccessSpine {
         &self.ordered_writers
     }
 
-    /// Next hop whose predecessor has published. Empty when the predecessor
-    /// is still in flight, so help-release cannot start the tail early.
-    pub(crate) fn help_next_hop(&self) -> Option<TxIdx> {
+    /// Next hop whose predecessor has published or finished. Empty when the
+    /// predecessor is still in flight, so help-release cannot start the tail
+    /// early. `is_done` counts: a writer can finish without passing the
+    /// ordered-location publish hook.
+    pub(crate) fn help_next_hop(&self, pred_finished: impl Fn(TxIdx) -> bool) -> Option<TxIdx> {
         if self.ordered_writers.is_empty() {
             return None;
         }
         for (i, &tx) in self.ordered_writers.iter().enumerate() {
-            if self.published.contains(&tx) {
+            if self.published.contains(&tx) || pred_finished(tx) {
                 continue;
             }
-            if i == 0 || self.published.contains(&self.ordered_writers[i - 1]) {
+            if i == 0 {
+                return Some(tx);
+            }
+            let pred = self.ordered_writers[i - 1];
+            if self.published.contains(&pred) || pred_finished(pred) {
                 return Some(tx);
             }
             return None;

@@ -70,7 +70,8 @@ pub(crate) fn pick(
     // Pred already published and the slot is empty: one help-release. This
     // does not hand the hop to a width core.
     if runnable.spine_slot_empty()
-        && let Some(next) = spine.help_next_hop()
+        && let Some(next) =
+            spine.help_next_hop(|w| scheduler.is_done(w) || scheduler.is_validated(w))
         && runnable.offer_spine(next)
     {
         runnable.note_help_release();
