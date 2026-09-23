@@ -691,9 +691,23 @@ impl MvMemory {
     // structure with special ESTIMATE markers to quickly abort higher transactions
     // that read them.
     pub(crate) fn convert_writes_to_estimates(&self, tx_idx: TxIdx) {
+        self.convert_writes_to_estimates_keeping(tx_idx, |_| false);
+    }
+
+    /// Like [`Self::convert_writes_to_estimates`], but locations where `keep`
+    /// is true stay Data. RetainHistory uses that so a WAR reader still sees
+    /// the tip it bound.
+    pub(crate) fn convert_writes_to_estimates_keeping(
+        &self,
+        tx_idx: TxIdx,
+        keep: impl Fn(MemoryLocationHash) -> bool,
+    ) {
         let writes = self.write_locations(tx_idx);
         self.residual_write_sets.insert(tx_idx, writes.clone());
         for location in &writes {
+            if keep(*location) {
+                continue;
+            }
             if let Some(mut written_transactions) = self.data.get_mut(location) {
                 written_transactions.insert(tx_idx, MemoryEntry::Estimate);
             }

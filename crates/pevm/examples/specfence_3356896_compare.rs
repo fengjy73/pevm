@@ -184,6 +184,11 @@ struct IterRow {
     storage_inc_gt0: Vec<usize>,
     off_edge_inc_gt0: Vec<usize>,
     edge_4_31: bool,
+    ordered_defer: usize,
+    ordered_handoff: usize,
+    retain_keeps: usize,
+    tip_already: usize,
+    chain_len: usize,
     estimate_block_sf: usize,
     spine_access: usize,
     spine_yield_ok: usize,
@@ -226,6 +231,11 @@ struct CompareSummary {
     spine_pins: usize,
     spine_revoked: usize,
     spine_radar: usize,
+    ordered_defer: usize,
+    ordered_handoff: usize,
+    retain_keeps: usize,
+    tip_already: usize,
+    chain_len: usize,
 }
 
 fn inc_gt0_in(incs: &[usize], set: &[usize]) -> Vec<usize> {
@@ -505,7 +515,7 @@ fn run_once(
             if mode_name == "specfence" {
                 print_focus(pevm, mode_name, i, n, &m);
                 println!(
-                    "  spine {mode_name}[{i}] access={} yield_ok={} yield_deadlock={} raw={} waw={} war={} armed={} pins={} revoked={} radar={} est_block={} soft={} occ_picks={}",
+                    "  spine {mode_name}[{i}] access={} yield_ok={} yield_deadlock={} raw={} waw={} war={} armed={} pins={} revoked={} radar={} defer={} handoff={} retain={} tip_already={} chain={} est_block={} soft={} occ_picks={}",
                     spine.access_events,
                     spine.yield_waits_ok,
                     spine.yield_deadlocks,
@@ -516,6 +526,11 @@ fn run_once(
                     spine.retained_pins,
                     spine.prior_revoked,
                     spine.prior_radar_only,
+                    spine.ordered_defer,
+                    spine.ordered_handoff,
+                    spine.retain_keeps,
+                    spine.tip_already,
+                    spine.chain_len,
                     m.estimate_block_sf,
                     m.soft_wait_arms,
                     m.occ_schedule_picks,
@@ -619,6 +634,11 @@ fn run_once(
                 storage_inc_gt0: inc_gt0_in(&incs, STORAGE_141617),
                 off_edge_inc_gt0: off_edge,
                 edge_4_31,
+                ordered_defer: spine.ordered_defer,
+                ordered_handoff: spine.ordered_handoff,
+                retain_keeps: spine.retain_keeps,
+                tip_already: spine.tip_already,
+                chain_len: spine.chain_len,
                 estimate_block_sf: m.estimate_block_sf,
                 spine_access: spine.access_events,
                 spine_yield_ok: spine.yield_waits_ok,
@@ -824,6 +844,11 @@ fn main() {
     let spine_pins = last_sf_metrics.map(|r| r.spine_pins).unwrap_or(0);
     let spine_revoked = last_sf_metrics.map(|r| r.spine_revoked).unwrap_or(0);
     let spine_radar = last_sf_metrics.map(|r| r.spine_radar).unwrap_or(0);
+    let ordered_defer = last_sf_metrics.map(|r| r.ordered_defer).unwrap_or(0);
+    let ordered_handoff = last_sf_metrics.map(|r| r.ordered_handoff).unwrap_or(0);
+    let retain_keeps = last_sf_metrics.map(|r| r.retain_keeps).unwrap_or(0);
+    let tip_already = last_sf_metrics.map(|r| r.tip_already).unwrap_or(0);
+    let chain_len = last_sf_metrics.map(|r| r.chain_len).unwrap_or(0);
 
     println!(
         "summary Soft=0 occ_median_ms={occ_med:.3} sf_cold_ms={} sf_reuse_median_ms={} primary_sf_ms={primary_sf:.3} primary={} sf_le_occ={sf_le_occ}",
@@ -836,7 +861,7 @@ fn main() {
         if primary_is_reuse { "reuse" } else { "cold" }
     );
     println!(
-        "TPS_SUMMARY block={block_no} n={n} cores={cores} iters={iters} occ_tps={occ_tps:.1} sf_tps={sf_tps:.1} ratio={ratio:.3} ge_1_5={} occ_ms={occ_med:.3} sf_ms={primary_sf:.3} est_block={est} soft={soft_arms} occ_picks={occ_picks} access={spine_access} yield_ok={spine_yield_ok} yield_deadlock={spine_yield_deadlock} raw={spine_raw} waw={spine_waw} war={spine_war} armed={spine_armed} pins={spine_pins} revoked={spine_revoked} radar={spine_radar}",
+        "TPS_SUMMARY block={block_no} n={n} cores={cores} iters={iters} occ_tps={occ_tps:.1} sf_tps={sf_tps:.1} ratio={ratio:.3} ge_1_5={} occ_ms={occ_med:.3} sf_ms={primary_sf:.3} est_block={est} soft={soft_arms} occ_picks={occ_picks} access={spine_access} yield_ok={spine_yield_ok} yield_deadlock={spine_yield_deadlock} raw={spine_raw} waw={spine_waw} war={spine_war} armed={spine_armed} pins={spine_pins} revoked={spine_revoked} radar={spine_radar} defer={ordered_defer} handoff={ordered_handoff} retain={retain_keeps} tip_already={tip_already} chain={chain_len}",
         ratio >= 1.5
     );
 
@@ -868,6 +893,11 @@ fn main() {
         spine_pins,
         spine_revoked,
         spine_radar,
+        ordered_defer,
+        ordered_handoff,
+        retain_keeps,
+        tip_already,
+        chain_len,
     };
 
     if std::env::var("SPECFENCE_COMPARE_CHECK").is_ok() {

@@ -9,7 +9,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use dashmap::DashMap;
+use dashmap::{DashSet, DashMap};
 
 use crate::{MemoryLocationHash, TxIdx};
 
@@ -213,6 +213,11 @@ pub(crate) struct SpinePrior {
     pub recipe_proposal: [f32; 3],
     /// Page-Hinkley / CUSUM asked for a revoke on the last boundary.
     pub revoked: bool,
+    /// Longest writer chain observed last block, ascending tx index.
+    /// Radar for OrderedTip. Empty after revoke. Not an Avoid arm.
+    pub chains: Vec<TxIdx>,
+    /// Location of [`Self::chains`]. `u64::MAX` when there is no chain.
+    pub chain_loc: MemoryLocationHash,
     ph_sum: f32,
     ph_min: f32,
     ph_n: u32,
@@ -242,6 +247,8 @@ impl Default for SpinePrior {
             prev_raw: 0,
             prev_waw: 0,
             prev_war: 0,
+            chains: Vec::new(),
+            chain_loc: u64::MAX,
         }
     }
 }
@@ -281,6 +288,16 @@ pub struct SpineReport {
     pub prior_revoked: usize,
     /// `1` when the carried prior's action is PreheatRadarOnly.
     pub prior_radar_only: usize,
+    /// Chain successors left on the queue until their pred has started.
+    pub ordered_defer: usize,
+    /// Next chain writer woken so it can enter and wait at the real read.
+    pub ordered_handoff: usize,
+    /// Estimate conversion skipped because a WAR pin still needs the tip.
+    pub retain_keeps: usize,
+    /// Ordered read whose pred tip was already published (no in-frame wait).
+    pub tip_already: usize,
+    /// Writer indexes carried on the ordered chain (0 when cold).
+    pub chain_len: usize,
 }
 
 /// Shared per-block spine. Workers share it. The Avoid table starts empty.
@@ -302,11 +319,23 @@ pub(crate) struct AccessSpine {
     armed_n: AtomicUsize,
     /// Generation for the deadlock escape flag.
     escape_gen: AtomicU64,
+    /// Previous block's longest chain. Not armed until a real write.
+    ordered_loc: MemoryLocationHash,
+    ordered_writers: Vec<TxIdx>,
+    published: DashSet<TxIdx>,
+    started: DashSet<TxIdx>,
+    handoff: AtomicUsize,
+    ordered_defer: AtomicUsize,
+    ordered_handoff: AtomicUsize,
+    retain_keeps: AtomicUsize,
+    tip_already: AtomicUsize,
 }
 
 impl AccessSpine {
     /// Empty Avoid. `prior` only warms the radar.
     pub(crate) fn begin(prior: SpinePrior, workers: usize) -> Self {
+        let ordered_loc = prior.chain_loc;
+        let ordered_writers = prior.chains.clone();
         Self {
             intra: DashMap::new(),
             prior,
@@ -322,7 +351,121 @@ impl AccessSpine {
             war_n: AtomicUsize::new(0),
             armed_n: AtomicUsize::new(0),
             escape_gen: AtomicU64::new(0),
+            ordered_loc,
+            ordered_writers,
+            published: DashSet::new(),
+            started: DashSet::new(),
+            handoff: AtomicUsize::new(usize::MAX),
+            ordered_defer: AtomicUsize::new(0),
+            ordered_handoff: AtomicUsize::new(0),
+            retain_keeps: AtomicUsize::new(0),
+            tip_already: AtomicUsize::new(0),
         }
+    }
+
+    /// This tx is on the carried writer chain.
+    pub(crate) fn is_ordered_member(&self, tx: TxIdx) -> bool {
+        self.ordered_writers.binary_search(&tx).is_ok()
+    }
+
+    pub(crate) fn ordered_len(&self) -> usize {
+        self.ordered_writers.len()
+    }
+
+    /// A chain successor may enter once its predecessor has started or finished.
+    /// The head always may. Non-members always may (antichain fill).
+    pub(crate) fn successor_blocked(
+        &self,
+        tx: TxIdx,
+        pred_finished: impl Fn(TxIdx) -> bool,
+    ) -> bool {
+        let Ok(i) = self.ordered_writers.binary_search(&tx) else {
+            return false;
+        };
+        if i == 0 {
+            return false;
+        }
+        let pred = self.ordered_writers[i - 1];
+        if self.published.contains(&pred) || self.started.contains(&pred) || pred_finished(pred) {
+            return false;
+        }
+        true
+    }
+
+    pub(crate) fn note_ordered_defer(&self) {
+        self.ordered_defer.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Chain tx entered the interpreter. Wake the immediate successor so its
+    /// prologue overlaps and its read waits for this tip in-frame.
+    pub(crate) fn note_chain_start(&self, tx: TxIdx) {
+        if self.ordered_writers.binary_search(&tx).is_err() {
+            return;
+        }
+        self.started.insert(tx);
+        let Ok(i) = self.ordered_writers.binary_search(&tx) else {
+            return;
+        };
+        let Some(&next) = self.ordered_writers.get(i + 1) else {
+            return;
+        };
+        self.handoff.store(next, Ordering::Release);
+        self.ordered_handoff.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Successor to run next, if a chain start queued one.
+    pub(crate) fn take_handoff(&self) -> Option<TxIdx> {
+        let tx = self.handoff.swap(usize::MAX, Ordering::AcqRel);
+        (tx != usize::MAX).then_some(tx)
+    }
+
+    /// Put a handoff back when the successor was still `ST_RUNNING`.
+    pub(crate) fn restore_handoff(&self, tx: TxIdx) {
+        let _ = self.handoff.compare_exchange(
+            usize::MAX,
+            tx,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Greatest chain writer below `tx` who has not published and is still open.
+    pub(crate) fn ordered_blocker(
+        &self,
+        loc: MemoryLocationHash,
+        tx: TxIdx,
+        still_open: impl Fn(TxIdx) -> bool,
+    ) -> Option<TxIdx> {
+        if self.ordered_loc != loc || self.ordered_writers.is_empty() {
+            return None;
+        }
+        self.ordered_writers
+            .iter()
+            .rev()
+            .copied()
+            .find(|&w| w < tx && !self.published.contains(&w) && still_open(w))
+    }
+
+    pub(crate) fn note_tip_already(&self) {
+        self.tip_already.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// WAR pin: do not replace this writer's Data with Estimate.
+    pub(crate) fn must_retain(&self, loc: MemoryLocationHash, writer: TxIdx) -> bool {
+        self.intra
+            .get(&loc)
+            .is_some_and(|rec| rec.retained.iter().any(|&(_, w)| w == writer))
+    }
+
+    pub(crate) fn note_retain_keep(&self) {
+        self.retain_keeps.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn mark_ordered_published(&self, loc: MemoryLocationHash, tx: TxIdx) {
+        if self.ordered_loc != loc {
+            return;
+        }
+        self.published.insert(tx);
     }
 
     /// Radar from the previous block. Opening a block does not copy it into Avoid.
@@ -430,6 +573,7 @@ impl AccessSpine {
             for reader in readers {
                 self.detect_war(ev, reader, tx);
             }
+            self.mark_ordered_published(loc, tx);
         }
     }
 
@@ -547,10 +691,20 @@ impl AccessSpine {
         let ph = page_hinkley_step(&mut next, war_delta);
         let cu = cusum_step(&mut next, hit);
         next.revoked = storm || ph || cu;
+        // Revoke drops predictive weights. The writer chain just observed in
+        // this block is a fresh list, not the stale prior, so the next block
+        // can still order it. A revoke with no chain clears the carried list.
         if next.revoked {
             next.loc_radar.clear();
         } else {
             next.loc_radar = self.hot_locs();
+        }
+        if let Some((loc, writers)) = self.longest_writer_chain() {
+            next.chain_loc = loc;
+            next.chains = writers;
+        } else if next.revoked {
+            next.chains.clear();
+            next.chain_loc = u64::MAX;
         }
         next.prev_raw = raw;
         next.prev_waw = waw;
@@ -568,8 +722,30 @@ impl AccessSpine {
             retained_pins,
             prior_revoked: usize::from(next.revoked),
             prior_radar_only: 1,
+            ordered_defer: self.ordered_defer.load(Ordering::Relaxed),
+            ordered_handoff: self.ordered_handoff.load(Ordering::Relaxed),
+            retain_keeps: self.retain_keeps.load(Ordering::Relaxed),
+            tip_already: self.tip_already.load(Ordering::Relaxed),
+            chain_len: self.ordered_writers.len(),
         };
         (report, next)
+    }
+
+    /// Longest writer list this block. Chain order is ascending tx index.
+    fn longest_writer_chain(&self) -> Option<(MemoryLocationHash, Vec<TxIdx>)> {
+        let mut best: Option<(MemoryLocationHash, Vec<TxIdx>)> = None;
+        for rec in self.intra.iter() {
+            if rec.writers.len() < 2 {
+                continue;
+            }
+            let mut writers = rec.writers.clone();
+            writers.sort_unstable();
+            writers.dedup();
+            if best.as_ref().is_none_or(|(_, w)| writers.len() > w.len()) {
+                best = Some((*rec.key(), writers));
+            }
+        }
+        best
     }
 
     fn hot_locs(&self) -> Vec<(MemoryLocationHash, f32)> {
@@ -885,6 +1061,42 @@ mod tests {
         // One large negative WAR step (14689598→99 style, Δwar = -17).
         let revoke = page_hinkley_step(&mut prior, -17.0);
         assert!(revoke);
+    }
+
+    #[test]
+    fn ordered_successor_waits_for_pred_start_then_handoff() {
+        let mut prior = SpinePrior::default();
+        prior.chain_loc = 7;
+        prior.chains = vec![1, 4, 9];
+        let spine = AccessSpine::begin(prior, 4);
+        assert_eq!(spine.armed_n.load(Ordering::Relaxed), 0, "chain is not an Avoid arm");
+        assert!(spine.successor_blocked(4, |_| false));
+        assert!(!spine.successor_blocked(1, |_| false));
+        spine.note_chain_start(1);
+        assert!(!spine.successor_blocked(4, |_| false));
+        assert_eq!(spine.take_handoff(), Some(4));
+        assert_eq!(spine.ordered_blocker(7, 4, |_| true), Some(1));
+        spine.on_write_effects(1, &[7]);
+        assert_eq!(spine.ordered_blocker(7, 4, |_| true), None);
+    }
+
+    #[test]
+    fn war_pin_is_a_retain_keep() {
+        let spine = AccessSpine::begin(SpinePrior::default(), 2);
+        let read = AccessEvent {
+            tx: 3,
+            loc: 1,
+            k: 1,
+            depth: 1,
+            mode: AccessMode::Read,
+        };
+        spine.detect_raw(read, 1);
+        spine.on_write_effects(8, &[1]);
+        assert!(spine.must_retain(1, 8));
+        spine.note_retain_keep();
+        let (report, next) = spine.end_block();
+        assert!(report.retain_keeps >= 1);
+        assert!(!next.may_fence());
     }
 
     #[test]

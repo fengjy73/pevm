@@ -393,7 +393,16 @@ fn abort_and_estimate(ctx: &ApplyCtx<'_>) {
     let aborted = ctx.scheduler.try_validation_abort(ctx.tx_version);
     if aborted {
         let locs = ctx.mv_memory.write_locations(tx);
-        ctx.mv_memory.convert_writes_to_estimates(tx);
+        let spine = ctx.specfence.spine;
+        ctx.mv_memory
+            .convert_writes_to_estimates_keeping(tx, |loc| {
+                if spine.must_retain(loc, tx) {
+                    spine.note_retain_keep();
+                    true
+                } else {
+                    false
+                }
+            });
         // Clear SF tip + live_writer (thin DashMap tip plane) + ChainSpineTip.
         if ctx.scheduler.block_size() <= super::THIN_SHELL_N {
             let _ = ctx.specfence.sf_tips.clear_writer(tx, &locs);

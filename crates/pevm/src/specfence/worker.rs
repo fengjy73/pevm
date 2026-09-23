@@ -182,6 +182,7 @@ pub(crate) fn run_sf_block<F, V>(
             specfence.policy,
             Some(metrics),
             worker_i,
+            specfence.spine,
         );
         match task {
             Some(Task::Execution(tx_version)) => {

@@ -24,4 +24,4 @@
 
    辅证墙时：3356896 OCC 1.010 ms / SF reuse 1.506 ms；15274915 OCC 5.836 ms / SF reuse 8.116 ms。
 
-5. **缺口（下一刀）。** 长链，不是第四原语。RAW 的 in-frame 等待只吃到少量读（薄块 reuse `yield_ok` 0–1；大块约 7）。WAW/WAR 记上了，但 OrderedTip 没有缩短 17/77 写者链，RetainHistory pin 还没接到丢历史的路径。反链仍走现有 SF 调度税，OCC 用更少的反链税盖过少量 abort。下一步：武装 ℓ 的剩余触及者在帧内等真 tip（把 `full_from_0` 压到 0），非触及者走 OCC 便宜路径填核。
+5. **进行中 — 长链这一刀。** 上一块观察到的写者链带到下一块（撤销只清权重，不清刚观察到的链）。后继在前驱开工前不占核；前驱一开工就 handoff 后继，后继在宿主读上 WaitTrueVersion。非链交易跳过 tip 安装。WAR pin 阻止把该写者的 Data 换成 Estimate。单测 11 过。TPS 待复测。

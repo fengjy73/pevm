@@ -26,6 +26,7 @@ pub(crate) fn pick(
     policy: Option<&CostPolicy>,
     metrics: Option<&MetricsInner>,
     worker_i: usize,
+    spine: &super::AccessSpine,
 ) -> Option<Task> {
     let _ = (wave, stages);
     if let Some(p) = policy
@@ -59,6 +60,14 @@ pub(crate) fn pick(
         m.sample_runnable_width(runnable.width_hint());
     }
 
+    // OrderedTip: the chain start woke its successor onto this worker's
+    // indep deque (LIFO) so the next pop is that writer, not a random tx.
+    if let Some(next) = spine.take_handoff() {
+        if !runnable.wake_idle(next, super::runnable_set::QueueKind::Indep) {
+            spine.restore_handoff(next);
+        }
+    }
+
     let refuse_before = runnable.refuse_fill_n();
     for _ in 0..16 {
         match runnable.pick(worker_i, ready) {
@@ -81,6 +90,15 @@ pub(crate) fn pick(
                 }
                 if scheduler.is_aborting(tx) && ready.may_execute(tx) {
                     let _ = scheduler.recover_aborting(tx);
+                }
+                // Later chain writers stay off-core until the predecessor has
+                // started. Non-members fall through and fill the antichain.
+                if spine.successor_blocked(tx, |w| {
+                    scheduler.is_done(w) || scheduler.is_validated(w)
+                }) {
+                    runnable.release_running(tx);
+                    spine.note_ordered_defer();
+                    continue;
                 }
                 if let Some(tx_version) = scheduler.try_execute_producer(tx) {
                     if refused {

@@ -2526,8 +2526,21 @@ fn try_validate(
             );
         }
         // OCC / PCC: full write-set ESTIMATE (unchanged).
+        // SpecFence RetainHistory keeps a pinned writer's Data.
         let occ_write_locs = mv_memory.write_locations(tx_version.tx_idx);
-        mv_memory.convert_writes_to_estimates(tx_version.tx_idx);
+        if specfence.mode == ConcurrencyMode::SpecFence {
+            let spine = specfence.spine;
+            mv_memory.convert_writes_to_estimates_keeping(tx_version.tx_idx, |loc| {
+                if spine.must_retain(loc, tx_version.tx_idx) {
+                    spine.note_retain_keep();
+                    true
+                } else {
+                    false
+                }
+            });
+        } else {
+            mv_memory.convert_writes_to_estimates(tx_version.tx_idx);
+        }
         // A2: ESTIMATE is a confirmed wr — flip Avoid in-batch for later readers.
         if specfence.mode == ConcurrencyMode::SpecFence {
             // Drop SF version tip / live_writer so WaitOnce does not park on

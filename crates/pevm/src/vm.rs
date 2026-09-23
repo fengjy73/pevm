@@ -564,7 +564,14 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 }
             })
         };
-        from_open.or(from_mv).filter(|&w| {
+        let from_ordered = self.specfence.spine.ordered_blocker(
+            location_hash,
+            self.tx_idx,
+            |w| {
+                !self.specfence.scheduler.is_done(w) && !self.specfence.scheduler.is_validated(w)
+            },
+        );
+        from_ordered.or(from_open).or(from_mv).filter(|&w| {
             w < self.tx_idx
                 && !self.specfence.scheduler.is_done(w)
                 && !self.specfence.scheduler.is_validated(w)
@@ -581,6 +588,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
         let recipe = self.specfence.spine.detect_raw(ev, writer);
         debug_assert_eq!(recipe, crate::specfence::Recipe::WaitTrueVersion);
         if self.true_tip_ready(writer) {
+            self.specfence.spine.note_tip_already();
             self.specfence.spine.credit_ok(ev.loc);
             return Ok(());
         }
@@ -630,7 +638,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 crate::tx_runner::flag_yield_wait();
                 return Err(ReadError::YieldWait(writer));
             }
-            if i % 64 == 0 {
+            // Yield the core so the predecessor actually runs. A tight spin
+            // pinned every worker and the chain writer never published.
+            if !executing || i % 8 == 0 {
                 std::thread::yield_now();
             } else {
                 std::hint::spin_loop();
@@ -3412,6 +3422,14 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         // Thin: DashMap WaitOnce/crit (skip when OCC-shaped non-producer).
         // Large: ChainSpineTip only (sticky≥32).
         if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            self.specfence.spine.note_chain_start(tx_version.tx_idx);
+            // Antichain: not on the ordered writer chain. Skip the tip-install
+            // walk. The host read still waits if this tx touches the chain loc.
+            let ordered_live = self.specfence.spine.ordered_len() > 0;
+            let chain_member = self.specfence.spine.is_ordered_member(tx_version.tx_idx);
+            if ordered_live && !chain_member {
+                // Cheap fill. Fall through to the interpreter.
+            } else {
             let thin = self.specfence.scheduler.block_size() <= crate::specfence::THIN_SHELL_N;
             let crit = self.specfence.access_arms.crit_loc_hash();
             let install_tip = thin
@@ -3464,6 +3482,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 && track(loc)
             {
                 self.specfence.sf_tips.note_open_writer(loc, tx);
+            }
             }
         }
 
