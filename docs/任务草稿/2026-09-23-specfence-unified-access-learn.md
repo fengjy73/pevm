@@ -36,5 +36,6 @@
 6. **进行中 — T0–T6 压反链调度税（同一 PR #48，不做 T7）。** 基线 tax ≈ +1.0 / +6.1 ms，ratio 0.690 / 0.707。
 
    - **目标：** Soft=0 Instant-off，N≥5，焦点 3356896 + 15274915。主指标 TPS SF/OCC（目标 ≥1.5，未达标如实）。辅：`tax_ms = SF_wall − chain_span` 相对长链刀后基线是否下降。计数 idle / steal / refuse_gated / gated_pick / spine_cores。
-   - **机制：** 每核本地 Admit 队列 + 只偷别人的队头；链跳只进 `spine_slot`，仅 worker 0 认领（`spine_cores≤1`）；发布 handoff 不再推进 Indep LIFO；Indep 空且前驱已发布时 help-release；`batch_pop` K=4。禁止 park-all、开工 handoff、Estimate 门、next_task*。
-   - **状态：** 待落地并测。
+   - **机制：** 反链进每核本地队列，只偷队头；链跳只在 `spine_q` / `spine_slot`，不进可偷 deque。任一空闲核可认领唯一槽。发布 handoff 不进 Indep LIFO。前驱未发布则 `defer_ordered` 放回 `spine_q`（禁止 `ST_CHAIN` 离队）。Indep 空且前驱已发布时 help-release。`batch_pop` K=4。
+   - **已测一轮（链堆在 worker 0，队头被偷）：** 3356896 ratio 0.618（SF 1.763 / OCC 1.090，tax 0.716，span 1.047，seq=par）；15274915 ratio 0.516（SF 10.726 / OCC 5.539，tax 9.254，span 1.472，**seq!=par**）。`gated_pick=0`，`spine_cores=2`。相对长链基线 0.690 / 0.707 退步。原因是链尾在可偷 deque 上，defer 后停在 `ST_CHAIN`。
+   - **状态：** 链与反链已拆开，待重测 N=5。

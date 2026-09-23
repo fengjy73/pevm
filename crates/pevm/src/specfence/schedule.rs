@@ -105,7 +105,7 @@ pub(crate) fn pick(
                 if spine
                     .successor_blocked(tx, |w| scheduler.is_done(w) || scheduler.is_validated(w))
                 {
-                    runnable.release_running(tx);
+                    runnable.defer_ordered(tx);
                     spine.note_ordered_defer();
                     continue;
                 }
