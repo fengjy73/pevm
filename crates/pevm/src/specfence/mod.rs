@@ -172,6 +172,7 @@ use hashbrown::HashMap;
 mod access_arm;
 mod access_log;
 mod access_policy;
+mod access_spine;
 mod access_vis;
 pub(crate) mod admit;
 mod arm_table;
@@ -218,6 +219,11 @@ pub(crate) use access_arm::{AccessArmTable, LiveAct};
 pub(crate) use access_log::AccessOrdinalLog;
 pub(crate) use access_policy::{
     AccessDecision, AccessVis, decide as decide_access, decide_queried as decide_access_queried,
+};
+pub use access_spine::SpineReport;
+pub(crate) use access_spine::{
+    AccessEvent, AccessMode as HostAccessMode, AccessSpine, EdgeClass, HandlerFault, MorphClass,
+    PriorAction, Recipe, SpinePrior, VersionPointer, handler_preserves_frame, ideal_lb,
 };
 pub(crate) use access_vis::compose_unfinished;
 pub(crate) use arm_table::ArmTable;
@@ -737,6 +743,8 @@ pub(crate) struct SpecFenceCtx<'a> {
     pub tx_first_start: &'a [std::sync::atomic::AtomicU64],
     /// Parallel phase origin for `tx_first_start`.
     pub exec_origin: &'a std::time::Instant,
+    /// AccessEvent three-primitive spine. Avoid starts empty each block.
+    pub spine: &'a AccessSpine,
 }
 
 impl<'a> SpecFenceCtx<'a> {

@@ -189,6 +189,10 @@ pub struct Pevm {
     /// Lab-only fine-grain RW/abort tracer (off by default).
     finegrain_enabled: bool,
     finegrain: FineGrainCollector,
+    /// Cross-block AccessEvent radar. Never an Avoid table.
+    spine_prior: crate::specfence::SpinePrior,
+    /// Last SpecFence block's spine counters (Soft=0 report).
+    last_spine: crate::specfence::SpineReport,
 }
 
 impl Default for Pevm {
@@ -216,6 +220,8 @@ impl Default for Pevm {
             last_abort_rate: 0.0,
             finegrain_enabled: false,
             finegrain: FineGrainCollector::new(),
+            spine_prior: crate::specfence::SpinePrior::default(),
+            last_spine: crate::specfence::SpineReport::default(),
         }
     }
 }
@@ -412,6 +418,13 @@ impl Pevm {
         self.bayes.prior_wait_probability(location)
     }
 
+    /// AccessEvent spine counters from the last SpecFence block.
+    ///
+    /// `prior_radar_only == 1` means the carried prior cannot fence.
+    pub fn last_spine(&self) -> crate::specfence::SpineReport {
+        self.last_spine
+    }
+
     /// Execute an Alloy block, which is becoming the "standard" format in Rust.
     /// TODO: Better error handling.
     pub fn execute<S, C>(
@@ -541,6 +554,9 @@ impl Pevm {
         // Shared waiter / AccessArm. Private state is the per-worker Vm.
         let access_arms = crate::specfence::AccessArmTable::new();
         let sf_tips = crate::specfence::SfTipTable::new();
+        // Soft=0: prior is radar only. Avoid table inside the spine starts empty.
+        let access_spine =
+            crate::specfence::AccessSpine::begin(self.spine_prior.clone(), concurrency_level.get());
         let lanes = crate::specfence::LaneTable::new();
         let edges = EdgeTable::new();
         let sketch = HotSketch::new();
@@ -660,6 +676,7 @@ impl Pevm {
             sf_tips: &sf_tips,
             tx_first_start: &tx_first_start,
             exec_origin: &exec_origin,
+            spine: &access_spine,
         };
 
         // TODO: Better thread handling
@@ -757,6 +774,11 @@ impl Pevm {
             }
         });
 
+        if self.concurrency_mode == ConcurrencyMode::SpecFence {
+            let (report, next) = access_spine.end_block();
+            self.spine_prior = next;
+            self.last_spine = report;
+        }
         if self.concurrency_mode == ConcurrencyMode::Pcc {
             update_heat(&self.heat, &hints, &metrics_inner, block_env.beneficiary);
         }
