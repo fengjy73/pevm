@@ -560,12 +560,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
             0,
             crate::specfence::ParkKind::WaitForDependency,
         );
-        // Interpreter step of BALANCE / EXTCODESIZE / EXTCODEHASH / SELFBALANCE
-        // can rewind this opcode and keep the frame. Other `basic` callers
-        // (pre-exec, CALL) stay on the ordinary Blocking path.
-        if self.allow_frame_suspend.get()
-            && crate::specfence::frame_suspend::op_safe_and_in_interp()
-        {
+        // The handler rewinds only BALANCE / EXTCODESIZE / EXTCODEHASH /
+        // SELFBALANCE after `run_plain` halts. CALL and pre-exec stay ordinary
+        // Blocking: those sites pop or have no frame yet.
+        if self.allow_frame_suspend.get() {
             crate::specfence::frame_suspend::request(pred);
         }
         Err(ReadError::Blocking(pred))
@@ -2965,10 +2963,11 @@ pub(crate) struct Vm<'a, S: Storage, C: PevmChain> {
     mv_memory: &'a MvMemory,
     specfence: SpecFenceCtx<'a>,
     beneficiary_location_hash: MemoryLocationHash,
+    spec_id: C::EvmSpecId,
     // Dedicated EVM for the worker, reset before each transaction exectution.
     evm: C::Evm<VmDb<'a, S>>,
-    /// Second EVM. A suspended interpreter lives here while `evm` runs another tx.
-    /// SpecFence only — OCC keeps one EVM so its wall stays the baseline.
+    /// Built on the first held frame. Absent until then so a block that never
+    /// suspends does not pay a second `Evm` on the SpecFence wall.
     spare: Option<C::Evm<VmDb<'a, S>>>,
     /// Frame sitting in `spare` after a rewind-safe `basic` returned `Blocking`.
     parked: Option<ParkedFrame>,
@@ -3075,8 +3074,6 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             read_accounts: HashMap::with_capacity_and_hasher(2, BuildIdentityHasher::default()),
             allow_frame_suspend: Cell::new(false),
         };
-        let spare = (specfence.mode == crate::ConcurrencyMode::SpecFence)
-            .then(|| chain.build_evm(spec_id, block_env.clone(), blank_db()));
         Self {
             chain,
             is_eip_161_enabled: chain.is_eip_161_enabled(spec_id),
@@ -3087,10 +3084,52 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             beneficiary_location_hash: hash_deterministic(MemoryLocation::Basic(
                 block_env.beneficiary,
             )),
+            spec_id,
             evm: chain.build_evm(spec_id, block_env.clone(), blank_db()),
-            spare,
+            spare: None,
             parked: None,
         }
+    }
+
+    fn blank_db(&mut self) -> VmDb<'a, S> {
+        let (storage, mv_memory, specfence) = {
+            let ctx = self.evm.ctx();
+            let proto = ctx.db();
+            (proto.storage, proto.mv_memory, proto.specfence)
+        };
+        VmDb {
+            storage,
+            mv_memory,
+            specfence,
+            tx_idx: 0,
+            tx_incarnation: 0,
+            tx: self.chain.tx_env(unsafe { self.txs.get_unchecked(0) }),
+            from_hash: 0,
+            to_hash: None,
+            to_code_hash: None,
+            is_lazy: false,
+            optimistic_majority_lazy: false,
+            optimistic_skip_gate: false,
+            sf_occ_shaped: false,
+            vis: VisibilityPolicy::Opt,
+            pcc_armed: Cell::new(false),
+            optimistic_read_this_tx: Cell::new(0),
+            pcc_this_tx: Cell::new(0),
+            has_nonce: true,
+            read_set: ReadSet::with_capacity_and_hasher(2, BuildIdentityHasher::default()),
+            read_accounts: HashMap::with_capacity_and_hasher(2, BuildIdentityHasher::default()),
+            allow_frame_suspend: Cell::new(false),
+        }
+    }
+
+    fn ensure_spare(&mut self) {
+        if self.spare.is_some() {
+            return;
+        }
+        let db = self.blank_db();
+        let spec_id = self.spec_id;
+        let block_env = self.block_env.clone();
+        self.spare = Some(self.chain.build_evm(spec_id, block_env, db));
     }
 
     /// Hinted Wait admission: previous `from`/`to` writer that is not done yet.
@@ -3349,6 +3388,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             }
             return;
         };
+        self.ensure_spare();
         self.swap_spare();
         self.parked = Some(ParkedFrame {
             tx: tx.clone(),
@@ -3374,7 +3414,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
 
     /// Known protected toucher whose predecessor is not `is_validated` yet.
     fn frame_suspend_candidate(&self, tx: TxIdx) -> bool {
-        if self.spare.is_none() || self.parked.is_some() {
+        if self.parked.is_some() {
             return false;
         }
         if self.specfence.mode != crate::ConcurrencyMode::SpecFence {
@@ -3405,14 +3445,14 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         // Resume continues with `run_plain`. The blocking opcode is re-executed
         // once; the suffix is not single-stepped.
         let arm = resume.is_none() && !use_inspect && self.frame_suspend_candidate(tx_idx);
-        crate::specfence::frame_suspend::set_allow(arm);
+        let _ = crate::specfence::frame_suspend::clear_request();
         self.evm.ctx().db().allow_frame_suspend.set(arm);
         let result = if let Some((init, refund)) = resume {
             self.chain.resume_pevm_tx(&mut self.evm, init, refund)
         } else {
             self.chain.run_pevm_tx(&mut self.evm, use_inspect)
         };
-        crate::specfence::frame_suspend::set_allow(false);
+        crate::specfence::frame_suspend::clear_request();
         self.evm.ctx().db().allow_frame_suspend.set(false);
         result
     }

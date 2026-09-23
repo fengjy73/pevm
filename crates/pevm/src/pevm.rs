@@ -1579,11 +1579,11 @@ impl Pevm {
             }
             // Known toucher of a protected ℓ: first interpreter entry sees
             // the published tip. Parking here is not a mid-exec reexec.
-            // A free suspend slot skips admission so the read can suspend
-            // inside the interpreter instead of dying before `Handler::run`.
+            // Do not skip this when the suspend slot is free. On the focus
+            // blocks the Blocking `basic` is not a rewind-safe opcode, so
+            // entering early only drops the prefix in `catch_error`.
             if !resuming
                 && !leftover_min
-                && !vm.suspend_slot_free()
                 && let Some(pred) = vm.protected_admission_blocker(tx_version.tx_idx)
             {
                 let parked = scheduler.add_wait_for_dependency(tx_version.tx_idx, pred);

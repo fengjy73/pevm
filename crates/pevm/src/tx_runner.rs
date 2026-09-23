@@ -16,7 +16,7 @@ use revm::{
         Host, InitialAndFloorGas, InstructionResult, InterpreterAction,
         interpreter::EthInterpreter,
         interpreter_action::FrameInit,
-        interpreter_types::{Jumps, LoopControl},
+        interpreter_types::Jumps,
     },
     state::EvmState,
 };
@@ -43,13 +43,13 @@ impl<EVM, ERROR> Default for NoBeneficiaryHandler<EVM, ERROR> {
 impl<EVM, ERROR> Handler for NoBeneficiaryHandler<EVM, ERROR>
 where
     EVM: EvmTr<
-            Context: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt> + Host,
-            Frame = EthFrame<EthInterpreter>,
-            Instructions: InstructionProvider<
-                Context = <EVM as EvmTr>::Context,
-                InterpreterTypes = EthInterpreter,
-            >,
+        Context: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt> + Host,
+        Frame = EthFrame<EthInterpreter>,
+        Instructions: InstructionProvider<
+            Context = <EVM as EvmTr>::Context,
+            InterpreterTypes = EthInterpreter,
         >,
+    >,
     ERROR: EvmTrError<EVM>,
 {
     type Evm = EVM;
@@ -140,13 +140,13 @@ where
 fn pump_frames<EVM, ERROR>(evm: &mut EVM) -> Result<FrameResult, ERROR>
 where
     EVM: EvmTr<
-            Context: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt> + Host,
-            Frame = EthFrame<EthInterpreter>,
-            Instructions: InstructionProvider<
-                Context = <EVM as EvmTr>::Context,
-                InterpreterTypes = EthInterpreter,
-            >,
+        Context: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt> + Host,
+        Frame = EthFrame<EthInterpreter>,
+        Instructions: InstructionProvider<
+            Context = <EVM as EvmTr>::Context,
+            InterpreterTypes = EthInterpreter,
         >,
+    >,
     ERROR: EvmTrError<EVM>,
 {
     loop {
@@ -181,138 +181,85 @@ where
     }
 }
 
-/// One top-frame burst. Protected touchers single-step so a safe `basic`
-/// can rewind the opcode instead of finishing the frame.
+/// One top-frame burst. After `run_plain`, a rewind-safe `basic` can hold
+/// the frame instead of finishing it.
 fn drive_top_frame<EVM, ERROR>(evm: &mut EVM) -> Result<ItemOrResult<FrameInit, FrameResult>, ERROR>
 where
     EVM: EvmTr<
-            Context: ContextTr + Host,
-            Frame = EthFrame<EthInterpreter>,
-            Instructions: InstructionProvider<
-                Context = <EVM as EvmTr>::Context,
-                InterpreterTypes = EthInterpreter,
-            >,
+        Context: ContextTr + Host,
+        Frame = EthFrame<EthInterpreter>,
+        Instructions: InstructionProvider<
+            Context = <EVM as EvmTr>::Context,
+            InterpreterTypes = EthInterpreter,
         >,
+    >,
     ERROR: EvmTrError<EVM>,
 {
-    let action = if crate::specfence::frame_suspend::allow() {
-        run_until_suspend_or_action::<EVM, ERROR>(evm)?
-    } else {
-        run_plain_stock(evm)
-    };
+    let action = run_plain_stock(evm);
+    let action = hold_if_rewind_safe::<EVM, ERROR>(evm, action)?;
     apply_interpreter_action(evm, action)
 }
 
 fn run_plain_stock<EVM>(evm: &mut EVM) -> InterpreterAction
 where
     EVM: EvmTr<
-            Context: ContextTr + Host,
-            Frame = EthFrame<EthInterpreter>,
-            Instructions: InstructionProvider<
-                Context = <EVM as EvmTr>::Context,
-                InterpreterTypes = EthInterpreter,
-            >,
+        Context: ContextTr + Host,
+        Frame = EthFrame<EthInterpreter>,
+        Instructions: InstructionProvider<
+            Context = <EVM as EvmTr>::Context,
+            InterpreterTypes = EthInterpreter,
         >,
+    >,
 {
     let (ctx, instructions, _, frames) = evm.all_mut();
     let table = instructions.instruction_table();
     frames.get().interpreter.run_plain(table, ctx)
 }
 
-fn run_until_suspend_or_action<EVM, ERROR>(evm: &mut EVM) -> Result<InterpreterAction, ERROR>
+/// `run_plain` already stepped past the opcode and charged static gas.
+/// Rewind only when that opcode did not pop or resize before `basic`.
+fn hold_if_rewind_safe<EVM, ERROR>(
+    evm: &mut EVM,
+    action: InterpreterAction,
+) -> Result<InterpreterAction, ERROR>
 where
     EVM: EvmTr<
-            Context: ContextTr + Host,
-            Frame = EthFrame<EthInterpreter>,
-            Instructions: InstructionProvider<
-                Context = <EVM as EvmTr>::Context,
-                InterpreterTypes = EthInterpreter,
-            >,
-        >,
+        Frame = EthFrame<EthInterpreter>,
+        Instructions: InstructionProvider<InterpreterTypes = EthInterpreter, Context: Host>,
+    >,
     ERROR: EvmTrError<EVM>,
 {
-    loop {
-        if !frame_not_end(evm) {
-            return Ok(take_frame_action(evm));
-        }
-        step_top_frame(evm);
-        if frame_not_end(evm) {
-            continue;
-        }
-        let action = take_frame_action(evm);
-        // Always drain a request. A non-fatal end must not leave it for a later opcode.
-        let requested = crate::specfence::frame_suspend::take_request();
-        if let Some(pred) = requested
-            && action.instruction_result() == Some(InstructionResult::FatalExternalError)
-        {
-            repair_suspended_opcode(evm);
-            match take_error::<ERROR, _>(evm.ctx().error()) {
-                Err(e) => {
-                    crate::specfence::frame_suspend::mark_held(pred);
-                    return Err(e);
-                }
-                Ok(()) => return Ok(action),
-            }
-        }
+    if action.instruction_result() != Some(InstructionResult::FatalExternalError) {
         return Ok(action);
     }
-}
-
-fn frame_not_end<EVM>(evm: &mut EVM) -> bool
-where
-    EVM: EvmTr<Frame = EthFrame<EthInterpreter>>,
-{
-    evm.frame_stack().get().interpreter.bytecode.is_not_end()
-}
-
-fn take_frame_action<EVM>(evm: &mut EVM) -> InterpreterAction
-where
-    EVM: EvmTr<Frame = EthFrame<EthInterpreter>>,
-{
-    evm.frame_stack().get().interpreter.take_next_action()
-}
-
-fn step_top_frame<EVM>(evm: &mut EVM)
-where
-    EVM: EvmTr<
-            Context: ContextTr + Host,
-            Frame = EthFrame<EthInterpreter>,
-            Instructions: InstructionProvider<
-                Context = <EVM as EvmTr>::Context,
-                InterpreterTypes = EthInterpreter,
-            >,
-        >,
-{
-    let (ctx, instructions, _, frames) = evm.all_mut();
-    let interp = &mut frames.get().interpreter;
-    let op = interp.bytecode.opcode();
-    crate::specfence::frame_suspend::set_op_safe(
-        crate::specfence::frame_suspend::opcode_rewind_safe(op),
-    );
-    let _guard = crate::specfence::frame_suspend::InterpGuard::enter();
-    let table = instructions.instruction_table();
-    interp.step(table, ctx);
-}
-
-/// PC was advanced and static gas charged before `basic` returned `Blocking`.
-/// Put the opcode back so resume re-executes that read and nothing else.
-fn repair_suspended_opcode<EVM>(evm: &mut EVM)
-where
-    EVM: EvmTr<
-            Context: Host,
-            Frame = EthFrame<EthInterpreter>,
-            Instructions: InstructionProvider<
-                Context = <EVM as EvmTr>::Context,
-                InterpreterTypes = EthInterpreter,
-            >,
-        >,
-{
-    let (_, instructions, _, frames) = evm.all_mut();
-    let interp = &mut frames.get().interpreter;
-    interp.bytecode.relative_jump(-1);
-    let op = interp.bytecode.opcode();
-    let static_gas = instructions.instruction_table()[op as usize].static_gas();
-    interp.gas.erase_cost(static_gas);
+    let Some(pred) = crate::specfence::frame_suspend::take_request() else {
+        return Ok(action);
+    };
+    let op_safe = {
+        let (_, instructions, _, frames) = evm.all_mut();
+        let interp = &mut frames.get().interpreter;
+        interp.bytecode.relative_jump(-1);
+        let op = interp.bytecode.opcode();
+        if !crate::specfence::frame_suspend::opcode_rewind_safe(op) {
+            interp.bytecode.relative_jump(1);
+            crate::specfence::frame_suspend::note_unsafe_opcode(op);
+            false
+        } else {
+            let static_gas = instructions.instruction_table()[op as usize].static_gas();
+            interp.gas.erase_cost(static_gas);
+            true
+        }
+    };
+    if !op_safe {
+        return Ok(action);
+    }
+    match take_error::<ERROR, _>(evm.ctx().error()) {
+        Err(e) => {
+            crate::specfence::frame_suspend::mark_held(pred);
+            Err(e)
+        }
+        Ok(()) => Ok(action),
+    }
 }
 
 fn apply_interpreter_action<EVM, ERROR>(
@@ -338,13 +285,13 @@ where
 impl<EVM, ERROR> NoBeneficiaryHandler<EVM, ERROR>
 where
     EVM: EvmTr<
-            Context: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt> + Host,
-            Frame = EthFrame<EthInterpreter>,
-            Instructions: InstructionProvider<
-                Context = <EVM as EvmTr>::Context,
-                InterpreterTypes = EthInterpreter,
-            >,
+        Context: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt> + Host,
+        Frame = EthFrame<EthInterpreter>,
+        Instructions: InstructionProvider<
+            Context = <EVM as EvmTr>::Context,
+            InterpreterTypes = EthInterpreter,
         >,
+    >,
     ERROR: EvmTrError<EVM>,
 {
     /// Continue a frame that already survived `Blocking`. No `validate`,
@@ -376,14 +323,14 @@ where
 impl<EVM, ERROR> InspectorHandler for NoBeneficiaryHandler<EVM, ERROR>
 where
     EVM: InspectorEvmTr<
-            Context: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt> + Host,
-            Frame = EthFrame<EthInterpreter>,
-            Instructions: InstructionProvider<
-                Context = <EVM as EvmTr>::Context,
-                InterpreterTypes = EthInterpreter,
-            >,
-            Inspector: Inspector<<EVM as EvmTr>::Context, EthInterpreter>,
+        Context: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt> + Host,
+        Frame = EthFrame<EthInterpreter>,
+        Instructions: InstructionProvider<
+            Context = <EVM as EvmTr>::Context,
+            InterpreterTypes = EthInterpreter,
         >,
+        Inspector: Inspector<<EVM as EvmTr>::Context, EthInterpreter>,
+    >,
     ERROR: EvmTrError<EVM>,
 {
     type IT = EthInterpreter;

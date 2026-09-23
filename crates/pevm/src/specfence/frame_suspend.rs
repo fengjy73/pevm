@@ -8,17 +8,17 @@
 //! This module is the thread-local handshake for the forked handler in
 //! `tx_runner`:
 //!
-//! 1. `Vm` arms `allow` only for a known protected toucher while the worker's
-//!    spare `Evm` is free.
-//! 2. The handler single-steps that transaction. Before a rewind-safe opcode
-//!    (`BALANCE` / `SELFBALANCE` / `EXTCODESIZE` / `EXTCODEHASH`) it marks the
-//!    opcode safe and enters the interpreter.
-//! 3. `VmDb::basic` requests a suspend instead of only returning `Blocking`.
-//! 4. The handler rewinds that opcode (PC and static gas), leaves the frame
-//!    stack and journal in place, and skips `catch_error`.
-//! 5. `Vm` swaps the live `Evm` into the spare slot. The next transaction's
+//! 1. `Vm` arms the DB cell only for a known protected toucher while no
+//!    frame is already parked. The spare `Evm` is built on the first hold.
+//!    Execution stays on `run_plain`.
+//! 2. `VmDb::basic` requests a suspend when that read returns `Blocking`.
+//! 3. After `run_plain` halts, the handler rewinds a safe opcode
+//!    (`BALANCE` / `SELFBALANCE` / `EXTCODESIZE` / `EXTCODEHASH`): PC −1 and
+//!    static gas. `CALL` is put back and dropped. `catch_error` is skipped
+//!    only when the frame is held.
+//! 4. `Vm` swaps the live `Evm` into the spare slot. The next transaction's
 //!    `set_tx` / `journal.clear()` hits the other `Evm`.
-//! 6. When the predecessor is `is_validated`, `resume_pevm_tx` continues the
+//! 5. When the predecessor is `is_validated`, `resume_pevm_tx` continues the
 //!    same frame loop. It does not call `Handler::run`.
 
 use std::cell::Cell;
@@ -28,69 +28,60 @@ use revm::interpreter::InitialAndFloorGas;
 
 static SUSPENDS: AtomicU64 = AtomicU64::new(0);
 static RESUMES: AtomicU64 = AtomicU64::new(0);
+static REQUESTS: AtomicU64 = AtomicU64::new(0);
+static UNSAFE_OP: AtomicU64 = AtomicU64::new(0);
+static PRE_FRAME: AtomicU64 = AtomicU64::new(0);
+static OP_HITS: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
 
 thread_local! {
-    static ALLOW: Cell<bool> = const { Cell::new(false) };
-    static IN_INTERP: Cell<bool> = const { Cell::new(false) };
-    static OP_SAFE: Cell<bool> = const { Cell::new(false) };
     static REQUESTED: Cell<Option<usize>> = const { Cell::new(None) };
     static HELD_PRED: Cell<Option<usize>> = const { Cell::new(None) };
     static GAS: Cell<Option<(InitialAndFloorGas, i64)>> = const { Cell::new(None) };
 }
 
-/// `(suspends, resumes)` since process start. Soft=0 compare prints these.
+/// `(suspends, resumes, basic requests, unsafe-opcode rejects)` since process start.
 #[must_use]
-pub fn frame_suspend_counts() -> (u64, u64) {
+pub fn frame_suspend_counts() -> (u64, u64, u64, u64, u64) {
     (
         SUSPENDS.load(Ordering::Relaxed),
         RESUMES.load(Ordering::Relaxed),
+        REQUESTS.load(Ordering::Relaxed),
+        UNSAFE_OP.load(Ordering::Relaxed),
+        PRE_FRAME.load(Ordering::Relaxed),
     )
 }
 
-/// Arm single-step + suspend for the handler invocation on this thread.
-pub(crate) fn set_allow(allow: bool) {
-    ALLOW.set(allow);
-    if !allow {
-        // A request is only meaningful for the handler invocation that armed it.
-        REQUESTED.set(None);
+/// Non-zero opcode hits among rewind rejects. `(opcode, count)`.
+#[must_use]
+pub fn frame_suspend_unsafe_ops() -> Vec<(u8, u64)> {
+    OP_HITS
+        .iter()
+        .enumerate()
+        .filter_map(|(op, n)| {
+            let n = n.load(Ordering::Relaxed);
+            (n > 0).then_some((op as u8, n))
+        })
+        .collect()
+}
+
+/// Drop a request the handler did not consume. Returns whether one was pending.
+pub(crate) fn clear_request() -> bool {
+    let pending = REQUESTED.take().is_some();
+    if pending {
+        PRE_FRAME.fetch_add(1, Ordering::Relaxed);
     }
+    pending
 }
 
-#[inline]
-pub(crate) fn allow() -> bool {
-    ALLOW.with(Cell::get)
-}
-
-/// True only while a rewind-safe opcode is inside `Interpreter::step`.
-#[inline]
-pub(crate) fn op_safe_and_in_interp() -> bool {
-    IN_INTERP.with(Cell::get) && OP_SAFE.with(Cell::get)
-}
-
-pub(crate) fn set_op_safe(safe: bool) {
-    OP_SAFE.set(safe);
-}
-
-/// Enter / leave the interpreter step. A guard clears the flag on panic.
-pub(crate) struct InterpGuard;
-
-impl InterpGuard {
-    pub(crate) fn enter() -> Self {
-        IN_INTERP.set(true);
-        Self
-    }
-}
-
-impl Drop for InterpGuard {
-    fn drop(&mut self) {
-        IN_INTERP.set(false);
-        OP_SAFE.set(false);
-    }
-}
-
-/// `basic` wants this read to suspend. The handler confirms it after rewind.
+/// `basic` wants this read to suspend. The handler confirms the opcode.
 pub(crate) fn request(pred: usize) {
+    REQUESTS.fetch_add(1, Ordering::Relaxed);
     REQUESTED.set(Some(pred));
+}
+
+pub(crate) fn note_unsafe_opcode(op: u8) {
+    UNSAFE_OP.fetch_add(1, Ordering::Relaxed);
+    OP_HITS[op as usize].fetch_add(1, Ordering::Relaxed);
 }
 
 /// Predecessor captured by [`request`], if `basic` asked to suspend.
