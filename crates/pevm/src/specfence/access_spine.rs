@@ -386,7 +386,9 @@ impl AccessSpine {
             return false;
         }
         let pred = self.ordered_writers[i - 1];
-        if self.published.contains(&pred) || self.started.contains(&pred) || pred_finished(pred) {
+        // Published or already finished. "Started" is not enough: waking the
+        // whole tail at start pinned every core inside WaitTrueVersion.
+        if self.published.contains(&pred) || pred_finished(pred) {
             return false;
         }
         true
@@ -396,21 +398,12 @@ impl AccessSpine {
         self.ordered_defer.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Chain tx entered the interpreter. Wake the immediate successor so its
-    /// prologue overlaps and its read waits for this tip in-frame.
+    /// Chain tx entered the interpreter. The successor is woken on publish,
+    /// not here, so only one chain writer occupies a core.
     pub(crate) fn note_chain_start(&self, tx: TxIdx) {
-        if self.ordered_writers.binary_search(&tx).is_err() {
-            return;
+        if self.ordered_writers.binary_search(&tx).is_ok() {
+            self.started.insert(tx);
         }
-        self.started.insert(tx);
-        let Ok(i) = self.ordered_writers.binary_search(&tx) else {
-            return;
-        };
-        let Some(&next) = self.ordered_writers.get(i + 1) else {
-            return;
-        };
-        self.handoff.store(next, Ordering::Release);
-        self.ordered_handoff.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Successor to run next, if a chain start queued one.
@@ -465,7 +458,15 @@ impl AccessSpine {
         if self.ordered_loc != loc {
             return;
         }
+        let Ok(i) = self.ordered_writers.binary_search(&tx) else {
+            return;
+        };
         self.published.insert(tx);
+        let Some(&next) = self.ordered_writers.get(i + 1) else {
+            return;
+        };
+        self.handoff.store(next, Ordering::Release);
+        self.ordered_handoff.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Radar from the previous block. Opening a block does not copy it into Avoid.
@@ -1073,10 +1074,12 @@ mod tests {
         assert!(spine.successor_blocked(4, |_| false));
         assert!(!spine.successor_blocked(1, |_| false));
         spine.note_chain_start(1);
-        assert!(!spine.successor_blocked(4, |_| false));
-        assert_eq!(spine.take_handoff(), Some(4));
+        assert!(spine.successor_blocked(4, |_| false));
+        assert_eq!(spine.take_handoff(), None);
         assert_eq!(spine.ordered_blocker(7, 4, |_| true), Some(1));
         spine.on_write_effects(1, &[7]);
+        assert!(!spine.successor_blocked(4, |_| false));
+        assert_eq!(spine.take_handoff(), Some(4));
         assert_eq!(spine.ordered_blocker(7, 4, |_| true), None);
     }
 

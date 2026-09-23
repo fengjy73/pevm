@@ -638,9 +638,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 crate::tx_runner::flag_yield_wait();
                 return Err(ReadError::YieldWait(writer));
             }
-            // Yield the core so the predecessor actually runs. A tight spin
-            // pinned every worker and the chain writer never published.
-            if !executing || i % 8 == 0 {
+            if i % 64 == 0 {
                 std::thread::yield_now();
             } else {
                 std::hint::spin_loop();
