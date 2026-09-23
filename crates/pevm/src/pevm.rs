@@ -715,6 +715,10 @@ impl Pevm {
                         );
                         let worker_i =
                             sf_worker_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // SAFETY: `run_sf_block` calls `poll_resume` and `execute`
+                        // one at a time on this thread. Neither re-enters the other.
+                        // The `Evm` is `!Send`; the pointer stays on this worker.
+                        let vm_ptr = &mut vm as *mut Vm<_, _>;
                         crate::specfence::run_sf_block(
                             &scheduler,
                             &mv_memory,
@@ -723,9 +727,15 @@ impl Pevm {
                             &arms,
                             worker_i,
                             || self.abort_reason.get().is_some(),
-                            |tx_version, vis| {
+                            || unsafe { (*vm_ptr).poll_frame_resume() },
+                            |tx_version, vis| unsafe {
                                 self.try_execute_sf(
-                                    &mut vm, &scheduler, tx_version, vis, wave_ref, &dag,
+                                    &mut *vm_ptr,
+                                    &scheduler,
+                                    tx_version,
+                                    vis,
+                                    wave_ref,
+                                    &dag,
                                 )
                             },
                             |tx_version, vis| {
@@ -1537,7 +1547,12 @@ impl Pevm {
                 }
                 return SfExec::Blocked { on: None };
             }
-            if let Some((blocking_tx_idx, address)) = vm.hinted_wait_blocker(tx_version.tx_idx) {
+            // Parked frame: continue it. Admission and hinted wait would
+            // park again and never call `resume_pevm_tx`.
+            let resuming = vm.has_parked_frame(&tx_version);
+            if !resuming
+                && let Some((blocking_tx_idx, address)) = vm.hinted_wait_blocker(tx_version.tx_idx)
+            {
                 if (leftover_min
                     && (blocking_tx_idx > tx_version.tx_idx
                         || scheduler.is_done(blocking_tx_idx)
@@ -1559,12 +1574,18 @@ impl Pevm {
                     on: Some(blocking_tx_idx),
                 };
             }
-            if let Some(wave) = wave {
+            if !resuming && let Some(wave) = wave {
                 vm.try_apply_park_resume(tx_version.tx_idx, wave);
             }
             // Known toucher of a protected ℓ: first interpreter entry sees
             // the published tip. Parking here is not a mid-exec reexec.
-            if !leftover_min && let Some(pred) = vm.protected_admission_blocker(tx_version.tx_idx) {
+            // A free suspend slot skips admission so the read can suspend
+            // inside the interpreter instead of dying before `Handler::run`.
+            if !resuming
+                && !leftover_min
+                && !vm.suspend_slot_free()
+                && let Some(pred) = vm.protected_admission_blocker(tx_version.tx_idx)
+            {
                 let parked = scheduler.add_wait_for_dependency(tx_version.tx_idx, pred);
                 if parked {
                     vm.record_wait_for_dependency();
@@ -1601,6 +1622,14 @@ impl Pevm {
                     SfExec::Fatal
                 }
                 Err(VmExecutionError::Blocking(blocking_tx_idx)) => {
+                    // Frame is on this worker's spare `Evm`. Do not register a
+                    // WaitForDependency wake — that would Ready the tx for a
+                    // fresh `Handler::run` on another worker.
+                    if scheduler.is_frame_held(tx_version.tx_idx) {
+                        return SfExec::Blocked {
+                            on: Some(blocking_tx_idx),
+                        };
+                    }
                     let pending = vm.take_pending_park();
                     let park_kind = pending
                         .map(|p| p.kind)

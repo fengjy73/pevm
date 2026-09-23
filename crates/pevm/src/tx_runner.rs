@@ -6,9 +6,18 @@ use revm::{
         ContextTr, JournalTr,
         result::{EVMError, ExecutionResult, HaltReason, InvalidTransaction},
     },
-    handler::{EthFrame, EvmTr, EvmTrError, FrameResult, FrameTr, Handler, ItemOrResult},
+    context_interface::context::take_error,
+    handler::{
+        EthFrame, EvmTr, EvmTrError, FrameResult, FrameTr, Handler, ItemOrResult,
+        instructions::InstructionProvider,
+    },
     inspector::{InspectorEvmTr, InspectorHandler, JournalExt},
-    interpreter::interpreter::EthInterpreter,
+    interpreter::{
+        Host, InitialAndFloorGas, InstructionResult, InterpreterAction,
+        interpreter::EthInterpreter,
+        interpreter_action::FrameInit,
+        interpreter_types::{Jumps, LoopControl},
+    },
     state::EvmState,
 };
 
@@ -34,8 +43,12 @@ impl<EVM, ERROR> Default for NoBeneficiaryHandler<EVM, ERROR> {
 impl<EVM, ERROR> Handler for NoBeneficiaryHandler<EVM, ERROR>
 where
     EVM: EvmTr<
-            Context: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt>,
+            Context: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt> + Host,
             Frame = EthFrame<EthInterpreter>,
+            Instructions: InstructionProvider<
+                Context = <EVM as EvmTr>::Context,
+                InterpreterTypes = EthInterpreter,
+            >,
         >,
     ERROR: EvmTrError<EVM>,
 {
@@ -49,6 +62,44 @@ where
         _: &mut FrameResult,
     ) -> Result<(), Self::Error> {
         Ok(())
+    }
+
+    /// Skip `catch_error` when the interpreter was rewound and must outlive
+    /// `Blocking`. `Vm` moves that `Evm` aside before the next `set_tx`.
+    fn run(
+        &mut self,
+        evm: &mut Self::Evm,
+    ) -> Result<ExecutionResult<Self::HaltReason>, Self::Error> {
+        match self.run_without_catch_error(evm) {
+            Ok(output) => Ok(output),
+            Err(e) => {
+                if crate::specfence::frame_suspend::is_held() {
+                    Err(e)
+                } else {
+                    self.catch_error(evm, e)
+                }
+            }
+        }
+    }
+
+    fn run_without_catch_error(
+        &mut self,
+        evm: &mut Self::Evm,
+    ) -> Result<ExecutionResult<Self::HaltReason>, Self::Error> {
+        let mut init_and_floor_gas = self.validate(evm)?;
+        let eip7702_refund = self.pre_execution(evm, &mut init_and_floor_gas)? as i64;
+        let mut exec_result = match self.execution(evm, &init_and_floor_gas) {
+            Ok(result) => result,
+            Err(e) => {
+                if crate::specfence::frame_suspend::is_held() {
+                    crate::specfence::frame_suspend::stash_gas(init_and_floor_gas, eip7702_refund);
+                }
+                return Err(e);
+            }
+        };
+        let result_gas =
+            self.post_execution(evm, &mut exec_result, init_and_floor_gas, eip7702_refund)?;
+        self.execution_result(evm, exec_result, result_gas)
     }
 
     /// Iter8: apply armed PENDING_RESUME on Handler::run (no inspect_run).
@@ -81,44 +132,256 @@ where
             }
         }
 
-        loop {
-            let call_or_result = evm.frame_run()?;
+        pump_frames::<EVM, ERROR>(evm)
+    }
+}
 
-            let result = match call_or_result {
-                ItemOrResult::Item(init) => match evm.frame_init(init)? {
-                    ItemOrResult::Item(_) => {
-                        // Iter29: hang-free nested OrderedAdmit consume after natural CALL
-                        // enters a new frame — stash is consulted only here (PENDING
-                        // cleared on mismatch; ≠ Iter28e frame_init-defer).
-                        if nested_ordered_admit_stash_armed() {
-                            let evm_ptr = evm as *mut Self::Evm;
-                            unsafe {
-                                let frame = (*evm_ptr).frame_stack().get();
-                                let depth = frame.depth.min(u16::MAX as usize) as u16;
-                                let interp = &mut frame.interpreter;
-                                let ctx = (*evm_ptr).ctx();
-                                try_consume_nested_ordered_admit_resume(interp, ctx, depth);
-                            }
+/// Frame loop shared by the first `Handler::run` and a same-frame resume.
+fn pump_frames<EVM, ERROR>(evm: &mut EVM) -> Result<FrameResult, ERROR>
+where
+    EVM: EvmTr<
+            Context: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt> + Host,
+            Frame = EthFrame<EthInterpreter>,
+            Instructions: InstructionProvider<
+                Context = <EVM as EvmTr>::Context,
+                InterpreterTypes = EthInterpreter,
+            >,
+        >,
+    ERROR: EvmTrError<EVM>,
+{
+    loop {
+        let call_or_result = drive_top_frame::<EVM, ERROR>(evm)?;
+
+        let result = match call_or_result {
+            ItemOrResult::Item(init) => match evm.frame_init(init)? {
+                ItemOrResult::Item(_) => {
+                    // Iter29: hang-free nested OrderedAdmit consume after natural CALL
+                    // enters a new frame — stash is consulted only here (PENDING
+                    // cleared on mismatch; ≠ Iter28e frame_init-defer).
+                    if nested_ordered_admit_stash_armed() {
+                        let evm_ptr = evm as *mut EVM;
+                        unsafe {
+                            let frame = (*evm_ptr).frame_stack().get();
+                            let depth = frame.depth.min(u16::MAX as usize) as u16;
+                            let interp = &mut frame.interpreter;
+                            let ctx = (*evm_ptr).ctx();
+                            try_consume_nested_ordered_admit_resume(interp, ctx, depth);
                         }
-                        continue;
                     }
-                    ItemOrResult::Result(result) => result,
-                },
+                    continue;
+                }
                 ItemOrResult::Result(result) => result,
-            };
+            },
+            ItemOrResult::Result(result) => result,
+        };
 
-            if let Some(result) = evm.frame_return_result(result)? {
-                return Ok(result);
+        if let Some(result) = evm.frame_return_result(result)? {
+            return Ok(result);
+        }
+    }
+}
+
+/// One top-frame burst. Protected touchers single-step so a safe `basic`
+/// can rewind the opcode instead of finishing the frame.
+fn drive_top_frame<EVM, ERROR>(evm: &mut EVM) -> Result<ItemOrResult<FrameInit, FrameResult>, ERROR>
+where
+    EVM: EvmTr<
+            Context: ContextTr + Host,
+            Frame = EthFrame<EthInterpreter>,
+            Instructions: InstructionProvider<
+                Context = <EVM as EvmTr>::Context,
+                InterpreterTypes = EthInterpreter,
+            >,
+        >,
+    ERROR: EvmTrError<EVM>,
+{
+    let action = if crate::specfence::frame_suspend::allow() {
+        run_until_suspend_or_action::<EVM, ERROR>(evm)?
+    } else {
+        run_plain_stock(evm)
+    };
+    apply_interpreter_action(evm, action)
+}
+
+fn run_plain_stock<EVM>(evm: &mut EVM) -> InterpreterAction
+where
+    EVM: EvmTr<
+            Context: ContextTr + Host,
+            Frame = EthFrame<EthInterpreter>,
+            Instructions: InstructionProvider<
+                Context = <EVM as EvmTr>::Context,
+                InterpreterTypes = EthInterpreter,
+            >,
+        >,
+{
+    let (ctx, instructions, _, frames) = evm.all_mut();
+    let table = instructions.instruction_table();
+    frames.get().interpreter.run_plain(table, ctx)
+}
+
+fn run_until_suspend_or_action<EVM, ERROR>(evm: &mut EVM) -> Result<InterpreterAction, ERROR>
+where
+    EVM: EvmTr<
+            Context: ContextTr + Host,
+            Frame = EthFrame<EthInterpreter>,
+            Instructions: InstructionProvider<
+                Context = <EVM as EvmTr>::Context,
+                InterpreterTypes = EthInterpreter,
+            >,
+        >,
+    ERROR: EvmTrError<EVM>,
+{
+    loop {
+        if !frame_not_end(evm) {
+            return Ok(take_frame_action(evm));
+        }
+        step_top_frame(evm);
+        if frame_not_end(evm) {
+            continue;
+        }
+        let action = take_frame_action(evm);
+        // Always drain a request. A non-fatal end must not leave it for a later opcode.
+        let requested = crate::specfence::frame_suspend::take_request();
+        if let Some(pred) = requested
+            && action.instruction_result() == Some(InstructionResult::FatalExternalError)
+        {
+            repair_suspended_opcode(evm);
+            match take_error::<ERROR, _>(evm.ctx().error()) {
+                Err(e) => {
+                    crate::specfence::frame_suspend::mark_held(pred);
+                    return Err(e);
+                }
+                Ok(()) => return Ok(action),
             }
         }
+        return Ok(action);
+    }
+}
+
+fn frame_not_end<EVM>(evm: &mut EVM) -> bool
+where
+    EVM: EvmTr<Frame = EthFrame<EthInterpreter>>,
+{
+    evm.frame_stack().get().interpreter.bytecode.is_not_end()
+}
+
+fn take_frame_action<EVM>(evm: &mut EVM) -> InterpreterAction
+where
+    EVM: EvmTr<Frame = EthFrame<EthInterpreter>>,
+{
+    evm.frame_stack().get().interpreter.take_next_action()
+}
+
+fn step_top_frame<EVM>(evm: &mut EVM)
+where
+    EVM: EvmTr<
+            Context: ContextTr + Host,
+            Frame = EthFrame<EthInterpreter>,
+            Instructions: InstructionProvider<
+                Context = <EVM as EvmTr>::Context,
+                InterpreterTypes = EthInterpreter,
+            >,
+        >,
+{
+    let (ctx, instructions, _, frames) = evm.all_mut();
+    let interp = &mut frames.get().interpreter;
+    let op = interp.bytecode.opcode();
+    crate::specfence::frame_suspend::set_op_safe(
+        crate::specfence::frame_suspend::opcode_rewind_safe(op),
+    );
+    let _guard = crate::specfence::frame_suspend::InterpGuard::enter();
+    let table = instructions.instruction_table();
+    interp.step(table, ctx);
+}
+
+/// PC was advanced and static gas charged before `basic` returned `Blocking`.
+/// Put the opcode back so resume re-executes that read and nothing else.
+fn repair_suspended_opcode<EVM>(evm: &mut EVM)
+where
+    EVM: EvmTr<
+            Context: Host,
+            Frame = EthFrame<EthInterpreter>,
+            Instructions: InstructionProvider<
+                Context = <EVM as EvmTr>::Context,
+                InterpreterTypes = EthInterpreter,
+            >,
+        >,
+{
+    let (_, instructions, _, frames) = evm.all_mut();
+    let interp = &mut frames.get().interpreter;
+    interp.bytecode.relative_jump(-1);
+    let op = interp.bytecode.opcode();
+    let static_gas = instructions.instruction_table()[op as usize].static_gas();
+    interp.gas.erase_cost(static_gas);
+}
+
+fn apply_interpreter_action<EVM, ERROR>(
+    evm: &mut EVM,
+    action: InterpreterAction,
+) -> Result<ItemOrResult<FrameInit, FrameResult>, ERROR>
+where
+    EVM: EvmTr<Context: ContextTr, Frame = EthFrame<EthInterpreter>>,
+    ERROR: EvmTrError<EVM>,
+{
+    let processed = {
+        let (ctx, _, _, frames) = evm.all_mut();
+        frames
+            .get()
+            .process_next_action::<<EVM as EvmTr>::Context, ERROR>(ctx, action)?
+    };
+    if processed.is_result() {
+        evm.frame_stack().get().set_finished(true);
+    }
+    Ok(processed)
+}
+
+impl<EVM, ERROR> NoBeneficiaryHandler<EVM, ERROR>
+where
+    EVM: EvmTr<
+            Context: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt> + Host,
+            Frame = EthFrame<EthInterpreter>,
+            Instructions: InstructionProvider<
+                Context = <EVM as EvmTr>::Context,
+                InterpreterTypes = EthInterpreter,
+            >,
+        >,
+    ERROR: EvmTrError<EVM>,
+{
+    /// Continue a frame that already survived `Blocking`. No `validate`,
+    /// `pre_execution`, or `frame_init` of the suspended root.
+    fn resume_held(
+        &mut self,
+        evm: &mut EVM,
+        init_and_floor_gas: InitialAndFloorGas,
+        eip7702_refund: i64,
+    ) -> Result<ExecutionResult<HaltReason>, ERROR> {
+        crate::specfence::frame_suspend::note_resume();
+        let mut exec_result = match pump_frames::<EVM, ERROR>(evm) {
+            Ok(result) => result,
+            Err(e) => {
+                if crate::specfence::frame_suspend::is_held() {
+                    crate::specfence::frame_suspend::stash_gas(init_and_floor_gas, eip7702_refund);
+                    return Err(e);
+                }
+                return self.catch_error(evm, e);
+            }
+        };
+        self.last_frame_result(evm, &mut exec_result)?;
+        let result_gas =
+            self.post_execution(evm, &mut exec_result, init_and_floor_gas, eip7702_refund)?;
+        self.execution_result(evm, exec_result, result_gas)
     }
 }
 
 impl<EVM, ERROR> InspectorHandler for NoBeneficiaryHandler<EVM, ERROR>
 where
     EVM: InspectorEvmTr<
-            Context: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt>,
+            Context: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt> + Host,
             Frame = EthFrame<EthInterpreter>,
+            Instructions: InstructionProvider<
+                Context = <EVM as EvmTr>::Context,
+                InterpreterTypes = EthInterpreter,
+            >,
             Inspector: Inspector<<EVM as EvmTr>::Context, EthInterpreter>,
         >,
     ERROR: EvmTrError<EVM>,
@@ -139,4 +402,15 @@ pub(crate) fn run_ethereum_tx<DB: Database>(
     } else {
         h.run(evm)
     }
+}
+
+/// Continue the suspended root frame. Not [`Handler::run`].
+pub(crate) fn resume_ethereum_tx<DB: Database>(
+    evm: &mut <PevmEthereum as PevmChain>::Evm<DB>,
+    init: InitialAndFloorGas,
+    eip7702_refund: i64,
+) -> Result<ExecutionResult<HaltReason>, EthDbError<DB>> {
+    let mut h =
+        NoBeneficiaryHandler::<<PevmEthereum as PevmChain>::Evm<DB>, EthDbError<DB>>::default();
+    h.resume_held(evm, init, eip7702_refund)
 }

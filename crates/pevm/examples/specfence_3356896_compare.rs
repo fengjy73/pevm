@@ -741,8 +741,9 @@ fn main() {
         );
     }
 
+    let (frame_suspends, frame_resumes) = pevm::specfence::frame_suspend_counts();
     println!(
-        "summary Soft=0 occ_median_ms={occ_med:.3} sf_cold_ms={} sf_reuse_median_ms={} primary_sf_ms={primary_sf:.3} primary={} sf_le_occ={sf_le_occ}",
+        "summary Soft=0 occ_median_ms={occ_med:.3} sf_cold_ms={} sf_reuse_median_ms={} primary_sf_ms={primary_sf:.3} primary={} sf_le_occ={sf_le_occ} frame_suspends={frame_suspends} frame_resumes={frame_resumes}",
         sf_cold
             .map(|v| format!("{v:.3}"))
             .unwrap_or_else(|| "n/a".into()),
