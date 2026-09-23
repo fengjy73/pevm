@@ -609,19 +609,28 @@ impl Pevm {
             // Do not sample block_size as ready_width when A1=0 (that read as 176).
             // Reuse WAW: nearest pred on the learned chain, then pop that
             // head before the low-index antichain.
-            let crit_head = self.inter_prior.crit_chain().and_then(|(loc, writers)| {
-                access_arms.note_prior_touchers(loc, &writers);
-                if writers.len() < 32 || writers.len() * 4 > block_size {
-                    return None;
-                }
-                access_arms.install_crit_chain(loc, &writers);
-                ready_edges.plant_nearest_preds(loc, &writers);
-                // ChainSpineTip: light true-publish plane (not DashMap WaitOnce tips).
-                sf_tips.bind_chain_spine(loc, &writers);
-                writers.first().copied()
-            });
+            let crit_head = self
+                .inter_prior
+                .crit_chain()
+                .and_then(|(loc, writers)| {
+                    access_arms.note_prior_touchers(loc, &writers);
+                    if writers.len() < 32 || writers.len() * 4 > block_size {
+                        return None;
+                    }
+                    access_arms.install_crit_chain(loc, &writers);
+                    ready_edges.plant_nearest_preds(loc, &writers);
+                    // ChainSpineTip: light true-publish plane (not DashMap WaitOnce tips).
+                    sf_tips.bind_chain_spine(loc, &writers);
+                    writers.first().copied()
+                })
+                .or_else(|| access_spine.ordered_head());
             self.last_begin_blocked = ready_edges.blocked_consumers();
             runnable.seed_begin(&ready_edges, &producer_stages, &scheduler, crit_head);
+            // Chain successors and remaining touchers stay off-core until the
+            // spine hands them the true tip. Non-touchers stay in the deque.
+            for tx in access_spine.txs_to_park() {
+                runnable.mark_wait(tx);
+            }
             // P3: do not sample (n_tx − blocked) as ready_width (reads as 172).
             if quiet && !learner.has_any_predicted() {
                 let n = sketch.revoke_prior_fences_if_quiet(true);
@@ -2531,7 +2540,7 @@ fn try_validate(
         if specfence.mode == ConcurrencyMode::SpecFence {
             let spine = specfence.spine;
             mv_memory.convert_writes_to_estimates_keeping(tx_version.tx_idx, |loc| {
-                if spine.must_retain(loc, tx_version.tx_idx) {
+                if spine.should_pin_origin(loc, tx_version.tx_idx) {
                     spine.note_retain_keep();
                     true
                 } else {

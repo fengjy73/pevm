@@ -60,8 +60,12 @@ pub(crate) fn pick(
         m.sample_runnable_width(runnable.width_hint());
     }
 
-    // OrderedTip: the chain start woke its successor onto this worker's
-    // indep deque (LIFO) so the next pop is that writer, not a random tx.
+    // Touchers first, then the next chain writer. Local LIFO pops the writer
+    // (pushed last). Other workers steal the readers and WaitTrueVersion.
+    let readers = spine.take_reader_wakes();
+    for tx in readers {
+        let _ = runnable.wake_idle(tx, super::runnable_set::QueueKind::Indep);
+    }
     if let Some(next) = spine.take_handoff() {
         if !runnable.wake_idle(next, super::runnable_set::QueueKind::Indep) {
             spine.restore_handoff(next);
@@ -93,9 +97,9 @@ pub(crate) fn pick(
                 }
                 // Later chain writers stay off-core until the predecessor has
                 // started. Non-members fall through and fill the antichain.
-                if spine.successor_blocked(tx, |w| {
-                    scheduler.is_done(w) || scheduler.is_validated(w)
-                }) {
+                if spine
+                    .successor_blocked(tx, |w| scheduler.is_done(w) || scheduler.is_validated(w))
+                {
                     runnable.release_running(tx);
                     spine.note_ordered_defer();
                     continue;

@@ -77,6 +77,11 @@ pub struct MvMemory {
     aborted_incarnations: DashMap<TxIdx, TxIncarnation, BuildIdentityHasher>,
     /// Prior incarnation write-set (Bohm-lite residual) for OrderedAdmit/WaitHard placeholders.
     residual_write_sets: DashMap<TxIdx, Vec<MemoryLocationHash>, BuildIdentityHasher>,
+    /// Values copied out before Estimate so a WAR reader can re-read the tip
+    /// it bound. The live entry is still Estimate, so validation fails closed
+    /// if the writer publishes a new incarnation.
+    retained_history:
+        DashMap<MemoryLocationHash, Vec<(TxIdx, TxIncarnation, MemoryValue)>, BuildIdentityHasher>,
 }
 
 impl MvMemory {
@@ -112,7 +117,35 @@ impl MvMemory {
             readers: DashMap::default(),
             aborted_incarnations: DashMap::default(),
             residual_write_sets: DashMap::default(),
+            retained_history: DashMap::default(),
         }
+    }
+
+    /// Copy one aborted Data value. The caller still installs Estimate.
+    pub(crate) fn pin_aborted_value(
+        &self,
+        location: MemoryLocationHash,
+        tx_idx: TxIdx,
+        inc: TxIncarnation,
+        value: MemoryValue,
+    ) {
+        let mut slot = self.retained_history.entry(location).or_default();
+        if slot.len() < 64 {
+            slot.push((tx_idx, inc, value));
+        }
+    }
+
+    /// Historical tip for `tx_idx` if RetainHistory snapshotted it.
+    pub(crate) fn pinned_entry(
+        &self,
+        location: MemoryLocationHash,
+        tx_idx: TxIdx,
+    ) -> Option<MemoryEntry> {
+        let slot = self.retained_history.get(&location)?;
+        slot.iter()
+            .rev()
+            .find(|(t, _, _)| *t == tx_idx)
+            .map(|(_, inc, value)| MemoryEntry::Data(*inc, value.clone()))
     }
 
     pub(crate) fn add_lazy_addresses(&self, new_lazy_addresses: impl IntoIterator<Item = Address>) {
@@ -694,9 +727,9 @@ impl MvMemory {
         self.convert_writes_to_estimates_keeping(tx_idx, |_| false);
     }
 
-    /// Like [`Self::convert_writes_to_estimates`], but locations where `keep`
-    /// is true stay Data. RetainHistory uses that so a WAR reader still sees
-    /// the tip it bound.
+    /// Like [`Self::convert_writes_to_estimates`]. Locations where `keep` is
+    /// true are snapshotted first. The live entry still becomes Estimate so a
+    /// higher reader cannot validate the aborted incarnation.
     pub(crate) fn convert_writes_to_estimates_keeping(
         &self,
         tx_idx: TxIdx,
@@ -706,7 +739,16 @@ impl MvMemory {
         self.residual_write_sets.insert(tx_idx, writes.clone());
         for location in &writes {
             if keep(*location) {
-                continue;
+                let snap = self
+                    .data
+                    .get(location)
+                    .and_then(|written| match written.get(&tx_idx) {
+                        Some(MemoryEntry::Data(inc, value)) => Some((*inc, value.clone())),
+                        _ => None,
+                    });
+                if let Some((inc, value)) = snap {
+                    self.pin_aborted_value(*location, tx_idx, inc, value);
+                }
             }
             if let Some(mut written_transactions) = self.data.get_mut(location) {
                 written_transactions.insert(tx_idx, MemoryEntry::Estimate);

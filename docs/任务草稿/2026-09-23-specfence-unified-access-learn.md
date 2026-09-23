@@ -24,4 +24,7 @@
 
    辅证墙时：3356896 OCC 1.010 ms / SF reuse 1.506 ms；15274915 OCC 5.836 ms / SF reuse 8.116 ms。
 
-5. **进行中 — 长链这一刀。** 上一块观察到的写者链带到下一块（撤销只清权重，不清刚观察到的链）。后继在前驱开工前不占核；前驱一开工就 handoff 后继，后继在宿主读上 WaitTrueVersion。非链交易跳过 tip 安装。WAR pin 阻止把该写者的 Data 换成 Estimate。单测 11 过。TPS 待复测。
+5. **进行中 — 长链这一刀（发布交接 + 触及者真等 + Retain 快照）。**
+   - 开工即 handoff 整条链进帧内等，测得 ratio 0.155 / 0.127，已弃。
+   - 发布才 handoff：薄块 0.825、大块 0.798，但大块 `seq!=par`。根因是 WAR pin 跳过 Estimate，已验证的更高交易不会因同位置重写而重验。
+   - 本刀：链后继与携带的读者先离队；写者开工时只唤醒它的剩余触及者做帧内 WaitTrueVersion（每写者最多 workers−1，其余在发布后走便宜路径）；非触及者 `cheap_fill` 不走 wait。RetainHistory 在打 Estimate 之前把原点快照进 `retained_history`，活条目仍是 Estimate。单测 11 过。TPS 待复测。
