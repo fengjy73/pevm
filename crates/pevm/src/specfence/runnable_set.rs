@@ -366,6 +366,8 @@ impl RunnableSet {
         {
             return false;
         }
+        // The hop left `ST_RUNNING`. A stale owner blocks every later claim.
+        self.clear_spine_claim(tx);
         self.place(tx, kind);
         true
     }
@@ -379,6 +381,9 @@ impl RunnableSet {
         }
         let tag = kind.tag();
         let prev = self.state[tx].swap(tag, Ordering::AcqRel);
+        if prev == ST_RUNNING {
+            self.clear_spine_claim(tx);
+        }
         if prev == tag {
             return;
         }
@@ -473,9 +478,13 @@ impl RunnableSet {
         if tx >= self.block_size {
             return;
         }
+        // Pause before dropping `ST_RUNNING`, or another worker pops the tail
+        // in the window between release and push.
+        self.spine_pause.store(true, Ordering::Release);
         self.release_running(tx);
         let st = self.state[tx].load(Ordering::Acquire);
         if st == ST_DONE || st == ST_RUNNING {
+            self.spine_pause.store(false, Ordering::Release);
             return;
         }
         if st != ST_INDEP {
@@ -682,18 +691,65 @@ impl RunnableSet {
         }
     }
 
+    /// True only while the owned hop is still inside execute. A owner left
+    /// on a requeued tx must not freeze the chain.
+    fn spine_busy(&self) -> bool {
+        let cur = self.spine_owner_tx.load(Ordering::Acquire);
+        cur < self.block_size && self.state[cur].load(Ordering::Acquire) == ST_RUNNING
+    }
+
+    fn release_spine_lock(&self) {
+        let _ = self.spine_owner_tx.compare_exchange(
+            SPINE_LOCK,
+            usize::MAX,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Exclusive right to pull one ordered hop. Stale owners are cleared.
+    fn lock_spine(&self) -> bool {
+        loop {
+            if self.spine_busy() {
+                return false;
+            }
+            let cur = self.spine_owner_tx.load(Ordering::Acquire);
+            if cur == SPINE_LOCK {
+                return false;
+            }
+            if cur == usize::MAX {
+                return self
+                    .spine_owner_tx
+                    .compare_exchange(usize::MAX, SPINE_LOCK, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok();
+            }
+            if cur < self.block_size && self.state[cur].load(Ordering::Acquire) == ST_RUNNING {
+                return false;
+            }
+            if self
+                .spine_owner_tx
+                .compare_exchange(cur, usize::MAX, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+            {
+                continue;
+            }
+        }
+    }
+
     /// One hop from `spine_q`. Does not skip a live head to start the tail.
     fn pop_spine_hop(&self) -> Option<TxIdx> {
         if self.spine_pause.load(Ordering::Acquire)
             || !self.spine_slot_empty()
-            || self
-                .spine_owner_tx
-                .compare_exchange(usize::MAX, SPINE_LOCK, Ordering::AcqRel, Ordering::Relaxed)
-                .is_err()
+            || !self.lock_spine()
         {
             return None;
         }
-        while let Some(tx) = self.spine_q.try_pop_local() {
+        let mut guard = 0usize;
+        while guard < self.block_size {
+            guard += 1;
+            let Some(tx) = self.spine_q.try_pop_local() else {
+                break;
+            };
             if tx >= self.block_size {
                 continue;
             }
@@ -701,8 +757,10 @@ impl RunnableSet {
             if st == ST_DONE {
                 continue;
             }
-            let still_ours = self.spine_owner_tx.load(Ordering::Acquire) == SPINE_LOCK;
-            if still_ours && st == ST_INDEP && self.take_if(tx, ST_INDEP) {
+            if self.spine_owner_tx.load(Ordering::Acquire) == SPINE_LOCK
+                && st == ST_INDEP
+                && self.take_if(tx, ST_INDEP)
+            {
                 self.spine_owner_tx.store(tx, Ordering::Release);
                 return Some(tx);
             }
@@ -711,12 +769,7 @@ impl RunnableSet {
             }
             break;
         }
-        let _ = self.spine_owner_tx.compare_exchange(
-            SPINE_LOCK,
-            usize::MAX,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        );
+        self.release_spine_lock();
         None
     }
 
@@ -726,6 +779,9 @@ impl RunnableSet {
     }
 
     fn claim_spine(&self) -> Option<TxIdx> {
+        if self.spine_busy() {
+            return None;
+        }
         let tx = self.spine_slot.swap(usize::MAX, Ordering::AcqRel);
         if tx == usize::MAX || tx >= self.block_size {
             return None;
@@ -746,27 +802,38 @@ impl RunnableSet {
             }
             return None;
         }
-        match self.spine_owner_tx.compare_exchange(
-            usize::MAX,
-            tx,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => Some(tx),
-            Err(cur) if cur == SPINE_LOCK || cur == tx => {
-                self.spine_owner_tx.store(tx, Ordering::Release);
-                Some(tx)
+        if self.own_spine(tx) {
+            Some(tx)
+        } else {
+            // A hop is actually running. Put this one back; do not drop it.
+            self.state[tx].store(ST_SPINE, Ordering::Release);
+            let _ = self.spine_slot.compare_exchange(
+                usize::MAX,
+                tx,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+            None
+        }
+    }
+
+    /// Install `tx` as the spine owner. Fails only when another hop is
+    /// `ST_RUNNING`. A stale owner (requeued, waiting, done) is replaced.
+    fn own_spine(&self, tx: TxIdx) -> bool {
+        loop {
+            let cur = self.spine_owner_tx.load(Ordering::Acquire);
+            if cur == tx {
+                return true;
             }
-            Err(_) => {
-                // Another hop is already in flight. Keep this one in the slot.
-                self.state[tx].store(ST_SPINE, Ordering::Release);
-                let _ = self.spine_slot.compare_exchange(
-                    usize::MAX,
-                    tx,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                );
-                None
+            if cur < self.block_size && self.state[cur].load(Ordering::Acquire) == ST_RUNNING {
+                return false;
+            }
+            if self
+                .spine_owner_tx
+                .compare_exchange(cur, tx, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                return true;
             }
         }
     }
