@@ -32,3 +32,9 @@
    | 15274915 | 162557.1 | 229915.2 | 0.707 | 否 | 是 | 4 | 76 | 2 | 77 |
 
    墙时：薄块 SF 1.459 / OCC 1.006 ms；大块 SF 7.542 / OCC 5.332 ms。末轮薄块链跨度约 0.42 ms。`est_block=0`，`soft=0`，`occ_picks=0`。下一刀是反链调度税，不是第四原语。
+
+6. **进行中 — T0–T6 压反链调度税（同一 PR #48，不做 T7）。** 基线 tax ≈ +1.0 / +6.1 ms，ratio 0.690 / 0.707。
+
+   - **目标：** Soft=0 Instant-off，N≥5，焦点 3356896 + 15274915。主指标 TPS SF/OCC（目标 ≥1.5，未达标如实）。辅：`tax_ms = SF_wall − chain_span` 相对长链刀后基线是否下降。计数 idle / steal / refuse_gated / gated_pick / spine_cores。
+   - **机制：** 每核本地 Admit 队列 + 只偷别人的队头；链跳只进 `spine_slot`，仅 worker 0 认领（`spine_cores≤1`）；发布 handoff 不再推进 Indep LIFO；Indep 空且前驱已发布时 help-release；`batch_pop` K=4。禁止 park-all、开工 handoff、Estimate 门、next_task*。
+   - **状态：** 待落地并测。

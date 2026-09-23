@@ -298,6 +298,20 @@ pub struct SpineReport {
     pub tip_already: usize,
     /// Writer indexes carried on the ordered chain (0 when cold).
     pub chain_len: usize,
+    /// Worker idle time accumulated before end_block.
+    pub idle_ns: u64,
+    /// Admit-Unfenced steals (local front or global front).
+    pub steal_hits: usize,
+    /// Picks that refused a gated or waiting tx.
+    pub refuse_gated: usize,
+    /// Gated `!may_execute` txs returned to a worker. Must stay 0.
+    pub gated_pick: usize,
+    /// Max concurrent spine-hop owners. Target ≤1.
+    pub spine_cores: usize,
+    /// Help-release offers that filled an empty spine slot.
+    pub help_release: usize,
+    /// Width picks served from a worker's own batch / local deque.
+    pub local_hits: usize,
 }
 
 /// Shared per-block spine. Workers share it. The Avoid table starts empty.
@@ -365,6 +379,29 @@ impl AccessSpine {
             retain_keeps: AtomicUsize::new(0),
             tip_already: AtomicUsize::new(0),
         }
+    }
+
+    /// Writer indexes carried from the previous block, ascending.
+    pub(crate) fn ordered_members(&self) -> &[TxIdx] {
+        &self.ordered_writers
+    }
+
+    /// Next hop whose predecessor has published. Empty when the predecessor
+    /// is still in flight, so help-release cannot start the tail early.
+    pub(crate) fn help_next_hop(&self) -> Option<TxIdx> {
+        if self.ordered_writers.is_empty() {
+            return None;
+        }
+        for (i, &tx) in self.ordered_writers.iter().enumerate() {
+            if self.published.contains(&tx) {
+                continue;
+            }
+            if i == 0 || self.published.contains(&self.ordered_writers[i - 1]) {
+                return Some(tx);
+            }
+            return None;
+        }
+        None
     }
 
     /// This tx is on the carried writer chain.
@@ -768,6 +805,13 @@ impl AccessSpine {
             retain_keeps: self.retain_keeps.load(Ordering::Relaxed),
             tip_already: self.tip_already.load(Ordering::Relaxed),
             chain_len: self.ordered_writers.len(),
+            idle_ns: 0,
+            steal_hits: 0,
+            refuse_gated: 0,
+            gated_pick: 0,
+            spine_cores: 0,
+            help_release: 0,
+            local_hits: 0,
         };
         (report, next)
     }

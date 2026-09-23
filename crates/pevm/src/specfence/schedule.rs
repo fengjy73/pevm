@@ -60,12 +60,20 @@ pub(crate) fn pick(
         m.sample_runnable_width(runnable.width_hint());
     }
 
-    // OrderedTip: publish queued the next writer onto this worker's indep
-    // deque (LIFO) so the next pop is that writer, not a random tx.
+    // OrderedTip short path: the next writer goes to the owner slot, not the
+    // Indep LIFO tail the width cores are stealing.
     if let Some(next) = spine.take_handoff() {
-        if !runnable.wake_idle(next, super::runnable_set::QueueKind::Indep) {
+        if !runnable.offer_spine(next) {
             spine.restore_handoff(next);
         }
+    }
+    // Pred already published and the slot is empty: one help-release. This
+    // does not hand the hop to a width core.
+    if runnable.spine_slot_empty()
+        && let Some(next) = spine.help_next_hop()
+        && runnable.offer_spine(next)
+    {
+        runnable.note_help_release();
     }
 
     let refuse_before = runnable.refuse_fill_n();

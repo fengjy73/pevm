@@ -24,6 +24,14 @@ const ST_REVALIDATE: u8 = 4;
 const ST_RUNNING: u8 = 5;
 const ST_WAIT: u8 = 6;
 const ST_DONE: u8 = 7;
+/// Ordered hop parked off every width deque. Only [`RunnableSet::offer_spine`]
+/// moves it. Heal must not dump these onto `Q_indep` (that put every core on
+/// the chain).
+const ST_CHAIN: u8 = 8;
+/// Hop sitting in [`RunnableSet::spine_slot`]. Worker 0 is the only claimer.
+const ST_SPINE: u8 = 9;
+/// Already-claimed Admit-Unfenced txs returned without another queue lock.
+const BATCH_K: usize = 4;
 
 /// Which first-class queue a tx belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,10 +102,30 @@ pub(crate) struct RunnableSet {
     idle_spins: AtomicUsize,
     width_sum: AtomicUsize,
     width_n: AtomicUsize,
+    /// Per-worker Admit-Unfenced deques. Owner pops the back; thieves the front.
+    locals: Vec<Deque>,
+    /// Claimed (ST_RUNNING) width txs for this worker. Not the spine hop.
+    batches: Vec<Mutex<VecDeque<TxIdx>>>,
+    /// Locals + batches. Global deques are counted by their own locks.
+    local_queued: AtomicUsize,
+    /// Next ordered hop. `usize::MAX` means empty. Never stolen.
+    spine_slot: AtomicUsize,
+    /// `worker_i + 1` while that worker holds a spine claim. 0 if none.
+    spine_holder: AtomicUsize,
+    spine_owner_tx: AtomicUsize,
+    spine_cores_max: AtomicUsize,
+    refuse_gated: AtomicUsize,
+    gated_pick: AtomicUsize,
+    local_hits: AtomicUsize,
+    help_release_n: AtomicUsize,
+    steal_cursor: AtomicUsize,
+    /// 1 when `tx` is on the ordered writer chain. Written before workers start.
+    chain_bit: Vec<AtomicU8>,
 }
 
 impl RunnableSet {
     pub(crate) fn new(block_size: usize, cores: usize) -> Self {
+        let cores = cores.max(1);
         Self {
             q_indep: Deque::new(),
             q_released: Deque::new(),
@@ -105,12 +133,25 @@ impl RunnableSet {
             q_revalidate: Deque::new(),
             state: (0..block_size).map(|_| AtomicU8::new(ST_NONE)).collect(),
             block_size,
-            cores: cores.max(1),
+            cores,
             steal_n: AtomicUsize::new(0),
             refuse_fill_n: AtomicUsize::new(0),
             idle_spins: AtomicUsize::new(0),
             width_sum: AtomicUsize::new(0),
             width_n: AtomicUsize::new(0),
+            locals: (0..cores).map(|_| Deque::new()).collect(),
+            batches: (0..cores).map(|_| Mutex::new(VecDeque::new())).collect(),
+            local_queued: AtomicUsize::new(0),
+            spine_slot: AtomicUsize::new(usize::MAX),
+            spine_holder: AtomicUsize::new(0),
+            spine_owner_tx: AtomicUsize::new(usize::MAX),
+            spine_cores_max: AtomicUsize::new(0),
+            refuse_gated: AtomicUsize::new(0),
+            gated_pick: AtomicUsize::new(0),
+            local_hits: AtomicUsize::new(0),
+            help_release_n: AtomicUsize::new(0),
+            steal_cursor: AtomicUsize::new(0),
+            chain_bit: (0..block_size).map(|_| AtomicU8::new(0)).collect(),
         }
     }
 
@@ -183,6 +224,101 @@ impl RunnableSet {
         self.push(tx, QueueKind::Indep);
     }
 
+    /// Move the seeded antichain onto per-worker deques. Chain members leave
+    /// the shared LIFO: the head sits in `spine_slot`, later hops stay
+    /// `ST_CHAIN` until publish / help-release. Call once, before workers.
+    pub(crate) fn shard_width(&self, members: &[TxIdx]) {
+        for &tx in members {
+            if tx < self.block_size {
+                self.chain_bit[tx].store(1, Ordering::Release);
+            }
+        }
+        let head = members
+            .iter()
+            .copied()
+            .filter(|&tx| tx < self.block_size)
+            .min();
+        let mut drained = Vec::new();
+        while let Some(tx) = self.q_indep.try_pop_local() {
+            drained.push(tx);
+        }
+        let mut rr = 0usize;
+        for tx in drained {
+            if tx >= self.block_size {
+                continue;
+            }
+            if self.is_chain_member(tx) {
+                if Some(tx) == head {
+                    self.state[tx].store(ST_SPINE, Ordering::Release);
+                    self.spine_slot.store(tx, Ordering::Release);
+                } else {
+                    self.state[tx].store(ST_CHAIN, Ordering::Release);
+                }
+                continue;
+            }
+            let w = rr % self.cores;
+            rr += 1;
+            self.locals[w].push_local(tx);
+            self.local_queued.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    fn is_chain_member(&self, tx: TxIdx) -> bool {
+        tx < self.block_size && self.chain_bit[tx].load(Ordering::Acquire) == 1
+    }
+
+    /// Chain hops never join a width deque. Revalidate stays on its queue.
+    fn place(&self, tx: TxIdx, kind: QueueKind) {
+        if kind != QueueKind::Revalidate && self.is_chain_member(tx) {
+            let _ = self.offer_spine(tx);
+            return;
+        }
+        self.q(kind).push_local(tx);
+    }
+
+    /// Publish the next ordered hop. True only when this call filled an empty
+    /// slot. Already-staged and in-flight hops return false so idle help does
+    /// not spin.
+    pub(crate) fn offer_spine(&self, tx: TxIdx) -> bool {
+        if tx >= self.block_size || !self.is_chain_member(tx) {
+            return false;
+        }
+        loop {
+            let prev = self.state[tx].load(Ordering::Acquire);
+            if prev == ST_RUNNING || prev == ST_DONE || prev == ST_REVALIDATE {
+                return false;
+            }
+            if prev == ST_SPINE {
+                return false;
+            }
+            if self.state[tx]
+                .compare_exchange(prev, ST_SPINE, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+            {
+                continue;
+            }
+            match self.spine_slot.compare_exchange(
+                usize::MAX,
+                tx,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(cur) if cur == tx => return false,
+                Err(_) => {
+                    let _ = self.state[tx].compare_exchange(
+                        ST_SPINE,
+                        ST_CHAIN,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    );
+                    return false;
+                }
+            }
+        }
+    }
+
     #[inline]
     pub(crate) fn push(&self, tx: TxIdx, kind: QueueKind) {
         if tx >= self.block_size {
@@ -199,7 +335,7 @@ impl RunnableSet {
         if prev == tag {
             return;
         }
-        self.q(kind).push_local(tx);
+        self.place(tx, kind);
     }
 
     /// Owner finished a failed claim. Only the worker that holds
@@ -217,7 +353,7 @@ impl RunnableSet {
         {
             return false;
         }
-        self.q(kind).push_local(tx);
+        self.place(tx, kind);
         true
     }
 
@@ -233,7 +369,7 @@ impl RunnableSet {
         if prev == tag {
             return;
         }
-        self.q(kind).push_local(tx);
+        self.place(tx, kind);
     }
 
     /// Heal / drain wake. Does not take `ST_RUNNING`: that claim is an
@@ -255,13 +391,30 @@ impl RunnableSet {
         if prev == tag {
             return true;
         }
+        // Heal must not drop every chain hop onto a width deque, and it must
+        // not fill the spine slot with a successor whose pred has not
+        // published. Handoff and help-release are the only offerers.
+        if self.is_chain_member(tx) && kind != QueueKind::Revalidate {
+            if prev == ST_RUNNING || prev == ST_DONE {
+                return false;
+            }
+            if prev != ST_CHAIN && prev != ST_SPINE {
+                let _ = self.state[tx].compare_exchange(
+                    prev,
+                    ST_CHAIN,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                );
+            }
+            return false;
+        }
         if self.state[tx]
             .compare_exchange(prev, tag, Ordering::AcqRel, Ordering::Relaxed)
             .is_err()
         {
             return false;
         }
-        self.q(kind).push_local(tx);
+        self.place(tx, kind);
         true
     }
 
@@ -278,6 +431,7 @@ impl RunnableSet {
             Ordering::AcqRel,
             Ordering::Relaxed,
         );
+        self.clear_spine_claim(tx);
     }
 
     #[inline]
@@ -309,6 +463,34 @@ impl RunnableSet {
     pub(crate) fn mark_done(&self, tx: TxIdx) {
         if tx < self.block_size {
             self.state[tx].store(ST_DONE, Ordering::Release);
+            self.clear_spine_claim(tx);
+        }
+    }
+
+    fn clear_spine_claim(&self, tx: TxIdx) {
+        if self
+            .spine_owner_tx
+            .compare_exchange(tx, usize::MAX, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.spine_holder.store(0, Ordering::Release);
+        }
+    }
+
+    fn note_spine_claim(&self, worker_i: usize, tx: TxIdx) {
+        self.spine_owner_tx.store(tx, Ordering::Release);
+        let tag = worker_i.saturating_add(1);
+        match self
+            .spine_holder
+            .compare_exchange(0, tag, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => {
+                self.spine_cores_max.fetch_max(1, Ordering::Relaxed);
+            }
+            Err(prev) if prev == tag => {}
+            Err(_) => {
+                self.spine_cores_max.fetch_max(2, Ordering::Relaxed);
+            }
         }
     }
 
@@ -361,31 +543,93 @@ impl RunnableSet {
         None
     }
 
-    /// Work-conserving pick (PC-1..PC-3). `worker_i` rotates local preference.
+    /// Work-conserving pick. Worker 0 alone claims the ordered hop. Every
+    /// other core pops its local Admit deque, then steals another worker's
+    /// front. Gated / waiting txs are never returned.
     pub(crate) fn pick(&self, worker_i: usize, ready: &ReadyEdgeTable) -> Option<SfPick> {
+        let worker = worker_i % self.cores;
+
+        // Longest remaining hop, before this worker drains a width batch.
+        if worker == 0
+            && let Some(tx) = self.claim_spine()
+        {
+            if let Some(p) = self.admit_or_refuse(tx, QueueKind::Indep, ready) {
+                self.note_spine_claim(worker, tx);
+                return Some(p);
+            }
+            self.park_claimed_hop(tx);
+        }
+
+        if let Some(tx) = self.pop_batch(worker) {
+            self.local_hits.fetch_add(1, Ordering::Relaxed);
+            return Some(self.exec_width(tx));
+        }
+
+        // One revalidate. Soft=0 aborts are rare; draining the queue here
+        // used to hide the antichain behind validation meta.
         if let Some(tx) = self.pop_kind(QueueKind::Revalidate) {
             return Some(SfPick::Revalidate(tx));
         }
-        // Independents first (PC-3). Worker 0 used to prefer Ordered/Released
-        // and 1-core starved Q_indep=29 behind one Released park-requeue
-        // (19469101 pending=30 / live_wait=false).
-        let prefer = match worker_i % 3 {
-            0 => [QueueKind::Indep, QueueKind::Released, QueueKind::Ordered],
-            1 => [QueueKind::Indep, QueueKind::Ordered, QueueKind::Released],
-            _ => [QueueKind::Released, QueueKind::Indep, QueueKind::Ordered],
-        };
-        // One gated !may_execute head must not hide a later runnable in the
-        // same deque (19469101: pending=30 stuck, schedule broke on first None).
-        for kind in prefer {
-            while let Some(tx) = self.pop_kind(kind) {
-                if let Some(p) = self.admit_or_refuse(tx, kind, ready) {
+
+        if self.claim_width_batch(worker, worker, false, ready) > 0
+            && let Some(tx) = self.pop_batch(worker)
+        {
+            self.local_hits.fetch_add(1, Ordering::Relaxed);
+            return Some(self.exec_width(tx));
+        }
+
+        if self.cores > 1 {
+            let start = self.steal_cursor.fetch_add(1, Ordering::Relaxed);
+            for k in 1..self.cores {
+                let victim = (start + k) % self.cores;
+                if self.claim_width_batch(worker, victim, true, ready) > 0
+                    && let Some(tx) = self.pop_batch(worker)
+                {
+                    self.local_hits.fetch_add(1, Ordering::Relaxed);
+                    return Some(self.exec_width(tx));
+                }
+            }
+        }
+
+        // Global backup. Only the spine owner pops the LIFO tail. Width
+        // workers steal the front, so they cannot race the next hop.
+        if worker == 0 {
+            while let Some(tx) = self.pop_kind(QueueKind::Indep) {
+                if self.is_chain_member(tx) {
+                    self.park_claimed_hop(tx);
+                    continue;
+                }
+                if let Some(p) = self.admit_or_refuse(tx, QueueKind::Indep, ready) {
+                    return Some(p);
+                }
+            }
+        } else {
+            while let Some(tx) = self.steal_kind(QueueKind::Indep) {
+                if self.is_chain_member(tx) {
+                    self.park_claimed_hop(tx);
+                    continue;
+                }
+                if let Some(p) = self.admit_or_refuse(tx, QueueKind::Indep, ready) {
                     return Some(p);
                 }
             }
         }
-        // Global steal: independents first (PC-3: keep width while a spine runs).
-        for kind in [QueueKind::Indep, QueueKind::Released, QueueKind::Ordered] {
+
+        for kind in [QueueKind::Released, QueueKind::Ordered] {
+            while let Some(tx) = self.pop_kind(kind) {
+                if self.is_chain_member(tx) {
+                    self.park_claimed_hop(tx);
+                    continue;
+                }
+                if let Some(p) = self.admit_or_refuse(tx, kind, ready) {
+                    return Some(p);
+                }
+            }
             while let Some(tx) = self.steal_kind(kind) {
+                if self.is_chain_member(tx) {
+                    self.park_claimed_hop(tx);
+                    continue;
+                }
                 if let Some(p) = self.admit_or_refuse(tx, kind, ready) {
                     return Some(p);
                 }
@@ -395,6 +639,134 @@ impl RunnableSet {
             return Some(SfPick::Revalidate(tx));
         }
         None
+    }
+
+    fn exec_width(&self, tx: TxIdx) -> SfPick {
+        SfPick::Execute {
+            tx,
+            vis: VisibilityPolicy::Opt,
+            from: QueueKind::Indep,
+            refused: false,
+        }
+    }
+
+    /// `pop_kind` already moved `tx` to `ST_RUNNING`. Put a chain hop back on
+    /// the owner slot instead of executing it on a width core.
+    fn park_claimed_hop(&self, tx: TxIdx) {
+        // Do not offer. An unpublished successor re-offered here pins worker 0
+        // in successor_blocked and the antichain stops. Handoff / help-release
+        // offer only after the predecessor has published.
+        self.release_running(tx);
+        if self.is_chain_member(tx) {
+            let _ = self.state[tx].compare_exchange(
+                ST_WAIT,
+                ST_CHAIN,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    #[inline]
+    pub(crate) fn spine_slot_empty(&self) -> bool {
+        self.spine_slot.load(Ordering::Acquire) == usize::MAX
+    }
+
+    fn claim_spine(&self) -> Option<TxIdx> {
+        let tx = self.spine_slot.swap(usize::MAX, Ordering::AcqRel);
+        if tx == usize::MAX || tx >= self.block_size {
+            return None;
+        }
+        if self.take_if(tx, ST_SPINE)
+            || self.take_if(tx, ST_CHAIN)
+            || self.take_if(tx, ST_INDEP)
+            || self.take_if(tx, ST_WAIT)
+        {
+            return Some(tx);
+        }
+        let st = self.state[tx].load(Ordering::Acquire);
+        if st != ST_RUNNING && st != ST_DONE {
+            let _ = self.spine_slot.compare_exchange(
+                usize::MAX,
+                tx,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+        }
+        None
+    }
+
+    fn pop_batch(&self, worker: usize) -> Option<TxIdx> {
+        let tx = self.batches.get(worker)?.lock().pop_back();
+        if tx.is_some() {
+            self.dec_queued();
+        }
+        tx
+    }
+
+    /// Claim up to [`BATCH_K`] Admit-Unfenced txs. `steal` pops the victim's
+    /// front; the owner pops its own back. Gated txs are not claimed.
+    fn claim_width_batch(
+        &self,
+        worker: usize,
+        owner: usize,
+        steal: bool,
+        ready: &ReadyEdgeTable,
+    ) -> usize {
+        let Some(q) = self.locals.get(owner) else {
+            return 0;
+        };
+        let mut n = 0;
+        while n < BATCH_K {
+            let Some(tx) = (if steal { q.steal() } else { q.try_pop_local() }) else {
+                break;
+            };
+            if tx >= self.block_size {
+                continue;
+            }
+            self.dec_queued();
+            if self.is_chain_member(tx) {
+                let _ = self.offer_spine(tx);
+                continue;
+            }
+            if self.refused_gate(tx, ready) {
+                ready.note_skip_gate(tx);
+                self.note_wait_unless_running(tx);
+                self.refuse_gated.fetch_add(1, Ordering::Relaxed);
+                self.refuse_fill_n.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            if !self.take_if(tx, ST_INDEP) {
+                continue;
+            }
+            self.batches[worker].lock().push_back(tx);
+            self.local_queued.fetch_add(1, Ordering::Relaxed);
+            if steal {
+                self.steal_n.fetch_add(1, Ordering::Relaxed);
+            }
+            n += 1;
+        }
+        n
+    }
+
+    fn dec_queued(&self) {
+        let mut cur = self.local_queued.load(Ordering::Relaxed);
+        while cur > 0 {
+            match self.local_queued.compare_exchange_weak(
+                cur,
+                cur - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(v) => cur = v,
+            }
+        }
+    }
+
+    fn refused_gate(&self, tx: TxIdx, ready: &ReadyEdgeTable) -> bool {
+        !ready.leftover_min_on_skippable_gate(tx)
+            && (ready.leftover_surplus(tx) || (ready.is_gated(tx) && !ready.may_execute(tx)))
     }
 
     fn admit_or_refuse(
@@ -408,6 +780,7 @@ impl RunnableSet {
         {
             ready.note_skip_gate(tx);
             self.mark_wait(tx);
+            self.refuse_gated.fetch_add(1, Ordering::Relaxed);
             self.refuse_fill_n.fetch_add(1, Ordering::Relaxed);
             // PC-2: immediately fill from Q_indep.
             if let Some(alt) = self
@@ -421,6 +794,11 @@ impl RunnableSet {
                     refused: true,
                 });
             }
+            return None;
+        }
+        if ready.is_gated(tx) && !ready.may_execute(tx) {
+            self.gated_pick.fetch_add(1, Ordering::Relaxed);
+            self.mark_wait(tx);
             return None;
         }
         let vis = match kind {
@@ -876,7 +1254,12 @@ impl RunnableSet {
 
     #[inline]
     pub(crate) fn width(&self) -> usize {
-        self.q_indep.len() + self.q_released.len() + self.q_ordered.len()
+        let spine = usize::from(self.spine_slot.load(Ordering::Relaxed) != usize::MAX);
+        self.q_indep.len()
+            + self.q_released.len()
+            + self.q_ordered.len()
+            + self.local_queued.load(Ordering::Relaxed)
+            + spine
     }
 
     #[inline]
@@ -897,6 +1280,36 @@ impl RunnableSet {
     #[inline]
     pub(crate) fn steal_n(&self) -> usize {
         self.steal_n.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn refuse_gated(&self) -> usize {
+        self.refuse_gated.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn gated_pick(&self) -> usize {
+        self.gated_pick.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn spine_cores(&self) -> usize {
+        self.spine_cores_max.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn local_hits(&self) -> usize {
+        self.local_hits.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn help_release_n(&self) -> usize {
+        self.help_release_n.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn note_help_release(&self) {
+        self.help_release_n.fetch_add(1, Ordering::Relaxed);
     }
 
     #[inline]
@@ -1314,6 +1727,37 @@ mod tests {
         let n = r.heal(&ready, &sched);
         assert!(n >= 1, "ghost producer with waiters must recover, got {n}");
         assert!(sched.is_ready(1));
+    }
+
+    #[test]
+    fn shard_spine_is_owner_only_and_width_steals() {
+        let ready = ReadyEdgeTable::new();
+        let r = RunnableSet::new(8, 4);
+        for t in 0..8 {
+            r.push(t, QueueKind::Indep);
+        }
+        r.shard_width(&[1, 4, 6]);
+        let SfPick::Execute { tx, .. } = r.pick(0, &ready).expect("spine hop") else {
+            panic!("expected execute");
+        };
+        assert_eq!(tx, 1, "worker 0 takes the chain head, not a width tx");
+        assert!(r.spine_cores() <= 1);
+        let mut width = Vec::new();
+        while let Some(p) = r.pick(1, &ready) {
+            match p {
+                SfPick::Execute { tx, .. } => {
+                    assert!(tx != 4 && tx != 6, "width core stole a parked hop {tx}");
+                    width.push(tx);
+                    r.mark_done(tx);
+                }
+                SfPick::Revalidate(tx) => r.mark_done(tx),
+            }
+        }
+        assert!(!width.is_empty(), "worker 1 must steal Admit-Unfenced work");
+        assert!(r.steal_n() > 0, "steal_hits must move the antichain");
+        assert_eq!(r.gated_pick(), 0);
+        // Unpublished successors stay off the slot until help/handoff.
+        assert!(r.spine_slot_empty() || r.spine_cores() <= 1);
     }
 
     #[test]

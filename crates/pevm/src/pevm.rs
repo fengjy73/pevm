@@ -609,22 +609,22 @@ impl Pevm {
             // Do not sample block_size as ready_width when A1=0 (that read as 176).
             // Reuse WAW: nearest pred on the learned chain, then pop that
             // head before the low-index antichain.
-            let crit_head = self
-                .inter_prior
-                .crit_chain()
-                .and_then(|(loc, writers)| {
-                    access_arms.note_prior_touchers(loc, &writers);
-                    if writers.len() < 32 || writers.len() * 4 > block_size {
-                        return None;
-                    }
-                    access_arms.install_crit_chain(loc, &writers);
-                    ready_edges.plant_nearest_preds(loc, &writers);
-                    // ChainSpineTip: light true-publish plane (not DashMap WaitOnce tips).
-                    sf_tips.bind_chain_spine(loc, &writers);
-                    writers.first().copied()
-                });
+            let crit_head = self.inter_prior.crit_chain().and_then(|(loc, writers)| {
+                access_arms.note_prior_touchers(loc, &writers);
+                if writers.len() < 32 || writers.len() * 4 > block_size {
+                    return None;
+                }
+                access_arms.install_crit_chain(loc, &writers);
+                ready_edges.plant_nearest_preds(loc, &writers);
+                // ChainSpineTip: light true-publish plane (not DashMap WaitOnce tips).
+                sf_tips.bind_chain_spine(loc, &writers);
+                writers.first().copied()
+            });
             self.last_begin_blocked = ready_edges.blocked_consumers();
             runnable.seed_begin(&ready_edges, &producer_stages, &scheduler, crit_head);
+            // Width on per-worker deques; the ordered head stays in the spine
+            // slot so the other cores steal the antichain instead of the hop.
+            runnable.shard_width(access_spine.ordered_members());
             // P3: do not sample (n_tx − blocked) as ready_width (reads as 172).
             if quiet && !learner.has_any_predicted() {
                 let n = sketch.revoke_prior_fences_if_quiet(true);
@@ -778,7 +778,14 @@ impl Pevm {
         });
 
         if self.concurrency_mode == ConcurrencyMode::SpecFence {
-            let (report, next) = access_spine.end_block();
+            let (mut report, next) = access_spine.end_block();
+            report.idle_ns = metrics_inner.idle_core_ns();
+            report.steal_hits = runnable.steal_n();
+            report.refuse_gated = runnable.refuse_gated();
+            report.gated_pick = runnable.gated_pick();
+            report.spine_cores = runnable.spine_cores();
+            report.help_release = runnable.help_release_n();
+            report.local_hits = runnable.local_hits();
             self.spine_prior = next;
             self.last_spine = report;
         }
