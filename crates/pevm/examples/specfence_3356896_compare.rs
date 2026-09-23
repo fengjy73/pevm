@@ -741,15 +741,18 @@ fn main() {
         );
     }
 
+    let (frame_suspends, frame_resumes, frame_requests, frame_unsafe_op, frame_pre_frame) =
+        pevm::specfence::frame_suspend_counts();
     println!(
-        "summary Soft=0 occ_median_ms={occ_med:.3} sf_cold_ms={} sf_reuse_median_ms={} primary_sf_ms={primary_sf:.3} primary={} sf_le_occ={sf_le_occ}",
+        "summary Soft=0 occ_median_ms={occ_med:.3} sf_cold_ms={} sf_reuse_median_ms={} primary_sf_ms={primary_sf:.3} primary={} sf_le_occ={sf_le_occ} frame_suspends={frame_suspends} frame_resumes={frame_resumes} frame_requests={frame_requests} frame_unsafe_op={frame_unsafe_op} frame_pre_frame={frame_pre_frame} unsafe_ops={:?}",
         sf_cold
             .map(|v| format!("{v:.3}"))
             .unwrap_or_else(|| "n/a".into()),
         sf_reuse_med
             .map(|v| format!("{v:.3}"))
             .unwrap_or_else(|| "n/a".into()),
-        if primary_is_reuse { "reuse" } else { "cold" }
+        if primary_is_reuse { "reuse" } else { "cold" },
+        pevm::specfence::frame_suspend_unsafe_ops(),
     );
 
     let summary = CompareSummary {

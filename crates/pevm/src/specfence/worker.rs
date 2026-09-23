@@ -17,7 +17,7 @@ use crate::scheduler::Scheduler;
 use crate::{Task, TxVersion};
 
 /// Drive one worker until the block is committed or aborted.
-pub(crate) fn run_sf_block<F, V>(
+pub(crate) fn run_sf_block<F, V, P>(
     scheduler: &Scheduler,
     mv_memory: &MvMemory,
     specfence: SpecFenceCtx<'_>,
@@ -25,11 +25,13 @@ pub(crate) fn run_sf_block<F, V>(
     arms: &ArmTable,
     worker_i: usize,
     abort: impl Fn() -> bool,
+    mut poll_resume: P,
     mut execute: F,
     mut validate_to_plan: V,
 ) where
     F: FnMut(TxVersion, VisibilityPolicy) -> SfExec,
     V: FnMut(&TxVersion, VisibilityPolicy) -> (super::ResolvePlan, Vec<crate::MemoryLocationHash>),
+    P: FnMut() -> Option<TxVersion>,
 {
     let metrics = specfence.metrics;
     let mut spins = 0u64;
@@ -172,17 +174,24 @@ pub(crate) fn run_sf_block<F, V>(
             break;
         }
         let t0 = Instant::now();
-        let task = schedule::pick(
-            scheduler,
-            specfence.wave,
-            specfence.ready_edges,
-            specfence.producer_stages,
-            runnable,
-            arms,
-            specfence.policy,
-            Some(metrics),
-            worker_i,
-        );
+        // Same-frame resume before antichain pick, including when pick is idle.
+        // The tx stays `Executing`; `schedule::pick` will not select it.
+        let resumed = poll_resume();
+        let task = if resumed.is_some() {
+            resumed.map(Task::Execution)
+        } else {
+            schedule::pick(
+                scheduler,
+                specfence.wave,
+                specfence.ready_edges,
+                specfence.producer_stages,
+                runnable,
+                arms,
+                specfence.policy,
+                Some(metrics),
+                worker_i,
+            )
+        };
         match task {
             Some(Task::Execution(tx_version)) => {
                 let tx_idx = tx_version.tx_idx;

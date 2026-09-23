@@ -91,6 +91,10 @@ pub(crate) struct Scheduler {
     /// Single-flight the O(n) Ready scan so 8 workers cannot mutex-walk
     /// a 37k ERC-20 block on every yield.
     ready_scan: AtomicBool,
+    /// Same-frame suspend: status stays `Executing` while the interpreter
+    /// lives on the owning worker. Heal must not `recover_executing_waiter`
+    /// this tx into a fresh k=0 execute on another worker.
+    frame_held: Vec<AtomicBool>,
 }
 
 // TODO: Better error handling.
@@ -123,7 +127,30 @@ impl Scheduler {
             aborted: AtomicBool::new(false),
             ready_hint: AtomicUsize::new(0),
             ready_scan: AtomicBool::new(false),
+            frame_held: (0..block_size).map(|_| AtomicBool::new(false)).collect(),
         }
+    }
+
+    /// Pin a transaction whose interpreter is parked on a worker.
+    pub(crate) fn pin_suspended_frame(&self, tx_idx: TxIdx) {
+        if let Some(slot) = self.frame_held.get(tx_idx) {
+            slot.store(true, Ordering::Release);
+        }
+    }
+
+    /// Drop the pin after the frame finishes or is discarded.
+    pub(crate) fn unpin_suspended_frame(&self, tx_idx: TxIdx) {
+        if let Some(slot) = self.frame_held.get(tx_idx) {
+            slot.store(false, Ordering::Release);
+        }
+    }
+
+    /// True while a suspended interpreter owns this transaction.
+    #[inline]
+    pub(crate) fn is_frame_held(&self, tx_idx: TxIdx) -> bool {
+        self.frame_held
+            .get(tx_idx)
+            .is_some_and(|slot| slot.load(Ordering::Acquire))
     }
 
     pub(crate) fn block_size(&self) -> usize {
@@ -1177,7 +1204,7 @@ impl Scheduler {
     /// returned `Blocked`. Same incarnation → Ready.
     #[inline]
     pub(crate) fn recover_executing_waiter(&self, tx_idx: TxIdx) -> bool {
-        if tx_idx >= self.block_size {
+        if tx_idx >= self.block_size || self.is_frame_held(tx_idx) {
             return false;
         }
         let mut tx = index_mutex!(self.transactions_status, tx_idx);
@@ -1496,5 +1523,17 @@ mod tests {
             !s.add_wait_for_dependency(1, 0),
             "writer already Done must not wait_for_dependency forever"
         );
+    }
+
+    #[test]
+    fn held_frame_is_not_recovered_into_ready() {
+        let s = Scheduler::new(2);
+        let _ = s.try_execute(1).unwrap();
+        s.pin_suspended_frame(1);
+        assert!(!s.recover_executing_waiter(1));
+        assert!(s.is_executing(1));
+        s.unpin_suspended_frame(1);
+        assert!(s.recover_executing_waiter(1));
+        assert!(s.is_ready(1));
     }
 }

@@ -4,7 +4,7 @@ use hashbrown::HashMap;
 use revm::{
     Database,
     context::{
-        BlockEnv, ContextSetters, ContextTr, DBErrorMarker, JournalTr, TxEnv,
+        BlockEnv, ContextSetters, ContextTr, DBErrorMarker, JournalTr, LocalContextTr, TxEnv,
         result::{EVMError, ExecutionResult, InvalidTransaction},
     },
     handler::EvmTr,
@@ -167,6 +167,8 @@ pub(crate) struct VmDb<'a, S: Storage> {
     read_set: ReadSet,
     // TODO: Clearer type for [AccountBasic] plus code hash
     read_accounts: HashMap<MemoryLocationHash, (AccountBasic, Option<B256>), BuildIdentityHasher>,
+    /// Set for the handler call that may suspend a rewind-safe `basic`.
+    allow_frame_suspend: Cell<bool>,
 }
 
 impl<'a, S: Storage> VmDb<'a, S> {
@@ -558,6 +560,12 @@ impl<'a, S: Storage> VmDb<'a, S> {
             0,
             crate::specfence::ParkKind::WaitForDependency,
         );
+        // The handler rewinds only BALANCE / EXTCODESIZE / EXTCODEHASH /
+        // SELFBALANCE after `run_plain` halts. CALL and pre-exec stay ordinary
+        // Blocking: those sites pop or have no frame yet.
+        if self.allow_frame_suspend.get() {
+            crate::specfence::frame_suspend::request(pred);
+        }
         Err(ReadError::Blocking(pred))
     }
 
@@ -2955,8 +2963,22 @@ pub(crate) struct Vm<'a, S: Storage, C: PevmChain> {
     mv_memory: &'a MvMemory,
     specfence: SpecFenceCtx<'a>,
     beneficiary_location_hash: MemoryLocationHash,
+    spec_id: C::EvmSpecId,
     // Dedicated EVM for the worker, reset before each transaction exectution.
     evm: C::Evm<VmDb<'a, S>>,
+    /// Built on the first held frame. Absent until then so a block that never
+    /// suspends does not pay a second `Evm` on the SpecFence wall.
+    spare: Option<C::Evm<VmDb<'a, S>>>,
+    /// Frame sitting in `spare` after a rewind-safe `basic` returned `Blocking`.
+    parked: Option<ParkedFrame>,
+}
+
+/// Gas and predecessor for [`PevmChain::resume_pevm_tx`]. Not a new `Handler::run`.
+struct ParkedFrame {
+    tx: TxVersion,
+    pred: TxIdx,
+    init: revm::interpreter::InitialAndFloorGas,
+    eip7702_refund: i64,
 }
 
 impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
@@ -3026,7 +3048,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
     ) -> Self {
         // The DB is initialised with mock values; each transaction execution
         // [VmDb::set_tx] the intended transaction before executing.
-        let db = VmDb {
+        let blank_db = || VmDb {
             storage,
             mv_memory,
             specfence,
@@ -3050,6 +3072,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             // read at least from the sender and recipient accounts.
             read_set: ReadSet::with_capacity_and_hasher(2, BuildIdentityHasher::default()),
             read_accounts: HashMap::with_capacity_and_hasher(2, BuildIdentityHasher::default()),
+            allow_frame_suspend: Cell::new(false),
         };
         Self {
             chain,
@@ -3061,8 +3084,52 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             beneficiary_location_hash: hash_deterministic(MemoryLocation::Basic(
                 block_env.beneficiary,
             )),
-            evm: chain.build_evm(spec_id, block_env.clone(), db),
+            spec_id,
+            evm: chain.build_evm(spec_id, block_env.clone(), blank_db()),
+            spare: None,
+            parked: None,
         }
+    }
+
+    fn blank_db(&mut self) -> VmDb<'a, S> {
+        let (storage, mv_memory, specfence) = {
+            let ctx = self.evm.ctx();
+            let proto = ctx.db();
+            (proto.storage, proto.mv_memory, proto.specfence)
+        };
+        VmDb {
+            storage,
+            mv_memory,
+            specfence,
+            tx_idx: 0,
+            tx_incarnation: 0,
+            tx: self.chain.tx_env(unsafe { self.txs.get_unchecked(0) }),
+            from_hash: 0,
+            to_hash: None,
+            to_code_hash: None,
+            is_lazy: false,
+            optimistic_majority_lazy: false,
+            optimistic_skip_gate: false,
+            sf_occ_shaped: false,
+            vis: VisibilityPolicy::Opt,
+            pcc_armed: Cell::new(false),
+            optimistic_read_this_tx: Cell::new(0),
+            pcc_this_tx: Cell::new(0),
+            has_nonce: true,
+            read_set: ReadSet::with_capacity_and_hasher(2, BuildIdentityHasher::default()),
+            read_accounts: HashMap::with_capacity_and_hasher(2, BuildIdentityHasher::default()),
+            allow_frame_suspend: Cell::new(false),
+        }
+    }
+
+    fn ensure_spare(&mut self) {
+        if self.spare.is_some() {
+            return;
+        }
+        let db = self.blank_db();
+        let spec_id = self.spec_id;
+        let block_env = self.block_env.clone();
+        self.spare = Some(self.chain.build_evm(spec_id, block_env, db));
     }
 
     /// Hinted Wait admission: previous `from`/`to` writer that is not done yet.
@@ -3259,6 +3326,137 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         }
     }
 
+    /// True when this worker has no interpreter parked across `Blocking`.
+    #[inline]
+    pub(crate) fn suspend_slot_free(&self) -> bool {
+        self.parked.is_none()
+    }
+
+    /// The parked frame is this transaction. Resume continues it in place.
+    #[inline]
+    pub(crate) fn has_parked_frame(&self, tx: &TxVersion) -> bool {
+        self.parked.as_ref().is_some_and(|p| &p.tx == tx)
+    }
+
+    /// Owner poll: predecessor `is_validated` and this tx is still `Executing`.
+    /// A lost `Executing` status drops the spare frame so heal can proceed.
+    pub(crate) fn poll_frame_resume(&mut self) -> Option<TxVersion> {
+        let (tx, pred) = {
+            let parked = self.parked.as_ref()?;
+            (parked.tx.clone(), parked.pred)
+        };
+        if !self.specfence.scheduler.is_executing(tx.tx_idx) {
+            self.discard_parked_frame();
+            return None;
+        }
+        self.specfence.scheduler.is_validated(pred).then_some(tx)
+    }
+
+    fn discard_parked_frame(&mut self) {
+        let Some(parked) = self.parked.take() else {
+            return;
+        };
+        self.specfence
+            .scheduler
+            .unpin_suspended_frame(parked.tx.tx_idx);
+        let Some(spare) = self.spare.as_mut() else {
+            return;
+        };
+        {
+            let ctx = spare.ctx();
+            let _ = revm::context_interface::context::take_error::<
+                EVMError<ReadError, InvalidTransaction>,
+                ReadError,
+            >(ctx.error());
+            ctx.local_mut().clear();
+            ctx.journal_mut().discard_tx();
+        }
+        spare.frame_stack().clear();
+    }
+
+    fn swap_spare(&mut self) {
+        if let Some(spare) = self.spare.as_mut() {
+            std::mem::swap(&mut self.evm, spare);
+        }
+    }
+
+    /// Put the suspended `Evm` in `spare` and bring the empty one forward.
+    fn park_if_suspended(&mut self, tx: &TxVersion, did_resume: bool) {
+        let Some(outcome) = crate::specfence::frame_suspend::take_outcome() else {
+            if did_resume {
+                self.specfence.scheduler.unpin_suspended_frame(tx.tx_idx);
+            }
+            return;
+        };
+        self.ensure_spare();
+        self.swap_spare();
+        self.parked = Some(ParkedFrame {
+            tx: tx.clone(),
+            pred: outcome.pred,
+            init: outcome.init,
+            eip7702_refund: outcome.eip7702_refund,
+        });
+        self.specfence.scheduler.pin_suspended_frame(tx.tx_idx);
+    }
+
+    fn take_matching_resume(
+        &mut self,
+        tx: &TxVersion,
+    ) -> Option<(revm::interpreter::InitialAndFloorGas, i64)> {
+        let matches = self.parked.as_ref().is_some_and(|p| &p.tx == tx);
+        if !matches {
+            return None;
+        }
+        let parked = self.parked.take().expect("parked");
+        self.swap_spare();
+        Some((parked.init, parked.eip7702_refund))
+    }
+
+    /// Known protected toucher whose predecessor is not `is_validated` yet.
+    fn frame_suspend_candidate(&self, tx: TxIdx) -> bool {
+        if self.parked.is_some() {
+            return false;
+        }
+        if self.specfence.mode != crate::ConcurrencyMode::SpecFence {
+            return false;
+        }
+        let Some(loc) = self.specfence.access_arms.known_toucher_loc(tx) else {
+            return false;
+        };
+        if !self.specfence.access_arms.is_protected(loc) {
+            return false;
+        }
+        if unfinished_writer_of(self.mv_memory, &self.specfence, loc, tx).is_some() {
+            return true;
+        }
+        self.specfence
+            .access_arms
+            .known_writer_indexes(loc)
+            .and_then(|ws| ws.iter().rev().find(|&&w| w < tx).copied())
+            .is_some_and(|w| !self.specfence.scheduler.is_validated(w))
+    }
+
+    fn dispatch_pevm(
+        &mut self,
+        use_inspect: bool,
+        resume: Option<(revm::interpreter::InitialAndFloorGas, i64)>,
+        tx_idx: TxIdx,
+    ) -> Result<ExecutionResult<C::EvmHaltReason>, EVMError<ReadError, InvalidTransaction>> {
+        // Resume continues with `run_plain`. The blocking opcode is re-executed
+        // once; the suffix is not single-stepped.
+        let arm = resume.is_none() && !use_inspect && self.frame_suspend_candidate(tx_idx);
+        let _ = crate::specfence::frame_suspend::clear_request();
+        self.evm.ctx().db().allow_frame_suspend.set(arm);
+        let result = if let Some((init, refund)) = resume {
+            self.chain.resume_pevm_tx(&mut self.evm, init, refund)
+        } else {
+            self.chain.run_pevm_tx(&mut self.evm, use_inspect)
+        };
+        crate::specfence::frame_suspend::clear_request();
+        self.evm.ctx().db().allow_frame_suspend.set(false);
+        result
+    }
+
     // Execute a transaction. This can read from memory but cannot modify any state.
     // A successful execution returns:
     //   - A write-set consisting of memory locations and their updated values.
@@ -3280,6 +3478,10 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         tx_version: &TxVersion,
         result_slot: &mut Option<PevmTxExecutionResult>,
     ) -> Result<FinishExecFlags, VmExecutionError> {
+        // Same frame: the spare `Evm` already holds PC/stack/memory/journal.
+        // `set_tx` would clear the read set and restart access ordinals.
+        let resume_gas = self.take_matching_resume(tx_version);
+        let did_resume = resume_gas.is_some();
         // SAFETY: A correct scheduler would guarantee this index to be inbound.
         let full_tx = unsafe { self.txs.get_unchecked(tx_version.tx_idx) };
         let tx = self.chain.tx_env(full_tx);
@@ -3290,40 +3492,43 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             .to()
             .map(|to| hash_deterministic(MemoryLocation::Basic(*to)));
 
-        let has_nonce = self.chain.has_nonce(&mut self.evm, full_tx);
+        if !did_resume {
+            let has_nonce = self.chain.has_nonce(&mut self.evm, full_tx);
 
-        // Prepare state for execution
-        {
-            let ctx = self.evm.ctx();
+            // Prepare state for execution
+            {
+                let ctx = self.evm.ctx();
 
-            ctx.db_mut()
-                .set_tx(
-                    tx_version.tx_idx,
-                    tx,
-                    from_hash,
-                    to_hash,
-                    has_nonce,
-                    tx_version.tx_incarnation,
-                )
-                .map_err(VmExecutionError::from)?;
+                ctx.db_mut()
+                    .set_tx(
+                        tx_version.tx_idx,
+                        tx,
+                        from_hash,
+                        to_hash,
+                        has_nonce,
+                        tx_version.tx_incarnation,
+                    )
+                    .map_err(VmExecutionError::from)?;
 
-            ctx.set_tx(full_tx.clone());
+                ctx.set_tx(full_tx.clone());
 
-            // We reset the journal when we finalise it into the result state on a
-            // successful execution but not on errors. Always reset here to be sure.
-            ctx.journal_mut().clear();
+                // We reset the journal when we finalise it into the result state on a
+                // successful execution but not on errors. Always reset here to be sure.
+                ctx.journal_mut().clear();
+            }
         }
 
         let sf_occ_shaped = self.evm.ctx().db().sf_occ_shaped;
         // Museum / tip only when this tx is a WaitOnce consumer or producer.
-        if !sf_occ_shaped {
+        // Resume already installed these on the first entry.
+        if !did_resume && !sf_occ_shaped {
             self.note_execute_edge(tx_version.tx_idx);
         }
 
         // SpecFence write path: early version tip + live_writer.
         // Thin: DashMap WaitOnce/crit (skip when OCC-shaped non-producer).
         // Large: ChainSpineTip only (sticky≥32).
-        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+        if !did_resume && self.specfence.mode == crate::ConcurrencyMode::SpecFence {
             let thin = self.specfence.scheduler.block_size() <= crate::specfence::THIN_SHELL_N;
             let crit = self.specfence.access_arms.crit_loc_hash();
             let install_tip = thin
@@ -3391,7 +3596,12 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             && !self.specfence.ready_edges.is_gated(tx_version.tx_idx);
         // OCC-shaped thin: force lean without engagement atomics.
         let lean = self.specfence.mode == crate::ConcurrencyMode::SpecFence
-            && (sf_occ_shaped || self.specfence.engagement.begin_tx(tx_version.tx_idx));
+            && (sf_occ_shaped
+                || if did_resume {
+                    self.specfence.engagement.tx_was_lean(tx_version.tx_idx)
+                } else {
+                    self.specfence.engagement.begin_tx(tx_version.tx_idx)
+                });
         let repair_armed = self.specfence.mode == crate::ConcurrencyMode::SpecFence
             && !optimistic_ungated_exec
             && (self
@@ -3399,7 +3609,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 .partial_retry
                 .is_rewind_resume(tx_version.tx_idx)
                 || self.specfence.partial_retry.has_ff_head(tx_version.tx_idx));
-        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+        if !did_resume && self.specfence.mode == crate::ConcurrencyMode::SpecFence {
             if repair_armed {
                 self.specfence.metrics.record_pcc_kernel_exec();
             } else {
@@ -3411,10 +3621,11 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 .specfence
                 .partial_retry
                 .is_rewind_resume(tx_version.tx_idx);
-        if rewind_resume {
+        // Resume already recorded entry on the first Handler::run.
+        if !did_resume && rewind_resume {
             // M1b/M1d: journal FF in set_tx; optional live PC arm inside inspect_run.
             self.specfence.metrics.record_resume();
-        } else if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+        } else if !did_resume && self.specfence.mode == crate::ConcurrencyMode::SpecFence {
             self.specfence.metrics.record_evm_entry();
             if repair_armed {
                 let _ = self
@@ -3542,7 +3753,8 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             && ordered_admit_memory_ok
             && ordered_admit_tip_ok;
         // Dig arm only when JUMP env set; production keeps aj=0 / SoftWait Soft=0.
-        let mut suffix_jump = suffix_jump_would;
+        // A resumed frame must not rewrite the live read set with a jump seed.
+        let mut suffix_jump = suffix_jump_would && !did_resume;
         let _ = suffix_jump_eligible;
         // Iter22: OrderedAdmit abs jump only behind fully Validated prefix (all tx < me).
         // Hang-free yield spin; refuse jump if prefix not ready — eliminates MV races
@@ -3799,7 +4011,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                             }
                         }
                     }
-                    let result = self.chain.run_pevm_tx(&mut self.evm, use_inspect);
+                    let result = self.dispatch_pevm(use_inspect, resume_gas, tx_idx);
                     if plant_jump {
                         partial_retry.note_jump_applied(tx_idx, resume_was_applied());
                     }
@@ -3952,9 +4164,10 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         }
                     }
                 }
-                let result = self.chain.run_pevm_tx(
-                    &mut self.evm,
+                let result = self.dispatch_pevm(
                     use_inspect && self.specfence.mode == crate::ConcurrencyMode::SpecFence,
+                    resume_gas,
+                    tx_idx,
                 );
                 if did_jump {
                     let applied = resume_was_applied();
@@ -3998,6 +4211,8 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     .take_needs_live_capture(tx_version.tx_idx);
             }
         }
+
+        self.park_if_suspended(tx_version, did_resume);
 
         match run_result {
             Ok(exec_result) => {

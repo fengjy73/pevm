@@ -188,6 +188,7 @@ mod executor;
 pub(crate) mod feeder;
 #[allow(missing_docs)]
 mod finegrain;
+pub(crate) mod frame_suspend;
 mod heat;
 mod hotset;
 #[cfg(test)]
@@ -270,6 +271,7 @@ pub use finegrain::{
     effect_raw_max_fanout, estimate_ma_md, filter_effect_edges, hot_locations, kind_histogram,
     l1_dag_summary, percentile_f64, producer_status_canonical, program_raw_longest_chain,
 };
+pub use frame_suspend::{frame_suspend_counts, frame_suspend_unsafe_ops};
 pub(crate) use heat::HeatMap;
 pub(crate) use hotset::HotSet;
 #[allow(unused_imports)]

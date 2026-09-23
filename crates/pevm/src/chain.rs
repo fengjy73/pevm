@@ -12,9 +12,9 @@ use revm::context_interface::LocalContextTr;
 use revm::handler::instructions::InstructionProvider;
 use revm::handler::{EvmTr, FrameResult, FrameTr, PrecompileProvider};
 use revm::inspector::JournalExt;
-use revm::interpreter::InterpreterResult;
 use revm::interpreter::interpreter::EthInterpreter;
 use revm::interpreter::interpreter_action::FrameInit;
+use revm::interpreter::{InitialAndFloorGas, InterpreterResult};
 use revm::primitives::hardfork::SpecId;
 use revm::state::EvmState;
 use revm::{
@@ -173,6 +173,21 @@ pub trait PevmChain: Debug {
         evm: &mut Self::Evm<DB>,
         use_inspect: bool,
     ) -> Result<ExecutionResult<Self::EvmHaltReason>, EVMError<DB::Error, InvalidTransaction>>;
+
+    /// Continue a frame that already passed `validate` / `pre_execution`.
+    ///
+    /// Ethereum parks that frame on a spare `Evm` when a rewind-safe `basic`
+    /// returns `Blocking`. Resume does not call [`Self::run_pevm_tx`].
+    /// Chains that never arm the suspend (Rise) fall back to a fresh run.
+    fn resume_pevm_tx<DB: Database>(
+        &self,
+        evm: &mut Self::Evm<DB>,
+        init: InitialAndFloorGas,
+        eip7702_refund: i64,
+    ) -> Result<ExecutionResult<Self::EvmHaltReason>, EVMError<DB::Error, InvalidTransaction>> {
+        let _ = (init, eip7702_refund);
+        self.run_pevm_tx(evm, false)
+    }
 
     /// Check whether EIP-1559 is enabled
     /// <https://github.com/ethereum/EIPs/blob/96523ef4d76ca440f73f0403ddb5c9cb3b24dcae/EIPS/eip-1559.md>

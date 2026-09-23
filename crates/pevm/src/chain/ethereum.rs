@@ -263,6 +263,15 @@ impl PevmChain for PevmEthereum {
         crate::tx_runner::run_ethereum_tx(evm, use_inspect)
     }
 
+    fn resume_pevm_tx<DB: Database>(
+        &self,
+        evm: &mut Self::Evm<DB>,
+        init: revm::interpreter::InitialAndFloorGas,
+        eip7702_refund: i64,
+    ) -> Result<ExecutionResult<Self::EvmHaltReason>, EVMError<DB::Error, InvalidTransaction>> {
+        crate::tx_runner::resume_ethereum_tx(evm, init, eip7702_refund)
+    }
+
     fn is_eip_1559_enabled(&self, spec_id: SpecId) -> bool {
         spec_id >= SpecId::LONDON
     }
