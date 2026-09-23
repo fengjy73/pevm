@@ -15,4 +15,13 @@
 1. **已完成 — 读 SoT 与现状。** 冲突主路径在 `VmDb`：薄块 Opt 放行 Estimate，大块 `ReadError::Blocking` → `catch_error` 拆栈。
 2. **已完成 — AccessSpine。** 访问点发 AccessEvent；RAW 在宿主调用内 WaitTrueVersion（不拆栈）；WAW/WAR 在写生效时记 OrderedTip / RetainHistory；Prior 只做雷达。单测 9 过。
 3. **已完成 — Handler。** `YieldWait` 先 resume 保住 frame；二次才 `catch_error`。绝对 2s 超时是死锁阀，不是主路径。
-4. **进行中 — 编译对比样例并跑 Soft=0 焦点块 TPS。** 样例打印 `TPS_SUMMARY`（SF_TPS、OCC_TPS、ratio、est_block、occ_picks、raw/waw/war）。
+4. **已完成 — Soft=0 焦点 TPS（release，LTO off，N=5，请求 8 核，宿主 4 核）。** 主指标是 reuse median。未达 1.5，不宣称胜利。
+
+   | 块 | SF_TPS | OCC_TPS | ratio | ≥1.5 | est | soft | occ_picks | seq≡par |
+   | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+   | 3356896 | 116903.6 | 174278.6 | 0.671 | 否 | 0 | 0 | 0 | 是 |
+   | 15274915 | 151063.5 | 210072.6 | 0.719 | 否 | 0 | 0 | 0 | 是 |
+
+   辅证墙时：3356896 OCC 1.010 ms / SF reuse 1.506 ms；15274915 OCC 5.836 ms / SF reuse 8.116 ms。
+
+5. **缺口（下一刀）。** 长链，不是第四原语。RAW 的 in-frame 等待只吃到少量读（薄块 reuse `yield_ok` 0–1；大块约 7）。WAW/WAR 记上了，但 OrderedTip 没有缩短 17/77 写者链，RetainHistory pin 还没接到丢历史的路径。反链仍走现有 SF 调度税，OCC 用更少的反链税盖过少量 abort。下一步：武装 ℓ 的剩余触及者在帧内等真 tip（把 `full_from_0` 压到 0），非触及者走 OCC 便宜路径填核。
