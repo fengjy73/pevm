@@ -622,15 +622,9 @@ impl Pevm {
                     // ChainSpineTip: light true-publish plane (not DashMap WaitOnce tips).
                     sf_tips.bind_chain_spine(loc, &writers);
                     writers.first().copied()
-                })
-                .or_else(|| access_spine.ordered_head());
+                });
             self.last_begin_blocked = ready_edges.blocked_consumers();
             runnable.seed_begin(&ready_edges, &producer_stages, &scheduler, crit_head);
-            // Chain successors and remaining touchers stay off-core until the
-            // spine hands them the true tip. Non-touchers stay in the deque.
-            for tx in access_spine.txs_to_park() {
-                runnable.mark_wait(tx);
-            }
             // P3: do not sample (n_tx − blocked) as ready_width (reads as 172).
             if quiet && !learner.has_any_predicted() {
                 let n = sketch.revoke_prior_fences_if_quiet(true);

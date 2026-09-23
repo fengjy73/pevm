@@ -7,7 +7,6 @@
 //! Ideal lower bound, when a caller has both inputs, is
 //! `max(L_crit, sum_work / cores)` — never `n / cores`.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use dashmap::{DashMap, DashSet};
@@ -199,44 +198,6 @@ fn push_unique<T: PartialEq + Copy>(v: &mut Vec<T>, x: T) {
     }
 }
 
-/// Readers grouped by their nearest lower chain writer.
-fn readers_of_writers(writers: &[TxIdx], readers: &[TxIdx]) -> Vec<Vec<TxIdx>> {
-    let mut by = vec![Vec::new(); writers.len()];
-    for &r in readers {
-        if writers.binary_search(&r).is_ok() {
-            continue;
-        }
-        let Some(pos) = writers.iter().rposition(|&w| w < r) else {
-            continue;
-        };
-        if by[pos].len() < 32 {
-            by[pos].push(r);
-        }
-    }
-    by
-}
-
-fn readers_of_loc(
-    intra: &DashMap<MemoryLocationHash, IntraRecord>,
-    loc: MemoryLocationHash,
-    writers: &[TxIdx],
-) -> Vec<TxIdx> {
-    let Some(rec) = intra.get(&loc) else {
-        return Vec::new();
-    };
-    let mut readers: Vec<TxIdx> = rec
-        .readers
-        .iter()
-        .copied()
-        .filter(|r| writers.binary_search(r).is_err())
-        .collect();
-    drop(rec);
-    readers.sort_unstable();
-    readers.dedup();
-    readers.truncate(64);
-    readers
-}
-
 /// Cross-block radar. `action` is fixed to preheat-only.
 #[derive(Debug, Clone)]
 pub(crate) struct SpinePrior {
@@ -257,9 +218,6 @@ pub(crate) struct SpinePrior {
     pub chains: Vec<TxIdx>,
     /// Location of [`Self::chains`]. `u64::MAX` when there is no chain.
     pub chain_loc: MemoryLocationHash,
-    /// Readers of `chain_loc` who are not writers. Remaining touchers.
-    /// Capped. Not an Avoid arm.
-    pub chain_readers: Vec<TxIdx>,
     ph_sum: f32,
     ph_min: f32,
     ph_n: u32,
@@ -291,7 +249,6 @@ impl Default for SpinePrior {
             prev_war: 0,
             chains: Vec::new(),
             chain_loc: u64::MAX,
-            chain_readers: Vec::new(),
         }
     }
 }
@@ -365,20 +322,12 @@ pub(crate) struct AccessSpine {
     /// Previous block's longest chain. Not armed until a real write.
     ordered_loc: MemoryLocationHash,
     ordered_writers: Vec<TxIdx>,
-    /// Sorted readers carried with the chain. Binary-searched on the hot path.
-    chain_readers: Vec<TxIdx>,
-    /// `readers_by[i]` are touchers whose nearest lower chain writer is
-    /// `ordered_writers[i]`. Woken when that writer starts, not with the tail.
-    readers_by: Vec<Vec<TxIdx>>,
     /// (reader, origin writer) bound by a real read. RetainHistory snapshots
     /// that origin when it would be replaced by Estimate.
     bounds: DashMap<MemoryLocationHash, Vec<(TxIdx, TxIdx)>>,
     published: DashSet<TxIdx>,
     started: DashSet<TxIdx>,
     handoff: AtomicUsize,
-    /// Readers to `wake_idle` on the next pick. Pushed before the writer
-    /// handoff so the chain worker's LIFO pop is still the next writer.
-    reader_wakes: Mutex<Vec<TxIdx>>,
     ordered_defer: AtomicUsize,
     ordered_handoff: AtomicUsize,
     retain_keeps: AtomicUsize,
@@ -390,10 +339,6 @@ impl AccessSpine {
     pub(crate) fn begin(prior: SpinePrior, workers: usize) -> Self {
         let ordered_loc = prior.chain_loc;
         let ordered_writers = prior.chains.clone();
-        let mut chain_readers = prior.chain_readers.clone();
-        chain_readers.sort_unstable();
-        chain_readers.dedup();
-        let readers_by = readers_of_writers(&ordered_writers, &chain_readers);
         Self {
             intra: DashMap::new(),
             prior,
@@ -411,13 +356,10 @@ impl AccessSpine {
             escape_gen: AtomicU64::new(0),
             ordered_loc,
             ordered_writers,
-            chain_readers,
-            readers_by,
             bounds: DashMap::new(),
             published: DashSet::new(),
             started: DashSet::new(),
             handoff: AtomicUsize::new(usize::MAX),
-            reader_wakes: Mutex::new(Vec::new()),
             ordered_defer: AtomicUsize::new(0),
             ordered_handoff: AtomicUsize::new(0),
             retain_keeps: AtomicUsize::new(0),
@@ -432,54 +374,6 @@ impl AccessSpine {
 
     pub(crate) fn ordered_len(&self) -> usize {
         self.ordered_writers.len()
-    }
-
-    /// Chain head, so seed can LIFO-pop it before the antichain.
-    pub(crate) fn ordered_head(&self) -> Option<TxIdx> {
-        self.ordered_writers.first().copied()
-    }
-
-    /// Non-touchers. Skip the in-frame wait walk and fill a core.
-    pub(crate) fn cheap_fill(&self, tx: TxIdx) -> bool {
-        if self.ordered_writers.is_empty() {
-            return false;
-        }
-        if self.is_ordered_member(tx) {
-            return false;
-        }
-        self.chain_readers.binary_search(&tx).is_err()
-    }
-
-    /// Writer successors and carried readers. Off the queue until this spine
-    /// wakes them: successors on publish, readers when their writer starts.
-    pub(crate) fn txs_to_park(&self) -> Vec<TxIdx> {
-        let mut v: Vec<TxIdx> = self.ordered_writers.iter().skip(1).copied().collect();
-        for readers in &self.readers_by {
-            v.extend(readers.iter().copied());
-        }
-        v
-    }
-
-    fn wake_cap(&self) -> usize {
-        self.workers.saturating_sub(1).max(1)
-    }
-
-    fn push_wakes(&self, txs: &[TxIdx]) {
-        if txs.is_empty() {
-            return;
-        }
-        let Ok(mut q) = self.reader_wakes.lock() else {
-            return;
-        };
-        q.extend_from_slice(txs);
-    }
-
-    /// Readers an in-flight writer just armed. Empty if this worker lost the race.
-    pub(crate) fn take_reader_wakes(&self) -> Vec<TxIdx> {
-        let Ok(mut q) = self.reader_wakes.lock() else {
-            return Vec::new();
-        };
-        std::mem::take(&mut *q)
     }
 
     /// A chain successor may enter once its predecessor has started or finished.
@@ -508,19 +402,12 @@ impl AccessSpine {
         self.ordered_defer.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Chain tx entered the interpreter. Wake only the readers whose nearest
-    /// lower writer is this tx, so they WaitTrueVersion during this publish
-    /// and not for the whole tail. The next writer stays parked until publish.
+    /// Chain tx entered the interpreter. The successor is woken on publish,
+    /// not here, so only one chain writer occupies a core.
     pub(crate) fn note_chain_start(&self, tx: TxIdx) {
-        let Ok(i) = self.ordered_writers.binary_search(&tx) else {
-            return;
-        };
-        if !self.started.insert(tx) {
-            return;
+        if self.ordered_writers.binary_search(&tx).is_ok() {
+            self.started.insert(tx);
         }
-        let readers = &self.readers_by[i];
-        let n = self.wake_cap().min(readers.len());
-        self.push_wakes(&readers[..n]);
     }
 
     /// Successor to run next, if a chain start queued one.
@@ -576,11 +463,6 @@ impl AccessSpine {
             return;
         };
         self.published.insert(tx);
-        // Readers past the in-frame cap run now. The tip is published, so
-        // they take the cheap consume instead of pinning a core.
-        let readers = &self.readers_by[i];
-        let n = self.wake_cap().min(readers.len());
-        self.push_wakes(&readers[n..]);
         let Some(&next) = self.ordered_writers.get(i + 1) else {
             return;
         };
@@ -859,13 +741,11 @@ impl AccessSpine {
             next.loc_radar = self.hot_locs();
         }
         if let Some((loc, writers)) = self.longest_writer_chain() {
-            next.chain_readers = readers_of_loc(&self.intra, loc, &writers);
             next.chain_loc = loc;
             next.chains = writers;
         } else if next.revoked {
             next.chains.clear();
             next.chain_loc = u64::MAX;
-            next.chain_readers.clear();
         }
         next.prev_raw = raw;
         next.prev_waw = waw;
@@ -1229,33 +1109,21 @@ mod tests {
         let mut prior = SpinePrior::default();
         prior.chain_loc = 7;
         prior.chains = vec![1, 4, 9];
-        prior.chain_readers = vec![2, 6, 12];
         let spine = AccessSpine::begin(prior, 4);
         assert_eq!(
             spine.armed_n.load(Ordering::Relaxed),
             0,
             "chain is not an Avoid arm"
         );
-        assert!(spine.cheap_fill(3), "non-toucher fills a core");
-        assert!(
-            !spine.cheap_fill(2),
-            "carried reader stays on the wait path"
-        );
-        let parked = spine.txs_to_park();
-        assert!(parked.contains(&4) && parked.contains(&9));
-        assert!(parked.contains(&2) && parked.contains(&6) && parked.contains(&12));
-        assert!(!parked.contains(&1));
         assert!(spine.successor_blocked(4, |_| false));
         assert!(!spine.successor_blocked(1, |_| false));
         spine.note_chain_start(1);
-        assert_eq!(spine.take_reader_wakes(), vec![2]);
         assert!(spine.successor_blocked(4, |_| false));
         assert_eq!(spine.take_handoff(), None);
         assert_eq!(spine.ordered_blocker(7, 4, |_| true), Some(1));
         spine.on_write_effects(1, &[7]);
         assert!(!spine.successor_blocked(4, |_| false));
         assert_eq!(spine.take_handoff(), Some(4));
-        assert!(spine.take_reader_wakes().is_empty());
         assert_eq!(spine.ordered_blocker(7, 4, |_| true), None);
     }
 

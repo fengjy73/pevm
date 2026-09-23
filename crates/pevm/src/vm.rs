@@ -538,9 +538,6 @@ impl<'a, S: Storage> VmDb<'a, S> {
             depth: crate::tx_runner::frame_depth(),
             mode: crate::specfence::HostAccessMode::Read,
         };
-        if self.specfence.spine.cheap_fill(self.tx_idx) {
-            return Ok(());
-        }
         self.specfence.spine.on_access(ev);
         let Some(writer) = self.peek_unpublished_writer(location_hash) else {
             return Ok(());
