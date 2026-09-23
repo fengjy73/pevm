@@ -184,6 +184,29 @@ struct IterRow {
     storage_inc_gt0: Vec<usize>,
     off_edge_inc_gt0: Vec<usize>,
     edge_4_31: bool,
+    ordered_defer: usize,
+    ordered_handoff: usize,
+    retain_keeps: usize,
+    tip_already: usize,
+    chain_len: usize,
+    estimate_block_sf: usize,
+    spine_access: usize,
+    spine_yield_ok: usize,
+    spine_yield_deadlock: usize,
+    spine_raw: usize,
+    spine_waw: usize,
+    spine_war: usize,
+    spine_armed: usize,
+    spine_pins: usize,
+    spine_revoked: usize,
+    spine_radar: usize,
+    head_ms: f64,
+    tail_ms: f64,
+    refuse_gated: usize,
+    gated_pick: usize,
+    spine_cores: usize,
+    help_release: usize,
+    local_hits: usize,
 }
 
 #[derive(Serialize)]
@@ -196,6 +219,37 @@ struct CompareSummary {
     primary_is_reuse: bool,
     sf_le_occ: bool,
     soft: u8,
+    n_tx: usize,
+    cores: usize,
+    occ_tps: f64,
+    sf_tps: f64,
+    ratio: f64,
+    ratio_ge_1_5: bool,
+    estimate_block_sf: usize,
+    occ_schedule_picks: usize,
+    soft_wait_arms: usize,
+    spine_access: usize,
+    spine_yield_ok: usize,
+    spine_yield_deadlock: usize,
+    spine_raw: usize,
+    spine_waw: usize,
+    spine_war: usize,
+    spine_armed: usize,
+    spine_pins: usize,
+    spine_revoked: usize,
+    spine_radar: usize,
+    ordered_defer: usize,
+    ordered_handoff: usize,
+    retain_keeps: usize,
+    tip_already: usize,
+    chain_len: usize,
+    tax_ms: f64,
+    chain_span_ms: f64,
+    idle_ns: u64,
+    steal_hits: usize,
+    refuse_gated: usize,
+    gated_pick: usize,
+    spine_cores: usize,
 }
 
 fn inc_gt0_in(incs: &[usize], set: &[usize]) -> Vec<usize> {
@@ -265,7 +319,13 @@ fn hist_compact(hist: &[usize; 32]) -> String {
 }
 
 /// Longest writer list is the shared-location chain. Head is its smallest index.
-fn print_focus(pevm: &Pevm, mode_name: &str, i: usize, n: usize, m: &pevm::SpecFenceMetrics) {
+fn print_focus(
+    pevm: &Pevm,
+    mode_name: &str,
+    i: usize,
+    n: usize,
+    m: &pevm::SpecFenceMetrics,
+) -> (f64, f64) {
     let starts = pevm.last_tx_first_start();
     let mut xs = Vec::new();
     let mut ys = Vec::new();
@@ -308,6 +368,8 @@ fn print_focus(pevm: &Pevm, mode_name: &str, i: usize, n: usize, m: &pevm::SpecF
             .map(|ns| ns as f64 / 1e6)
             .unwrap_or(0.0)
     };
+    let head_ms = start_ms(head);
+    let tail_ms = start_ms(tail);
     println!(
         "  focus {mode_name}[{i}] full={} full_from_0={} prefix={} fail_k_n={} fail_k_min={} fail_k_max={} hist={} chain={loc:016x} chain_n={} head_tx={} head_ms={:.3} tail_tx={} tail_ms={:.3} corr={corr:.3} low_q_ms={:.3} high_q_ms={:.3} explore={} began_prior={} detect_a={} avoid_b={} resolve_c={} early_tip={} est_block={} raw_ab={} raw_c={} war_ab={} war_c={} waw_ab={} waw_c={} chain_ab={} chain_c={} protect={} pbo={} replay_after={}",
         m.resolve_full_replay,
@@ -319,9 +381,9 @@ fn print_focus(pevm: &Pevm, mode_name: &str, i: usize, n: usize, m: &pevm::SpecF
         hist_compact(&m.fail_k_hist),
         chain.len(),
         head.unwrap_or(0),
-        start_ms(head),
+        head_ms,
         tail.unwrap_or(0),
-        start_ms(tail),
+        tail_ms,
         median_ms(&mut low),
         median_ms(&mut high),
         m.explore_n,
@@ -343,6 +405,7 @@ fn print_focus(pevm: &Pevm, mode_name: &str, i: usize, n: usize, m: &pevm::SpecF
         m.sf_protect_before_opt_n,
         m.sf_replay_after_protect_n,
     );
+    (head_ms, tail_ms)
 }
 
 fn run_once(
@@ -471,9 +534,41 @@ fn run_once(
                 m.journal_ff_hits,
                 m.resolve_partial_rewind
             );
-            if mode_name == "specfence" {
-                print_focus(pevm, mode_name, i, n, &m);
-            }
+            let spine = pevm.last_spine();
+            let (head_ms, tail_ms) = if mode_name == "specfence" {
+                let span = print_focus(pevm, mode_name, i, n, &m);
+                println!(
+                    "  spine {mode_name}[{i}] access={} yield_ok={} yield_deadlock={} raw={} waw={} war={} armed={} pins={} revoked={} radar={} defer={} handoff={} retain={} tip_already={} chain={} est_block={} soft={} occ_picks={} idle_ns={} steal={} refuse_gated={} gated_pick={} spine_cores={} help={} local_hits={}",
+                    spine.access_events,
+                    spine.yield_waits_ok,
+                    spine.yield_deadlocks,
+                    spine.raw_n,
+                    spine.waw_n,
+                    spine.war_n,
+                    spine.armed_locs,
+                    spine.retained_pins,
+                    spine.prior_revoked,
+                    spine.prior_radar_only,
+                    spine.ordered_defer,
+                    spine.ordered_handoff,
+                    spine.retain_keeps,
+                    spine.tip_already,
+                    spine.chain_len,
+                    m.estimate_block_sf,
+                    m.soft_wait_arms,
+                    m.occ_schedule_picks,
+                    spine.idle_ns,
+                    spine.steal_hits,
+                    spine.refuse_gated,
+                    spine.gated_pick,
+                    spine.spine_cores,
+                    spine.help_release,
+                    spine.local_hits,
+                );
+                span
+            } else {
+                (0.0, 0.0)
+            };
             IterRow {
                 mode: mode_name.to_string(),
                 i,
@@ -572,6 +667,29 @@ fn run_once(
                 storage_inc_gt0: inc_gt0_in(&incs, STORAGE_141617),
                 off_edge_inc_gt0: off_edge,
                 edge_4_31,
+                ordered_defer: spine.ordered_defer,
+                ordered_handoff: spine.ordered_handoff,
+                retain_keeps: spine.retain_keeps,
+                tip_already: spine.tip_already,
+                chain_len: spine.chain_len,
+                estimate_block_sf: m.estimate_block_sf,
+                spine_access: spine.access_events,
+                spine_yield_ok: spine.yield_waits_ok,
+                spine_yield_deadlock: spine.yield_deadlocks,
+                spine_raw: spine.raw_n,
+                spine_waw: spine.waw_n,
+                spine_war: spine.war_n,
+                spine_armed: spine.armed_locs,
+                spine_pins: spine.retained_pins,
+                spine_revoked: spine.prior_revoked,
+                spine_radar: spine.prior_radar_only,
+                head_ms,
+                tail_ms,
+                refuse_gated: spine.refuse_gated,
+                gated_pick: spine.gated_pick,
+                spine_cores: spine.spine_cores,
+                help_release: spine.help_release,
+                local_hits: spine.local_hits,
             }
         }
         Err(e) => {
@@ -741,6 +859,55 @@ fn main() {
         );
     }
 
+    let occ_tps = if occ_med > 0.0 {
+        n as f64 / (occ_med / 1000.0)
+    } else {
+        0.0
+    };
+    let sf_tps = if primary_sf > 0.0 {
+        n as f64 / (primary_sf / 1000.0)
+    } else {
+        0.0
+    };
+    let ratio = if occ_tps > 0.0 { sf_tps / occ_tps } else { 0.0 };
+    let last_sf_metrics = rows.iter().rev().find(|r| r.mode == "specfence");
+    let est = last_sf_metrics.map(|r| r.estimate_block_sf).unwrap_or(0);
+    let occ_picks = last_sf_metrics.map(|r| r.occ_schedule_picks).unwrap_or(0);
+    let soft_arms = last_sf_metrics.map(|r| r.soft_wait_arms).unwrap_or(0);
+    let spine_access = last_sf_metrics.map(|r| r.spine_access).unwrap_or(0);
+    let spine_yield_ok = last_sf_metrics.map(|r| r.spine_yield_ok).unwrap_or(0);
+    let spine_yield_deadlock = last_sf_metrics.map(|r| r.spine_yield_deadlock).unwrap_or(0);
+    let spine_raw = last_sf_metrics.map(|r| r.spine_raw).unwrap_or(0);
+    let spine_waw = last_sf_metrics.map(|r| r.spine_waw).unwrap_or(0);
+    let spine_war = last_sf_metrics.map(|r| r.spine_war).unwrap_or(0);
+    let spine_armed = last_sf_metrics.map(|r| r.spine_armed).unwrap_or(0);
+    let spine_pins = last_sf_metrics.map(|r| r.spine_pins).unwrap_or(0);
+    let spine_revoked = last_sf_metrics.map(|r| r.spine_revoked).unwrap_or(0);
+    let spine_radar = last_sf_metrics.map(|r| r.spine_radar).unwrap_or(0);
+    let ordered_defer = last_sf_metrics.map(|r| r.ordered_defer).unwrap_or(0);
+    let ordered_handoff = last_sf_metrics.map(|r| r.ordered_handoff).unwrap_or(0);
+    let retain_keeps = last_sf_metrics.map(|r| r.retain_keeps).unwrap_or(0);
+    let tip_already = last_sf_metrics.map(|r| r.tip_already).unwrap_or(0);
+    let chain_len = last_sf_metrics.map(|r| r.chain_len).unwrap_or(0);
+    let idle_ns = last_sf_metrics.map(|r| r.idle_core_ns).unwrap_or(0);
+    let steal_hits = last_sf_metrics.map(|r| r.steal_n).unwrap_or(0);
+    let refuse_gated = last_sf_metrics.map(|r| r.refuse_gated).unwrap_or(0);
+    let gated_pick = last_sf_metrics.map(|r| r.gated_pick).unwrap_or(0);
+    let spine_cores = last_sf_metrics.map(|r| r.spine_cores).unwrap_or(0);
+    let spans: Vec<f64> = rows
+        .iter()
+        .filter(|r| r.mode == "specfence" && r.i >= 1 && r.tail_ms > r.head_ms)
+        .map(|r| r.tail_ms - r.head_ms)
+        .collect();
+    let chain_span_ms = if spans.is_empty() {
+        last_sf_metrics
+            .map(|r| (r.tail_ms - r.head_ms).max(0.0))
+            .unwrap_or(0.0)
+    } else {
+        median(spans)
+    };
+    let tax_ms = primary_sf - chain_span_ms;
+
     println!(
         "summary Soft=0 occ_median_ms={occ_med:.3} sf_cold_ms={} sf_reuse_median_ms={} primary_sf_ms={primary_sf:.3} primary={} sf_le_occ={sf_le_occ}",
         sf_cold
@@ -750,6 +917,10 @@ fn main() {
             .map(|v| format!("{v:.3}"))
             .unwrap_or_else(|| "n/a".into()),
         if primary_is_reuse { "reuse" } else { "cold" }
+    );
+    println!(
+        "TPS_SUMMARY block={block_no} n={n} cores={cores} iters={iters} occ_tps={occ_tps:.1} sf_tps={sf_tps:.1} ratio={ratio:.3} ge_1_5={} occ_ms={occ_med:.3} sf_ms={primary_sf:.3} tax_ms={tax_ms:.3} chain_span_ms={chain_span_ms:.3} est_block={est} soft={soft_arms} occ_picks={occ_picks} access={spine_access} yield_ok={spine_yield_ok} yield_deadlock={spine_yield_deadlock} raw={spine_raw} waw={spine_waw} war={spine_war} armed={spine_armed} pins={spine_pins} revoked={spine_revoked} radar={spine_radar} defer={ordered_defer} handoff={ordered_handoff} retain={retain_keeps} tip_already={tip_already} chain={chain_len} idle_ns={idle_ns} steal_hits={steal_hits} refuse_gated={refuse_gated} gated_pick={gated_pick} spine_cores={spine_cores}",
+        ratio >= 1.5
     );
 
     let summary = CompareSummary {
@@ -761,6 +932,37 @@ fn main() {
         primary_is_reuse,
         sf_le_occ,
         soft: 0,
+        n_tx: n,
+        cores,
+        occ_tps,
+        sf_tps,
+        ratio,
+        ratio_ge_1_5: ratio >= 1.5,
+        estimate_block_sf: est,
+        occ_schedule_picks: occ_picks,
+        soft_wait_arms: soft_arms,
+        spine_access,
+        spine_yield_ok,
+        spine_yield_deadlock,
+        spine_raw,
+        spine_waw,
+        spine_war,
+        spine_armed,
+        spine_pins,
+        spine_revoked,
+        spine_radar,
+        ordered_defer,
+        ordered_handoff,
+        retain_keeps,
+        tip_already,
+        chain_len,
+        tax_ms,
+        chain_span_ms,
+        idle_ns,
+        steal_hits,
+        refuse_gated,
+        gated_pick,
+        spine_cores,
     };
 
     if std::env::var("SPECFENCE_COMPARE_CHECK").is_ok() {

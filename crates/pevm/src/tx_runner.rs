@@ -1,5 +1,7 @@
 //! Shared no-beneficiary Handler for pevm execute paths.
 
+use std::cell::Cell;
+
 use revm::{
     Database, Inspector,
     context::{
@@ -8,7 +10,10 @@ use revm::{
     },
     handler::{EthFrame, EvmTr, EvmTrError, FrameResult, FrameTr, Handler, ItemOrResult},
     inspector::{InspectorEvmTr, InspectorHandler, JournalExt},
-    interpreter::interpreter::EthInterpreter,
+    interpreter::{
+        interpreter::EthInterpreter,
+        interpreter_types::{Jumps, LoopControl},
+    },
     state::EvmState,
 };
 
@@ -51,6 +56,48 @@ where
         Ok(())
     }
 
+    /// YieldWait does not discard the journal or the frame stack.
+    ///
+    /// The successful WaitTrueVersion path never returns this error: it waits
+    /// inside the host call and continues the same opcode. This override is the
+    /// deadlock release: one resume of the halted opcode (frame kept), then
+    /// `catch_error` only if the tip is still missing.
+    fn run(
+        &mut self,
+        evm: &mut Self::Evm,
+    ) -> Result<ExecutionResult<Self::HaltReason>, Self::Error> {
+        clear_frame_depth();
+        let mut init_and_floor_gas = match self.validate(evm) {
+            Ok(gas) => gas,
+            Err(e) => return self.catch_error(evm, e),
+        };
+        let eip7702_refund = match self.pre_execution(evm, &mut init_and_floor_gas) {
+            Ok(refund) => refund,
+            Err(e) => return self.catch_error(evm, e),
+        };
+        let mut exec_result = match self.execution(evm, &init_and_floor_gas) {
+            Ok(result) => result,
+            Err(e) if take_yield_pending() => match self.resume_yield(evm, e) {
+                Ok(result) => result,
+                Err(e) => return Err(e),
+            },
+            Err(e) => return self.catch_error(evm, e),
+        };
+        let result_gas = match self.post_execution(
+            evm,
+            &mut exec_result,
+            init_and_floor_gas,
+            eip7702_refund as i64,
+        ) {
+            Ok(gas) => gas,
+            Err(e) => return self.catch_error(evm, e),
+        };
+        match self.execution_result(evm, exec_result, result_gas) {
+            Ok(out) => Ok(out),
+            Err(e) => self.catch_error(evm, e),
+        }
+    }
+
     /// Iter8: apply armed PENDING_RESUME on Handler::run (no inspect_run).
     /// Stock revm only applies via Inspector::initialize_interp; we hook after
     /// first frame_init so memory-lite absolute jump works hang-free on Lean.
@@ -82,6 +129,7 @@ where
         }
 
         loop {
+            note_frame_depth(evm);
             let call_or_result = evm.frame_run()?;
 
             let result = match call_or_result {
@@ -114,6 +162,56 @@ where
     }
 }
 
+impl<EVM, ERROR> NoBeneficiaryHandler<EVM, ERROR>
+where
+    EVM: EvmTr<
+            Context: ContextTr<Journal: JournalTr<State = EvmState> + JournalExt>,
+            Frame = EthFrame<EthInterpreter>,
+        >,
+    ERROR: EvmTrError<EVM>,
+{
+    /// Continue the live frame after YieldWait. Does not call `discard_tx`.
+    fn resume_yield(&mut self, evm: &mut EVM, first_err: ERROR) -> Result<FrameResult, ERROR> {
+        // One in-frame retry. A second YieldWait releases the core.
+        if !prep_yield_resume(evm) {
+            return self.discard_frame(evm, first_err);
+        }
+        match self.continue_frame(evm) {
+            Ok(mut frame_result) => match self.last_frame_result(evm, &mut frame_result) {
+                Ok(()) => Ok(frame_result),
+                Err(e) => self.discard_frame(evm, e),
+            },
+            Err(e) => self.discard_frame(evm, e),
+        }
+    }
+
+    fn discard_frame(&self, evm: &mut EVM, error: ERROR) -> Result<FrameResult, ERROR> {
+        let _ = take_yield_pending();
+        match self.catch_error(evm, error) {
+            Err(err) => Err(err),
+            Ok(_) => unreachable!("catch_error propagates the database error"),
+        }
+    }
+
+    /// `run_exec_loop` without `frame_init` — the halted frame is still on the stack.
+    fn continue_frame(&mut self, evm: &mut EVM) -> Result<FrameResult, ERROR> {
+        loop {
+            note_frame_depth(evm);
+            let call_or_result = evm.frame_run()?;
+            let result = match call_or_result {
+                ItemOrResult::Item(init) => match evm.frame_init(init)? {
+                    ItemOrResult::Item(_) => continue,
+                    ItemOrResult::Result(result) => result,
+                },
+                ItemOrResult::Result(result) => result,
+            };
+            if let Some(result) = evm.frame_return_result(result)? {
+                return Ok(result);
+            }
+        }
+    }
+}
+
 impl<EVM, ERROR> InspectorHandler for NoBeneficiaryHandler<EVM, ERROR>
 where
     EVM: InspectorEvmTr<
@@ -127,6 +225,62 @@ where
 }
 
 pub(crate) type EthDbError<DB> = EVMError<<DB as Database>::Error, InvalidTransaction>;
+
+thread_local! {
+    static FRAME_DEPTH: Cell<u8> = const { Cell::new(0) };
+    static YIELD_PENDING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Live interpreter frame depth. `0` before the first frame.
+pub(crate) fn frame_depth() -> u8 {
+    FRAME_DEPTH.with(Cell::get)
+}
+
+pub(crate) fn clear_frame_depth() {
+    FRAME_DEPTH.with(|c| c.set(0));
+}
+
+fn note_frame_depth<EVM>(evm: &mut EVM)
+where
+    EVM: EvmTr<Frame = EthFrame<EthInterpreter>>,
+{
+    let depth = evm.frame_stack().get().depth.min(u8::MAX as usize) as u8;
+    FRAME_DEPTH.with(|c| c.set(depth));
+}
+
+/// The host read is returning YieldWait. `Handler::run` must not discard first.
+pub(crate) fn flag_yield_wait() {
+    YIELD_PENDING.with(|c| c.set(true));
+}
+
+pub(crate) fn take_yield_pending() -> bool {
+    YIELD_PENDING.with(|c| c.replace(false))
+}
+
+/// Nested re-entry guard. The in-host wait does not re-enter the read.
+pub(crate) fn in_yield_reread() -> bool {
+    false
+}
+
+fn prep_yield_resume<EVM>(evm: &mut EVM) -> bool
+where
+    EVM: EvmTr<Context: ContextTr, Frame = EthFrame<EthInterpreter>>,
+{
+    if evm.frame_stack().index().is_none() {
+        return false;
+    }
+    *evm.ctx().error() = Ok(());
+    let frame = evm.frame_stack().get();
+    if frame.is_finished() {
+        return false;
+    }
+    // Halt left the PC one byte past the opcode and `continue_execution` clear.
+    // Rewind that byte and clear the halt so the same opcode runs again.
+    *frame.interpreter.bytecode.action() = None;
+    frame.interpreter.bytecode.reset_action();
+    frame.interpreter.bytecode.relative_jump(-1);
+    true
+}
 
 pub(crate) fn run_ethereum_tx<DB: Database>(
     evm: &mut <PevmEthereum as PevmChain>::Evm<DB>,

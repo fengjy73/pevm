@@ -182,6 +182,7 @@ pub(crate) fn run_sf_block<F, V>(
             specfence.policy,
             Some(metrics),
             worker_i,
+            specfence.spine,
         );
         match task {
             Some(Task::Execution(tx_version)) => {
@@ -300,12 +301,20 @@ pub(crate) fn run_sf_block<F, V>(
                 metrics.add_worker_busy_ns(t0.elapsed().as_nanos() as u64);
             }
             None => {
-                // Idle: `pick` already stole the antichain tail. Help release
-                // is heal of writers that have published.
+                // Width deques are empty. Offer the next ordered hop when its
+                // predecessor has published, then heal. Do not spin a gated head.
                 metrics.add_idle_core_ns(t0.elapsed().as_nanos() as u64);
                 runnable.note_idle_spin();
                 if abort() {
                     break;
+                }
+                if runnable.spine_slot_empty()
+                    && let Some(tx) = specfence
+                        .spine
+                        .help_next_hop(|w| scheduler.is_done(w) || scheduler.is_validated(w))
+                    && runnable.offer_spine(tx)
+                {
+                    runnable.note_help_release();
                 }
                 specfence
                     .ready_edges

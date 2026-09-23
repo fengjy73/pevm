@@ -1185,6 +1185,10 @@ impl MetricsInner {
     }
 
     #[inline]
+    pub(crate) fn idle_core_ns(&self) -> u64 {
+        self.idle_core_ns.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn add_idle_core_ns(&self, ns: u64) {
         if ns > 0 {
             self.idle_core_ns.fetch_add(ns, Ordering::Relaxed);

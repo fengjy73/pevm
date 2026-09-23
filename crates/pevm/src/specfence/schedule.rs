@@ -26,6 +26,7 @@ pub(crate) fn pick(
     policy: Option<&CostPolicy>,
     metrics: Option<&MetricsInner>,
     worker_i: usize,
+    spine: &super::AccessSpine,
 ) -> Option<Task> {
     let _ = (wave, stages);
     if let Some(p) = policy
@@ -59,6 +60,23 @@ pub(crate) fn pick(
         m.sample_runnable_width(runnable.width_hint());
     }
 
+    // OrderedTip short path: the next writer goes to the owner slot, not the
+    // Indep LIFO tail the width cores are stealing.
+    if let Some(next) = spine.take_handoff() {
+        if !runnable.offer_spine(next) {
+            spine.restore_handoff(next);
+        }
+    }
+    // Pred already published and the slot is empty: one help-release. This
+    // does not hand the hop to a width core.
+    if runnable.spine_slot_empty()
+        && let Some(next) =
+            spine.help_next_hop(|w| scheduler.is_done(w) || scheduler.is_validated(w))
+        && runnable.offer_spine(next)
+    {
+        runnable.note_help_release();
+    }
+
     let refuse_before = runnable.refuse_fill_n();
     for _ in 0..16 {
         match runnable.pick(worker_i, ready) {
@@ -81,6 +99,17 @@ pub(crate) fn pick(
                 }
                 if scheduler.is_aborting(tx) && ready.may_execute(tx) {
                     let _ = scheduler.recover_aborting(tx);
+                }
+                // Later chain writers stay off-core until the predecessor has
+                // started. Non-members fall through and fill the antichain.
+                if spine
+                    .successor_blocked(tx, |w| scheduler.is_done(w) || scheduler.is_validated(w))
+                {
+                    // WAIT, not a private spine queue. Heal requeues onto Indep
+                    // once the predecessor has published.
+                    runnable.release_running(tx);
+                    spine.note_ordered_defer();
+                    continue;
                 }
                 if let Some(tx_version) = scheduler.try_execute_producer(tx) {
                     if refused {
