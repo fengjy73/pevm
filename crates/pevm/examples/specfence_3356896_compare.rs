@@ -516,7 +516,7 @@ fn run_once(
             if mode_name == "specfence" {
                 print_focus(pevm, mode_name, i, n, &m);
                 println!(
-                    "  spine {mode_name}[{i}] access={} yield_ok={} yield_deadlock={} raw={} waw={} war={} armed={} pins={} revoked={} radar={} defer={} handoff={} retain={} tip_already={} chain={} est_block={} soft={} occ_picks={} spine_cores_max={} spine_cores_end={} handoff_claims={} claim_denied={} exact_wakes={} idle_parks={} help={} steal={} idle_spins={}",
+                    "  spine {mode_name}[{i}] access={} yield_ok={} yield_deadlock={} raw={} waw={} war={} armed={} pins={} revoked={} radar={} defer={} handoff={} retain={} tip_already={} chain={} est_block={} soft={} occ_picks={} spine_cores_max={} spine_cores_end={} handoff_claims={} claim_denied={} exact_wakes={} idle_parks={} help={} steal={} idle_spins={} local_pops={} steal_top_ns={} end_block_ns={} wake_miss={}",
                     spine.access_events,
                     spine.yield_waits_ok,
                     spine.yield_deadlocks,
@@ -544,6 +544,10 @@ fn run_once(
                     spine.help_releases,
                     spine.steal_n,
                     spine.idle_spins,
+                    spine.seed_owner_local_pops,
+                    spine.steal_top_ns,
+                    spine.end_block_ns,
+                    spine.exact_wake_missed_nopark,
                 );
             }
             IterRow {
@@ -871,7 +875,7 @@ fn main() {
         if primary_is_reuse { "reuse" } else { "cold" }
     );
     println!(
-        "TPS_SUMMARY block={block_no} n={n} cores={cores} iters={iters} occ_tps={occ_tps:.1} sf_tps={sf_tps:.1} ratio={ratio:.3} ge_1_5={} occ_ms={occ_med:.3} sf_ms={primary_sf:.3} est_block={est} soft={soft_arms} occ_picks={occ_picks} access={spine_access} yield_ok={spine_yield_ok} yield_deadlock={spine_yield_deadlock} raw={spine_raw} waw={spine_waw} war={spine_war} armed={spine_armed} pins={spine_pins} revoked={spine_revoked} radar={spine_radar} defer={ordered_defer} handoff={ordered_handoff} retain={retain_keeps} tip_already={tip_already} chain={chain_len} spine_cores_max={} spine_cores_end={} handoff_claims={} claim_denied={} exact_wakes={} idle_parks={} help={} steal={} idle_spins={}",
+        "TPS_SUMMARY block={block_no} n={n} cores={cores} iters={iters} occ_tps={occ_tps:.1} sf_tps={sf_tps:.1} ratio={ratio:.3} ge_1_5={} occ_ms={occ_med:.3} sf_ms={primary_sf:.3} est_block={est} soft={soft_arms} occ_picks={occ_picks} access={spine_access} yield_ok={spine_yield_ok} yield_deadlock={spine_yield_deadlock} raw={spine_raw} waw={spine_waw} war={spine_war} armed={spine_armed} pins={spine_pins} revoked={spine_revoked} radar={spine_radar} defer={ordered_defer} handoff={ordered_handoff} retain={retain_keeps} tip_already={tip_already} chain={chain_len} spine_cores_max={} spine_cores_end={} handoff_claims={} claim_denied={} exact_wakes={} idle_parks={} help={} steal={} idle_spins={} local_pops={} steal_top_ns={} end_block_ns={} wake_miss={}",
         ratio >= 1.5,
         sf.last_spine().spine_cores_max,
         sf.last_spine().spine_cores_end,
@@ -882,6 +886,10 @@ fn main() {
         sf.last_spine().help_releases,
         sf.last_spine().steal_n,
         sf.last_spine().idle_spins,
+        sf.last_spine().seed_owner_local_pops,
+        sf.last_spine().steal_top_ns,
+        sf.last_spine().end_block_ns,
+        sf.last_spine().exact_wake_missed_nopark,
     );
 
     let summary = CompareSummary {

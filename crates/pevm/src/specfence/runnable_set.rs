@@ -1,18 +1,21 @@
-//! RunnableSet — IdleStealWake-core on the three-primitive spine.
+//! RunnableSet — AdmitShard on the three-primitive spine.
 //!
-//! AdmitIndep lives on a per-worker [`LocalAdmitDeque`]: the owner pops LIFO,
-//! another core steals FIFO from the bottom. Gated / waiting heads are not
-//! work — refuse marks them and steals immediately. The spine hop is not on
-//! these deques; [`super::access_spine::AccessSpine`] holds one handoff slot.
-//! Pick never calls `Scheduler::next_task*`.
+//! `AdmitIndep` is seeded across per-worker Chase-Lev deques. The owner pops
+//! LIFO at the bottom; a thief pops FIFO at the top only when its own deque
+//! is empty. There is no single-owner mutex. Gated / waiting heads are not
+//! work. Spine hops stay on [`super::access_spine::AccessSpine`]'s handoff
+//! slot and are never seeded as `AdmitIndep`. Pick never calls
+//! `Scheduler::next_task*`.
 
 use std::cell::Cell;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::thread::Thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
+
+use super::admit_deque::LocalAdmitDeque;
 
 thread_local! {
     static ADMIT_OWNER: Cell<Option<usize>> = const { Cell::new(None) };
@@ -91,18 +94,22 @@ impl Deque {
 /// Detect-driven runnable set: antichain ∪ released ∪ ordered tips.
 #[derive(Debug)]
 pub(crate) struct RunnableSet {
-    /// Per-worker AdmitIndep. Index = worker. Owner LIFO / thief FIFO.
-    local_admit: Vec<Deque>,
+    /// Per-worker `AdmitIndep`. Index = worker. Owner LIFO / thief FIFO.
+    local_admit: Vec<LocalAdmitDeque>,
     q_released: Deque,
     q_ordered: Deque,
     q_revalidate: Deque,
     state: Vec<AtomicU8>,
     block_size: usize,
     cores: usize,
-    /// `usize::MAX` except while seeding the chain head onto worker 0.
-    seed_shard: AtomicUsize,
     rr: AtomicUsize,
     steal_n: AtomicUsize,
+    /// Owner `pop_bottom` of `AdmitIndep` (not a steal).
+    seed_owner_local_pops: AtomicUsize,
+    /// Sum across workers of time spent in thief `pop_top`. Not a wall clock.
+    steal_top_ns: AtomicU64,
+    /// `exact_wake_one` found no parked core.
+    exact_wake_missed_nopark: AtomicUsize,
     refuse_fill_n: AtomicUsize,
     idle_spins: AtomicUsize,
     width_sum: AtomicUsize,
@@ -119,16 +126,20 @@ impl RunnableSet {
     pub(crate) fn new(block_size: usize, cores: usize) -> Self {
         let cores = cores.max(1);
         Self {
-            local_admit: (0..cores).map(|_| Deque::new()).collect(),
+            local_admit: (0..cores)
+                .map(|_| LocalAdmitDeque::with_capacity(block_size))
+                .collect(),
             q_released: Deque::new(),
             q_ordered: Deque::new(),
             q_revalidate: Deque::new(),
             state: (0..block_size).map(|_| AtomicU8::new(ST_NONE)).collect(),
             block_size,
             cores,
-            seed_shard: AtomicUsize::new(usize::MAX),
             rr: AtomicUsize::new(0),
             steal_n: AtomicUsize::new(0),
+            seed_owner_local_pops: AtomicUsize::new(0),
+            steal_top_ns: AtomicU64::new(0),
+            exact_wake_missed_nopark: AtomicUsize::new(0),
             refuse_fill_n: AtomicUsize::new(0),
             idle_spins: AtomicUsize::new(0),
             width_sum: AtomicUsize::new(0),
@@ -142,7 +153,7 @@ impl RunnableSet {
         }
     }
 
-    /// Worker-local AdmitIndep pushes land on this shard.
+    /// Worker-local `AdmitIndep` pushes land on this shard.
     pub(crate) fn bind_worker(&self, worker_i: usize) {
         let i = worker_i % self.cores;
         *self.threads[i].lock() = Some(std::thread::current());
@@ -151,10 +162,6 @@ impl RunnableSet {
 
     #[inline]
     fn indep_shard(&self) -> usize {
-        let forced = self.seed_shard.load(Ordering::Relaxed);
-        if forced != usize::MAX {
-            return forced % self.cores;
-        }
         ADMIT_OWNER.with(|c| {
             c.get()
                 .unwrap_or_else(|| self.rr.fetch_add(1, Ordering::Relaxed) % self.cores)
@@ -164,8 +171,7 @@ impl RunnableSet {
     #[inline]
     fn q(&self, kind: QueueKind) -> &Deque {
         match kind {
-            // AdmitIndep is sharded. Callers use [`Self::enqueue`].
-            QueueKind::Indep => &self.local_admit[0],
+            QueueKind::Indep => unreachable!("AdmitIndep is a Chase-Lev shard"),
             QueueKind::Released => &self.q_released,
             QueueKind::Ordered => &self.q_ordered,
             QueueKind::Revalidate => &self.q_revalidate,
@@ -176,7 +182,7 @@ impl RunnableSet {
     fn enqueue(&self, tx: TxIdx, kind: QueueKind) {
         if kind == QueueKind::Indep {
             let shard = self.indep_shard();
-            self.local_admit[shard].push_local(tx);
+            self.local_admit[shard].push_bottom(tx);
         } else {
             self.q(kind).push_local(tx);
         }
@@ -184,8 +190,58 @@ impl RunnableSet {
         self.exact_wake_one();
     }
 
-    /// Seed after Detect `admit_seed`. Ungated → Q_indep. Window heads →
-    /// Q_ordered. Released consumers → Q_released. Unreleased stay off-queue.
+    /// Seed-time `AdmitIndep` push. Workers are not running, so this does not
+    /// call `ExactWake` (there is nobody to unpark).
+    fn place_seed_indep(&self, shard: usize, tx: TxIdx) {
+        if tx >= self.block_size {
+            return;
+        }
+        let prev = self.state[tx].swap(ST_INDEP, Ordering::AcqRel);
+        if prev == ST_RUNNING || prev == ST_DONE {
+            self.state[tx].store(prev, Ordering::Release);
+            return;
+        }
+        if prev == ST_INDEP {
+            return;
+        }
+        self.local_admit[shard % self.cores].push_bottom(tx);
+    }
+
+    /// Contiguous count-balanced bands of `AdmitIndep`, already sorted ascending.
+    ///
+    /// Band 0 is pushed high-to-low so worker 0's LIFO pops the low prefix
+    /// and a thief takes that band's high end. Later bands are pushed
+    /// low-to-high so those owners start at their high end, not in the
+    /// prefix. Round-robin (`tx % C`) put every core in the prefix and
+    /// committed a wrong receipt on 15274915 at 2 cores.
+    fn shard_indep(&self, indep_asc: &[TxIdx]) {
+        let cores = self.cores;
+        let n = indep_asc.len();
+        if n == 0 || cores == 0 {
+            return;
+        }
+        let base = n / cores;
+        let rem = n % cores;
+        let mut cursor = 0;
+        for shard in 0..cores {
+            let len = base + usize::from(shard < rem);
+            let band = &indep_asc[cursor..cursor + len];
+            cursor += len;
+            if shard == 0 {
+                for &tx in band.iter().rev() {
+                    self.place_seed_indep(shard, tx);
+                }
+            } else {
+                for &tx in band {
+                    self.place_seed_indep(shard, tx);
+                }
+            }
+        }
+    }
+
+    /// Seed after Detect `admit_seed`. Ungated `AdmitIndep` is sharded onto
+    /// per-core deques. Window heads and released consumers stay on their
+    /// own queues. Spine successors stay off-queue (`mark_wait`).
     pub(crate) fn seed_begin(
         &self,
         ready: &ReadyEdgeTable,
@@ -193,23 +249,27 @@ impl RunnableSet {
         scheduler: &Scheduler,
         crit_head: Option<TxIdx>,
     ) {
-        // One AdmitIndep deque at the start (worker 0). Push high indices
-        // first so the owner LIFO-pops the low end, and the chain head last.
-        // Other cores FIFO-steal the high-index tail. Round-robin seeding
-        // put every core in the prefix together and committed a wrong
-        // receipt (15274915 seq!=par from 2 cores).
         let head = crit_head.filter(|&tx| tx < self.block_size);
-        self.seed_shard.store(0, Ordering::Relaxed);
+        let mut indep = Vec::new();
+        // High index first matches the previous Released LIFO (low index
+        // popped first). AdmitIndep is collected and sharded afterwards.
         for tx in (0..self.block_size).rev() {
             if Some(tx) == head {
                 continue;
             }
-            self.seed_one(tx, ready, stages, scheduler);
+            self.seed_one(tx, ready, stages, scheduler, &mut indep);
         }
+        indep.reverse();
+        self.shard_indep(&indep);
         if let Some(tx) = head {
-            self.seed_one(tx, ready, stages, scheduler);
+            let mut ignored = Vec::new();
+            self.seed_one(tx, ready, stages, scheduler, &mut ignored);
+            // Chain head last on worker 0 so it is the first LIFO pop,
+            // ahead of the low prefix.
+            for tx in ignored {
+                self.place_seed_indep(0, tx);
+            }
         }
-        self.seed_shard.store(usize::MAX, Ordering::Relaxed);
     }
 
     fn seed_one(
@@ -218,6 +278,7 @@ impl RunnableSet {
         ready: &ReadyEdgeTable,
         stages: &ProducerStageTable,
         scheduler: &Scheduler,
+        indep: &mut Vec<TxIdx>,
     ) {
         if scheduler.is_done(tx) || scheduler.is_validated(tx) {
             self.state[tx].store(ST_DONE, Ordering::Relaxed);
@@ -237,14 +298,14 @@ impl RunnableSet {
             return;
         }
         // Learned WAW successor: off-queue until the pred commits, still
-        // ungated so the resume stays on the Opt path.
+        // ungated so the resume stays on the Opt path. Not stealable Indep.
         if let Some(pred) = ready.blocking_producer(tx)
             && !ready.is_writer_done(pred)
         {
             self.mark_wait(tx);
             return;
         }
-        self.push(tx, QueueKind::Indep);
+        indep.push(tx);
     }
 
     #[inline]
@@ -500,10 +561,11 @@ impl RunnableSet {
     /// Owner LIFO. A gated head is not scanned further — caller steals.
     fn pop_local_admit(&self, worker_i: usize, ready: &ReadyEdgeTable) -> LocalAdmit {
         let shard = worker_i % self.cores;
-        while let Some(tx) = self.local_admit[shard].try_pop_local() {
+        while let Some(tx) = self.local_admit[shard].pop_bottom() {
             if !self.take_if(tx, ST_INDEP) {
                 continue;
             }
+            self.seed_owner_local_pops.fetch_add(1, Ordering::Relaxed);
             if self.refused_gate(tx, ready) {
                 self.note_refuse(tx, ready);
                 return LocalAdmit::Refused;
@@ -513,13 +575,20 @@ impl RunnableSet {
         LocalAdmit::Empty
     }
 
-    /// FIFO from the bottom of another worker's AdmitIndep deque only.
+    /// FIFO `pop_top` of another worker's `AdmitIndep` deque only.
     fn steal_admit(&self, worker_i: usize, ready: &ReadyEdgeTable) -> Option<TxIdx> {
         let n = self.cores;
         for k in 1..n {
             let victim = (worker_i + k) % n;
             let mut gated_budget = 0u8;
-            while let Some(tx) = self.local_admit[victim].steal() {
+            loop {
+                let t0 = Instant::now();
+                let stolen = self.local_admit[victim].pop_top();
+                self.steal_top_ns
+                    .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                let Some(tx) = stolen else {
+                    break;
+                };
                 if !self.take_if(tx, ST_INDEP) {
                     continue;
                 }
@@ -1069,6 +1138,21 @@ impl RunnableSet {
     }
 
     #[inline]
+    pub(crate) fn seed_owner_local_pops(&self) -> usize {
+        self.seed_owner_local_pops.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn steal_top_ns(&self) -> u64 {
+        self.steal_top_ns.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn exact_wake_missed_nopark(&self) -> usize {
+        self.exact_wake_missed_nopark.load(Ordering::Relaxed)
+    }
+
+    #[inline]
     pub(crate) fn refuse_fill_n(&self) -> usize {
         self.refuse_fill_n.load(Ordering::Relaxed)
     }
@@ -1141,6 +1225,8 @@ impl RunnableSet {
                 return;
             }
         }
+        self.exact_wake_missed_nopark
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Teardown only. Work distribution never broadcasts.
@@ -1574,7 +1660,51 @@ mod tests {
         };
         assert_eq!(tx, 1, "thief pops FIFO bottom");
         assert!(r.steal_n() >= 1, "cross-core steal counts");
+        assert!(r.seed_owner_local_pops() >= 1, "owner pop is not a steal");
         ADMIT_OWNER.with(|c| c.set(None));
+    }
+
+    #[test]
+    fn admit_shard_prefix_stays_on_worker0() {
+        let ready = ReadyEdgeTable::new();
+        let stages = ProducerStageTable::new();
+        let sched = Scheduler::new(8);
+        ready.note_consumer(1, 0);
+        ready.plant_nearest_preds(0xabc, &[4, 6]);
+        let r = RunnableSet::new(8, 2);
+        r.seed_begin(&ready, &stages, &sched, Some(4));
+        assert_eq!(
+            ready.blocking_producer(6),
+            Some(4),
+            "spine successor is not seeded as Indep"
+        );
+        let SfPick::Execute { tx, slot, .. } = r.pick(0, &ready).expect("worker 0") else {
+            panic!("expected execute");
+        };
+        assert_eq!(tx, 4, "chain head is worker 0's first pop");
+        assert!(!slot);
+        assert_eq!(r.steal_n(), 0);
+        let SfPick::Execute { tx, .. } = r.pick(1, &ready).expect("worker 1") else {
+            panic!("expected execute");
+        };
+        assert!(
+            tx >= 5,
+            "other cores start at the high end of their band, got {tx}"
+        );
+        assert_eq!(r.steal_n(), 0, "balanced local pop is not a steal");
+        assert!(r.seed_owner_local_pops() >= 2);
+        let mut saw_waiter = false;
+        for w in 0..2 {
+            for _ in 0..8 {
+                let Some(SfPick::Execute { tx, .. }) = r.pick(w, &ready) else {
+                    break;
+                };
+                if tx == 1 || tx == 6 {
+                    saw_waiter = true;
+                }
+            }
+        }
+        assert!(!saw_waiter, "gated and spine successor stay off AdmitIndep");
     }
 
     #[test]

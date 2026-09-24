@@ -784,6 +784,9 @@ impl Pevm {
             report.help_releases = runnable.help_releases();
             report.steal_n = runnable.steal_n();
             report.idle_spins = runnable.idle_spins();
+            report.seed_owner_local_pops = runnable.seed_owner_local_pops();
+            report.steal_top_ns = runnable.steal_top_ns();
+            report.exact_wake_missed_nopark = runnable.exact_wake_missed_nopark();
             self.spine_prior = next;
             self.last_spine = report;
         }
@@ -1142,6 +1145,7 @@ impl Pevm {
             metrics_inner.add_idle_core_ns(ready_edges.idle_core_ns());
             let mut report = self.cost_policy.take_report(ready_w, idle);
             report.end_block_ns = end_t0.elapsed().as_nanos() as u64;
+            self.last_spine.end_block_ns = report.end_block_ns;
             report.ungated_occ_n = ready_edges.pick_occ_n();
             report.pick_gate_n = ready_edges.pick_gate_n();
             report.skip_gate_n = ready_edges.skip_gate_n();

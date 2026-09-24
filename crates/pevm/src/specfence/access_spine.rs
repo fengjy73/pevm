@@ -314,6 +314,14 @@ pub struct SpineReport {
     pub help_releases: usize,
     /// Cross-core AdmitSteal hits (also mirrored on the metrics snapshot).
     pub steal_n: usize,
+    /// Owner LIFO pops of `AdmitIndep`. Seeded work consumed locally.
+    pub seed_owner_local_pops: usize,
+    /// Sum across workers of thief `pop_top` time. Not a wall-clock interval.
+    pub steal_top_ns: u64,
+    /// Post-join `end_block` learn phase. Same window as `LearnReport::end_block_ns`.
+    pub end_block_ns: u64,
+    /// `exact_wake_one` ran and no core was parked.
+    pub exact_wake_missed_nopark: usize,
     /// Scheduler idle entries.
     pub idle_spins: usize,
 }
@@ -847,6 +855,10 @@ impl AccessSpine {
             idle_parks: 0,
             help_releases: 0,
             steal_n: 0,
+            seed_owner_local_pops: 0,
+            steal_top_ns: 0,
+            end_block_ns: 0,
+            exact_wake_missed_nopark: 0,
             idle_spins: 0,
         };
         (report, next)
