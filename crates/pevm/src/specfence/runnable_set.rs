@@ -91,6 +91,43 @@ impl Deque {
     }
 }
 
+/// One-shot counts taken when the prior-chain tail records `first_start`.
+pub(crate) struct SpanEndSnap {
+    pub not_started: usize,
+    pub unfinished: usize,
+    pub owed: usize,
+    pub running: usize,
+    pub pending: usize,
+    pub indep: usize,
+    pub false_bits: u64,
+}
+
+/// Post-span join probe. Sums are worker-time. Origins are `exec_origin`.
+#[derive(Clone, Copy)]
+pub(crate) struct PostSpanProbe {
+    pub span_end_origin_ns: u64,
+    pub last_exec_origin_ns: u64,
+    pub last_validate_origin_ns: u64,
+    pub quiet_true_origin_ns: u64,
+    pub last_exit_origin_ns: u64,
+    pub post_span_exec_ns: u64,
+    pub post_span_validate_ns: u64,
+    pub post_span_heal_ns: u64,
+    pub post_span_yield_ns: u64,
+    pub post_span_park_ns: u64,
+    pub post_span_steal_ns: u64,
+    pub post_span_exec_n: usize,
+    pub post_span_idle_n: usize,
+    pub span_end_not_started: usize,
+    pub span_end_unfinished: usize,
+    pub span_end_owed: usize,
+    pub span_end_running: usize,
+    pub span_end_pending: usize,
+    pub span_end_indep: usize,
+    pub span_end_false_bits: u64,
+    pub quiet_false_or: u64,
+}
+
 /// Detect-driven runnable set: antichain ∪ released ∪ ordered tips.
 #[derive(Debug)]
 pub(crate) struct RunnableSet {
@@ -124,6 +161,48 @@ pub(crate) struct RunnableSet {
     span_head: AtomicUsize,
     /// Prior crit tail for the span filter. `usize::MAX` if unset.
     span_tail: AtomicUsize,
+    /// `exec_origin` at the prior-chain tail's `first_start`. 0 if no tail.
+    span_end_origin_ns: AtomicU64,
+    /// Latest `exec_origin` at which an execution attempt returned.
+    last_exec_origin_ns: AtomicU64,
+    /// Latest `exec_origin` at which validate/resolve returned.
+    last_validate_origin_ns: AtomicU64,
+    /// First `exec_origin` at which a worker observed full BlockQuiet.
+    quiet_true_origin_ns: AtomicU64,
+    /// Latest `exec_origin` at which a worker left the loop.
+    last_exit_origin_ns: AtomicU64,
+    /// Sum of execute() time at or after [`Self::span_end_origin_ns`].
+    post_span_exec_ns: AtomicU64,
+    /// Sum of validate/resolve time at or after the span end.
+    post_span_validate_ns: AtomicU64,
+    /// Sum of idle-arm heal time at or after the span end.
+    post_span_heal_ns: AtomicU64,
+    /// Sum of `yield_now` time at or after the span end.
+    post_span_yield_ns: AtomicU64,
+    /// Sum of `park_idle` time at or after the span end.
+    post_span_park_ns: AtomicU64,
+    /// Sum of `pick → None` time at or after the span end.
+    post_span_steal_ns: AtomicU64,
+    /// Execution attempts whose start is at or after the span end.
+    post_span_exec_n: AtomicUsize,
+    /// Idle-arm entries at or after the span end.
+    post_span_idle_n: AtomicUsize,
+    /// Txs with `first_start` still 0 when the tail started.
+    span_end_not_started: AtomicUsize,
+    /// Txs not yet Executed/Validated when the tail started.
+    span_end_unfinished: AtomicUsize,
+    /// Executed-but-not-validated txs when the tail started.
+    span_end_owed: AtomicUsize,
+    /// `ST_RUNNING` count when the tail started.
+    span_end_running: AtomicUsize,
+    /// `pending_work` when the tail started.
+    span_end_pending: AtomicUsize,
+    /// AdmitShard occupancy when the tail started.
+    span_end_indep: AtomicUsize,
+    /// BlockQuiet clauses that were false when the tail started.
+    span_end_false_bits: AtomicU64,
+    /// OR of BlockQuiet clauses false on idle samples after the span end.
+    quiet_false_or: AtomicU64,
     width_sum: AtomicUsize,
     width_n: AtomicUsize,
     threads: Vec<Mutex<Option<Thread>>>,
@@ -135,6 +214,27 @@ pub(crate) struct RunnableSet {
 }
 
 impl RunnableSet {
+    /// Admit shards, released, ordered, or revalidate still hold a tx.
+    pub(crate) const QF_PENDING: u64 = 1 << 0;
+    /// Wave bag still holds a wake.
+    pub(crate) const QF_WAVE: u64 = 1 << 1;
+    /// Spine handoff slot is occupied.
+    pub(crate) const QF_HANDOFF: u64 = 1 << 2;
+    /// Some `ST_WAIT` is on a producer that is executing.
+    pub(crate) const QF_WAITING_LIVE: u64 = 1 << 3;
+    /// Some tx is `ST_RUNNING`.
+    pub(crate) const QF_RUNNING: u64 = 1 << 4;
+    /// Chain hop still owns `spine_owner`.
+    pub(crate) const QF_SPINE: u64 = 1 << 5;
+    /// A gated tx has not been marked done.
+    pub(crate) const QF_GATED: u64 = 1 << 6;
+    /// A sleeper is waiting for a true tip.
+    pub(crate) const QF_SLEEPING: u64 = 1 << 7;
+    /// Some tx is not yet Executed or Validated.
+    pub(crate) const QF_UNFINISHED: u64 = 1 << 8;
+    /// Some tx is Executed and still needs validate.
+    pub(crate) const QF_OWED: u64 = 1 << 9;
+
     pub(crate) fn new(block_size: usize, cores: usize) -> Self {
         let cores = cores.max(1);
         Self {
@@ -160,6 +260,27 @@ impl RunnableSet {
             post_exec_in_span_ns: AtomicU64::new(0),
             span_head: AtomicUsize::new(usize::MAX),
             span_tail: AtomicUsize::new(usize::MAX),
+            span_end_origin_ns: AtomicU64::new(0),
+            last_exec_origin_ns: AtomicU64::new(0),
+            last_validate_origin_ns: AtomicU64::new(0),
+            quiet_true_origin_ns: AtomicU64::new(0),
+            last_exit_origin_ns: AtomicU64::new(0),
+            post_span_exec_ns: AtomicU64::new(0),
+            post_span_validate_ns: AtomicU64::new(0),
+            post_span_heal_ns: AtomicU64::new(0),
+            post_span_yield_ns: AtomicU64::new(0),
+            post_span_park_ns: AtomicU64::new(0),
+            post_span_steal_ns: AtomicU64::new(0),
+            post_span_exec_n: AtomicUsize::new(0),
+            post_span_idle_n: AtomicUsize::new(0),
+            span_end_not_started: AtomicUsize::new(0),
+            span_end_unfinished: AtomicUsize::new(0),
+            span_end_owed: AtomicUsize::new(0),
+            span_end_running: AtomicUsize::new(0),
+            span_end_pending: AtomicUsize::new(0),
+            span_end_indep: AtomicUsize::new(0),
+            span_end_false_bits: AtomicU64::new(0),
+            quiet_false_or: AtomicU64::new(0),
             width_sum: AtomicUsize::new(0),
             width_n: AtomicUsize::new(0),
             threads: (0..cores).map(|_| Mutex::new(None)).collect(),
@@ -1217,6 +1338,154 @@ impl RunnableSet {
     #[inline]
     pub(crate) fn span_tail(&self) -> usize {
         self.span_tail.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn span_end_ns(&self) -> u64 {
+        self.span_end_origin_ns.load(Ordering::Relaxed)
+    }
+
+    /// First writer wins. Later incarnations of the tail do not refresh it.
+    pub(crate) fn publish_span_end(&self, origin_ns: u64, snap: SpanEndSnap) {
+        if self
+            .span_end_origin_ns
+            .compare_exchange(0, origin_ns.max(1), Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        self.span_end_not_started
+            .store(snap.not_started, Ordering::Relaxed);
+        self.span_end_unfinished
+            .store(snap.unfinished, Ordering::Relaxed);
+        self.span_end_owed.store(snap.owed, Ordering::Relaxed);
+        self.span_end_running.store(snap.running, Ordering::Relaxed);
+        self.span_end_pending.store(snap.pending, Ordering::Relaxed);
+        self.span_end_indep.store(snap.indep, Ordering::Relaxed);
+        self.span_end_false_bits
+            .store(snap.false_bits, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn note_max_origin(slot: &AtomicU64, origin_ns: u64) {
+        let mut cur = slot.load(Ordering::Relaxed);
+        while origin_ns > cur {
+            match slot.compare_exchange_weak(cur, origin_ns, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(seen) => cur = seen,
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn note_last_exec(&self, origin_ns: u64) {
+        Self::note_max_origin(&self.last_exec_origin_ns, origin_ns);
+    }
+
+    #[inline]
+    pub(crate) fn note_last_validate(&self, origin_ns: u64) {
+        Self::note_max_origin(&self.last_validate_origin_ns, origin_ns);
+    }
+
+    #[inline]
+    pub(crate) fn note_worker_exit(&self, origin_ns: u64) {
+        Self::note_max_origin(&self.last_exit_origin_ns, origin_ns);
+    }
+
+    /// First full BlockQuiet observation. Later samples keep the earlier time.
+    #[inline]
+    pub(crate) fn note_quiet_true(&self, origin_ns: u64) {
+        let _ = self.quiet_true_origin_ns.compare_exchange(
+            0,
+            origin_ns.max(1),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    #[inline]
+    pub(crate) fn note_quiet_false(&self, bits: u64) {
+        if bits != 0 {
+            self.quiet_false_or.fetch_or(bits, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn add_post_span_exec_ns(&self, ns: u64) {
+        if ns != 0 {
+            self.post_span_exec_ns.fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn add_post_span_validate_ns(&self, ns: u64) {
+        if ns != 0 {
+            self.post_span_validate_ns.fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn add_post_span_heal_ns(&self, ns: u64) {
+        if ns != 0 {
+            self.post_span_heal_ns.fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn add_post_span_yield_ns(&self, ns: u64) {
+        if ns != 0 {
+            self.post_span_yield_ns.fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn add_post_span_park_ns(&self, ns: u64) {
+        if ns != 0 {
+            self.post_span_park_ns.fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn add_post_span_steal_ns(&self, ns: u64) {
+        if ns != 0 {
+            self.post_span_steal_ns.fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn inc_post_span_exec_n(&self) {
+        self.post_span_exec_n.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn inc_post_span_idle_n(&self) {
+        self.post_span_idle_n.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn post_span_probe(&self) -> PostSpanProbe {
+        PostSpanProbe {
+            span_end_origin_ns: self.span_end_origin_ns.load(Ordering::Relaxed),
+            last_exec_origin_ns: self.last_exec_origin_ns.load(Ordering::Relaxed),
+            last_validate_origin_ns: self.last_validate_origin_ns.load(Ordering::Relaxed),
+            quiet_true_origin_ns: self.quiet_true_origin_ns.load(Ordering::Relaxed),
+            last_exit_origin_ns: self.last_exit_origin_ns.load(Ordering::Relaxed),
+            post_span_exec_ns: self.post_span_exec_ns.load(Ordering::Relaxed),
+            post_span_validate_ns: self.post_span_validate_ns.load(Ordering::Relaxed),
+            post_span_heal_ns: self.post_span_heal_ns.load(Ordering::Relaxed),
+            post_span_yield_ns: self.post_span_yield_ns.load(Ordering::Relaxed),
+            post_span_park_ns: self.post_span_park_ns.load(Ordering::Relaxed),
+            post_span_steal_ns: self.post_span_steal_ns.load(Ordering::Relaxed),
+            post_span_exec_n: self.post_span_exec_n.load(Ordering::Relaxed),
+            post_span_idle_n: self.post_span_idle_n.load(Ordering::Relaxed),
+            span_end_not_started: self.span_end_not_started.load(Ordering::Relaxed),
+            span_end_unfinished: self.span_end_unfinished.load(Ordering::Relaxed),
+            span_end_owed: self.span_end_owed.load(Ordering::Relaxed),
+            span_end_running: self.span_end_running.load(Ordering::Relaxed),
+            span_end_pending: self.span_end_pending.load(Ordering::Relaxed),
+            span_end_indep: self.span_end_indep.load(Ordering::Relaxed),
+            span_end_false_bits: self.span_end_false_bits.load(Ordering::Relaxed),
+            quiet_false_or: self.quiet_false_or.load(Ordering::Relaxed),
+        }
     }
 
     #[inline]
