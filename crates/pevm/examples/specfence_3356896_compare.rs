@@ -745,10 +745,9 @@ fn run_once(
 }
 
 fn main() {
-    // Measurement clocks inside `run_pevm_tx`. Off in the library unless this
-    // env is set. Instant per VmDb call inflates walls; do not relock them.
-    // SAFETY: main is still single-threaded. Workers start later, inside execute.
-    unsafe { std::env::set_var("SPECFENCE_INTERP_SPLIT", "1") };
+    // Do not force `SPECFENCE_INTERP_SPLIT` or `SPECFENCE_IDEAL_PROXIMITY_DIFF`.
+    // Both add clocks. Unset them for a Soft=0 wall that can be compared with
+    // the locked band. Set the proximity flag to emit IdealProximityDiff.
     let data_dir = repo_root().join("data/ethereum");
     let block_no = std::env::var("SPECFENCE_COMPARE_BLOCK")
         .ok()
@@ -789,6 +788,7 @@ fn main() {
     );
 
     let mut rows: Vec<IterRow> = Vec::with_capacity(iters * 2);
+    let mut prox_held: Vec<HeldProx> = Vec::new();
     let mut occ_walls = Vec::new();
     let mut sf_walls = Vec::new();
     let mut last_occ = None;
@@ -856,6 +856,19 @@ fn main() {
             sf_row.resolve_apply_n,
             sf_row.explore_n,
         ));
+        let spine = sf.last_spine();
+        prox_held.push(HeldProx {
+            i,
+            wall_ms: sf_row.wall_ms,
+            snap: sf.last_ideal_prox().clone(),
+            first_start: sf.last_tx_first_start().to_vec(),
+            not_started: spine.span_end_not_started,
+            admit_at_tail: spine.span_end_indep,
+            running_at_tail: spine.span_end_running,
+            span_end_ns: spine.span_end_origin_ns,
+            span_head: spine.span_head,
+            span_tail: spine.span_tail,
+        });
         rows.push(sf_row);
     }
 
@@ -976,6 +989,7 @@ fn main() {
         sf.last_spine().span_tail,
         sf.last_spine().indep_first_cuts,
     );
+    emit_ideal_prox(block_no, cores, &prox_held, primary_sf);
 
     let summary = CompareSummary {
         occ_median_ms: occ_med,
@@ -1047,4 +1061,180 @@ fn main() {
                 .unwrap()
         );
     }
+}
+
+struct HeldProx {
+    i: usize,
+    wall_ms: f64,
+    snap: pevm::specfence::IdealProxSnap,
+    first_start: Vec<u64>,
+    not_started: usize,
+    admit_at_tail: usize,
+    running_at_tail: usize,
+    span_end_ns: u64,
+    span_head: usize,
+    span_tail: usize,
+}
+
+fn locked_l_crit_ms(block: u64) -> Option<f64> {
+    match block {
+        15_274_915 => Some(1.19),
+        3_356_896 => Some(0.031),
+        _ => None,
+    }
+}
+
+fn reuse_median_prox(held: &[HeldProx], primary_sf: f64) -> Option<&HeldProx> {
+    let mut rows: Vec<&HeldProx> = held.iter().filter(|h| h.i > 0).collect();
+    if rows.is_empty() {
+        rows = held.iter().collect();
+    }
+    rows.into_iter().min_by(|a, b| {
+        let da = (a.wall_ms - primary_sf).abs();
+        let db = (b.wall_ms - primary_sf).abs();
+        da.partial_cmp(&db)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.i.cmp(&b.i))
+    })
+}
+
+fn emit_ideal_prox(block: u64, cores: usize, held: &[HeldProx], primary_sf: f64) {
+    let Some(row) = reuse_median_prox(held, primary_sf) else {
+        return;
+    };
+    if !row.snap.enabled {
+        return;
+    }
+    let diff = pevm::specfence::diff_indep(&row.snap, &row.first_start);
+    let l_crit = locked_l_crit_ms(block);
+    let sf_minus_ideal = l_crit.map(|lb| row.wall_ms - lb);
+    let bins = diff
+        .wave_lag_bins
+        .iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    println!(
+        "IDEAL_PROX_SUMMARY block={block} iter={} wall_ms={:.3} probe_wall=1 not_locked_band l_crit_ms={} sf_minus_ideal_ms={} indep={} entered={} not_entered={} aligned={} median_enter_ms={:.3} corr_tx_enter={:.3} fill_0.2={:.3} fill_0.5={:.3} fill_1.19={:.3} fill_2.089={:.3} wave_lag_bins={bins} enter_eq_first_start={} not_started_at_tail={} admit_at_tail={} running_at_tail={} span_end_ms={:.3} span_head={} span_tail={} ge_1_5=false",
+        row.i,
+        row.wall_ms,
+        l_crit
+            .map(|v| format!("{v:.3}"))
+            .unwrap_or_else(|| "n/a".into()),
+        sf_minus_ideal
+            .map(|v| format!("{v:.3}"))
+            .unwrap_or_else(|| "n/a".into()),
+        diff.indep_n,
+        diff.entered_indep,
+        diff.not_entered_indep,
+        diff.aligned_n,
+        diff.median_enter_ms,
+        diff.corr_tx_enter,
+        diff.fill_at[0],
+        diff.fill_at[1],
+        diff.fill_at[2],
+        diff.fill_at[3],
+        diff.enter_eq_first_start,
+        row.not_started,
+        row.admit_at_tail,
+        row.running_at_tail,
+        row.span_end_ns as f64 / 1e6,
+        row.span_head,
+        row.span_tail,
+    );
+    let mut counts = Vec::new();
+    let mut lag = Vec::new();
+    for (i, (n, sum)) in diff
+        .blocker_counts
+        .iter()
+        .zip(diff.blocker_lag_sum_ms.iter())
+        .enumerate()
+    {
+        if *n == 0 {
+            continue;
+        }
+        let name = pevm::specfence::blocker_name(i as u8);
+        counts.push(serde_json::json!({ "class": name, "n": n }));
+        lag.push(serde_json::json!({ "class": name, "lag_sum_ms": sum }));
+    }
+    println!(
+        "IDEAL_PROX_BLOCKERS {}",
+        serde_json::to_string(&counts).unwrap_or_else(|_| "[]".into())
+    );
+    let out = std::env::var("SPECFENCE_IDEAL_PROXIMITY_DIFF_OUT")
+        .or_else(|_| std::env::var("SPECFENCE_IDEAL_PROX_DIFF_OUT"))
+        .ok();
+    let Some(path) = out else {
+        return;
+    };
+    let mut late: Vec<&pevm::specfence::IdealProxTx> = row
+        .snap
+        .txs
+        .iter()
+        .filter(|t| pevm::specfence::role_name(t.role) == "IndepClean" && t.enter_ns > 0)
+        .collect();
+    late.sort_by(|a, b| b.enter_ns.cmp(&a.enter_ns));
+    late.truncate(16);
+    let samples: Vec<_> = late
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "tx_id": t.tx,
+                "ideal_ready_ms": 0.0,
+                "ideal_wave": t.wave,
+                "sf_first_execute_enter_ms": t.enter_ns as f64 / 1e6,
+                "sf_finish_ms": t.finish_ns as f64 / 1e6,
+                "blocker_class": pevm::specfence::blocker_name(t.blocker),
+                "secondary_class": pevm::specfence::blocker_name(t.secondary),
+                "role": pevm::specfence::role_name(t.role),
+                "preds_ideal": t.preds,
+                "attempts": t.attempts,
+            })
+        })
+        .collect();
+    let body = serde_json::json!({
+        "meta": {
+            "block": block,
+            "iter": row.i,
+            "cores": cores,
+            "protocol": "Soft=0 Instant-off",
+            "probe": "SPECFENCE_IDEAL_PROXIMITY_DIFF",
+            "probe_wall": true,
+            "not_locked_band": true,
+            "ideal_ready_clock": "Detect antichain: IndepClean ideal_ready_ms=0. Offline per-tx DAG work column is not in this tree.",
+            "enter_eq_first_start": diff.enter_eq_first_start,
+        },
+        "block_metrics": {
+            "sf_wall_ms": row.wall_ms,
+            "primary_sf_ms": primary_sf,
+            "ideal_L_crit_ms": l_crit,
+            "sf_minus_ideal_ms": sf_minus_ideal,
+            "span_end_ms": row.span_end_ns as f64 / 1e6,
+            "span_head": row.span_head,
+            "span_tail": row.span_tail,
+            "not_started_at_tail": row.not_started,
+            "admitshard_at_tail": row.admit_at_tail,
+            "running_at_tail": row.running_at_tail,
+            "ge_1_5": false,
+        },
+        "hist": {
+            "wave_lag_bins_ms": ["(-inf,0]", "(0,0.2]", "(0.2,0.5]", "(0.5,1.19]", "(1.19,2.089]", "(2.089,5]", "(5,+inf)"],
+            "wave_lag_counts": diff.wave_lag_bins,
+            "fill_at_ms": [0.2, 0.5, 1.19, 2.089],
+            "fill_frac": diff.fill_at,
+            "corr_tx_enter": diff.corr_tx_enter,
+            "median_enter_ms": diff.median_enter_ms,
+            "aligned_eps_ms": 0.05,
+            "aligned_n": diff.aligned_n,
+        },
+        "blocker_counts": counts,
+        "blocker_lag_sum_ms": lag,
+        "samples_latest_indep": samples,
+    });
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&body).expect("prox json"),
+    )
+    .unwrap_or_else(|e| eprintln!("ideal prox write {path}: {e}"));
+    println!("wrote {path}");
 }

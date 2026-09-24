@@ -183,6 +183,8 @@ pub struct Pevm {
     last_begin_blocked: Vec<usize>,
     /// First Execution-pick elapsed ns. 0 = that tx never started. SpecFence only.
     last_tx_first_start: Vec<u64>,
+    /// IdealProximityDiff snapshot. `enabled` is false unless the env flag was on.
+    last_ideal_prox: crate::specfence::IdealProxSnap,
     last_initial_wait_accounts: std::collections::HashSet<alloy_primitives::Address>,
     /// M4: abort rate from the previous SpecFence block (`occ_aborts / n_tx`).
     last_abort_rate: f64,
@@ -216,6 +218,7 @@ impl Default for Pevm {
             last_location_writers: Vec::new(),
             last_begin_blocked: Vec::new(),
             last_tx_first_start: Vec::new(),
+            last_ideal_prox: crate::specfence::IdealProxSnap::default(),
             last_initial_wait_accounts: std::collections::HashSet::new(),
             last_abort_rate: 0.0,
             finegrain_enabled: false,
@@ -396,6 +399,11 @@ impl Pevm {
     /// `0` means that index never started. SpecFence fills this; OCC leaves it empty.
     pub fn last_tx_first_start(&self) -> &[u64] {
         &self.last_tx_first_start
+    }
+
+    /// IdealProximityDiff from the last SpecFence block. Empty when the flag is off.
+    pub fn last_ideal_prox(&self) -> &crate::specfence::IdealProxSnap {
+        &self.last_ideal_prox
     }
 
     /// G7: InterBlockPrior flip-α events observed since last reset.
@@ -646,7 +654,13 @@ impl Pevm {
                     }
                 }
             }
-            runnable.seed_begin(&ready_edges, &producer_stages, &scheduler, crit_head);
+            runnable.seed_begin(
+                &ready_edges,
+                &producer_stages,
+                &scheduler,
+                crit_head,
+                hints.gas_limit_slice(),
+            );
             // P3: do not sample (n_tx − blocked) as ready_width (reads as 172).
             if quiet && !learner.has_any_predicted() {
                 let n = sketch.revoke_prior_fences_if_quiet(true);
@@ -669,6 +683,7 @@ impl Pevm {
             self.finegrain.attach_runtime(&mv_memory, &scheduler);
         }
         let finegrain_ref = self.finegrain_enabled.then_some(&self.finegrain);
+        let ideal_prox = crate::specfence::IdealProxLog::new(block_size);
         let specfence = SpecFenceCtx {
             mode: self.concurrency_mode,
             hints: &hints,
@@ -702,6 +717,7 @@ impl Pevm {
             tx_first_start: &tx_first_start,
             exec_origin: &exec_origin,
             spine: &access_spine,
+            ideal_prox: &ideal_prox,
         };
 
         // TODO: Better thread handling
@@ -1267,6 +1283,9 @@ impl Pevm {
                 .iter()
                 .map(|slot| slot.load(Ordering::Relaxed))
                 .collect();
+            self.last_ideal_prox = ideal_prox.snapshot();
+        } else {
+            self.last_ideal_prox = crate::specfence::IdealProxSnap::default();
         }
         self.last_metrics = metrics_inner.snapshot(
             wave_id,

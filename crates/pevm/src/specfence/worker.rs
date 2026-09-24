@@ -214,17 +214,47 @@ pub(crate) fn run_sf_block<F, V>(
         match task {
             Some(Task::Execution(tx_version)) => {
                 let tx_idx = tx_version.tx_idx;
+                let mut first_ns = 0u64;
                 if let Some(slot) = specfence.tx_first_start.get(tx_idx) {
                     if slot.load(Ordering::Relaxed) == 0 {
                         let ns = origin_ns(specfence).max(1);
                         if slot
                             .compare_exchange(0, ns, Ordering::Relaxed, Ordering::Relaxed)
                             .is_ok()
-                            && tx_idx == runnable.span_tail()
                         {
-                            publish_span_end(scheduler, specfence, runnable, ns);
+                            first_ns = ns;
+                            if tx_idx == runnable.span_tail() {
+                                publish_span_end(scheduler, specfence, runnable, ns);
+                            }
                         }
                     }
+                }
+                if specfence.ideal_prox.enabled() {
+                    let ns = if first_ns != 0 {
+                        first_ns
+                    } else {
+                        origin_ns(specfence).max(1)
+                    };
+                    let ordered = specfence.spine.is_ordered_member(tx_idx);
+                    let has_pred = specfence.ready_edges.recorded_pred(tx_idx).is_some();
+                    let (blocker, secondary, role, preds) = super::ideal_prox::classify_enter(
+                        ordered,
+                        has_pred,
+                        runnable.width_hint(),
+                        runnable.cores(),
+                    );
+                    let wave = if ordered {
+                        specfence
+                            .spine
+                            .ordered_pos(tx_idx)
+                            .unwrap_or(0)
+                            .min(u16::MAX as usize) as u16
+                    } else {
+                        0
+                    };
+                    specfence
+                        .ideal_prox
+                        .note_enter(tx_idx, ns, blocker, secondary, role, preds, wave);
                 }
                 specfence.ready_edges.note_started(tx_idx);
                 // leftover_min must skip Estimate tips so nonce/fund
@@ -239,6 +269,7 @@ pub(crate) fn run_sf_block<F, V>(
                 match execute(tx_version.clone(), vis) {
                     SfExec::Executed { wrote_new_location } => {
                         let exec_end = origin_ns(specfence);
+                        specfence.ideal_prox.note_finish(tx_idx, exec_end);
                         note_exec_span(runnable, exec_start, exec_end);
                         // Next hop may start on another core while we validate.
                         // Ownership ends with the hop, not with validation.

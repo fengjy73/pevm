@@ -17,6 +17,30 @@ use parking_lot::Mutex;
 
 use super::admit_deque::LocalAdmitDeque;
 
+/// Product knife. Default on. `SPECFENCE_IDEAL_TIMED_ADMIT=0` restores
+/// index-band seed and does not park later waves on a second deque.
+fn ideal_timed_admit_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("SPECFENCE_IDEAL_TIMED_ADMIT").ok().as_deref(),
+            Some("0") | Some("false") | Some("FALSE")
+        )
+    })
+}
+
+fn work_hint(work: &[u64], tx: TxIdx) -> u64 {
+    work.get(tx).copied().filter(|&gas| gas > 0).unwrap_or(1)
+}
+
+fn hints_vary(txs: &[TxIdx], work: &[u64]) -> bool {
+    if work.is_empty() || txs.is_empty() {
+        return false;
+    }
+    let first = work_hint(work, txs[0]);
+    txs.iter().any(|&tx| work_hint(work, tx) != first)
+}
+
 thread_local! {
     static ADMIT_OWNER: Cell<Option<usize>> = const { Cell::new(None) };
 }
@@ -132,7 +156,14 @@ pub(crate) struct PostSpanProbe {
 #[derive(Debug)]
 pub(crate) struct RunnableSet {
     /// Per-worker `AdmitIndep`. Index = worker. Owner LIFO / thief FIFO.
+    /// Ideal-ready (no Detect pred) lives here.
     local_admit: Vec<LocalAdmitDeque>,
+    /// Later-wave AdmitIndep (a Detect pred exists). Popped only after
+    /// `local_admit` when Ideal-timed admit is on, so a publish wake cannot
+    /// jump the antichain. Spine hops never land here.
+    local_late: Vec<LocalAdmitDeque>,
+    /// Seeded with no Detect predecessor.
+    ideal_ready: Vec<AtomicBool>,
     q_released: Deque,
     q_ordered: Deque,
     q_revalidate: Deque,
@@ -241,6 +272,10 @@ impl RunnableSet {
             local_admit: (0..cores)
                 .map(|_| LocalAdmitDeque::with_capacity(block_size))
                 .collect(),
+            local_late: (0..cores)
+                .map(|_| LocalAdmitDeque::with_capacity(block_size))
+                .collect(),
+            ideal_ready: (0..block_size).map(|_| AtomicBool::new(false)).collect(),
             q_released: Deque::new(),
             q_ordered: Deque::new(),
             q_revalidate: Deque::new(),
@@ -321,7 +356,15 @@ impl RunnableSet {
     fn enqueue(&self, tx: TxIdx, kind: QueueKind) {
         if kind == QueueKind::Indep {
             let shard = self.indep_shard();
-            self.local_admit[shard].push_bottom(tx);
+            let late = ideal_timed_admit_on()
+                && tx < self.ideal_ready.len()
+                && !self.ideal_ready[tx].load(Ordering::Relaxed);
+            let q = if late {
+                &self.local_late
+            } else {
+                &self.local_admit
+            };
+            q[shard].push_bottom(tx);
         } else {
             self.q(kind).push_local(tx);
         }
@@ -331,7 +374,11 @@ impl RunnableSet {
 
     /// Seed-time `AdmitIndep` push. Workers are not running, so this does not
     /// call `ExactWake` (there is nobody to unpark).
-    fn place_seed_indep(&self, shard: usize, tx: TxIdx) {
+    ///
+    /// `late` parks a tx that already has a Detect predecessor on
+    /// [`Self::local_late`]. Ideal-ready txs (`late == false`) set the bit
+    /// and land on [`Self::local_admit`].
+    fn place_seed_on(&self, shard: usize, tx: TxIdx, late: bool) {
         if tx >= self.block_size {
             return;
         }
@@ -343,7 +390,63 @@ impl RunnableSet {
         if prev == ST_INDEP {
             return;
         }
-        self.local_admit[shard % self.cores].push_bottom(tx);
+        if !late {
+            self.ideal_ready[tx].store(true, Ordering::Relaxed);
+        }
+        let q = if late {
+            &self.local_late
+        } else {
+            &self.local_admit
+        };
+        q[shard % self.cores].push_bottom(tx);
+    }
+
+    /// `pop_low_first`: push high-to-low so LIFO yields the lowest index.
+    fn push_index_order(&self, shard: usize, txs: &[TxIdx], late: bool, pop_low_first: bool) {
+        if pop_low_first {
+            for &tx in txs.iter().rev() {
+                self.place_seed_on(shard, tx, late);
+            }
+        } else {
+            for &tx in txs {
+                self.place_seed_on(shard, tx, late);
+            }
+        }
+    }
+
+    /// Split one index band. Ideal-ready keeps the historical direction.
+    /// A recorded Detect pred goes to the late deque.
+    fn push_band_ordered(
+        &self,
+        shard: usize,
+        band: &[TxIdx],
+        ready: &ReadyEdgeTable,
+        low_first: bool,
+    ) {
+        let mut ideal = Vec::new();
+        let mut late = Vec::new();
+        for &tx in band {
+            if ideal_timed_admit_on() && ready.recorded_pred(tx).is_some() {
+                late.push(tx);
+            } else {
+                ideal.push(tx);
+            }
+        }
+        self.push_index_order(shard, &late, true, low_first);
+        self.push_index_order(shard, &ideal, false, low_first);
+    }
+
+    /// Pop heavier gas first inside one shard. Equal gas breaks ties toward
+    /// the higher index, matching the historical free-core high end.
+    /// Does not move a tx onto another shard: cross-shard gas balance put
+    /// the large block's free cores into a schedule that intermittently
+    /// disagreed with sequential execution.
+    fn push_heavy_first(&self, shard: usize, txs: &[TxIdx], work: &[u64], late: bool) {
+        let mut order = txs.to_vec();
+        order.sort_by(|&a, &b| work_hint(work, a).cmp(&work_hint(work, b)).then(a.cmp(&b)));
+        for tx in order {
+            self.place_seed_on(shard, tx, late);
+        }
     }
 
     /// Contiguous count-balanced bands of `AdmitIndep`, already sorted ascending.
@@ -353,7 +456,12 @@ impl RunnableSet {
     /// low-to-high so those owners start at their high end, not in the
     /// prefix. Round-robin (`tx % C`) put every core in the prefix and
     /// committed a wrong receipt on 15274915 at 2 cores.
-    fn shard_indep(&self, indep_asc: &[TxIdx]) {
+    ///
+    /// Ideal-timed admit keeps those bands. A recorded Detect pred waits on
+    /// `local_late` until that shard's Ideal-ready deque is empty. On a free
+    /// core, when gas limits differ, Ideal-ready txs in the band pop heaviest
+    /// first. They stay on that core.
+    fn shard_indep(&self, indep_asc: &[TxIdx], ready: &ReadyEdgeTable, work: &[u64]) {
         let cores = self.cores;
         let n = indep_asc.len();
         if n == 0 || cores == 0 {
@@ -366,15 +474,22 @@ impl RunnableSet {
             let len = base + usize::from(shard < rem);
             let band = &indep_asc[cursor..cursor + len];
             cursor += len;
-            if shard == 0 {
-                for &tx in band.iter().rev() {
-                    self.place_seed_indep(shard, tx);
-                }
-            } else {
-                for &tx in band {
-                    self.place_seed_indep(shard, tx);
+            let heavy = ideal_timed_admit_on() && shard > 0 && hints_vary(band, work);
+            if !heavy {
+                self.push_band_ordered(shard, band, ready, shard == 0);
+                continue;
+            }
+            let mut ideal = Vec::new();
+            let mut late = Vec::new();
+            for &tx in band {
+                if ready.recorded_pred(tx).is_some() {
+                    late.push(tx);
+                } else {
+                    ideal.push(tx);
                 }
             }
+            self.push_heavy_first(shard, &late, work, true);
+            self.push_heavy_first(shard, &ideal, work, false);
         }
     }
 
@@ -387,6 +502,7 @@ impl RunnableSet {
         stages: &ProducerStageTable,
         scheduler: &Scheduler,
         crit_head: Option<TxIdx>,
+        work_hint: &[u64],
     ) {
         let head = crit_head.filter(|&tx| tx < self.block_size);
         let mut indep = Vec::new();
@@ -399,14 +515,16 @@ impl RunnableSet {
             self.seed_one(tx, ready, stages, scheduler, &mut indep);
         }
         indep.reverse();
-        self.shard_indep(&indep);
+        self.shard_indep(&indep, ready, work_hint);
         if let Some(tx) = head {
             let mut ignored = Vec::new();
             self.seed_one(tx, ready, stages, scheduler, &mut ignored);
             // Chain head last on worker 0 so it is the first LIFO pop,
-            // ahead of the low prefix.
+            // ahead of the low prefix. A head that already has a Detect
+            // pred does not jump the Ideal-ready deque.
             for tx in ignored {
-                self.place_seed_indep(0, tx);
+                let late = ideal_timed_admit_on() && ready.recorded_pred(tx).is_some();
+                self.place_seed_on(0, tx, late);
             }
         }
     }
@@ -697,10 +815,25 @@ impl RunnableSet {
         }
     }
 
-    /// Owner LIFO. A gated head is not scanned further — caller steals.
+    /// Owner LIFO. Ideal-ready first, then the late deque. A gated head is
+    /// not scanned further — caller steals.
     fn pop_local_admit(&self, worker_i: usize, ready: &ReadyEdgeTable) -> LocalAdmit {
+        let primary = self.pop_deque(worker_i, &self.local_admit, ready);
+        if matches!(primary, LocalAdmit::Empty) && ideal_timed_admit_on() {
+            self.pop_deque(worker_i, &self.local_late, ready)
+        } else {
+            primary
+        }
+    }
+
+    fn pop_deque(
+        &self,
+        worker_i: usize,
+        deques: &[LocalAdmitDeque],
+        ready: &ReadyEdgeTable,
+    ) -> LocalAdmit {
         let shard = worker_i % self.cores;
-        while let Some(tx) = self.local_admit[shard].pop_bottom() {
+        while let Some(tx) = deques[shard].pop_bottom() {
             if !self.take_if(tx, ST_INDEP) {
                 continue;
             }
@@ -715,14 +848,31 @@ impl RunnableSet {
     }
 
     /// FIFO `pop_top` of another worker's `AdmitIndep` deque only.
+    /// Ideal-ready deques first. Spine hops are not in either deque.
     fn steal_admit(&self, worker_i: usize, ready: &ReadyEdgeTable) -> Option<TxIdx> {
+        if let Some(tx) = self.steal_deques(worker_i, &self.local_admit, ready) {
+            return Some(tx);
+        }
+        if ideal_timed_admit_on() {
+            self.steal_deques(worker_i, &self.local_late, ready)
+        } else {
+            None
+        }
+    }
+
+    fn steal_deques(
+        &self,
+        worker_i: usize,
+        deques: &[LocalAdmitDeque],
+        ready: &ReadyEdgeTable,
+    ) -> Option<TxIdx> {
         let n = self.cores;
         for k in 1..n {
             let victim = (worker_i + k) % n;
             let mut gated_budget = 0u8;
             loop {
                 let t0 = Instant::now();
-                let stolen = self.local_admit[victim].pop_top();
+                let stolen = deques[victim].pop_top();
                 self.steal_top_ns
                     .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 let Some(tx) = stolen else {
@@ -790,8 +940,9 @@ impl RunnableSet {
         if let Some(tx) = self.pop_kind(QueueKind::Revalidate) {
             return Some(SfPick::Revalidate(tx));
         }
-        // Slot before local Indep so the chain is not stuck behind a wide
-        // antichain. Only one core wins; the rest fall through to fill.
+        // Handoff before local Indep so the single spine hop is not stuck
+        // behind a wide antichain. Only one core wins (`spine≤1`); the rest
+        // fall through and fill Ideal-ready AdmitIndep. No Estimate gate.
         if let Some(spine) = spine
             && let Some(p) = self.claim_handoff(ready, spine)
         {
@@ -1550,7 +1701,11 @@ impl RunnableSet {
 
     #[inline]
     pub(crate) fn q_indep_len(&self) -> usize {
-        self.local_admit.iter().map(|d| d.len()).sum()
+        self.local_admit
+            .iter()
+            .chain(self.local_late.iter())
+            .map(|d| d.len())
+            .sum()
     }
 
     /// Unpark one worker waiting on an ExactWakeToken.
@@ -1683,7 +1838,7 @@ mod tests {
         let sched = Scheduler::new(6);
         ready.note_consumer(3, 0);
         let r = RunnableSet::new(6, 2);
-        r.seed_begin(&ready, &stages, &sched, None);
+        r.seed_begin(&ready, &stages, &sched, None, &[]);
         assert!(r.q_indep_len() >= 4, "ungated antichain in Q_indep");
         assert_eq!(r.q_ordered_len(), 0, "no ordered tip until a window head");
         // Gated 3 is waiting, not on a Q.
@@ -1703,7 +1858,7 @@ mod tests {
         let sched = Scheduler::new(8);
         ready.plant_nearest_preds(0xabc, &[4, 6]);
         let r = RunnableSet::new(8, 2);
-        r.seed_begin(&ready, &stages, &sched, Some(4));
+        r.seed_begin(&ready, &stages, &sched, Some(4), &[]);
         let first = r.pick(0, &ready).expect("head");
         let SfPick::Execute { tx, .. } = first else {
             panic!("expected execute");
@@ -2016,7 +2171,7 @@ mod tests {
         ready.note_consumer(1, 0);
         ready.plant_nearest_preds(0xabc, &[4, 6]);
         let r = RunnableSet::new(8, 2);
-        r.seed_begin(&ready, &stages, &sched, Some(4));
+        r.seed_begin(&ready, &stages, &sched, Some(4), &[]);
         assert_eq!(
             ready.blocking_producer(6),
             Some(4),
@@ -2049,6 +2204,49 @@ mod tests {
             }
         }
         assert!(!saw_waiter, "gated and spine successor stay off AdmitIndep");
+    }
+
+    #[test]
+    fn ideal_timed_free_core_pops_heavier_ready_first() {
+        let ready = ReadyEdgeTable::new();
+        let stages = ProducerStageTable::new();
+        let sched = Scheduler::new(8);
+        let r = RunnableSet::new(8, 2);
+        let mut work = vec![1u64; 8];
+        work[5] = 5_000_000;
+        r.seed_begin(&ready, &stages, &sched, None, &work);
+        let SfPick::Execute { tx, .. } = r.pick(0, &ready).expect("worker 0") else {
+            panic!("expected execute");
+        };
+        assert!(tx <= 3, "worker 0 still owns the low prefix, got {tx}");
+        let SfPick::Execute { tx, .. } = r.pick(1, &ready).expect("worker 1") else {
+            panic!("expected execute");
+        };
+        assert_eq!(tx, 5, "free core pops the heavy Ideal-ready tx first");
+    }
+
+    #[test]
+    fn ideal_timed_late_wave_waits_behind_ready() {
+        let ready = ReadyEdgeTable::new();
+        let stages = ProducerStageTable::new();
+        let sched = Scheduler::new(4);
+        let wave = crate::specfence::wave::WaveParkTable::new();
+        ready.plant_nearest_preds(0xabc, &[0, 3]);
+        let r = RunnableSet::new(4, 1);
+        r.seed_begin(&ready, &stages, &sched, None, &[]);
+        assert_eq!(ready.blocking_producer(3), Some(0));
+        ready.note_producer_done(0, &wave);
+        assert!(
+            r.wake_idle(3, QueueKind::Indep),
+            "published successor must rejoin"
+        );
+        let SfPick::Execute { tx, .. } = r.pick(0, &ready).expect("ideal") else {
+            panic!("expected execute");
+        };
+        assert_ne!(
+            tx, 3,
+            "a woken later wave must not preempt Ideal-ready still queued"
+        );
     }
 
     #[test]

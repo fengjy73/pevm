@@ -192,6 +192,7 @@ pub(crate) mod feeder;
 mod finegrain;
 mod heat;
 mod hotset;
+mod ideal_prox;
 #[cfg(test)]
 mod kernel;
 mod lane;
@@ -281,6 +282,10 @@ pub(crate) use heat::HeatMap;
 pub(crate) use hotset::HotSet;
 #[allow(unused_imports)]
 pub(crate) use hotset::{H_A, H_W};
+pub(crate) use ideal_prox::IdealProxLog;
+pub use ideal_prox::{
+    IdealProxDiff, IdealProxSnap, IdealProxTx, blocker_name, diff_indep, role_name,
+};
 pub use resolve_plan::ResolvePlan;
 pub(crate) use runnable_set::RunnableSet;
 pub(crate) use sf_mv::{SfConflictClass, SfMvMemory, SfTip, SfTipTable, classify_wait_conflict};
@@ -495,6 +500,12 @@ impl AccountHints {
     #[inline]
     pub(crate) fn is_pure_transfer(&self, idx: TxIdx) -> bool {
         self.is_value_transfer(idx) && self.gas_limit.get(idx).copied() == Some(21_000)
+    }
+
+    /// Per-tx gas limit. Work hint for Ideal-timed AdmitIndep seeding.
+    #[inline]
+    pub(crate) fn gas_limit_slice(&self) -> &[u64] {
+        &self.gas_limit
     }
 
     #[inline]
@@ -746,6 +757,8 @@ pub(crate) struct SpecFenceCtx<'a> {
     pub exec_origin: &'a std::time::Instant,
     /// AccessEvent three-primitive spine. Avoid starts empty each block.
     pub spine: &'a AccessSpine,
+    /// IdealProximityDiff log. Empty unless the env flag is on.
+    pub ideal_prox: &'a ideal_prox::IdealProxLog,
 }
 
 impl<'a> SpecFenceCtx<'a> {
