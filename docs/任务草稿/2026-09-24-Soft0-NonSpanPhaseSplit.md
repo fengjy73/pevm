@@ -23,5 +23,5 @@
 ## 步骤
 
 1. **已完成** — 常开四组探针。薄块第一次跑发现 `inter_prior.crit_chain()` 为空（链长 17 < 32），span 过滤没装上，`post_exec_validate_ns` 变成未过滤总和。已改为空 crit 时用 `SpinePrior::chains`。
-2. **进行中** — 修正后重跑 release、LTO off、N=5、两块。2 核冷检。OCC 若相对笔记漂移，同宿主再量基线。
-3. **待做** — 笔记和 PR 填实测表。草稿留到用户验收。
+2. **已完成** — `8832029` 上 N=5 两块。薄 0.697（税 0.860），大 0.683（税 5.221）。`ge_1_5=false`。2 核冷检 `seq=par`。OCC 相对笔记漂移，同机重跑了 `aa448cb`。
+3. **已完成** — 表在 `docs/specfence-soft0-nonspan-phasesplit.md` 和 PR #51。大块宿主四段加总等于 tax，残差 1.165 ms 是没探针的缝。薄块中位轮链头 31≠focus 4。草稿留到用户验收。
