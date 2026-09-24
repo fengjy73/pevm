@@ -632,6 +632,20 @@ impl Pevm {
                 writers.first().copied()
             });
             self.last_begin_blocked = ready_edges.blocked_consumers();
+            // Thin focus chains are shorter than the ≥32 sticky install, so
+            // `inter_prior.crit_chain()` stays empty. The spine still carries
+            // last block's longest writer list; that is the chain `ordered_writers`
+            // and the next focus span are built from.
+            if runnable.span_head() == usize::MAX {
+                if let (Some(head), Some(tail)) = (
+                    self.spine_prior.chains.iter().copied().min(),
+                    self.spine_prior.chains.iter().copied().max(),
+                ) {
+                    if head != tail {
+                        runnable.note_span_ends(head, tail);
+                    }
+                }
+            }
             runnable.seed_begin(&ready_edges, &producer_stages, &scheduler, crit_head);
             // P3: do not sample (n_tx − blocked) as ready_width (reads as 172).
             if quiet && !learner.has_any_predicted() {

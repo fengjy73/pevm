@@ -22,6 +22,6 @@
 
 ## 步骤
 
-1. **进行中** — 常开 `admit_seed_ns` / `join_wait_ns` / `idle_ns`+`heal_ns` / `post_exec_validate_ns`（span 外）+ `post_exec_in_span_ns`。`join_mark_origin_ns` 用来和 focus 的 head/tail 相交，避免把整段 join 当成税。
-2. **待做** — release、LTO off、N=5、请求 8 核。两块。2 核冷检 `seq≡par`。
+1. **已完成** — 常开四组探针。薄块第一次跑发现 `inter_prior.crit_chain()` 为空（链长 17 < 32），span 过滤没装上，`post_exec_validate_ns` 变成未过滤总和。已改为空 crit 时用 `SpinePrior::chains`。
+2. **进行中** — 修正后重跑 release、LTO off、N=5、两块。2 核冷检。OCC 若相对笔记漂移，同宿主再量基线。
 3. **待做** — 笔记和 PR 填实测表。草稿留到用户验收。

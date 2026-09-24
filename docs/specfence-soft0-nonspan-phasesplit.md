@@ -18,7 +18,7 @@
 | `post_exec_validate_ns` | 执行成功后的 `drain_wave` + `validate_to_plan` + `resolve_plan::apply`，以及 `Task::Validation` 臂上的 validate+resolve。按窗口**起点**分类：起点落在先验 crit 链 span `[head.first_start, tail.first_start)` 之外才计入。 | 各工人纳秒之和 |
 | `post_exec_in_span_ns` | 同一窗口，起点落在开着的 span 内。整段算进 span 内，即使尾部在窗口中途开工。 | 求和。`post_exec_validate_ns + post_exec_in_span_ns` 才是未过滤总量 |
 
-`span_head` / `span_tail` 是先验 crit 链的最小 / 最大 tx。没有链时是 `usize::MAX`，此时过滤器把全部 post-exec 算进 `post_exec_validate_ns`（冷启动没有先验链）。中位墙是复用轮，有先验链。薄块链长 < 32，安装门会跳过，但过滤器仍用这条先验链。focus 在链长 < 32 时改用本块最长写者表；若 `span_head/tail` 和 focus `head_tx/tail_tx` 不一致，span 外那一列只是近似，表里会标明。
+`span_head` / `span_tail` 是链两端的 tx 下标。先取 `inter_prior` 的 crit 链（大块 sticky ≥32 走这里）。那条链空着时（薄块链长 < 32，sticky 安装门会跳过，`crit_chain()` 一直是空）改用 `SpinePrior::chains`，也就是上一块最长写者表，和本块 `ordered_writers` 是同一份。没有链时是 `usize::MAX`，过滤器把全部 post-exec 算进 `post_exec_validate_ns`。冷启动没有先验链，所以冷启动的 `post_exec_validate_ns` 是未过滤总和。中位墙是复用轮。若 `span_head/tail` 和 focus 的 `head_tx/tail_tx` 不一致，span 外那一列只是近似，表里会标明。
 
 仍保留：`steal_top_ns`、`end_block_ns`、`seed_owner_local_pops`、`steal`、`wake_miss`（`exact_wake_missed_nopark`）、`defer`、`idle_parks`、`exact_wakes`、`idle_spins`。
 
