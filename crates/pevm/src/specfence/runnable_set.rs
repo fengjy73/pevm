@@ -1162,7 +1162,9 @@ impl RunnableSet {
             self.parked[i].store(false, Ordering::Release);
             return;
         }
-        std::thread::park_timeout(Duration::from_micros(250));
+        // Safety net so a missed unpark cannot pin `thread::scope`. Long
+        // enough that it is not the scheduling heartbeat.
+        std::thread::park_timeout(Duration::from_millis(20));
         self.parked[i].store(false, Ordering::Release);
     }
 

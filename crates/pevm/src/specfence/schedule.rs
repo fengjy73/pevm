@@ -97,7 +97,10 @@ pub(crate) fn pick(
                     runnable.release_running(tx);
                     spine.note_ordered_defer();
                     if slot {
+                        // We took the slot. Put it back and leave this pick.
+                        // Continuing would claim the same waiting hop again.
                         spine.offer_handoff_if_absent(tx);
+                        break;
                     }
                     continue;
                 }
@@ -106,7 +109,10 @@ pub(crate) fn pick(
                 let hop = spine.is_ordered_member(tx);
                 if hop && !spine.try_acquire(tx) {
                     runnable.release_running(tx);
-                    spine.offer_handoff_if_absent(tx);
+                    if slot {
+                        spine.offer_handoff_if_absent(tx);
+                        break;
+                    }
                     continue;
                 }
                 if let Some(tx_version) = scheduler.try_execute_producer(tx) {
@@ -163,8 +169,7 @@ pub(crate) fn pick(
                     let hop = spine.is_ordered_member(tx);
                     if hop && !spine.try_acquire(tx) {
                         runnable.release_running(tx);
-                        spine.offer_handoff_if_absent(tx);
-                        continue;
+                        break;
                     }
                     if let Some(tx_version) = scheduler.try_execute_producer(tx) {
                         return Some(Task::Execution(tx_version));

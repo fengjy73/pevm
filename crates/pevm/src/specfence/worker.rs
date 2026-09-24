@@ -352,12 +352,10 @@ pub(crate) fn run_sf_block<F, V>(
                 if runnable.pending_work() > 0 {
                     continue;
                 }
-                // ExactWake: one parked core, woken by the next AdmitIndep push
-                // or by teardown. Busy-poll a moment first so a publish in
-                // flight does not pay the park.
-                if runnable.any_running()
-                    || runnable.waiting_on_live_producer(specfence.ready_edges, scheduler)
-                {
+                // ExactWake only while a live producer still owns the core.
+                // A short timeout here woke every idle worker together and
+                // raced force-idle recover (large block seq!=par).
+                if runnable.waiting_on_live_producer(specfence.ready_edges, scheduler) {
                     for _ in 0..32 {
                         std::hint::spin_loop();
                     }
