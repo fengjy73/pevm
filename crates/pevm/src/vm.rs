@@ -156,6 +156,19 @@ pub(crate) struct VmDb<'a, S: Storage> {
     optimistic_majority_lazy: bool,
     /// A1=0 ungated: skip access-gate / rem / ReadyEdge (P3 ≡ OCC).
     optimistic_skip_gate: bool,
+    /// Incarnation-0 ungated non-chain: skip cold-read museum (ordinal log,
+    /// value snap, pre-read peek). Detect stays on the chain / WaitOnce loc.
+    indep_first_cut: bool,
+    /// Probe: kept Detect (spine peek + WaitOnce consult) on a first-cut read.
+    probe_detect_ns: Cell<u64>,
+    /// Probe: first-cut read that returned before Detect. Includes the branch.
+    probe_skip_ns: Cell<u64>,
+    /// Probe: MV / account / storage work after Detect on a first-cut read.
+    probe_mv_ns: Cell<u64>,
+    /// Probe: interpreter `code_by_hash` on a first-cut tx.
+    probe_code_ns: Cell<u64>,
+    probe_keep_n: Cell<u64>,
+    probe_skip_n: Cell<u64>,
     /// Thin Soft=0: no WaitOnce peer before this tx → OCC-shaped execute
     /// (skip consult body / engagement / museum; keep access_log ordinals).
     sf_occ_shaped: bool,
@@ -201,9 +214,26 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 .policy
                 .is_some_and(|p| p.skip_ungated_tx_path_tax())
             && !self.specfence.ready_edges.is_gated(tx_idx);
+        // First Opt of a non-chain AdmitIndep. Chain members and a later
+        // incarnation keep the full path (rewind / prefix keep). Detect on
+        // the ordered location is not part of this skip — see
+        // [`Self::read_keeps_detect`].
+        self.indep_first_cut = self.optimistic_skip_gate
+            && incarnation == 0
+            && !self.specfence.spine.is_ordered_member(tx_idx)
+            && !self.specfence.ready_edges.is_live_leftover_min(tx_idx);
+        if self.indep_first_cut {
+            self.specfence.spine.note_indep_first_cut();
+        }
+        self.probe_detect_ns.set(0);
+        self.probe_skip_ns.set(0);
+        self.probe_mv_ns.set(0);
+        self.probe_code_ns.set(0);
+        self.probe_keep_n.set(0);
+        self.probe_skip_n.set(0);
         // Thin Soft=0 OCC-shaped: no WaitOnce peer before this tx → skip consult
-        // body / engagement / museum. Keep access_log.note (fail_k). Tip install
-        // still runs if this tx is a WaitOnce/crit producer.
+        // body / engagement / museum. Tip install still runs if this tx is a
+        // WaitOnce/crit producer. indep_first_cut also skips the ordinal log.
         self.sf_occ_shaped = self.specfence.mode == crate::ConcurrencyMode::SpecFence
             && self.specfence.scheduler.block_size() <= crate::specfence::THIN_SHELL_N
             && !self.specfence.access_arms.has_wait_once_peer_before(tx_idx);
@@ -219,8 +249,8 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.read_accounts.clear();
         self.pcc_armed.set(false);
         if let Some(fg) = self.specfence.finegrain {
-            // OCC-shaped: no finegrain museum (no rem / consult grain).
-            if !self.sf_occ_shaped {
+            // OCC-shaped and the cheap first Opt: no finegrain museum.
+            if !self.sf_occ_shaped && !self.indep_first_cut {
                 fg.deep_begin_consumer(tx_idx, incarnation);
             }
         }
@@ -314,7 +344,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
     /// shaped txs do not arm prefix keep; snap inserts are pure shell tax.
     #[inline]
     fn maybe_note_value(&self, location_hash: MemoryLocationHash, value: FfValue) {
-        if self.specfence.mode != crate::ConcurrencyMode::SpecFence || self.sf_occ_shaped {
+        if self.specfence.mode != crate::ConcurrencyMode::SpecFence
+            || self.sf_occ_shaped
+            || self.indep_first_cut
+        {
             return;
         }
         self.specfence
@@ -514,6 +547,62 @@ impl<'a, S: Storage> VmDb<'a, S> {
         unfinished_writer_of(self.mv_memory, &self.specfence, location_hash, tx)
     }
 
+    /// First-cut read: time Detect, then the MV walk. Other txs pay nothing.
+    fn begin_cut_read(&self, location_hash: MemoryLocationHash) -> CutReadTimer {
+        if !self.indep_first_cut {
+            return unarmed_cut_timer();
+        }
+        CutReadTimer {
+            armed: true,
+            keep: self.read_keeps_detect(location_hash),
+            t0: Instant::now(),
+            detect_at: None,
+            detect_ns: self.probe_detect_ns.as_ptr(),
+            skip_ns: self.probe_skip_ns.as_ptr(),
+            mv_ns: self.probe_mv_ns.as_ptr(),
+            keep_n: self.probe_keep_n.as_ptr(),
+            skip_n: self.probe_skip_n.as_ptr(),
+        }
+    }
+
+    /// Interpreter bytecode fetch on a first-cut tx. Not a location Detect.
+    fn begin_cut_code(&self) -> Option<Instant> {
+        self.indep_first_cut.then(Instant::now)
+    }
+
+    fn end_cut_code(&self, start: Option<Instant>) {
+        if let Some(start) = start {
+            self.probe_code_ns
+                .set(self.probe_code_ns.get().wrapping_add(start.elapsed().as_nanos() as u64));
+        }
+    }
+
+    /// Chain / crit / protected / non-crit WaitOnce still take full Detect.
+    /// A cold antichain location does not: the MV walk below still sees
+    /// Estimate and parks via [`live_writer_act`]. Validation closes the rest.
+    #[inline]
+    fn read_keeps_detect(&self, location_hash: MemoryLocationHash) -> bool {
+        if !self.indep_first_cut {
+            return true;
+        }
+        if self.specfence.spine.is_ordered_loc(location_hash)
+            || self.specfence.sf_tips.is_chain_loc(location_hash)
+        {
+            return true;
+        }
+        let crit = self.specfence.access_arms.crit_loc_hash();
+        if crit != u64::MAX && crit == location_hash {
+            return true;
+        }
+        if self.specfence.access_arms.protect_live()
+            && self.specfence.access_arms.is_protected(location_hash)
+        {
+            return true;
+        }
+        self.specfence.access_arms.non_crit_wait()
+            && self.specfence.access_arms.is_wait_once(location_hash)
+    }
+
     /// Structural read: emit [`AccessEvent`](crate::specfence::AccessEvent) and, on a
     /// real unpublished lower writer, WaitTrueVersion inside this host call.
     /// The interpreter frame stays up because this returns `Ok` after the tip
@@ -529,6 +618,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
             || address == self.specfence.beneficiary
             || crate::tx_runner::in_yield_reread()
         {
+            return Ok(());
+        }
+        if self.indep_first_cut && !self.read_keeps_detect(location_hash) {
+            self.specfence.spine.note_fast_access();
             return Ok(());
         }
         let ev = crate::specfence::AccessEvent {
@@ -665,6 +758,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return Ok(());
         }
         if self.is_lazy || address == self.specfence.beneficiary {
+            return Ok(());
+        }
+        // Cold first Opt: WaitOnce consult is loc-specific. The chain loc
+        // already returned through [`Self::read_keeps_detect`].
+        if self.indep_first_cut && !self.read_keeps_detect(location_hash) {
             return Ok(());
         }
         // Thin Soft=0 OCC-shaped: no WaitOnce peer — zero consult tax (ordinals
@@ -2102,6 +2200,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
         kind: crate::specfence::LocationKind,
         origin: Option<&ReadOrigin>,
     ) {
+        if self.indep_first_cut {
+            return;
+        }
         let Some(fg) = self.specfence.finegrain else {
             return;
         };
@@ -2124,7 +2225,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
 
     fn get_code_hash(&mut self, address: Address) -> Result<Option<B256>, ReadError> {
         let location_hash = hash_deterministic(MemoryLocation::CodeHash(address));
-        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+        if self.specfence.mode == crate::ConcurrencyMode::SpecFence && !self.indep_first_cut {
             let _ = self.specfence.access_log.note(self.tx_idx, location_hash);
         }
         let read_origins = self.read_set.entry(location_hash).or_default();
@@ -2198,6 +2299,78 @@ impl<'a, S: Storage> VmDb<'a, S> {
     }
 }
 
+/// Times one first-cut host read. Unarmed on every other path.
+/// Detect time ends at [`CutReadTimer::mark_detect`]; the rest is MV.
+struct CutReadTimer {
+    armed: bool,
+    keep: bool,
+    t0: Instant,
+    detect_at: Option<Instant>,
+    detect_ns: *mut u64,
+    skip_ns: *mut u64,
+    mv_ns: *mut u64,
+    keep_n: *mut u64,
+    skip_n: *mut u64,
+}
+
+impl Drop for CutReadTimer {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let now = Instant::now();
+        // The cells live in this worker's `VmDb` for the whole read.
+        unsafe {
+            if let Some(detect_at) = self.detect_at {
+                *self.mv_ns = (*self.mv_ns).wrapping_add(elapsed_ns(detect_at, now));
+            } else {
+                self.credit_detect(elapsed_ns(self.t0, now));
+            }
+        }
+    }
+}
+
+impl CutReadTimer {
+    fn mark_detect(&mut self) {
+        if !self.armed || self.detect_at.is_some() {
+            return;
+        }
+        let now = Instant::now();
+        unsafe {
+            self.credit_detect(elapsed_ns(self.t0, now));
+        }
+        self.detect_at = Some(now);
+    }
+
+    unsafe fn credit_detect(&mut self, ns: u64) {
+        if self.keep {
+            *self.detect_ns = (*self.detect_ns).wrapping_add(ns);
+            *self.keep_n = (*self.keep_n).wrapping_add(1);
+        } else {
+            *self.skip_ns = (*self.skip_ns).wrapping_add(ns);
+            *self.skip_n = (*self.skip_n).wrapping_add(1);
+        }
+    }
+}
+
+fn elapsed_ns(start: Instant, end: Instant) -> u64 {
+    end.saturating_duration_since(start).as_nanos() as u64
+}
+
+fn unarmed_cut_timer() -> CutReadTimer {
+    CutReadTimer {
+        armed: false,
+        keep: false,
+        t0: Instant::now(),
+        detect_at: None,
+        detect_ns: std::ptr::null_mut(),
+        skip_ns: std::ptr::null_mut(),
+        mv_ns: std::ptr::null_mut(),
+        keep_n: std::ptr::null_mut(),
+        skip_n: std::ptr::null_mut(),
+    }
+}
+
 /// Opt | WaitOnce | NeverWait. Not a method: callers hold `read_set`.
 /// SpecFence Soft=0 thin: never Block on OCC Estimate alone — WaitOnce
 /// consult owns thin consume. Large: AccessArm decide may Block once
@@ -2246,13 +2419,16 @@ impl<S: Storage> Database for VmDb<'_, S> {
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         let location_hash = self.hash_basic(&address);
-        let access_k = if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
-            self.specfence.access_log.note(self.tx_idx, location_hash)
-        } else {
-            0
-        };
+        let access_k =
+            if self.specfence.mode == crate::ConcurrencyMode::SpecFence && !self.indep_first_cut {
+                self.specfence.access_log.note(self.tx_idx, location_hash)
+            } else {
+                0
+            };
+        let mut cut = self.begin_cut_read(location_hash);
         self.spine_before_read(address, location_hash, access_k)?;
         self.consult_ungated_wait_once(address, location_hash, access_k)?;
+        cut.mark_detect();
         self.maybe_wait(address, location_hash, false)?;
         let resolve = self.resolve_read_overlay();
 
@@ -2715,25 +2891,28 @@ impl<S: Storage> Database for VmDb<'_, S> {
     }
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        match self
-            .storage
-            .code_by_hash(&code_hash)
-            .map_err(|err| ReadError::StorageError(err.to_string()))?
-        {
-            Some(evm_code) => Ok(Bytecode::from(evm_code)),
-            None => Ok(Bytecode::default()),
+        let cut = self.begin_cut_code();
+        let fetched = self.storage.code_by_hash(&code_hash);
+        self.end_cut_code(cut);
+        match fetched {
+            Ok(Some(evm_code)) => Ok(Bytecode::from(evm_code)),
+            Ok(None) => Ok(Bytecode::default()),
+            Err(err) => Err(ReadError::StorageError(err.to_string())),
         }
     }
 
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
         let location_hash = hash_deterministic(MemoryLocation::Storage(address, index));
-        let access_k = if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
-            self.specfence.access_log.note(self.tx_idx, location_hash)
-        } else {
-            0
-        };
+        let access_k =
+            if self.specfence.mode == crate::ConcurrencyMode::SpecFence && !self.indep_first_cut {
+                self.specfence.access_log.note(self.tx_idx, location_hash)
+            } else {
+                0
+            };
+        let mut cut = self.begin_cut_read(location_hash);
         self.spine_before_read(address, location_hash, access_k)?;
         self.consult_ungated_wait_once(address, location_hash, access_k)?;
+        cut.mark_detect();
         self.maybe_wait(address, location_hash, true)?;
         let resolve = self.resolve_read_overlay();
 
@@ -3176,6 +3355,13 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             is_lazy: false,
             optimistic_majority_lazy: false,
             optimistic_skip_gate: false,
+            indep_first_cut: false,
+            probe_detect_ns: Cell::new(0),
+            probe_skip_ns: Cell::new(0),
+            probe_mv_ns: Cell::new(0),
+            probe_code_ns: Cell::new(0),
+            probe_keep_n: Cell::new(0),
+            probe_skip_n: Cell::new(0),
             sf_occ_shaped: false,
             vis: VisibilityPolicy::Opt,
             pcc_armed: Cell::new(false),
@@ -3411,6 +3597,28 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
     // value are added to the write set, possibly replacing a pair with a prior value
     // (if it is not the first time the transaction wrote to this location during the
     // execution).
+    /// Move this attempt's first-cut timers onto the spine, then zero them.
+    pub(crate) fn flush_cut_probe(&mut self, exec_ns: u64, finish_ns: u64) {
+        if self.specfence.mode != crate::ConcurrencyMode::SpecFence {
+            return;
+        }
+        let db = self.evm.ctx().db_mut();
+        let cut = db.indep_first_cut;
+        let detect = db.probe_detect_ns.replace(0);
+        let skip = db.probe_skip_ns.replace(0);
+        let mv = db.probe_mv_ns.replace(0);
+        let code = db.probe_code_ns.replace(0);
+        let keep_n = db.probe_keep_n.replace(0);
+        let skip_n = db.probe_skip_n.replace(0);
+        if cut {
+            db.specfence.spine.note_cut_exec(
+                exec_ns, finish_ns, detect, skip, mv, code, keep_n, skip_n,
+            );
+        } else {
+            db.specfence.spine.note_other_exec(exec_ns, finish_ns);
+        }
+    }
+
     pub(crate) fn execute(
         &mut self,
         tx_version: &TxVersion,

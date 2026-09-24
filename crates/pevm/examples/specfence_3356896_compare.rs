@@ -516,7 +516,7 @@ fn run_once(
             if mode_name == "specfence" {
                 print_focus(pevm, mode_name, i, n, &m);
                 println!(
-                    "  spine {mode_name}[{i}] access={} yield_ok={} yield_deadlock={} raw={} waw={} war={} armed={} pins={} revoked={} radar={} defer={} handoff={} retain={} tip_already={} chain={} est_block={} soft={} occ_picks={} spine_cores_max={} spine_cores_end={} handoff_claims={} claim_denied={} exact_wakes={} idle_parks={} help={} steal={} idle_spins={} local_pops={} steal_top_ns={} end_block_ns={} wake_miss={} admit_seed_ns={} join_wait_ns={} join_mark_origin_ns={} idle_ns={} heal_ns={} post_exec_validate_ns={} post_exec_in_span_ns={} span_head={} span_tail={} span_end_ns={} last_exec_ns={} last_val_ns={} quiet_true_ns={} last_exit_ns={} ps_exec_ns={} ps_val_ns={} ps_heal_ns={} ps_yield_ns={} ps_park_ns={} ps_steal_ns={} ps_exec_n={} ps_idle_n={} se_unstarted={} se_unfinished={} se_owed={} se_running={} se_pending={} se_indep={} se_bits={} qf_or={}",
+                    "  spine {mode_name}[{i}] access={} yield_ok={} yield_deadlock={} raw={} waw={} war={} armed={} pins={} revoked={} radar={} defer={} handoff={} retain={} tip_already={} chain={} est_block={} soft={} occ_picks={} spine_cores_max={} spine_cores_end={} handoff_claims={} claim_denied={} exact_wakes={} idle_parks={} help={} steal={} idle_spins={} local_pops={} steal_top_ns={} end_block_ns={} wake_miss={} admit_seed_ns={} join_wait_ns={} join_mark_origin_ns={} idle_ns={} heal_ns={} post_exec_validate_ns={} post_exec_in_span_ns={} span_head={} span_tail={} span_end_ns={} last_exec_ns={} last_val_ns={} quiet_true_ns={} last_exit_ns={} ps_exec_ns={} ps_val_ns={} ps_heal_ns={} ps_yield_ns={} ps_park_ns={} ps_steal_ns={} ps_exec_n={} ps_idle_n={} se_unstarted={} se_unfinished={} se_owed={} se_running={} se_pending={} se_indep={} se_bits={} qf_or={} first_cut={}",
                     spine.access_events,
                     spine.yield_waits_ok,
                     spine.yield_deadlocks,
@@ -578,6 +578,21 @@ fn run_once(
                     spine.span_end_indep,
                     spine.span_end_false_bits,
                     spine.quiet_false_or,
+                    spine.indep_first_cuts,
+                );
+                println!(
+                    "  cutprobe {mode_name}[{i}] cut_exec_ns={} cut_exec_n={} cut_detect_ns={} cut_skip_ns={} cut_mv_ns={} cut_code_ns={} cut_finish_ns={} cut_keep_n={} cut_skip_n={} other_exec_ns={} other_exec_n={}",
+                    spine.cut_exec_ns,
+                    spine.cut_exec_n,
+                    spine.cut_detect_ns,
+                    spine.cut_skip_ns,
+                    spine.cut_mv_ns,
+                    spine.cut_code_ns,
+                    spine.cut_finish_ns,
+                    spine.cut_keep_n,
+                    spine.cut_skip_n,
+                    spine.other_exec_ns,
+                    spine.other_exec_n,
                 );
             }
             IterRow {
@@ -905,7 +920,7 @@ fn main() {
         if primary_is_reuse { "reuse" } else { "cold" }
     );
     println!(
-        "TPS_SUMMARY block={block_no} n={n} cores={cores} iters={iters} occ_tps={occ_tps:.1} sf_tps={sf_tps:.1} ratio={ratio:.3} ge_1_5={} occ_ms={occ_med:.3} sf_ms={primary_sf:.3} est_block={est} soft={soft_arms} occ_picks={occ_picks} access={spine_access} yield_ok={spine_yield_ok} yield_deadlock={spine_yield_deadlock} raw={spine_raw} waw={spine_waw} war={spine_war} armed={spine_armed} pins={spine_pins} revoked={spine_revoked} radar={spine_radar} defer={ordered_defer} handoff={ordered_handoff} retain={retain_keeps} tip_already={tip_already} chain={chain_len} spine_cores_max={} spine_cores_end={} handoff_claims={} claim_denied={} exact_wakes={} idle_parks={} help={} steal={} idle_spins={} local_pops={} steal_top_ns={} end_block_ns={} wake_miss={} admit_seed_ns={} join_wait_ns={} join_mark_origin_ns={} idle_ns={} heal_ns={} post_exec_validate_ns={} post_exec_in_span_ns={} span_head={} span_tail={}",
+        "TPS_SUMMARY block={block_no} n={n} cores={cores} iters={iters} occ_tps={occ_tps:.1} sf_tps={sf_tps:.1} ratio={ratio:.3} ge_1_5={} occ_ms={occ_med:.3} sf_ms={primary_sf:.3} est_block={est} soft={soft_arms} occ_picks={occ_picks} access={spine_access} yield_ok={spine_yield_ok} yield_deadlock={spine_yield_deadlock} raw={spine_raw} waw={spine_waw} war={spine_war} armed={spine_armed} pins={spine_pins} revoked={spine_revoked} radar={spine_radar} defer={ordered_defer} handoff={ordered_handoff} retain={retain_keeps} tip_already={tip_already} chain={chain_len} spine_cores_max={} spine_cores_end={} handoff_claims={} claim_denied={} exact_wakes={} idle_parks={} help={} steal={} idle_spins={} local_pops={} steal_top_ns={} end_block_ns={} wake_miss={} admit_seed_ns={} join_wait_ns={} join_mark_origin_ns={} idle_ns={} heal_ns={} post_exec_validate_ns={} post_exec_in_span_ns={} span_head={} span_tail={} first_cut={}",
         ratio >= 1.5,
         sf.last_spine().spine_cores_max,
         sf.last_spine().spine_cores_end,
@@ -929,6 +944,7 @@ fn main() {
         sf.last_spine().post_exec_in_span_ns,
         sf.last_spine().span_head,
         sf.last_spine().span_tail,
+        sf.last_spine().indep_first_cuts,
     );
 
     let summary = CompareSummary {

@@ -401,6 +401,30 @@ pub struct SpineReport {
     pub span_end_false_bits: u64,
     /// OR of BlockQuiet clauses false on post-span idle samples.
     pub quiet_false_or: u64,
+    /// Ungated non-chain incarnation-0 executes that took the cheap first Opt.
+    pub indep_first_cuts: usize,
+    /// Sum of `vm.execute` plus the following `finish_execution` on first-cut txs.
+    /// Worker sum, not a wall clock.
+    pub cut_exec_ns: u64,
+    /// First-cut `vm.execute` attempts (incarnation 0, including a same-thread retry).
+    pub cut_exec_n: u64,
+    /// Kept Detect inside those executes: spine peek and WaitOnce consult.
+    pub cut_detect_ns: u64,
+    /// First-cut reads that skipped Detect. Includes the branch itself.
+    pub cut_skip_ns: u64,
+    /// MV / account / storage after Detect on first-cut reads.
+    pub cut_mv_ns: u64,
+    /// Interpreter `code_by_hash` on first-cut txs.
+    pub cut_code_ns: u64,
+    /// `finish_execution` after a first-cut `vm.execute`.
+    pub cut_finish_ns: u64,
+    /// First-cut reads that kept Detect.
+    pub cut_keep_n: u64,
+    /// First-cut reads that skipped Detect.
+    pub cut_skip_n: u64,
+    /// `vm.execute` plus `finish_execution` on every other SpecFence attempt.
+    pub other_exec_ns: u64,
+    pub other_exec_n: u64,
 }
 
 /// Shared per-block spine. Workers share it. The Avoid table starts empty.
@@ -440,6 +464,19 @@ pub(crate) struct AccessSpine {
     spine_cores_max: AtomicUsize,
     handoff_claims: AtomicUsize,
     claim_denied: AtomicUsize,
+    /// Cheap first Opt of ungated non-chain txs (incarnation 0).
+    indep_first_cuts: AtomicUsize,
+    cut_exec_ns: AtomicU64,
+    cut_exec_n: AtomicU64,
+    cut_detect_ns: AtomicU64,
+    cut_skip_ns: AtomicU64,
+    cut_mv_ns: AtomicU64,
+    cut_code_ns: AtomicU64,
+    cut_finish_ns: AtomicU64,
+    cut_keep_n: AtomicU64,
+    cut_skip_n: AtomicU64,
+    other_exec_ns: AtomicU64,
+    other_exec_n: AtomicU64,
 }
 
 impl AccessSpine {
@@ -476,6 +513,18 @@ impl AccessSpine {
             spine_cores_max: AtomicUsize::new(0),
             handoff_claims: AtomicUsize::new(0),
             claim_denied: AtomicUsize::new(0),
+            indep_first_cuts: AtomicUsize::new(0),
+            cut_exec_ns: AtomicU64::new(0),
+            cut_exec_n: AtomicU64::new(0),
+            cut_detect_ns: AtomicU64::new(0),
+            cut_skip_ns: AtomicU64::new(0),
+            cut_mv_ns: AtomicU64::new(0),
+            cut_code_ns: AtomicU64::new(0),
+            cut_finish_ns: AtomicU64::new(0),
+            cut_keep_n: AtomicU64::new(0),
+            cut_skip_n: AtomicU64::new(0),
+            other_exec_ns: AtomicU64::new(0),
+            other_exec_n: AtomicU64::new(0),
         }
     }
 
@@ -526,6 +575,51 @@ impl AccessSpine {
     /// This tx is on the carried writer chain.
     pub(crate) fn is_ordered_member(&self, tx: TxIdx) -> bool {
         self.ordered_writers.binary_search(&tx).is_ok()
+    }
+
+    /// `loc` is the ordered writer-chain location. Non-members still Detect here.
+    #[inline]
+    pub(crate) fn is_ordered_loc(&self, loc: MemoryLocationHash) -> bool {
+        self.ordered_loc != u64::MAX && self.ordered_loc == loc && !self.ordered_writers.is_empty()
+    }
+
+    /// One ungated non-chain first execute took the cheap Opt path.
+    #[inline]
+    pub(crate) fn note_indep_first_cut(&self) {
+        self.indep_first_cuts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One first-cut attempt. `finish_ns` is 0 when execute did not commit.
+    #[inline]
+    pub(crate) fn note_cut_exec(
+        &self,
+        exec_ns: u64,
+        finish_ns: u64,
+        detect_ns: u64,
+        skip_ns: u64,
+        mv_ns: u64,
+        code_ns: u64,
+        keep_n: u64,
+        skip_n: u64,
+    ) {
+        self.cut_exec_ns
+            .fetch_add(exec_ns.wrapping_add(finish_ns), Ordering::Relaxed);
+        self.cut_exec_n.fetch_add(1, Ordering::Relaxed);
+        self.cut_detect_ns.fetch_add(detect_ns, Ordering::Relaxed);
+        self.cut_skip_ns.fetch_add(skip_ns, Ordering::Relaxed);
+        self.cut_mv_ns.fetch_add(mv_ns, Ordering::Relaxed);
+        self.cut_code_ns.fetch_add(code_ns, Ordering::Relaxed);
+        self.cut_finish_ns.fetch_add(finish_ns, Ordering::Relaxed);
+        self.cut_keep_n.fetch_add(keep_n, Ordering::Relaxed);
+        self.cut_skip_n.fetch_add(skip_n, Ordering::Relaxed);
+    }
+
+    /// SpecFence attempt that did not take the cheap first Opt.
+    #[inline]
+    pub(crate) fn note_other_exec(&self, exec_ns: u64, finish_ns: u64) {
+        self.other_exec_ns
+            .fetch_add(exec_ns.wrapping_add(finish_ns), Ordering::Relaxed);
+        self.other_exec_n.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn ordered_len(&self) -> usize {
@@ -674,6 +768,12 @@ impl AccessSpine {
     /// Radar from the previous block. Opening a block does not copy it into Avoid.
     pub(crate) fn prior(&self) -> &SpinePrior {
         &self.prior
+    }
+
+    /// Cold antichain read: count the access, skip the intra map.
+    #[inline]
+    pub(crate) fn note_fast_access(&self) {
+        self.access_events.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Host access. Cheap until a location is armed: one atomic.
@@ -973,6 +1073,18 @@ impl AccessSpine {
             span_end_indep: 0,
             span_end_false_bits: 0,
             quiet_false_or: 0,
+            indep_first_cuts: self.indep_first_cuts.load(Ordering::Relaxed),
+            cut_exec_ns: self.cut_exec_ns.load(Ordering::Relaxed),
+            cut_exec_n: self.cut_exec_n.load(Ordering::Relaxed),
+            cut_detect_ns: self.cut_detect_ns.load(Ordering::Relaxed),
+            cut_skip_ns: self.cut_skip_ns.load(Ordering::Relaxed),
+            cut_mv_ns: self.cut_mv_ns.load(Ordering::Relaxed),
+            cut_code_ns: self.cut_code_ns.load(Ordering::Relaxed),
+            cut_finish_ns: self.cut_finish_ns.load(Ordering::Relaxed),
+            cut_keep_n: self.cut_keep_n.load(Ordering::Relaxed),
+            cut_skip_n: self.cut_skip_n.load(Ordering::Relaxed),
+            other_exec_ns: self.other_exec_ns.load(Ordering::Relaxed),
+            other_exec_n: self.other_exec_n.load(Ordering::Relaxed),
         };
         (report, next)
     }
