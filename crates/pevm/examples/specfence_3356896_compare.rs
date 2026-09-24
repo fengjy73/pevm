@@ -528,6 +528,16 @@ fn run_once(
                 m.phase_pick_n,
                 m.phase_pick_ns,
             );
+            println!(
+                "  SPLIT {mode_name}[{i}] opcode_ns={} vmdb_ns={} detect_ns={} other_ns={} vmdb_n={} detect_n={} split_n={}",
+                m.phase_opcode_ns,
+                m.phase_vmdb_ns,
+                m.phase_detect_ns,
+                m.phase_other_ns,
+                m.phase_vmdb_n,
+                m.phase_detect_n,
+                m.phase_split_n,
+            );
             let spine = pevm.last_spine();
             if mode_name == "specfence" {
                 print_focus(pevm, mode_name, i, n, &m);
@@ -735,6 +745,10 @@ fn run_once(
 }
 
 fn main() {
+    // Measurement clocks inside `run_pevm_tx`. Off in the library unless this
+    // env is set. Instant per VmDb call inflates walls; do not relock them.
+    // SAFETY: main is still single-threaded. Workers start later, inside execute.
+    unsafe { std::env::set_var("SPECFENCE_INTERP_SPLIT", "1") };
     let data_dir = repo_root().join("data/ethereum");
     let block_no = std::env::var("SPECFENCE_COMPARE_BLOCK")
         .ok()

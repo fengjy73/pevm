@@ -475,6 +475,21 @@ pub struct SpecFenceMetrics {
     pub phase_pick_n: usize,
     /// Measurement-only. Sum of those pick calls.
     pub phase_pick_ns: u64,
+    /// Measurement-only. `run_pevm_tx` calls that armed the interp split.
+    pub phase_split_n: usize,
+    /// Measurement-only. `run_pevm_tx` minus VmDb and kept Detect.
+    pub phase_opcode_ns: u64,
+    /// Measurement-only. VmDb `Database` methods, excluding kept Detect.
+    pub phase_vmdb_ns: u64,
+    /// Measurement-only. Kept spine peek and WaitOnce consult inside those methods.
+    pub phase_detect_ns: u64,
+    /// Measurement-only. Residual inside `run_pevm_tx` outside the three centers. Always 0:
+    /// opcode is that residual.
+    pub phase_other_ns: u64,
+    /// Measurement-only. VmDb `Database` method entries while the split is armed.
+    pub phase_vmdb_n: u64,
+    /// Measurement-only. Kept Detect sections entered (spine body and/or WaitOnce body).
+    pub phase_detect_n: u64,
 }
 
 /// Shared counters written by worker threads.
@@ -700,6 +715,13 @@ pub(crate) struct MetricsInner {
     phase_val_ns: AtomicU64,
     phase_pick_n: AtomicUsize,
     phase_pick_ns: AtomicU64,
+    phase_split_n: AtomicUsize,
+    phase_opcode_ns: AtomicU64,
+    phase_vmdb_ns: AtomicU64,
+    phase_detect_ns: AtomicU64,
+    phase_other_ns: AtomicU64,
+    phase_vmdb_n: AtomicU64,
+    phase_detect_n: AtomicU64,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -1688,6 +1710,29 @@ impl MetricsInner {
         self.phase_pick_ns.fetch_add(ns, Ordering::Relaxed);
     }
 
+    /// Measurement-only. One `run_pevm_tx` split. No-op when the probe is off.
+    pub(crate) fn add_interp_split(
+        &self,
+        probed: bool,
+        opcode: u64,
+        vmdb: u64,
+        detect: u64,
+        other: u64,
+        vmdb_n: u64,
+        detect_n: u64,
+    ) {
+        if !probed {
+            return;
+        }
+        self.phase_split_n.fetch_add(1, Ordering::Relaxed);
+        self.phase_opcode_ns.fetch_add(opcode, Ordering::Relaxed);
+        self.phase_vmdb_ns.fetch_add(vmdb, Ordering::Relaxed);
+        self.phase_detect_ns.fetch_add(detect, Ordering::Relaxed);
+        self.phase_other_ns.fetch_add(other, Ordering::Relaxed);
+        self.phase_vmdb_n.fetch_add(vmdb_n, Ordering::Relaxed);
+        self.phase_detect_n.fetch_add(detect_n, Ordering::Relaxed);
+    }
+
     pub(crate) fn snapshot(
         &self,
         wave_id: usize,
@@ -1957,6 +2002,13 @@ impl MetricsInner {
             phase_val_ns: self.phase_val_ns.load(Ordering::Relaxed),
             phase_pick_n: self.phase_pick_n.load(Ordering::Relaxed),
             phase_pick_ns: self.phase_pick_ns.load(Ordering::Relaxed),
+            phase_split_n: self.phase_split_n.load(Ordering::Relaxed),
+            phase_opcode_ns: self.phase_opcode_ns.load(Ordering::Relaxed),
+            phase_vmdb_ns: self.phase_vmdb_ns.load(Ordering::Relaxed),
+            phase_detect_ns: self.phase_detect_ns.load(Ordering::Relaxed),
+            phase_other_ns: self.phase_other_ns.load(Ordering::Relaxed),
+            phase_vmdb_n: self.phase_vmdb_n.load(Ordering::Relaxed),
+            phase_detect_n: self.phase_detect_n.load(Ordering::Relaxed),
         }
     }
 }

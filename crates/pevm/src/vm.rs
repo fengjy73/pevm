@@ -169,6 +169,14 @@ pub(crate) struct VmDb<'a, S: Storage> {
     probe_code_ns: Cell<u64>,
     probe_keep_n: Cell<u64>,
     probe_skip_n: Cell<u64>,
+    /// `SPECFENCE_INTERP_SPLIT=1` during this `run_pevm_tx` only.
+    interp_split: Cell<bool>,
+    /// VmDb method time excluding kept Detect.
+    split_vmdb_ns: Cell<u64>,
+    /// Kept spine peek + WaitOnce consult.
+    split_detect_ns: Cell<u64>,
+    split_vmdb_n: Cell<u64>,
+    split_detect_n: Cell<u64>,
     /// Thin Soft=0: no WaitOnce peer before this tx → OCC-shaped execute
     /// (skip consult body / engagement / museum; keep access_log ordinals).
     sf_occ_shaped: bool,
@@ -606,6 +614,55 @@ impl<'a, S: Storage> VmDb<'a, S> {
             && self.specfence.access_arms.is_wait_once(location_hash)
     }
 
+    /// Arm the interp split for this `run_pevm_tx`. Off unless
+    /// `SPECFENCE_INTERP_SPLIT=1`. Does not change the read.
+    fn arm_interp_split(&self) {
+        self.interp_split.set(interp_split_enabled());
+        self.split_vmdb_ns.set(0);
+        self.split_detect_ns.set(0);
+        self.split_vmdb_n.set(0);
+        self.split_detect_n.set(0);
+    }
+
+    fn take_interp_split(&self) -> InterpSplitTake {
+        let probed = self.interp_split.replace(false);
+        InterpSplitTake {
+            probed,
+            vmdb_ns: self.split_vmdb_ns.replace(0),
+            detect_ns: self.split_detect_ns.replace(0),
+            vmdb_n: self.split_vmdb_n.replace(0),
+            detect_n: self.split_detect_n.replace(0),
+        }
+    }
+
+    /// Time this `Database` method. Unarmed: no `Instant`.
+    #[inline]
+    fn begin_vmdb(&self) -> VmdbSplit {
+        if !self.interp_split.get() {
+            return VmdbSplit::Off;
+        }
+        VmdbSplit::On {
+            t0: Instant::now(),
+            detect_before: self.split_detect_ns.get(),
+            vmdb_ns: self.split_vmdb_ns.as_ptr(),
+            detect_ns: self.split_detect_ns.as_ptr(),
+            vmdb_n: self.split_vmdb_n.as_ptr(),
+        }
+    }
+
+    /// Time a kept Detect section. Unarmed: no `Instant`.
+    #[inline]
+    fn begin_kept_detect(&self) -> KeptDetect {
+        if !self.interp_split.get() {
+            return KeptDetect::Off;
+        }
+        KeptDetect::On {
+            t0: Instant::now(),
+            detect_ns: self.split_detect_ns.as_ptr(),
+            detect_n: self.split_detect_n.as_ptr(),
+        }
+    }
+
     /// Structural read: emit [`AccessEvent`](crate::specfence::AccessEvent) and, on a
     /// real unpublished lower writer, WaitTrueVersion inside this host call.
     /// The interpreter frame stays up because this returns `Ok` after the tip
@@ -627,6 +684,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
             self.specfence.spine.note_fast_access();
             return Ok(());
         }
+        let _detect = self.begin_kept_detect();
         let ev = crate::specfence::AccessEvent {
             tx: self.tx_idx,
             loc: location_hash,
@@ -794,6 +852,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if !wait && !crit {
             return Ok(());
         }
+        let _detect = self.begin_kept_detect();
         let thin = self.specfence.scheduler.block_size() <= crate::specfence::THIN_SHELL_N;
         // Checkpoint before this read so fail_k can RewindTo (large blocks).
         // Thin shell skips RewindTo — do not pay rem tax for unused cps.
@@ -2360,6 +2419,100 @@ fn elapsed_ns(start: Instant, end: Instant) -> u64 {
     end.saturating_duration_since(start).as_nanos() as u64
 }
 
+/// One `run_pevm_tx` split. `probed` is false when the env flag is off.
+struct InterpSplitTake {
+    probed: bool,
+    vmdb_ns: u64,
+    detect_ns: u64,
+    vmdb_n: u64,
+    detect_n: u64,
+}
+
+/// `SPECFENCE_INTERP_SPLIT=1`. Read once per process.
+fn interp_split_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("SPECFENCE_INTERP_SPLIT").is_some_and(|v| {
+            let s = v.to_string_lossy();
+            s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
+        })
+    })
+}
+
+/// Times one VmDb `Database` method. Kept Detect is subtracted so it is not
+/// also in the VmDb bucket. The cells live in this worker's `VmDb`.
+enum VmdbSplit {
+    Off,
+    On {
+        t0: Instant,
+        detect_before: u64,
+        vmdb_ns: *mut u64,
+        detect_ns: *mut u64,
+        vmdb_n: *mut u64,
+    },
+}
+
+impl Drop for VmdbSplit {
+    fn drop(&mut self) {
+        let VmdbSplit::On {
+            t0,
+            detect_before,
+            vmdb_ns,
+            detect_ns,
+            vmdb_n,
+        } = self
+        else {
+            return;
+        };
+        let t0 = *t0;
+        let detect_before = *detect_before;
+        let vmdb_ns = *vmdb_ns;
+        let detect_ns = *detect_ns;
+        let vmdb_n = *vmdb_n;
+        let total = elapsed_ns(t0, Instant::now());
+        // SAFETY: the cells belong to this worker's `VmDb` for the whole read.
+        // A nested kept-Detect guard drops first and has already added its ns.
+        unsafe {
+            let detect_delta = (*detect_ns).wrapping_sub(detect_before);
+            let vmdb = total.saturating_sub(detect_delta);
+            *vmdb_ns = (*vmdb_ns).wrapping_add(vmdb);
+            *vmdb_n = (*vmdb_n).wrapping_add(1);
+        }
+    }
+}
+
+/// Times one kept Detect section (spine peek or WaitOnce consult).
+enum KeptDetect {
+    Off,
+    On {
+        t0: Instant,
+        detect_ns: *mut u64,
+        detect_n: *mut u64,
+    },
+}
+
+impl Drop for KeptDetect {
+    fn drop(&mut self) {
+        let KeptDetect::On {
+            t0,
+            detect_ns,
+            detect_n,
+        } = self
+        else {
+            return;
+        };
+        let t0 = *t0;
+        let detect_ns = *detect_ns;
+        let detect_n = *detect_n;
+        let ns = elapsed_ns(t0, Instant::now());
+        // SAFETY: same worker `VmDb` cells as [`VmdbSplit`].
+        unsafe {
+            *detect_ns = (*detect_ns).wrapping_add(ns);
+            *detect_n = (*detect_n).wrapping_add(1);
+        }
+    }
+}
+
 fn unarmed_cut_timer() -> CutReadTimer {
     CutReadTimer {
         armed: false,
@@ -2421,6 +2574,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
     type Error = ReadError;
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        let _split = self.begin_vmdb();
         let location_hash = self.hash_basic(&address);
         let access_k =
             if self.specfence.mode == crate::ConcurrencyMode::SpecFence && !self.indep_first_cut {
@@ -2894,6 +3048,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
     }
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        let _split = self.begin_vmdb();
         let cut = self.begin_cut_code();
         let fetched = self.storage.code_by_hash(&code_hash);
         self.end_cut_code(cut);
@@ -2905,6 +3060,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
     }
 
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        let _split = self.begin_vmdb();
         let location_hash = hash_deterministic(MemoryLocation::Storage(address, index));
         let access_k =
             if self.specfence.mode == crate::ConcurrencyMode::SpecFence && !self.indep_first_cut {
@@ -3201,6 +3357,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
     }
 
     fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
+        let _split = self.begin_vmdb();
         self.storage
             .block_hash(&number)
             .map_err(|err| ReadError::StorageError(err.to_string()))
@@ -3365,6 +3522,11 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             probe_code_ns: Cell::new(0),
             probe_keep_n: Cell::new(0),
             probe_skip_n: Cell::new(0),
+            interp_split: Cell::new(false),
+            split_vmdb_ns: Cell::new(0),
+            split_detect_ns: Cell::new(0),
+            split_vmdb_n: Cell::new(0),
+            split_detect_n: Cell::new(0),
             sf_occ_shaped: false,
             vis: VisibilityPolicy::Opt,
             pcc_armed: Cell::new(false),
@@ -4095,6 +4257,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             }
         }
         phase.mark_interp_start();
+        self.evm.ctx().db_mut().arm_interp_split();
         let profile = crate::specfence::profile_timing_enabled();
         let handler_t0 = profile.then(Instant::now);
         // Iter19: read-prefix OrderedAdmit-snap jump arms WITHOUT protocol TLS (no WaitHard
@@ -4346,7 +4509,8 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 run_body()
             }
         };
-        phase.mark_interp_end();
+        let split = self.evm.ctx().db_mut().take_interp_split();
+        phase.mark_interp_end(split);
         if let Some(t0) = handler_t0 {
             self.specfence
                 .metrics
@@ -5006,6 +5170,13 @@ struct ExecPhase<'a> {
     interp_t0: Option<Instant>,
     reached_interp: bool,
     kind: u8,
+    split_probed: bool,
+    opcode_ns: u64,
+    vmdb_ns: u64,
+    detect_ns: u64,
+    other_ns: u64,
+    vmdb_n: u64,
+    detect_n: u64,
 }
 
 impl<'a> ExecPhase<'a> {
@@ -5018,6 +5189,13 @@ impl<'a> ExecPhase<'a> {
             interp_t0: None,
             reached_interp: false,
             kind: 0,
+            split_probed: false,
+            opcode_ns: 0,
+            vmdb_ns: 0,
+            detect_ns: 0,
+            other_ns: 0,
+            vmdb_n: 0,
+            detect_n: 0,
         }
     }
 
@@ -5027,10 +5205,21 @@ impl<'a> ExecPhase<'a> {
         self.interp_t0 = Some(Instant::now());
     }
 
-    fn mark_interp_end(&mut self) {
+    fn mark_interp_end(&mut self, split: InterpSplitTake) {
         if let Some(t0) = self.interp_t0.take() {
             self.interp_ns = t0.elapsed().as_nanos() as u64;
         }
+        if !split.probed {
+            return;
+        }
+        let timed = split.vmdb_ns.saturating_add(split.detect_ns);
+        self.split_probed = true;
+        self.opcode_ns = self.interp_ns.saturating_sub(timed);
+        self.vmdb_ns = split.vmdb_ns;
+        self.detect_ns = split.detect_ns;
+        self.other_ns = 0;
+        self.vmdb_n = split.vmdb_n;
+        self.detect_n = split.detect_n;
     }
 
     fn mark_ok(&mut self) {
@@ -5055,5 +5244,14 @@ impl Drop for ExecPhase<'_> {
         };
         self.metrics
             .add_exec_phase(total, pre, interp, post, self.kind);
+        self.metrics.add_interp_split(
+            self.split_probed,
+            self.opcode_ns,
+            self.vmdb_ns,
+            self.detect_ns,
+            self.other_ns,
+            self.vmdb_n,
+            self.detect_n,
+        );
     }
 }
