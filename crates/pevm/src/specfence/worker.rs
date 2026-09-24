@@ -41,6 +41,16 @@ pub(crate) fn run_sf_block<F, V>(
         }
     }
     let _exit_wake = ExitWake(runnable);
+    // Records the whole idle arm, including early `break` / `continue`.
+    struct IdleAccum<'a> {
+        set: &'a RunnableSet,
+        t0: Instant,
+    }
+    impl Drop for IdleAccum<'_> {
+        fn drop(&mut self) {
+            self.set.add_idle_ns(self.t0.elapsed().as_nanos() as u64);
+        }
+    }
     let mut spins = 0u64;
     loop {
         spins += 1;
@@ -223,6 +233,10 @@ pub(crate) fn run_sf_block<F, V>(
                         specfence.spine.release_owner_tx(tx_idx);
                         // finish_execution may have waved dependents — park them
                         // on RunnableSet before this worker spends time validating.
+                        // Probe: drain + validate + resolve. Execute itself is
+                        // outside this window. Classified by window start.
+                        let outside = post_exec_start_outside_span(specfence, runnable);
+                        let phase_t0 = Instant::now();
                         drain_wave(specfence, scheduler, runnable);
                         let (plan, invalid) = validate_to_plan(&tx_version, vis);
                         resolve_plan::apply(
@@ -239,6 +253,7 @@ pub(crate) fn run_sf_block<F, V>(
                                 invalid: &invalid,
                             },
                         );
+                        record_post_exec(runnable, outside, phase_t0.elapsed().as_nanos() as u64);
                     }
                     SfExec::Blocked { on } => {
                         specfence.spine.release_owner_tx(tx_idx);
@@ -299,6 +314,10 @@ pub(crate) fn run_sf_block<F, V>(
             }
             Some(Task::Validation(tx_version)) => {
                 let vis = VisibilityPolicy::for_ready(specfence.ready_edges, tx_version.tx_idx);
+                // Revalidate is the same post-exec window, without the
+                // execute-path drain that already ran on the owner.
+                let outside = post_exec_start_outside_span(specfence, runnable);
+                let phase_t0 = Instant::now();
                 let (plan, invalid) = validate_to_plan(&tx_version, vis);
                 resolve_plan::apply(
                     plan,
@@ -314,22 +333,31 @@ pub(crate) fn run_sf_block<F, V>(
                         invalid: &invalid,
                     },
                 );
+                record_post_exec(runnable, outside, phase_t0.elapsed().as_nanos() as u64);
                 metrics.add_worker_busy_ns(t0.elapsed().as_nanos() as u64);
             }
             None => {
                 // Idle: `pick` already stole the antichain tail. Help release
                 // is heal of writers that have published.
+                // `idle_ns` is this whole arm. `heal_ns` is the heal cluster
+                // only (not yield / spin / park). Both are worker sums.
                 metrics.add_idle_core_ns(t0.elapsed().as_nanos() as u64);
                 runnable.note_idle_spin();
+                let _idle_accum = IdleAccum {
+                    set: runnable,
+                    t0: Instant::now(),
+                };
                 if abort() {
                     break;
                 }
+                let heal_t0 = Instant::now();
                 specfence
                     .ready_edges
                     .heal_finished_preds(|w| scheduler.is_done(w));
                 let _ = specfence.ready_edges.wake_ready_sleepers(specfence.wave);
                 let _ = runnable.heal(specfence.ready_edges, scheduler);
                 drain_wave(specfence, scheduler, runnable);
+                runnable.add_heal_ns(heal_t0.elapsed().as_nanos() as u64);
                 if scheduler.all_validated() && runnable.pending_work() == 0 {
                     break;
                 }
@@ -339,12 +367,14 @@ pub(crate) fn run_sf_block<F, V>(
                     && scheduler.has_unfinished()
                     && !runnable.waiting_on_live_producer(specfence.ready_edges, scheduler)
                 {
+                    let heal_t0 = Instant::now();
                     let _ = runnable.heal(specfence.ready_edges, scheduler);
                     drain_wave(specfence, scheduler, runnable);
                     if runnable.pending_work() == 0 {
                         let _ = runnable.force_idle_recover(specfence.ready_edges, scheduler);
                         drain_wave(specfence, scheduler, runnable);
                     }
+                    runnable.add_heal_ns(heal_t0.elapsed().as_nanos() as u64);
                     if runnable.pending_work() > 0 {
                         continue;
                     }
@@ -400,6 +430,53 @@ pub(crate) enum SfExec {
     Fatal,
 }
 
+/// `true` when a post-exec window that starts at `now_ns` is outside the
+/// prior-crit span `[head.first_start, tail.first_start)`.
+///
+/// No chain, a zero-width chain, or a head that has not started yet counts
+/// as outside. An open span (head started, tail not) counts as inside for
+/// the whole window, even if the tail starts mid-window.
+pub(crate) const fn post_exec_outside_span(
+    head: usize,
+    tail: usize,
+    head_ns: u64,
+    tail_ns: u64,
+    now_ns: u64,
+) -> bool {
+    if head == usize::MAX || tail == usize::MAX || head == tail {
+        return true;
+    }
+    if head_ns == 0 {
+        return true;
+    }
+    if tail_ns == 0 {
+        return false;
+    }
+    now_ns < head_ns || now_ns >= tail_ns
+}
+
+fn post_exec_start_outside_span(specfence: SpecFenceCtx<'_>, runnable: &RunnableSet) -> bool {
+    let head = runnable.span_head();
+    let tail = runnable.span_tail();
+    let load = |tx: usize| {
+        specfence
+            .tx_first_start
+            .get(tx)
+            .map(|slot| slot.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    };
+    let now_ns = specfence.exec_origin.elapsed().as_nanos() as u64;
+    post_exec_outside_span(head, tail, load(head), load(tail), now_ns)
+}
+
+fn record_post_exec(runnable: &RunnableSet, outside: bool, ns: u64) {
+    if outside {
+        runnable.add_post_exec_validate_ns(ns);
+    } else {
+        runnable.add_post_exec_in_span_ns(ns);
+    }
+}
+
 fn drain_wave(specfence: SpecFenceCtx<'_>, scheduler: &Scheduler, runnable: &RunnableSet) {
     let mut still_executing = Vec::new();
     while let Some(t) = specfence.wave.pop_ready() {
@@ -452,5 +529,18 @@ mod tests {
             code.contains("note_consumer_on"),
             "Blocked parks must plant Detect so heal cannot incarnation++ mill"
         );
+    }
+
+    #[test]
+    fn post_exec_span_window_is_start_classified() {
+        use super::post_exec_outside_span;
+        assert!(post_exec_outside_span(usize::MAX, usize::MAX, 0, 0, 10));
+        assert!(post_exec_outside_span(3, 3, 10, 10, 10));
+        assert!(post_exec_outside_span(1, 9, 0, 0, 50));
+        assert!(!post_exec_outside_span(1, 9, 100, 0, 150));
+        assert!(post_exec_outside_span(1, 9, 100, 400, 50));
+        assert!(!post_exec_outside_span(1, 9, 100, 400, 100));
+        assert!(!post_exec_outside_span(1, 9, 100, 400, 399));
+        assert!(post_exec_outside_span(1, 9, 100, 400, 400));
     }
 }

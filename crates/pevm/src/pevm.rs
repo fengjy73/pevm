@@ -561,6 +561,10 @@ impl Pevm {
         let edges = EdgeTable::new();
         let sketch = HotSketch::new();
         let process = ProcessTrace::new();
+        // Soft=0 phase probe, always on (not PROFILE): host serial seed until
+        // the instant before `thread::scope`. Before any tx first_start.
+        let admit_seed_t0 =
+            (self.concurrency_mode == ConcurrencyMode::SpecFence).then(Instant::now);
         if self.concurrency_mode == ConcurrencyMode::SpecFence {
             let flipped = self.inter_prior.take_last_flipped();
             let quiet = abc_prior_morph.is_some_and(|m| m.dominant_quiet());
@@ -609,21 +613,39 @@ impl Pevm {
             // Do not sample block_size as ready_width when A1=0 (that read as 176).
             // Reuse WAW: nearest pred on the learned chain, then pop that
             // head before the low-index antichain.
-            let crit_head = self
-                .inter_prior
-                .crit_chain()
-                .and_then(|(loc, writers)| {
-                    access_arms.note_prior_touchers(loc, &writers);
-                    if writers.len() < 32 || writers.len() * 4 > block_size {
-                        return None;
-                    }
-                    access_arms.install_crit_chain(loc, &writers);
-                    ready_edges.plant_nearest_preds(loc, &writers);
-                    // ChainSpineTip: light true-publish plane (not DashMap WaitOnce tips).
-                    sf_tips.bind_chain_spine(loc, &writers);
-                    writers.first().copied()
-                });
+            let crit_head = self.inter_prior.crit_chain().and_then(|(loc, writers)| {
+                access_arms.note_prior_touchers(loc, &writers);
+                // Span filter uses the prior crit even when the ≥32 install
+                // gate skips (thin focus chain is shorter than 32).
+                if let (Some(head), Some(tail)) =
+                    (writers.iter().copied().min(), writers.iter().copied().max())
+                {
+                    runnable.note_span_ends(head, tail);
+                }
+                if writers.len() < 32 || writers.len() * 4 > block_size {
+                    return None;
+                }
+                access_arms.install_crit_chain(loc, &writers);
+                ready_edges.plant_nearest_preds(loc, &writers);
+                // ChainSpineTip: light true-publish plane (not DashMap WaitOnce tips).
+                sf_tips.bind_chain_spine(loc, &writers);
+                writers.first().copied()
+            });
             self.last_begin_blocked = ready_edges.blocked_consumers();
+            // Thin focus chains are shorter than the ≥32 sticky install, so
+            // `inter_prior.crit_chain()` stays empty. The spine still carries
+            // last block's longest writer list; that is the chain `ordered_writers`
+            // and the next focus span are built from.
+            if runnable.span_head() == usize::MAX {
+                if let (Some(head), Some(tail)) = (
+                    self.spine_prior.chains.iter().copied().min(),
+                    self.spine_prior.chains.iter().copied().max(),
+                ) {
+                    if head != tail {
+                        runnable.note_span_ends(head, tail);
+                    }
+                }
+            }
             runnable.seed_begin(&ready_edges, &producer_stages, &scheduler, crit_head);
             // P3: do not sample (n_tx − blocked) as ready_width (reads as 172).
             if quiet && !learner.has_any_predicted() {
@@ -683,7 +705,13 @@ impl Pevm {
         };
 
         // TODO: Better thread handling
+        let admit_seed_ns = admit_seed_t0
+            .map(|t0| t0.elapsed().as_nanos() as u64)
+            .unwrap_or(0);
         let sf_worker_seq = std::sync::atomic::AtomicUsize::new(0);
+        // Join probe starts after the last spawn. `thread::scope` joins after
+        // this closure returns, so the stamp is the host wait's start.
+        let mut join_mark = exec_origin;
         thread::scope(|scope| {
             if self.concurrency_mode == ConcurrencyMode::SpecFence {
                 // True SF-PS ring: RunnableSet.pick → Execute(vis) → Resolve.apply.
@@ -716,6 +744,7 @@ impl Pevm {
                         );
                     });
                 }
+                join_mark = Instant::now();
             } else {
                 for _ in 0..concurrency_level.into() {
                     scope.spawn(|| {
@@ -787,6 +816,16 @@ impl Pevm {
             report.seed_owner_local_pops = runnable.seed_owner_local_pops();
             report.steal_top_ns = runnable.steal_top_ns();
             report.exact_wake_missed_nopark = runnable.exact_wake_missed_nopark();
+            report.admit_seed_ns = admit_seed_ns;
+            report.join_wait_ns = join_mark.elapsed().as_nanos() as u64;
+            report.join_mark_origin_ns =
+                join_mark.saturating_duration_since(exec_origin).as_nanos() as u64;
+            report.idle_ns = runnable.idle_ns();
+            report.heal_ns = runnable.heal_ns();
+            report.post_exec_validate_ns = runnable.post_exec_validate_ns();
+            report.post_exec_in_span_ns = runnable.post_exec_in_span_ns();
+            report.span_head = runnable.span_head();
+            report.span_tail = runnable.span_tail();
             self.spine_prior = next;
             self.last_spine = report;
         }
