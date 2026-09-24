@@ -175,6 +175,7 @@ mod access_policy;
 mod access_spine;
 mod access_vis;
 pub(crate) mod admit;
+mod admit_deque;
 mod arm_table;
 mod bayes;
 mod boundary;
