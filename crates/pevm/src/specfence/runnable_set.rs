@@ -193,10 +193,13 @@ impl RunnableSet {
         scheduler: &Scheduler,
         crit_head: Option<TxIdx>,
     ) {
-        // Index order is the suffix proxy. A learned crit head is pushed
-        // last so the local LIFO pop starts that chain before lower indices.
-        // Steal still pops the high-index end (antichain tail).
+        // One AdmitIndep deque at the start (worker 0). Push high indices
+        // first so the owner LIFO-pops the low end, and the chain head last.
+        // Other cores FIFO-steal the high-index tail. Round-robin seeding
+        // put every core in the prefix together and committed a wrong
+        // receipt (15274915 seq!=par from 2 cores).
         let head = crit_head.filter(|&tx| tx < self.block_size);
+        self.seed_shard.store(0, Ordering::Relaxed);
         for tx in (0..self.block_size).rev() {
             if Some(tx) == head {
                 continue;
@@ -204,12 +207,9 @@ impl RunnableSet {
             self.seed_one(tx, ready, stages, scheduler);
         }
         if let Some(tx) = head {
-            // Chain head is the first SpineHop. Park it at the LIFO top of
-            // worker 0 so that core starts the chain while others eat width.
-            self.seed_shard.store(0, Ordering::Relaxed);
             self.seed_one(tx, ready, stages, scheduler);
-            self.seed_shard.store(usize::MAX, Ordering::Relaxed);
         }
+        self.seed_shard.store(usize::MAX, Ordering::Relaxed);
     }
 
     fn seed_one(
