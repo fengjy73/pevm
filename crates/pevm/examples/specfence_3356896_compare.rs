@@ -516,7 +516,7 @@ fn run_once(
             if mode_name == "specfence" {
                 print_focus(pevm, mode_name, i, n, &m);
                 println!(
-                    "  spine {mode_name}[{i}] access={} yield_ok={} yield_deadlock={} raw={} waw={} war={} armed={} pins={} revoked={} radar={} defer={} handoff={} retain={} tip_already={} chain={} est_block={} soft={} occ_picks={} spine_cores_max={} spine_cores_end={} handoff_claims={} claim_denied={} exact_wakes={} idle_parks={} help={} steal={} idle_spins={} local_pops={} steal_top_ns={} end_block_ns={} wake_miss={} admit_seed_ns={} join_wait_ns={} join_mark_origin_ns={} idle_ns={} heal_ns={} post_exec_validate_ns={} post_exec_in_span_ns={} span_head={} span_tail={}",
+                    "  spine {mode_name}[{i}] access={} yield_ok={} yield_deadlock={} raw={} waw={} war={} armed={} pins={} revoked={} radar={} defer={} handoff={} retain={} tip_already={} chain={} est_block={} soft={} occ_picks={} spine_cores_max={} spine_cores_end={} handoff_claims={} claim_denied={} exact_wakes={} idle_parks={} help={} steal={} idle_spins={} local_pops={} steal_top_ns={} end_block_ns={} wake_miss={} admit_seed_ns={} join_wait_ns={} join_mark_origin_ns={} idle_ns={} heal_ns={} post_exec_validate_ns={} post_exec_in_span_ns={} span_head={} span_tail={} span_end_ns={} last_exec_ns={} last_val_ns={} quiet_true_ns={} last_exit_ns={} ps_exec_ns={} ps_val_ns={} ps_heal_ns={} ps_yield_ns={} ps_park_ns={} ps_steal_ns={} ps_exec_n={} ps_idle_n={} se_unstarted={} se_unfinished={} se_owed={} se_running={} se_pending={} se_indep={} se_bits={} qf_or={}",
                     spine.access_events,
                     spine.yield_waits_ok,
                     spine.yield_deadlocks,
@@ -557,6 +557,27 @@ fn run_once(
                     spine.post_exec_in_span_ns,
                     spine.span_head,
                     spine.span_tail,
+                    spine.span_end_origin_ns,
+                    spine.last_exec_origin_ns,
+                    spine.last_validate_origin_ns,
+                    spine.quiet_true_origin_ns,
+                    spine.last_exit_origin_ns,
+                    spine.post_span_exec_ns,
+                    spine.post_span_validate_ns,
+                    spine.post_span_heal_ns,
+                    spine.post_span_yield_ns,
+                    spine.post_span_park_ns,
+                    spine.post_span_steal_ns,
+                    spine.post_span_exec_n,
+                    spine.post_span_idle_n,
+                    spine.span_end_not_started,
+                    spine.span_end_unfinished,
+                    spine.span_end_owed,
+                    spine.span_end_running,
+                    spine.span_end_pending,
+                    spine.span_end_indep,
+                    spine.span_end_false_bits,
+                    spine.quiet_false_or,
                 );
             }
             IterRow {

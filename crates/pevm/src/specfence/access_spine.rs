@@ -359,6 +359,48 @@ pub struct SpineReport {
     pub span_head: usize,
     /// Prior crit tail tx used by the span filter. `usize::MAX` when no chain.
     pub span_tail: usize,
+    /// `exec_origin` when the prior-chain tail recorded `first_start`. 0 if cold.
+    pub span_end_origin_ns: u64,
+    /// Latest `exec_origin` at which an execution attempt returned.
+    pub last_exec_origin_ns: u64,
+    /// Latest `exec_origin` at which validate/resolve returned.
+    pub last_validate_origin_ns: u64,
+    /// First `exec_origin` at which a worker observed full BlockQuiet. 0 if none.
+    pub quiet_true_origin_ns: u64,
+    /// Latest `exec_origin` at which a worker left the loop.
+    pub last_exit_origin_ns: u64,
+    /// Sum of `execute` time at or after the span end. Not a wall clock.
+    pub post_span_exec_ns: u64,
+    /// Sum of validate/resolve time at or after the span end. Not a wall clock.
+    pub post_span_validate_ns: u64,
+    /// Sum of idle-arm heal time at or after the span end. Not a wall clock.
+    pub post_span_heal_ns: u64,
+    /// Sum of `yield_now` time at or after the span end. Not a wall clock.
+    pub post_span_yield_ns: u64,
+    /// Sum of `park_idle` time at or after the span end. Not a wall clock.
+    pub post_span_park_ns: u64,
+    /// Sum of `pick → None` time at or after the span end. Not a wall clock.
+    pub post_span_steal_ns: u64,
+    /// Execution attempts that started at or after the span end.
+    pub post_span_exec_n: usize,
+    /// Idle-arm entries at or after the span end.
+    pub post_span_idle_n: usize,
+    /// Txs whose `first_start` was still 0 when the tail started.
+    pub span_end_not_started: usize,
+    /// Txs not yet Executed/Validated when the tail started.
+    pub span_end_unfinished: usize,
+    /// Executed-but-not-validated txs when the tail started.
+    pub span_end_owed: usize,
+    /// `ST_RUNNING` count when the tail started.
+    pub span_end_running: usize,
+    /// `pending_work` when the tail started.
+    pub span_end_pending: usize,
+    /// AdmitShard occupancy when the tail started.
+    pub span_end_indep: usize,
+    /// BlockQuiet clauses false at the span end. See `RunnableSet::QF_*`.
+    pub span_end_false_bits: u64,
+    /// OR of BlockQuiet clauses false on post-span idle samples.
+    pub quiet_false_or: u64,
 }
 
 /// Shared per-block spine. Workers share it. The Avoid table starts empty.
@@ -522,6 +564,12 @@ impl AccessSpine {
         if self.ordered_writers.binary_search(&tx).is_ok() {
             self.started.insert(tx);
         }
+    }
+
+    /// Slot has no unclaimed spine hop. Does not take the hop.
+    #[inline]
+    pub(crate) fn handoff_is_empty(&self) -> bool {
+        self.handoff.load(Ordering::Acquire) == usize::MAX
     }
 
     /// Successor to run next, if a chain start queued one.
@@ -904,6 +952,27 @@ impl AccessSpine {
             post_exec_in_span_ns: 0,
             span_head: usize::MAX,
             span_tail: usize::MAX,
+            span_end_origin_ns: 0,
+            last_exec_origin_ns: 0,
+            last_validate_origin_ns: 0,
+            quiet_true_origin_ns: 0,
+            last_exit_origin_ns: 0,
+            post_span_exec_ns: 0,
+            post_span_validate_ns: 0,
+            post_span_heal_ns: 0,
+            post_span_yield_ns: 0,
+            post_span_park_ns: 0,
+            post_span_steal_ns: 0,
+            post_span_exec_n: 0,
+            post_span_idle_n: 0,
+            span_end_not_started: 0,
+            span_end_unfinished: 0,
+            span_end_owed: 0,
+            span_end_running: 0,
+            span_end_pending: 0,
+            span_end_indep: 0,
+            span_end_false_bits: 0,
+            quiet_false_or: 0,
         };
         (report, next)
     }

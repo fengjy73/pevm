@@ -185,9 +185,17 @@ pub(crate) fn run_sf_block<F, V>(
             );
         }
         if abort() {
+            mark_exit(specfence, runnable);
             break;
         }
-        if scheduler.all_validated() && runnable.pending_work() == 0 {
+        // Fast complete path: the tally only. A short counter must not scan
+        // every tx before pick; QuietExit on the idle arm reads the flags.
+        if scheduler.validated_tally_reached()
+            && runnable.pending_work() == 0
+            && specfence.wave.ready_depth() == 0
+            && specfence.spine.handoff_is_empty()
+        {
+            mark_exit(specfence, runnable);
             break;
         }
         let t0 = Instant::now();
@@ -208,13 +216,14 @@ pub(crate) fn run_sf_block<F, V>(
                 let tx_idx = tx_version.tx_idx;
                 if let Some(slot) = specfence.tx_first_start.get(tx_idx) {
                     if slot.load(Ordering::Relaxed) == 0 {
-                        let ns = specfence.exec_origin.elapsed().as_nanos() as u64;
-                        let _ = slot.compare_exchange(
-                            0,
-                            ns.max(1),
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                        );
+                        let ns = origin_ns(specfence).max(1);
+                        if slot
+                            .compare_exchange(0, ns, Ordering::Relaxed, Ordering::Relaxed)
+                            .is_ok()
+                            && tx_idx == runnable.span_tail()
+                        {
+                            publish_span_end(scheduler, specfence, runnable, ns);
+                        }
                     }
                 }
                 specfence.ready_edges.note_started(tx_idx);
@@ -226,8 +235,11 @@ pub(crate) fn run_sf_block<F, V>(
                 } else {
                     VisibilityPolicy::for_ready(specfence.ready_edges, tx_idx)
                 };
+                let exec_start = origin_ns(specfence);
                 match execute(tx_version.clone(), vis) {
                     SfExec::Executed { wrote_new_location } => {
+                        let exec_end = origin_ns(specfence);
+                        note_exec_span(runnable, exec_start, exec_end);
                         // Next hop may start on another core while we validate.
                         // Ownership ends with the hop, not with validation.
                         specfence.spine.release_owner_tx(tx_idx);
@@ -237,6 +249,7 @@ pub(crate) fn run_sf_block<F, V>(
                         // outside this window. Classified by window start.
                         let outside = post_exec_start_outside_span(specfence, runnable);
                         let phase_t0 = Instant::now();
+                        let val_start = origin_ns(specfence);
                         drain_wave(specfence, scheduler, runnable);
                         let (plan, invalid) = validate_to_plan(&tx_version, vis);
                         resolve_plan::apply(
@@ -253,9 +266,11 @@ pub(crate) fn run_sf_block<F, V>(
                                 invalid: &invalid,
                             },
                         );
+                        note_validate_span(runnable, val_start, origin_ns(specfence));
                         record_post_exec(runnable, outside, phase_t0.elapsed().as_nanos() as u64);
                     }
                     SfExec::Blocked { on } => {
+                        note_exec_span(runnable, exec_start, origin_ns(specfence));
                         specfence.spine.release_owner_tx(tx_idx);
                         // add_dependency parks leave Aborting with no Detect
                         // edge. Heal then recovered them into a live antichain
@@ -306,7 +321,9 @@ pub(crate) fn run_sf_block<F, V>(
                         drain_wave(specfence, scheduler, runnable);
                     }
                     SfExec::Fatal => {
+                        note_exec_span(runnable, exec_start, origin_ns(specfence));
                         specfence.spine.release_owner_tx(tx_idx);
+                        mark_exit(specfence, runnable);
                         break;
                     }
                 }
@@ -318,6 +335,7 @@ pub(crate) fn run_sf_block<F, V>(
                 // execute-path drain that already ran on the owner.
                 let outside = post_exec_start_outside_span(specfence, runnable);
                 let phase_t0 = Instant::now();
+                let val_start = origin_ns(specfence);
                 let (plan, invalid) = validate_to_plan(&tx_version, vis);
                 resolve_plan::apply(
                     plan,
@@ -333,10 +351,15 @@ pub(crate) fn run_sf_block<F, V>(
                         invalid: &invalid,
                     },
                 );
+                note_validate_span(runnable, val_start, origin_ns(specfence));
                 record_post_exec(runnable, outside, phase_t0.elapsed().as_nanos() as u64);
                 metrics.add_worker_busy_ns(t0.elapsed().as_nanos() as u64);
             }
             None => {
+                if runnable.span_end_ns() != 0 {
+                    runnable.add_post_span_steal_ns(t0.elapsed().as_nanos() as u64);
+                    runnable.inc_post_span_idle_n();
+                }
                 // Idle: `pick` already stole the antichain tail. Help release
                 // is heal of writers that have published.
                 // `idle_ns` is this whole arm. `heal_ns` is the heal cluster
@@ -348,6 +371,13 @@ pub(crate) fn run_sf_block<F, V>(
                     t0: Instant::now(),
                 };
                 if abort() {
+                    mark_exit(specfence, runnable);
+                    break;
+                }
+                // BlockQuiet before another heal. `pick → None` already
+                // missed one steal probe. Do not yield until the tally moves.
+                if observe_quiet(scheduler, specfence, runnable) {
+                    mark_exit(specfence, runnable);
                     break;
                 }
                 let heal_t0 = Instant::now();
@@ -357,27 +387,41 @@ pub(crate) fn run_sf_block<F, V>(
                 let _ = specfence.ready_edges.wake_ready_sleepers(specfence.wave);
                 let _ = runnable.heal(specfence.ready_edges, scheduler);
                 drain_wave(specfence, scheduler, runnable);
-                runnable.add_heal_ns(heal_t0.elapsed().as_nanos() as u64);
-                if scheduler.all_validated() && runnable.pending_work() == 0 {
+                let heal_ns = heal_t0.elapsed().as_nanos() as u64;
+                runnable.add_heal_ns(heal_ns);
+                if runnable.span_end_ns() != 0 {
+                    runnable.add_post_span_heal_ns(heal_ns);
+                }
+                if observe_quiet(scheduler, specfence, runnable) {
+                    mark_exit(specfence, runnable);
                     break;
                 }
                 // Last-ditch: unfinished + empty queues + no live producer.
-                // Heal already ran; if still stuck, yield then retry heal.
+                // Heal already ran; recover ghosts, then QuietExit if the
+                // schedule is silent. Do not spin on the validation tally.
                 if runnable.pending_work() == 0
-                    && scheduler.has_unfinished()
                     && !runnable.waiting_on_live_producer(specfence.ready_edges, scheduler)
+                    && (scheduler.has_unfinished() || scheduler.has_done_unvalidated())
                 {
                     let heal_t0 = Instant::now();
                     let _ = runnable.heal(specfence.ready_edges, scheduler);
                     drain_wave(specfence, scheduler, runnable);
-                    if runnable.pending_work() == 0 {
+                    if runnable.pending_work() == 0 && !runnable.any_running() {
                         let _ = runnable.force_idle_recover(specfence.ready_edges, scheduler);
                         drain_wave(specfence, scheduler, runnable);
                     }
-                    runnable.add_heal_ns(heal_t0.elapsed().as_nanos() as u64);
+                    let heal_ns = heal_t0.elapsed().as_nanos() as u64;
+                    runnable.add_heal_ns(heal_ns);
+                    if runnable.span_end_ns() != 0 {
+                        runnable.add_post_span_heal_ns(heal_ns);
+                    }
                     if runnable.pending_work() > 0 {
                         continue;
                     }
+                }
+                if observe_quiet(scheduler, specfence, runnable) {
+                    mark_exit(specfence, runnable);
+                    break;
                 }
                 if runnable.pending_work() > 0 {
                     continue;
@@ -392,13 +436,246 @@ pub(crate) fn run_sf_block<F, V>(
                     if runnable.pending_work() > 0 {
                         continue;
                     }
+                    if observe_quiet(scheduler, specfence, runnable) {
+                        mark_exit(specfence, runnable);
+                        break;
+                    }
+                    let park_t0 = Instant::now();
                     runnable.park_idle(worker_i);
+                    if runnable.span_end_ns() != 0 {
+                        runnable.add_post_span_park_ns(park_t0.elapsed().as_nanos() as u64);
+                    }
                     continue;
                 }
+                // Still unfinished or a tip is unpublished. Back off so the
+                // last producer keeps the core. QuietExit already returned.
+                let yield_t0 = Instant::now();
                 std::thread::yield_now();
+                if runnable.span_end_ns() != 0 {
+                    runnable.add_post_span_yield_ns(yield_t0.elapsed().as_nanos() as u64);
+                }
             }
         }
     }
+}
+
+fn origin_ns(specfence: SpecFenceCtx<'_>) -> u64 {
+    specfence.exec_origin.elapsed().as_nanos() as u64
+}
+
+fn mark_exit(specfence: SpecFenceCtx<'_>, runnable: &RunnableSet) {
+    runnable.note_worker_exit(origin_ns(specfence));
+}
+
+/// Nanoseconds of `[start, end)` that fall at or after `mark`.
+/// `mark == 0` means the span end was never published.
+pub(crate) fn ns_after(mark: u64, start: u64, end: u64) -> u64 {
+    if mark == 0 || end <= mark || end <= start {
+        return 0;
+    }
+    if start >= mark {
+        end - start
+    } else {
+        end - mark
+    }
+}
+
+fn note_exec_span(runnable: &RunnableSet, start: u64, end: u64) {
+    runnable.note_last_exec(end);
+    let mark = runnable.span_end_ns();
+    runnable.add_post_span_exec_ns(ns_after(mark, start, end));
+    if mark != 0 && start >= mark {
+        runnable.inc_post_span_exec_n();
+    }
+}
+
+fn note_validate_span(runnable: &RunnableSet, start: u64, end: u64) {
+    runnable.note_last_validate(end);
+    runnable.add_post_span_validate_ns(ns_after(runnable.span_end_ns(), start, end));
+}
+
+fn publish_span_end(
+    scheduler: &Scheduler,
+    specfence: SpecFenceCtx<'_>,
+    runnable: &RunnableSet,
+    origin: u64,
+) {
+    let n = scheduler.block_size();
+    let mut not_started = 0usize;
+    let mut unfinished = 0usize;
+    let mut owed = 0usize;
+    for i in 0..n {
+        if specfence
+            .tx_first_start
+            .get(i)
+            .is_some_and(|slot| slot.load(Ordering::Relaxed) == 0)
+        {
+            not_started += 1;
+        }
+        let done = scheduler.is_done(i);
+        let validated = scheduler.is_validated(i);
+        if !done && !validated {
+            unfinished += 1;
+        } else if done && !validated {
+            owed += 1;
+        }
+    }
+    let view = quiet_view(scheduler, specfence, runnable);
+    runnable.publish_span_end(
+        origin,
+        super::runnable_set::SpanEndSnap {
+            not_started,
+            unfinished,
+            owed,
+            running: runnable.running_n(),
+            pending: runnable.pending_work(),
+            indep: runnable.q_indep_len(),
+            false_bits: quiet_false_bits(view),
+        },
+    );
+}
+
+/// Inputs for [`quiet_exit`]. Booleans only, so the predicate can be tested
+/// without a block.
+#[derive(Clone, Copy)]
+struct QuietExitView {
+    /// Admit shards, released, ordered, or revalidate still hold a tx.
+    pending: bool,
+    /// Wave bag still holds a wake that [`drain_wave`] has not applied.
+    wave_pending: bool,
+    /// Spine handoff slot has an unclaimed hop.
+    handoff_empty: bool,
+    /// Chain hop still owns `spine_owner`.
+    spine_busy: bool,
+    /// Some tx is `ST_RUNNING`.
+    any_running: bool,
+    /// Detect still has a gated tx that has not been marked done.
+    pending_gated: bool,
+    /// A sleeper is waiting for a true tip.
+    sleeping: bool,
+    /// `ST_WAIT` on a producer that is executing.
+    waiting_live: bool,
+    /// Some tx is not yet Executed or Validated.
+    unfinished: bool,
+    /// Some tx is Executed and still needs validate.
+    done_unvalidated: bool,
+}
+
+fn quiet_view(
+    scheduler: &Scheduler,
+    specfence: SpecFenceCtx<'_>,
+    runnable: &RunnableSet,
+) -> QuietExitView {
+    QuietExitView {
+        pending: runnable.pending_work() != 0,
+        wave_pending: specfence.wave.ready_depth() != 0,
+        handoff_empty: specfence.spine.handoff_is_empty(),
+        spine_busy: specfence.spine.spine_busy(),
+        any_running: runnable.any_running(),
+        pending_gated: specfence.ready_edges.has_pending_gated(),
+        sleeping: specfence.ready_edges.has_sleeping_waiters(),
+        waiting_live: runnable.waiting_on_live_producer(specfence.ready_edges, scheduler),
+        unfinished: scheduler.has_unfinished(),
+        done_unvalidated: scheduler.has_done_unvalidated(),
+    }
+}
+
+/// Soft=0 QuietExit.
+///
+/// BlockQuiet (every clause): admit/validate queues empty, the steal probe
+/// already missed (`pick` returned `None` and `pending` is still false),
+/// handoff empty, no `ST_RUNNING`, no unpublished WaitOnce/ordered tip,
+/// every incarnation validated. The validation *counter* is not an input.
+///
+/// Idle workers also leave while the last executor is still inside validate,
+/// once every tx has at least executed and no Avoid tip is unpublished.
+/// The host still joins the scope.
+fn quiet_exit(v: QuietExitView) -> bool {
+    if v.pending || v.wave_pending || !v.handoff_empty || v.waiting_live {
+        return false;
+    }
+    let tips_published = !v.pending_gated && !v.sleeping;
+    let settled = !v.unfinished && !v.done_unvalidated;
+    // BlockQuiet. A stale spine bit is not a live executor; handled below.
+    if !v.any_running && !v.spine_busy && tips_published && settled {
+        return true;
+    }
+    if !tips_published || v.unfinished {
+        return false;
+    }
+    if v.any_running {
+        // Last useful worker still holds the core. This idle worker leaves
+        // so it does not heal/yield against that core.
+        return true;
+    }
+    // Nobody running. Leave only when validation is not owed. A stale
+    // spine owner must not pin `thread::scope` after every tx is validated.
+    settled
+}
+
+fn block_quiet(v: QuietExitView) -> bool {
+    !v.pending
+        && !v.wave_pending
+        && v.handoff_empty
+        && !v.waiting_live
+        && !v.any_running
+        && !v.spine_busy
+        && !v.pending_gated
+        && !v.sleeping
+        && !v.unfinished
+        && !v.done_unvalidated
+}
+
+fn quiet_false_bits(v: QuietExitView) -> u64 {
+    use super::runnable_set::RunnableSet;
+    let mut bits = 0u64;
+    if v.pending {
+        bits |= RunnableSet::QF_PENDING;
+    }
+    if v.wave_pending {
+        bits |= RunnableSet::QF_WAVE;
+    }
+    if !v.handoff_empty {
+        bits |= RunnableSet::QF_HANDOFF;
+    }
+    if v.waiting_live {
+        bits |= RunnableSet::QF_WAITING_LIVE;
+    }
+    if v.any_running {
+        bits |= RunnableSet::QF_RUNNING;
+    }
+    if v.spine_busy {
+        bits |= RunnableSet::QF_SPINE;
+    }
+    if v.pending_gated {
+        bits |= RunnableSet::QF_GATED;
+    }
+    if v.sleeping {
+        bits |= RunnableSet::QF_SLEEPING;
+    }
+    if v.unfinished {
+        bits |= RunnableSet::QF_UNFINISHED;
+    }
+    if v.done_unvalidated {
+        bits |= RunnableSet::QF_OWED;
+    }
+    bits
+}
+
+fn observe_quiet(
+    scheduler: &Scheduler,
+    specfence: SpecFenceCtx<'_>,
+    runnable: &RunnableSet,
+) -> bool {
+    let view = quiet_view(scheduler, specfence, runnable);
+    if runnable.span_end_ns() != 0 {
+        if block_quiet(view) {
+            runnable.note_quiet_true(origin_ns(specfence));
+        } else if !quiet_exit(view) {
+            runnable.note_quiet_false(quiet_false_bits(view));
+        }
+    }
+    quiet_exit(view)
 }
 
 fn hang_sched(scheduler: &Scheduler, tx: crate::TxIdx) -> &'static str {
@@ -529,6 +806,84 @@ mod tests {
             code.contains("note_consumer_on"),
             "Blocked parks must plant Detect so heal cannot incarnation++ mill"
         );
+        assert!(
+            code.contains("quiet_exit"),
+            "Soft=0 idle arm must QuietExit on BlockQuiet"
+        );
+        let idle = code
+            .split("None =>")
+            .nth(1)
+            .expect("idle arm")
+            .split("fn hang_sched")
+            .next()
+            .expect("idle arm body");
+        assert!(
+            !idle.contains("all_validated()"),
+            "idle exit must not wait on the validation tally scan"
+        );
+    }
+
+    #[test]
+    fn quiet_exit_on_block_quiet_and_not_while_work_remains() {
+        let quiet = super::QuietExitView {
+            pending: false,
+            wave_pending: false,
+            handoff_empty: true,
+            spine_busy: false,
+            any_running: false,
+            pending_gated: false,
+            sleeping: false,
+            waiting_live: false,
+            unfinished: false,
+            done_unvalidated: false,
+        };
+        assert!(super::quiet_exit(quiet), "BlockQuiet");
+
+        let mut handoff = quiet;
+        handoff.handoff_empty = false;
+        assert!(!super::quiet_exit(handoff), "spine hop still in the slot");
+
+        let mut wave = quiet;
+        wave.wave_pending = true;
+        assert!(!super::quiet_exit(wave), "wake not drained");
+
+        let mut live = quiet;
+        live.waiting_live = true;
+        live.any_running = true;
+        assert!(!super::quiet_exit(live), "WaitOnce on a live producer");
+
+        let mut unfinished = quiet;
+        unfinished.unfinished = true;
+        assert!(!super::quiet_exit(unfinished), "tx not yet executed");
+
+        let mut owed = quiet;
+        owed.done_unvalidated = true;
+        assert!(
+            !super::quiet_exit(owed),
+            "Executed tx with nobody left to validate"
+        );
+
+        let mut validating = quiet;
+        validating.any_running = true;
+        validating.done_unvalidated = true;
+        assert!(
+            super::quiet_exit(validating),
+            "idle worker leaves while the last validate runs"
+        );
+
+        let mut gated = validating;
+        gated.pending_gated = true;
+        assert!(
+            !super::quiet_exit(gated),
+            "unpublished Avoid tip keeps the idle worker"
+        );
+
+        let mut stale_spine = quiet;
+        stale_spine.spine_busy = true;
+        assert!(
+            super::quiet_exit(stale_spine),
+            "settled block must not wait on a stale spine bit"
+        );
     }
 
     #[test]
@@ -542,5 +897,34 @@ mod tests {
         assert!(!post_exec_outside_span(1, 9, 100, 400, 100));
         assert!(!post_exec_outside_span(1, 9, 100, 400, 399));
         assert!(post_exec_outside_span(1, 9, 100, 400, 400));
+    }
+
+    #[test]
+    fn post_span_overlap_and_quiet_bits() {
+        use super::ns_after;
+        use crate::specfence::runnable_set::RunnableSet;
+        assert_eq!(ns_after(0, 10, 20), 0);
+        assert_eq!(ns_after(100, 40, 90), 0);
+        assert_eq!(ns_after(100, 40, 130), 30);
+        assert_eq!(ns_after(100, 100, 140), 40);
+        assert_eq!(ns_after(100, 110, 140), 30);
+        let unfinished = super::QuietExitView {
+            pending: true,
+            wave_pending: false,
+            handoff_empty: true,
+            spine_busy: false,
+            any_running: true,
+            pending_gated: false,
+            sleeping: false,
+            waiting_live: false,
+            unfinished: true,
+            done_unvalidated: false,
+        };
+        let bits = super::quiet_false_bits(unfinished);
+        assert_eq!(
+            bits,
+            RunnableSet::QF_PENDING | RunnableSet::QF_RUNNING | RunnableSet::QF_UNFINISHED
+        );
+        assert!(!super::block_quiet(unfinished));
     }
 }
