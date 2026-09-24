@@ -572,8 +572,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
 
     fn end_cut_code(&self, start: Option<Instant>) {
         if let Some(start) = start {
-            self.probe_code_ns
-                .set(self.probe_code_ns.get().wrapping_add(start.elapsed().as_nanos() as u64));
+            self.probe_code_ns.set(
+                self.probe_code_ns
+                    .get()
+                    .wrapping_add(start.elapsed().as_nanos() as u64),
+            );
         }
     }
 
@@ -3597,6 +3600,10 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
     // value are added to the write set, possibly replacing a pair with a prior value
     // (if it is not the first time the transaction wrote to this location during the
     // execution).
+    pub(crate) fn note_phase_finish(&self, ns: u64) {
+        self.specfence.metrics.add_phase_finish(ns);
+    }
+
     /// Move this attempt's first-cut timers onto the spine, then zero them.
     pub(crate) fn flush_cut_probe(&mut self, exec_ns: u64, finish_ns: u64) {
         if self.specfence.mode != crate::ConcurrencyMode::SpecFence {
@@ -3611,9 +3618,9 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         let keep_n = db.probe_keep_n.replace(0);
         let skip_n = db.probe_skip_n.replace(0);
         if cut {
-            db.specfence.spine.note_cut_exec(
-                exec_ns, finish_ns, detect, skip, mv, code, keep_n, skip_n,
-            );
+            db.specfence
+                .spine
+                .note_cut_exec(exec_ns, finish_ns, detect, skip, mv, code, keep_n, skip_n);
         } else {
             db.specfence.spine.note_other_exec(exec_ns, finish_ns);
         }
@@ -3624,6 +3631,8 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         tx_version: &TxVersion,
         result_slot: &mut Option<PevmTxExecutionResult>,
     ) -> Result<FinishExecFlags, VmExecutionError> {
+        // Measurement only. Drop records pre / interpreter / write-commit.
+        let mut phase = ExecPhase::start(self.specfence.metrics);
         // SAFETY: A correct scheduler would guarantee this index to be inbound.
         let full_tx = unsafe { self.txs.get_unchecked(tx_version.tx_idx) };
         let tx = self.chain.tx_env(full_tx);
@@ -4085,6 +4094,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     .push(read_origin);
             }
         }
+        phase.mark_interp_start();
         let profile = crate::specfence::profile_timing_enabled();
         let handler_t0 = profile.then(Instant::now);
         // Iter19: read-prefix OrderedAdmit-snap jump arms WITHOUT protocol TLS (no WaitHard
@@ -4336,6 +4346,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 run_body()
             }
         };
+        phase.mark_interp_end();
         if let Some(t0) = handler_t0 {
             self.specfence
                 .metrics
@@ -4721,6 +4732,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                             state: state.collect(),
                         });
                     }
+                    phase.mark_ok();
                     return Ok(flags);
                 }
 
@@ -4933,9 +4945,13 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         state: state.collect(),
                     });
                 }
+                phase.mark_ok();
                 Ok(flags)
             }
             Err(EVMError::Database(read_error)) => {
+                if matches!(read_error, ReadError::Blocking(_) | ReadError::YieldWait(_)) {
+                    phase.mark_block();
+                }
                 self.evm.ctx().db_mut().flush_access_census();
                 Err(VmExecutionError::from(read_error))
             }
@@ -4970,6 +4986,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         // leftover_min + done prefix: do not ghost-park.
                         Err(VmExecutionError::Retry)
                     } else {
+                        phase.mark_block();
                         Err(VmExecutionError::Blocking(tx_version.tx_idx - 1))
                     }
                 } else {
@@ -4977,5 +4994,66 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 }
             }
         }
+    }
+}
+
+/// Measurement-only timer for one `vm.execute`. Dropped on every return.
+struct ExecPhase<'a> {
+    metrics: &'a crate::specfence::MetricsInner,
+    enter: Instant,
+    pre_ns: u64,
+    interp_ns: u64,
+    interp_t0: Option<Instant>,
+    reached_interp: bool,
+    kind: u8,
+}
+
+impl<'a> ExecPhase<'a> {
+    fn start(metrics: &'a crate::specfence::MetricsInner) -> Self {
+        Self {
+            metrics,
+            enter: Instant::now(),
+            pre_ns: 0,
+            interp_ns: 0,
+            interp_t0: None,
+            reached_interp: false,
+            kind: 0,
+        }
+    }
+
+    fn mark_interp_start(&mut self) {
+        self.pre_ns = self.enter.elapsed().as_nanos() as u64;
+        self.reached_interp = true;
+        self.interp_t0 = Some(Instant::now());
+    }
+
+    fn mark_interp_end(&mut self) {
+        if let Some(t0) = self.interp_t0.take() {
+            self.interp_ns = t0.elapsed().as_nanos() as u64;
+        }
+    }
+
+    fn mark_ok(&mut self) {
+        self.kind = 1;
+    }
+
+    fn mark_block(&mut self) {
+        self.kind = 2;
+    }
+}
+
+impl Drop for ExecPhase<'_> {
+    fn drop(&mut self) {
+        let total = self.enter.elapsed().as_nanos() as u64;
+        let (pre, interp, post) = if self.reached_interp {
+            let post = total
+                .saturating_sub(self.pre_ns)
+                .saturating_sub(self.interp_ns);
+            (self.pre_ns, self.interp_ns, post)
+        } else {
+            (total, 0, 0)
+        };
+        self.metrics
+            .add_exec_phase(total, pre, interp, post, self.kind);
     }
 }

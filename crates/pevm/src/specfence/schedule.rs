@@ -11,6 +11,8 @@ use super::producer_stage::ProducerStageTable;
 use super::ready_edge::ReadyEdgeTable;
 use super::runnable_set::{RunnableSet, SfPick};
 use super::wave::WaveParkTable;
+use std::time::Instant;
+
 use crate::Task;
 use crate::scheduler::Scheduler;
 
@@ -28,6 +30,11 @@ pub(crate) fn pick(
     worker_i: usize,
     spine: &super::AccessSpine,
 ) -> Option<Task> {
+    // Measurement only. Idle after `None` is not in this window.
+    let _pick_phase = PickPhase {
+        metrics,
+        t0: Instant::now(),
+    };
     let _ = (wave, stages);
     if let Some(p) = policy
         && p.has_pending_idle()
@@ -195,6 +202,20 @@ pub(crate) fn pick(
         }
     }
     None
+}
+
+/// Measurement-only. Covers every return from `pick`, not the idle arm after `None`.
+struct PickPhase<'a> {
+    metrics: Option<&'a MetricsInner>,
+    t0: Instant,
+}
+
+impl Drop for PickPhase<'_> {
+    fn drop(&mut self) {
+        if let Some(metrics) = self.metrics {
+            metrics.add_phase_pick(self.t0.elapsed().as_nanos() as u64);
+        }
+    }
 }
 
 #[cfg(test)]

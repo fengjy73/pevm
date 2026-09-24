@@ -449,6 +449,32 @@ pub struct SpecFenceMetrics {
     pub sf_protect_before_opt_n: usize,
     /// FullReplay on an ℓ that was already protected.
     pub sf_replay_after_protect_n: usize,
+    /// Measurement-only. `vm.execute` attempts on this block (both engines).
+    pub phase_exec_n: usize,
+    /// Measurement-only. Attempts that returned `Ok`.
+    pub phase_exec_ok_n: usize,
+    /// Measurement-only. Attempts that returned `Blocking`.
+    pub phase_exec_block_n: usize,
+    /// Measurement-only. Sum of `vm.execute` thread time.
+    pub phase_exec_ns: u64,
+    /// Measurement-only. Thread time inside `vm.execute` before `run_pevm_tx`.
+    pub phase_pre_ns: u64,
+    /// Measurement-only. Thread time inside `run_pevm_tx`.
+    pub phase_interp_ns: u64,
+    /// Measurement-only. Thread time inside `vm.execute` after `run_pevm_tx` (write commit).
+    pub phase_post_ns: u64,
+    /// Measurement-only. `finish_execution_with_wave_fence` calls.
+    pub phase_finish_n: usize,
+    /// Measurement-only. Sum of those finish calls.
+    pub phase_finish_ns: u64,
+    /// Measurement-only. Validate calls (OCC stage, or SF plan+apply).
+    pub phase_val_n: usize,
+    /// Measurement-only. Sum of those validate calls.
+    pub phase_val_ns: u64,
+    /// Measurement-only. Pick calls. OCC includes yield-until-task; SF is `schedule::pick` only.
+    pub phase_pick_n: usize,
+    /// Measurement-only. Sum of those pick calls.
+    pub phase_pick_ns: u64,
 }
 
 /// Shared counters written by worker threads.
@@ -661,6 +687,19 @@ pub(crate) struct MetricsInner {
     sf_protect_n: AtomicUsize,
     sf_protect_before_opt_n: AtomicUsize,
     sf_replay_after_protect_n: AtomicUsize,
+    phase_exec_n: AtomicUsize,
+    phase_exec_ok_n: AtomicUsize,
+    phase_exec_block_n: AtomicUsize,
+    phase_exec_ns: AtomicU64,
+    phase_pre_ns: AtomicU64,
+    phase_interp_ns: AtomicU64,
+    phase_post_ns: AtomicU64,
+    phase_finish_n: AtomicUsize,
+    phase_finish_ns: AtomicU64,
+    phase_val_n: AtomicUsize,
+    phase_val_ns: AtomicU64,
+    phase_pick_n: AtomicUsize,
+    phase_pick_ns: AtomicU64,
     /// Stored as bits of f64 mean at snapshot time from WaveParkTable.
     wait_addresses: DashMap<Address, (), BuildSuffixHasher>,
     speculate_addresses: DashMap<Address, (), BuildSuffixHasher>,
@@ -1424,7 +1463,12 @@ impl MetricsInner {
     }
 
     /// Mid-block hot-key protect census (end of block, not an increment).
-    pub(crate) fn record_hot_protect(&self, protect: usize, before_opt: usize, replay_after: usize) {
+    pub(crate) fn record_hot_protect(
+        &self,
+        protect: usize,
+        before_opt: usize,
+        replay_after: usize,
+    ) {
         self.sf_protect_n.store(protect, Ordering::Relaxed);
         self.sf_protect_before_opt_n
             .store(before_opt, Ordering::Relaxed);
@@ -1613,6 +1657,35 @@ impl MetricsInner {
 
     pub(crate) fn hot_accounts(&self) -> impl Iterator<Item = Address> + '_ {
         self.hot_accounts.iter().map(|entry| *entry.key())
+    }
+
+    /// Measurement-only phase sums. Does not change scheduling.
+    pub(crate) fn add_exec_phase(&self, total: u64, pre: u64, interp: u64, post: u64, kind: u8) {
+        self.phase_exec_n.fetch_add(1, Ordering::Relaxed);
+        self.phase_exec_ns.fetch_add(total, Ordering::Relaxed);
+        self.phase_pre_ns.fetch_add(pre, Ordering::Relaxed);
+        self.phase_interp_ns.fetch_add(interp, Ordering::Relaxed);
+        self.phase_post_ns.fetch_add(post, Ordering::Relaxed);
+        if kind == 1 {
+            self.phase_exec_ok_n.fetch_add(1, Ordering::Relaxed);
+        } else if kind == 2 {
+            self.phase_exec_block_n.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn add_phase_finish(&self, ns: u64) {
+        self.phase_finish_n.fetch_add(1, Ordering::Relaxed);
+        self.phase_finish_ns.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    pub(crate) fn add_phase_val(&self, ns: u64) {
+        self.phase_val_n.fetch_add(1, Ordering::Relaxed);
+        self.phase_val_ns.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    pub(crate) fn add_phase_pick(&self, ns: u64) {
+        self.phase_pick_n.fetch_add(1, Ordering::Relaxed);
+        self.phase_pick_ns.fetch_add(ns, Ordering::Relaxed);
     }
 
     pub(crate) fn snapshot(
@@ -1871,6 +1944,19 @@ impl MetricsInner {
             sf_protect_n: self.sf_protect_n.load(Ordering::Relaxed),
             sf_protect_before_opt_n: self.sf_protect_before_opt_n.load(Ordering::Relaxed),
             sf_replay_after_protect_n: self.sf_replay_after_protect_n.load(Ordering::Relaxed),
+            phase_exec_n: self.phase_exec_n.load(Ordering::Relaxed),
+            phase_exec_ok_n: self.phase_exec_ok_n.load(Ordering::Relaxed),
+            phase_exec_block_n: self.phase_exec_block_n.load(Ordering::Relaxed),
+            phase_exec_ns: self.phase_exec_ns.load(Ordering::Relaxed),
+            phase_pre_ns: self.phase_pre_ns.load(Ordering::Relaxed),
+            phase_interp_ns: self.phase_interp_ns.load(Ordering::Relaxed),
+            phase_post_ns: self.phase_post_ns.load(Ordering::Relaxed),
+            phase_finish_n: self.phase_finish_n.load(Ordering::Relaxed),
+            phase_finish_ns: self.phase_finish_ns.load(Ordering::Relaxed),
+            phase_val_n: self.phase_val_n.load(Ordering::Relaxed),
+            phase_val_ns: self.phase_val_ns.load(Ordering::Relaxed),
+            phase_pick_n: self.phase_pick_n.load(Ordering::Relaxed),
+            phase_pick_ns: self.phase_pick_ns.load(Ordering::Relaxed),
         }
     }
 }
