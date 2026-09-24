@@ -842,11 +842,26 @@ impl Scheduler {
         }
     }
 
+    /// Counter reached `block_size`. Does not scan flags.
+    ///
+    /// Soft=0 QuietExit must not treat a short counter as "still busy":
+    /// the fallback scan in [`Self::all_validated`] is the late bit.
+    #[inline]
+    pub(crate) fn validated_tally_reached(&self) -> bool {
+        self.num_validated.load(Ordering::Relaxed) >= self.block_size
+    }
+
     /// All txs have a Validated stamp (SF block-complete).
     #[inline]
     pub(crate) fn all_validated(&self) -> bool {
-        self.num_validated.load(Ordering::Relaxed) >= self.block_size
-            || (0..self.block_size).all(|i| self.is_validated(i))
+        self.validated_tally_reached() || (0..self.block_size).all(|i| self.is_validated(i))
+    }
+
+    /// `Executed` but not `Validated`. QuietExit must not drop these when
+    /// no worker is left inside validate.
+    #[inline]
+    pub(crate) fn has_done_unvalidated(&self) -> bool {
+        (0..self.block_size).any(|i| self.is_done(i) && !self.is_validated(i))
     }
 
     /// SpecFence validation finish: never returns a Block-STM next task.

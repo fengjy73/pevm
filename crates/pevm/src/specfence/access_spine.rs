@@ -524,6 +524,12 @@ impl AccessSpine {
         }
     }
 
+    /// Slot has no unclaimed spine hop. Does not take the hop.
+    #[inline]
+    pub(crate) fn handoff_is_empty(&self) -> bool {
+        self.handoff.load(Ordering::Acquire) == usize::MAX
+    }
+
     /// Successor to run next, if a chain start queued one.
     pub(crate) fn take_handoff(&self) -> Option<TxIdx> {
         let tx = self.handoff.swap(usize::MAX, Ordering::AcqRel);

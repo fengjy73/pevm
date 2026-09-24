@@ -187,7 +187,13 @@ pub(crate) fn run_sf_block<F, V>(
         if abort() {
             break;
         }
-        if scheduler.all_validated() && runnable.pending_work() == 0 {
+        // Fast complete path: the tally only. A short counter must not scan
+        // every tx before pick; QuietExit on the idle arm reads the flags.
+        if scheduler.validated_tally_reached()
+            && runnable.pending_work() == 0
+            && specfence.wave.ready_depth() == 0
+            && specfence.spine.handoff_is_empty()
+        {
             break;
         }
         let t0 = Instant::now();
@@ -350,6 +356,11 @@ pub(crate) fn run_sf_block<F, V>(
                 if abort() {
                     break;
                 }
+                // BlockQuiet before another heal. `pick → None` already
+                // missed one steal probe. Do not yield until the tally moves.
+                if quiet_exit(quiet_view(scheduler, specfence, runnable)) {
+                    break;
+                }
                 let heal_t0 = Instant::now();
                 specfence
                     .ready_edges
@@ -358,19 +369,20 @@ pub(crate) fn run_sf_block<F, V>(
                 let _ = runnable.heal(specfence.ready_edges, scheduler);
                 drain_wave(specfence, scheduler, runnable);
                 runnable.add_heal_ns(heal_t0.elapsed().as_nanos() as u64);
-                if scheduler.all_validated() && runnable.pending_work() == 0 {
+                if quiet_exit(quiet_view(scheduler, specfence, runnable)) {
                     break;
                 }
                 // Last-ditch: unfinished + empty queues + no live producer.
-                // Heal already ran; if still stuck, yield then retry heal.
+                // Heal already ran; recover ghosts, then QuietExit if the
+                // schedule is silent. Do not spin on the validation tally.
                 if runnable.pending_work() == 0
-                    && scheduler.has_unfinished()
                     && !runnable.waiting_on_live_producer(specfence.ready_edges, scheduler)
+                    && (scheduler.has_unfinished() || scheduler.has_done_unvalidated())
                 {
                     let heal_t0 = Instant::now();
                     let _ = runnable.heal(specfence.ready_edges, scheduler);
                     drain_wave(specfence, scheduler, runnable);
-                    if runnable.pending_work() == 0 {
+                    if runnable.pending_work() == 0 && !runnable.any_running() {
                         let _ = runnable.force_idle_recover(specfence.ready_edges, scheduler);
                         drain_wave(specfence, scheduler, runnable);
                     }
@@ -378,6 +390,9 @@ pub(crate) fn run_sf_block<F, V>(
                     if runnable.pending_work() > 0 {
                         continue;
                     }
+                }
+                if quiet_exit(quiet_view(scheduler, specfence, runnable)) {
+                    break;
                 }
                 if runnable.pending_work() > 0 {
                     continue;
@@ -392,13 +407,96 @@ pub(crate) fn run_sf_block<F, V>(
                     if runnable.pending_work() > 0 {
                         continue;
                     }
+                    if quiet_exit(quiet_view(scheduler, specfence, runnable)) {
+                        break;
+                    }
                     runnable.park_idle(worker_i);
                     continue;
                 }
+                // Still unfinished or a tip is unpublished. Back off so the
+                // last producer keeps the core. QuietExit already returned.
                 std::thread::yield_now();
             }
         }
     }
+}
+
+/// Inputs for [`quiet_exit`]. Booleans only, so the predicate can be tested
+/// without a block.
+#[derive(Clone, Copy)]
+struct QuietExitView {
+    /// Admit shards, released, ordered, or revalidate still hold a tx.
+    pending: bool,
+    /// Wave bag still holds a wake that [`drain_wave`] has not applied.
+    wave_pending: bool,
+    /// Spine handoff slot has an unclaimed hop.
+    handoff_empty: bool,
+    /// Chain hop still owns `spine_owner`.
+    spine_busy: bool,
+    /// Some tx is `ST_RUNNING`.
+    any_running: bool,
+    /// Detect still has a gated tx that has not been marked done.
+    pending_gated: bool,
+    /// A sleeper is waiting for a true tip.
+    sleeping: bool,
+    /// `ST_WAIT` on a producer that is executing.
+    waiting_live: bool,
+    /// Some tx is not yet Executed or Validated.
+    unfinished: bool,
+    /// Some tx is Executed and still needs validate.
+    done_unvalidated: bool,
+}
+
+fn quiet_view(
+    scheduler: &Scheduler,
+    specfence: SpecFenceCtx<'_>,
+    runnable: &RunnableSet,
+) -> QuietExitView {
+    QuietExitView {
+        pending: runnable.pending_work() != 0,
+        wave_pending: specfence.wave.ready_depth() != 0,
+        handoff_empty: specfence.spine.handoff_is_empty(),
+        spine_busy: specfence.spine.spine_busy(),
+        any_running: runnable.any_running(),
+        pending_gated: specfence.ready_edges.has_pending_gated(),
+        sleeping: specfence.ready_edges.has_sleeping_waiters(),
+        waiting_live: runnable.waiting_on_live_producer(specfence.ready_edges, scheduler),
+        unfinished: scheduler.has_unfinished(),
+        done_unvalidated: scheduler.has_done_unvalidated(),
+    }
+}
+
+/// Soft=0 QuietExit.
+///
+/// BlockQuiet (every clause): admit/validate queues empty, the steal probe
+/// already missed (`pick` returned `None` and `pending` is still false),
+/// handoff empty, no `ST_RUNNING`, no unpublished WaitOnce/ordered tip,
+/// every incarnation validated. The validation *counter* is not an input.
+///
+/// Idle workers also leave while the last executor is still inside validate,
+/// once every tx has at least executed and no Avoid tip is unpublished.
+/// The host still joins the scope.
+fn quiet_exit(v: QuietExitView) -> bool {
+    if v.pending || v.wave_pending || !v.handoff_empty || v.waiting_live {
+        return false;
+    }
+    let tips_published = !v.pending_gated && !v.sleeping;
+    let settled = !v.unfinished && !v.done_unvalidated;
+    // BlockQuiet. A stale spine bit is not a live executor; handled below.
+    if !v.any_running && !v.spine_busy && tips_published && settled {
+        return true;
+    }
+    if !tips_published || v.unfinished {
+        return false;
+    }
+    if v.any_running {
+        // Last useful worker still holds the core. This idle worker leaves
+        // so it does not heal/yield against that core.
+        return true;
+    }
+    // Nobody running. Leave only when validation is not owed. A stale
+    // spine owner must not pin `thread::scope` after every tx is validated.
+    settled
 }
 
 fn hang_sched(scheduler: &Scheduler, tx: crate::TxIdx) -> &'static str {
@@ -528,6 +626,84 @@ mod tests {
         assert!(
             code.contains("note_consumer_on"),
             "Blocked parks must plant Detect so heal cannot incarnation++ mill"
+        );
+        assert!(
+            code.contains("quiet_exit"),
+            "Soft=0 idle arm must QuietExit on BlockQuiet"
+        );
+        let idle = code
+            .split("None =>")
+            .nth(1)
+            .expect("idle arm")
+            .split("fn hang_sched")
+            .next()
+            .expect("idle arm body");
+        assert!(
+            !idle.contains("all_validated()"),
+            "idle exit must not wait on the validation tally scan"
+        );
+    }
+
+    #[test]
+    fn quiet_exit_on_block_quiet_and_not_while_work_remains() {
+        let quiet = super::QuietExitView {
+            pending: false,
+            wave_pending: false,
+            handoff_empty: true,
+            spine_busy: false,
+            any_running: false,
+            pending_gated: false,
+            sleeping: false,
+            waiting_live: false,
+            unfinished: false,
+            done_unvalidated: false,
+        };
+        assert!(super::quiet_exit(quiet), "BlockQuiet");
+
+        let mut handoff = quiet;
+        handoff.handoff_empty = false;
+        assert!(!super::quiet_exit(handoff), "spine hop still in the slot");
+
+        let mut wave = quiet;
+        wave.wave_pending = true;
+        assert!(!super::quiet_exit(wave), "wake not drained");
+
+        let mut live = quiet;
+        live.waiting_live = true;
+        live.any_running = true;
+        assert!(!super::quiet_exit(live), "WaitOnce on a live producer");
+
+        let mut unfinished = quiet;
+        unfinished.unfinished = true;
+        assert!(!super::quiet_exit(unfinished), "tx not yet executed");
+
+        let mut owed = quiet;
+        owed.done_unvalidated = true;
+        assert!(
+            !super::quiet_exit(owed),
+            "Executed tx with nobody left to validate"
+        );
+
+        let mut validating = quiet;
+        validating.any_running = true;
+        validating.done_unvalidated = true;
+        assert!(
+            super::quiet_exit(validating),
+            "idle worker leaves while the last validate runs"
+        );
+
+        let mut gated = validating;
+        gated.pending_gated = true;
+        assert!(
+            !super::quiet_exit(gated),
+            "unpublished Avoid tip keeps the idle worker"
+        );
+
+        let mut stale_spine = quiet;
+        stale_spine.spine_busy = true;
+        assert!(
+            super::quiet_exit(stale_spine),
+            "settled block must not wait on a stale spine bit"
         );
     }
 
