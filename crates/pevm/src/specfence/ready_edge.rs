@@ -909,6 +909,16 @@ impl ReadyEdgeTable {
             .filter(|&w| w < tx_idx && !self.is_writer_done(w))
     }
 
+    /// Detect predecessor, including one whose writer has already published.
+    /// `None` is the Ideal-ready antichain (`preds = 0` on this graph).
+    #[inline]
+    pub(crate) fn recorded_pred(&self, tx_idx: TxIdx) -> Option<TxIdx> {
+        self.consumers
+            .get(&tx_idx)
+            .map(|e| e.load(Ordering::Relaxed))
+            .filter(|&w| w != NONE && w < tx_idx)
+    }
+
     /// Detect pred chain reaches `target`. Used to break add_dependency
     /// cycles: later leftover waits on us, we parked Aborting on them.
     pub(crate) fn detect_waits_on(&self, mut tx: TxIdx, target: TxIdx) -> bool {

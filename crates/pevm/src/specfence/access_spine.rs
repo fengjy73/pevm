@@ -577,6 +577,12 @@ impl AccessSpine {
         self.ordered_writers.binary_search(&tx).is_ok()
     }
 
+    /// Index of `tx` on the carried writer chain.
+    #[inline]
+    pub(crate) fn ordered_pos(&self, tx: TxIdx) -> Option<usize> {
+        self.ordered_writers.binary_search(&tx).ok()
+    }
+
     /// `loc` is the ordered writer-chain location. Non-members still Detect here.
     #[inline]
     pub(crate) fn is_ordered_loc(&self, loc: MemoryLocationHash) -> bool {
