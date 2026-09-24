@@ -159,6 +159,16 @@ pub(crate) struct VmDb<'a, S: Storage> {
     /// Incarnation-0 ungated non-chain: skip cold-read museum (ordinal log,
     /// value snap, pre-read peek). Detect stays on the chain / WaitOnce loc.
     indep_first_cut: bool,
+    /// Probe: kept Detect (spine peek + WaitOnce consult) on a first-cut read.
+    probe_detect_ns: Cell<u64>,
+    /// Probe: first-cut read that returned before Detect. Includes the branch.
+    probe_skip_ns: Cell<u64>,
+    /// Probe: MV / account / storage work after Detect on a first-cut read.
+    probe_mv_ns: Cell<u64>,
+    /// Probe: interpreter `code_by_hash` on a first-cut tx.
+    probe_code_ns: Cell<u64>,
+    probe_keep_n: Cell<u64>,
+    probe_skip_n: Cell<u64>,
     /// Thin Soft=0: no WaitOnce peer before this tx → OCC-shaped execute
     /// (skip consult body / engagement / museum; keep access_log ordinals).
     sf_occ_shaped: bool,
@@ -215,6 +225,12 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if self.indep_first_cut {
             self.specfence.spine.note_indep_first_cut();
         }
+        self.probe_detect_ns.set(0);
+        self.probe_skip_ns.set(0);
+        self.probe_mv_ns.set(0);
+        self.probe_code_ns.set(0);
+        self.probe_keep_n.set(0);
+        self.probe_skip_n.set(0);
         // Thin Soft=0 OCC-shaped: no WaitOnce peer before this tx → skip consult
         // body / engagement / museum. Tip install still runs if this tx is a
         // WaitOnce/crit producer. indep_first_cut also skips the ordinal log.
@@ -529,6 +545,36 @@ impl<'a, S: Storage> VmDb<'a, S> {
         tx: TxIdx,
     ) -> Option<TxIdx> {
         unfinished_writer_of(self.mv_memory, &self.specfence, location_hash, tx)
+    }
+
+    /// First-cut read: time Detect, then the MV walk. Other txs pay nothing.
+    fn begin_cut_read(&self, location_hash: MemoryLocationHash) -> CutReadTimer {
+        if !self.indep_first_cut {
+            return unarmed_cut_timer();
+        }
+        CutReadTimer {
+            armed: true,
+            keep: self.read_keeps_detect(location_hash),
+            t0: Instant::now(),
+            detect_at: None,
+            detect_ns: self.probe_detect_ns.as_ptr(),
+            skip_ns: self.probe_skip_ns.as_ptr(),
+            mv_ns: self.probe_mv_ns.as_ptr(),
+            keep_n: self.probe_keep_n.as_ptr(),
+            skip_n: self.probe_skip_n.as_ptr(),
+        }
+    }
+
+    /// Interpreter bytecode fetch on a first-cut tx. Not a location Detect.
+    fn begin_cut_code(&self) -> Option<Instant> {
+        self.indep_first_cut.then(Instant::now)
+    }
+
+    fn end_cut_code(&self, start: Option<Instant>) {
+        if let Some(start) = start {
+            self.probe_code_ns
+                .set(self.probe_code_ns.get().wrapping_add(start.elapsed().as_nanos() as u64));
+        }
     }
 
     /// Chain / crit / protected / non-crit WaitOnce still take full Detect.
@@ -2253,6 +2299,78 @@ impl<'a, S: Storage> VmDb<'a, S> {
     }
 }
 
+/// Times one first-cut host read. Unarmed on every other path.
+/// Detect time ends at [`CutReadTimer::mark_detect`]; the rest is MV.
+struct CutReadTimer {
+    armed: bool,
+    keep: bool,
+    t0: Instant,
+    detect_at: Option<Instant>,
+    detect_ns: *mut u64,
+    skip_ns: *mut u64,
+    mv_ns: *mut u64,
+    keep_n: *mut u64,
+    skip_n: *mut u64,
+}
+
+impl Drop for CutReadTimer {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let now = Instant::now();
+        // The cells live in this worker's `VmDb` for the whole read.
+        unsafe {
+            if let Some(detect_at) = self.detect_at {
+                *self.mv_ns = (*self.mv_ns).wrapping_add(elapsed_ns(detect_at, now));
+            } else {
+                self.credit_detect(elapsed_ns(self.t0, now));
+            }
+        }
+    }
+}
+
+impl CutReadTimer {
+    fn mark_detect(&mut self) {
+        if !self.armed || self.detect_at.is_some() {
+            return;
+        }
+        let now = Instant::now();
+        unsafe {
+            self.credit_detect(elapsed_ns(self.t0, now));
+        }
+        self.detect_at = Some(now);
+    }
+
+    unsafe fn credit_detect(&mut self, ns: u64) {
+        if self.keep {
+            *self.detect_ns = (*self.detect_ns).wrapping_add(ns);
+            *self.keep_n = (*self.keep_n).wrapping_add(1);
+        } else {
+            *self.skip_ns = (*self.skip_ns).wrapping_add(ns);
+            *self.skip_n = (*self.skip_n).wrapping_add(1);
+        }
+    }
+}
+
+fn elapsed_ns(start: Instant, end: Instant) -> u64 {
+    end.saturating_duration_since(start).as_nanos() as u64
+}
+
+fn unarmed_cut_timer() -> CutReadTimer {
+    CutReadTimer {
+        armed: false,
+        keep: false,
+        t0: Instant::now(),
+        detect_at: None,
+        detect_ns: std::ptr::null_mut(),
+        skip_ns: std::ptr::null_mut(),
+        mv_ns: std::ptr::null_mut(),
+        keep_n: std::ptr::null_mut(),
+        skip_n: std::ptr::null_mut(),
+    }
+}
+
 /// Opt | WaitOnce | NeverWait. Not a method: callers hold `read_set`.
 /// SpecFence Soft=0 thin: never Block on OCC Estimate alone — WaitOnce
 /// consult owns thin consume. Large: AccessArm decide may Block once
@@ -2307,8 +2425,10 @@ impl<S: Storage> Database for VmDb<'_, S> {
             } else {
                 0
             };
+        let mut cut = self.begin_cut_read(location_hash);
         self.spine_before_read(address, location_hash, access_k)?;
         self.consult_ungated_wait_once(address, location_hash, access_k)?;
+        cut.mark_detect();
         self.maybe_wait(address, location_hash, false)?;
         let resolve = self.resolve_read_overlay();
 
@@ -2771,13 +2891,13 @@ impl<S: Storage> Database for VmDb<'_, S> {
     }
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        match self
-            .storage
-            .code_by_hash(&code_hash)
-            .map_err(|err| ReadError::StorageError(err.to_string()))?
-        {
-            Some(evm_code) => Ok(Bytecode::from(evm_code)),
-            None => Ok(Bytecode::default()),
+        let cut = self.begin_cut_code();
+        let fetched = self.storage.code_by_hash(&code_hash);
+        self.end_cut_code(cut);
+        match fetched {
+            Ok(Some(evm_code)) => Ok(Bytecode::from(evm_code)),
+            Ok(None) => Ok(Bytecode::default()),
+            Err(err) => Err(ReadError::StorageError(err.to_string())),
         }
     }
 
@@ -2789,8 +2909,10 @@ impl<S: Storage> Database for VmDb<'_, S> {
             } else {
                 0
             };
+        let mut cut = self.begin_cut_read(location_hash);
         self.spine_before_read(address, location_hash, access_k)?;
         self.consult_ungated_wait_once(address, location_hash, access_k)?;
+        cut.mark_detect();
         self.maybe_wait(address, location_hash, true)?;
         let resolve = self.resolve_read_overlay();
 
@@ -3234,6 +3356,12 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             optimistic_majority_lazy: false,
             optimistic_skip_gate: false,
             indep_first_cut: false,
+            probe_detect_ns: Cell::new(0),
+            probe_skip_ns: Cell::new(0),
+            probe_mv_ns: Cell::new(0),
+            probe_code_ns: Cell::new(0),
+            probe_keep_n: Cell::new(0),
+            probe_skip_n: Cell::new(0),
             sf_occ_shaped: false,
             vis: VisibilityPolicy::Opt,
             pcc_armed: Cell::new(false),
@@ -3469,6 +3597,28 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
     // value are added to the write set, possibly replacing a pair with a prior value
     // (if it is not the first time the transaction wrote to this location during the
     // execution).
+    /// Move this attempt's first-cut timers onto the spine, then zero them.
+    pub(crate) fn flush_cut_probe(&mut self, exec_ns: u64, finish_ns: u64) {
+        if self.specfence.mode != crate::ConcurrencyMode::SpecFence {
+            return;
+        }
+        let db = self.evm.ctx().db_mut();
+        let cut = db.indep_first_cut;
+        let detect = db.probe_detect_ns.replace(0);
+        let skip = db.probe_skip_ns.replace(0);
+        let mv = db.probe_mv_ns.replace(0);
+        let code = db.probe_code_ns.replace(0);
+        let keep_n = db.probe_keep_n.replace(0);
+        let skip_n = db.probe_skip_n.replace(0);
+        if cut {
+            db.specfence.spine.note_cut_exec(
+                exec_ns, finish_ns, detect, skip, mv, code, keep_n, skip_n,
+            );
+        } else {
+            db.specfence.spine.note_other_exec(exec_ns, finish_ns);
+        }
+    }
+
     pub(crate) fn execute(
         &mut self,
         tx_version: &TxVersion,

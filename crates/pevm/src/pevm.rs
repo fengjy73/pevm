@@ -1616,22 +1616,27 @@ impl Pevm {
                 }
             }
             let exec_t0 = (tx_version.tx_incarnation > 0).then(Instant::now);
+            let cut_t0 = Instant::now();
             return match vm.execute(
                 &tx_version,
                 self.execution_results.slot_mut(tx_version.tx_idx),
             ) {
                 Ok(flags) => {
+                    let exec_ns = cut_t0.elapsed().as_nanos() as u64;
                     if let Some(t0) = exec_t0 {
                         vm.note_hot_reexec_ns(tx_version.tx_idx, t0.elapsed().as_nanos() as u64);
                     }
                     let wrote_new_location =
                         flags.contains(crate::FinishExecFlags::WroteNewLocation);
                     let fence = crate::specfence::fence_for_mode(ConcurrencyMode::SpecFence, dag);
+                    let fin_t0 = Instant::now();
                     let _ =
                         scheduler.finish_execution_with_wave_fence(tx_version, flags, wave, fence);
+                    vm.flush_cut_probe(exec_ns, fin_t0.elapsed().as_nanos() as u64);
                     SfExec::Executed { wrote_new_location }
                 }
                 Err(VmExecutionError::Retry) => {
+                    vm.flush_cut_probe(cut_t0.elapsed().as_nanos() as u64, 0);
                     if self.abort_reason.get().is_none() {
                         retry_n += 1;
                         continue;
@@ -1639,12 +1644,14 @@ impl Pevm {
                     SfExec::Fatal
                 }
                 Err(VmExecutionError::FallbackToSequential) => {
+                    vm.flush_cut_probe(cut_t0.elapsed().as_nanos() as u64, 0);
                     scheduler.abort();
                     self.abort_reason
                         .get_or_init(|| AbortReason::FallbackToSequential);
                     SfExec::Fatal
                 }
                 Err(VmExecutionError::Blocking(blocking_tx_idx)) => {
+                    vm.flush_cut_probe(cut_t0.elapsed().as_nanos() as u64, 0);
                     let pending = vm.take_pending_park();
                     let park_kind = pending
                         .map(|p| p.kind)
@@ -1699,6 +1706,7 @@ impl Pevm {
                     }
                 }
                 Err(VmExecutionError::ExecutionError(err)) => {
+                    vm.flush_cut_probe(cut_t0.elapsed().as_nanos() as u64, 0);
                     scheduler.abort();
                     self.abort_reason
                         .get_or_init(|| AbortReason::ExecutionError(err));

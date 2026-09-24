@@ -580,6 +580,20 @@ fn run_once(
                     spine.quiet_false_or,
                     spine.indep_first_cuts,
                 );
+                println!(
+                    "  cutprobe {mode_name}[{i}] cut_exec_ns={} cut_exec_n={} cut_detect_ns={} cut_skip_ns={} cut_mv_ns={} cut_code_ns={} cut_finish_ns={} cut_keep_n={} cut_skip_n={} other_exec_ns={} other_exec_n={}",
+                    spine.cut_exec_ns,
+                    spine.cut_exec_n,
+                    spine.cut_detect_ns,
+                    spine.cut_skip_ns,
+                    spine.cut_mv_ns,
+                    spine.cut_code_ns,
+                    spine.cut_finish_ns,
+                    spine.cut_keep_n,
+                    spine.cut_skip_n,
+                    spine.other_exec_ns,
+                    spine.other_exec_n,
+                );
             }
             IterRow {
                 mode: mode_name.to_string(),
