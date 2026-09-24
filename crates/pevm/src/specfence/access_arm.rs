@@ -80,6 +80,9 @@ pub(crate) struct AccessArmTable {
     prefix_keep_n: AtomicUsize,
     /// Fast Soft=0 Opt skip: any WaitOnce arm installed this block.
     any_wait_once: std::sync::atomic::AtomicBool,
+    /// WaitOnce on a location that is not the installed crit chain.
+    /// While this is false, a non-chain first Opt can skip the arm DashMap.
+    non_crit_wait: std::sync::atomic::AtomicBool,
     /// Locations protected this block after the first hot conflict.
     /// Later reads must WaitOnce before Opt-discovering ℓ again.
     protected: DashSet<MemoryLocationHash, BuildIdentityHasher>,
@@ -116,6 +119,7 @@ impl AccessArmTable {
         self.prefix_resume.store(0, Ordering::Relaxed);
         self.prefix_keep_n.store(0, Ordering::Relaxed);
         self.any_wait_once.store(false, Ordering::Relaxed);
+        self.non_crit_wait.store(false, Ordering::Relaxed);
         self.protected.clear();
         self.protect_n.store(0, Ordering::Relaxed);
         self.protect_before_opt_n.store(0, Ordering::Relaxed);
@@ -156,6 +160,7 @@ impl AccessArmTable {
                 }
             }
         }
+        self.refresh_non_crit_wait();
     }
 
     /// Pack prior. Morph flip decays WaitOnce that this block did not
@@ -185,12 +190,7 @@ impl AccessArmTable {
     }
 
     /// Record a WaitOnce consumer→producer edge for Detect (a) plant.
-    pub(crate) fn note_wait_edge(
-        &self,
-        consumer: TxIdx,
-        producer: TxIdx,
-        loc: MemoryLocationHash,
-    ) {
+    pub(crate) fn note_wait_edge(&self, consumer: TxIdx, producer: TxIdx, loc: MemoryLocationHash) {
         if producer == 0 || producer >= consumer {
             return;
         }
@@ -234,6 +234,30 @@ impl AccessArmTable {
         self.any_wait_once.load(Ordering::Relaxed)
     }
 
+    /// True when some WaitOnce location is not the crit chain location.
+    #[inline]
+    pub(crate) fn non_crit_wait(&self) -> bool {
+        self.non_crit_wait.load(Ordering::Relaxed)
+    }
+
+    fn mark_non_crit_wait(&self, loc: MemoryLocationHash) {
+        let crit = self.crit_loc.load(Ordering::Relaxed);
+        if crit == u64::MAX || crit != loc {
+            self.non_crit_wait.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Recompute after crit install. A prior WaitOnce on the crit loc alone
+    /// must not force every cold read through the arm map.
+    pub(crate) fn refresh_non_crit_wait(&self) {
+        let crit = self.crit_loc.load(Ordering::Relaxed);
+        let extra = self
+            .arms
+            .iter()
+            .any(|e| e.arm == AccessArm::WaitOnce && (crit == u64::MAX || *e.key() != crit));
+        self.non_crit_wait.store(extra, Ordering::Relaxed);
+    }
+
     /// Remember who touched `ℓ` last block. WaitOnce edges are installed
     /// only when this block's first hot conflict protects `ℓ`.
     pub(crate) fn note_prior_touchers(&self, loc: MemoryLocationHash, writers: &[TxIdx]) {
@@ -260,6 +284,10 @@ impl AccessArmTable {
         self.crit_loc.store(loc, Ordering::Relaxed);
         *self.crit_writers.lock().unwrap() = writers.to_vec();
         self.note_early_waw(loc, 1);
+        // note_early_waw may have set the flag before crit was visible to a
+        // racing reader; this block is still single-threaded. Recompute so a
+        // crit-only arm does not tax cold antichain reads.
+        self.refresh_non_crit_wait();
     }
 
     #[inline]
@@ -506,6 +534,7 @@ impl AccessArmTable {
                 peer,
             });
         self.any_wait_once.store(true, Ordering::Relaxed);
+        self.mark_non_crit_wait(loc);
     }
 
     /// WaitOnce + peer for consumer `tx` (Detect before next pick / block).
@@ -586,6 +615,9 @@ impl AccessArmTable {
                         });
                 }
                 self.any_wait_once.store(true, Ordering::Relaxed);
+                if !already_never {
+                    self.mark_non_crit_wait(loc);
+                }
                 LiveAct::Block
             }
         }
@@ -674,10 +706,15 @@ mod tests {
         // Crit spine alone must not gate OCC-shaped.
         t.install_crit_chain(99, &[1, 7, 20, 40]);
         assert!(
+            !t.non_crit_wait(),
+            "crit-only WaitOnce must not tax cold antichain reads"
+        );
+        assert!(
             !t.has_wait_once_peer_before(40),
             "crit_pred alone must not block OCC-shaped"
         );
         t.note_early_waw_peer(33, 5, 7);
+        assert!(t.non_crit_wait(), "non-crit WaitOnce stays on the arm map");
         assert!(t.any_wait_once());
         assert!(t.has_wait_once_peer_before(40));
         assert!(!t.has_wait_once_peer_before(5), "peer must be before tx");

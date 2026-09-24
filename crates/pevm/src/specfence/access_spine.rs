@@ -401,6 +401,8 @@ pub struct SpineReport {
     pub span_end_false_bits: u64,
     /// OR of BlockQuiet clauses false on post-span idle samples.
     pub quiet_false_or: u64,
+    /// Ungated non-chain incarnation-0 executes that took the cheap first Opt.
+    pub indep_first_cuts: usize,
 }
 
 /// Shared per-block spine. Workers share it. The Avoid table starts empty.
@@ -440,6 +442,8 @@ pub(crate) struct AccessSpine {
     spine_cores_max: AtomicUsize,
     handoff_claims: AtomicUsize,
     claim_denied: AtomicUsize,
+    /// Cheap first Opt of ungated non-chain txs (incarnation 0).
+    indep_first_cuts: AtomicUsize,
 }
 
 impl AccessSpine {
@@ -476,6 +480,7 @@ impl AccessSpine {
             spine_cores_max: AtomicUsize::new(0),
             handoff_claims: AtomicUsize::new(0),
             claim_denied: AtomicUsize::new(0),
+            indep_first_cuts: AtomicUsize::new(0),
         }
     }
 
@@ -526,6 +531,18 @@ impl AccessSpine {
     /// This tx is on the carried writer chain.
     pub(crate) fn is_ordered_member(&self, tx: TxIdx) -> bool {
         self.ordered_writers.binary_search(&tx).is_ok()
+    }
+
+    /// `loc` is the ordered writer-chain location. Non-members still Detect here.
+    #[inline]
+    pub(crate) fn is_ordered_loc(&self, loc: MemoryLocationHash) -> bool {
+        self.ordered_loc != u64::MAX && self.ordered_loc == loc && !self.ordered_writers.is_empty()
+    }
+
+    /// One ungated non-chain first execute took the cheap Opt path.
+    #[inline]
+    pub(crate) fn note_indep_first_cut(&self) {
+        self.indep_first_cuts.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn ordered_len(&self) -> usize {
@@ -674,6 +691,12 @@ impl AccessSpine {
     /// Radar from the previous block. Opening a block does not copy it into Avoid.
     pub(crate) fn prior(&self) -> &SpinePrior {
         &self.prior
+    }
+
+    /// Cold antichain read: count the access, skip the intra map.
+    #[inline]
+    pub(crate) fn note_fast_access(&self) {
+        self.access_events.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Host access. Cheap until a location is armed: one atomic.
@@ -973,6 +996,7 @@ impl AccessSpine {
             span_end_indep: 0,
             span_end_false_bits: 0,
             quiet_false_or: 0,
+            indep_first_cuts: self.indep_first_cuts.load(Ordering::Relaxed),
         };
         (report, next)
     }

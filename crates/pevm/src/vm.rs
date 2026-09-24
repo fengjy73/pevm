@@ -156,6 +156,9 @@ pub(crate) struct VmDb<'a, S: Storage> {
     optimistic_majority_lazy: bool,
     /// A1=0 ungated: skip access-gate / rem / ReadyEdge (P3 ≡ OCC).
     optimistic_skip_gate: bool,
+    /// Incarnation-0 ungated non-chain: skip cold-read museum (ordinal log,
+    /// value snap, pre-read peek). Detect stays on the chain / WaitOnce loc.
+    indep_first_cut: bool,
     /// Thin Soft=0: no WaitOnce peer before this tx → OCC-shaped execute
     /// (skip consult body / engagement / museum; keep access_log ordinals).
     sf_occ_shaped: bool,
@@ -201,9 +204,20 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 .policy
                 .is_some_and(|p| p.skip_ungated_tx_path_tax())
             && !self.specfence.ready_edges.is_gated(tx_idx);
+        // First Opt of a non-chain AdmitIndep. Chain members and a later
+        // incarnation keep the full path (rewind / prefix keep). Detect on
+        // the ordered location is not part of this skip — see
+        // [`Self::read_keeps_detect`].
+        self.indep_first_cut = self.optimistic_skip_gate
+            && incarnation == 0
+            && !self.specfence.spine.is_ordered_member(tx_idx)
+            && !self.specfence.ready_edges.is_live_leftover_min(tx_idx);
+        if self.indep_first_cut {
+            self.specfence.spine.note_indep_first_cut();
+        }
         // Thin Soft=0 OCC-shaped: no WaitOnce peer before this tx → skip consult
-        // body / engagement / museum. Keep access_log.note (fail_k). Tip install
-        // still runs if this tx is a WaitOnce/crit producer.
+        // body / engagement / museum. Tip install still runs if this tx is a
+        // WaitOnce/crit producer. indep_first_cut also skips the ordinal log.
         self.sf_occ_shaped = self.specfence.mode == crate::ConcurrencyMode::SpecFence
             && self.specfence.scheduler.block_size() <= crate::specfence::THIN_SHELL_N
             && !self.specfence.access_arms.has_wait_once_peer_before(tx_idx);
@@ -219,8 +233,8 @@ impl<'a, S: Storage> VmDb<'a, S> {
         self.read_accounts.clear();
         self.pcc_armed.set(false);
         if let Some(fg) = self.specfence.finegrain {
-            // OCC-shaped: no finegrain museum (no rem / consult grain).
-            if !self.sf_occ_shaped {
+            // OCC-shaped and the cheap first Opt: no finegrain museum.
+            if !self.sf_occ_shaped && !self.indep_first_cut {
                 fg.deep_begin_consumer(tx_idx, incarnation);
             }
         }
@@ -314,7 +328,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
     /// shaped txs do not arm prefix keep; snap inserts are pure shell tax.
     #[inline]
     fn maybe_note_value(&self, location_hash: MemoryLocationHash, value: FfValue) {
-        if self.specfence.mode != crate::ConcurrencyMode::SpecFence || self.sf_occ_shaped {
+        if self.specfence.mode != crate::ConcurrencyMode::SpecFence
+            || self.sf_occ_shaped
+            || self.indep_first_cut
+        {
             return;
         }
         self.specfence
@@ -514,6 +531,32 @@ impl<'a, S: Storage> VmDb<'a, S> {
         unfinished_writer_of(self.mv_memory, &self.specfence, location_hash, tx)
     }
 
+    /// Chain / crit / protected / non-crit WaitOnce still take full Detect.
+    /// A cold antichain location does not: the MV walk below still sees
+    /// Estimate and parks via [`live_writer_act`]. Validation closes the rest.
+    #[inline]
+    fn read_keeps_detect(&self, location_hash: MemoryLocationHash) -> bool {
+        if !self.indep_first_cut {
+            return true;
+        }
+        if self.specfence.spine.is_ordered_loc(location_hash)
+            || self.specfence.sf_tips.is_chain_loc(location_hash)
+        {
+            return true;
+        }
+        let crit = self.specfence.access_arms.crit_loc_hash();
+        if crit != u64::MAX && crit == location_hash {
+            return true;
+        }
+        if self.specfence.access_arms.protect_live()
+            && self.specfence.access_arms.is_protected(location_hash)
+        {
+            return true;
+        }
+        self.specfence.access_arms.non_crit_wait()
+            && self.specfence.access_arms.is_wait_once(location_hash)
+    }
+
     /// Structural read: emit [`AccessEvent`](crate::specfence::AccessEvent) and, on a
     /// real unpublished lower writer, WaitTrueVersion inside this host call.
     /// The interpreter frame stays up because this returns `Ok` after the tip
@@ -529,6 +572,10 @@ impl<'a, S: Storage> VmDb<'a, S> {
             || address == self.specfence.beneficiary
             || crate::tx_runner::in_yield_reread()
         {
+            return Ok(());
+        }
+        if self.indep_first_cut && !self.read_keeps_detect(location_hash) {
+            self.specfence.spine.note_fast_access();
             return Ok(());
         }
         let ev = crate::specfence::AccessEvent {
@@ -665,6 +712,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return Ok(());
         }
         if self.is_lazy || address == self.specfence.beneficiary {
+            return Ok(());
+        }
+        // Cold first Opt: WaitOnce consult is loc-specific. The chain loc
+        // already returned through [`Self::read_keeps_detect`].
+        if self.indep_first_cut && !self.read_keeps_detect(location_hash) {
             return Ok(());
         }
         // Thin Soft=0 OCC-shaped: no WaitOnce peer — zero consult tax (ordinals
@@ -2102,6 +2154,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
         kind: crate::specfence::LocationKind,
         origin: Option<&ReadOrigin>,
     ) {
+        if self.indep_first_cut {
+            return;
+        }
         let Some(fg) = self.specfence.finegrain else {
             return;
         };
@@ -2124,7 +2179,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
 
     fn get_code_hash(&mut self, address: Address) -> Result<Option<B256>, ReadError> {
         let location_hash = hash_deterministic(MemoryLocation::CodeHash(address));
-        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+        if self.specfence.mode == crate::ConcurrencyMode::SpecFence && !self.indep_first_cut {
             let _ = self.specfence.access_log.note(self.tx_idx, location_hash);
         }
         let read_origins = self.read_set.entry(location_hash).or_default();
@@ -2246,11 +2301,12 @@ impl<S: Storage> Database for VmDb<'_, S> {
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         let location_hash = self.hash_basic(&address);
-        let access_k = if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
-            self.specfence.access_log.note(self.tx_idx, location_hash)
-        } else {
-            0
-        };
+        let access_k =
+            if self.specfence.mode == crate::ConcurrencyMode::SpecFence && !self.indep_first_cut {
+                self.specfence.access_log.note(self.tx_idx, location_hash)
+            } else {
+                0
+            };
         self.spine_before_read(address, location_hash, access_k)?;
         self.consult_ungated_wait_once(address, location_hash, access_k)?;
         self.maybe_wait(address, location_hash, false)?;
@@ -2727,11 +2783,12 @@ impl<S: Storage> Database for VmDb<'_, S> {
 
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
         let location_hash = hash_deterministic(MemoryLocation::Storage(address, index));
-        let access_k = if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
-            self.specfence.access_log.note(self.tx_idx, location_hash)
-        } else {
-            0
-        };
+        let access_k =
+            if self.specfence.mode == crate::ConcurrencyMode::SpecFence && !self.indep_first_cut {
+                self.specfence.access_log.note(self.tx_idx, location_hash)
+            } else {
+                0
+            };
         self.spine_before_read(address, location_hash, access_k)?;
         self.consult_ungated_wait_once(address, location_hash, access_k)?;
         self.maybe_wait(address, location_hash, true)?;
@@ -3176,6 +3233,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             is_lazy: false,
             optimistic_majority_lazy: false,
             optimistic_skip_gate: false,
+            indep_first_cut: false,
             sf_occ_shaped: false,
             vis: VisibilityPolicy::Opt,
             pcc_armed: Cell::new(false),
