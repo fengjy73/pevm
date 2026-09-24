@@ -23,6 +23,6 @@
 
 ## 步骤
 
-1. **进行中：** 在 `basic` / `storage` / `code_by_hash` / `block_hash` 上包 VmDb 钟；kept 的 spine peek 与 WaitOnce consult 另计 Detect。残差为 opcode。`other` 恒为 0（`run_pevm_tx` 里没有第四段）。
-2. **待做：** 比较例程打印 `SPLIT`。release LTO off 跑两块。
-3. **待做：** 写探针笔记。不落地产品刀。
+1. **已完成：** `3421771`。VmDb 方法计时；kept spine / WaitOnce 另计 Detect。opcode 是残差。`other` 恒为 0。比较例程打印 `SPLIT`。
+2. **已完成：** release、LTO off、`taskset -c 0-3`、8 核。大块 N=5 复用中位 SF 7.687 / OCC 5.795，ratio 0.754，`ge_1_5=false`。两块 `seq=par ok`，`occ_picks=0`，`spine_cores_max=1`。
+3. **已完成：** `docs/specfence-soft0-interp-delta-split-probe.md`。四次复用的正差在 Detect-on-kept，不在 opcode。产品切仍 CONDITIONAL，本轮不切。
