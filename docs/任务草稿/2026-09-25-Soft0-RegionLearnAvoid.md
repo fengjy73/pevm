@@ -28,6 +28,6 @@
 1. **已完成。** 读设计纸、predictions、steal dig，并对照现有 `protect_hot` / WaitOnce / spine 链。
 2. **已完成，并改过一版。** `SPECFENCE_REGION_LEARN_AVOID` 默认开。块初只记 spine 链雷达。本块第一个链成员被 pick 时对该 `ℓ` 装 WaitOnce（peer=0，不写 `wait_edges`，不调用 `protect_hot`）。访问点用 `region_pred` 等真 tip；ExactWake 看 `is_region_armed`。薄块 admission 仍直接返回。beneficiary / NeverWait 不入。
    - 第一版调用了 `protect_hot` 并放开薄块 admission。3356896 刀开复用中位 **16.213 ms**（defer=9391），是整 tx 离队，不是访问点 Avoid。已丢掉。
-3. **进行中。** 单元测试改为断言不 `protect_live`、peer 不门控 OCC-shaped、`region_pred` 指向相邻写者。
-4. **待做。** 测试通过后 release、LTO off，同机刀开/刀关跑两块。主墙 `GLOBAL_IDEAL_READY_POOL=0`。
-5. **待做。** 按实测写正式笔记和 PR 判词。alone 不宣称 ≥1.5，除非数字到了。
+3. **已完成。** 三则单元测试通过：不 `protect_live`，peer 不门控 OCC-shaped，`region_pred` 指向相邻写者，NeverWait 不武装。
+4. **已完成。** `89197b1`，release，LTO off，`taskset -c 0-3`。主墙两旗都关（池和 Ideal-timed）。大块刀开 8.767 / 关刀 8.252。薄块刀开 1.583 / 关刀 1.825。`seq=par ok`。只关池、留下 #56 的薄块约 16 ms，不作为本刀地板。
+5. **已完成。** 判词 FAIL。笔记 `docs/specfence-soft0-region-learn-avoid.md`。`ge_1_5=false`。草稿留到用户验收。
