@@ -436,35 +436,16 @@ impl RunnableSet {
         self.push_index_order(shard, &ideal, false, low_first);
     }
 
-    /// Longest-processing-time onto shards `shard0..`. Heavier gas is popped
-    /// first. Equal gas breaks ties toward the higher index.
-    fn assign_lpt(&self, shard0: usize, txs: &[TxIdx], work: &[u64], late: bool) {
-        if txs.is_empty() {
-            return;
-        }
-        let n_free = self.cores.saturating_sub(shard0);
-        if n_free == 0 {
-            return;
-        }
+    /// Pop heavier gas first inside one shard. Equal gas breaks ties toward
+    /// the higher index, matching the historical free-core high end.
+    /// Does not move a tx onto another shard: cross-shard gas balance put
+    /// the large block's free cores into a schedule that intermittently
+    /// disagreed with sequential execution.
+    fn push_heavy_first(&self, shard: usize, txs: &[TxIdx], work: &[u64], late: bool) {
         let mut order = txs.to_vec();
-        order.sort_by(|&a, &b| work_hint(work, b).cmp(&work_hint(work, a)).then(b.cmp(&a)));
-        let mut load = vec![0u64; n_free];
-        let mut buckets: Vec<Vec<TxIdx>> = vec![Vec::new(); n_free];
+        order.sort_by(|&a, &b| work_hint(work, a).cmp(&work_hint(work, b)).then(a.cmp(&b)));
         for tx in order {
-            let mut best = 0usize;
-            for i in 1..n_free {
-                if load[i] < load[best] {
-                    best = i;
-                }
-            }
-            load[best] = load[best].saturating_add(work_hint(work, tx));
-            buckets[best].push(tx);
-        }
-        for (i, mut bucket) in buckets.into_iter().enumerate() {
-            bucket.sort_by(|&a, &b| work_hint(work, a).cmp(&work_hint(work, b)).then(a.cmp(&b)));
-            for tx in bucket {
-                self.place_seed_on(shard0 + i, tx, late);
-            }
+            self.place_seed_on(shard, tx, late);
         }
     }
 
@@ -476,10 +457,10 @@ impl RunnableSet {
     /// prefix. Round-robin (`tx % C`) put every core in the prefix and
     /// committed a wrong receipt on 15274915 at 2 cores.
     ///
-    /// When Ideal-timed admit is on and gas limits differ, band 0 stays that
-    /// prefix. The other bands' Ideal-ready txs are reassigned by gas onto
-    /// the free cores (longest first). Txs with a Detect pred wait on
-    /// `local_late` until the Ideal-ready deque is empty.
+    /// Ideal-timed admit keeps those bands. A recorded Detect pred waits on
+    /// `local_late` until that shard's Ideal-ready deque is empty. On a free
+    /// core, when gas limits differ, Ideal-ready txs in the band pop heaviest
+    /// first. They stay on that core.
     fn shard_indep(&self, indep_asc: &[TxIdx], ready: &ReadyEdgeTable, work: &[u64]) {
         let cores = self.cores;
         let n = indep_asc.len();
@@ -489,32 +470,26 @@ impl RunnableSet {
         let base = n / cores;
         let rem = n % cores;
         let mut cursor = 0;
-        let mut bands: Vec<&[TxIdx]> = Vec::with_capacity(cores);
         for shard in 0..cores {
             let len = base + usize::from(shard < rem);
-            bands.push(&indep_asc[cursor..cursor + len]);
+            let band = &indep_asc[cursor..cursor + len];
             cursor += len;
-        }
-        let lpt_free = ideal_timed_admit_on() && cores > 1 && hints_vary(indep_asc, work);
-        if lpt_free {
-            self.push_band_ordered(0, bands[0], ready, true);
-            let mut free_ideal = Vec::new();
-            let mut free_late = Vec::new();
-            for band in bands.iter().skip(1) {
-                for &tx in *band {
-                    if ready.recorded_pred(tx).is_some() {
-                        free_late.push(tx);
-                    } else {
-                        free_ideal.push(tx);
-                    }
+            let heavy = ideal_timed_admit_on() && shard > 0 && hints_vary(band, work);
+            if !heavy {
+                self.push_band_ordered(shard, band, ready, shard == 0);
+                continue;
+            }
+            let mut ideal = Vec::new();
+            let mut late = Vec::new();
+            for &tx in band {
+                if ready.recorded_pred(tx).is_some() {
+                    late.push(tx);
+                } else {
+                    ideal.push(tx);
                 }
             }
-            self.assign_lpt(1, &free_ideal, work, false);
-            self.assign_lpt(1, &free_late, work, true);
-        } else {
-            for (shard, band) in bands.iter().enumerate() {
-                self.push_band_ordered(shard, band, ready, shard == 0);
-            }
+            self.push_heavy_first(shard, &late, work, true);
+            self.push_heavy_first(shard, &ideal, work, false);
         }
     }
 
