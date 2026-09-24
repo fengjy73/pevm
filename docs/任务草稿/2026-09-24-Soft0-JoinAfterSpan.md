@@ -16,6 +16,21 @@ Soft=0 Instant-off 下，工人在 **BlockQuiet** 成立后 **QuietExit**，宿�
 ## 步骤
 
 1. **已完成：** 读设计笔记与 `worker.rs` 空转出口。出口只认 `all_validated && pending_work==0`，否则 `force_idle_recover` / ExactPark / `yield_now`。`all_validated` 在计数未满时会扫整块。
-2. **进行中：** 落地 `quiet_exit`。BlockQuiet = 分片空 ∧ handoff 空 ∧ 无 `ST_RUNNING` ∧ 无未发布 WaitOnce/ordered tip ∧ validate/wave 已排空 ∧ 每个 incarnation 已验证（看标志，不看 `num_validated`）。末工人仍在验证时，已无未执行交易且 tip 已发布的空闲工人先退出。`pick→None` 的 steal 未命中即 AdmitShards 的探测。宿主 join 不变。
-3. **待做：** 2 核 `seq≡par` 冷检，再对 3356896 与 15274915 做 release、LTO off、N=5、请求 8 核的 Soft=0。写出 SF/OCC/ratio/span/tax/join-out，并和 0.217 / 3.046 比方向。
-4. **待做：** 提交、推送、开 PR。数字进 PR 正文。验证后把新颖点写入 `docs/经验记录.md`。
+2. **已完成：** 落地 `quiet_exit`（`a5d23e9`）。BlockQuiet = 分片空 ∧ handoff 空 ∧ 无 `ST_RUNNING` ∧ 无未发布 WaitOnce/ordered tip ∧ validate/wave 已排空 ∧ 每个 incarnation 已验证（看标志，不看 `num_validated`）。末工人仍在验证时，已无未执行交易且 tip 已发布的空闲工人先退出。`pick→None` 的 steal 未命中即 AdmitShards 的探测。宿主 join 不变。热路径只看验证计数。
+3. **已完成：** release、LTO off、Instant-off、`taskset -c 0-3`、请求 8 核、N=5 两轮。2 核冷检两块 `seq=par ok`。中位墙协议 `est=0 soft=0 occ_picks=0 spine_cores_max=1`。`ge_1_5=false`。join-out / tax / ratio 相对 `8832029` 没有稳定同向改善。数字在 PR #52。
+4. **已完成：** 分支 `cursor/soft0-joinafterspan-quietexit-0f0e`，PR #52（基线是 #51 分支）。经验写入 `docs/经验记录.md`。草稿留到用户验收。
+
+## 实测（中位墙那一轮）
+
+宿主 4 核。ratio 是 harness 的 OCC 中位墙 / SF 复用中位墙。join-out 用 focus `[head_ms, tail_ms)` 与 `[join_mark, join_mark+join_wait)` 的差。
+
+| 轮 | 块 | ratio | SF | OCC | span | tax | join-out | before | end_block | 链端 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 基线 `8832029` | 3356896 | 0.697 | 1.442 | 1.006 | 0.582 | 0.860 | 0.217 | 0.215 | 0.101 | 过滤器头 31 ≠ focus 4 |
+| 1 | 3356896 | 0.651 | 1.457 | 0.948 | 0.285 | 1.172 | 0.524 | 0.252 | 0.086 | 4/171 对齐 |
+| 2 | 3356896 | 0.692 | 1.502 | 1.039 | 0.483 | 1.019 | 0.454 | 0.217 | 0.105 | 4/171 对齐 |
+| 基线 | 15274915 | 0.683 | 7.615 | 5.202 | 2.394 | 5.221 | 3.046 | 0.672 | 0.338 | 116/1219 对齐 |
+| 1 | 15274915 | 0.642 | 8.213 | 5.276 | 3.606 | 4.607 | 2.712 | 0.573 | 0.076 | 116/1219 对齐 |
+| 2 | 15274915 | 0.697 | 8.144 | 5.680 | 2.085 | 6.059 | 3.925 | 0.685 | 0.076 | focus 与过滤器头都是 122，不是 116 |
+
+大块第 1 轮 join-out 和 tax 低于基线，但 span 拉到 3.606，SF 墙更高，ratio 更低。其余中位行 join-out 高于 0.217 / 3.046。
