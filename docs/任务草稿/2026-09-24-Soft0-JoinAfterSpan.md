@@ -43,6 +43,6 @@ Soft=0 Instant-off 下，工人在 **BlockQuiet** 成立后 **QuietExit**，宿�
 
 **步骤：**
 
-1. **进行中：** 探针落地到本分支。
-2. **待做：** 2 核 `seq≡par`，再 N=5 大块。薄块只在需要对照时跑。
-3. **待做：** 写根因，并给出一把下一刀（只设计）。数字进 PR。
+1. **已完成：** 探针 `114cdda`。
+2. **已完成：** 2 核两块 `seq=par ok`。大块 N=5：中位墙 ratio 0.751（7.065 / 5.306），join-out 3.046，最后有用工作到离开 0.114 ms。`ge_1_5=false`。薄块没再跑 N=5，大块已经能分开执行和空转。
+3. **已完成：** 根因写在 `docs/specfence-soft0-joinafterspan-dig.md`。下一刀是缩短 AdmitShard 里非链交易的第一次 `execute`，不是更早退出。
