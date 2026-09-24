@@ -85,15 +85,10 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
 
     // First hot conflict on ℓ: WaitOnce for every later read this block.
     // Not a mutex and not Estimate Block — consult consumes the true tip.
-    if !matches!(
-        plan,
-        ResolvePlan::Commit | ResolvePlan::PartialAbortRebind
-    ) {
+    if !matches!(plan, ResolvePlan::Commit | ResolvePlan::PartialAbortRebind) {
         let full = matches!(plan, ResolvePlan::FullReplay);
         for &loc in ctx.invalid {
-            if ctx.specfence.access_arms.is_never(loc)
-                || location_is_lazy(ctx.mv_memory, tx, loc)
-            {
+            if ctx.specfence.access_arms.is_never(loc) || location_is_lazy(ctx.mv_memory, tx, loc) {
                 continue;
             }
             if ctx.specfence.access_arms.is_protected(loc) {
@@ -393,13 +388,24 @@ fn abort_and_estimate(ctx: &ApplyCtx<'_>) {
     let aborted = ctx.scheduler.try_validation_abort(ctx.tx_version);
     if aborted {
         let locs = ctx.mv_memory.write_locations(tx);
-        ctx.mv_memory.convert_writes_to_estimates(tx);
+        let spine = ctx.specfence.spine;
+        ctx.mv_memory
+            .convert_writes_to_estimates_keeping(tx, |loc| {
+                if spine.should_pin_origin(loc, tx) {
+                    spine.note_retain_keep();
+                    true
+                } else {
+                    false
+                }
+            });
         // Clear SF tip + live_writer (thin DashMap tip plane) + ChainSpineTip.
         if ctx.scheduler.block_size() <= super::THIN_SHELL_N {
             let _ = ctx.specfence.sf_tips.clear_writer(tx, &locs);
-        } else if ctx.specfence.sf_tips.is_chain_loc(
-            ctx.specfence.access_arms.crit_loc_hash(),
-        ) {
+        } else if ctx
+            .specfence
+            .sf_tips
+            .is_chain_loc(ctx.specfence.access_arms.crit_loc_hash())
+        {
             ctx.specfence.sf_tips.chain_clear(tx);
         }
         for &loc in &locs {
@@ -576,10 +582,7 @@ pub(crate) fn try_chain_released_rewind(
         return None;
     }
     // Prefer crit ℓ even when multi-loc invalid (len==1 was under-firing).
-    let loc = invalid
-        .iter()
-        .copied()
-        .find(|&l| arms.is_crit_loc(l))?;
+    let loc = invalid.iter().copied().find(|&l| arms.is_crit_loc(l))?;
     if arms.is_never(loc) || location_is_lazy(mv_memory, tx, loc) {
         return None;
     }
@@ -622,7 +625,10 @@ pub(crate) fn try_chain_released_rewind(
         return None;
     }
     // Synthetic RewindTo head at fail_k when no mid-tx checkpoint existed.
-    if let Some(cp) = specfence.partial_retry.last_checkpoint_before(tx, k as usize) {
+    if let Some(cp) = specfence
+        .partial_retry
+        .last_checkpoint_before(tx, k as usize)
+    {
         let certified: Vec<_> = prefix.iter().map(|(l, _)| *l).collect();
         specfence.partial_retry.arm_rewind_to(
             tx,
@@ -756,10 +762,7 @@ fn enqueue_higher_revalidate(ctx: &ApplyCtx<'_>, tx: crate::TxIdx) {
 }
 
 /// Four-class late Resolve (c): map first conflict → Raw|War|Waw|Chain.
-fn record_four_class_late(
-    ctx: &ApplyCtx<'_>,
-    first: Option<&super::collateral::FirstConflict>,
-) {
+fn record_four_class_late(ctx: &ApplyCtx<'_>, first: Option<&super::collateral::FirstConflict>) {
     let Some(f) = first else {
         // No classified ℓ — treat as WAW miss (common Opt→FullReplay theater).
         ctx.specfence
@@ -784,9 +787,9 @@ fn record_four_class_late(
                 _ => {
                     // Basic WAW default. WAR late when peer already done and
                     // WaitOnce was never armed (Opt read then write landed).
-                    if f.peer.is_some_and(|p| {
-                        ctx.scheduler.is_done(p) || ctx.scheduler.is_validated(p)
-                    }) && arms.wait_once_k(f.location) == 0
+                    if f.peer
+                        .is_some_and(|p| ctx.scheduler.is_done(p) || ctx.scheduler.is_validated(p))
+                        && arms.wait_once_k(f.location) == 0
                         && !arms.is_wait_once(f.location)
                     {
                         SfConflictClass::War

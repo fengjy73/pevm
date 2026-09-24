@@ -26,6 +26,7 @@ pub(crate) fn pick(
     policy: Option<&CostPolicy>,
     metrics: Option<&MetricsInner>,
     worker_i: usize,
+    spine: &super::AccessSpine,
 ) -> Option<Task> {
     let _ = (wave, stages);
     if let Some(p) = policy
@@ -59,11 +60,17 @@ pub(crate) fn pick(
         m.sample_runnable_width(runnable.width_hint());
     }
 
+    // Handoff stays in the spine slot. `pick_in` claims it for at most
+    // one core; it is not pushed onto the AdmitIndep deques.
     let refuse_before = runnable.refuse_fill_n();
     for _ in 0..16 {
-        match runnable.pick(worker_i, ready) {
+        match runnable.pick_in(worker_i, ready, Some(spine)) {
             Some(SfPick::Execute {
-                tx, vis, refused, ..
+                tx,
+                vis,
+                refused,
+                slot,
+                ..
             }) => {
                 if scheduler.is_validated(tx) {
                     runnable.mark_done(tx);
@@ -82,6 +89,32 @@ pub(crate) fn pick(
                 if scheduler.is_aborting(tx) && ready.may_execute(tx) {
                     let _ = scheduler.recover_aborting(tx);
                 }
+                // Later chain writers stay off-core until the predecessor has
+                // started. Non-members fall through and fill the antichain.
+                if spine
+                    .successor_blocked(tx, |w| scheduler.is_done(w) || scheduler.is_validated(w))
+                {
+                    runnable.release_running(tx);
+                    spine.note_ordered_defer();
+                    if slot {
+                        // We took the slot. Put it back and leave this pick.
+                        // Continuing would claim the same waiting hop again.
+                        spine.offer_handoff_if_absent(tx);
+                        break;
+                    }
+                    continue;
+                }
+                // One core owns the current chain hop. A second claim waits
+                // in the slot instead of running beside the owner.
+                let hop = spine.is_ordered_member(tx);
+                if hop && !spine.try_acquire(tx) {
+                    runnable.release_running(tx);
+                    if slot {
+                        spine.offer_handoff_if_absent(tx);
+                        break;
+                    }
+                    continue;
+                }
                 if let Some(tx_version) = scheduler.try_execute_producer(tx) {
                     if refused {
                         arms.note_e4();
@@ -92,7 +125,13 @@ pub(crate) fn pick(
                             m.record_refuse_fill(1);
                         }
                     }
+                    if slot {
+                        spine.note_handoff_claim();
+                    }
                     return Some(Task::Execution(tx_version));
+                }
+                if hop {
+                    spine.release_owner_tx(tx);
                 }
                 if scheduler.is_ready(tx) {
                     // Owner only. Do not tight-loop the same Ready claim
@@ -112,6 +151,9 @@ pub(crate) fn pick(
                 // (6196166 N=3: gated=false, n_unf=27, pending=0).
                 // CAS only: mark_wait would clear a stolen live owner.
                 runnable.release_running(tx);
+                if slot {
+                    spine.offer_handoff_if_absent(tx);
+                }
             }
             Some(SfPick::Revalidate(tx)) => {
                 if let Some(v) = scheduler.prepare_revalidate(tx) {
@@ -124,8 +166,16 @@ pub(crate) fn pick(
                     let _ = scheduler.recover_aborting(tx);
                 }
                 if scheduler.is_ready(tx) {
+                    let hop = spine.is_ordered_member(tx);
+                    if hop && !spine.try_acquire(tx) {
+                        runnable.release_running(tx);
+                        break;
+                    }
                     if let Some(tx_version) = scheduler.try_execute_producer(tx) {
                         return Some(Task::Execution(tx_version));
+                    }
+                    if hop {
+                        spine.release_owner_tx(tx);
                     }
                     let _ = runnable.release_owner(tx, super::runnable_set::QueueKind::Indep);
                 } else if scheduler.is_executed(tx) {

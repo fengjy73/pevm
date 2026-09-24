@@ -99,6 +99,11 @@ pub enum ReadError {
     /// This memory location has been written by a lower transaction.
     #[error("Read of memory location is blocked by tx #{0}")]
     Blocking(TxIdx),
+    /// In-frame wait could not keep the core. Handler must not treat this as a
+    /// normal fatal teardown on the first resume; the scheduler retry is the
+    /// deadlock release after that resume fails.
+    #[error("YieldWait for true tip of tx #{0}")]
+    YieldWait(TxIdx),
     /// There has been an inconsistent read like reading the same
     /// location from storage in the first call but from [`VmMemory`] in
     /// the next.
@@ -125,7 +130,7 @@ impl From<ReadError> for VmExecutionError {
         match err {
             ReadError::InconsistentRead => Self::Retry,
             ReadError::SelfDestructedAccount => Self::FallbackToSequential,
-            ReadError::Blocking(tx_idx) => Self::Blocking(tx_idx),
+            ReadError::Blocking(tx_idx) | ReadError::YieldWait(tx_idx) => Self::Blocking(tx_idx),
             _ => Self::ExecutionError(EVMError::Database(err)),
         }
     }
@@ -507,6 +512,143 @@ impl<'a, S: Storage> VmDb<'a, S> {
         tx: TxIdx,
     ) -> Option<TxIdx> {
         unfinished_writer_of(self.mv_memory, &self.specfence, location_hash, tx)
+    }
+
+    /// Structural read: emit [`AccessEvent`](crate::specfence::AccessEvent) and, on a
+    /// real unpublished lower writer, WaitTrueVersion inside this host call.
+    /// The interpreter frame stays up because this returns `Ok` after the tip
+    /// is published. `YieldWait` is only the deadlock release.
+    fn spine_before_read(
+        &self,
+        address: Address,
+        location_hash: MemoryLocationHash,
+        access_k: u32,
+    ) -> Result<(), ReadError> {
+        if self.specfence.mode != crate::ConcurrencyMode::SpecFence
+            || self.is_lazy
+            || address == self.specfence.beneficiary
+            || crate::tx_runner::in_yield_reread()
+        {
+            return Ok(());
+        }
+        let ev = crate::specfence::AccessEvent {
+            tx: self.tx_idx,
+            loc: location_hash,
+            k: u16::try_from(access_k).unwrap_or(u16::MAX),
+            depth: crate::tx_runner::frame_depth(),
+            mode: crate::specfence::HostAccessMode::Read,
+        };
+        self.specfence.spine.on_access(ev);
+        let Some(writer) = self.peek_unpublished_writer(location_hash) else {
+            return Ok(());
+        };
+        self.yield_wait_true_version(ev, writer)
+    }
+
+    /// Nearest lower writer whose tip is not true Data yet.
+    fn peek_unpublished_writer(&self, location_hash: MemoryLocationHash) -> Option<TxIdx> {
+        let from_open =
+            unfinished_writer_of(self.mv_memory, &self.specfence, location_hash, self.tx_idx);
+        let from_mv = {
+            let _nest = crate::mv_memory::DataNest::enter("spine.peek");
+            self.mv_memory.data.get(&location_hash).and_then(|written| {
+                let (idx, entry) = written.range(..self.tx_idx).next_back()?;
+                match entry {
+                    MemoryEntry::Estimate => Some(*idx),
+                    MemoryEntry::Data(inc, _)
+                        if self.mv_memory.is_aborted_incarnation(*idx, *inc) =>
+                    {
+                        Some(*idx)
+                    }
+                    _ => None,
+                }
+            })
+        };
+        let from_ordered = self
+            .specfence
+            .spine
+            .ordered_blocker(location_hash, self.tx_idx, |w| {
+                !self.specfence.scheduler.is_done(w) && !self.specfence.scheduler.is_validated(w)
+            });
+        from_ordered.or(from_open).or(from_mv).filter(|&w| {
+            w < self.tx_idx
+                && !self.specfence.scheduler.is_done(w)
+                && !self.specfence.scheduler.is_validated(w)
+        })
+    }
+
+    /// RAW → WaitTrueVersion. Spins in this host call until the writer publishes.
+    /// Does not read the OCC estimate and does not increment `estimate_block_sf`.
+    fn yield_wait_true_version(
+        &self,
+        ev: crate::specfence::AccessEvent,
+        writer: TxIdx,
+    ) -> Result<(), ReadError> {
+        let recipe = self.specfence.spine.detect_raw(ev, writer);
+        debug_assert_eq!(recipe, crate::specfence::Recipe::WaitTrueVersion);
+        if self.true_tip_ready(writer) {
+            self.specfence.spine.note_tip_already();
+            self.specfence.spine.credit_ok(ev.loc);
+            return Ok(());
+        }
+        if !self.specfence.spine.enter_yield() {
+            self.specfence.spine.credit_fail(ev.loc);
+            crate::tx_runner::flag_yield_wait();
+            return Err(ReadError::YieldWait(writer));
+        }
+        let started = Instant::now();
+        let mut i = 0u32;
+        let mut executing = self.specfence.scheduler.is_executing(writer);
+        loop {
+            if self.true_tip_ready(writer) {
+                self.specfence.spine.leave_yield_ok();
+                self.specfence.spine.credit_ok(ev.loc);
+                return Ok(());
+            }
+            if i % 16 == 0 {
+                executing = self.specfence.scheduler.is_executing(writer);
+            }
+            let elapsed = started.elapsed();
+            let pin = self.specfence.spine.yield_waiters() + 1 >= self.specfence.spine.workers();
+            if !executing && elapsed > std::time::Duration::from_micros(500) && pin {
+                if self.specfence.spine.try_escape() {
+                    self.specfence.spine.leave_yield_deadlock();
+                    self.specfence.spine.credit_fail(ev.loc);
+                    crate::tx_runner::flag_yield_wait();
+                    return Err(ReadError::YieldWait(writer));
+                }
+            }
+            if elapsed > std::time::Duration::from_millis(15)
+                && !self.specfence.scheduler.is_executing(writer)
+            {
+                self.specfence.spine.leave_yield_deadlock();
+                self.specfence.spine.clear_escape();
+                self.specfence.spine.credit_fail(ev.loc);
+                crate::tx_runner::flag_yield_wait();
+                return Err(ReadError::YieldWait(writer));
+            }
+            // Absolute valve: a writer that stays Executing past this bound is
+            // not a useful in-frame wait (deadlock or a stuck host). One
+            // YieldWait releases the core. The common path returns Ok above.
+            if elapsed > std::time::Duration::from_secs(2) {
+                self.specfence.spine.leave_yield_deadlock();
+                self.specfence.spine.clear_escape();
+                self.specfence.spine.credit_fail(ev.loc);
+                crate::tx_runner::flag_yield_wait();
+                return Err(ReadError::YieldWait(writer));
+            }
+            if i % 64 == 0 {
+                std::thread::yield_now();
+            } else {
+                std::hint::spin_loop();
+            }
+            i = i.wrapping_add(1);
+        }
+    }
+
+    #[inline]
+    fn true_tip_ready(&self, writer: TxIdx) -> bool {
+        self.specfence.scheduler.is_done(writer) || self.specfence.scheduler.is_validated(writer)
     }
 
     /// Learned WaitOnce on the ungated Opt path. Consume via SfMvMemory
@@ -2109,6 +2251,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
         } else {
             0
         };
+        self.spine_before_read(address, location_hash, access_k)?;
         self.consult_ungated_wait_once(address, location_hash, access_k)?;
         self.maybe_wait(address, location_hash, false)?;
         let resolve = self.resolve_read_overlay();
@@ -2200,7 +2343,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
 
         // Snapshot then drop the DashMap guard before any other `data.get`
         // (same-shard re-entry corrupts the heap — 19807137).
-        let history: Vec<(TxIdx, MemoryEntry)> = if self.tx_idx > 0 {
+        let mut history: Vec<(TxIdx, MemoryEntry)> = if self.tx_idx > 0 {
             let _nest = crate::mv_memory::DataNest::enter("basic.history");
             self.mv_memory
                 .data
@@ -2215,6 +2358,20 @@ impl<S: Storage> Database for VmDb<'_, S> {
         } else {
             Vec::new()
         };
+        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+            for (idx, entry) in history.iter_mut() {
+                if matches!(entry, MemoryEntry::Estimate)
+                    && self
+                        .specfence
+                        .spine
+                        .reader_needs_origin(location_hash, self.tx_idx, *idx)
+                {
+                    if let Some(data) = self.mv_memory.pinned_entry(location_hash, *idx) {
+                        *entry = data;
+                    }
+                }
+            }
+        }
         if !history.is_empty() {
             let mut iter = history.iter().rev();
 
@@ -2321,6 +2478,13 @@ impl<S: Storage> Database for VmDb<'_, S> {
                             return Err(ReadError::InconsistentRead);
                         }
                         new_origins.push(origin);
+                        if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+                            self.specfence.spine.note_reader_origin(
+                                location_hash,
+                                self.tx_idx,
+                                *closest_idx,
+                            );
+                        }
                         match value {
                             MemoryValue::Basic(basic) => {
                                 // TODO: Return [SelfDestructedAccount] if [basic] is
@@ -2568,6 +2732,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
         } else {
             0
         };
+        self.spine_before_read(address, location_hash, access_k)?;
         self.consult_ungated_wait_once(address, location_hash, access_k)?;
         self.maybe_wait(address, location_hash, true)?;
         let resolve = self.resolve_read_overlay();
@@ -2669,6 +2834,11 @@ impl<S: Storage> Database for VmDb<'_, S> {
                     tx_incarnation: inc,
                 });
                 Self::push_origin(read_origins, origin.clone())?;
+                if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
+                    self.specfence
+                        .spine
+                        .note_reader_origin(location_hash, self.tx_idx, idx);
+                }
                 self.deep_trace_read(
                     location_hash,
                     crate::specfence::LocationKind::Storage,
@@ -2725,6 +2895,21 @@ impl<S: Storage> Database for VmDb<'_, S> {
                         // Blocking(tx-1) livelocks when tx-1 is already done).
                         // NeverWait / a second WaitOnce may fall through; leftover
                         // still parks (`live_writer_act`).
+                        if let Some(MemoryEntry::Data(inc, MemoryValue::Storage(pinned))) =
+                            self.mv_memory.pinned_entry(location_hash, closest_idx)
+                            && self.specfence.spine.reader_needs_origin(
+                                location_hash,
+                                self.tx_idx,
+                                closest_idx,
+                            )
+                        {
+                            let origin = ReadOrigin::MvMemory(TxVersion {
+                                tx_idx: closest_idx,
+                                tx_incarnation: inc,
+                            });
+                            Self::push_origin(read_origins, origin)?;
+                            return Ok(pinned);
+                        }
                         self.specfence.metrics.record_optimistic_read();
                         if !self.specfence.scheduler.is_done(closest_idx) {
                             match live_writer_act(
@@ -2894,6 +3079,23 @@ pub(crate) struct Vm<'a, S: Storage, C: PevmChain> {
 }
 
 impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
+    /// WAW / WAR classification at the committed write. Not an estimate publish.
+    fn note_spine_writes(&mut self, tx: TxIdx, write_set: &WriteSet) {
+        if self.specfence.mode != crate::ConcurrencyMode::SpecFence || self.evm.ctx().db().is_lazy {
+            return;
+        }
+        let beneficiary = self.beneficiary_location_hash;
+        let locs: Vec<MemoryLocationHash> = write_set
+            .iter()
+            .map(|(loc, _)| *loc)
+            .filter(|&loc| loc != beneficiary)
+            .collect();
+        if locs.is_empty() {
+            return;
+        }
+        self.specfence.spine.on_write_effects(tx, &locs);
+    }
+
     /// A2 progressive DAG: published Data notifies Blocking waiters (not SoftWait Soft).
     /// Ready transition stays in `finish_execution` (dependents drain) — do not
     /// `try_ready` here or release builds double-incarnate and corrupt.
@@ -3258,58 +3460,67 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         // Thin: DashMap WaitOnce/crit (skip when OCC-shaped non-producer).
         // Large: ChainSpineTip only (sticky≥32).
         if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
-            let thin = self.specfence.scheduler.block_size() <= crate::specfence::THIN_SHELL_N;
-            let crit = self.specfence.access_arms.crit_loc_hash();
-            let install_tip = thin
-                && (!sf_occ_shaped
-                    || self
-                        .specfence
-                        .access_arms
-                        .is_wait_once_producer(tx_version.tx_idx));
-            if install_tip {
-                let prior = self.mv_memory.write_locations(tx_version.tx_idx);
-                for &loc in &prior {
-                    if self.specfence.access_arms.is_crit_loc(loc)
-                        || self.specfence.access_arms.is_wait_once(loc)
+            self.specfence.spine.note_chain_start(tx_version.tx_idx);
+            // Antichain: not on the ordered writer chain. Skip the tip-install
+            // walk. The host read still waits if this tx touches the chain loc.
+            let ordered_live = self.specfence.spine.ordered_len() > 0;
+            let chain_member = self.specfence.spine.is_ordered_member(tx_version.tx_idx);
+            if ordered_live && !chain_member {
+                // Cheap fill. Fall through to the interpreter.
+            } else {
+                let thin = self.specfence.scheduler.block_size() <= crate::specfence::THIN_SHELL_N;
+                let crit = self.specfence.access_arms.crit_loc_hash();
+                let install_tip = thin
+                    && (!sf_occ_shaped
+                        || self
+                            .specfence
+                            .access_arms
+                            .is_wait_once_producer(tx_version.tx_idx));
+                if install_tip {
+                    let prior = self.mv_memory.write_locations(tx_version.tx_idx);
+                    for &loc in &prior {
+                        if self.specfence.access_arms.is_crit_loc(loc)
+                            || self.specfence.access_arms.is_wait_once(loc)
+                        {
+                            self.specfence.sf_tips.install_version_tip(
+                                loc,
+                                tx_version.tx_idx,
+                                tx_version.tx_incarnation,
+                            );
+                        }
+                    }
+                    if crit != u64::MAX
+                        && self.specfence.access_arms.is_wait_once(crit)
+                        && !prior.iter().any(|&l| l == crit)
                     {
                         self.specfence.sf_tips.install_version_tip(
-                            loc,
+                            crit,
                             tx_version.tx_idx,
                             tx_version.tx_incarnation,
                         );
                     }
+                } else if !thin && self.specfence.sf_tips.is_chain_loc(crit) {
+                    // ChainSpineTip claim — O(1) flag, not WaitOnce DashMap mill.
+                    self.specfence
+                        .sf_tips
+                        .chain_claim(tx_version.tx_idx, tx_version.tx_incarnation);
                 }
-                if crit != u64::MAX
-                    && self.specfence.access_arms.is_wait_once(crit)
-                    && !prior.iter().any(|&l| l == crit)
+                let tx = tx_version.tx_idx;
+                let track = |loc: crate::MemoryLocationHash| {
+                    self.specfence.access_arms.is_protected(loc)
+                        || self.specfence.access_arms.is_wait_once(loc)
+                        || self.specfence.access_arms.is_crit_loc(loc)
+                };
+                for loc in self.mv_memory.write_locations(tx) {
+                    if track(loc) {
+                        self.specfence.sf_tips.note_open_writer(loc, tx);
+                    }
+                }
+                if let Some(loc) = self.specfence.access_arms.known_toucher_loc(tx)
+                    && track(loc)
                 {
-                    self.specfence.sf_tips.install_version_tip(
-                        crit,
-                        tx_version.tx_idx,
-                        tx_version.tx_incarnation,
-                    );
-                }
-            } else if !thin && self.specfence.sf_tips.is_chain_loc(crit) {
-                // ChainSpineTip claim — O(1) flag, not WaitOnce DashMap mill.
-                self.specfence
-                    .sf_tips
-                    .chain_claim(tx_version.tx_idx, tx_version.tx_incarnation);
-            }
-            let tx = tx_version.tx_idx;
-            let track = |loc: crate::MemoryLocationHash| {
-                self.specfence.access_arms.is_protected(loc)
-                    || self.specfence.access_arms.is_wait_once(loc)
-                    || self.specfence.access_arms.is_crit_loc(loc)
-            };
-            for loc in self.mv_memory.write_locations(tx) {
-                if track(loc) {
                     self.specfence.sf_tips.note_open_writer(loc, tx);
                 }
-            }
-            if let Some(loc) = self.specfence.access_arms.known_toucher_loc(tx)
-                && track(loc)
-            {
-                self.specfence.sf_tips.note_open_writer(loc, tx);
             }
         }
 
@@ -4243,6 +4454,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                             })
                             .collect()
                     };
+                    self.note_spine_writes(tx_version.tx_idx, &write_set);
                     let (wrote_new_location, contended) =
                         self.mv_memory.record(tx_version, read_set, write_set);
                     for loc in tip_locs {
@@ -4379,6 +4591,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         }
                     }
                 }
+                self.note_spine_writes(tx_version.tx_idx, &write_set);
                 let (wrote_new_location, contended) =
                     self.mv_memory.record(tx_version, read_set, write_set);
                 if self.specfence.mode == crate::ConcurrencyMode::SpecFence {

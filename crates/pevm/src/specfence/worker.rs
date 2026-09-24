@@ -32,6 +32,15 @@ pub(crate) fn run_sf_block<F, V>(
     V: FnMut(&TxVersion, VisibilityPolicy) -> (super::ResolvePlan, Vec<crate::MemoryLocationHash>),
 {
     let metrics = specfence.metrics;
+    runnable.bind_worker(worker_i);
+    // Unpark peers on every exit so a parked worker cannot outlive the scope.
+    struct ExitWake<'a>(&'a RunnableSet);
+    impl Drop for ExitWake<'_> {
+        fn drop(&mut self) {
+            self.0.wake_all_teardown();
+        }
+    }
+    let _exit_wake = ExitWake(runnable);
     let mut spins = 0u64;
     loop {
         spins += 1;
@@ -182,6 +191,7 @@ pub(crate) fn run_sf_block<F, V>(
             specfence.policy,
             Some(metrics),
             worker_i,
+            specfence.spine,
         );
         match task {
             Some(Task::Execution(tx_version)) => {
@@ -208,6 +218,9 @@ pub(crate) fn run_sf_block<F, V>(
                 };
                 match execute(tx_version.clone(), vis) {
                     SfExec::Executed { wrote_new_location } => {
+                        // Next hop may start on another core while we validate.
+                        // Ownership ends with the hop, not with validation.
+                        specfence.spine.release_owner_tx(tx_idx);
                         // finish_execution may have waved dependents — park them
                         // on RunnableSet before this worker spends time validating.
                         drain_wave(specfence, scheduler, runnable);
@@ -228,6 +241,7 @@ pub(crate) fn run_sf_block<F, V>(
                         );
                     }
                     SfExec::Blocked { on } => {
+                        specfence.spine.release_owner_tx(tx_idx);
                         // add_dependency parks leave Aborting with no Detect
                         // edge. Heal then recovered them into a live antichain
                         // (incarnation++ mill — 6196166 reuse 206k / 19807137).
@@ -276,7 +290,10 @@ pub(crate) fn run_sf_block<F, V>(
                         }
                         drain_wave(specfence, scheduler, runnable);
                     }
-                    SfExec::Fatal => break,
+                    SfExec::Fatal => {
+                        specfence.spine.release_owner_tx(tx_idx);
+                        break;
+                    }
                 }
                 metrics.add_worker_busy_ns(t0.elapsed().as_nanos() as u64);
             }
@@ -332,10 +349,20 @@ pub(crate) fn run_sf_block<F, V>(
                         continue;
                     }
                 }
+                if runnable.pending_work() > 0 {
+                    continue;
+                }
+                // ExactWake only while a live producer still owns the core.
+                // A short timeout here woke every idle worker together and
+                // raced force-idle recover (large block seq!=par).
                 if runnable.waiting_on_live_producer(specfence.ready_edges, scheduler) {
                     for _ in 0..32 {
                         std::hint::spin_loop();
                     }
+                    if runnable.pending_work() > 0 {
+                        continue;
+                    }
+                    runnable.park_idle(worker_i);
                     continue;
                 }
                 std::thread::yield_now();

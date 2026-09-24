@@ -1,13 +1,22 @@
-//! RunnableSet — three first-class queues + work-steal (SF-PS T1 / PC).
+//! RunnableSet — IdleStealWake-core on the three-primitive spine.
 //!
-//! `Q_indep` / `Q_released` / `Q_ordered` are real deques. Pick never calls
-//! `Scheduler::next_task*`. Refuse = leave the head waiting and steal another
-//! independent (PC-2). Soft=0: WaitReleased txs are not on any Q.
+//! AdmitIndep lives on a per-worker [`LocalAdmitDeque`]: the owner pops LIFO,
+//! another core steals FIFO from the bottom. Gated / waiting heads are not
+//! work — refuse marks them and steals immediately. The spine hop is not on
+//! these deques; [`super::access_spine::AccessSpine`] holds one handoff slot.
+//! Pick never calls `Scheduler::next_task*`.
 
+use std::cell::Cell;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::thread::Thread;
+use std::time::Duration;
 
 use parking_lot::Mutex;
+
+thread_local! {
+    static ADMIT_OWNER: Cell<Option<usize>> = const { Cell::new(None) };
+}
 
 use crate::TxIdx;
 use crate::scheduler::Scheduler;
@@ -82,46 +91,97 @@ impl Deque {
 /// Detect-driven runnable set: antichain ∪ released ∪ ordered tips.
 #[derive(Debug)]
 pub(crate) struct RunnableSet {
-    q_indep: Deque,
+    /// Per-worker AdmitIndep. Index = worker. Owner LIFO / thief FIFO.
+    local_admit: Vec<Deque>,
     q_released: Deque,
     q_ordered: Deque,
     q_revalidate: Deque,
     state: Vec<AtomicU8>,
     block_size: usize,
     cores: usize,
+    /// `usize::MAX` except while seeding the chain head onto worker 0.
+    seed_shard: AtomicUsize,
+    rr: AtomicUsize,
     steal_n: AtomicUsize,
     refuse_fill_n: AtomicUsize,
     idle_spins: AtomicUsize,
     width_sum: AtomicUsize,
     width_n: AtomicUsize,
+    threads: Vec<Mutex<Option<Thread>>>,
+    parked: Vec<AtomicBool>,
+    wake_rr: AtomicUsize,
+    exact_wakes: AtomicUsize,
+    parks: AtomicUsize,
+    help_n: AtomicUsize,
 }
 
 impl RunnableSet {
     pub(crate) fn new(block_size: usize, cores: usize) -> Self {
+        let cores = cores.max(1);
         Self {
-            q_indep: Deque::new(),
+            local_admit: (0..cores).map(|_| Deque::new()).collect(),
             q_released: Deque::new(),
             q_ordered: Deque::new(),
             q_revalidate: Deque::new(),
             state: (0..block_size).map(|_| AtomicU8::new(ST_NONE)).collect(),
             block_size,
-            cores: cores.max(1),
+            cores,
+            seed_shard: AtomicUsize::new(usize::MAX),
+            rr: AtomicUsize::new(0),
             steal_n: AtomicUsize::new(0),
             refuse_fill_n: AtomicUsize::new(0),
             idle_spins: AtomicUsize::new(0),
             width_sum: AtomicUsize::new(0),
             width_n: AtomicUsize::new(0),
+            threads: (0..cores).map(|_| Mutex::new(None)).collect(),
+            parked: (0..cores).map(|_| AtomicBool::new(false)).collect(),
+            wake_rr: AtomicUsize::new(0),
+            exact_wakes: AtomicUsize::new(0),
+            parks: AtomicUsize::new(0),
+            help_n: AtomicUsize::new(0),
         }
+    }
+
+    /// Worker-local AdmitIndep pushes land on this shard.
+    pub(crate) fn bind_worker(&self, worker_i: usize) {
+        let i = worker_i % self.cores;
+        *self.threads[i].lock() = Some(std::thread::current());
+        ADMIT_OWNER.with(|c| c.set(Some(i)));
+    }
+
+    #[inline]
+    fn indep_shard(&self) -> usize {
+        let forced = self.seed_shard.load(Ordering::Relaxed);
+        if forced != usize::MAX {
+            return forced % self.cores;
+        }
+        ADMIT_OWNER.with(|c| {
+            c.get()
+                .unwrap_or_else(|| self.rr.fetch_add(1, Ordering::Relaxed) % self.cores)
+        })
     }
 
     #[inline]
     fn q(&self, kind: QueueKind) -> &Deque {
         match kind {
-            QueueKind::Indep => &self.q_indep,
+            // AdmitIndep is sharded. Callers use [`Self::enqueue`].
+            QueueKind::Indep => &self.local_admit[0],
             QueueKind::Released => &self.q_released,
             QueueKind::Ordered => &self.q_ordered,
             QueueKind::Revalidate => &self.q_revalidate,
         }
+    }
+
+    #[inline]
+    fn enqueue(&self, tx: TxIdx, kind: QueueKind) {
+        if kind == QueueKind::Indep {
+            let shard = self.indep_shard();
+            self.local_admit[shard].push_local(tx);
+        } else {
+            self.q(kind).push_local(tx);
+        }
+        // One sleeper, not the herd. No-op when nobody is parked.
+        self.exact_wake_one();
     }
 
     /// Seed after Detect `admit_seed`. Ungated → Q_indep. Window heads →
@@ -133,10 +193,13 @@ impl RunnableSet {
         scheduler: &Scheduler,
         crit_head: Option<TxIdx>,
     ) {
-        // Index order is the suffix proxy. A learned crit head is pushed
-        // last so the local LIFO pop starts that chain before lower indices.
-        // Steal still pops the high-index end (antichain tail).
+        // One AdmitIndep deque at the start (worker 0). Push high indices
+        // first so the owner LIFO-pops the low end, and the chain head last.
+        // Other cores FIFO-steal the high-index tail. Round-robin seeding
+        // put every core in the prefix together and committed a wrong
+        // receipt (15274915 seq!=par from 2 cores).
         let head = crit_head.filter(|&tx| tx < self.block_size);
+        self.seed_shard.store(0, Ordering::Relaxed);
         for tx in (0..self.block_size).rev() {
             if Some(tx) == head {
                 continue;
@@ -146,6 +209,7 @@ impl RunnableSet {
         if let Some(tx) = head {
             self.seed_one(tx, ready, stages, scheduler);
         }
+        self.seed_shard.store(usize::MAX, Ordering::Relaxed);
     }
 
     fn seed_one(
@@ -199,7 +263,7 @@ impl RunnableSet {
         if prev == tag {
             return;
         }
-        self.q(kind).push_local(tx);
+        self.enqueue(tx, kind);
     }
 
     /// Owner finished a failed claim. Only the worker that holds
@@ -217,7 +281,7 @@ impl RunnableSet {
         {
             return false;
         }
-        self.q(kind).push_local(tx);
+        self.enqueue(tx, kind);
         true
     }
 
@@ -233,7 +297,7 @@ impl RunnableSet {
         if prev == tag {
             return;
         }
-        self.q(kind).push_local(tx);
+        self.enqueue(tx, kind);
     }
 
     /// Heal / drain wake. Does not take `ST_RUNNING`: that claim is an
@@ -261,7 +325,7 @@ impl RunnableSet {
         {
             return false;
         }
-        self.q(kind).push_local(tx);
+        self.enqueue(tx, kind);
         true
     }
 
@@ -339,6 +403,9 @@ impl RunnableSet {
     }
 
     fn pop_kind(&self, kind: QueueKind) -> Option<TxIdx> {
+        if kind == QueueKind::Indep {
+            return None;
+        }
         let tag = kind.tag();
         let q = self.q(kind);
         while let Some(tx) = q.try_pop_local() {
@@ -349,11 +416,9 @@ impl RunnableSet {
         None
     }
 
-    fn steal_kind(&self, kind: QueueKind) -> Option<TxIdx> {
-        let tag = kind.tag();
-        let q = self.q(kind);
-        while let Some(tx) = q.steal() {
-            if self.take_if(tx, tag) {
+    fn steal_revalidate(&self) -> Option<TxIdx> {
+        while let Some(tx) = self.q_revalidate.steal() {
+            if self.take_if(tx, ST_REVALIDATE) {
                 self.steal_n.fetch_add(1, Ordering::Relaxed);
                 return Some(tx);
             }
@@ -361,80 +426,184 @@ impl RunnableSet {
         None
     }
 
-    /// Work-conserving pick (PC-1..PC-3). `worker_i` rotates local preference.
-    pub(crate) fn pick(&self, worker_i: usize, ready: &ReadyEdgeTable) -> Option<SfPick> {
-        if let Some(tx) = self.pop_kind(QueueKind::Revalidate) {
-            return Some(SfPick::Revalidate(tx));
+    /// Take the spine slot when no hop owns a core. The tx is not pushed
+    /// onto any AdmitIndep deque.
+    fn claim_handoff(
+        &self,
+        ready: &ReadyEdgeTable,
+        spine: &super::access_spine::AccessSpine,
+    ) -> Option<SfPick> {
+        if spine.spine_busy() {
+            return None;
         }
-        // Independents first (PC-3). Worker 0 used to prefer Ordered/Released
-        // and 1-core starved Q_indep=29 behind one Released park-requeue
-        // (19469101 pending=30 / live_wait=false).
-        let prefer = match worker_i % 3 {
-            0 => [QueueKind::Indep, QueueKind::Released, QueueKind::Ordered],
-            1 => [QueueKind::Indep, QueueKind::Ordered, QueueKind::Released],
-            _ => [QueueKind::Released, QueueKind::Indep, QueueKind::Ordered],
-        };
-        // One gated !may_execute head must not hide a later runnable in the
-        // same deque (19469101: pending=30 stuck, schedule broke on first None).
-        for kind in prefer {
-            while let Some(tx) = self.pop_kind(kind) {
-                if let Some(p) = self.admit_or_refuse(tx, kind, ready) {
-                    return Some(p);
-                }
+        let tx = spine.take_handoff()?;
+        if tx >= self.block_size {
+            return None;
+        }
+        let st = self.state[tx].load(Ordering::Acquire);
+        if st == ST_DONE {
+            return None;
+        }
+        if st == ST_RUNNING {
+            spine.restore_handoff(tx);
+            return None;
+        }
+        if !self.claim_running(tx) {
+            spine.restore_handoff(tx);
+            return None;
+        }
+        if self.refused_gate(tx, ready) {
+            self.mark_wait(tx);
+            spine.restore_handoff(tx);
+            return None;
+        }
+        Some(SfPick::Execute {
+            tx,
+            vis: self.visibility(ready, tx),
+            from: QueueKind::Ordered,
+            refused: false,
+            slot: true,
+        })
+    }
+
+    /// CAS into `ST_RUNNING` from a parked or queued state. Not from a live owner.
+    fn claim_running(&self, tx: TxIdx) -> bool {
+        for expect in [ST_WAIT, ST_NONE, ST_INDEP, ST_RELEASED, ST_ORDERED] {
+            if self.take_if(tx, expect) {
+                return true;
             }
         }
-        // Global steal: independents first (PC-3: keep width while a spine runs).
-        for kind in [QueueKind::Indep, QueueKind::Released, QueueKind::Ordered] {
-            while let Some(tx) = self.steal_kind(kind) {
-                if let Some(p) = self.admit_or_refuse(tx, kind, ready) {
-                    return Some(p);
-                }
-            }
+        false
+    }
+
+    fn refused_gate(&self, tx: TxIdx, ready: &ReadyEdgeTable) -> bool {
+        !ready.leftover_min_on_skippable_gate(tx)
+            && (ready.leftover_surplus(tx) || (ready.is_gated(tx) && !ready.may_execute(tx)))
+    }
+
+    fn note_refuse(&self, tx: TxIdx, ready: &ReadyEdgeTable) {
+        ready.note_skip_gate(tx);
+        self.mark_wait(tx);
+        self.refuse_fill_n.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn execute_indep(&self, tx: TxIdx, refused: bool) -> SfPick {
+        SfPick::Execute {
+            tx,
+            vis: VisibilityPolicy::Opt,
+            from: QueueKind::Indep,
+            refused,
+            slot: false,
         }
-        if let Some(tx) = self.steal_kind(QueueKind::Revalidate) {
-            return Some(SfPick::Revalidate(tx));
+    }
+
+    /// Owner LIFO. A gated head is not scanned further — caller steals.
+    fn pop_local_admit(&self, worker_i: usize, ready: &ReadyEdgeTable) -> LocalAdmit {
+        let shard = worker_i % self.cores;
+        while let Some(tx) = self.local_admit[shard].try_pop_local() {
+            if !self.take_if(tx, ST_INDEP) {
+                continue;
+            }
+            if self.refused_gate(tx, ready) {
+                self.note_refuse(tx, ready);
+                return LocalAdmit::Refused;
+            }
+            return LocalAdmit::Ready(tx);
+        }
+        LocalAdmit::Empty
+    }
+
+    /// FIFO from the bottom of another worker's AdmitIndep deque only.
+    fn steal_admit(&self, worker_i: usize, ready: &ReadyEdgeTable) -> Option<TxIdx> {
+        let n = self.cores;
+        for k in 1..n {
+            let victim = (worker_i + k) % n;
+            let mut gated_budget = 0u8;
+            while let Some(tx) = self.local_admit[victim].steal() {
+                if !self.take_if(tx, ST_INDEP) {
+                    continue;
+                }
+                self.steal_n.fetch_add(1, Ordering::Relaxed);
+                if self.refused_gate(tx, ready) {
+                    self.note_refuse(tx, ready);
+                    gated_budget += 1;
+                    if gated_budget >= 4 {
+                        break;
+                    }
+                    continue;
+                }
+                return Some(tx);
+            }
         }
         None
     }
 
-    fn admit_or_refuse(
-        &self,
-        tx: TxIdx,
-        kind: QueueKind,
-        ready: &ReadyEdgeTable,
-    ) -> Option<SfPick> {
-        if !ready.leftover_min_on_skippable_gate(tx)
-            && (ready.leftover_surplus(tx) || (ready.is_gated(tx) && !ready.may_execute(tx)))
-        {
-            ready.note_skip_gate(tx);
-            self.mark_wait(tx);
-            self.refuse_fill_n.fetch_add(1, Ordering::Relaxed);
-            // PC-2: immediately fill from Q_indep.
-            if let Some(alt) = self
-                .pop_kind(QueueKind::Indep)
-                .or_else(|| self.steal_kind(QueueKind::Indep))
-            {
+    /// HelpRelease: one runnable Released/Ordered after AdmitIndep is empty.
+    /// Gated heads are skipped, not returned.
+    fn help_release(&self, ready: &ReadyEdgeTable) -> Option<SfPick> {
+        for kind in [QueueKind::Released, QueueKind::Ordered] {
+            for _ in 0..8 {
+                let Some(tx) = self.pop_kind(kind) else {
+                    break;
+                };
+                if self.refused_gate(tx, ready) {
+                    self.note_refuse(tx, ready);
+                    continue;
+                }
+                self.help_n.fetch_add(1, Ordering::Relaxed);
+                let vis = if kind == QueueKind::Ordered {
+                    VisibilityPolicy::OrderedTip
+                } else {
+                    VisibilityPolicy::for_ready(ready, tx)
+                };
                 return Some(SfPick::Execute {
-                    tx: alt,
-                    vis: VisibilityPolicy::Opt,
-                    from: QueueKind::Indep,
-                    refused: true,
+                    tx,
+                    vis,
+                    from: kind,
+                    refused: false,
+                    slot: false,
                 });
             }
-            return None;
         }
-        let vis = match kind {
-            QueueKind::Indep => VisibilityPolicy::Opt,
-            QueueKind::Released => VisibilityPolicy::for_ready(ready, tx),
-            QueueKind::Ordered => VisibilityPolicy::OrderedTip,
-            QueueKind::Revalidate => VisibilityPolicy::for_ready(ready, tx),
+        None
+    }
+
+    /// IdleStealWake pick. `spine` is `None` in unit tests (no handoff slot).
+    pub(crate) fn pick(&self, worker_i: usize, ready: &ReadyEdgeTable) -> Option<SfPick> {
+        self.pick_in(worker_i, ready, None)
+    }
+
+    pub(crate) fn pick_in(
+        &self,
+        worker_i: usize,
+        ready: &ReadyEdgeTable,
+        spine: Option<&super::access_spine::AccessSpine>,
+    ) -> Option<SfPick> {
+        if let Some(tx) = self.pop_kind(QueueKind::Revalidate) {
+            return Some(SfPick::Revalidate(tx));
+        }
+        // Slot before local Indep so the chain is not stuck behind a wide
+        // antichain. Only one core wins; the rest fall through to fill.
+        if let Some(spine) = spine
+            && let Some(p) = self.claim_handoff(ready, spine)
+        {
+            return Some(p);
+        }
+        let refused = match self.pop_local_admit(worker_i, ready) {
+            LocalAdmit::Ready(tx) => return Some(self.execute_indep(tx, false)),
+            LocalAdmit::Refused => true,
+            LocalAdmit::Empty => false,
         };
-        Some(SfPick::Execute {
-            tx,
-            vis,
-            from: kind,
-            refused: false,
-        })
+        if let Some(tx) = self.steal_admit(worker_i, ready) {
+            return Some(self.execute_indep(tx, refused));
+        }
+        if let Some(p) = self.help_release(ready) {
+            return Some(p);
+        }
+        if let Some(tx) = self.steal_revalidate() {
+            return Some(SfPick::Revalidate(tx));
+        }
+        None
     }
 
     /// `Aborting` parked on a still-unpublished writer must not incarnation++.
@@ -876,7 +1045,7 @@ impl RunnableSet {
 
     #[inline]
     pub(crate) fn width(&self) -> usize {
-        self.q_indep.len() + self.q_released.len() + self.q_ordered.len()
+        self.q_indep_len() + self.q_released.len() + self.q_ordered.len()
     }
 
     #[inline]
@@ -953,7 +1122,70 @@ impl RunnableSet {
 
     #[inline]
     pub(crate) fn q_indep_len(&self) -> usize {
-        self.q_indep.len()
+        self.local_admit.iter().map(|d| d.len()).sum()
+    }
+
+    /// Unpark one worker waiting on an ExactWakeToken.
+    pub(crate) fn exact_wake_one(&self) {
+        let start = self.wake_rr.fetch_add(1, Ordering::Relaxed);
+        for k in 0..self.cores {
+            let i = (start + k) % self.cores;
+            if self.parked[i]
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                if let Some(t) = self.threads[i].lock().clone() {
+                    t.unpark();
+                    self.exact_wakes.fetch_add(1, Ordering::Relaxed);
+                }
+                return;
+            }
+        }
+    }
+
+    /// Teardown only. Work distribution never broadcasts.
+    pub(crate) fn wake_all_teardown(&self) {
+        for i in 0..self.cores {
+            self.parked[i].store(false, Ordering::Release);
+            if let Some(t) = self.threads[i].lock().clone() {
+                t.unpark();
+            }
+        }
+    }
+
+    /// Park this worker until one ExactWake or a short safety timeout.
+    pub(crate) fn park_idle(&self, worker_i: usize) {
+        let i = worker_i % self.cores;
+        self.parks.fetch_add(1, Ordering::Relaxed);
+        self.parked[i].store(true, Ordering::Release);
+        if self.pending_work() > 0 {
+            self.parked[i].store(false, Ordering::Release);
+            return;
+        }
+        // Safety net so a missed unpark cannot pin `thread::scope`. Long
+        // enough that it is not the scheduling heartbeat.
+        std::thread::park_timeout(Duration::from_millis(20));
+        self.parked[i].store(false, Ordering::Release);
+    }
+
+    #[inline]
+    pub(crate) fn any_running(&self) -> bool {
+        (0..self.block_size).any(|t| self.state[t].load(Ordering::Acquire) == ST_RUNNING)
+    }
+
+    #[inline]
+    pub(crate) fn exact_wakes(&self) -> usize {
+        self.exact_wakes.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn idle_parks(&self) -> usize {
+        self.parks.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn help_releases(&self) -> usize {
+        self.help_n.load(Ordering::Relaxed)
     }
 
     #[inline]
@@ -995,8 +1227,17 @@ pub(crate) enum SfPick {
         vis: VisibilityPolicy,
         from: QueueKind,
         refused: bool,
+        /// Taken from [`super::access_spine::AccessSpine`]'s handoff slot.
+        slot: bool,
     },
     Revalidate(TxIdx),
+}
+
+enum LocalAdmit {
+    Ready(TxIdx),
+    /// Gated head. Do not keep popping this deque.
+    Refused,
+    Empty,
 }
 
 #[cfg(test)]
@@ -1314,6 +1555,26 @@ mod tests {
         let n = r.heal(&ready, &sched);
         assert!(n >= 1, "ghost producer with waiters must recover, got {n}");
         assert!(sched.is_ready(1));
+    }
+
+    #[test]
+    fn local_lifo_and_cross_core_fifo_steal() {
+        let ready = ReadyEdgeTable::new();
+        let r = RunnableSet::new(6, 2);
+        r.bind_worker(0);
+        r.push(1, QueueKind::Indep);
+        r.push(2, QueueKind::Indep);
+        let SfPick::Execute { tx, slot, .. } = r.pick(0, &ready).expect("owner") else {
+            panic!("expected execute");
+        };
+        assert_eq!(tx, 2, "owner pops LIFO");
+        assert!(!slot);
+        let SfPick::Execute { tx, .. } = r.pick(1, &ready).expect("thief") else {
+            panic!("expected execute");
+        };
+        assert_eq!(tx, 1, "thief pops FIFO bottom");
+        assert!(r.steal_n() >= 1, "cross-core steal counts");
+        ADMIT_OWNER.with(|c| c.set(None));
     }
 
     #[test]

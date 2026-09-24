@@ -189,6 +189,10 @@ pub struct Pevm {
     /// Lab-only fine-grain RW/abort tracer (off by default).
     finegrain_enabled: bool,
     finegrain: FineGrainCollector,
+    /// Cross-block AccessEvent radar. Never an Avoid table.
+    spine_prior: crate::specfence::SpinePrior,
+    /// Last SpecFence block's spine counters (Soft=0 report).
+    last_spine: crate::specfence::SpineReport,
 }
 
 impl Default for Pevm {
@@ -216,6 +220,8 @@ impl Default for Pevm {
             last_abort_rate: 0.0,
             finegrain_enabled: false,
             finegrain: FineGrainCollector::new(),
+            spine_prior: crate::specfence::SpinePrior::default(),
+            last_spine: crate::specfence::SpineReport::default(),
         }
     }
 }
@@ -412,6 +418,13 @@ impl Pevm {
         self.bayes.prior_wait_probability(location)
     }
 
+    /// AccessEvent spine counters from the last SpecFence block.
+    ///
+    /// `prior_radar_only == 1` means the carried prior cannot fence.
+    pub fn last_spine(&self) -> crate::specfence::SpineReport {
+        self.last_spine
+    }
+
     /// Execute an Alloy block, which is becoming the "standard" format in Rust.
     /// TODO: Better error handling.
     pub fn execute<S, C>(
@@ -541,6 +554,9 @@ impl Pevm {
         // Shared waiter / AccessArm. Private state is the per-worker Vm.
         let access_arms = crate::specfence::AccessArmTable::new();
         let sf_tips = crate::specfence::SfTipTable::new();
+        // Soft=0: prior is radar only. Avoid table inside the spine starts empty.
+        let access_spine =
+            crate::specfence::AccessSpine::begin(self.spine_prior.clone(), concurrency_level.get());
         let lanes = crate::specfence::LaneTable::new();
         let edges = EdgeTable::new();
         let sketch = HotSketch::new();
@@ -593,17 +609,20 @@ impl Pevm {
             // Do not sample block_size as ready_width when A1=0 (that read as 176).
             // Reuse WAW: nearest pred on the learned chain, then pop that
             // head before the low-index antichain.
-            let crit_head = self.inter_prior.crit_chain().and_then(|(loc, writers)| {
-                access_arms.note_prior_touchers(loc, &writers);
-                if writers.len() < 32 || writers.len() * 4 > block_size {
-                    return None;
-                }
-                access_arms.install_crit_chain(loc, &writers);
-                ready_edges.plant_nearest_preds(loc, &writers);
-                // ChainSpineTip: light true-publish plane (not DashMap WaitOnce tips).
-                sf_tips.bind_chain_spine(loc, &writers);
-                writers.first().copied()
-            });
+            let crit_head = self
+                .inter_prior
+                .crit_chain()
+                .and_then(|(loc, writers)| {
+                    access_arms.note_prior_touchers(loc, &writers);
+                    if writers.len() < 32 || writers.len() * 4 > block_size {
+                        return None;
+                    }
+                    access_arms.install_crit_chain(loc, &writers);
+                    ready_edges.plant_nearest_preds(loc, &writers);
+                    // ChainSpineTip: light true-publish plane (not DashMap WaitOnce tips).
+                    sf_tips.bind_chain_spine(loc, &writers);
+                    writers.first().copied()
+                });
             self.last_begin_blocked = ready_edges.blocked_consumers();
             runnable.seed_begin(&ready_edges, &producer_stages, &scheduler, crit_head);
             // P3: do not sample (n_tx − blocked) as ready_width (reads as 172).
@@ -660,6 +679,7 @@ impl Pevm {
             sf_tips: &sf_tips,
             tx_first_start: &tx_first_start,
             exec_origin: &exec_origin,
+            spine: &access_spine,
         };
 
         // TODO: Better thread handling
@@ -757,6 +777,16 @@ impl Pevm {
             }
         });
 
+        if self.concurrency_mode == ConcurrencyMode::SpecFence {
+            let (mut report, next) = access_spine.end_block();
+            report.exact_wakes = runnable.exact_wakes();
+            report.idle_parks = runnable.idle_parks();
+            report.help_releases = runnable.help_releases();
+            report.steal_n = runnable.steal_n();
+            report.idle_spins = runnable.idle_spins();
+            self.spine_prior = next;
+            self.last_spine = report;
+        }
         if self.concurrency_mode == ConcurrencyMode::Pcc {
             update_heat(&self.heat, &hints, &metrics_inner, block_env.beneficiary);
         }
@@ -2504,8 +2534,21 @@ fn try_validate(
             );
         }
         // OCC / PCC: full write-set ESTIMATE (unchanged).
+        // SpecFence RetainHistory keeps a pinned writer's Data.
         let occ_write_locs = mv_memory.write_locations(tx_version.tx_idx);
-        mv_memory.convert_writes_to_estimates(tx_version.tx_idx);
+        if specfence.mode == ConcurrencyMode::SpecFence {
+            let spine = specfence.spine;
+            mv_memory.convert_writes_to_estimates_keeping(tx_version.tx_idx, |loc| {
+                if spine.should_pin_origin(loc, tx_version.tx_idx) {
+                    spine.note_retain_keep();
+                    true
+                } else {
+                    false
+                }
+            });
+        } else {
+            mv_memory.convert_writes_to_estimates(tx_version.tx_idx);
+        }
         // A2: ESTIMATE is a confirmed wr — flip Avoid in-batch for later readers.
         if specfence.mode == ConcurrencyMode::SpecFence {
             // Drop SF version tip / live_writer so WaitOnce does not park on
