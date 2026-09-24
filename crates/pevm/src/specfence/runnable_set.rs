@@ -1,11 +1,12 @@
 //! RunnableSet — AdmitShard on the three-primitive spine.
 //!
-//! `AdmitIndep` is seeded across per-worker Chase-Lev deques. The owner pops
-//! LIFO at the bottom; a thief pops FIFO at the top only when its own deque
-//! is empty. There is no single-owner mutex. Gated / waiting heads are not
-//! work. Spine hops stay on [`super::access_spine::AccessSpine`]'s handoff
-//! slot and are never seeded as `AdmitIndep`. Pick never calls
-//! `Scheduler::next_task*`.
+//! Ideal-ready `AdmitIndep` (no Detect predecessor) is seeded into one
+//! global pool. Worker 0 pops the low end; every other core pops the high
+//! end. That is the primary supply, before any local late deque. A recorded
+//! Detect predecessor stays on a per-core late deque. Spine hops stay on
+//! [`super::access_spine::AccessSpine`]'s handoff slot and are never seeded
+//! into the pool. `SPECFENCE_GLOBAL_IDEAL_READY_POOL=0` restores the
+//! within-shard Ideal-timed deques. Pick never calls `Scheduler::next_task*`.
 
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -27,6 +28,26 @@ fn ideal_timed_admit_on() -> bool {
             Some("0") | Some("false") | Some("FALSE")
         )
     })
+}
+
+/// Soft=0 product path. Default on.
+/// `SPECFENCE_GLOBAL_IDEAL_READY_POOL=0` restores within-shard Ideal-timed
+/// admit (the #56 pop law). Index bands are `SPECFENCE_IDEAL_TIMED_ADMIT=0`
+/// with the pool also off.
+fn global_ideal_ready_pool_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("SPECFENCE_GLOBAL_IDEAL_READY_POOL")
+                .ok()
+                .as_deref(),
+            Some("0" | "false" | "FALSE")
+        )
+    })
+}
+
+fn late_split_on() -> bool {
+    global_ideal_ready_pool_on() || ideal_timed_admit_on()
 }
 
 fn work_hint(work: &[u64], tx: TxIdx) -> u64 {
@@ -152,16 +173,99 @@ pub(crate) struct PostSpanProbe {
     pub quiet_false_or: u64,
 }
 
+/// Lock-free dual-ended Ideal-ready pool.
+///
+/// Seed fills `slots[0..n)` in ascending tx order, then publishes `range`.
+/// `pop_low` claims the next low index. `pop_high` claims the next high
+/// index. One atomic range so the last tx is taken once. No gas sort.
+/// Spine hops and Ordered tips are never seeded here.
+#[derive(Debug)]
+struct GlobalIdealReadyPool {
+    slots: Box<[AtomicUsize]>,
+    /// Low 32 bits = inclusive low cursor. High 32 bits = exclusive high cursor.
+    range: AtomicU64,
+}
+
+impl GlobalIdealReadyPool {
+    fn new(block_size: usize) -> Self {
+        Self {
+            slots: (0..block_size).map(|_| AtomicUsize::new(0)).collect(),
+            range: AtomicU64::new(0),
+        }
+    }
+
+    /// Single-threaded. `txs` is ascending. Workers have not started.
+    fn seed(&self, txs: &[TxIdx]) {
+        let n = txs.len().min(self.slots.len());
+        for (i, &tx) in txs.iter().take(n).enumerate() {
+            self.slots[i].store(tx, Ordering::Relaxed);
+        }
+        self.range.store((n as u64) << 32, Ordering::Release);
+    }
+
+    fn len(&self) -> usize {
+        let (lo, hi) = self.cursors();
+        hi.saturating_sub(lo) as usize
+    }
+
+    fn pop_low(&self) -> Option<TxIdx> {
+        self.pop_end(true)
+    }
+
+    fn pop_high(&self) -> Option<TxIdx> {
+        self.pop_end(false)
+    }
+
+    fn cursors(&self) -> (u32, u32) {
+        let v = self.range.load(Ordering::Acquire);
+        (v as u32, (v >> 32) as u32)
+    }
+
+    fn pop_end(&self, low: bool) -> Option<TxIdx> {
+        loop {
+            let v = self.range.load(Ordering::Acquire);
+            let lo = v as u32;
+            let hi = (v >> 32) as u32;
+            if lo >= hi {
+                return None;
+            }
+            let (nlo, nhi, idx) = if low {
+                (lo + 1, hi, lo)
+            } else {
+                (lo, hi - 1, hi - 1)
+            };
+            let next = ((nhi as u64) << 32) | u64::from(nlo);
+            if self
+                .range
+                .compare_exchange(v, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(self.slots[idx as usize].load(Ordering::Relaxed));
+            }
+        }
+    }
+}
+
 /// Detect-driven runnable set: antichain ∪ released ∪ ordered tips.
 #[derive(Debug)]
 pub(crate) struct RunnableSet {
     /// Per-worker `AdmitIndep`. Index = worker. Owner LIFO / thief FIFO.
     /// Ideal-ready (no Detect pred) lives here.
     local_admit: Vec<LocalAdmitDeque>,
-    /// Later-wave AdmitIndep (a Detect pred exists). Popped only after
-    /// `local_admit` when Ideal-timed admit is on, so a publish wake cannot
-    /// jump the antichain. Spine hops never land here.
+    /// Later-wave AdmitIndep (a Detect pred exists). Popped only after the
+    /// global Ideal-ready pool (or this shard's `local_admit` when the pool
+    /// is off). Spine hops never land here.
     local_late: Vec<LocalAdmitDeque>,
+    /// Ideal-ready inventory. Not index-band owned. Empty when the pool flag
+    /// is off.
+    global_pool: GlobalIdealReadyPool,
+    /// Requeue of an already-seeded Ideal-ready tx. Owner pushes the bottom.
+    /// Any core may pop the top. Popped with the pool, before local late.
+    ideal_overflow: Vec<LocalAdmitDeque>,
+    /// Crit head, stored as `tx + 1`. `0` means empty. Worker 0 pops this
+    /// before the pool so the spine starts while other cores drain Ideal-ready.
+    /// Never a stealable SpineHop.
+    head_slot: AtomicUsize,
     /// Seeded with no Detect predecessor.
     ideal_ready: Vec<AtomicBool>,
     q_released: Deque,
@@ -275,6 +379,11 @@ impl RunnableSet {
             local_late: (0..cores)
                 .map(|_| LocalAdmitDeque::with_capacity(block_size))
                 .collect(),
+            global_pool: GlobalIdealReadyPool::new(block_size),
+            ideal_overflow: (0..cores)
+                .map(|_| LocalAdmitDeque::with_capacity(block_size))
+                .collect(),
+            head_slot: AtomicUsize::new(0),
             ideal_ready: (0..block_size).map(|_| AtomicBool::new(false)).collect(),
             q_released: Deque::new(),
             q_ordered: Deque::new(),
@@ -356,42 +465,71 @@ impl RunnableSet {
     fn enqueue(&self, tx: TxIdx, kind: QueueKind) {
         if kind == QueueKind::Indep {
             let shard = self.indep_shard();
-            let late = ideal_timed_admit_on()
+            let ideal = global_ideal_ready_pool_on()
                 && tx < self.ideal_ready.len()
-                && !self.ideal_ready[tx].load(Ordering::Relaxed);
-            let q = if late {
-                &self.local_late
+                && self.ideal_ready[tx].load(Ordering::Relaxed);
+            if ideal {
+                // Requeued Ideal-ready. Visible to any core before local late.
+                // Spine hops never have this bit set.
+                self.ideal_overflow[shard].push_bottom(tx);
             } else {
-                &self.local_admit
-            };
-            q[shard].push_bottom(tx);
+                let late = late_split_on()
+                    && tx < self.ideal_ready.len()
+                    && !self.ideal_ready[tx].load(Ordering::Relaxed);
+                let q = if late {
+                    &self.local_late
+                } else {
+                    &self.local_admit
+                };
+                q[shard].push_bottom(tx);
+            }
         } else {
             self.q(kind).push_local(tx);
         }
-        // One sleeper, not the herd. No-op when nobody is parked.
+        // One sleeper, not the herd. Pool push wakes one idle core, not the herd.
         self.exact_wake_one();
     }
 
-    /// Seed-time `AdmitIndep` push. Workers are not running, so this does not
-    /// call `ExactWake` (there is nobody to unpark).
+    /// Seed-time `AdmitIndep` claim. Workers are not running, so this does not
+    /// call `ExactWake`. Returns false when the tx is already claimed.
     ///
-    /// `late` parks a tx that already has a Detect predecessor on
-    /// [`Self::local_late`]. Ideal-ready txs (`late == false`) set the bit
-    /// and land on [`Self::local_admit`].
-    fn place_seed_on(&self, shard: usize, tx: TxIdx, late: bool) {
+    /// `late` is a recorded Detect predecessor. Ideal-ready txs set the bit
+    /// so a later requeue stays out of the late deque and out of the spine slot.
+    fn claim_seed_indep(&self, tx: TxIdx, late: bool) -> bool {
         if tx >= self.block_size {
-            return;
+            return false;
         }
         let prev = self.state[tx].swap(ST_INDEP, Ordering::AcqRel);
         if prev == ST_RUNNING || prev == ST_DONE {
             self.state[tx].store(prev, Ordering::Release);
-            return;
+            return false;
         }
         if prev == ST_INDEP {
-            return;
+            return false;
         }
         if !late {
             self.ideal_ready[tx].store(true, Ordering::Relaxed);
+        }
+        true
+    }
+
+    fn place_seed_on(&self, shard: usize, tx: TxIdx, late: bool) {
+        if !self.claim_seed_indep(tx, late) {
+            return;
+        }
+        self.push_claimed_seed(shard, tx, late);
+    }
+
+    fn push_claimed_seed(&self, shard: usize, tx: TxIdx, late: bool) {
+        if global_ideal_ready_pool_on() {
+            // Crit head only (the sole caller while the pool is on). Off the
+            // global pool, and off every non-spine pop, so the spine starts
+            // while other cores drain Ideal-ready. `late` still skips the
+            // ideal_ready bit via [`Self::claim_seed_indep`].
+            let _ = (shard, late);
+            debug_assert_eq!(self.head_slot.load(Ordering::Relaxed), 0);
+            self.head_slot.store(tx + 1, Ordering::Release);
+            return;
         }
         let q = if late {
             &self.local_late
@@ -399,6 +537,11 @@ impl RunnableSet {
             &self.local_admit
         };
         q[shard % self.cores].push_bottom(tx);
+    }
+
+    fn take_head(&self) -> Option<TxIdx> {
+        let v = self.head_slot.swap(0, Ordering::AcqRel);
+        if v == 0 { None } else { Some(v - 1) }
     }
 
     /// `pop_low_first`: push high-to-low so LIFO yields the lowest index.
@@ -451,17 +594,22 @@ impl RunnableSet {
 
     /// Contiguous count-balanced bands of `AdmitIndep`, already sorted ascending.
     ///
-    /// Band 0 is pushed high-to-low so worker 0's LIFO pops the low prefix
-    /// and a thief takes that band's high end. Later bands are pushed
-    /// low-to-high so those owners start at their high end, not in the
-    /// prefix. Round-robin (`tx % C`) put every core in the prefix and
-    /// committed a wrong receipt on 15274915 at 2 cores.
+    /// With the global pool on, Ideal-ready leaves these bands. Detect-pred
+    /// late txs keep them. Band 0 is pushed high-to-low so worker 0's LIFO
+    /// pops the low end. Later bands are pushed low-to-high so those owners
+    /// start at their high end. Round-robin (`tx % C`) put every core in the
+    /// prefix and committed a wrong receipt on 15274915 at 2 cores.
     ///
-    /// Ideal-timed admit keeps those bands. A recorded Detect pred waits on
-    /// `local_late` until that shard's Ideal-ready deque is empty. On a free
-    /// core, when gas limits differ, Ideal-ready txs in the band pop heaviest
-    /// first. They stay on that core.
+    /// Pool off: Ideal-timed admit keeps Ideal-ready inside the band. A
+    /// recorded Detect pred waits on `local_late` until that shard's
+    /// Ideal-ready deque is empty. On a free core, when gas limits differ,
+    /// Ideal-ready txs in the band pop heaviest first. They stay on that core.
+    /// That within-band reorder is not the product knife.
     fn shard_indep(&self, indep_asc: &[TxIdx], ready: &ReadyEdgeTable, work: &[u64]) {
+        if global_ideal_ready_pool_on() {
+            self.shard_indep_global(indep_asc, ready);
+            return;
+        }
         let cores = self.cores;
         let n = indep_asc.len();
         if n == 0 || cores == 0 {
@@ -490,6 +638,51 @@ impl RunnableSet {
             }
             self.push_heavy_first(shard, &late, work, true);
             self.push_heavy_first(shard, &ideal, work, false);
+        }
+    }
+
+    /// Ideal-ready → one global pool. Late → index bands. No gas rebalance.
+    fn shard_indep_global(&self, indep_asc: &[TxIdx], ready: &ReadyEdgeTable) {
+        let mut ideal = Vec::new();
+        let mut late = Vec::new();
+        for &tx in indep_asc {
+            let late_tx = ready.recorded_pred(tx).is_some();
+            if !self.claim_seed_indep(tx, late_tx) {
+                continue;
+            }
+            if late_tx {
+                late.push(tx);
+            } else {
+                ideal.push(tx);
+            }
+        }
+        self.seed_late_bands(&late);
+        self.global_pool.seed(&ideal);
+    }
+
+    /// State is already `ST_INDEP`. Index order only — not gas-weighted.
+    fn seed_late_bands(&self, late_asc: &[TxIdx]) {
+        let cores = self.cores;
+        let n = late_asc.len();
+        if n == 0 || cores == 0 {
+            return;
+        }
+        let base = n / cores;
+        let rem = n % cores;
+        let mut cursor = 0;
+        for shard in 0..cores {
+            let len = base + usize::from(shard < rem);
+            let band = &late_asc[cursor..cursor + len];
+            cursor += len;
+            if shard == 0 {
+                for &tx in band.iter().rev() {
+                    self.local_late[shard].push_bottom(tx);
+                }
+            } else {
+                for &tx in band {
+                    self.local_late[shard].push_bottom(tx);
+                }
+            }
         }
     }
 
@@ -523,7 +716,7 @@ impl RunnableSet {
             // ahead of the low prefix. A head that already has a Detect
             // pred does not jump the Ideal-ready deque.
             for tx in ignored {
-                let late = ideal_timed_admit_on() && ready.recorded_pred(tx).is_some();
+                let late = late_split_on() && ready.recorded_pred(tx).is_some();
                 self.place_seed_on(0, tx, late);
             }
         }
@@ -815,15 +1008,74 @@ impl RunnableSet {
         }
     }
 
-    /// Owner LIFO. Ideal-ready first, then the late deque. A gated head is
-    /// not scanned further — caller steals.
+    /// Non-spine: global Ideal-ready, then this core's late deque.
+    /// Worker 0 also takes the crit-head slot before the pool (spine start).
+    /// Pool off: owner LIFO of the local Ideal-ready deque, then late.
+    /// A gated local head is not scanned further — caller steals.
     fn pop_local_admit(&self, worker_i: usize, ready: &ReadyEdgeTable) -> LocalAdmit {
-        let primary = self.pop_deque(worker_i, &self.local_admit, ready);
-        if matches!(primary, LocalAdmit::Empty) && ideal_timed_admit_on() {
-            self.pop_deque(worker_i, &self.local_late, ready)
+        if global_ideal_ready_pool_on() {
+            match self.pop_global_ideal(worker_i, ready) {
+                LocalAdmit::Empty => self.pop_deque(worker_i, &self.local_late, ready),
+                other => other,
+            }
         } else {
-            primary
+            let primary = self.pop_deque(worker_i, &self.local_admit, ready);
+            if matches!(primary, LocalAdmit::Empty) && ideal_timed_admit_on() {
+                self.pop_deque(worker_i, &self.local_late, ready)
+            } else {
+                primary
+            }
         }
+    }
+
+    /// Primary Ideal-ready supply. Not a steal. Refused heads are skipped so
+    /// one gated tx cannot strand the rest of the pool.
+    fn pop_global_ideal(&self, worker_i: usize, ready: &ReadyEdgeTable) -> LocalAdmit {
+        let shard = worker_i % self.cores;
+        while let Some(tx) = self.next_seeded_ideal(shard) {
+            if let Some(out) = self.finish_ideal_pop(tx, ready) {
+                return out;
+            }
+        }
+        while let Some(tx) = self.ideal_overflow[shard].pop_bottom() {
+            if let Some(out) = self.finish_ideal_pop(tx, ready) {
+                return out;
+            }
+        }
+        for k in 1..self.cores {
+            let victim = (shard + k) % self.cores;
+            while let Some(tx) = self.ideal_overflow[victim].pop_top() {
+                if let Some(out) = self.finish_ideal_pop(tx, ready) {
+                    return out;
+                }
+            }
+        }
+        LocalAdmit::Empty
+    }
+
+    fn next_seeded_ideal(&self, shard: usize) -> Option<TxIdx> {
+        if shard == 0
+            && let Some(tx) = self.take_head()
+        {
+            return Some(tx);
+        }
+        if shard == 0 {
+            self.global_pool.pop_low()
+        } else {
+            self.global_pool.pop_high()
+        }
+    }
+
+    fn finish_ideal_pop(&self, tx: TxIdx, ready: &ReadyEdgeTable) -> Option<LocalAdmit> {
+        if tx >= self.block_size || !self.take_if(tx, ST_INDEP) {
+            return None;
+        }
+        self.seed_owner_local_pops.fetch_add(1, Ordering::Relaxed);
+        if self.refused_gate(tx, ready) {
+            self.note_refuse(tx, ready);
+            return None;
+        }
+        Some(LocalAdmit::Ready(tx))
     }
 
     fn pop_deque(
@@ -847,9 +1099,13 @@ impl RunnableSet {
         LocalAdmit::Empty
     }
 
-    /// FIFO `pop_top` of another worker's `AdmitIndep` deque only.
-    /// Ideal-ready deques first. Spine hops are not in either deque.
+    /// Late rebalance after the Ideal-ready pool and this core's late deque
+    /// are empty. Pool on: do not steal Ideal-ready (that supply was the pool).
+    /// Spine hops are not in either deque. No gas-weighted victim choice.
     fn steal_admit(&self, worker_i: usize, ready: &ReadyEdgeTable) -> Option<TxIdx> {
+        if global_ideal_ready_pool_on() {
+            return self.steal_deques(worker_i, &self.local_late, ready);
+        }
         if let Some(tx) = self.steal_deques(worker_i, &self.local_admit, ready) {
             return Some(tx);
         }
@@ -1701,11 +1957,18 @@ impl RunnableSet {
 
     #[inline]
     pub(crate) fn q_indep_len(&self) -> usize {
-        self.local_admit
+        let mut n: usize = self
+            .local_admit
             .iter()
             .chain(self.local_late.iter())
+            .chain(self.ideal_overflow.iter())
             .map(|d| d.len())
-            .sum()
+            .sum();
+        n += self.global_pool.len();
+        if self.head_slot.load(Ordering::Acquire) != 0 {
+            n += 1;
+        }
+        n
     }
 
     /// Unpark one worker waiting on an ExactWakeToken.
@@ -2207,7 +2470,7 @@ mod tests {
     }
 
     #[test]
-    fn ideal_timed_free_core_pops_heavier_ready_first() {
+    fn global_pool_free_core_pops_high_end_not_gas_order() {
         let ready = ReadyEdgeTable::new();
         let stages = ProducerStageTable::new();
         let sched = Scheduler::new(8);
@@ -2218,11 +2481,129 @@ mod tests {
         let SfPick::Execute { tx, .. } = r.pick(0, &ready).expect("worker 0") else {
             panic!("expected execute");
         };
-        assert!(tx <= 3, "worker 0 still owns the low prefix, got {tx}");
+        assert!(tx <= 3, "worker 0 still pops the low end, got {tx}");
         let SfPick::Execute { tx, .. } = r.pick(1, &ready).expect("worker 1") else {
             panic!("expected execute");
         };
-        assert_eq!(tx, 5, "free core pops the heavy Ideal-ready tx first");
+        assert_eq!(
+            tx, 7,
+            "free core pops the global high end, not the heavy tx inside a band"
+        );
+        assert_eq!(
+            r.steal_n(),
+            0,
+            "pool pop is the primary supply, not a steal"
+        );
+    }
+
+    #[test]
+    fn spine_hop_never_enters_global_ideal_pool() {
+        let ready = ReadyEdgeTable::new();
+        let stages = ProducerStageTable::new();
+        let sched = Scheduler::new(8);
+        ready.plant_nearest_preds(0xabc, &[4, 6]);
+        let r = RunnableSet::new(8, 2);
+        r.seed_begin(&ready, &stages, &sched, Some(4), &[]);
+        assert_eq!(ready.blocking_producer(6), Some(4));
+        assert_eq!(r.q_ordered_len(), 0, "ordered queue is not the pool");
+        let mut saw_hop = false;
+        for w in 0..2 {
+            for _ in 0..8 {
+                let Some(SfPick::Execute { tx, from, .. }) = r.pick(w, &ready) else {
+                    break;
+                };
+                assert_ne!(from, QueueKind::Ordered);
+                if tx == 6 {
+                    saw_hop = true;
+                }
+            }
+        }
+        assert!(!saw_hop, "SpineHop stays on mark_wait, never in the pool");
+    }
+
+    #[test]
+    fn non_spine_pops_global_ideal_before_local_late() {
+        let ready = ReadyEdgeTable::new();
+        let stages = ProducerStageTable::new();
+        let sched = Scheduler::new(8);
+        let wave = crate::specfence::wave::WaveParkTable::new();
+        // Live preds stay off the pool (`mark_wait`). After publish, the
+        // successor is AdmitIndepLate on the waker's local deque.
+        ready.plant_nearest_preds(0x11, &[0, 1]);
+        ready.plant_nearest_preds(0x22, &[4, 5]);
+        let r = RunnableSet::new(8, 2);
+        r.seed_begin(&ready, &stages, &sched, None, &[]);
+        ready.note_producer_done(4, &wave);
+        r.bind_worker(1);
+        assert!(
+            r.wake_idle(5, QueueKind::Indep),
+            "published successor rejoins as late, not as Ideal-ready"
+        );
+        let mut got = Vec::new();
+        for _ in 0..6 {
+            let SfPick::Execute { tx, .. } = r.pick(1, &ready).expect("ideal") else {
+                panic!("expected execute");
+            };
+            assert_ne!(
+                tx, 5,
+                "non-spine must pop global Ideal-ready before its local late deque"
+            );
+            got.push(tx);
+        }
+        assert!(
+            got.iter().any(|&tx| tx <= 3),
+            "non-spine must see Ideal-ready from the low index band, got {got:?}"
+        );
+        assert_eq!(
+            r.steal_n(),
+            0,
+            "cross-band Ideal-ready is a pool pop, not a steal"
+        );
+        let SfPick::Execute { tx, .. } = r.pick(1, &ready).expect("late") else {
+            panic!("expected late");
+        };
+        assert_eq!(
+            tx, 5,
+            "own late deque runs only after the global pool, got {tx}"
+        );
+        assert_eq!(r.steal_n(), 0, "own late pop is not a steal");
+        ADMIT_OWNER.with(|c| c.set(None));
+    }
+
+    #[test]
+    fn global_pool_claims_each_tx_once() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let pool = Arc::new(GlobalIdealReadyPool::new(64));
+        let txs: Vec<usize> = (0..50).collect();
+        pool.seed(&txs);
+        let mut handles = Vec::new();
+        for i in 0..4 {
+            let pool = Arc::clone(&pool);
+            handles.push(thread::spawn(move || {
+                let mut got = Vec::new();
+                loop {
+                    let item = if i == 0 {
+                        pool.pop_low()
+                    } else {
+                        pool.pop_high()
+                    };
+                    match item {
+                        Some(tx) => got.push(tx),
+                        None => break,
+                    }
+                }
+                got
+            }));
+        }
+        let mut all = Vec::new();
+        for h in handles {
+            all.extend(h.join().expect("pop"));
+        }
+        all.sort_unstable();
+        assert_eq!(all, txs, "lost or duplicated Ideal-ready tx");
+        assert_eq!(pool.len(), 0);
     }
 
     #[test]
