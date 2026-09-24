@@ -753,10 +753,12 @@ impl Pevm {
                         );
                         let profile = crate::specfence::profile_timing_enabled();
                         let occ_mode = self.concurrency_mode == ConcurrencyMode::Occ;
-                        let mut sched_t0 = profile.then(Instant::now);
+                        let mut pick_t0 = Instant::now();
                         let mut task = crate::specfence::next_occ_task(&scheduler);
-                        if let Some(t0) = sched_t0 {
-                            metrics_inner.add_profile_scheduler_ns(t0.elapsed().as_nanos() as u64);
+                        let mut pick_ns = pick_t0.elapsed().as_nanos() as u64;
+                        metrics_inner.add_phase_pick(pick_ns);
+                        if profile {
+                            metrics_inner.add_profile_scheduler_ns(pick_ns);
                         }
                         while task.is_some() {
                             task = match task.unwrap() {
@@ -770,7 +772,7 @@ impl Pevm {
                                     )
                                 }
                                 Task::Validation(tx_version) => {
-                                    let v0 = profile.then(Instant::now);
+                                    let v0 = Instant::now();
                                     let next = if occ_mode {
                                         crate::specfence::validate_occ_stage(
                                             &mv_memory,
@@ -781,10 +783,10 @@ impl Pevm {
                                     } else {
                                         try_validate(&mv_memory, &scheduler, &tx_version, specfence)
                                     };
-                                    if let Some(t0) = v0 {
-                                        metrics_inner.add_profile_validate_ns(
-                                            t0.elapsed().as_nanos() as u64,
-                                        );
+                                    let vns = v0.elapsed().as_nanos() as u64;
+                                    metrics_inner.add_phase_val(vns);
+                                    if profile {
+                                        metrics_inner.add_profile_validate_ns(vns);
                                     }
                                     next
                                 }
@@ -793,11 +795,12 @@ impl Pevm {
                                 break;
                             }
                             if task.is_none() {
-                                sched_t0 = profile.then(Instant::now);
+                                pick_t0 = Instant::now();
                                 task = crate::specfence::next_occ_task(&scheduler);
-                                if let Some(t0) = sched_t0 {
-                                    metrics_inner
-                                        .add_profile_scheduler_ns(t0.elapsed().as_nanos() as u64);
+                                pick_ns = pick_t0.elapsed().as_nanos() as u64;
+                                metrics_inner.add_phase_pick(pick_ns);
+                                if profile {
+                                    metrics_inner.add_profile_scheduler_ns(pick_ns);
                                 }
                             }
                         }
@@ -1465,8 +1468,10 @@ impl Pevm {
                     }
                     // PublishWrite ≈ incarnation finished: wake location waiters + ready.
                     let done_idx = tx_version.tx_idx;
+                    let fin_t0 = Instant::now();
                     let task =
                         scheduler.finish_execution_with_wave_fence(tx_version, flags, wave, fence);
+                    vm.note_phase_finish(fin_t0.elapsed().as_nanos() as u64);
                     if let Some(wave) = wave {
                         vm.release_ready_edges(done_idx, wave);
                     }
@@ -1632,7 +1637,9 @@ impl Pevm {
                     let fin_t0 = Instant::now();
                     let _ =
                         scheduler.finish_execution_with_wave_fence(tx_version, flags, wave, fence);
-                    vm.flush_cut_probe(exec_ns, fin_t0.elapsed().as_nanos() as u64);
+                    let finish_ns = fin_t0.elapsed().as_nanos() as u64;
+                    vm.note_phase_finish(finish_ns);
+                    vm.flush_cut_probe(exec_ns, finish_ns);
                     SfExec::Executed { wrote_new_location }
                 }
                 Err(VmExecutionError::Retry) => {

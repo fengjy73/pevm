@@ -251,6 +251,7 @@ pub(crate) fn run_sf_block<F, V>(
                         let phase_t0 = Instant::now();
                         let val_start = origin_ns(specfence);
                         drain_wave(specfence, scheduler, runnable);
+                        let phase_v0 = Instant::now();
                         let (plan, invalid) = validate_to_plan(&tx_version, vis);
                         resolve_plan::apply(
                             plan,
@@ -266,6 +267,7 @@ pub(crate) fn run_sf_block<F, V>(
                                 invalid: &invalid,
                             },
                         );
+                        metrics.add_phase_val(phase_v0.elapsed().as_nanos() as u64);
                         note_validate_span(runnable, val_start, origin_ns(specfence));
                         record_post_exec(runnable, outside, phase_t0.elapsed().as_nanos() as u64);
                     }
@@ -336,6 +338,7 @@ pub(crate) fn run_sf_block<F, V>(
                 let outside = post_exec_start_outside_span(specfence, runnable);
                 let phase_t0 = Instant::now();
                 let val_start = origin_ns(specfence);
+                let phase_v0 = Instant::now();
                 let (plan, invalid) = validate_to_plan(&tx_version, vis);
                 resolve_plan::apply(
                     plan,
@@ -351,6 +354,7 @@ pub(crate) fn run_sf_block<F, V>(
                         invalid: &invalid,
                     },
                 );
+                metrics.add_phase_val(phase_v0.elapsed().as_nanos() as u64);
                 note_validate_span(runnable, val_start, origin_ns(specfence));
                 record_post_exec(runnable, outside, phase_t0.elapsed().as_nanos() as u64);
                 metrics.add_worker_busy_ns(t0.elapsed().as_nanos() as u64);

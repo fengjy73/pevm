@@ -594,6 +594,22 @@ fn run_once(
                     spine.other_exec_ns,
                     spine.other_exec_n,
                 );
+                println!(
+                    "  PHASE {mode_name}[{i}] exec_n={} ok={} block={} exec_ns={} pre_ns={} interp_ns={} post_ns={} finish_n={} finish_ns={} val_n={} val_ns={} pick_n={} pick_ns={}",
+                    m.phase_exec_n,
+                    m.phase_exec_ok_n,
+                    m.phase_exec_block_n,
+                    m.phase_exec_ns,
+                    m.phase_pre_ns,
+                    m.phase_interp_ns,
+                    m.phase_post_ns,
+                    m.phase_finish_n,
+                    m.phase_finish_ns,
+                    m.phase_val_n,
+                    m.phase_val_ns,
+                    m.phase_pick_n,
+                    m.phase_pick_ns,
+                );
             }
             IterRow {
                 mode: mode_name.to_string(),
