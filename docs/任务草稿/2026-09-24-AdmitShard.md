@@ -23,6 +23,6 @@
 
 ## 步骤
 
-1. **进行中** — Chase-Lev `LocalAdmitDeque` + 连续分片播种 + 四枚探针进 SpineReport / Soft=0 日志。
-2. **待做** — 单元测试，再 2 核正确性，再 N=5 release、LTO off、请求 8 核。
-3. **待做** — 用实测数字写 `docs/specfence-admitshard.md` 和 PR，不编墙时。
+1. **已完成** — Chase-Lev `LocalAdmitDeque` + 连续分片播种 + 四枚探针。代码 `1fa3308`。
+2. **已完成** — `runnable_set` / `admit_deque` 单元测试通过。2 核冷检两块各 4/4 `seq=par`。
+3. **已完成** — N=5 与同宿主 `ac9e82d` 重跑写进 `docs/specfence-admitshard.md`。薄 0.701、大 0.737。1.5 未到。草稿保留到用户验收。
