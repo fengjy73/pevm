@@ -324,6 +324,41 @@ pub struct SpineReport {
     pub exact_wake_missed_nopark: usize,
     /// Scheduler idle entries.
     pub idle_spins: usize,
+    /// Host wall from the SpecFence begin-block seed (prior sketch, arms,
+    /// `admit_seed_begin_block`, crit install, `RunnableSet::seed_begin`)
+    /// until the instant before `thread::scope`. Before any worker and before
+    /// the chain span. Not PROFILE-gated.
+    pub admit_seed_ns: u64,
+    /// Host wall from the instant after the last worker spawn until
+    /// `thread::scope` returns. Overlaps the worker tail (execute,
+    /// post-exec validate, idle). Not additive with those sums.
+    pub join_wait_ns: u64,
+    /// Nanoseconds from the parallel-phase origin to the join-wait start.
+    /// Intersect `[join_mark, join_mark + join_wait)` with focus
+    /// `head_ms`/`tail_ms` (same origin) before treating join as tax.
+    pub join_mark_origin_ns: u64,
+    /// Sum across workers of the idle ring (heal + yield + spin + park).
+    /// Includes [`Self::heal_ns`]. Not a wall clock.
+    pub idle_ns: u64,
+    /// Subset of [`Self::idle_ns`]: `heal_finished_preds`, sleeper wake,
+    /// `heal`, `force_idle_recover`, and idle-arm `drain_wave`. Not yield,
+    /// spin, or park.
+    pub heal_ns: u64,
+    /// Sum across workers of post-exec `drain_wave` + `validate_to_plan` +
+    /// `resolve_plan::apply` (and the `Task::Validation` arm) whose window
+    /// **start** is outside the prior-crit span
+    /// `[head.first_start, tail.first_start)`. Start-classified: a window
+    /// that begins inside the open span counts entirely as in-span.
+    /// Not a wall clock. Not additive with [`Self::join_wait_ns`].
+    pub post_exec_validate_ns: u64,
+    /// Same post-exec window that started inside the open prior-crit span.
+    /// This slice overlaps the span interval and is not tax by itself.
+    /// `post_exec_validate_ns + post_exec_in_span_ns` is the unfiltered sum.
+    pub post_exec_in_span_ns: u64,
+    /// Prior crit head tx used by the span filter. `usize::MAX` when no chain.
+    pub span_head: usize,
+    /// Prior crit tail tx used by the span filter. `usize::MAX` when no chain.
+    pub span_tail: usize,
 }
 
 /// Shared per-block spine. Workers share it. The Avoid table starts empty.
@@ -860,6 +895,15 @@ impl AccessSpine {
             end_block_ns: 0,
             exact_wake_missed_nopark: 0,
             idle_spins: 0,
+            admit_seed_ns: 0,
+            join_wait_ns: 0,
+            join_mark_origin_ns: 0,
+            idle_ns: 0,
+            heal_ns: 0,
+            post_exec_validate_ns: 0,
+            post_exec_in_span_ns: 0,
+            span_head: usize::MAX,
+            span_tail: usize::MAX,
         };
         (report, next)
     }

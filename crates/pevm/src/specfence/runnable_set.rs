@@ -112,6 +112,18 @@ pub(crate) struct RunnableSet {
     exact_wake_missed_nopark: AtomicUsize,
     refuse_fill_n: AtomicUsize,
     idle_spins: AtomicUsize,
+    /// Idle-ring sum (includes [`Self::heal_ns`]). Not a wall clock.
+    idle_ns: AtomicU64,
+    /// Heal subset of [`Self::idle_ns`].
+    heal_ns: AtomicU64,
+    /// Post-exec validate/resolve/drain outside the prior-crit span.
+    post_exec_validate_ns: AtomicU64,
+    /// Post-exec validate/resolve/drain that started inside the open span.
+    post_exec_in_span_ns: AtomicU64,
+    /// Prior crit head for the span filter. `usize::MAX` if unset.
+    span_head: AtomicUsize,
+    /// Prior crit tail for the span filter. `usize::MAX` if unset.
+    span_tail: AtomicUsize,
     width_sum: AtomicUsize,
     width_n: AtomicUsize,
     threads: Vec<Mutex<Option<Thread>>>,
@@ -142,6 +154,12 @@ impl RunnableSet {
             exact_wake_missed_nopark: AtomicUsize::new(0),
             refuse_fill_n: AtomicUsize::new(0),
             idle_spins: AtomicUsize::new(0),
+            idle_ns: AtomicU64::new(0),
+            heal_ns: AtomicU64::new(0),
+            post_exec_validate_ns: AtomicU64::new(0),
+            post_exec_in_span_ns: AtomicU64::new(0),
+            span_head: AtomicUsize::new(usize::MAX),
+            span_tail: AtomicUsize::new(usize::MAX),
             width_sum: AtomicUsize::new(0),
             width_n: AtomicUsize::new(0),
             threads: (0..cores).map(|_| Mutex::new(None)).collect(),
@@ -1182,6 +1200,63 @@ impl RunnableSet {
     #[inline]
     pub(crate) fn idle_spins(&self) -> usize {
         self.idle_spins.load(Ordering::Relaxed)
+    }
+
+    /// Prior crit ends for the post-exec span filter. `head == tail` is a
+    /// zero-width span (all post-exec time counts as outside).
+    pub(crate) fn note_span_ends(&self, head: TxIdx, tail: TxIdx) {
+        self.span_head.store(head, Ordering::Relaxed);
+        self.span_tail.store(tail, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn span_head(&self) -> usize {
+        self.span_head.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn span_tail(&self) -> usize {
+        self.span_tail.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn add_idle_ns(&self, ns: u64) {
+        self.idle_ns.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn idle_ns(&self) -> u64 {
+        self.idle_ns.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn add_heal_ns(&self, ns: u64) {
+        self.heal_ns.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn heal_ns(&self) -> u64 {
+        self.heal_ns.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn add_post_exec_validate_ns(&self, ns: u64) {
+        self.post_exec_validate_ns.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn post_exec_validate_ns(&self) -> u64 {
+        self.post_exec_validate_ns.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn add_post_exec_in_span_ns(&self, ns: u64) {
+        self.post_exec_in_span_ns.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn post_exec_in_span_ns(&self) -> u64 {
+        self.post_exec_in_span_ns.load(Ordering::Relaxed)
     }
 
     #[inline]
