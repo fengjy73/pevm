@@ -16,5 +16,5 @@ Soft=0 Instant-off 下，非链 AdmitIndep 的第一次 Opt 少付冷读元数�
 
 ## 步骤
 
-1. **进行中：** 第一次 Opt（incarnation 0、未门控、非链成员、非 leftover_min）跳过 access ordinal、value snap、finegrain、以及非热位置上的 `spine_before_read` / WaitOnce consult。链位置、crit、protected、非 crit WaitOnce 仍走完整 Detect。MV 读到 Estimate 仍走 `live_writer_act`（不记 `estimate_block_sf`）。中止则整段重放，不靠残缺前缀 rewind。
-2. **待做：** release、LTO off、`taskset -c 0-3`、请求 8 核、N=5。2 核冷检两块 `seq=par`。报 SF/OCC/ratio/span/tax/join-out，并写明相对 dig 是 (B) 还是 (A)。
+1. **已完成：** `a253d6f`。第一次 Opt（incarnation 0、未门控、非链成员、非 leftover_min）跳过 access ordinal、value snap、finegrain、以及非热位置上的 `spine_before_read` / WaitOnce consult。链位置、crit、protected、非 crit WaitOnce 仍走完整 Detect。MV 读到 Estimate 仍走 `live_writer_act`（不记 `estimate_block_sf`）。中止则整段重放。种子不重排。QuietExit 未改。
+2. **已完成：** release、LTO off、`taskset -c 0-3`、请求 8 核、N=5。2 核冷检两块 `seq=par ok`。大块复用中位 SF **7.210** / OCC **5.900** / ratio **0.818** / span **3.312** / tax **3.898** / join-out **2.166**，链 116/1219。相对 dig 7.065 是 **(A)**：墙没有下降，span 变长、join-out 变短。薄块 0.591（1.520 / 0.898，span 0.338，tax 1.182，join-out 0.610）。`ge_1_5=false`。笔记 `docs/specfence-soft0-admitindep-firstexec-cut.md`。草稿保留到用户验收。
