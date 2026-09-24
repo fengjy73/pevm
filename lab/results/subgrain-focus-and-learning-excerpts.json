@@ -1,0 +1,4537 @@
+{
+  "focus_excerpts": {
+    "597": {
+      "morph": "fan_out",
+      "wave": 434,
+      "chain": 29,
+      "fanout": 448,
+      "txs": {
+        "5": {
+          "work": {
+            "tx": 5,
+            "gas_used": 351872,
+            "opcode_steps": 3660,
+            "n_reads": 34,
+            "n_writes": 23
+          },
+          "reads_from": [
+            {
+              "consumer_tx": 5,
+              "location": 85335018835337005,
+              "producer_tx": 3,
+              "producer_effect_k": 36,
+              "warm": false
+            },
+            {
+              "consumer_tx": 5,
+              "location": 17702941225697825771,
+              "producer_tx": 3,
+              "producer_effect_k": 38,
+              "warm": false
+            },
+            {
+              "consumer_tx": 5,
+              "location": 85335018835337005,
+              "producer_tx": 3,
+              "producer_effect_k": 36,
+              "warm": true
+            },
+            {
+              "consumer_tx": 5,
+              "location": 14071748704357703226,
+              "producer_tx": 3,
+              "producer_effect_k": 28,
+              "warm": false
+            },
+            {
+              "consumer_tx": 5,
+              "location": 6790576347048465192,
+              "producer_tx": 3,
+              "producer_effect_k": 34,
+              "warm": false
+            },
+            {
+              "consumer_tx": 5,
+              "location": 14071748704357703226,
+              "producer_tx": 3,
+              "producer_effect_k": 28,
+              "warm": true
+            },
+            {
+              "consumer_tx": 5,
+              "location": 6790576347048465192,
+              "producer_tx": 3,
+              "producer_effect_k": 34,
+              "warm": true
+            }
+          ],
+          "as_producer": [
+            {
+              "consumer_tx": 8,
+              "location": 85335018835337005,
+              "producer_tx": 5,
+              "producer_effect_k": 34,
+              "warm": false
+            },
+            {
+              "consumer_tx": 8,
+              "location": 17702941225697825771,
+              "producer_tx": 5,
+              "producer_effect_k": 38,
+              "warm": false
+            },
+            {
+              "consumer_tx": 8,
+              "location": 85335018835337005,
+              "producer_tx": 5,
+              "producer_effect_k": 34,
+              "warm": true
+            },
+            {
+              "consumer_tx": 8,
+              "location": 14071748704357703226,
+              "producer_tx": 5,
+              "producer_effect_k": 28,
+              "warm": false
+            },
+            {
+              "consumer_tx": 8,
+              "location": 6790576347048465192,
+              "producer_tx": 5,
+              "producer_effect_k": 32,
+              "warm": false
+            },
+            {
+              "consumer_tx": 8,
+              "location": 14071748704357703226,
+              "producer_tx": 5,
+              "producer_effect_k": 28,
+              "warm": true
+            },
+            {
+              "consumer_tx": 8,
+              "location": 6790576347048465192,
+              "producer_tx": 5,
+              "producer_effect_k": 32,
+              "warm": true
+            }
+          ],
+          "effects": [
+            {
+              "tx": 5,
+              "incarnation": 0,
+              "effect_k": 0,
+              "op_class": "sload",
+              "location": 13980140906397189668,
+              "mode": "R",
+              "gas_used_so_far": 30759,
+              "opcode_steps": 167,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 5,
+              "incarnation": 0,
+              "effect_k": 1,
+              "op_class": "sload",
+              "location": 14950447053500574803,
+              "mode": "R",
+              "gas_used_so_far": 32902,
+              "opcode_steps": 180,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 5,
+              "incarnation": 0,
+              "effect_k": 2,
+              "op_class": "sstore",
+              "location": 16053763603770628480,
+              "mode": "W",
+              "gas_used_so_far": 35028,
+              "opcode_steps": 188,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 5,
+              "incarnation": 0,
+              "effect_k": 3,
+              "op_class": "sload",
+              "location": 85335018835337005,
+              "mode": "R",
+              "gas_used_so_far": 37954,
+              "opcode_steps": 196,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 5,
+              "incarnation": 0,
+              "effect_k": 4,
+              "op_class": "sload",
+              "location": 12847376713127717181,
+              "mode": "R",
+              "gas_used_so_far": 40147,
+              "opcode_steps": 223,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 5,
+              "incarnation": 0,
+              "effect_k": 5,
+              "op_class": "sload",
+              "location": 7593728185942401190,
+              "mode": "R",
+              "gas_used_so_far": 42273,
+              "opcode_steps": 231,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 5,
+              "incarnation": 0,
+              "effect_k": 6,
+              "op_class": "sload",
+              "location": 15738400804798418364,
+              "mode": "R",
+              "gas_used_so_far": 44444,
+              "opcode_steps": 243,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 5,
+              "incarnation": 0,
+              "effect_k": 7,
+              "op_class": "sload",
+              "location": 1513214290813739940,
+              "mode": "R",
+              "gas_used_so_far": 46637,
+              "opcode_steps": 270,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 5,
+              "incarnation": 0,
+              "effect_k": 8,
+              "op_class": "sload",
+              "location": 3475265516245837399,
+              "mode": "R",
+              "gas_used_so_far": 49022,
+              "opcode_steps": 325,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 5,
+              "incarnation": 0,
+              "effect_k": 9,
+              "op_class": "sload",
+              "location": 13980140906397189668,
+              "mode": "R",
+              "gas_used_so_far": 56331,
+              "opcode_steps": 1664,
+              "call_depth": 1,
+              "warm": true,
+              "kind": "storage"
+            },
+            {
+              "tx": 5,
+              "incarnation": 0,
+              "effect_k": 10,
+              "op_class": "sload",
+              "location": 11065929453512471562,
+              "mode": "R",
+              "gas_used_so_far": 56501,
+              "opcode_steps": 1685,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 5,
+              "incarnation": 0,
+              "effect_k": 11,
+              "op_class": "sload",
+              "location": 11065929453512471562,
+              "mode": "R",
+              "gas_used_so_far": 58621,
+              "opcode_steps": 1691,
+              "call_depth": 1,
+              "warm": true,
+              "kind": "storage"
+            },
+            {
+              "tx": 5,
+              "incarnation": 0,
+              "effect_k": 12,
+              "op_class": "sload",
+              "location": 1115894024319217746,
+              "mode": "R",
+              "gas_used_so_far": 58815,
+              "opcode_steps": 1720,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 5,
+              "incarnation": 0,
+              "effect_k": 13,
+              "op_class": "sload",
+              "location": 5840135075898068057,
+              "mode": "R",
+              "gas_used_so_far": 60943,
+              "opcode_steps": 1729,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 5,
+              "incarnation": 0,
+              "effect_k": 14,
+              "op_class": "sload",
+              "location": 1513214290813739940,
+              "mode": "R",
+              "gas_used_so_far": 63170,
+              "opcode_steps": 1769,
+              "call_depth": 1,
+              "warm": true,
+              "kind": "storage"
+            }
+          ],
+          "l2_edges": [
+            {
+              "producer_tx": 0,
+              "consumer_tx": 5,
+              "consumer_incarnation": 0,
+              "location": 14416837895128685369,
+              "kind": "storage",
+              "class": "program",
+              "gas_used_so_far": 332111,
+              "opcode_steps": 3536,
+              "warm": true,
+              "call_depth": 1,
+              "producer_status": "Data",
+              "ready_for_bind": true,
+              "producer_ready": "validated",
+              "producer_mv": "data"
+            },
+            {
+              "producer_tx": 3,
+              "consumer_tx": 5,
+              "consumer_incarnation": 1,
+              "location": 12945856420659929306,
+              "kind": "storage",
+              "class": "program",
+              "gas_used_so_far": 312211,
+              "opcode_steps": 3536,
+              "warm": true,
+              "call_depth": 1,
+              "producer_status": "Data",
+              "ready_for_bind": true,
+              "producer_ready": "data",
+              "producer_mv": "data"
+            },
+            {
+              "producer_tx": 3,
+              "consumer_tx": 5,
+              "consumer_incarnation": 3,
+              "location": 85335018835337005,
+              "kind": "storage",
+              "class": "program",
+              "gas_used_so_far": 37954,
+              "opcode_steps": 196,
+              "warm": false,
+              "call_depth": 1,
+              "producer_status": "Data",
+              "ready_for_bind": true,
+              "producer_ready": "validated",
+              "producer_mv": "data"
+            },
+            {
+              "producer_tx": 3,
+              "consumer_tx": 5,
+              "consumer_incarnation": 3,
+              "location": 17702941225697825771,
+              "kind": "storage",
+              "class": "program",
+              "gas_used_so_far": 77372,
+              "opcode_steps": 2293,
+              "warm": false,
+              "call_depth": 2,
+              "producer_status": "Data",
+              "ready_for_bind": true,
+              "producer_ready": "validated",
+              "producer_mv": "data"
+            },
+            {
+              "producer_tx": 3,
+              "consumer_tx": 5,
+              "consumer_incarnation": 3,
+              "location": 85335018835337005,
+              "kind": "storage",
+              "class": "program",
+              "gas_used_so_far": 87714,
+              "opcode_steps": 2678,
+              "warm": true,
+              "call_depth": 1,
+              "producer_status": "Data",
+              "ready_for_bind": true,
+              "producer_ready": "validated",
+              "producer_mv": "data"
+            },
+            {
+              "producer_tx": 3,
+              "consumer_tx": 5,
+              "consumer_incarnation": 3,
+              "location": 14071748704357703226,
+              "kind": "storage",
+              "class": "program",
+              "gas_used_so_far": 113025,
+              "opcode_steps": 2775,
+              "warm": false,
+              "call_depth": 1,
+              "producer_status": "Data",
+              "ready_for_bind": true,
+              "producer_ready": "validated",
+              "producer_mv": "data"
+            },
+            {
+              "producer_tx": 3,
+              "consumer_tx": 5,
+              "consumer_incarnation": 3,
+              "location": 6790576347048465192,
+              "kind": "storage",
+              "class": "program",
+              "gas_used_so_far": 120519,
+              "opcode_steps": 2884,
+              "warm": false,
+              "call_depth": 1,
+              "producer_status": "Data",
+              "ready_for_bind": true,
+              "producer_ready": "validated",
+              "producer_mv": "data"
+            },
+            {
+              "producer_tx": 3,
+              "consumer_tx": 5,
+              "consumer_incarnation": 3,
+              "location": 14071748704357703226,
+              "kind": "storage",
+              "class": "program",
+              "gas_used_so_far": 239582,
+              "opcode_steps": 3211,
+              "warm": true,
+              "call_depth": 1,
+              "producer_status": "Data",
+              "ready_for_bind": true,
+              "producer_ready": "validated",
+              "producer_mv": "data"
+            },
+            {
+              "producer_tx": 3,
+              "consumer_tx": 5,
+              "consumer_incarnation": 3,
+              "location": 6790576347048465192,
+              "kind": "storage",
+              "class": "program",
+              "gas_used_so_far": 242276,
+              "opcode_steps": 3320,
+              "warm": true,
+              "call_depth": 1,
+              "producer_status": "Data",
+              "ready_for_bind": true,
+              "producer_ready": "validated",
+              "producer_mv": "data"
+            }
+          ],
+          "process": {
+            "tx": 5,
+            "n_bind": 10,
+            "n_wait_for": 0,
+            "n_unfenced": 78,
+            "n_unfenced_after_avoid": 23,
+            "n_force_prefix_none": 0,
+            "n_park": 0,
+            "n_abort": 0,
+            "final_incarnation": 2,
+            "reasons": {
+              "bind_published": 10,
+              "unfenced_canary": 12,
+              "unfenced_cold": 19,
+              "unfenced_independence": 3,
+              "unfenced_writer_done": 44
+            },
+            "fail_score": 27
+          },
+          "final_inc": 2
+        },
+        "8": {
+          "work": {
+            "tx": 8,
+            "gas_used": 351842,
+            "opcode_steps": 3657,
+            "n_reads": 34,
+            "n_writes": 23
+          },
+          "reads_from": [
+            {
+              "consumer_tx": 8,
+              "location": 85335018835337005,
+              "producer_tx": 5,
+              "producer_effect_k": 34,
+              "warm": false
+            },
+            {
+              "consumer_tx": 8,
+              "location": 17702941225697825771,
+              "producer_tx": 5,
+              "producer_effect_k": 38,
+              "warm": false
+            },
+            {
+              "consumer_tx": 8,
+              "location": 85335018835337005,
+              "producer_tx": 5,
+              "producer_effect_k": 34,
+              "warm": true
+            },
+            {
+              "consumer_tx": 8,
+              "location": 14071748704357703226,
+              "producer_tx": 5,
+              "producer_effect_k": 28,
+              "warm": false
+            },
+            {
+              "consumer_tx": 8,
+              "location": 6790576347048465192,
+              "producer_tx": 5,
+              "producer_effect_k": 32,
+              "warm": false
+            },
+            {
+              "consumer_tx": 8,
+              "location": 14071748704357703226,
+              "producer_tx": 5,
+              "producer_effect_k": 28,
+              "warm": true
+            },
+            {
+              "consumer_tx": 8,
+              "location": 6790576347048465192,
+              "producer_tx": 5,
+              "producer_effect_k": 32,
+              "warm": true
+            }
+          ],
+          "as_producer": [
+            {
+              "consumer_tx": 9,
+              "location": 85335018835337005,
+              "producer_tx": 8,
+              "producer_effect_k": 35,
+              "warm": false
+            },
+            {
+              "consumer_tx": 9,
+              "location": 17702941225697825771,
+              "producer_tx": 8,
+              "producer_effect_k": 39,
+              "warm": false
+            },
+            {
+              "consumer_tx": 9,
+              "location": 85335018835337005,
+              "producer_tx": 8,
+              "producer_effect_k": 35,
+              "warm": true
+            },
+            {
+              "consumer_tx": 9,
+              "location": 14071748704357703226,
+              "producer_tx": 8,
+              "producer_effect_k": 28,
+              "warm": false
+            },
+            {
+              "consumer_tx": 9,
+              "location": 6790576347048465192,
+              "producer_tx": 8,
+              "producer_effect_k": 33,
+              "warm": false
+            }
+          ],
+          "effects": [
+            {
+              "tx": 8,
+              "incarnation": 0,
+              "effect_k": 0,
+              "op_class": "sload",
+              "location": 13980140906397189668,
+              "mode": "R",
+              "gas_used_so_far": 30759,
+              "opcode_steps": 167,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 8,
+              "incarnation": 0,
+              "effect_k": 1,
+              "op_class": "sload",
+              "location": 14950447053500574803,
+              "mode": "R",
+              "gas_used_so_far": 32902,
+              "opcode_steps": 180,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 8,
+              "incarnation": 0,
+              "effect_k": 2,
+              "op_class": "sstore",
+              "location": 16053763603770628480,
+              "mode": "W",
+              "gas_used_so_far": 35028,
+              "opcode_steps": 188,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 8,
+              "incarnation": 0,
+              "effect_k": 3,
+              "op_class": "sload",
+              "location": 85335018835337005,
+              "mode": "R",
+              "gas_used_so_far": 37954,
+              "opcode_steps": 196,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 8,
+              "incarnation": 0,
+              "effect_k": 4,
+              "op_class": "sload",
+              "location": 12847376713127717181,
+              "mode": "R",
+              "gas_used_so_far": 40147,
+              "opcode_steps": 223,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 8,
+              "incarnation": 0,
+              "effect_k": 5,
+              "op_class": "sload",
+              "location": 7593728185942401190,
+              "mode": "R",
+              "gas_used_so_far": 42273,
+              "opcode_steps": 231,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 8,
+              "incarnation": 0,
+              "effect_k": 6,
+              "op_class": "sload",
+              "location": 14745087126224310087,
+              "mode": "R",
+              "gas_used_so_far": 44444,
+              "opcode_steps": 243,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 8,
+              "incarnation": 0,
+              "effect_k": 7,
+              "op_class": "sload",
+              "location": 1513214290813739940,
+              "mode": "R",
+              "gas_used_so_far": 46637,
+              "opcode_steps": 270,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 8,
+              "incarnation": 0,
+              "effect_k": 8,
+              "op_class": "sload",
+              "location": 3475265516245837399,
+              "mode": "R",
+              "gas_used_so_far": 49022,
+              "opcode_steps": 325,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 8,
+              "incarnation": 0,
+              "effect_k": 9,
+              "op_class": "sload",
+              "location": 13980140906397189668,
+              "mode": "R",
+              "gas_used_so_far": 56301,
+              "opcode_steps": 1661,
+              "call_depth": 1,
+              "warm": true,
+              "kind": "storage"
+            },
+            {
+              "tx": 8,
+              "incarnation": 0,
+              "effect_k": 10,
+              "op_class": "sload",
+              "location": 11065929453512471562,
+              "mode": "R",
+              "gas_used_so_far": 56471,
+              "opcode_steps": 1682,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 8,
+              "incarnation": 0,
+              "effect_k": 11,
+              "op_class": "sload",
+              "location": 11065929453512471562,
+              "mode": "R",
+              "gas_used_so_far": 58591,
+              "opcode_steps": 1688,
+              "call_depth": 1,
+              "warm": true,
+              "kind": "storage"
+            },
+            {
+              "tx": 8,
+              "incarnation": 0,
+              "effect_k": 12,
+              "op_class": "sload",
+              "location": 1115894024319217746,
+              "mode": "R",
+              "gas_used_so_far": 58785,
+              "opcode_steps": 1717,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 8,
+              "incarnation": 0,
+              "effect_k": 13,
+              "op_class": "sload",
+              "location": 5840135075898068057,
+              "mode": "R",
+              "gas_used_so_far": 60913,
+              "opcode_steps": 1726,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 8,
+              "incarnation": 0,
+              "effect_k": 14,
+              "op_class": "sload",
+              "location": 1513214290813739940,
+              "mode": "R",
+              "gas_used_so_far": 63140,
+              "opcode_steps": 1766,
+              "call_depth": 1,
+              "warm": true,
+              "kind": "storage"
+            }
+          ],
+          "l2_edges": [
+            {
+              "producer_tx": 5,
+              "consumer_tx": 8,
+              "consumer_incarnation": 0,
+              "location": 17702941225697825771,
+              "kind": "storage",
+              "class": "program",
+              "gas_used_so_far": 77342,
+              "opcode_steps": 2290,
+              "warm": false,
+              "call_depth": 2,
+              "producer_status": "Estimate",
+              "ready_for_bind": false,
+              "producer_ready": "estimate",
+              "producer_mv": "estimate"
+            },
+            {
+              "producer_tx": 5,
+              "consumer_tx": 8,
+              "consumer_incarnation": 1,
+              "location": 85335018835337005,
+              "kind": "storage",
+              "class": "program",
+              "gas_used_so_far": 37954,
+              "opcode_steps": 196,
+              "warm": false,
+              "call_depth": 1,
+              "producer_status": "Estimate",
+              "ready_for_bind": false,
+              "producer_ready": "estimate",
+              "producer_mv": "estimate"
+            },
+            {
+              "producer_tx": 5,
+              "consumer_tx": 8,
+              "consumer_incarnation": 2,
+              "location": 85335018835337005,
+              "kind": "storage",
+              "class": "program",
+              "gas_used_so_far": 37954,
+              "opcode_steps": 196,
+              "warm": false,
+              "call_depth": 1,
+              "producer_status": "Data",
+              "ready_for_bind": true,
+              "producer_ready": "validated",
+              "producer_mv": "data"
+            },
+            {
+              "producer_tx": 5,
+              "consumer_tx": 8,
+              "consumer_incarnation": 2,
+              "location": 17702941225697825771,
+              "kind": "storage",
+              "class": "program",
+              "gas_used_so_far": 77342,
+              "opcode_steps": 2290,
+              "warm": false,
+              "call_depth": 2,
+              "producer_status": "Data",
+              "ready_for_bind": true,
+              "producer_ready": "validated",
+              "producer_mv": "data"
+            },
+            {
+              "producer_tx": 5,
+              "consumer_tx": 8,
+              "consumer_incarnation": 2,
+              "location": 85335018835337005,
+              "kind": "storage",
+              "class": "program",
+              "gas_used_so_far": 87684,
+              "opcode_steps": 2675,
+              "warm": true,
+              "call_depth": 1,
+              "producer_status": "Data",
+              "ready_for_bind": true,
+              "producer_ready": "validated",
+              "producer_mv": "data"
+            },
+            {
+              "producer_tx": 5,
+              "consumer_tx": 8,
+              "consumer_incarnation": 2,
+              "location": 14071748704357703226,
+              "kind": "storage",
+              "class": "program",
+              "gas_used_so_far": 112995,
+              "opcode_steps": 2772,
+              "warm": false,
+              "call_depth": 1,
+              "producer_status": "Data",
+              "ready_for_bind": true,
+              "producer_ready": "validated",
+              "producer_mv": "data"
+            }
+          ],
+          "process": {
+            "tx": 8,
+            "n_bind": 9,
+            "n_wait_for": 1,
+            "n_unfenced": 69,
+            "n_unfenced_after_avoid": 14,
+            "n_force_prefix_none": 0,
+            "n_park": 1,
+            "n_abort": 0,
+            "final_incarnation": 2,
+            "reasons": {
+              "bind_published": 9,
+              "unfenced_canary": 16,
+              "unfenced_cold": 21,
+              "unfenced_independence": 4,
+              "unfenced_writer_done": 28,
+              "wait_for_writer": 1
+            },
+            "fail_score": 19
+          },
+          "final_inc": 2
+        },
+        "11": {
+          "work": {
+            "tx": 11,
+            "gas_used": 232091,
+            "opcode_steps": 3224,
+            "n_reads": 27,
+            "n_writes": 15
+          },
+          "reads_from": [
+            {
+              "consumer_tx": 11,
+              "location": 85335018835337005,
+              "producer_tx": 9,
+              "producer_effect_k": 24,
+              "warm": false
+            },
+            {
+              "consumer_tx": 11,
+              "location": 17702941225697825771,
+              "producer_tx": 9,
+              "producer_effect_k": 28,
+              "warm": false
+            },
+            {
+              "consumer_tx": 11,
+              "location": 85335018835337005,
+              "producer_tx": 9,
+              "producer_effect_k": 24,
+              "warm": true
+            },
+            {
+              "consumer_tx": 11,
+              "location": 14071748704357703226,
+              "producer_tx": 9,
+              "producer_effect_k": 19,
+              "warm": false
+            },
+            {
+              "consumer_tx": 11,
+              "location": 6790576347048465192,
+              "producer_tx": 9,
+              "producer_effect_k": 23,
+              "warm": false
+            }
+          ],
+          "as_producer": [
+            {
+              "consumer_tx": 19,
+              "location": 85335018835337005,
+              "producer_tx": 11,
+              "producer_effect_k": 22,
+              "warm": false
+            },
+            {
+              "consumer_tx": 19,
+              "location": 17702941225697825771,
+              "producer_tx": 11,
+              "producer_effect_k": 26,
+              "warm": false
+            },
+            {
+              "consumer_tx": 19,
+              "location": 85335018835337005,
+              "producer_tx": 11,
+              "producer_effect_k": 22,
+              "warm": true
+            },
+            {
+              "consumer_tx": 19,
+              "location": 14071748704357703226,
+              "producer_tx": 11,
+              "producer_effect_k": 17,
+              "warm": false
+            }
+          ],
+          "effects": [],
+          "l2_edges": [
+            {
+              "producer_tx": 0,
+              "consumer_tx": 11,
+              "consumer_incarnation": 0,
+              "location": 85335018835337005,
+              "kind": "storage",
+              "class": "program",
+              "gas_used_so_far": 37930,
+              "opcode_steps": 196,
+              "warm": false,
+              "call_depth": 1,
+              "producer_status": "Data",
+              "ready_for_bind": true,
+              "producer_ready": "validated",
+              "producer_mv": "data"
+            },
+            {
+              "producer_tx": 5,
+              "consumer_tx": 11,
+              "consumer_incarnation": 0,
+              "location": 17702941225697825771,
+              "kind": "storage",
+              "class": "program",
+              "gas_used_so_far": 75835,
+              "opcode_steps": 2293,
+              "warm": false,
+              "call_depth": 2,
+              "producer_status": "Estimate",
+              "ready_for_bind": false,
+              "producer_ready": "estimate",
+              "producer_mv": "estimate"
+            },
+            {
+              "producer_tx": 5,
+              "consumer_tx": 11,
+              "consumer_incarnation": 1,
+              "location": 85335018835337005,
+              "kind": "storage",
+              "class": "program",
+              "gas_used_so_far": 37930,
+              "opcode_steps": 196,
+              "warm": false,
+              "call_depth": 1,
+              "producer_status": "Estimate",
+              "ready_for_bind": false,
+              "producer_ready": "estimate",
+              "producer_mv": "estimate"
+            },
+            {
+              "producer_tx": 5,
+              "consumer_tx": 11,
+              "consumer_incarnation": 2,
+              "location": 85335018835337005,
+              "kind": "storage",
+              "class": "program",
+              "gas_used_so_far": 37930,
+              "opcode_steps": 196,
+              "warm": false,
+              "call_depth": 1,
+              "producer_status": "Data",
+              "ready_for_bind": true,
+              "producer_ready": "validated",
+              "producer_mv": "data"
+            },
+            {
+              "producer_tx": 5,
+              "consumer_tx": 11,
+              "consumer_incarnation": 2,
+              "location": 17702941225697825771,
+              "kind": "storage",
+              "class": "program",
+              "gas_used_so_far": 75835,
+              "opcode_steps": 2293,
+              "warm": false,
+              "call_depth": 2,
+              "producer_status": "Data",
+              "ready_for_bind": true,
+              "producer_ready": "validated",
+              "producer_mv": "data"
+            },
+            {
+              "producer_tx": 5,
+              "consumer_tx": 11,
+              "consumer_incarnation": 2,
+              "location": 85335018835337005,
+              "kind": "storage",
+              "class": "program",
+              "gas_used_so_far": 87690,
+              "opcode_steps": 2678,
+              "warm": true,
+              "call_depth": 1,
+              "producer_status": "Data",
+              "ready_for_bind": true,
+              "producer_ready": "validated",
+              "producer_mv": "data"
+            },
+            {
+              "producer_tx": 5,
+              "consumer_tx": 11,
+              "consumer_incarnation": 2,
+              "location": 14071748704357703226,
+              "kind": "storage",
+              "class": "program",
+              "gas_used_so_far": 113001,
+              "opcode_steps": 2775,
+              "warm": false,
+              "call_depth": 1,
+              "producer_status": "Data",
+              "ready_for_bind": true,
+              "producer_ready": "validated",
+              "producer_mv": "data"
+            },
+            {
+              "producer_tx": 5,
+              "consumer_tx": 11,
+              "consumer_incarnation": 2,
+              "location": 6790576347048465192,
+              "kind": "storage",
+              "class": "program",
+              "gas_used_so_far": 120495,
+              "opcode_steps": 2884,
+              "warm": false,
+              "call_depth": 1,
+              "producer_status": "Data",
+              "ready_for_bind": true,
+              "producer_ready": "validated",
+              "producer_mv": "data"
+            },
+            {
+              "producer_tx": 8,
+              "consumer_tx": 11,
+              "consumer_incarnation": 3,
+              "location": 85335018835337005,
+              "kind": "storage",
+              "class": "program",
+              "gas_used_so_far": 37930,
+              "opcode_steps": 196,
+              "warm": false,
+              "call_depth": 1,
+              "producer_status": "Running",
+              "ready_for_bind": false,
+              "producer_ready": "running",
+              "producer_mv": "absent"
+            }
+          ],
+          "process": {
+            "tx": 11,
+            "n_bind": 14,
+            "n_wait_for": 2,
+            "n_unfenced": 78,
+            "n_unfenced_after_avoid": 10,
+            "n_force_prefix_none": 0,
+            "n_park": 2,
+            "n_abort": 0,
+            "final_incarnation": 3,
+            "reasons": {
+              "bind_published": 14,
+              "unfenced_canary": 13,
+              "unfenced_cold": 21,
+              "unfenced_independence": 4,
+              "unfenced_writer_done": 40,
+              "wait_for_writer": 2
+            },
+            "fail_score": 18
+          },
+          "final_inc": 3
+        },
+        "29": {
+          "work": {
+            "tx": 29,
+            "gas_used": 347012,
+            "opcode_steps": 3654,
+            "n_reads": 34,
+            "n_writes": 23
+          },
+          "reads_from": [
+            {
+              "consumer_tx": 29,
+              "location": 85335018835337005,
+              "producer_tx": 28,
+              "producer_effect_k": 35,
+              "warm": false
+            },
+            {
+              "consumer_tx": 29,
+              "location": 17702941225697825771,
+              "producer_tx": 28,
+              "producer_effect_k": 38,
+              "warm": false
+            },
+            {
+              "consumer_tx": 29,
+              "location": 85335018835337005,
+              "producer_tx": 28,
+              "producer_effect_k": 35,
+              "warm": true
+            },
+            {
+              "consumer_tx": 29,
+              "location": 14071748704357703226,
+              "producer_tx": 28,
+              "producer_effect_k": 29,
+              "warm": false
+            },
+            {
+              "consumer_tx": 29,
+              "location": 6790576347048465192,
+              "producer_tx": 28,
+              "producer_effect_k": 34,
+              "warm": false
+            },
+            {
+              "consumer_tx": 29,
+              "location": 14071748704357703226,
+              "producer_tx": 28,
+              "producer_effect_k": 29,
+              "warm": true
+            },
+            {
+              "consumer_tx": 29,
+              "location": 6790576347048465192,
+              "producer_tx": 28,
+              "producer_effect_k": 34,
+              "warm": true
+            }
+          ],
+          "as_producer": [
+            {
+              "consumer_tx": 30,
+              "location": 85335018835337005,
+              "producer_tx": 29,
+              "producer_effect_k": 35,
+              "warm": false
+            },
+            {
+              "consumer_tx": 30,
+              "location": 17702941225697825771,
+              "producer_tx": 29,
+              "producer_effect_k": 39,
+              "warm": false
+            },
+            {
+              "consumer_tx": 30,
+              "location": 85335018835337005,
+              "producer_tx": 29,
+              "producer_effect_k": 35,
+              "warm": true
+            },
+            {
+              "consumer_tx": 30,
+              "location": 14071748704357703226,
+              "producer_tx": 29,
+              "producer_effect_k": 28,
+              "warm": false
+            },
+            {
+              "consumer_tx": 30,
+              "location": 6790576347048465192,
+              "producer_tx": 29,
+              "producer_effect_k": 33,
+              "warm": false
+            },
+            {
+              "consumer_tx": 30,
+              "location": 14071748704357703226,
+              "producer_tx": 29,
+              "producer_effect_k": 28,
+              "warm": true
+            },
+            {
+              "consumer_tx": 30,
+              "location": 6790576347048465192,
+              "producer_tx": 29,
+              "producer_effect_k": 33,
+              "warm": true
+            }
+          ],
+          "effects": [],
+          "l2_edges": [
+            {
+              "producer_tx": 5,
+              "consumer_tx": 29,
+              "consumer_incarnation": 0,
+              "location": 85335018835337005,
+              "kind": "storage",
+              "class": "program",
+              "gas_used_so_far": 37954,
+              "opcode_steps": 196,
+              "warm": false,
+              "call_depth": 1,
+              "producer_status": "Estimate",
+              "ready_for_bind": false,
+              "producer_ready": "estimate",
+              "producer_mv": "estimate"
+            },
+            {
+              "producer_tx": 5,
+              "consumer_tx": 29,
+              "consumer_incarnation": 1,
+              "location": 85335018835337005,
+              "kind": "storage",
+              "class": "program",
+              "gas_used_so_far": 37954,
+              "opcode_steps": 196,
+              "warm": false,
+              "call_depth": 1,
+              "producer_status": "Estimate",
+              "ready_for_bind": false,
+              "producer_ready": "estimate",
+              "producer_mv": "estimate"
+            }
+          ],
+          "process": {
+            "tx": 29,
+            "n_bind": 11,
+            "n_wait_for": 3,
+            "n_unfenced": 67,
+            "n_unfenced_after_avoid": 7,
+            "n_force_prefix_none": 0,
+            "n_park": 3,
+            "n_abort": 0,
+            "final_incarnation": 4,
+            "reasons": {
+              "bind_published": 11,
+              "unfenced_canary": 18,
+              "unfenced_cold": 21,
+              "unfenced_independence": 4,
+              "unfenced_writer_done": 24,
+              "wait_for_serial": 1,
+              "wait_for_writer": 2
+            },
+            "fail_score": 18
+          },
+          "final_inc": 4
+        },
+        "28": {
+          "work": {
+            "tx": 28,
+            "gas_used": 351884,
+            "opcode_steps": 3660,
+            "n_reads": 34,
+            "n_writes": 23
+          },
+          "reads_from": [
+            {
+              "consumer_tx": 28,
+              "location": 85335018835337005,
+              "producer_tx": 27,
+              "producer_effect_k": 23,
+              "warm": false
+            },
+            {
+              "consumer_tx": 28,
+              "location": 17702941225697825771,
+              "producer_tx": 27,
+              "producer_effect_k": 27,
+              "warm": false
+            },
+            {
+              "consumer_tx": 28,
+              "location": 85335018835337005,
+              "producer_tx": 27,
+              "producer_effect_k": 23,
+              "warm": true
+            },
+            {
+              "consumer_tx": 28,
+              "location": 14071748704357703226,
+              "producer_tx": 27,
+              "producer_effect_k": 17,
+              "warm": false
+            },
+            {
+              "consumer_tx": 28,
+              "location": 6790576347048465192,
+              "producer_tx": 27,
+              "producer_effect_k": 22,
+              "warm": false
+            },
+            {
+              "consumer_tx": 28,
+              "location": 14071748704357703226,
+              "producer_tx": 27,
+              "producer_effect_k": 17,
+              "warm": true
+            },
+            {
+              "consumer_tx": 28,
+              "location": 6790576347048465192,
+              "producer_tx": 27,
+              "producer_effect_k": 22,
+              "warm": true
+            }
+          ],
+          "as_producer": [
+            {
+              "consumer_tx": 29,
+              "location": 85335018835337005,
+              "producer_tx": 28,
+              "producer_effect_k": 35,
+              "warm": false
+            },
+            {
+              "consumer_tx": 29,
+              "location": 17702941225697825771,
+              "producer_tx": 28,
+              "producer_effect_k": 38,
+              "warm": false
+            },
+            {
+              "consumer_tx": 29,
+              "location": 85335018835337005,
+              "producer_tx": 28,
+              "producer_effect_k": 35,
+              "warm": true
+            },
+            {
+              "consumer_tx": 29,
+              "location": 14071748704357703226,
+              "producer_tx": 28,
+              "producer_effect_k": 29,
+              "warm": false
+            },
+            {
+              "consumer_tx": 29,
+              "location": 6790576347048465192,
+              "producer_tx": 28,
+              "producer_effect_k": 34,
+              "warm": false
+            },
+            {
+              "consumer_tx": 29,
+              "location": 14071748704357703226,
+              "producer_tx": 28,
+              "producer_effect_k": 29,
+              "warm": true
+            },
+            {
+              "consumer_tx": 29,
+              "location": 6790576347048465192,
+              "producer_tx": 28,
+              "producer_effect_k": 34,
+              "warm": true
+            }
+          ],
+          "effects": [],
+          "l2_edges": [
+            {
+              "producer_tx": 5,
+              "consumer_tx": 28,
+              "consumer_incarnation": 0,
+              "location": 85335018835337005,
+              "kind": "storage",
+              "class": "program",
+              "gas_used_so_far": 37966,
+              "opcode_steps": 196,
+              "warm": false,
+              "call_depth": 1,
+              "producer_status": "Estimate",
+              "ready_for_bind": false,
+              "producer_ready": "estimate",
+              "producer_mv": "estimate"
+            },
+            {
+              "producer_tx": 5,
+              "consumer_tx": 28,
+              "consumer_incarnation": 1,
+              "location": 85335018835337005,
+              "kind": "storage",
+              "class": "program",
+              "gas_used_so_far": 37966,
+              "opcode_steps": 196,
+              "warm": false,
+              "call_depth": 1,
+              "producer_status": "Estimate",
+              "ready_for_bind": false,
+              "producer_ready": "estimate",
+              "producer_mv": "estimate"
+            }
+          ],
+          "process": {
+            "tx": 28,
+            "n_bind": 11,
+            "n_wait_for": 2,
+            "n_unfenced": 67,
+            "n_unfenced_after_avoid": 7,
+            "n_force_prefix_none": 0,
+            "n_park": 2,
+            "n_abort": 0,
+            "final_incarnation": 3,
+            "reasons": {
+              "bind_published": 11,
+              "unfenced_canary": 22,
+              "unfenced_cold": 29,
+              "unfenced_independence": 7,
+              "unfenced_writer_done": 9,
+              "wait_for_serial": 1,
+              "wait_for_writer": 1
+            },
+            "fail_score": 15
+          },
+          "final_inc": 3
+        },
+        "71": {
+          "work": {
+            "tx": 71,
+            "gas_used": 40260,
+            "opcode_steps": 254,
+            "n_reads": 3,
+            "n_writes": 1
+          },
+          "reads_from": [
+            {
+              "consumer_tx": 71,
+              "location": 85335018835337005,
+              "producer_tx": 38,
+              "producer_effect_k": 34,
+              "warm": false
+            }
+          ],
+          "as_producer": [],
+          "effects": [],
+          "l2_edges": [
+            {
+              "producer_tx": 3,
+              "consumer_tx": 71,
+              "consumer_incarnation": 0,
+              "location": 85335018835337005,
+              "kind": "storage",
+              "class": "program",
+              "gas_used_so_far": 37954,
+              "opcode_steps": 196,
+              "warm": false,
+              "call_depth": 1,
+              "producer_status": "Estimate",
+              "ready_for_bind": false,
+              "producer_ready": "estimate",
+              "producer_mv": "estimate"
+            }
+          ],
+          "process": {
+            "tx": 71,
+            "n_bind": 5,
+            "n_wait_for": 1,
+            "n_unfenced": 58,
+            "n_unfenced_after_avoid": 4,
+            "n_force_prefix_none": 0,
+            "n_park": 1,
+            "n_abort": 0,
+            "final_incarnation": 5,
+            "reasons": {
+              "bind_published": 5,
+              "unfenced_canary": 2,
+              "unfenced_cold": 30,
+              "unfenced_independence": 6,
+              "unfenced_writer_done": 20,
+              "wait_for_serial": 1
+            },
+            "fail_score": 15
+          },
+          "final_inc": 5
+        },
+        "30": {
+          "work": {
+            "tx": 30,
+            "gas_used": 351890,
+            "opcode_steps": 3663,
+            "n_reads": 34,
+            "n_writes": 23
+          },
+          "reads_from": [
+            {
+              "consumer_tx": 30,
+              "location": 85335018835337005,
+              "producer_tx": 29,
+              "producer_effect_k": 35,
+              "warm": false
+            },
+            {
+              "consumer_tx": 30,
+              "location": 17702941225697825771,
+              "producer_tx": 29,
+              "producer_effect_k": 39,
+              "warm": false
+            },
+            {
+              "consumer_tx": 30,
+              "location": 85335018835337005,
+              "producer_tx": 29,
+              "producer_effect_k": 35,
+              "warm": true
+            },
+            {
+              "consumer_tx": 30,
+              "location": 14071748704357703226,
+              "producer_tx": 29,
+              "producer_effect_k": 28,
+              "warm": false
+            },
+            {
+              "consumer_tx": 30,
+              "location": 6790576347048465192,
+              "producer_tx": 29,
+              "producer_effect_k": 33,
+              "warm": false
+            },
+            {
+              "consumer_tx": 30,
+              "location": 14071748704357703226,
+              "producer_tx": 29,
+              "producer_effect_k": 28,
+              "warm": true
+            },
+            {
+              "consumer_tx": 30,
+              "location": 6790576347048465192,
+              "producer_tx": 29,
+              "producer_effect_k": 33,
+              "warm": true
+            }
+          ],
+          "as_producer": [
+            {
+              "consumer_tx": 31,
+              "location": 85335018835337005,
+              "producer_tx": 30,
+              "producer_effect_k": 35,
+              "warm": false
+            },
+            {
+              "consumer_tx": 31,
+              "location": 17702941225697825771,
+              "producer_tx": 30,
+              "producer_effect_k": 38,
+              "warm": false
+            },
+            {
+              "consumer_tx": 31,
+              "location": 85335018835337005,
+              "producer_tx": 30,
+              "producer_effect_k": 35,
+              "warm": true
+            },
+            {
+              "consumer_tx": 31,
+              "location": 14071748704357703226,
+              "producer_tx": 30,
+              "producer_effect_k": 27,
+              "warm": false
+            },
+            {
+              "consumer_tx": 31,
+              "location": 6790576347048465192,
+              "producer_tx": 30,
+              "producer_effect_k": 34,
+              "warm": false
+            },
+            {
+              "consumer_tx": 31,
+              "location": 14071748704357703226,
+              "producer_tx": 30,
+              "producer_effect_k": 27,
+              "warm": true
+            },
+            {
+              "consumer_tx": 31,
+              "location": 6790576347048465192,
+              "producer_tx": 30,
+              "producer_effect_k": 34,
+              "warm": true
+            }
+          ],
+          "effects": [],
+          "l2_edges": [
+            {
+              "producer_tx": 5,
+              "consumer_tx": 30,
+              "consumer_incarnation": 0,
+              "location": 85335018835337005,
+              "kind": "storage",
+              "class": "program",
+              "gas_used_so_far": 37942,
+              "opcode_steps": 196,
+              "warm": false,
+              "call_depth": 1,
+              "producer_status": "Estimate",
+              "ready_for_bind": false,
+              "producer_ready": "estimate",
+              "producer_mv": "estimate"
+            },
+            {
+              "producer_tx": 5,
+              "consumer_tx": 30,
+              "consumer_incarnation": 1,
+              "location": 85335018835337005,
+              "kind": "storage",
+              "class": "program",
+              "gas_used_so_far": 37942,
+              "opcode_steps": 196,
+              "warm": false,
+              "call_depth": 1,
+              "producer_status": "Estimate",
+              "ready_for_bind": false,
+              "producer_ready": "estimate",
+              "producer_mv": "estimate"
+            }
+          ],
+          "process": {
+            "tx": 30,
+            "n_bind": 15,
+            "n_wait_for": 4,
+            "n_unfenced": 83,
+            "n_unfenced_after_avoid": 0,
+            "n_force_prefix_none": 0,
+            "n_park": 4,
+            "n_abort": 0,
+            "final_incarnation": 4,
+            "reasons": {
+              "bind_published": 15,
+              "unfenced_canary": 14,
+              "unfenced_cold": 31,
+              "unfenced_independence": 6,
+              "unfenced_writer_done": 32,
+              "wait_for_writer": 4
+            },
+            "fail_score": 12
+          },
+          "final_inc": 4
+        },
+        "3": {
+          "work": {
+            "tx": 3,
+            "gas_used": 351894,
+            "opcode_steps": 3661,
+            "n_reads": 34,
+            "n_writes": 23
+          },
+          "reads_from": [
+            {
+              "consumer_tx": 3,
+              "location": 85335018835337005,
+              "producer_tx": 0,
+              "producer_effect_k": 35,
+              "warm": false
+            },
+            {
+              "consumer_tx": 3,
+              "location": 17702941225697825771,
+              "producer_tx": 0,
+              "producer_effect_k": 39,
+              "warm": false
+            },
+            {
+              "consumer_tx": 3,
+              "location": 85335018835337005,
+              "producer_tx": 0,
+              "producer_effect_k": 35,
+              "warm": true
+            },
+            {
+              "consumer_tx": 3,
+              "location": 14071748704357703226,
+              "producer_tx": 0,
+              "producer_effect_k": 27,
+              "warm": false
+            },
+            {
+              "consumer_tx": 3,
+              "location": 6790576347048465192,
+              "producer_tx": 0,
+              "producer_effect_k": 33,
+              "warm": false
+            },
+            {
+              "consumer_tx": 3,
+              "location": 14071748704357703226,
+              "producer_tx": 0,
+              "producer_effect_k": 27,
+              "warm": true
+            },
+            {
+              "consumer_tx": 3,
+              "location": 6790576347048465192,
+              "producer_tx": 0,
+              "producer_effect_k": 33,
+              "warm": true
+            }
+          ],
+          "as_producer": [
+            {
+              "consumer_tx": 5,
+              "location": 85335018835337005,
+              "producer_tx": 3,
+              "producer_effect_k": 36,
+              "warm": false
+            },
+            {
+              "consumer_tx": 5,
+              "location": 17702941225697825771,
+              "producer_tx": 3,
+              "producer_effect_k": 38,
+              "warm": false
+            },
+            {
+              "consumer_tx": 5,
+              "location": 85335018835337005,
+              "producer_tx": 3,
+              "producer_effect_k": 36,
+              "warm": true
+            },
+            {
+              "consumer_tx": 5,
+              "location": 14071748704357703226,
+              "producer_tx": 3,
+              "producer_effect_k": 28,
+              "warm": false
+            },
+            {
+              "consumer_tx": 5,
+              "location": 6790576347048465192,
+              "producer_tx": 3,
+              "producer_effect_k": 34,
+              "warm": false
+            },
+            {
+              "consumer_tx": 5,
+              "location": 14071748704357703226,
+              "producer_tx": 3,
+              "producer_effect_k": 28,
+              "warm": true
+            },
+            {
+              "consumer_tx": 5,
+              "location": 6790576347048465192,
+              "producer_tx": 3,
+              "producer_effect_k": 34,
+              "warm": true
+            }
+          ],
+          "effects": [
+            {
+              "tx": 3,
+              "incarnation": 0,
+              "effect_k": 0,
+              "op_class": "sload",
+              "location": 13980140906397189668,
+              "mode": "R",
+              "gas_used_so_far": 30771,
+              "opcode_steps": 167,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 3,
+              "incarnation": 0,
+              "effect_k": 1,
+              "op_class": "sload",
+              "location": 14950447053500574803,
+              "mode": "R",
+              "gas_used_so_far": 32914,
+              "opcode_steps": 180,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 3,
+              "incarnation": 0,
+              "effect_k": 2,
+              "op_class": "sstore",
+              "location": 16053763603770628480,
+              "mode": "W",
+              "gas_used_so_far": 35040,
+              "opcode_steps": 188,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 3,
+              "incarnation": 0,
+              "effect_k": 3,
+              "op_class": "sload",
+              "location": 85335018835337005,
+              "mode": "R",
+              "gas_used_so_far": 37966,
+              "opcode_steps": 196,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 3,
+              "incarnation": 0,
+              "effect_k": 4,
+              "op_class": "sload",
+              "location": 12847376713127717181,
+              "mode": "R",
+              "gas_used_so_far": 40159,
+              "opcode_steps": 223,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 3,
+              "incarnation": 0,
+              "effect_k": 5,
+              "op_class": "sload",
+              "location": 7593728185942401190,
+              "mode": "R",
+              "gas_used_so_far": 42285,
+              "opcode_steps": 231,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 3,
+              "incarnation": 0,
+              "effect_k": 6,
+              "op_class": "sload",
+              "location": 16277692343892934942,
+              "mode": "R",
+              "gas_used_so_far": 44456,
+              "opcode_steps": 243,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 3,
+              "incarnation": 0,
+              "effect_k": 7,
+              "op_class": "sload",
+              "location": 1513214290813739940,
+              "mode": "R",
+              "gas_used_so_far": 46649,
+              "opcode_steps": 270,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 3,
+              "incarnation": 0,
+              "effect_k": 8,
+              "op_class": "sload",
+              "location": 3475265516245837399,
+              "mode": "R",
+              "gas_used_so_far": 49034,
+              "opcode_steps": 325,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 3,
+              "incarnation": 0,
+              "effect_k": 9,
+              "op_class": "sload",
+              "location": 13980140906397189668,
+              "mode": "R",
+              "gas_used_so_far": 56353,
+              "opcode_steps": 1665,
+              "call_depth": 1,
+              "warm": true,
+              "kind": "storage"
+            },
+            {
+              "tx": 3,
+              "incarnation": 0,
+              "effect_k": 10,
+              "op_class": "sload",
+              "location": 11065929453512471562,
+              "mode": "R",
+              "gas_used_so_far": 56523,
+              "opcode_steps": 1686,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 3,
+              "incarnation": 0,
+              "effect_k": 11,
+              "op_class": "sload",
+              "location": 11065929453512471562,
+              "mode": "R",
+              "gas_used_so_far": 58643,
+              "opcode_steps": 1692,
+              "call_depth": 1,
+              "warm": true,
+              "kind": "storage"
+            },
+            {
+              "tx": 3,
+              "incarnation": 0,
+              "effect_k": 12,
+              "op_class": "sload",
+              "location": 1115894024319217746,
+              "mode": "R",
+              "gas_used_so_far": 58837,
+              "opcode_steps": 1721,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 3,
+              "incarnation": 0,
+              "effect_k": 13,
+              "op_class": "sload",
+              "location": 5840135075898068057,
+              "mode": "R",
+              "gas_used_so_far": 60965,
+              "opcode_steps": 1730,
+              "call_depth": 1,
+              "warm": false,
+              "kind": "storage"
+            },
+            {
+              "tx": 3,
+              "incarnation": 0,
+              "effect_k": 14,
+              "op_class": "sload",
+              "location": 1513214290813739940,
+              "mode": "R",
+              "gas_used_so_far": 63192,
+              "opcode_steps": 1770,
+              "call_depth": 1,
+              "warm": true,
+              "kind": "storage"
+            }
+          ],
+          "l2_edges": [
+            {
+              "producer_tx": 0,
+              "consumer_tx": 3,
+              "consumer_incarnation": 0,
+              "location": 14071748704357703226,
+              "kind": "storage",
+              "class": "program",
+              "gas_used_so_far": 113047,
+              "opcode_steps": 2776,
+              "warm": false,
+              "call_depth": 1,
+              "producer_status": "Data",
+              "ready_for_bind": true,
+              "producer_ready": "validated",
+              "producer_mv": "data"
+            }
+          ],
+          "process": {
+            "tx": 3,
+            "n_bind": 4,
+            "n_wait_for": 1,
+            "n_unfenced": 44,
+            "n_unfenced_after_avoid": 8,
+            "n_force_prefix_none": 0,
+            "n_park": 1,
+            "n_abort": 0,
+            "final_incarnation": 1,
+            "reasons": {
+              "bind_published": 4,
+              "unfenced_canary": 6,
+              "unfenced_cold": 12,
+              "unfenced_independence": 3,
+              "unfenced_writer_done": 23,
+              "wait_for_writer": 1
+            },
+            "fail_score": 11
+          },
+          "final_inc": 1
+        }
+      },
+      "metrics": {
+        "edge_bind": 760,
+        "edge_wait_for": 72,
+        "edge_unfenced": 3898,
+        "avoid_broadcasts": 909,
+        "canary_probes": 556,
+        "independent_unfenced": 1187,
+        "soft_wait_arms": 0,
+        "occ_aborts": 47,
+        "force_prefix_unfenced": 0,
+        "prefer_admit": 0,
+        "multi_spine_admit": 9,
+        "quiet_fence_revoke": 0,
+        "writer_identity_preserved": 92,
+        "ready_steal_on_wait": 112,
+        "wait_park_count": 60,
+        "wait_park_ns": 86697846,
+        "evm_entries": 627,
+        "rebind_only": 0,
+        "full_restart": 5,
+        "rewind_to_cp": 88,
+        "force_bind_reabort": 11
+      },
+      "process_hist": {
+        "bind_published": 760,
+        "unfenced_after_avoid": 0,
+        "unfenced_canary": 556,
+        "unfenced_cold": 1566,
+        "unfenced_independence": 1187,
+        "unfenced_inversion": 0,
+        "unfenced_plant_tls": 0,
+        "unfenced_writer_done": 589,
+        "wait_for_canary": 0,
+        "wait_for_prefix": 0,
+        "wait_for_serial": 41,
+        "wait_for_writer": 31
+      },
+      "hot_locations": [
+        {
+          "location": 85335018835337005,
+          "bind": 538,
+          "wait_for": 0,
+          "unfenced": 6,
+          "unfenced_before_avoid": 6,
+          "unfenced_after_avoid": 0,
+          "wait_after_avoid": 0,
+          "bind_after_avoid": 538,
+          "unfenced_after_canary": 5,
+          "first_avoid_seq": 128,
+          "first_canary_seq": 5,
+          "first_fence_seq": 195,
+          "reasons": {
+            "bind_published": 538,
+            "unfenced_canary": 1,
+            "unfenced_cold": 5
+          }
+        },
+        {
+          "location": 14071748704357703226,
+          "bind": 58,
+          "wait_for": 0,
+          "unfenced": 2,
+          "unfenced_before_avoid": 2,
+          "unfenced_after_avoid": 0,
+          "wait_after_avoid": 0,
+          "bind_after_avoid": 58,
+          "unfenced_after_canary": 1,
+          "first_avoid_seq": 121,
+          "first_canary_seq": 38,
+          "first_fence_seq": 139,
+          "reasons": {
+            "bind_published": 58,
+            "unfenced_canary": 1,
+            "unfenced_cold": 1
+          }
+        },
+        {
+          "location": 17702941225697825771,
+          "bind": 56,
+          "wait_for": 0,
+          "unfenced": 4,
+          "unfenced_before_avoid": 4,
+          "unfenced_after_avoid": 0,
+          "wait_after_avoid": 0,
+          "bind_after_avoid": 56,
+          "unfenced_after_canary": 3,
+          "first_avoid_seq": 129,
+          "first_canary_seq": 28,
+          "first_fence_seq": 153,
+          "reasons": {
+            "bind_published": 56,
+            "unfenced_canary": 1,
+            "unfenced_cold": 3
+          }
+        },
+        {
+          "location": 6790576347048465192,
+          "bind": 39,
+          "wait_for": 0,
+          "unfenced": 1,
+          "unfenced_before_avoid": 1,
+          "unfenced_after_avoid": 0,
+          "wait_after_avoid": 0,
+          "bind_after_avoid": 39,
+          "unfenced_after_canary": 0,
+          "first_avoid_seq": 128,
+          "first_canary_seq": 52,
+          "first_fence_seq": 149,
+          "reasons": {
+            "bind_published": 39,
+            "unfenced_canary": 1
+          }
+        },
+        {
+          "location": 5199336656051454403,
+          "bind": 29,
+          "wait_for": 1,
+          "unfenced": 2,
+          "unfenced_before_avoid": 2,
+          "unfenced_after_avoid": 0,
+          "wait_after_avoid": 1,
+          "bind_after_avoid": 29,
+          "unfenced_after_canary": 0,
+          "first_avoid_seq": 866,
+          "first_canary_seq": 0,
+          "first_fence_seq": 867,
+          "reasons": {
+            "bind_published": 29,
+            "unfenced_independence": 2,
+            "wait_for_writer": 1
+          }
+        },
+        {
+          "location": 13553746943858601937,
+          "bind": 16,
+          "wait_for": 0,
+          "unfenced": 3,
+          "unfenced_before_avoid": 3,
+          "unfenced_after_avoid": 0,
+          "wait_after_avoid": 0,
+          "bind_after_avoid": 16,
+          "unfenced_after_canary": 0,
+          "first_avoid_seq": 967,
+          "first_canary_seq": 0,
+          "first_fence_seq": 972,
+          "reasons": {
+            "bind_published": 16,
+            "unfenced_independence": 3
+          }
+        },
+        {
+          "location": 15175023130755338476,
+          "bind": 0,
+          "wait_for": 12,
+          "unfenced": 4,
+          "unfenced_before_avoid": 3,
+          "unfenced_after_avoid": 1,
+          "wait_after_avoid": 12,
+          "bind_after_avoid": 0,
+          "unfenced_after_canary": 3,
+          "first_avoid_seq": 467,
+          "first_canary_seq": 436,
+          "first_fence_seq": 624,
+          "reasons": {
+            "unfenced_canary": 1,
+            "unfenced_cold": 2,
+            "unfenced_writer_done": 1,
+            "wait_for_writer": 12
+          }
+        },
+        {
+          "location": 4624439299733222876,
+          "bind": 0,
+          "wait_for": 4,
+          "unfenced": 3,
+          "unfenced_before_avoid": 2,
+          "unfenced_after_avoid": 1,
+          "wait_after_avoid": 4,
+          "bind_after_avoid": 0,
+          "unfenced_after_canary": 2,
+          "first_avoid_seq": 320,
+          "first_canary_seq": 301,
+          "first_fence_seq": 489,
+          "reasons": {
+            "unfenced_canary": 1,
+            "unfenced_cold": 1,
+            "unfenced_writer_done": 1,
+            "wait_for_writer": 4
+          }
+        },
+        {
+          "location": 2705538834146010334,
+          "bind": 3,
+          "wait_for": 0,
+          "unfenced": 2,
+          "unfenced_before_avoid": 1,
+          "unfenced_after_avoid": 1,
+          "wait_after_avoid": 0,
+          "bind_after_avoid": 3,
+          "unfenced_after_canary": 1,
+          "first_avoid_seq": 397,
+          "first_canary_seq": 352,
+          "first_fence_seq": 415,
+          "reasons": {
+            "bind_published": 3,
+            "unfenced_canary": 1,
+            "unfenced_writer_done": 1
+          }
+        },
+        {
+          "location": 15673774672545722556,
+          "bind": 1,
+          "wait_for": 1,
+          "unfenced": 8,
+          "unfenced_before_avoid": 8,
+          "unfenced_after_avoid": 0,
+          "wait_after_avoid": 1,
+          "bind_after_avoid": 1,
+          "unfenced_after_canary": 0,
+          "first_avoid_seq": 2979,
+          "first_canary_seq": 0,
+          "first_fence_seq": 2980,
+          "reasons": {
+            "bind_published": 1,
+            "unfenced_independence": 8,
+            "wait_for_writer": 1
+          }
+        },
+        {
+          "location": 15244909177200214250,
+          "bind": 2,
+          "wait_for": 0,
+          "unfenced": 3,
+          "unfenced_before_avoid": 3,
+          "unfenced_after_avoid": 0,
+          "wait_after_avoid": 0,
+          "bind_after_avoid": 2,
+          "unfenced_after_canary": 0,
+          "first_avoid_seq": 3121,
+          "first_canary_seq": 0,
+          "first_fence_seq": 3138,
+          "reasons": {
+            "bind_published": 2,
+            "unfenced_independence": 3
+          }
+        },
+        {
+          "location": 3809669987777055750,
+          "bind": 0,
+          "wait_for": 2,
+          "unfenced": 3,
+          "unfenced_before_avoid": 1,
+          "unfenced_after_avoid": 2,
+          "wait_after_avoid": 2,
+          "bind_after_avoid": 0,
+          "unfenced_after_canary": 2,
+          "first_avoid_seq": 320,
+          "first_canary_seq": 306,
+          "first_fence_seq": 454,
+          "reasons": {
+            "unfenced_canary": 1,
+            "unfenced_writer_done": 2,
+            "wait_for_writer": 2
+          }
+        }
+      ],
+      "hot_fanout_l": {
+        "location": 85335018835337005,
+        "bind": 538,
+        "wait_for": 0,
+        "unfenced": 6,
+        "unfenced_before_avoid": 6,
+        "unfenced_after_avoid": 0,
+        "wait_after_avoid": 0,
+        "bind_after_avoid": 538,
+        "unfenced_after_canary": 5,
+        "first_avoid_seq": 128,
+        "first_canary_seq": 5,
+        "first_fence_seq": 195,
+        "reasons": {
+          "bind_published": 538,
+          "unfenced_canary": 1,
+          "unfenced_cold": 5
+        }
+      },
+      "u_aa": 128,
+      "wall_ms": 17.954035,
+      "n_tx": 564
+    },
+    "599": {
+      "morph": "long_chain",
+      "wave": 261,
+      "chain": 61,
+      "fanout": 14,
+      "txs": {
+        "187": {
+          "work": {
+            "tx": 187,
+            "gas_used": 362243,
+            "opcode_steps": 26361,
+            "n_reads": 121,
+            "n_writes": 40
+          },
+          "reads_from": [],
+          "as_producer": [],
+          "effects": [],
+          "l2_edges": [],
+          "process": {
+            "tx": 187,
+            "n_bind": 4,
+            "n_wait_for": 0,
+            "n_unfenced": 240,
+            "n_unfenced_after_avoid": 81,
+            "n_force_prefix_none": 0,
+            "n_park": 0,
+            "n_abort": 0,
+            "final_incarnation": 3,
+            "reasons": {
+              "bind_published": 4,
+              "unfenced_canary": 35,
+              "unfenced_cold": 37,
+              "unfenced_independence": 21,
+              "unfenced_writer_done": 147
+            },
+            "fail_score": 87
+          },
+          "final_inc": 3
+        },
+        "63": {
+          "work": {
+            "tx": 63,
+            "gas_used": 86792,
+            "opcode_steps": 2518,
+            "n_reads": 17,
+            "n_writes": 9
+          },
+          "reads_from": [
+            {
+              "consumer_tx": 63,
+              "location": 13758554269703882113,
+              "producer_tx": 52,
+              "producer_effect_k": 28,
+              "warm": false
+            }
+          ],
+          "as_producer": [
+            {
+              "consumer_tx": 64,
+              "location": 2411129661802360381,
+              "producer_tx": 63,
+              "producer_effect_k": 16,
+              "warm": false
+            },
+            {
+              "consumer_tx": 64,
+              "location": 12065881356051624027,
+              "producer_tx": 63,
+              "producer_effect_k": 11,
+              "warm": false
+            },
+            {
+              "consumer_tx": 64,
+              "location": 2411129661802360381,
+              "producer_tx": 63,
+              "producer_effect_k": 16,
+              "warm": true
+            },
+            {
+              "consumer_tx": 64,
+              "location": 12065881356051624027,
+              "producer_tx": 63,
+              "producer_effect_k": 11,
+              "warm": true
+            },
+            {
+              "consumer_tx": 64,
+              "location": 15262262704814852074,
+              "producer_tx": 63,
+              "producer_effect_k": 12,
+              "warm": false
+            },
+            {
+              "consumer_tx": 64,
+              "location": 15262262704814852074,
+              "producer_tx": 63,
+              "producer_effect_k": 12,
+              "warm": true
+            },
+            {
+              "consumer_tx": 64,
+              "location": 2411129661802360381,
+              "producer_tx": 63,
+              "producer_effect_k": 16,
+              "warm": true
+            },
+            {
+              "consumer_tx": 64,
+              "location": 15262262704814852074,
+              "producer_tx": 63,
+              "producer_effect_k": 12,
+              "warm": true
+            },
+            {
+              "consumer_tx": 64,
+              "location": 12065881356051624027,
+              "producer_tx": 63,
+              "producer_effect_k": 11,
+              "warm": true
+            },
+            {
+              "consumer_tx": 64,
+              "location": 12065881356051624027,
+              "producer_tx": 63,
+              "producer_effect_k": 11,
+              "warm": true
+            }
+          ],
+          "effects": [],
+          "l2_edges": [],
+          "process": {
+            "tx": 63,
+            "n_bind": 8,
+            "n_wait_for": 0,
+            "n_unfenced": 109,
+            "n_unfenced_after_avoid": 63,
+            "n_force_prefix_none": 0,
+            "n_park": 0,
+            "n_abort": 0,
+            "final_incarnation": 7,
+            "reasons": {
+              "bind_published": 8,
+              "unfenced_canary": 8,
+              "unfenced_cold": 8,
+              "unfenced_independence": 8,
+              "unfenced_writer_done": 85
+            },
+            "fail_score": 77
+          },
+          "final_inc": 7
+        },
+        "42": {
+          "work": {
+            "tx": 42,
+            "gas_used": 188654,
+            "opcode_steps": 7669,
+            "n_reads": 54,
+            "n_writes": 19
+          },
+          "reads_from": [
+            {
+              "consumer_tx": 42,
+              "location": 13758554269703882113,
+              "producer_tx": 31,
+              "producer_effect_k": 23,
+              "warm": false
+            }
+          ],
+          "as_producer": [
+            {
+              "consumer_tx": 43,
+              "location": 7054062116746368461,
+              "producer_tx": 42,
+              "producer_effect_k": 18,
+              "warm": false
+            },
+            {
+              "consumer_tx": 43,
+              "location": 10998356807233929645,
+              "producer_tx": 42,
+              "producer_effect_k": 15,
+              "warm": false
+            },
+            {
+              "consumer_tx": 43,
+              "location": 13758554269703882113,
+              "producer_tx": 42,
+              "producer_effect_k": 23,
+              "warm": false
+            },
+            {
+              "consumer_tx": 43,
+              "location": 7054062116746368461,
+              "producer_tx": 42,
+              "producer_effect_k": 18,
+              "warm": true
+            },
+            {
+              "consumer_tx": 43,
+              "location": 7054062116746368461,
+              "producer_tx": 42,
+              "producer_effect_k": 18,
+              "warm": true
+            }
+          ],
+          "effects": [],
+          "l2_edges": [
+            {
+              "producer_tx": 31,
+              "consumer_tx": 42,
+              "consumer_incarnation": 1,
+              "location": 13758554269703882113,
+              "kind": "basic",
+              "class": "handler",
+              "gas_used_so_far": null,
+              "opcode_steps": 38,
+              "warm": false,
+              "call_depth": null,
+              "producer_status": "Data",
+              "ready_for_bind": true,
+              "producer_ready": "validated",
+              "producer_mv": "data"
+            }
+          ],
+          "process": {
+            "tx": 42,
+            "n_bind": 6,
+            "n_wait_for": 0,
+            "n_unfenced": 174,
+            "n_unfenced_after_avoid": 50,
+            "n_force_prefix_none": 0,
+            "n_park": 0,
+            "n_abort": 0,
+            "final_incarnation": 5,
+            "reasons": {
+              "bind_published": 6,
+              "unfenced_canary": 22,
+              "unfenced_cold": 29,
+              "unfenced_independence": 16,
+              "unfenced_writer_done": 107
+            },
+            "fail_score": 60
+          },
+          "final_inc": 5
+        },
+        "203": {
+          "work": {
+            "tx": 203,
+            "gas_used": 69676,
+            "opcode_steps": 2269,
+            "n_reads": 12,
+            "n_writes": 9
+          },
+          "reads_from": [],
+          "as_producer": [],
+          "effects": [],
+          "l2_edges": [],
+          "process": {
+            "tx": 203,
+            "n_bind": 16,
+            "n_wait_for": 0,
+            "n_unfenced": 112,
+            "n_unfenced_after_avoid": 30,
+            "n_force_prefix_none": 0,
+            "n_park": 0,
+            "n_abort": 0,
+            "final_incarnation": 15,
+            "reasons": {
+              "bind_published": 16,
+              "unfenced_canary": 3,
+              "unfenced_cold": 16,
+              "unfenced_independence": 13,
+              "unfenced_writer_done": 80
+            },
+            "fail_score": 60
+          },
+          "final_inc": 15
+        },
+        "28": {
+          "work": {
+            "tx": 28,
+            "gas_used": 260821,
+            "opcode_steps": 16205,
+            "n_reads": 100,
+            "n_writes": 36
+          },
+          "reads_from": [
+            {
+              "consumer_tx": 28,
+              "location": 13758554269703882113,
+              "producer_tx": 26,
+              "producer_effect_k": 1,
+              "warm": false
+            }
+          ],
+          "as_producer": [
+            {
+              "consumer_tx": 31,
+              "location": 13758554269703882113,
+              "producer_tx": 28,
+              "producer_effect_k": 43,
+              "warm": false
+            }
+          ],
+          "effects": [],
+          "l2_edges": [
+            {
+              "producer_tx": 26,
+              "consumer_tx": 28,
+              "consumer_incarnation": 3,
+              "location": 13758554269703882113,
+              "kind": "basic",
+              "class": "handler",
+              "gas_used_so_far": null,
+              "opcode_steps": 65,
+              "warm": false,
+              "call_depth": null,
+              "producer_status": "Data",
+              "ready_for_bind": true,
+              "producer_ready": "validated",
+              "producer_mv": "data"
+            }
+          ],
+          "process": {
+            "tx": 28,
+            "n_bind": 5,
+            "n_wait_for": 0,
+            "n_unfenced": 185,
+            "n_unfenced_after_avoid": 48,
+            "n_force_prefix_none": 0,
+            "n_park": 0,
+            "n_abort": 0,
+            "final_incarnation": 4,
+            "reasons": {
+              "bind_published": 5,
+              "unfenced_canary": 28,
+              "unfenced_cold": 1,
+              "unfenced_independence": 8,
+              "unfenced_writer_done": 148
+            },
+            "fail_score": 56
+          },
+          "final_inc": 4
+        },
+        "45": {
+          "work": {
+            "tx": 45,
+            "gas_used": 275537,
+            "opcode_steps": 17667,
+            "n_reads": 93,
+            "n_writes": 38
+          },
+          "reads_from": [
+            {
+              "consumer_tx": 45,
+              "location": 13758554269703882113,
+              "producer_tx": 43,
+              "producer_effect_k": 2,
+              "warm": false
+            }
+          ],
+          "as_producer": [
+            {
+              "consumer_tx": 50,
+              "location": 13758554269703882113,
+              "producer_tx": 45,
+              "producer_effect_k": 46,
+              "warm": false
+            }
+          ],
+          "effects": [],
+          "l2_edges": [],
+          "process": {
+            "tx": 45,
+            "n_bind": 5,
+            "n_wait_for": 0,
+            "n_unfenced": 155,
+            "n_unfenced_after_avoid": 48,
+            "n_force_prefix_none": 0,
+            "n_park": 0,
+            "n_abort": 0,
+            "final_incarnation": 4,
+            "reasons": {
+              "bind_published": 5,
+              "unfenced_canary": 22,
+              "unfenced_cold": 27,
+              "unfenced_independence": 20,
+              "unfenced_writer_done": 86
+            },
+            "fail_score": 56
+          },
+          "final_inc": 4
+        },
+        "326": {
+          "work": {
+            "tx": 326,
+            "gas_used": 162236,
+            "opcode_steps": 5390,
+            "n_reads": 50,
+            "n_writes": 17
+          },
+          "reads_from": [],
+          "as_producer": [],
+          "effects": [],
+          "l2_edges": [],
+          "process": {
+            "tx": 326,
+            "n_bind": 10,
+            "n_wait_for": 1,
+            "n_unfenced": 170,
+            "n_unfenced_after_avoid": 40,
+            "n_force_prefix_none": 0,
+            "n_park": 1,
+            "n_abort": 0,
+            "final_incarnation": 5,
+            "reasons": {
+              "bind_published": 10,
+              "unfenced_canary": 28,
+              "unfenced_cold": 42,
+              "unfenced_independence": 9,
+              "unfenced_writer_done": 91,
+              "wait_for_writer": 1
+            },
+            "fail_score": 51
+          },
+          "final_inc": 5
+        },
+        "31": {
+          "work": {
+            "tx": 31,
+            "gas_used": 162269,
+            "opcode_steps": 5997,
+            "n_reads": 54,
+            "n_writes": 17
+          },
+          "reads_from": [
+            {
+              "consumer_tx": 31,
+              "location": 13758554269703882113,
+              "producer_tx": 28,
+              "producer_effect_k": 43,
+              "warm": false
+            }
+          ],
+          "as_producer": [
+            {
+              "consumer_tx": 42,
+              "location": 13758554269703882113,
+              "producer_tx": 31,
+              "producer_effect_k": 23,
+              "warm": false
+            }
+          ],
+          "effects": [],
+          "l2_edges": [
+            {
+              "producer_tx": 26,
+              "consumer_tx": 31,
+              "consumer_incarnation": 0,
+              "location": 13758554269703882113,
+              "kind": "basic",
+              "class": "handler",
+              "gas_used_so_far": null,
+              "opcode_steps": 47,
+              "warm": false,
+              "call_depth": null,
+              "producer_status": "Data",
+              "ready_for_bind": true,
+              "producer_ready": "executed",
+              "producer_mv": "data"
+            },
+            {
+              "producer_tx": 26,
+              "consumer_tx": 31,
+              "consumer_incarnation": 4,
+              "location": 13758554269703882113,
+              "kind": "basic",
+              "class": "handler",
+              "gas_used_so_far": null,
+              "opcode_steps": 47,
+              "warm": false,
+              "call_depth": null,
+              "producer_status": "Data",
+              "ready_for_bind": true,
+              "producer_ready": "validated",
+              "producer_mv": "data"
+            }
+          ],
+          "process": {
+            "tx": 31,
+            "n_bind": 6,
+            "n_wait_for": 0,
+            "n_unfenced": 192,
+            "n_unfenced_after_avoid": 40,
+            "n_force_prefix_none": 0,
+            "n_park": 0,
+            "n_abort": 0,
+            "final_incarnation": 5,
+            "reasons": {
+              "bind_published": 6,
+              "unfenced_canary": 23,
+              "unfenced_cold": 44,
+              "unfenced_independence": 13,
+              "unfenced_writer_done": 112
+            },
+            "fail_score": 50
+          },
+          "final_inc": 5
+        }
+      },
+      "metrics": {
+        "edge_bind": 550,
+        "edge_wait_for": 55,
+        "edge_unfenced": 8130,
+        "avoid_broadcasts": 1277,
+        "canary_probes": 2190,
+        "independent_unfenced": 1485,
+        "soft_wait_arms": 0,
+        "occ_aborts": 159,
+        "force_prefix_unfenced": 0,
+        "prefer_admit": 1,
+        "multi_spine_admit": 24,
+        "quiet_fence_revoke": 0,
+        "writer_identity_preserved": 166,
+        "ready_steal_on_wait": 63,
+        "wait_park_count": 56,
+        "wait_park_ns": 48087242,
+        "evm_entries": 417,
+        "rebind_only": 8,
+        "full_restart": 31,
+        "rewind_to_cp": 170,
+        "force_bind_reabort": 56
+      },
+      "process_hist": {
+        "bind_published": 550,
+        "unfenced_after_avoid": 0,
+        "unfenced_canary": 2190,
+        "unfenced_cold": 1218,
+        "unfenced_independence": 1485,
+        "unfenced_inversion": 0,
+        "unfenced_plant_tls": 0,
+        "unfenced_writer_done": 3237,
+        "wait_for_canary": 0,
+        "wait_for_prefix": 0,
+        "wait_for_serial": 27,
+        "wait_for_writer": 28
+      },
+      "hot_locations": [
+        {
+          "location": 13758554269703882113,
+          "bind": 232,
+          "wait_for": 0,
+          "unfenced": 4,
+          "unfenced_before_avoid": 4,
+          "unfenced_after_avoid": 0,
+          "wait_after_avoid": 0,
+          "bind_after_avoid": 232,
+          "unfenced_after_canary": 0,
+          "first_avoid_seq": 216,
+          "first_canary_seq": 0,
+          "first_fence_seq": 221,
+          "reasons": {
+            "bind_published": 232,
+            "unfenced_independence": 4
+          }
+        },
+        {
+          "location": 10357899511347443885,
+          "bind": 38,
+          "wait_for": 0,
+          "unfenced": 6,
+          "unfenced_before_avoid": 6,
+          "unfenced_after_avoid": 0,
+          "wait_after_avoid": 0,
+          "bind_after_avoid": 38,
+          "unfenced_after_canary": 0,
+          "first_avoid_seq": 3397,
+          "first_canary_seq": 0,
+          "first_fence_seq": 3444,
+          "reasons": {
+            "bind_published": 38,
+            "unfenced_independence": 4,
+            "unfenced_writer_done": 2
+          }
+        },
+        {
+          "location": 3565139037764453269,
+          "bind": 12,
+          "wait_for": 0,
+          "unfenced": 1,
+          "unfenced_before_avoid": 1,
+          "unfenced_after_avoid": 0,
+          "wait_after_avoid": 0,
+          "bind_after_avoid": 12,
+          "unfenced_after_canary": 0,
+          "first_avoid_seq": 1222,
+          "first_canary_seq": 0,
+          "first_fence_seq": 4172,
+          "reasons": {
+            "bind_published": 12,
+            "unfenced_independence": 1
+          }
+        },
+        {
+          "location": 12751924054141618995,
+          "bind": 8,
+          "wait_for": 0,
+          "unfenced": 5,
+          "unfenced_before_avoid": 1,
+          "unfenced_after_avoid": 4,
+          "wait_after_avoid": 0,
+          "bind_after_avoid": 8,
+          "unfenced_after_canary": 4,
+          "first_avoid_seq": 568,
+          "first_canary_seq": 433,
+          "first_fence_seq": 4037,
+          "reasons": {
+            "bind_published": 8,
+            "unfenced_canary": 1,
+            "unfenced_writer_done": 4
+          }
+        },
+        {
+          "location": 2201940979742291067,
+          "bind": 8,
+          "wait_for": 0,
+          "unfenced": 5,
+          "unfenced_before_avoid": 1,
+          "unfenced_after_avoid": 4,
+          "wait_after_avoid": 0,
+          "bind_after_avoid": 8,
+          "unfenced_after_canary": 4,
+          "first_avoid_seq": 569,
+          "first_canary_seq": 386,
+          "first_fence_seq": 4029,
+          "reasons": {
+            "bind_published": 8,
+            "unfenced_canary": 1,
+            "unfenced_writer_done": 4
+          }
+        },
+        {
+          "location": 14740505458979786277,
+          "bind": 8,
+          "wait_for": 0,
+          "unfenced": 5,
+          "unfenced_before_avoid": 1,
+          "unfenced_after_avoid": 4,
+          "wait_after_avoid": 0,
+          "bind_after_avoid": 8,
+          "unfenced_after_canary": 4,
+          "first_avoid_seq": 570,
+          "first_canary_seq": 450,
+          "first_fence_seq": 4056,
+          "reasons": {
+            "bind_published": 8,
+            "unfenced_canary": 1,
+            "unfenced_writer_done": 4
+          }
+        },
+        {
+          "location": 4001654997680271158,
+          "bind": 8,
+          "wait_for": 0,
+          "unfenced": 5,
+          "unfenced_before_avoid": 1,
+          "unfenced_after_avoid": 4,
+          "wait_after_avoid": 0,
+          "bind_after_avoid": 8,
+          "unfenced_after_canary": 4,
+          "first_avoid_seq": 572,
+          "first_canary_seq": 479,
+          "first_fence_seq": 4088,
+          "reasons": {
+            "bind_published": 8,
+            "unfenced_canary": 1,
+            "unfenced_writer_done": 4
+          }
+        },
+        {
+          "location": 12706960404452454218,
+          "bind": 8,
+          "wait_for": 0,
+          "unfenced": 1,
+          "unfenced_before_avoid": 1,
+          "unfenced_after_avoid": 0,
+          "wait_after_avoid": 0,
+          "bind_after_avoid": 8,
+          "unfenced_after_canary": 0,
+          "first_avoid_seq": 6568,
+          "first_canary_seq": 6543,
+          "first_fence_seq": 6574,
+          "reasons": {
+            "bind_published": 8,
+            "unfenced_canary": 1
+          }
+        },
+        {
+          "location": 6661591636648175780,
+          "bind": 7,
+          "wait_for": 0,
+          "unfenced": 2,
+          "unfenced_before_avoid": 2,
+          "unfenced_after_avoid": 0,
+          "wait_after_avoid": 0,
+          "bind_after_avoid": 7,
+          "unfenced_after_canary": 0,
+          "first_avoid_seq": 6567,
+          "first_canary_seq": 0,
+          "first_fence_seq": 6654,
+          "reasons": {
+            "bind_published": 7,
+            "unfenced_independence": 2
+          }
+        },
+        {
+          "location": 2411129661802360381,
+          "bind": 5,
+          "wait_for": 1,
+          "unfenced": 8,
+          "unfenced_before_avoid": 1,
+          "unfenced_after_avoid": 7,
+          "wait_after_avoid": 1,
+          "bind_after_avoid": 5,
+          "unfenced_after_canary": 7,
+          "first_avoid_seq": 1629,
+          "first_canary_seq": 1584,
+          "first_fence_seq": 1632,
+          "reasons": {
+            "bind_published": 5,
+            "unfenced_canary": 1,
+            "unfenced_writer_done": 7,
+            "wait_for_writer": 1
+          }
+        },
+        {
+          "location": 3165918322799250506,
+          "bind": 6,
+          "wait_for": 0,
+          "unfenced": 2,
+          "unfenced_before_avoid": 1,
+          "unfenced_after_avoid": 1,
+          "wait_after_avoid": 0,
+          "bind_after_avoid": 6,
+          "unfenced_after_canary": 1,
+          "first_avoid_seq": 4918,
+          "first_canary_seq": 4887,
+          "first_fence_seq": 4949,
+          "reasons": {
+            "bind_published": 6,
+            "unfenced_canary": 1,
+            "unfenced_writer_done": 1
+          }
+        },
+        {
+          "location": 12653452103398754885,
+          "bind": 5,
+          "wait_for": 1,
+          "unfenced": 2,
+          "unfenced_before_avoid": 1,
+          "unfenced_after_avoid": 1,
+          "wait_after_avoid": 1,
+          "bind_after_avoid": 5,
+          "unfenced_after_canary": 1,
+          "first_avoid_seq": 4918,
+          "first_canary_seq": 4898,
+          "first_fence_seq": 4962,
+          "reasons": {
+            "bind_published": 5,
+            "unfenced_canary": 1,
+            "unfenced_writer_done": 1,
+            "wait_for_writer": 1
+          }
+        }
+      ],
+      "hot_fanout_l": {
+        "location": 13758554269703882113,
+        "bind": 232,
+        "wait_for": 0,
+        "unfenced": 4,
+        "unfenced_before_avoid": 4,
+        "unfenced_after_avoid": 0,
+        "wait_after_avoid": 0,
+        "bind_after_avoid": 232,
+        "unfenced_after_canary": 0,
+        "first_avoid_seq": 216,
+        "first_canary_seq": 0,
+        "first_fence_seq": 221,
+        "reasons": {
+          "bind_published": 232,
+          "unfenced_independence": 4
+        }
+      },
+      "u_aa": 1124,
+      "wall_ms": 34.013329,
+      "n_tx": 367
+    },
+    "097": {
+      "morph": "long_chain",
+      "wave": 198,
+      "chain": 47,
+      "fanout": 6,
+      "txs": {
+        "34": {
+          "work": {
+            "tx": 34,
+            "gas_used": 161143,
+            "opcode_steps": 6530,
+            "n_reads": 65,
+            "n_writes": 19
+          },
+          "reads_from": [
+            {
+              "consumer_tx": 34,
+              "location": 13758554269703882113,
+              "producer_tx": 29,
+              "producer_effect_k": 20,
+              "warm": false
+            }
+          ],
+          "as_producer": [
+            {
+              "consumer_tx": 36,
+              "location": 13758554269703882113,
+              "producer_tx": 34,
+              "producer_effect_k": 23,
+              "warm": false
+            }
+          ],
+          "effects": [],
+          "l2_edges": [
+            {
+              "producer_tx": 21,
+              "consumer_tx": 34,
+              "consumer_incarnation": 0,
+              "location": 13758554269703882113,
+              "kind": "basic",
+              "class": "handler",
+              "gas_used_so_far": null,
+              "opcode_steps": 58,
+              "warm": false,
+              "call_depth": null,
+              "producer_status": "Data",
+              "ready_for_bind": true,
+              "producer_ready": "validated",
+              "producer_mv": "data"
+            }
+          ],
+          "process": {
+            "tx": 34,
+            "n_bind": 5,
+            "n_wait_for": 0,
+            "n_unfenced": 155,
+            "n_unfenced_after_avoid": 36,
+            "n_force_prefix_none": 0,
+            "n_park": 0,
+            "n_abort": 0,
+            "final_incarnation": 4,
+            "reasons": {
+              "bind_published": 5,
+              "unfenced_canary": 26,
+              "unfenced_cold": 18,
+              "unfenced_independence": 9,
+              "unfenced_writer_done": 102
+            },
+            "fail_score": 44
+          },
+          "final_inc": 4
+        },
+        "36": {
+          "work": {
+            "tx": 36,
+            "gas_used": 135907,
+            "opcode_steps": 9057,
+            "n_reads": 28,
+            "n_writes": 17
+          },
+          "reads_from": [
+            {
+              "consumer_tx": 36,
+              "location": 7054062116746368461,
+              "producer_tx": 2,
+              "producer_effect_k": 21,
+              "warm": false
+            },
+            {
+              "consumer_tx": 36,
+              "location": 7054062116746368461,
+              "producer_tx": 2,
+              "producer_effect_k": 21,
+              "warm": true
+            },
+            {
+              "consumer_tx": 36,
+              "location": 13758554269703882113,
+              "producer_tx": 34,
+              "producer_effect_k": 23,
+              "warm": false
+            },
+            {
+              "consumer_tx": 36,
+              "location": 7054062116746368461,
+              "producer_tx": 2,
+              "producer_effect_k": 21,
+              "warm": true
+            },
+            {
+              "consumer_tx": 36,
+              "location": 7054062116746368461,
+              "producer_tx": 2,
+              "producer_effect_k": 21,
+              "warm": true
+            }
+          ],
+          "as_producer": [
+            {
+              "consumer_tx": 37,
+              "location": 13758554269703882113,
+              "producer_tx": 36,
+              "producer_effect_k": 20,
+              "warm": false
+            },
+            {
+              "consumer_tx": 37,
+              "location": 6775151257255550366,
+              "producer_tx": 36,
+              "producer_effect_k": 17,
+              "warm": false
+            },
+            {
+              "consumer_tx": 37,
+              "location": 6775151257255550366,
+              "producer_tx": 36,
+              "producer_effect_k": 17,
+              "warm": true
+            },
+            {
+              "consumer_tx": 37,
+              "location": 374026756458220942,
+              "producer_tx": 36,
+              "producer_effect_k": 18,
+              "warm": false
+            },
+            {
+              "consumer_tx": 37,
+              "location": 6775151257255550366,
+              "producer_tx": 36,
+              "producer_effect_k": 17,
+              "warm": true
+            },
+            {
+              "consumer_tx": 37,
+              "location": 12002167462798944181,
+              "producer_tx": 36,
+              "producer_effect_k": 24,
+              "warm": false
+            },
+            {
+              "consumer_tx": 37,
+              "location": 5249012626508274354,
+              "producer_tx": 36,
+              "producer_effect_k": 21,
+              "warm": false
+            },
+            {
+              "consumer_tx": 37,
+              "location": 5249012626508274354,
+              "producer_tx": 36,
+              "producer_effect_k": 21,
+              "warm": true
+            },
+            {
+              "consumer_tx": 37,
+              "location": 5249012626508274354,
+              "producer_tx": 36,
+              "producer_effect_k": 21,
+              "warm": true
+            },
+            {
+              "consumer_tx": 37,
+              "location": 6775151257255550366,
+              "producer_tx": 36,
+              "producer_effect_k": 17,
+              "warm": true
+            }
+          ],
+          "effects": [],
+          "l2_edges": [],
+          "process": {
+            "tx": 36,
+            "n_bind": 5,
+            "n_wait_for": 0,
+            "n_unfenced": 85,
+            "n_unfenced_after_avoid": 32,
+            "n_force_prefix_none": 0,
+            "n_park": 0,
+            "n_abort": 0,
+            "final_incarnation": 4,
+            "reasons": {
+              "bind_published": 5,
+              "unfenced_canary": 10,
+              "unfenced_cold": 12,
+              "unfenced_independence": 13,
+              "unfenced_writer_done": 50
+            },
+            "fail_score": 40
+          },
+          "final_inc": 4
+        },
+        "320": {
+          "work": {
+            "tx": 320,
+            "gas_used": 118816,
+            "opcode_steps": 7537,
+            "n_reads": 24,
+            "n_writes": 12
+          },
+          "reads_from": [],
+          "as_producer": [],
+          "effects": [],
+          "l2_edges": [],
+          "process": {
+            "tx": 320,
+            "n_bind": 10,
+            "n_wait_for": 0,
+            "n_unfenced": 79,
+            "n_unfenced_after_avoid": 28,
+            "n_force_prefix_none": 0,
+            "n_park": 0,
+            "n_abort": 0,
+            "final_incarnation": 4,
+            "reasons": {
+              "bind_published": 10,
+              "unfenced_canary": 9,
+              "unfenced_cold": 9,
+              "unfenced_independence": 7,
+              "unfenced_writer_done": 54
+            },
+            "fail_score": 36
+          },
+          "final_inc": 4
+        },
+        "322": {
+          "work": {
+            "tx": 322,
+            "gas_used": 30428,
+            "opcode_steps": 180,
+            "n_reads": 2,
+            "n_writes": 3
+          },
+          "reads_from": [],
+          "as_producer": [],
+          "effects": [],
+          "l2_edges": [],
+          "process": {
+            "tx": 322,
+            "n_bind": 10,
+            "n_wait_for": 0,
+            "n_unfenced": 20,
+            "n_unfenced_after_avoid": 18,
+            "n_force_prefix_none": 0,
+            "n_park": 0,
+            "n_abort": 0,
+            "final_incarnation": 9,
+            "reasons": {
+              "bind_published": 10,
+              "unfenced_canary": 1,
+              "unfenced_independence": 1,
+              "unfenced_writer_done": 18
+            },
+            "fail_score": 36
+          },
+          "final_inc": 9
+        },
+        "224": {
+          "work": {
+            "tx": 224,
+            "gas_used": 164546,
+            "opcode_steps": 9660,
+            "n_reads": 34,
+            "n_writes": 17
+          },
+          "reads_from": [],
+          "as_producer": [],
+          "effects": [],
+          "l2_edges": [],
+          "process": {
+            "tx": 224,
+            "n_bind": 3,
+            "n_wait_for": 4,
+            "n_unfenced": 74,
+            "n_unfenced_after_avoid": 19,
+            "n_force_prefix_none": 0,
+            "n_park": 4,
+            "n_abort": 0,
+            "final_incarnation": 6,
+            "reasons": {
+              "bind_published": 3,
+              "unfenced_canary": 12,
+              "unfenced_cold": 15,
+              "unfenced_independence": 12,
+              "unfenced_writer_done": 35,
+              "wait_for_serial": 2,
+              "wait_for_writer": 2
+            },
+            "fail_score": 35
+          },
+          "final_inc": 6
+        },
+        "29": {
+          "work": {
+            "tx": 29,
+            "gas_used": 139052,
+            "opcode_steps": 6384,
+            "n_reads": 35,
+            "n_writes": 15
+          },
+          "reads_from": [
+            {
+              "consumer_tx": 29,
+              "location": 13758554269703882113,
+              "producer_tx": 27,
+              "producer_effect_k": 2,
+              "warm": false
+            }
+          ],
+          "as_producer": [
+            {
+              "consumer_tx": 34,
+              "location": 13758554269703882113,
+              "producer_tx": 29,
+              "producer_effect_k": 20,
+              "warm": false
+            }
+          ],
+          "effects": [],
+          "l2_edges": [
+            {
+              "producer_tx": 21,
+              "consumer_tx": 29,
+              "consumer_incarnation": 0,
+              "location": 13758554269703882113,
+              "kind": "basic",
+              "class": "handler",
+              "gas_used_so_far": null,
+              "opcode_steps": 27,
+              "warm": false,
+              "call_depth": null,
+              "producer_status": "Data",
+              "ready_for_bind": true,
+              "producer_ready": "validated",
+              "producer_mv": "data"
+            }
+          ],
+          "process": {
+            "tx": 29,
+            "n_bind": 4,
+            "n_wait_for": 0,
+            "n_unfenced": 84,
+            "n_unfenced_after_avoid": 27,
+            "n_force_prefix_none": 0,
+            "n_park": 0,
+            "n_abort": 0,
+            "final_incarnation": 3,
+            "reasons": {
+              "bind_published": 4,
+              "unfenced_canary": 15,
+              "unfenced_cold": 8,
+              "unfenced_independence": 10,
+              "unfenced_writer_done": 51
+            },
+            "fail_score": 33
+          },
+          "final_inc": 3
+        },
+        "25": {
+          "work": {
+            "tx": 25,
+            "gas_used": 101444,
+            "opcode_steps": 5230,
+            "n_reads": 21,
+            "n_writes": 9
+          },
+          "reads_from": [
+            {
+              "consumer_tx": 25,
+              "location": 13758554269703882113,
+              "producer_tx": 21,
+              "producer_effect_k": 4,
+              "warm": false
+            }
+          ],
+          "as_producer": [],
+          "effects": [],
+          "l2_edges": [
+            {
+              "producer_tx": 21,
+              "consumer_tx": 25,
+              "consumer_incarnation": 0,
+              "location": 13758554269703882113,
+              "kind": "basic",
+              "class": "handler",
+              "gas_used_so_far": null,
+              "opcode_steps": 18,
+              "warm": false,
+              "call_depth": null,
+              "producer_status": "Data",
+              "ready_for_bind": true,
+              "producer_ready": "validated",
+              "producer_mv": "data"
+            }
+          ],
+          "process": {
+            "tx": 25,
+            "n_bind": 4,
+            "n_wait_for": 0,
+            "n_unfenced": 60,
+            "n_unfenced_after_avoid": 24,
+            "n_force_prefix_none": 0,
+            "n_park": 0,
+            "n_abort": 0,
+            "final_incarnation": 3,
+            "reasons": {
+              "bind_published": 4,
+              "unfenced_canary": 11,
+              "unfenced_independence": 4,
+              "unfenced_writer_done": 45
+            },
+            "fail_score": 30
+          },
+          "final_inc": 3
+        },
+        "27": {
+          "work": {
+            "tx": 27,
+            "gas_used": 206127,
+            "opcode_steps": 11497,
+            "n_reads": 34,
+            "n_writes": 19
+          },
+          "reads_from": [
+            {
+              "consumer_tx": 27,
+              "location": 13758554269703882113,
+              "producer_tx": 21,
+              "producer_effect_k": 4,
+              "warm": false
+            }
+          ],
+          "as_producer": [
+            {
+              "consumer_tx": 29,
+              "location": 13758554269703882113,
+              "producer_tx": 27,
+              "producer_effect_k": 2,
+              "warm": false
+            }
+          ],
+          "effects": [],
+          "l2_edges": [],
+          "process": {
+            "tx": 27,
+            "n_bind": 3,
+            "n_wait_for": 0,
+            "n_unfenced": 84,
+            "n_unfenced_after_avoid": 24,
+            "n_force_prefix_none": 0,
+            "n_park": 0,
+            "n_abort": 0,
+            "final_incarnation": 2,
+            "reasons": {
+              "bind_published": 3,
+              "unfenced_canary": 19,
+              "unfenced_independence": 9,
+              "unfenced_writer_done": 56
+            },
+            "fail_score": 28
+          },
+          "final_inc": 2
+        }
+      },
+      "metrics": {
+        "edge_bind": 462,
+        "edge_wait_for": 45,
+        "edge_unfenced": 4466,
+        "avoid_broadcasts": 1071,
+        "canary_probes": 1431,
+        "independent_unfenced": 1012,
+        "soft_wait_arms": 0,
+        "occ_aborts": 203,
+        "force_prefix_unfenced": 0,
+        "prefer_admit": 1,
+        "multi_spine_admit": 27,
+        "quiet_fence_revoke": 0,
+        "writer_identity_preserved": 217,
+        "ready_steal_on_wait": 53,
+        "wait_park_count": 50,
+        "wait_park_ns": 15624052,
+        "evm_entries": 386,
+        "rebind_only": 4,
+        "full_restart": 24,
+        "rewind_to_cp": 211,
+        "force_bind_reabort": 45
+      },
+      "process_hist": {
+        "bind_published": 462,
+        "unfenced_after_avoid": 0,
+        "unfenced_canary": 1431,
+        "unfenced_cold": 428,
+        "unfenced_independence": 1012,
+        "unfenced_inversion": 0,
+        "unfenced_plant_tls": 0,
+        "unfenced_writer_done": 1595,
+        "wait_for_canary": 0,
+        "wait_for_prefix": 0,
+        "wait_for_serial": 31,
+        "wait_for_writer": 14
+      },
+      "hot_locations": [
+        {
+          "location": 5756944208085735096,
+          "bind": 120,
+          "wait_for": 0,
+          "unfenced": 1,
+          "unfenced_before_avoid": 1,
+          "unfenced_after_avoid": 0,
+          "wait_after_avoid": 0,
+          "bind_after_avoid": 120,
+          "unfenced_after_canary": 0,
+          "first_avoid_seq": 869,
+          "first_canary_seq": 865,
+          "first_fence_seq": 887,
+          "reasons": {
+            "bind_published": 120,
+            "unfenced_canary": 1
+          }
+        },
+        {
+          "location": 13758554269703882113,
+          "bind": 105,
+          "wait_for": 0,
+          "unfenced": 7,
+          "unfenced_before_avoid": 5,
+          "unfenced_after_avoid": 2,
+          "wait_after_avoid": 0,
+          "bind_after_avoid": 105,
+          "unfenced_after_canary": 0,
+          "first_avoid_seq": 270,
+          "first_canary_seq": 0,
+          "first_fence_seq": 315,
+          "reasons": {
+            "bind_published": 105,
+            "unfenced_independence": 5,
+            "unfenced_writer_done": 2
+          }
+        },
+        {
+          "location": 6156966760139355624,
+          "bind": 98,
+          "wait_for": 0,
+          "unfenced": 2,
+          "unfenced_before_avoid": 2,
+          "unfenced_after_avoid": 0,
+          "wait_after_avoid": 0,
+          "bind_after_avoid": 98,
+          "unfenced_after_canary": 1,
+          "first_avoid_seq": 270,
+          "first_canary_seq": 261,
+          "first_fence_seq": 343,
+          "reasons": {
+            "bind_published": 98,
+            "unfenced_canary": 1,
+            "unfenced_cold": 1
+          }
+        },
+        {
+          "location": 10357899511347443885,
+          "bind": 23,
+          "wait_for": 0,
+          "unfenced": 3,
+          "unfenced_before_avoid": 3,
+          "unfenced_after_avoid": 0,
+          "wait_after_avoid": 0,
+          "bind_after_avoid": 23,
+          "unfenced_after_canary": 0,
+          "first_avoid_seq": 3287,
+          "first_canary_seq": 0,
+          "first_fence_seq": 4023,
+          "reasons": {
+            "bind_published": 23,
+            "unfenced_independence": 1,
+            "unfenced_writer_done": 2
+          }
+        },
+        {
+          "location": 7242912284647832413,
+          "bind": 6,
+          "wait_for": 0,
+          "unfenced": 1,
+          "unfenced_before_avoid": 1,
+          "unfenced_after_avoid": 0,
+          "wait_after_avoid": 0,
+          "bind_after_avoid": 6,
+          "unfenced_after_canary": 0,
+          "first_avoid_seq": 2001,
+          "first_canary_seq": 1990,
+          "first_fence_seq": 2003,
+          "reasons": {
+            "bind_published": 6,
+            "unfenced_canary": 1
+          }
+        },
+        {
+          "location": 5571831401313774584,
+          "bind": 4,
+          "wait_for": 0,
+          "unfenced": 3,
+          "unfenced_before_avoid": 2,
+          "unfenced_after_avoid": 1,
+          "wait_after_avoid": 0,
+          "bind_after_avoid": 4,
+          "unfenced_after_canary": 2,
+          "first_avoid_seq": 180,
+          "first_canary_seq": 33,
+          "first_fence_seq": 364,
+          "reasons": {
+            "bind_published": 4,
+            "unfenced_canary": 1,
+            "unfenced_cold": 1,
+            "unfenced_writer_done": 1
+          }
+        },
+        {
+          "location": 709449316407789583,
+          "bind": 4,
+          "wait_for": 0,
+          "unfenced": 2,
+          "unfenced_before_avoid": 2,
+          "unfenced_after_avoid": 0,
+          "wait_after_avoid": 0,
+          "bind_after_avoid": 4,
+          "unfenced_after_canary": 0,
+          "first_avoid_seq": 4333,
+          "first_canary_seq": 0,
+          "first_fence_seq": 4345,
+          "reasons": {
+            "bind_published": 4,
+            "unfenced_independence": 2
+          }
+        },
+        {
+          "location": 3980158569742776693,
+          "bind": 4,
+          "wait_for": 0,
+          "unfenced": 1,
+          "unfenced_before_avoid": 1,
+          "unfenced_after_avoid": 0,
+          "wait_after_avoid": 0,
+          "bind_after_avoid": 4,
+          "unfenced_after_canary": 0,
+          "first_avoid_seq": 171,
+          "first_canary_seq": 29,
+          "first_fence_seq": 2607,
+          "reasons": {
+            "bind_published": 4,
+            "unfenced_canary": 1
+          }
+        },
+        {
+          "location": 9495673275323199801,
+          "bind": 4,
+          "wait_for": 0,
+          "unfenced": 1,
+          "unfenced_before_avoid": 1,
+          "unfenced_after_avoid": 0,
+          "wait_after_avoid": 0,
+          "bind_after_avoid": 4,
+          "unfenced_after_canary": 0,
+          "first_avoid_seq": 4312,
+          "first_canary_seq": 4312,
+          "first_fence_seq": 4397,
+          "reasons": {
+            "bind_published": 4,
+            "unfenced_canary": 1
+          }
+        },
+        {
+          "location": 13318161822704774809,
+          "bind": 4,
+          "wait_for": 0,
+          "unfenced": 1,
+          "unfenced_before_avoid": 1,
+          "unfenced_after_avoid": 0,
+          "wait_after_avoid": 0,
+          "bind_after_avoid": 4,
+          "unfenced_after_canary": 0,
+          "first_avoid_seq": 166,
+          "first_canary_seq": 23,
+          "first_fence_seq": 2603,
+          "reasons": {
+            "bind_published": 4,
+            "unfenced_canary": 1
+          }
+        },
+        {
+          "location": 4608851390494091502,
+          "bind": 4,
+          "wait_for": 0,
+          "unfenced": 1,
+          "unfenced_before_avoid": 1,
+          "unfenced_after_avoid": 0,
+          "wait_after_avoid": 0,
+          "bind_after_avoid": 4,
+          "unfenced_after_canary": 0,
+          "first_avoid_seq": 4312,
+          "first_canary_seq": 0,
+          "first_fence_seq": 4322,
+          "reasons": {
+            "bind_published": 4,
+            "unfenced_independence": 1
+          }
+        },
+        {
+          "location": 5289021439620362907,
+          "bind": 4,
+          "wait_for": 0,
+          "unfenced": 1,
+          "unfenced_before_avoid": 1,
+          "unfenced_after_avoid": 0,
+          "wait_after_avoid": 0,
+          "bind_after_avoid": 4,
+          "unfenced_after_canary": 0,
+          "first_avoid_seq": 4331,
+          "first_canary_seq": 4331,
+          "first_fence_seq": 4398,
+          "reasons": {
+            "bind_published": 4,
+            "unfenced_canary": 1
+          }
+        }
+      ],
+      "hot_fanout_l": {
+        "location": 5756944208085735096,
+        "bind": 120,
+        "wait_for": 0,
+        "unfenced": 1,
+        "unfenced_before_avoid": 1,
+        "unfenced_after_avoid": 0,
+        "wait_after_avoid": 0,
+        "bind_after_avoid": 120,
+        "unfenced_after_canary": 0,
+        "first_avoid_seq": 869,
+        "first_canary_seq": 865,
+        "first_fence_seq": 887,
+        "reasons": {
+          "bind_published": 120,
+          "unfenced_canary": 1
+        }
+      },
+      "u_aa": 790,
+      "wall_ms": 19.504413000000003,
+      "n_tx": 336
+    }
+  },
+  "conflict_edges": [
+    {
+      "block": "597",
+      "edge": "(\u2113=85335018835337005, *readers, Wr)",
+      "kind": "star RAW / fanout",
+      "should_avoid": "Avoid on first publish; subsequent readers Bind Data or WaitFor Executing tip",
+      "actually": {
+        "first_canary_seq": 5,
+        "first_avoid_seq": 128,
+        "first_fence_seq": 195,
+        "bind_after_avoid": 538,
+        "unfenced_after_avoid": 0,
+        "unfenced_after_fence": 0,
+        "reasons": {
+          "bind_published": 538,
+          "unfenced_canary": 1,
+          "unfenced_cold": 5
+        }
+      },
+      "should_resolve": "R1 RebindOnly when value-stable; preserve \u2113\u2192writer through R2/R4",
+      "actually_resolve": {
+        "rebind_only": 0,
+        "rewind_to_cp": 88,
+        "full_restart": 5,
+        "writer_identity_preserved": 92,
+        "work_inflation": 1.2872340425531914
+      },
+      "cost": "star itself cheap after Avoid; wall is long-tail writer_done + repair on secondary \u2113"
+    },
+    {
+      "block": "599",
+      "edge": "(\u2113=13758554269703882113, *readers, Wr)",
+      "kind": "spine tip / handler basic",
+      "should_avoid": "Avoid on first publish; subsequent readers Bind Data or WaitFor Executing tip",
+      "actually": {
+        "first_canary_seq": 0,
+        "first_avoid_seq": 216,
+        "first_fence_seq": 221,
+        "bind_after_avoid": 232,
+        "unfenced_after_avoid": 0,
+        "unfenced_after_fence": 0,
+        "reasons": {
+          "bind_published": 232,
+          "unfenced_independence": 4
+        }
+      },
+      "should_resolve": "R1 RebindOnly when value-stable; preserve \u2113\u2192writer through R2/R4",
+      "actually_resolve": {
+        "rebind_only": 8,
+        "rewind_to_cp": 170,
+        "full_restart": 31,
+        "writer_identity_preserved": 166,
+        "work_inflation": 1.6212534059945505
+      },
+      "cost": "star itself cheap after Avoid; wall is long-tail writer_done + repair on secondary \u2113"
+    },
+    {
+      "block": "097",
+      "edge": "(\u2113=13758554269703882113, *readers, Wr)",
+      "kind": "spine tip / handler basic",
+      "should_avoid": "Avoid on first publish; subsequent readers Bind Data or WaitFor Executing tip",
+      "actually": {
+        "first_canary_seq": 0,
+        "first_avoid_seq": 270,
+        "first_fence_seq": 315,
+        "bind_after_avoid": 105,
+        "unfenced_after_avoid": 2,
+        "unfenced_after_fence": 0,
+        "reasons": {
+          "bind_published": 105,
+          "unfenced_independence": 5,
+          "unfenced_writer_done": 2
+        }
+      },
+      "should_resolve": "R1 RebindOnly when value-stable; preserve \u2113\u2192writer through R2/R4",
+      "actually_resolve": {
+        "rebind_only": 4,
+        "rewind_to_cp": 211,
+        "full_restart": 24,
+        "writer_identity_preserved": 217,
+        "work_inflation": 1.7827380952380953
+      },
+      "cost": "star itself cheap after Avoid; wall is long-tail writer_done + repair on secondary \u2113"
+    },
+    {
+      "block": "597",
+      "edge": "(\u2113=15175023130755338476, readers*, Wr)",
+      "kind": "secondary hot with writer_done",
+      "should_avoid": "After Avoid: never Unfence; Bind residual Data or WaitFor live spine / serial only if force_prefix",
+      "actually": {
+        "unfenced_writer_done": 1,
+        "unfenced_after_avoid": 1,
+        "bind_after_avoid": 0,
+        "wait_after_avoid": 12,
+        "first_avoid_seq": 467,
+        "first_fence_seq": 624
+      },
+      "should_resolve": "Publish residual version on Done writer; or keep Region Fenced until Data",
+      "actually_resolve": "fence_wait_for \u2192 UnfencedWriterDone (writer Done \u2227 no Data)",
+      "cost_events": 1
+    },
+    {
+      "block": "597",
+      "edge": "(\u2113=4624439299733222876, readers*, Wr)",
+      "kind": "secondary hot with writer_done",
+      "should_avoid": "After Avoid: never Unfence; Bind residual Data or WaitFor live spine / serial only if force_prefix",
+      "actually": {
+        "unfenced_writer_done": 1,
+        "unfenced_after_avoid": 1,
+        "bind_after_avoid": 0,
+        "wait_after_avoid": 4,
+        "first_avoid_seq": 320,
+        "first_fence_seq": 489
+      },
+      "should_resolve": "Publish residual version on Done writer; or keep Region Fenced until Data",
+      "actually_resolve": "fence_wait_for \u2192 UnfencedWriterDone (writer Done \u2227 no Data)",
+      "cost_events": 1
+    },
+    {
+      "block": "597",
+      "edge": "(\u2113=2705538834146010334, readers*, Wr)",
+      "kind": "secondary hot with writer_done",
+      "should_avoid": "After Avoid: never Unfence; Bind residual Data or WaitFor live spine / serial only if force_prefix",
+      "actually": {
+        "unfenced_writer_done": 1,
+        "unfenced_after_avoid": 1,
+        "bind_after_avoid": 3,
+        "wait_after_avoid": 0,
+        "first_avoid_seq": 397,
+        "first_fence_seq": 415
+      },
+      "should_resolve": "Publish residual version on Done writer; or keep Region Fenced until Data",
+      "actually_resolve": "fence_wait_for \u2192 UnfencedWriterDone (writer Done \u2227 no Data)",
+      "cost_events": 1
+    },
+    {
+      "block": "597",
+      "edge": "(\u2113=3809669987777055750, readers*, Wr)",
+      "kind": "secondary hot with writer_done",
+      "should_avoid": "After Avoid: never Unfence; Bind residual Data or WaitFor live spine / serial only if force_prefix",
+      "actually": {
+        "unfenced_writer_done": 2,
+        "unfenced_after_avoid": 2,
+        "bind_after_avoid": 0,
+        "wait_after_avoid": 2,
+        "first_avoid_seq": 320,
+        "first_fence_seq": 454
+      },
+      "should_resolve": "Publish residual version on Done writer; or keep Region Fenced until Data",
+      "actually_resolve": "fence_wait_for \u2192 UnfencedWriterDone (writer Done \u2227 no Data)",
+      "cost_events": 2
+    },
+    {
+      "block": "597",
+      "edge": "(\u2113=5083396379059841106, readers*, Wr)",
+      "kind": "secondary hot with writer_done",
+      "should_avoid": "After Avoid: never Unfence; Bind residual Data or WaitFor live spine / serial only if force_prefix",
+      "actually": {
+        "unfenced_writer_done": 1,
+        "unfenced_after_avoid": 1,
+        "bind_after_avoid": 0,
+        "wait_after_avoid": 2,
+        "first_avoid_seq": 1131,
+        "first_fence_seq": 1225
+      },
+      "should_resolve": "Publish residual version on Done writer; or keep Region Fenced until Data",
+      "actually_resolve": "fence_wait_for \u2192 UnfencedWriterDone (writer Done \u2227 no Data)",
+      "cost_events": 1
+    },
+    {
+      "block": "597",
+      "edge": "(\u2113=10161912669939478048, readers*, Wr)",
+      "kind": "secondary hot with writer_done",
+      "should_avoid": "After Avoid: never Unfence; Bind residual Data or WaitFor live spine / serial only if force_prefix",
+      "actually": {
+        "unfenced_writer_done": 2,
+        "unfenced_after_avoid": 1,
+        "bind_after_avoid": 0,
+        "wait_after_avoid": 1,
+        "first_avoid_seq": 1645,
+        "first_fence_seq": 1494
+      },
+      "should_resolve": "Publish residual version on Done writer; or keep Region Fenced until Data",
+      "actually_resolve": "fence_wait_for \u2192 UnfencedWriterDone (writer Done \u2227 no Data)",
+      "cost_events": 2
+    },
+    {
+      "block": "597",
+      "edge": "(\u2113=14832901110955129767, readers*, Wr)",
+      "kind": "secondary hot with writer_done",
+      "should_avoid": "After Avoid: never Unfence; Bind residual Data or WaitFor live spine / serial only if force_prefix",
+      "actually": {
+        "unfenced_writer_done": 4,
+        "unfenced_after_avoid": 4,
+        "bind_after_avoid": 0,
+        "wait_after_avoid": 1,
+        "first_avoid_seq": 1063,
+        "first_fence_seq": 1102
+      },
+      "should_resolve": "Publish residual version on Done writer; or keep Region Fenced until Data",
+      "actually_resolve": "fence_wait_for \u2192 UnfencedWriterDone (writer Done \u2227 no Data)",
+      "cost_events": 4
+    },
+    {
+      "block": "599",
+      "edge": "(\u2113=10357899511347443885, readers*, Wr)",
+      "kind": "secondary hot with writer_done",
+      "should_avoid": "After Avoid: never Unfence; Bind residual Data or WaitFor live spine / serial only if force_prefix",
+      "actually": {
+        "unfenced_writer_done": 2,
+        "unfenced_after_avoid": 0,
+        "bind_after_avoid": 38,
+        "wait_after_avoid": 0,
+        "first_avoid_seq": 3397,
+        "first_fence_seq": 3444
+      },
+      "should_resolve": "Publish residual version on Done writer; or keep Region Fenced until Data",
+      "actually_resolve": "fence_wait_for \u2192 UnfencedWriterDone (writer Done \u2227 no Data)",
+      "cost_events": 2
+    },
+    {
+      "block": "599",
+      "edge": "(\u2113=12751924054141618995, readers*, Wr)",
+      "kind": "secondary hot with writer_done",
+      "should_avoid": "After Avoid: never Unfence; Bind residual Data or WaitFor live spine / serial only if force_prefix",
+      "actually": {
+        "unfenced_writer_done": 4,
+        "unfenced_after_avoid": 4,
+        "bind_after_avoid": 8,
+        "wait_after_avoid": 0,
+        "first_avoid_seq": 568,
+        "first_fence_seq": 4037
+      },
+      "should_resolve": "Publish residual version on Done writer; or keep Region Fenced until Data",
+      "actually_resolve": "fence_wait_for \u2192 UnfencedWriterDone (writer Done \u2227 no Data)",
+      "cost_events": 4
+    },
+    {
+      "block": "599",
+      "edge": "(\u2113=2201940979742291067, readers*, Wr)",
+      "kind": "secondary hot with writer_done",
+      "should_avoid": "After Avoid: never Unfence; Bind residual Data or WaitFor live spine / serial only if force_prefix",
+      "actually": {
+        "unfenced_writer_done": 4,
+        "unfenced_after_avoid": 4,
+        "bind_after_avoid": 8,
+        "wait_after_avoid": 0,
+        "first_avoid_seq": 569,
+        "first_fence_seq": 4029
+      },
+      "should_resolve": "Publish residual version on Done writer; or keep Region Fenced until Data",
+      "actually_resolve": "fence_wait_for \u2192 UnfencedWriterDone (writer Done \u2227 no Data)",
+      "cost_events": 4
+    },
+    {
+      "block": "599",
+      "edge": "(\u2113=14740505458979786277, readers*, Wr)",
+      "kind": "secondary hot with writer_done",
+      "should_avoid": "After Avoid: never Unfence; Bind residual Data or WaitFor live spine / serial only if force_prefix",
+      "actually": {
+        "unfenced_writer_done": 4,
+        "unfenced_after_avoid": 4,
+        "bind_after_avoid": 8,
+        "wait_after_avoid": 0,
+        "first_avoid_seq": 570,
+        "first_fence_seq": 4056
+      },
+      "should_resolve": "Publish residual version on Done writer; or keep Region Fenced until Data",
+      "actually_resolve": "fence_wait_for \u2192 UnfencedWriterDone (writer Done \u2227 no Data)",
+      "cost_events": 4
+    },
+    {
+      "block": "599",
+      "edge": "(\u2113=4001654997680271158, readers*, Wr)",
+      "kind": "secondary hot with writer_done",
+      "should_avoid": "After Avoid: never Unfence; Bind residual Data or WaitFor live spine / serial only if force_prefix",
+      "actually": {
+        "unfenced_writer_done": 4,
+        "unfenced_after_avoid": 4,
+        "bind_after_avoid": 8,
+        "wait_after_avoid": 0,
+        "first_avoid_seq": 572,
+        "first_fence_seq": 4088
+      },
+      "should_resolve": "Publish residual version on Done writer; or keep Region Fenced until Data",
+      "actually_resolve": "fence_wait_for \u2192 UnfencedWriterDone (writer Done \u2227 no Data)",
+      "cost_events": 4
+    },
+    {
+      "block": "599",
+      "edge": "(\u2113=2411129661802360381, readers*, Wr)",
+      "kind": "secondary hot with writer_done",
+      "should_avoid": "After Avoid: never Unfence; Bind residual Data or WaitFor live spine / serial only if force_prefix",
+      "actually": {
+        "unfenced_writer_done": 7,
+        "unfenced_after_avoid": 7,
+        "bind_after_avoid": 5,
+        "wait_after_avoid": 1,
+        "first_avoid_seq": 1629,
+        "first_fence_seq": 1632
+      },
+      "should_resolve": "Publish residual version on Done writer; or keep Region Fenced until Data",
+      "actually_resolve": "fence_wait_for \u2192 UnfencedWriterDone (writer Done \u2227 no Data)",
+      "cost_events": 7
+    },
+    {
+      "block": "599",
+      "edge": "(\u2113=3165918322799250506, readers*, Wr)",
+      "kind": "secondary hot with writer_done",
+      "should_avoid": "After Avoid: never Unfence; Bind residual Data or WaitFor live spine / serial only if force_prefix",
+      "actually": {
+        "unfenced_writer_done": 1,
+        "unfenced_after_avoid": 1,
+        "bind_after_avoid": 6,
+        "wait_after_avoid": 0,
+        "first_avoid_seq": 4918,
+        "first_fence_seq": 4949
+      },
+      "should_resolve": "Publish residual version on Done writer; or keep Region Fenced until Data",
+      "actually_resolve": "fence_wait_for \u2192 UnfencedWriterDone (writer Done \u2227 no Data)",
+      "cost_events": 1
+    },
+    {
+      "block": "599",
+      "edge": "(\u2113=12653452103398754885, readers*, Wr)",
+      "kind": "secondary hot with writer_done",
+      "should_avoid": "After Avoid: never Unfence; Bind residual Data or WaitFor live spine / serial only if force_prefix",
+      "actually": {
+        "unfenced_writer_done": 1,
+        "unfenced_after_avoid": 1,
+        "bind_after_avoid": 5,
+        "wait_after_avoid": 1,
+        "first_avoid_seq": 4918,
+        "first_fence_seq": 4962
+      },
+      "should_resolve": "Publish residual version on Done writer; or keep Region Fenced until Data",
+      "actually_resolve": "fence_wait_for \u2192 UnfencedWriterDone (writer Done \u2227 no Data)",
+      "cost_events": 1
+    },
+    {
+      "block": "599",
+      "edge": "(\u2113=9567042823663688794, readers*, Wr)",
+      "kind": "secondary hot with writer_done",
+      "should_avoid": "After Avoid: never Unfence; Bind residual Data or WaitFor live spine / serial only if force_prefix",
+      "actually": {
+        "unfenced_writer_done": 1,
+        "unfenced_after_avoid": 1,
+        "bind_after_avoid": 6,
+        "wait_after_avoid": 0,
+        "first_avoid_seq": 4918,
+        "first_fence_seq": 4937
+      },
+      "should_resolve": "Publish residual version on Done writer; or keep Region Fenced until Data",
+      "actually_resolve": "fence_wait_for \u2192 UnfencedWriterDone (writer Done \u2227 no Data)",
+      "cost_events": 1
+    },
+    {
+      "block": "599",
+      "edge": "(\u2113=1969659763500873606, readers*, Wr)",
+      "kind": "secondary hot with writer_done",
+      "should_avoid": "After Avoid: never Unfence; Bind residual Data or WaitFor live spine / serial only if force_prefix",
+      "actually": {
+        "unfenced_writer_done": 1,
+        "unfenced_after_avoid": 1,
+        "bind_after_avoid": 6,
+        "wait_after_avoid": 0,
+        "first_avoid_seq": 4917,
+        "first_fence_seq": 4952
+      },
+      "should_resolve": "Publish residual version on Done writer; or keep Region Fenced until Data",
+      "actually_resolve": "fence_wait_for \u2192 UnfencedWriterDone (writer Done \u2227 no Data)",
+      "cost_events": 1
+    },
+    {
+      "block": "599",
+      "edge": "(\u2113=12065881356051624027, readers*, Wr)",
+      "kind": "secondary hot with writer_done",
+      "should_avoid": "After Avoid: never Unfence; Bind residual Data or WaitFor live spine / serial only if force_prefix",
+      "actually": {
+        "unfenced_writer_done": 7,
+        "unfenced_after_avoid": 7,
+        "bind_after_avoid": 5,
+        "wait_after_avoid": 0,
+        "first_avoid_seq": 1629,
+        "first_fence_seq": 1658
+      },
+      "should_resolve": "Publish residual version on Done writer; or keep Region Fenced until Data",
+      "actually_resolve": "fence_wait_for \u2192 UnfencedWriterDone (writer Done \u2227 no Data)",
+      "cost_events": 7
+    },
+    {
+      "block": "599",
+      "edge": "(\u2113=15262262704814852074, readers*, Wr)",
+      "kind": "secondary hot with writer_done",
+      "should_avoid": "After Avoid: never Unfence; Bind residual Data or WaitFor live spine / serial only if force_prefix",
+      "actually": {
+        "unfenced_writer_done": 7,
+        "unfenced_after_avoid": 7,
+        "bind_after_avoid": 4,
+        "wait_after_avoid": 1,
+        "first_avoid_seq": 1629,
+        "first_fence_seq": 1673
+      },
+      "should_resolve": "Publish residual version on Done writer; or keep Region Fenced until Data",
+      "actually_resolve": "fence_wait_for \u2192 UnfencedWriterDone (writer Done \u2227 no Data)",
+      "cost_events": 7
+    },
+    {
+      "block": "097",
+      "edge": "(\u2113=13758554269703882113, readers*, Wr)",
+      "kind": "secondary hot with writer_done",
+      "should_avoid": "After Avoid: never Unfence; Bind residual Data or WaitFor live spine / serial only if force_prefix",
+      "actually": {
+        "unfenced_writer_done": 2,
+        "unfenced_after_avoid": 2,
+        "bind_after_avoid": 105,
+        "wait_after_avoid": 0,
+        "first_avoid_seq": 270,
+        "first_fence_seq": 315
+      },
+      "should_resolve": "Publish residual version on Done writer; or keep Region Fenced until Data",
+      "actually_resolve": "fence_wait_for \u2192 UnfencedWriterDone (writer Done \u2227 no Data)",
+      "cost_events": 2
+    },
+    {
+      "block": "097",
+      "edge": "(\u2113=10357899511347443885, readers*, Wr)",
+      "kind": "secondary hot with writer_done",
+      "should_avoid": "After Avoid: never Unfence; Bind residual Data or WaitFor live spine / serial only if force_prefix",
+      "actually": {
+        "unfenced_writer_done": 2,
+        "unfenced_after_avoid": 0,
+        "bind_after_avoid": 23,
+        "wait_after_avoid": 0,
+        "first_avoid_seq": 3287,
+        "first_fence_seq": 4023
+      },
+      "should_resolve": "Publish residual version on Done writer; or keep Region Fenced until Data",
+      "actually_resolve": "fence_wait_for \u2192 UnfencedWriterDone (writer Done \u2227 no Data)",
+      "cost_events": 2
+    },
+    {
+      "block": "097",
+      "edge": "(\u2113=5571831401313774584, readers*, Wr)",
+      "kind": "secondary hot with writer_done",
+      "should_avoid": "After Avoid: never Unfence; Bind residual Data or WaitFor live spine / serial only if force_prefix",
+      "actually": {
+        "unfenced_writer_done": 1,
+        "unfenced_after_avoid": 1,
+        "bind_after_avoid": 4,
+        "wait_after_avoid": 0,
+        "first_avoid_seq": 180,
+        "first_fence_seq": 364
+      },
+      "should_resolve": "Publish residual version on Done writer; or keep Region Fenced until Data",
+      "actually_resolve": "fence_wait_for \u2192 UnfencedWriterDone (writer Done \u2227 no Data)",
+      "cost_events": 1
+    },
+    {
+      "block": "097",
+      "edge": "(\u2113=16216398866791966285, readers*, Wr)",
+      "kind": "secondary hot with writer_done",
+      "should_avoid": "After Avoid: never Unfence; Bind residual Data or WaitFor live spine / serial only if force_prefix",
+      "actually": {
+        "unfenced_writer_done": 3,
+        "unfenced_after_avoid": 3,
+        "bind_after_avoid": 3,
+        "wait_after_avoid": 0,
+        "first_avoid_seq": 357,
+        "first_fence_seq": 3331
+      },
+      "should_resolve": "Publish residual version on Done writer; or keep Region Fenced until Data",
+      "actually_resolve": "fence_wait_for \u2192 UnfencedWriterDone (writer Done \u2227 no Data)",
+      "cost_events": 3
+    },
+    {
+      "block": "097",
+      "edge": "(\u2113=9943007405427446629, readers*, Wr)",
+      "kind": "secondary hot with writer_done",
+      "should_avoid": "After Avoid: never Unfence; Bind residual Data or WaitFor live spine / serial only if force_prefix",
+      "actually": {
+        "unfenced_writer_done": 3,
+        "unfenced_after_avoid": 3,
+        "bind_after_avoid": 3,
+        "wait_after_avoid": 0,
+        "first_avoid_seq": 356,
+        "first_fence_seq": 3315
+      },
+      "should_resolve": "Publish residual version on Done writer; or keep Region Fenced until Data",
+      "actually_resolve": "fence_wait_for \u2192 UnfencedWriterDone (writer Done \u2227 no Data)",
+      "cost_events": 3
+    }
+  ],
+  "learning_gaps": {
+    "should_learn_but_didnt": [
+      {
+        "signal": "ProcessReason::UnfencedWriterDone counts per \u2113",
+        "where_emitted": "vm.rs::fence_wait_for + process.rs::record",
+        "never_enters": "LiveLearner / InterBlockPrior / HotSketch",
+        "file_fn": "process.rs:record; learner.rs has no note_writer_done"
+      },
+      {
+        "signal": "unfenced_after_avoid loc counter (avoid\u2227UnfencedWriterDone)",
+        "where_emitted": "process.rs when avoid=true",
+        "never_enters": "Avoid policy / InterBlockPrior top-\u2113 abort_rate",
+        "file_fn": "process.rs:~226; pack_top_locations ignores u_aa"
+      },
+      {
+        "signal": "R4 FullRestart / force_bind_reabort per \u2113",
+        "where_emitted": "metrics + rem.rs::escalate_full_restart",
+        "never_enters": "learner sticky / sketch decay features for that \u2113",
+        "file_fn": "rem.rs:escalate_full_restart; learner note_abort only gets cascade_hint"
+      },
+      {
+        "signal": "park_ns on fan_out clique readers",
+        "where_emitted": "metrics wait_park_ns; learner.note_steal_or_park_proxy",
+        "never_enters": "choose_edge_action (no EV); e_idle only for dead choose_action",
+        "file_fn": "learner.rs:note_steal_or_park_proxy; edge.rs:choose_edge_action"
+      },
+      {
+        "signal": "secondary spine writers (non-tip unfinished on \u2113)",
+        "where_emitted": "sketch.push_spine / unfinished_writers_before",
+        "never_enters": "InterBlockPrior TopLocPrior.chain_len used only as warm seed confidence, not multi-spine PreferAdmit prior",
+        "file_fn": "sketch.rs:unfinished_writers_before; learner TopLocPrior"
+      },
+      {
+        "signal": "first-wave canary failure without Avoid (probe done, no publish)",
+        "where_emitted": "try_canary consumes grant",
+        "never_enters": "reopen_canary_if_probe_done never called in prod",
+        "file_fn": "sketch.rs:reopen_canary_if_probe_done (tests only)"
+      },
+      {
+        "signal": "per-tx incarnation / work inflation on spine tips",
+        "where_emitted": "scheduler final incarnation",
+        "never_enters": "learning state for prefer R1 vs R2",
+        "file_fn": "no learner hook on incarnation bump"
+      }
+    ],
+    "learned_but_unused": [
+      {
+        "state": "AdaptiveParams \u03b1/\u03b2/\u03b3/\u03b4 + e_wait_time/e_cascade/e_reexec/e_idle EMA",
+        "updated_by": "LiveLearner note_*",
+        "never_read_by": "choose_edge_action (live \u03c0); choose_resolve/choose_action orphaned from maybe_wait_specfence",
+        "file_fn": "edge.rs:72-106; mod.rs:choose_resolve; resolve.rs:compute_ev"
+      },
+      {
+        "state": "MorphWeights.wait_depth_prior / dominant_fan_out",
+        "updated_by": "bump_morph_from_observe + InterBlockPrior EMA",
+        "never_read_by": "choose_edge_action; only dead AEC w_remain + engagement mode metrics",
+        "file_fn": "learner.rs:wait_depth_prior; resolve.rs:w_remain"
+      },
+      {
+        "state": "AdaptiveParams.d_wait / cost_margin",
+        "updated_by": "lab JSON overrides",
+        "never_read_by": "\u03c0 (deprecated comments)",
+        "file_fn": "learner.rs:143-146"
+      },
+      {
+        "state": "sticky_resolve flag",
+        "updated_by": "pevm note_sticky_resolve on repair",
+        "never_read_by": "compute_ev explicitly ignores (`let _ = ctx.sticky_resolve`); choose_edge_action only via is_sticky\u2192essential",
+        "file_fn": "resolve.rs:241; vm.rs:529"
+      },
+      {
+        "state": "ChainTemplate predicted_fanout/chain_len/confidence",
+        "updated_by": "seed_from_prior_morph + decay_warm_failures",
+        "limited_use": "template_live \u2192 in_serial_lane / essential; confidence not in Avoid/admit",
+        "file_fn": "sketch.rs:ChainTemplate, template_live"
+      },
+      {
+        "state": "prefer_admit counter / Ready spine window",
+        "updated_by": "vm.rs when is_ready(w)",
+        "unused_effect": "\u22480/1 observed \u2014 Ready rarely visible; admit still runs but metric dead as control signal",
+        "file_fn": "vm.rs:610-614"
+      },
+      {
+        "state": "bind_success_total / note_bind_success",
+        "updated_by": "tests + note_publish path partial",
+        "never_read_by": "Avoid/Fence/admit (no production reader of bind_success_total)",
+        "file_fn": "learner.rs:562-563,811"
+      },
+      {
+        "state": "meta_budget_rho / SoftWait meta_ops",
+        "updated_by": "note_meta_op on dead WaitHard choose_resolve",
+        "never_read_by": "SoftWait Soft=0; choose_edge_action path",
+        "file_fn": "learner.rs:meta_budget_exceeded; engagement SoftWait ban"
+      },
+      {
+        "state": "engagement Quiet/Storm from morph",
+        "updated_by": "set_mode_from_morph / maybe_flip_mode",
+        "limited_use": "escalate ForceBind gates + EarlyVal lean; does not change edge verbs",
+        "file_fn": "engagement.rs; pevm.rs storm escalate"
+      }
+    ],
+    "warm_start": {
+      "598_to_599_flip": {
+        "test": "quiet\u2192mixed flip",
+        "blocks": [
+          19606598,
+          19606599
+        ],
+        "rows": [
+          {
+            "block": 19606598,
+            "ok": true,
+            "tps": 20092.966401910555,
+            "soft_wait_arms": 0,
+            "wait_hard": 1,
+            "occ_aborts": 19,
+            "inter_prior_flip_count": 1
+          },
+          {
+            "block": 19606599,
+            "ok": true,
+            "tps": 11116.21050019676,
+            "soft_wait_arms": 0,
+            "wait_hard": 55,
+            "occ_aborts": 167,
+            "inter_prior_flip_count": 2
+          }
+        ],
+        "pass_criteria": "SoftWaits must not stick from quiet\u2192mixed; flip \u03b1 path exercised (flip_count may be \u22650 depending on morph KL)"
+      },
+      "sf_occ": {
+        "14689597": 0.22176051233051514,
+        "19606599": 0.3000283212501781,
+        "19469097": 0.3145081064474998,
+        "19606598": 0.32185901529696415
+      },
+      "note": "598 quiet SF/OCC~0.32; 599 after flip still ~0.30 but absolute TPS halves \u2014 warm HotSet/morph does not teach writer_done visibility or R1"
+    }
+  },
+  "head": "e9cca35",
+  "method": "post-u1 per-tx + exec-process + L1L2 + code audit of learner/sketch/edge/vm"
+}

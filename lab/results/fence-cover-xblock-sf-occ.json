@@ -1,0 +1,129 @@
+{
+  "test": "SF vs OCC@8 architecture cores",
+  "tag": "fence-cover-xblock",
+  "softwait_disabled": false,
+  "iters": 3,
+  "v8_mean_reference": 0.325,
+  "mean_sf_occ": 0.268,
+  "ratios": [
+    {
+      "block": 14689597,
+      "sf_occ": 0.305,
+      "sf_tps": 8882,
+      "occ_tps": 29126,
+      "sf_wall_ms_median": 63.5,
+      "occ_wall_ms_median": 13.3
+    },
+    {
+      "block": 19606599,
+      "sf_occ": 0.196,
+      "sf_tps": 2600,
+      "occ_tps": 13242,
+      "sf_wall_ms_median": 141.1,
+      "occ_wall_ms_median": 27.4
+    },
+    {
+      "block": 19469097,
+      "sf_occ": 0.379,
+      "sf_tps": 9071,
+      "occ_tps": 23903,
+      "sf_wall_ms_median": 49.7,
+      "occ_wall_ms_median": 14.1
+    },
+    {
+      "block": 19606598,
+      "sf_occ": 0.19,
+      "sf_tps": 4598,
+      "occ_tps": 24146,
+      "sf_wall_ms_median": 8.2,
+      "occ_wall_ms_median": 6.3
+    }
+  ],
+  "honesty": "SF/OCC from last-iter TPS (stdout). Medians from G7 SUMMARY. Host slower than rename cut; do not compare absolute TPS to 0.353 rename host.",
+  "soft_wait_arms": 0,
+  "await_at_a": 0,
+  "rows": [
+    {
+      "block": 14689597,
+      "mode": "occ",
+      "iters": 3,
+      "wall_ms_median": 13.3,
+      "wall_ms_p90": 19.4,
+      "wall_ms_min": 12.1,
+      "occ_aborts_median": 209
+    },
+    {
+      "block": 14689597,
+      "mode": "specfence",
+      "iters": 3,
+      "wall_ms_median": 63.5,
+      "wall_ms_p90": 120.4,
+      "wall_ms_min": 55.8,
+      "occ_aborts_median": 162,
+      "soft_wait_arms": 0,
+      "edge_bind": 826,
+      "edge_wait_for": 44,
+      "edge_unfenced": 5162,
+      "avoid_broadcasts": 908,
+      "canary_probes": 714,
+      "independent_unfenced": 1251
+    },
+    {
+      "block": 19606599,
+      "mode": "occ",
+      "iters": 3,
+      "wall_ms_median": 27.4,
+      "wall_ms_p90": 27.7,
+      "wall_ms_min": 19.7,
+      "occ_aborts_median": 73
+    },
+    {
+      "block": 19606599,
+      "mode": "specfence",
+      "iters": 3,
+      "wall_ms_median": 141.1,
+      "wall_ms_p90": 193.2,
+      "wall_ms_min": 133.6,
+      "occ_aborts_median": 100,
+      "soft_wait_arms": 0
+    },
+    {
+      "block": 19469097,
+      "mode": "occ",
+      "iters": 3,
+      "wall_ms_median": 14.1,
+      "wall_ms_p90": 17.1,
+      "wall_ms_min": 9.3,
+      "occ_aborts_median": 34
+    },
+    {
+      "block": 19469097,
+      "mode": "specfence",
+      "iters": 3,
+      "wall_ms_median": 49.7,
+      "wall_ms_p90": 60.4,
+      "wall_ms_min": 37.0,
+      "occ_aborts_median": 66,
+      "soft_wait_arms": 0
+    },
+    {
+      "block": 19606598,
+      "mode": "occ",
+      "iters": 3,
+      "wall_ms_median": 6.3,
+      "wall_ms_p90": 8.0,
+      "wall_ms_min": 3.8,
+      "occ_aborts_median": 4
+    },
+    {
+      "block": 19606598,
+      "mode": "specfence",
+      "iters": 3,
+      "wall_ms_median": 8.2,
+      "wall_ms_p90": 19.8,
+      "wall_ms_min": 6.6,
+      "occ_aborts_median": 2,
+      "soft_wait_arms": 0
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "plant": "82d9262/fbf328a",
+  "soft_wait_arms": 0,
+  "parent": { "median_nonempty": 0.7033, "fan_14689597_n3": 0.4485, "r1": "3/2439" },
+  "focus_n3": {
+    "14689597": { "sf_occ": 0.276, "r1": "1/1", "abort_sf": 111, "abort_occ": 41 },
+    "19807137": { "sf_occ": 0.269, "r1": "672/673", "abort_sf": 1009, "abort_occ": 1066 },
+    "19606599": { "sf_occ": 0.499, "r1": "18/18", "abort_sf": 76, "abort_occ": 93 },
+    "19469097": { "sf_occ": 0.445, "r1": "34/35", "abort_sf": 58, "abort_occ": 77 },
+    "median": 0.445
+  },
+  "all_blocks_n1_nonempty": { "n": 98, "median": 0.600, "r1": "1574/1581" },
+  "beat_0703": false,
+  "beat_0449": false,
+  "beat_19807137_parent": true
+}

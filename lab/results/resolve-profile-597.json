@@ -1,0 +1,48 @@
+{
+  "block": 14689597,
+  "cores": 8,
+  "base_tip": "1c1ad81",
+  "iters_profile": 7,
+  "wall_ms": {
+    "sf_median": 30.620336,
+    "occ_median": 3.636787,
+    "gap_ms": 26.983549000000004
+  },
+  "bucket_table_sf_cpu_ms_sum_across_workers": {
+    "handler_total_incl_maybe_wait": 156.588012,
+    "maybe_wait_pi_meta": 124.833212,
+    "pure_evm_handler_minus_maybe_wait": 31.7548,
+    "validate_suffix_repair": 72.762513,
+    "scheduler_next_task": 1.115704,
+    "softwait_park_idle": 391.305715
+  },
+  "bucket_table_occ_cpu_ms_sum_across_workers": {
+    "handler_total": 15.004033,
+    "maybe_wait": 0.0,
+    "validate": 4.525764,
+    "park_idle": 0.0
+  },
+  "diagnosis": {
+    "root_bucket": "softwait_park_idle + maybe_wait_meta",
+    "evidence": [
+      "SF park_ns_sum=391305715 (~391ms across workers) vs wall ~30.6ms \u2192 critical-path idle/serialization",
+      "SF maybe_wait=124.8ms \u2248 80% of handler CPU; OCC maybe_wait=0",
+      "SF pure_evm\u224831.8ms vs OCC handler=15.0ms \u2014 EVM not the 9\u00d7; meta+idle are",
+      "SF evm_entries=1528 vs OCC=1905 on profile capture (SF often \u2264 OCC)",
+      "SpecRead-through-writer and Bind\u2192SpecRead SoftWait-strip cut median toward ~26ms but abort-stormed or broke M3 prior_bind"
+    ],
+    "not_root": [
+      "SoftWait arm count (scarce \u226a428)",
+      "whole-block inspect (off)",
+      "EVM Handler dominance vs OCC"
+    ]
+  },
+  "counters_sf": {
+    "soft_wait_arms_median": 42.0,
+    "occ_aborts_median": 280.0,
+    "occ_fast_first": 2351,
+    "cold_spec_fast": 5451,
+    "ready_steal_on_wait": 120,
+    "park_resume_full_retry": 238
+  }
+}

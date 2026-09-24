@@ -1,0 +1,245 @@
+{
+  "plant": "specfence-v9.4-full-land",
+  "head": "3687da6",
+  "pr": 10,
+  "when": "2026-09-14 15:36 CST",
+  "honesty": "fresh Pevm + reset_inter_prior; Soft=0 asserted; drop n_tx==0; SF vs OCC @8",
+  "base_bb67ff7": {
+    "nonempty_median": 0.728,
+    "fan_14689597_n3": 0.362
+  },
+  "all_blocks_n1": {
+    "json": "lab/results/v9.4-full-land-all-blocks-n1-sweep.json",
+    "log": "lab/results/v9.4-full-land-all-blocks-n1-sweep.run.log",
+    "loaded": 99,
+    "nonempty": 98,
+    "dropped_empty": [
+      19910734
+    ],
+    "median_sf_occ": 0.6853,
+    "p10": 0.4641,
+    "p90": 1.1778,
+    "min": 0.1953,
+    "mean": 2.5308,
+    "ge_0_7": 46,
+    "ge_0_95": 25,
+    "ge_1_0": 22,
+    "quiet_n": 33,
+    "quiet_median": 1.0634,
+    "quiet_p10": 0.5124,
+    "quiet_ge1": "21/33",
+    "morph_counts": {
+      "spine": 53,
+      "quiet": 33,
+      "quiet_ish": 12
+    },
+    "soft": 0,
+    "edge_bind": 2208,
+    "edge_wait_for": 2151,
+    "waitfor_pin": 2061,
+    "waitfor_aborting": 3280,
+    "bind_after_done": 205,
+    "r1_win": 6,
+    "r1_attempt": 1636,
+    "r1_win_rate": 0.0037,
+    "schedule_refuse": 0,
+    "vs_base_median_delta": -0.0427
+  },
+  "focus_n3": {
+    "json": "lab/results/v9.4-full-land-focus-n3-sweep.json",
+    "log": "lab/results/v9.4-full-land-focus-n3-sweep.run.log",
+    "blocks": [
+      14689597,
+      19807137,
+      2179522,
+      19606599,
+      19469097
+    ],
+    "cores": 8,
+    "iters": 3,
+    "soft": 0,
+    "named": {
+      "14689597": {
+        "n1": {
+          "sf_occ": 0.3375,
+          "sf_ms": 10.9441,
+          "occ_ms": 3.6932,
+          "morph": "spine",
+          "soft": 0,
+          "bind": 552,
+          "wait": 68,
+          "waitfor_pin": 66,
+          "waitfor_aborting": 138,
+          "bind_after_done": 12,
+          "r1_win": 0,
+          "r1_attempt": 89,
+          "ab_sf": 105,
+          "ab_occ": 50
+        },
+        "n3": {
+          "sf_occ": 0.3482,
+          "sf_ms": 12.0796,
+          "occ_ms": 4.2057,
+          "morph": "spine",
+          "soft": 0,
+          "bind": 472,
+          "wait": 47,
+          "waitfor_pin": 45,
+          "waitfor_aborting": 179,
+          "bind_after_done": 1,
+          "r1_win": 0,
+          "r1_attempt": 42,
+          "ab_sf": 200,
+          "ab_occ": 60
+        }
+      },
+      "19807137": {
+        "n1": {
+          "sf_occ": 0.1953,
+          "sf_ms": 51.8202,
+          "occ_ms": 10.1203,
+          "morph": "spine",
+          "soft": 0,
+          "bind": 215,
+          "wait": 426,
+          "waitfor_pin": 401,
+          "waitfor_aborting": 983,
+          "bind_after_done": 109,
+          "r1_win": 6,
+          "r1_attempt": 533,
+          "ab_sf": 767,
+          "ab_occ": 586
+        },
+        "n3": {
+          "sf_occ": 0.2265,
+          "sf_ms": 51.4508,
+          "occ_ms": 11.6559,
+          "morph": "spine",
+          "soft": 0,
+          "bind": 202,
+          "wait": 442,
+          "waitfor_pin": 420,
+          "waitfor_aborting": 937,
+          "bind_after_done": 90,
+          "r1_win": 4,
+          "r1_attempt": 491,
+          "ab_sf": 770,
+          "ab_occ": 666
+        }
+      },
+      "2179522": {
+        "n1": {
+          "sf_occ": 1.6857,
+          "sf_ms": 1.5794,
+          "occ_ms": 2.6623,
+          "morph": "quiet",
+          "soft": 0,
+          "bind": 0,
+          "wait": 0,
+          "waitfor_pin": 0,
+          "waitfor_aborting": 0,
+          "bind_after_done": 0,
+          "r1_win": 0,
+          "r1_attempt": 0,
+          "ab_sf": 1,
+          "ab_occ": 1
+        },
+        "n3": {
+          "sf_occ": 0.6382,
+          "sf_ms": 1.4719,
+          "occ_ms": 0.9394,
+          "morph": "quiet",
+          "soft": 0,
+          "bind": 0,
+          "wait": 0,
+          "waitfor_pin": 0,
+          "waitfor_aborting": 1,
+          "bind_after_done": 0,
+          "r1_win": 0,
+          "r1_attempt": 0,
+          "ab_sf": 1,
+          "ab_occ": 1
+        }
+      },
+      "19606599": {
+        "n1": {
+          "sf_occ": 0.6825,
+          "sf_ms": 14.3134,
+          "occ_ms": 9.7693,
+          "morph": "spine",
+          "soft": 0,
+          "bind": 63,
+          "wait": 78,
+          "waitfor_pin": 77,
+          "waitfor_aborting": 97,
+          "bind_after_done": 0,
+          "r1_win": 0,
+          "r1_attempt": 50,
+          "ab_sf": 84,
+          "ab_occ": 78
+        },
+        "n3": {
+          "sf_occ": 0.6922,
+          "sf_ms": 14.5877,
+          "occ_ms": 10.0971,
+          "morph": "spine",
+          "soft": 0,
+          "bind": 55,
+          "wait": 46,
+          "waitfor_pin": 44,
+          "waitfor_aborting": 91,
+          "bind_after_done": 1,
+          "r1_win": 0,
+          "r1_attempt": 41,
+          "ab_sf": 80,
+          "ab_occ": 91
+        }
+      },
+      "19469097": {
+        "n1": {
+          "sf_occ": 0.6866,
+          "sf_ms": 9.1053,
+          "occ_ms": 6.2521,
+          "morph": "spine",
+          "soft": 0,
+          "bind": 56,
+          "wait": 83,
+          "waitfor_pin": 77,
+          "waitfor_aborting": 70,
+          "bind_after_done": 9,
+          "r1_win": 0,
+          "r1_attempt": 62,
+          "ab_sf": 98,
+          "ab_occ": 86
+        },
+        "n3": {
+          "sf_occ": 0.6247,
+          "sf_ms": 9.048,
+          "occ_ms": 5.6522,
+          "morph": "spine",
+          "soft": 0,
+          "bind": 65,
+          "wait": 72,
+          "waitfor_pin": 70,
+          "waitfor_aborting": 51,
+          "bind_after_done": 4,
+          "r1_win": 1,
+          "r1_attempt": 54,
+          "ab_sf": 106,
+          "ab_occ": 109
+        }
+      }
+    },
+    "fan_14689597_n3": 0.3482,
+    "vs_base_fan_delta": -0.0138
+  },
+  "bars": {
+    "soft_0": true,
+    "nonempty_median_ge_0_95": false,
+    "fan_14689597_n3_ge_0_90": false,
+    "quiet_p10_ge_0_90": false,
+    "r1_win_ge_50pct_of_attempts": false,
+    "bind_after_done_share_of_bind": 0.0928
+  },
+  "note": "Soft=0 held on all SF rows. Nonempty median 0.685 vs base 0.728 (delta -0.0427); 14689597 N=3 0.3482 vs base 0.362 (delta -0.0138). Quiet median ~1.06 but quiet p10 0.51 misses \u22650.90. R1 path live (attempt>0) but win rate near-zero. 2179522 N=1 can look OCC-slow; use N=3 (0.638). Do not claim product bars."
+}

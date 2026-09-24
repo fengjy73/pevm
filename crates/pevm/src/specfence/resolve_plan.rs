@@ -1,0 +1,842 @@
+//! ResolvePlan — validate produces a structured plan (SF-PS §C / T3).
+//!
+//! `apply` changes certificates, RunnableSet queues, and write visibility.
+//! Edged paths never fall through to `validate_occ_kernel` as the default.
+
+use crate::mv_memory::MvMemory;
+use crate::scheduler::Scheduler;
+use crate::{MemoryLocationHash, MemoryValue, TxVersion};
+
+use super::SpecFenceCtx;
+use super::VisibilityPolicy;
+use super::arm_table::ArmTable;
+use super::collateral::{ConflictClass, classify_first_conflict, location_is_lazy};
+use super::runnable_set::{QueueKind, RunnableSet};
+use super::sf_mv::SfConflictClass;
+
+/// Structured validate outcome. Replaces “bool valid → abort” as the SF root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResolvePlan {
+    /// Read set still matches; commit this incarnation.
+    Commit,
+    /// Value-stable rebind of invalid reads (same incarnation).
+    PartialAbortRebind,
+    /// Certified prefix kept; rewind uncertified suffix once.
+    PartialAbortRewind,
+    /// Replay the conflict segment under OrderedTip visibility.
+    OrderedReplay,
+    /// Whole-tx re-enter RunnableSet (Learn penalty). Not “this is OCC”.
+    FullReplay,
+}
+
+impl ResolvePlan {
+    /// True when this plan commits without a new EVM head.
+    #[inline]
+    pub const fn commits(self) -> bool {
+        matches!(self, Self::Commit | Self::PartialAbortRebind)
+    }
+
+    /// True when Resolve repaired instead of throwing the tx.
+    #[inline]
+    pub const fn is_partial(self) -> bool {
+        matches!(self, Self::PartialAbortRebind | Self::PartialAbortRewind)
+    }
+}
+
+/// Inputs for [`apply`].
+pub(crate) struct ApplyCtx<'a> {
+    pub specfence: SpecFenceCtx<'a>,
+    pub mv_memory: &'a MvMemory,
+    pub scheduler: &'a Scheduler,
+    pub runnable: &'a RunnableSet,
+    pub arms: &'a ArmTable,
+    pub tx_version: &'a TxVersion,
+    pub vis: VisibilityPolicy,
+    pub wrote_new_location: bool,
+    pub invalid: &'a [MemoryLocationHash],
+}
+
+/// Apply a plan: certificates, queues, release, learn. Never returns a
+/// Block-STM `Task` — the worker always picks from [`RunnableSet`].
+pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
+    let tx = ctx.tx_version.tx_idx;
+    ctx.specfence.metrics.record_resolve_plan(plan);
+    ctx.specfence.metrics.record_resolve_apply();
+
+    let first = if ctx.invalid.is_empty() {
+        None
+    } else {
+        classify_first_conflict(
+            ctx.specfence.hints,
+            ctx.mv_memory,
+            ctx.specfence.beneficiary,
+            tx,
+            ctx.invalid,
+        )
+    };
+    let loc = first.map(|f| f.location);
+    let lazy = first.is_some_and(|f| f.lazy)
+        || ctx
+            .invalid
+            .iter()
+            .any(|&l| location_is_lazy(ctx.mv_memory, tx, l));
+    let unfenced = !ctx.specfence.ready_edges.was_queued(tx)
+        && matches!(plan, ResolvePlan::FullReplay | ResolvePlan::OrderedReplay);
+
+    // First hot conflict on ℓ: WaitOnce for every later read this block.
+    // Not a mutex and not Estimate Block — consult consumes the true tip.
+    if !matches!(plan, ResolvePlan::Commit | ResolvePlan::PartialAbortRebind) {
+        let full = matches!(plan, ResolvePlan::FullReplay);
+        for &loc in ctx.invalid {
+            if ctx.specfence.access_arms.is_never(loc) || location_is_lazy(ctx.mv_memory, tx, loc) {
+                continue;
+            }
+            if ctx.specfence.access_arms.is_protected(loc) {
+                if full {
+                    ctx.specfence.access_arms.note_replay_after_protect();
+                }
+            } else if ctx.specfence.access_arms.protect_hot(loc) {
+                // Writers already observed this block. Prior-chain touchers
+                // are edged inside protect_hot. Arm peer stays 0.
+                let seen = ctx.specfence.ready_edges.writers_of(loc);
+                for w in seen.windows(2) {
+                    ctx.specfence.access_arms.note_wait_edge(w[1], w[0], loc);
+                }
+            }
+        }
+    }
+
+    match plan {
+        ResolvePlan::Commit | ResolvePlan::PartialAbortRebind => {
+            if plan == ResolvePlan::PartialAbortRebind {
+                ctx.specfence.learner.note_resolve_partial_abort();
+                ctx.specfence.metrics.record_rebind_only();
+                ctx.specfence.metrics.record_partial_abort_win();
+                ctx.specfence.metrics.record_partial_retry();
+                clear_retry(ctx.specfence, tx);
+            }
+            if let Some(l) = loc {
+                ctx.specfence.certificates.note_success(tx, l);
+            }
+            ctx.scheduler
+                .finish_validation_sf(ctx.tx_version, false, None);
+            release_successors(&ctx, tx);
+            // Every published write can invalidate a higher reader, including
+            // a re-execution that rewrites the same locations (not only
+            // WroteNewLocation). Block-STM did this via validation_idx.
+            enqueue_higher_revalidate(&ctx, tx);
+            ctx.runnable.mark_done(tx);
+        }
+        ResolvePlan::PartialAbortRewind => {
+            // (c) Resolve after fail — live mistake found; prefix from fail_k.
+            ctx.specfence.sf_tips.record_resolve_after_fail();
+            record_four_class_late(&ctx, first.as_ref());
+            ctx.specfence.metrics.record_partial_abort_attempt();
+            if ctx.scheduler.try_validation_abort(ctx.tx_version) {
+                let write_locations = ctx.mv_memory.write_locations(tx);
+                let estimated = ctx
+                    .mv_memory
+                    .invalidate_partial_suffix(tx, &write_locations);
+                if !estimated.is_empty() {
+                    ctx.specfence
+                        .metrics
+                        .record_selective_invalidate(estimated.len());
+                }
+                ctx.specfence.learner.note_resolve_partial_abort();
+                ctx.specfence.metrics.record_partial_abort_win();
+                ctx.specfence.metrics.record_rewind_to_cp();
+                ctx.specfence.metrics.record_partial_retry();
+                // Early-k WAW Soft=0: RewindTo + ff_head, Indep requeue.
+                // needs_live_capture + Released was the 19807137 hang class.
+                let early_ungated =
+                    ctx.invalid.len() == 1 && !ctx.specfence.ready_edges.is_gated(tx);
+                if early_ungated {
+                    // try_early_waw_rewind already installed ff_head + RewindTo.
+                    if !ctx.specfence.partial_retry.has_ff_head(tx) {
+                        let _ = keep_single_invalid_prefix(&ctx);
+                    }
+                } else {
+                    ctx.specfence.partial_retry.mark_needs_live_capture(tx);
+                }
+            }
+            // Partial rewind drops the publish. Leaving the edge done-bit set
+            // made `note_consumer_on` bail (`is_writer_done`) while
+            // `add_dependency` still parked, and heal incarnation-milled
+            // (19807137 root_inc tens of thousands on a Ready passed writer).
+            ctx.specfence.ready_edges.note_abort_reincarnate(tx);
+            ctx.scheduler
+                .finish_validation_sf(ctx.tx_version, true, Some(tx + 1));
+            ctx.specfence.ready_edges.clear_started(tx);
+            let early_ungated = ctx.invalid.len() == 1 && !ctx.specfence.ready_edges.is_gated(tx);
+            if early_ungated {
+                requeue(&ctx, tx, QueueKind::Indep);
+            } else {
+                requeue(&ctx, tx, QueueKind::Released);
+            }
+            enqueue_higher_revalidate(&ctx, tx);
+        }
+        ResolvePlan::OrderedReplay => {
+            abort_and_estimate(&ctx);
+            if let Some(f) = first
+                && f.class == ConflictClass::EffectiveWAW
+                && let Some(p) = ctx.specfence.policy
+            {
+                seed_short_edge(ctx.specfence, p, tx, &f);
+            }
+            if let Some(f) = first {
+                plant_observed_waw(&ctx, &f);
+                break_replay_mill(&ctx, &f);
+            }
+            plant_invalid_locs(&ctx);
+            // Per-ℓ leftover can still leave many Released tips (19807137
+            // ~40-head mill). Serialize only writers that may_execute after
+            // the loc plant — do not drain-rebind first-wave onto leftover_min.
+            if ctx.specfence.ready_edges.may_execute(tx) {
+                let _ = ctx.specfence.ready_edges.plant_global_leftover(tx);
+            }
+            ctx.scheduler
+                .finish_validation_sf(ctx.tx_version, true, Some(tx + 1));
+            ctx.specfence.ready_edges.clear_started(tx);
+            if ctx.specfence.ready_edges.leftover_surplus(tx)
+                || (ctx.specfence.ready_edges.is_gated(tx)
+                    && !ctx.specfence.ready_edges.may_execute(tx))
+            {
+                ctx.runnable.mark_wait(tx);
+            } else if ctx.specfence.ready_edges.is_gated(tx) || ctx.vis.needs_fence() {
+                requeue(&ctx, tx, QueueKind::Released);
+            } else {
+                requeue(&ctx, tx, QueueKind::Indep);
+            }
+            enqueue_higher_revalidate(&ctx, tx);
+        }
+        ResolvePlan::FullReplay => {
+            // (c) Resolve after fail — Opt→validate→FullReplay theater when
+            // Detect/Avoid did not keep the collision from happening.
+            ctx.specfence.sf_tips.record_resolve_after_fail();
+            record_four_class_late(&ctx, first.as_ref());
+            abort_and_estimate(&ctx);
+            if let Some(f) = first {
+                match f.class {
+                    ConflictClass::EffectiveWAW => {
+                        if let Some(p) = ctx.specfence.policy {
+                            seed_short_edge(ctx.specfence, p, tx, &f);
+                        }
+                        plant_observed_waw(&ctx, &f);
+                        break_replay_mill(&ctx, &f);
+                    }
+                    ConflictClass::LazyNoise | ConflictClass::CommuteCandidate => {
+                        if let Some(p) = ctx.specfence.policy {
+                            p.ignore_conflict(Some(f.location));
+                        }
+                        break_replay_mill(&ctx, &f);
+                    }
+                }
+            }
+            plant_invalid_locs(&ctx);
+            if ctx.specfence.ready_edges.may_execute(tx) {
+                let _ = ctx.specfence.ready_edges.plant_global_leftover(tx);
+            }
+            ctx.scheduler
+                .finish_validation_sf(ctx.tx_version, true, Some(tx + 1));
+            ctx.specfence.ready_edges.clear_started(tx);
+            // abort_and_estimate cleared ff_head. Install prefix snaps now,
+            // before the next incarnation's reset, so reads with k < fail_k
+            // are served from ff_head. The failed location is not in the set.
+            // A miss is a true restart from k=0.
+            if !keep_single_invalid_prefix(&ctx) {
+                ctx.specfence.metrics.record_full_from_zero();
+            }
+            enqueue_higher_revalidate(&ctx, tx);
+            // Observed WAW: wait for the producer instead of Opt ping-pong.
+            if ctx.specfence.ready_edges.leftover_surplus(tx)
+                || (ctx.specfence.ready_edges.is_gated(tx)
+                    && !ctx.specfence.ready_edges.may_execute(tx))
+            {
+                ctx.runnable.mark_wait(tx);
+            } else {
+                // Never Q_ordered from FullReplay: 19807137 milled ~43
+                // location-admitted OrderedTip heads (c5b6ce3/7e2dd73).
+                // Heal/drain may still Ordered a location cohort.
+                let kind = if ctx.specfence.ready_edges.is_gated(tx) || ctx.vis.needs_fence() {
+                    QueueKind::Released
+                } else {
+                    QueueKind::Indep
+                };
+                requeue(&ctx, tx, kind);
+            }
+        }
+    }
+
+    ctx.arms.observe(
+        plan,
+        loc,
+        lazy,
+        unfenced,
+        ctx.scheduler.block_size(),
+        ctx.invalid.len(),
+    );
+    // E6: only ungate *lazy* ℓ. Demoting the first-conflict loc whenever
+    // any invalid was lazy tore down observed-WAW plants (19807137 mill).
+    if lazy {
+        if first.is_some_and(|f| f.lazy) {
+            ctx.arms
+                .demote_lazy_graph(loc.unwrap(), ctx.specfence.ready_edges, ctx.runnable);
+        }
+        for &l in ctx.invalid {
+            if first.is_some_and(|f| f.location == l && f.lazy) {
+                continue;
+            }
+            if location_is_lazy(ctx.mv_memory, tx, l) {
+                ctx.arms
+                    .demote_lazy_graph(l, ctx.specfence.ready_edges, ctx.runnable);
+            }
+        }
+    }
+}
+
+/// Raise a Detect edge on an observed non-lazy WAW. Thin `hops=0` must
+/// not leave two Opt writers ping-ponging FullReplay forever — but a
+/// deep / fat plant serializes ERC-20 and 19469101. Window = wait only
+/// on a runnable producer, and at most `w_max` waiters per ℓ.
+fn plant_observed_waw(ctx: &ApplyCtx<'_>, f: &super::collateral::FirstConflict) {
+    if f.lazy || f.class != ConflictClass::EffectiveWAW {
+        return;
+    }
+    let tx = ctx.tx_version.tx_idx;
+    let Some(producer) = f.peer.filter(|&w| w < tx) else {
+        return;
+    };
+    // Width 1: ArmTable::w_max is admit_seed cover. A window of 4 on one
+    // register is the 19807137 Released mill. Do not skip when `producer`
+    // is already done — leftover writers must elect/chain.
+    let _ = ctx
+        .specfence
+        .ready_edges
+        .plant_observed_window(tx, producer, f.location, 1);
+}
+
+/// Second+ incarnation FullReplay that is not EffectiveWAW still Opt-mills
+/// (19469101 ~390%). After one retry, raise an anonymous wait on the peer
+/// even if Learn classified LazyNoise / Commute.
+/// Plant every non-lazy invalid ℓ, not only FirstConflict. Shared storage
+/// slots that are not the first fail still Opt-mill (19807137 ~30 heads).
+fn plant_invalid_locs(ctx: &ApplyCtx<'_>) {
+    let tx = ctx.tx_version.tx_idx;
+    for &loc in ctx.invalid {
+        if location_is_lazy(ctx.mv_memory, tx, loc) {
+            continue;
+        }
+        let producer = ctx
+            .mv_memory
+            .last_writer_before(loc, tx)
+            .filter(|&w| w < tx)
+            .unwrap_or(tx);
+        let _ = ctx
+            .specfence
+            .ready_edges
+            .plant_observed_window(tx, producer, loc, 1);
+    }
+}
+
+fn break_replay_mill(ctx: &ApplyCtx<'_>, f: &super::collateral::FirstConflict) {
+    if ctx.tx_version.tx_incarnation < 1 {
+        return;
+    }
+    let tx = ctx.tx_version.tx_idx;
+    let producer = f
+        .peer
+        .or_else(|| ctx.mv_memory.last_writer_before(f.location, tx))
+        .filter(|&w| w < tx)
+        .unwrap_or(tx);
+    let _ = ctx
+        .specfence
+        .ready_edges
+        .plant_observed_window(tx, producer, f.location, 1);
+}
+
+fn seed_short_edge(
+    specfence: SpecFenceCtx<'_>,
+    policy: &super::policy::CostPolicy,
+    tx_idx: crate::TxIdx,
+    f: &super::collateral::FirstConflict,
+) {
+    policy.promote_short_edge(f.location, 0);
+    let producer = f.peer.filter(|&w| w < tx_idx).unwrap_or(tx_idx);
+    crate::specfence::admit::persist_short_chain_after_abort(
+        specfence.hints,
+        policy,
+        tx_idx,
+        producer,
+        f.location,
+    );
+    let n_pairs = policy.pairs_of(f.location).len();
+    if policy.hops_to_admit(f.location, n_pairs) > 0 {
+        crate::specfence::admit::queue_nearest_unfinished_successor(
+            specfence.ready_edges,
+            policy,
+            specfence.hints,
+            f.location,
+            tx_idx,
+            specfence.hints.from_of(tx_idx),
+            specfence.hints.to_of(tx_idx),
+        );
+    }
+}
+
+fn abort_and_estimate(ctx: &ApplyCtx<'_>) {
+    let tx = ctx.tx_version.tx_idx;
+    let aborted = ctx.scheduler.try_validation_abort(ctx.tx_version);
+    if aborted {
+        let locs = ctx.mv_memory.write_locations(tx);
+        let spine = ctx.specfence.spine;
+        ctx.mv_memory
+            .convert_writes_to_estimates_keeping(tx, |loc| {
+                if spine.should_pin_origin(loc, tx) {
+                    spine.note_retain_keep();
+                    true
+                } else {
+                    false
+                }
+            });
+        // Clear SF tip + live_writer (thin DashMap tip plane) + ChainSpineTip.
+        if ctx.scheduler.block_size() <= super::THIN_SHELL_N {
+            let _ = ctx.specfence.sf_tips.clear_writer(tx, &locs);
+        } else if ctx
+            .specfence
+            .sf_tips
+            .is_chain_loc(ctx.specfence.access_arms.crit_loc_hash())
+        {
+            ctx.specfence.sf_tips.chain_clear(tx);
+        }
+        for &loc in &locs {
+            ctx.specfence.sf_tips.note_open_writer(loc, tx);
+        }
+        ctx.specfence.metrics.record_occ_abort();
+        ctx.specfence.metrics.record_full_abort_reexecute();
+    }
+    // Clear a prior Commit done-stamp. Leaving it set made leftover_min
+    // sticky-done (19807137 glob_min=396 min_done=true, 24-head mill).
+    // Bits only — do not walk waiters (DashMap abort).
+    ctx.specfence.ready_edges.note_abort_reincarnate(tx);
+    if !ctx.invalid.is_empty() {
+        ctx.specfence
+            .metrics
+            .record_region_validate_fail(ctx.invalid.len());
+    }
+    clear_retry(ctx.specfence, tx);
+    for &location in ctx.invalid {
+        ctx.specfence.metrics.record_bayes_conflict();
+        ctx.specfence.hotset.note_abort(location);
+        let loc_k = ctx
+            .specfence
+            .access_log
+            .first_k(tx, location)
+            .or_else(|| {
+                ctx.specfence
+                    .partial_retry
+                    .first_k(tx, location)
+                    .map(|k| k as u32)
+            })
+            .or_else(|| ctx.specfence.edges.min_k_of_location(tx, location))
+            .filter(|&k| k > 0);
+        if !location_is_lazy(ctx.mv_memory, tx, location) {
+            crate::specfence::feeder::observe_abort(
+                ctx.specfence.learner,
+                ctx.specfence.bayes,
+                location,
+                ctx.invalid.len().max(1),
+                loc_k,
+            );
+        }
+        if let Some(k) = loc_k {
+            ctx.specfence.sketch.mark_access_class(location, k);
+        }
+    }
+}
+
+/// n_invalid = 1 at a known k: keep snaps for k' < fail_k. Not Ordered-from-0.
+/// Returns whether a prefix was installed.
+fn keep_single_invalid_prefix(ctx: &ApplyCtx<'_>) -> bool {
+    if ctx.invalid.len() != 1 {
+        return false;
+    }
+    let tx = ctx.tx_version.tx_idx;
+    let loc = ctx.invalid[0];
+    if ctx.specfence.access_arms.is_never(loc) || location_is_lazy(ctx.mv_memory, tx, loc) {
+        return false;
+    }
+    let Some(k) = ctx.specfence.access_log.first_k(tx, loc).filter(|k| *k > 0) else {
+        return false;
+    };
+    let peer = ctx
+        .mv_memory
+        .last_writer_before(loc, tx)
+        .filter(|&w| w < tx)
+        .or_else(|| {
+            ctx.specfence
+                .ready_edges
+                .writers_of(loc)
+                .into_iter()
+                .rev()
+                .find(|&w| w < tx)
+        })
+        .unwrap_or(0);
+    ctx.specfence
+        .access_arms
+        .note_early_waw_edge(tx, loc, k, peer);
+    // Thin mid-block ungated plant cascades (cold FullReplay hundreds,
+    // rset_w collapse). Detect(a) plant is at begin from packed edges;
+    // within-block Avoid stays consult WaitOnce + SfMvMemory.
+    let prefix = ctx.specfence.access_log.prefix_before(tx, k);
+    let mut n = ctx
+        .specfence
+        .partial_retry
+        .arm_prefix_keep(tx, loc, k, &prefix);
+    // Ungated early reads sometimes leave access_log prefix without rem
+    // snaps (code_hash / None basic). Keep every snap except the fail loc.
+    if n == 0 {
+        n = ctx
+            .specfence
+            .partial_retry
+            .arm_prefix_keep_all_except(tx, loc);
+    }
+    if n > 0 {
+        ctx.specfence.access_arms.note_prefix_resume(n);
+        ctx.specfence.metrics.record_prefix_resume(n);
+        ctx.specfence.metrics.record_fail_k(k);
+        true
+    } else {
+        false
+    }
+}
+
+/// Opt early-WAW: mid-tx checkpoint before fail_k → hang-free RewindTo.
+pub(crate) fn try_early_waw_rewind(
+    mv_memory: &MvMemory,
+    tx_version: &TxVersion,
+    specfence: SpecFenceCtx<'_>,
+    invalid: &[MemoryLocationHash],
+) -> Option<ResolvePlan> {
+    if invalid.len() != 1 {
+        return None;
+    }
+    // Thin shell: RewindTo tax exceeds the FullReplay it removes (3356896).
+    if specfence.scheduler.block_size() <= super::THIN_SHELL_N {
+        return None;
+    }
+    let tx = tx_version.tx_idx;
+    let loc = invalid[0];
+    if specfence.access_arms.is_never(loc) || location_is_lazy(mv_memory, tx, loc) {
+        return None;
+    }
+    // Already RewindTo once this block — escalate to FullReplay. Prefix
+    // re-snap on FF basics still cuts full_from_0 on that escalate.
+    if specfence.partial_retry.suffix_repair_depth(tx) != 0 {
+        return None;
+    }
+    let k = specfence.access_log.first_k(tx, loc).filter(|&k| k > 1)?;
+    let k_fail = k as usize;
+    let cp = specfence.partial_retry.last_checkpoint_before(tx, k_fail)?;
+    if cp.k == 0 || cp.k >= k_fail {
+        return None;
+    }
+    let prefix = specfence.access_log.prefix_before(tx, k);
+    let mut n = specfence.partial_retry.arm_prefix_keep(tx, loc, k, &prefix);
+    if n == 0 {
+        n = specfence.partial_retry.arm_prefix_keep_all_except(tx, loc);
+    }
+    if n == 0 {
+        return None;
+    }
+    let certified: Vec<_> = prefix.iter().map(|(l, _)| *l).collect();
+    specfence
+        .partial_retry
+        .arm_rewind_to(tx, cp, k_fail, certified, Vec::new(), Vec::new());
+    specfence.partial_retry.note_suffix_repair(tx);
+    specfence.access_arms.note_early_waw(loc, k);
+    specfence.access_arms.note_prefix_resume(n);
+    specfence.metrics.record_prefix_resume(n);
+    specfence.metrics.record_fail_k(k);
+    Some(ResolvePlan::PartialAbortRewind)
+}
+
+/// Large sticky≥32: conflict includes crit ℓ and peer already ChainSpine
+/// Released / true_publish_ready → Prefer PartialAbortRewind (+ prefix) over
+/// FullReplay. Cuts chain_c wall; Avoid theater Opt→validate→FullReplay.
+pub(crate) fn try_chain_released_rewind(
+    mv_memory: &MvMemory,
+    tx_version: &TxVersion,
+    specfence: SpecFenceCtx<'_>,
+    invalid: &[MemoryLocationHash],
+) -> Option<ResolvePlan> {
+    if invalid.is_empty() {
+        return None;
+    }
+    // Thin: Rewind tax > FullReplay (same rule as try_early_waw_rewind).
+    if specfence.scheduler.block_size() <= super::THIN_SHELL_N {
+        return None;
+    }
+    let tx = tx_version.tx_idx;
+    let arms = specfence.access_arms;
+    if arms.crit_chain_len() < 32 {
+        return None;
+    }
+    // Prefer crit ℓ even when multi-loc invalid (len==1 was under-firing).
+    let loc = invalid.iter().copied().find(|&l| arms.is_crit_loc(l))?;
+    if arms.is_never(loc) || location_is_lazy(mv_memory, tx, loc) {
+        return None;
+    }
+    if specfence.partial_retry.suffix_repair_depth(tx) != 0 {
+        return None;
+    }
+    let peer = mv_memory
+        .last_writer_before(loc, tx)
+        .filter(|&w| w < tx)
+        .or_else(|| arms.crit_pred(tx, loc))
+        .or_else(|| {
+            specfence
+                .ready_edges
+                .writers_of(loc)
+                .into_iter()
+                .rev()
+                .find(|&w| w < tx)
+        })?;
+    let sf = super::sf_mv::SfMvMemory::new(mv_memory, specfence.sf_tips);
+    let released = specfence.sf_tips.chain_released(peer)
+        || sf.true_publish_ready(loc, peer)
+        || specfence.scheduler.is_done(peer)
+        || specfence.scheduler.is_validated(peer);
+    if !released {
+        return None;
+    }
+    // Checkpoint path first (hang-free RewindTo).
+    if let Some(plan) = try_early_waw_rewind(mv_memory, tx_version, specfence, invalid) {
+        return Some(plan);
+    }
+    // No checkpoint: still Prefer Rewind — apply's early_ungated arm installs
+    // keep_single_invalid_prefix (fail_k snaps) instead of full_from_0.
+    let k = specfence.access_log.first_k(tx, loc).filter(|&k| k > 0)?;
+    let prefix = specfence.access_log.prefix_before(tx, k);
+    let mut n = specfence.partial_retry.arm_prefix_keep(tx, loc, k, &prefix);
+    if n == 0 {
+        n = specfence.partial_retry.arm_prefix_keep_all_except(tx, loc);
+    }
+    if n == 0 {
+        return None;
+    }
+    // Synthetic RewindTo head at fail_k when no mid-tx checkpoint existed.
+    if let Some(cp) = specfence
+        .partial_retry
+        .last_checkpoint_before(tx, k as usize)
+    {
+        let certified: Vec<_> = prefix.iter().map(|(l, _)| *l).collect();
+        specfence.partial_retry.arm_rewind_to(
+            tx,
+            cp,
+            k as usize,
+            certified,
+            Vec::new(),
+            Vec::new(),
+        );
+        specfence.partial_retry.note_suffix_repair(tx);
+    }
+    arms.note_early_waw(loc, k);
+    arms.note_prefix_resume(n);
+    specfence.metrics.record_prefix_resume(n);
+    specfence.metrics.record_fail_k(k);
+    Some(ResolvePlan::PartialAbortRewind)
+}
+
+fn clear_retry(specfence: SpecFenceCtx<'_>, tx: crate::TxIdx) {
+    specfence.partial_retry.clear_force_ordered_admit(tx);
+    specfence.partial_retry.clear_force_writers(tx);
+    specfence.partial_retry.clear_repair(tx);
+    specfence.partial_retry.clear_ff_head(tx);
+    specfence.partial_retry.clear_suffix_repair_depth(tx);
+}
+
+fn release_successors(ctx: &ApplyCtx<'_>, producer: crate::TxIdx) {
+    ctx.specfence
+        .ready_edges
+        .note_producer_done(producer, ctx.specfence.wave);
+    ctx.specfence.producer_stages.note_done(producer);
+    drain_wave_to_runnable(ctx);
+    // IntraPatch at the release boundary (same rule as pick): ≤1 / ℓ / block.
+    let _ = ctx.arms.apply_pending_patches(
+        ctx.runnable,
+        ctx.specfence.ready_edges,
+        ctx.specfence.policy,
+        ctx.runnable.cores(),
+        ctx.scheduler.block_size(),
+    );
+}
+
+fn drain_wave_to_runnable(ctx: &ApplyCtx<'_>) {
+    let mut still_running = Vec::new();
+    while let Some(t) = ctx.specfence.wave.pop_ready() {
+        if ctx.scheduler.is_validated(t) {
+            ctx.runnable.mark_done(t);
+            continue;
+        }
+        // Same rule as the worker drain: do not steal `ST_RUNNING`.
+        if ctx.runnable.is_running(t) {
+            still_running.push(t);
+            continue;
+        }
+        if ctx.specfence.ready_edges.is_gated(t) && !ctx.specfence.ready_edges.may_execute(t) {
+            ctx.runnable.note_wait_unless_running(t);
+            continue;
+        }
+        let kind = if ctx.specfence.ready_edges.is_gated(t) {
+            QueueKind::Released
+        } else {
+            QueueKind::Indep
+        };
+        if !ctx.runnable.wake_idle(t, kind) && ctx.runnable.is_running(t) {
+            still_running.push(t);
+        }
+    }
+    for t in still_running {
+        ctx.specfence.wave.push_ready(t);
+    }
+}
+
+fn requeue(ctx: &ApplyCtx<'_>, tx: crate::TxIdx, kind: QueueKind) {
+    // Owner holds ST_RUNNING from the pick. CAS it onto the queue.
+    // force_push would also overwrite a claim another worker already took.
+    if !ctx.runnable.release_owner(tx, kind) {
+        let _ = ctx.runnable.wake_idle(tx, kind);
+    }
+}
+
+fn enqueue_revalidate(ctx: &ApplyCtx<'_>, reader: crate::TxIdx) -> bool {
+    if reader >= ctx.scheduler.block_size() {
+        return false;
+    }
+    if !ctx.scheduler.is_executed(reader) && !ctx.scheduler.is_validated(reader) {
+        return false;
+    }
+    // Skip readers whose read set still matches — avoids an O(n²) beneficiary
+    // revalidate mill on independent raw transfers.
+    if super::occ_read_set_valid(ctx.mv_memory, reader) {
+        return false;
+    }
+    // Demote before the worker loop samples all_validated, otherwise the
+    // last Commit exits every core and the revalidate never runs.
+    let _ = ctx.scheduler.prepare_revalidate(reader);
+    let _ = ctx.runnable.wake_idle(reader, QueueKind::Revalidate);
+    true
+}
+
+/// WAR Avoid (first-class): on publish/Commit, demote higher readers of
+/// written ℓ before they validate a stale read. Not schedule-only absorption —
+/// each successful demote is timely Avoid for write-after-read.
+fn enqueue_higher_revalidate(ctx: &ApplyCtx<'_>, tx: crate::TxIdx) {
+    let writes = ctx.mv_memory.write_locations(tx);
+    // Lazy beneficiary/sender writes still invalidate higher readers. Skipping
+    // that fan-out on the thin shell (n≤176) committed a different account
+    // balance than sequential on 3356896 while receipts matched.
+    for loc in writes {
+        let readers = ctx.mv_memory.higher_readers_of(loc, tx);
+        if readers.is_empty() {
+            continue;
+        }
+        // (a) Detect WAR: higher readers of this published write exist.
+        ctx.specfence.sf_tips.record_detect_before();
+        let mut avoided = 0usize;
+        for reader in readers {
+            if reader > tx && enqueue_revalidate(ctx, reader) {
+                avoided += 1;
+            }
+        }
+        if avoided > 0 {
+            // (b) Avoid WAR: revalidate before stale Commit.
+            ctx.specfence.sf_tips.record_avoid_publish();
+            for _ in 0..avoided {
+                ctx.specfence
+                    .sf_tips
+                    .record_class_avoid(SfConflictClass::War);
+            }
+        }
+    }
+}
+
+/// Four-class late Resolve (c): map first conflict → Raw|War|Waw|Chain.
+fn record_four_class_late(ctx: &ApplyCtx<'_>, first: Option<&super::collateral::FirstConflict>) {
+    let Some(f) = first else {
+        // No classified ℓ — treat as WAW miss (common Opt→FullReplay theater).
+        ctx.specfence
+            .sf_tips
+            .record_class_late(SfConflictClass::Waw);
+        return;
+    };
+    let arms = ctx.specfence.access_arms;
+    if arms.is_crit_loc(f.location) && arms.crit_chain_len() >= 32 {
+        ctx.specfence
+            .sf_tips
+            .record_class_late(SfConflictClass::Chain);
+        return;
+    }
+    let class = match f.class {
+        ConflictClass::EffectiveWAW => {
+            match ctx
+                .mv_memory
+                .current_data_value(ctx.tx_version.tx_idx, f.location)
+            {
+                Some(MemoryValue::Storage(_)) => SfConflictClass::Raw,
+                _ => {
+                    // Basic WAW default. WAR late when peer already done and
+                    // WaitOnce was never armed (Opt read then write landed).
+                    if f.peer
+                        .is_some_and(|p| ctx.scheduler.is_done(p) || ctx.scheduler.is_validated(p))
+                        && arms.wait_once_k(f.location) == 0
+                        && !arms.is_wait_once(f.location)
+                    {
+                        SfConflictClass::War
+                    } else {
+                        SfConflictClass::Waw
+                    }
+                }
+            }
+        }
+        ConflictClass::LazyNoise | ConflictClass::CommuteCandidate => SfConflictClass::War,
+    };
+    ctx.specfence.sf_tips.record_class_late(class);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_kinds() {
+        assert!(ResolvePlan::Commit.commits());
+        assert!(ResolvePlan::PartialAbortRebind.commits());
+        assert!(ResolvePlan::PartialAbortRebind.is_partial());
+        assert!(!ResolvePlan::FullReplay.commits());
+        assert!(!ResolvePlan::OrderedReplay.is_partial());
+    }
+
+    #[test]
+    fn apply_source_never_calls_occ_pick_or_occ_stage() {
+        let src = include_str!("resolve_plan.rs");
+        let code = src.split("#[cfg(test)]").next().unwrap();
+        assert!(!code.contains("next_task_with_wave_ready("));
+        assert!(!code.contains("validate_occ_stage("));
+        assert!(!code.contains("validate_occ_kernel("));
+        assert!(code.contains("finish_validation_sf"));
+        assert!(code.contains("release_successors"));
+        assert!(
+            code.contains("plant_observed_window"),
+            "mid-block WAW plant must stay windowed (no deep/fat spine)"
+        );
+        assert!(
+            code.contains("break_replay_mill"),
+            "incarnation≥1 FullReplay must not Opt-mill"
+        );
+        assert!(
+            include_str!("resolve_plan.rs").contains("try_chain_released_rewind"),
+            "ChainSpine Released peer must Prefer Rewind over FullReplay"
+        );
+    }
+}

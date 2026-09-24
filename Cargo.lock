@@ -3437,6 +3437,7 @@ dependencies = [
  "op-alloy-network",
  "op-alloy-rpc-types",
  "op-revm",
+ "parking_lot",
  "rand 0.10.1",
  "rayon",
  "reqwest",

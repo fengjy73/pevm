@@ -1,0 +1,1094 @@
+{
+  "title": "SpecFence 10-block parallel upper bound catalog",
+  "date": "2026-09-14",
+  "tip": "2cbd339 cursor/specfence-cc-glossary-302f",
+  "soft_wait_arms": 0,
+  "vocabulary": "lab/notes/specfence-cc-glossary.md",
+  "method": {
+    "dag": "Final-RW conflict DAG via analyze_dag (RAW+WAW; beneficiary/basic_lazy excluded). Commit-order edges only.",
+    "critical_path": "longest_chain = max hop-length under RAW/WAW with tx index order",
+    "width": "max_wave_width = max antichain / ready wave",
+    "bound": "speedup_inf = n_tx/longest_chain; speedup_p8 = min(8, speedup_inf, max_wave_width); ideal_wall = t_work/speedup",
+    "t_work": "sequential wall, or OCC@1 if sequential path pathological (serial > 5\u00d7 OCC@1)",
+    "sources": [
+      "lab/results/10block-parallel-upper-bound-finegrain.json",
+      "lab/results/tps-stall-10block-soft0-n1.json",
+      "lab/results/all-blocks-process-*.json",
+      "lab/results/effect-raw-deeper-b{14689597,19606599,19469097}.json",
+      "lab/results/contiguous-segments-finegrain-b{14689597,19606599,19469097}.json"
+    ]
+  },
+  "blocks": [
+    {
+      "block": 14689597,
+      "label": "fan_out",
+      "morphology": "RAW_fan_out",
+      "n_tx": 564,
+      "gas_used": 30028257,
+      "dag_source": "finegrain_final_rw",
+      "dag": {
+        "n_raw": 449,
+        "n_waw": 145,
+        "n_edges": 594,
+        "longest_chain": 29,
+        "max_wave_width": 434,
+        "mean_wave_width": 19.448275862068964,
+        "independent_frac": 0.09929078014184398,
+        "multi_writer_locs": 25,
+        "max_writers_on_loc": 26,
+        "max_conflict_component": 476,
+        "n_levels": 29
+      },
+      "hot_top3": [
+        {
+          "location": 85335018835337005,
+          "kind": "storage",
+          "n_writers": 26,
+          "n_readers": 474,
+          "touches": 500
+        },
+        {
+          "location": 16919754296811192938,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 488,
+          "touches": 488
+        },
+        {
+          "location": 9455998136233537804,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 488,
+          "touches": 488
+        }
+      ],
+      "kind_hist": {
+        "basic": 519,
+        "storage": 373,
+        "unknown": 2,
+        "basic_lazy": 14
+      },
+      "timings_ms": {
+        "sequential": 3.834,
+        "occ1": 7.438,
+        "occ8": 5.639,
+        "work_proxy": "sequential",
+        "t_work": 3.834,
+        "pathological_sequential": false,
+        "soft0_sf": 25.369,
+        "soft0_occ": 4.64,
+        "soft0_occ_pathological": false
+      },
+      "upper_bound": {
+        "model": "equal_cost_tx_hops_commit_order_RAW_WAW_DAG",
+        "cores": 8,
+        "speedup_bound_infinite_cores": 19.448,
+        "speedup_bound_p8": 8,
+        "ideal_wall_inf_ms": 0.197,
+        "ideal_wall_p8_ms": 0.479,
+        "occ8_over_ideal_p8": 11.767,
+        "occ8_speedup_vs_work": 0.68,
+        "sf_over_finegrain_occ8": 0.222,
+        "soft0_sf_occ_reported": 0.18291295752146358
+      },
+      "occ_shortfall": {
+        "abort_rate": 0.12411347517730496,
+        "occ_aborts": 70,
+        "max_incarnation": 8,
+        "dominant_stage": "optimistic_read_then_validate_fail_full_abort_reexecute_fanout"
+      },
+      "effect_raw": {
+        "journal_raw_program": 605,
+        "journal_raw_handler": 42,
+        "final_rw_raw": 449,
+        "max_program_fanout": 448,
+        "longest_effect_program_path": 27,
+        "gross_work_depth_p50": 0.942722305017387,
+        "redo_saved_proxy": 426.7060664099791,
+        "wait_added_proxy": 107.67996453900707,
+        "occ8_abort_consumers_with_prior_discovery": 54,
+        "occ8_mean_gw_at_abort": 0.7464076836758855,
+        "occ8_edge_ready_waitish_frac": 0.289588801399825
+      },
+      "soft0_process": {
+        "soft_wait_arms": 0,
+        "wait_for_dependency": 367,
+        "wait_for_full_abort": 16,
+        "refuse_admit": 1221,
+        "partial_abort_win": 1,
+        "partial_abort_attempt": 1,
+        "full_abort_reexecute": 226,
+        "park_resume_full_abort_reexecute": 365,
+        "optimistic_read_count": 4,
+        "ordered_admit_hits": 0,
+        "reexec_entries": 1040
+      },
+      "what_must_change": {
+        "at_sites": "optimistic_read_then_validate_fail_full_abort_reexecute_fanout",
+        "specfence_levers": [
+          "dependency_aware_admission: prefer-admit early writers before fan-out consumers",
+          "wait_for_dependency on predicted-essential RAW once producer Executing (not optimistic_read)",
+          "ordered_admit when producer published+EV",
+          "partial_abort (rebind/rewind) when certified prefix exists; avoid full_abort_reexecute storms"
+        ]
+      }
+    },
+    {
+      "block": 19807137,
+      "label": "spine",
+      "morphology": "WAW_spine",
+      "n_tx": 712,
+      "gas_used": 29981386,
+      "dag_source": "finegrain_final_rw",
+      "dag": {
+        "n_raw": 9,
+        "n_waw": 629,
+        "n_edges": 638,
+        "longest_chain": 571,
+        "max_wave_width": 105,
+        "mean_wave_width": 1.2469352014010509,
+        "independent_frac": 0.1306179775280899,
+        "multi_writer_locs": 31,
+        "max_writers_on_loc": 571,
+        "max_conflict_component": 571,
+        "n_levels": 571
+      },
+      "hot_top3": [
+        {
+          "location": 6996519588683120047,
+          "kind": "storage",
+          "n_writers": 571,
+          "n_readers": 571,
+          "touches": 1142
+        },
+        {
+          "location": 11299050903170838323,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 573,
+          "touches": 573
+        },
+        {
+          "location": 316062990106050706,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 573,
+          "touches": 573
+        }
+      ],
+      "kind_hist": {
+        "basic_lazy": 11,
+        "basic": 746,
+        "storage": 1006
+      },
+      "timings_ms": {
+        "sequential": 2769.545,
+        "occ1": 21.167,
+        "occ8": 11.919,
+        "work_proxy": "occ1",
+        "t_work": 21.167,
+        "pathological_sequential": true,
+        "soft0_sf": 75.188,
+        "soft0_occ": 2685.21,
+        "soft0_occ_pathological": true
+      },
+      "upper_bound": {
+        "model": "equal_cost_tx_hops_commit_order_RAW_WAW_DAG",
+        "cores": 8,
+        "speedup_bound_infinite_cores": 1.247,
+        "speedup_bound_p8": 1.247,
+        "ideal_wall_inf_ms": 16.975,
+        "ideal_wall_p8_ms": 16.975,
+        "occ8_over_ideal_p8": 0.702,
+        "occ8_speedup_vs_work": 1.776,
+        "sf_over_finegrain_occ8": 0.159,
+        "soft0_sf_occ_reported": 35.71345796598842
+      },
+      "occ_shortfall": {
+        "abort_rate": 0.8286516853932584,
+        "occ_aborts": 590,
+        "max_incarnation": 12,
+        "dominant_stage": "execute_validate_full_abort_reexecute_on_WAW_chain"
+      },
+      "effect_raw": null,
+      "soft0_process": {
+        "soft_wait_arms": 0,
+        "wait_for_dependency": 1337,
+        "wait_for_full_abort": 4,
+        "refuse_admit": 6961,
+        "partial_abort_win": 505,
+        "partial_abort_attempt": 503,
+        "full_abort_reexecute": 232,
+        "park_resume_full_abort_reexecute": 1324,
+        "optimistic_read_count": 137,
+        "ordered_admit_hits": 0,
+        "reexec_entries": 1577
+      },
+      "what_must_change": {
+        "at_sites": "execute_validate_full_abort_reexecute_on_WAW_chain",
+        "specfence_levers": [
+          "pessimistic_admit / ordered_admit (serial-lane) along multi-writer WAW locations",
+          "dependency_aware_admission refuse_admit of later writers while prior writer Ready|Executing",
+          "partial_abort for incidental RAW side-edges; do not full_abort_reexecute the whole spine",
+          "wait_for_dependency only on unfinished prior writer \u2014 never SoftWait Soft"
+        ]
+      }
+    },
+    {
+      "block": 19606599,
+      "label": "mixed_cancun",
+      "morphology": "mixed_RAW_WAW",
+      "n_tx": 367,
+      "gas_used": 29981684,
+      "dag_source": "finegrain_final_rw",
+      "dag": {
+        "n_raw": 42,
+        "n_waw": 177,
+        "n_edges": 219,
+        "longest_chain": 57,
+        "max_wave_width": 261,
+        "mean_wave_width": 6.43859649122807,
+        "independent_frac": 0.6430517711171662,
+        "multi_writer_locs": 87,
+        "max_writers_on_loc": 54,
+        "max_conflict_component": 79,
+        "n_levels": 57
+      },
+      "hot_top3": [
+        {
+          "location": 13758554269703882113,
+          "kind": "basic",
+          "n_writers": 54,
+          "n_readers": 74,
+          "touches": 128
+        },
+        {
+          "location": 2775566356639094496,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 74,
+          "touches": 74
+        },
+        {
+          "location": 15368894169142028,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 34,
+          "touches": 34
+        }
+      ],
+      "kind_hist": {
+        "storage": 802,
+        "basic_lazy": 29,
+        "basic": 448
+      },
+      "timings_ms": {
+        "sequential": 19.138,
+        "occ1": 23.235,
+        "occ8": 10.612,
+        "work_proxy": "sequential",
+        "t_work": 19.138,
+        "pathological_sequential": false,
+        "soft0_sf": 19.646,
+        "soft0_occ": 10.239,
+        "soft0_occ_pathological": false
+      },
+      "upper_bound": {
+        "model": "equal_cost_tx_hops_commit_order_RAW_WAW_DAG",
+        "cores": 8,
+        "speedup_bound_infinite_cores": 6.439,
+        "speedup_bound_p8": 6.439,
+        "ideal_wall_inf_ms": 2.972,
+        "ideal_wall_p8_ms": 2.972,
+        "occ8_over_ideal_p8": 3.57,
+        "occ8_speedup_vs_work": 1.804,
+        "sf_over_finegrain_occ8": 0.54,
+        "soft0_sf_occ_reported": 0.521155199448635
+      },
+      "occ_shortfall": {
+        "abort_rate": 0.23433242506811988,
+        "occ_aborts": 86,
+        "max_incarnation": 9,
+        "dominant_stage": "mixed_abort_reexecute_plus_wave_underfill"
+      },
+      "effect_raw": {
+        "journal_raw_program": 439,
+        "journal_raw_handler": 145,
+        "final_rw_raw": 42,
+        "max_program_fanout": 14,
+        "longest_effect_program_path": 26,
+        "gross_work_depth_p50": 0.3812670101504596,
+        "redo_saved_proxy": 38.38015344370059,
+        "wait_added_proxy": 7.213896457765666,
+        "occ8_abort_consumers_with_prior_discovery": 31,
+        "occ8_mean_gw_at_abort": 0.3903992831305612,
+        "occ8_edge_ready_waitish_frac": 0.12627669452181986
+      },
+      "soft0_process": {
+        "soft_wait_arms": 0,
+        "wait_for_dependency": 146,
+        "wait_for_full_abort": 5,
+        "refuse_admit": 16342,
+        "partial_abort_win": 24,
+        "partial_abort_attempt": 24,
+        "full_abort_reexecute": 52,
+        "park_resume_full_abort_reexecute": 80,
+        "optimistic_read_count": 7,
+        "ordered_admit_hits": 0,
+        "reexec_entries": 138
+      },
+      "what_must_change": {
+        "at_sites": "mixed_abort_reexecute_plus_wave_underfill",
+        "specfence_levers": [
+          "split policy: program RAW \u2192 wait_for_dependency/ordered_admit; handler chatter \u2192 optimistic_read unless abort spikes",
+          "dependency_aware_admission on Ready|Executing producers without over-serializing independents",
+          "partial_abort over full_abort_reexecute when strips cover"
+        ]
+      }
+    },
+    {
+      "block": 19469097,
+      "label": "mixed_waw",
+      "morphology": "mixed_RAW_WAW",
+      "n_tx": 336,
+      "gas_used": 22901234,
+      "dag_source": "finegrain_final_rw",
+      "dag": {
+        "n_raw": 28,
+        "n_waw": 182,
+        "n_edges": 210,
+        "longest_chain": 47,
+        "max_wave_width": 197,
+        "mean_wave_width": 7.148936170212766,
+        "independent_frac": 0.5416666666666666,
+        "multi_writer_locs": 53,
+        "max_writers_on_loc": 47,
+        "max_conflict_component": 51,
+        "n_levels": 47
+      },
+      "hot_top3": [
+        {
+          "location": 16365982050024182287,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 108,
+          "touches": 108
+        },
+        {
+          "location": 5382994136959394670,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 108,
+          "touches": 108
+        },
+        {
+          "location": 5756944208085735096,
+          "kind": "storage",
+          "n_writers": 47,
+          "n_readers": 47,
+          "touches": 94
+        }
+      ],
+      "kind_hist": {
+        "basic_lazy": 49,
+        "storage": 674,
+        "basic": 347
+      },
+      "timings_ms": {
+        "sequential": 9.425,
+        "occ1": 12.268,
+        "occ8": 6.694,
+        "work_proxy": "sequential",
+        "t_work": 9.425,
+        "pathological_sequential": false,
+        "soft0_sf": 14.485,
+        "soft0_occ": 6.291,
+        "soft0_occ_pathological": false
+      },
+      "upper_bound": {
+        "model": "equal_cost_tx_hops_commit_order_RAW_WAW_DAG",
+        "cores": 8,
+        "speedup_bound_infinite_cores": 7.149,
+        "speedup_bound_p8": 7.149,
+        "ideal_wall_inf_ms": 1.318,
+        "ideal_wall_p8_ms": 1.318,
+        "occ8_over_ideal_p8": 5.077,
+        "occ8_speedup_vs_work": 1.408,
+        "sf_over_finegrain_occ8": 0.462,
+        "soft0_sf_occ_reported": 0.43430446521654686
+      },
+      "occ_shortfall": {
+        "abort_rate": 0.2767857142857143,
+        "occ_aborts": 93,
+        "max_incarnation": 6,
+        "dominant_stage": "mixed_abort_reexecute_plus_wave_underfill"
+      },
+      "effect_raw": {
+        "journal_raw_program": 341,
+        "journal_raw_handler": 69,
+        "final_rw_raw": 28,
+        "max_program_fanout": 6,
+        "longest_effect_program_path": 47,
+        "gross_work_depth_p50": 0.6106971290237168,
+        "redo_saved_proxy": 87.684316886727,
+        "wait_added_proxy": 5.694940476190472,
+        "occ8_abort_consumers_with_prior_discovery": 56,
+        "occ8_mean_gw_at_abort": 0.7786244802458028,
+        "occ8_edge_ready_waitish_frac": 0.09116022099447514
+      },
+      "soft0_process": {
+        "soft_wait_arms": 0,
+        "wait_for_dependency": 165,
+        "wait_for_full_abort": 5,
+        "refuse_admit": 8442,
+        "partial_abort_win": 32,
+        "partial_abort_attempt": 33,
+        "full_abort_reexecute": 71,
+        "park_resume_full_abort_reexecute": 141,
+        "optimistic_read_count": 9,
+        "ordered_admit_hits": 0,
+        "reexec_entries": 223
+      },
+      "what_must_change": {
+        "at_sites": "mixed_abort_reexecute_plus_wave_underfill",
+        "specfence_levers": [
+          "split policy: program RAW \u2192 wait_for_dependency/ordered_admit; handler chatter \u2192 optimistic_read unless abort spikes",
+          "dependency_aware_admission on Ready|Executing producers without over-serializing independents",
+          "partial_abort over full_abort_reexecute when strips cover"
+        ]
+      }
+    },
+    {
+      "block": 2179522,
+      "label": "quiet",
+      "morphology": "near_independent",
+      "n_tx": 222,
+      "gas_used": 4698004,
+      "dag_source": "finegrain_final_rw",
+      "dag": {
+        "n_raw": 0,
+        "n_waw": 1,
+        "n_edges": 1,
+        "longest_chain": 2,
+        "max_wave_width": 221,
+        "mean_wave_width": 111.0,
+        "independent_frac": 0.990990990990991,
+        "multi_writer_locs": 1,
+        "max_writers_on_loc": 2,
+        "max_conflict_component": 2,
+        "n_levels": 2
+      },
+      "hot_top3": [
+        {
+          "location": 2579313645105776518,
+          "kind": "basic_lazy",
+          "n_writers": 209,
+          "n_readers": 9,
+          "touches": 218
+        },
+        {
+          "location": 8468566810168786419,
+          "kind": "basic_lazy",
+          "n_writers": 8,
+          "n_readers": 4,
+          "touches": 12
+        },
+        {
+          "location": 10043069805750540516,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 9,
+          "touches": 9
+        }
+      ],
+      "kind_hist": {
+        "basic": 22,
+        "basic_lazy": 207
+      },
+      "timings_ms": {
+        "sequential": 0.288,
+        "occ1": 1.124,
+        "occ8": 1.075,
+        "work_proxy": "sequential",
+        "t_work": 0.288,
+        "pathological_sequential": false,
+        "soft0_sf": 1.505,
+        "soft0_occ": 5.284,
+        "soft0_occ_pathological": false
+      },
+      "upper_bound": {
+        "model": "equal_cost_tx_hops_commit_order_RAW_WAW_DAG",
+        "cores": 8,
+        "speedup_bound_infinite_cores": 111.0,
+        "speedup_bound_p8": 8,
+        "ideal_wall_inf_ms": 0.003,
+        "ideal_wall_p8_ms": 0.036,
+        "occ8_over_ideal_p8": 29.926,
+        "occ8_speedup_vs_work": 0.267,
+        "sf_over_finegrain_occ8": 0.715,
+        "soft0_sf_occ_reported": 3.5108096327196714
+      },
+      "occ_shortfall": {
+        "abort_rate": 0.0045045045045045045,
+        "occ_aborts": 1,
+        "max_incarnation": 1,
+        "dominant_stage": "scheduler_meta_overhead"
+      },
+      "effect_raw": null,
+      "soft0_process": {
+        "soft_wait_arms": 0,
+        "wait_for_dependency": 0,
+        "wait_for_full_abort": 0,
+        "refuse_admit": 80,
+        "partial_abort_win": 0,
+        "partial_abort_attempt": 0,
+        "full_abort_reexecute": 0,
+        "park_resume_full_abort_reexecute": 0,
+        "optimistic_read_count": 0,
+        "ordered_admit_hits": 0,
+        "reexec_entries": 3
+      },
+      "what_must_change": {
+        "at_sites": "scheduler_meta_overhead",
+        "specfence_levers": [
+          "keep optimistic_read default; minimize refuse_admit idle tax",
+          "avoid wait_for_dependency and ordered_admit theater on cold locations",
+          "SpecFence should match OCC wall (meta overhead is the only gap)"
+        ]
+      }
+    },
+    {
+      "block": 6196166,
+      "label": "soft0_worst_waw_spine",
+      "morphology": "WAW_spine",
+      "n_tx": 108,
+      "gas_used": 7975867,
+      "dag_source": "finegrain_final_rw",
+      "dag": {
+        "n_raw": 0,
+        "n_waw": 249,
+        "n_edges": 249,
+        "longest_chain": 49,
+        "max_wave_width": 25,
+        "mean_wave_width": 2.204081632653061,
+        "independent_frac": 0.2037037037037037,
+        "multi_writer_locs": 9,
+        "max_writers_on_loc": 49,
+        "max_conflict_component": 49,
+        "n_levels": 49
+      },
+      "hot_top3": [
+        {
+          "location": 11122529517629299212,
+          "kind": "storage",
+          "n_writers": 49,
+          "n_readers": 49,
+          "touches": 98
+        },
+        {
+          "location": 5262856192839117782,
+          "kind": "storage",
+          "n_writers": 49,
+          "n_readers": 49,
+          "touches": 98
+        },
+        {
+          "location": 10504549689189145288,
+          "kind": "storage",
+          "n_writers": 49,
+          "n_readers": 49,
+          "touches": 98
+        }
+      ],
+      "kind_hist": {
+        "basic_lazy": 14,
+        "storage": 199,
+        "basic": 99
+      },
+      "timings_ms": {
+        "sequential": 0.696,
+        "occ1": 1.481,
+        "occ8": 1.704,
+        "work_proxy": "sequential",
+        "t_work": 0.696,
+        "pathological_sequential": false,
+        "soft0_sf": 7.362,
+        "soft0_occ": 1.262,
+        "soft0_occ_pathological": false
+      },
+      "upper_bound": {
+        "model": "equal_cost_tx_hops_commit_order_RAW_WAW_DAG",
+        "cores": 8,
+        "speedup_bound_infinite_cores": 2.204,
+        "speedup_bound_p8": 2.204,
+        "ideal_wall_inf_ms": 0.316,
+        "ideal_wall_p8_ms": 0.316,
+        "occ8_over_ideal_p8": 5.396,
+        "occ8_speedup_vs_work": 0.408,
+        "sf_over_finegrain_occ8": 0.232,
+        "soft0_sf_occ_reported": 0.17135925725948037
+      },
+      "occ_shortfall": {
+        "abort_rate": 0.7129629629629629,
+        "occ_aborts": 77,
+        "max_incarnation": 8,
+        "dominant_stage": "execute_validate_full_abort_reexecute_on_WAW_chain"
+      },
+      "effect_raw": null,
+      "soft0_process": {
+        "soft_wait_arms": 0,
+        "wait_for_dependency": 152,
+        "wait_for_full_abort": 0,
+        "refuse_admit": 0,
+        "partial_abort_win": 0,
+        "partial_abort_attempt": 0,
+        "full_abort_reexecute": 75,
+        "park_resume_full_abort_reexecute": 152,
+        "optimistic_read_count": 9,
+        "ordered_admit_hits": 0,
+        "reexec_entries": 237
+      },
+      "what_must_change": {
+        "at_sites": "execute_validate_full_abort_reexecute_on_WAW_chain",
+        "specfence_levers": [
+          "pessimistic_admit / ordered_admit (serial-lane) along multi-writer WAW locations",
+          "dependency_aware_admission refuse_admit of later writers while prior writer Ready|Executing",
+          "partial_abort for incidental RAW side-edges; do not full_abort_reexecute the whole spine",
+          "wait_for_dependency only on unfinished prior writer \u2014 never SoftWait Soft"
+        ]
+      }
+    },
+    {
+      "block": 8889776,
+      "label": "soft0_worst_spine",
+      "morphology": "mixed_RAW_WAW",
+      "n_tx": 330,
+      "gas_used": 9996021,
+      "dag_source": "finegrain_final_rw",
+      "dag": {
+        "n_raw": 16,
+        "n_waw": 225,
+        "n_edges": 241,
+        "longest_chain": 56,
+        "max_wave_width": 128,
+        "mean_wave_width": 5.892857142857143,
+        "independent_frac": 0.31212121212121213,
+        "multi_writer_locs": 50,
+        "max_writers_on_loc": 56,
+        "max_conflict_component": 59,
+        "n_levels": 56
+      },
+      "hot_top3": [
+        {
+          "location": 8459682269906218042,
+          "kind": "storage",
+          "n_writers": 56,
+          "n_readers": 56,
+          "touches": 112
+        },
+        {
+          "location": 6599691356542003300,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 60,
+          "touches": 60
+        },
+        {
+          "location": 6484931057196468668,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 60,
+          "touches": 60
+        }
+      ],
+      "kind_hist": {
+        "basic": 272,
+        "selfdestruct": 1,
+        "basic_lazy": 39,
+        "storage": 365
+      },
+      "timings_ms": {
+        "sequential": 2.36,
+        "occ1": 4.589,
+        "occ8": 2.208,
+        "work_proxy": "sequential",
+        "t_work": 2.36,
+        "pathological_sequential": false,
+        "soft0_sf": 6.952,
+        "soft0_occ": 1.719,
+        "soft0_occ_pathological": false
+      },
+      "upper_bound": {
+        "model": "equal_cost_tx_hops_commit_order_RAW_WAW_DAG",
+        "cores": 8,
+        "speedup_bound_infinite_cores": 5.893,
+        "speedup_bound_p8": 5.893,
+        "ideal_wall_inf_ms": 0.4,
+        "ideal_wall_p8_ms": 0.4,
+        "occ8_over_ideal_p8": 5.514,
+        "occ8_speedup_vs_work": 1.069,
+        "sf_over_finegrain_occ8": 0.318,
+        "soft0_sf_occ_reported": 0.24733959149336748
+      },
+      "occ_shortfall": {
+        "abort_rate": 0.19696969696969696,
+        "occ_aborts": 65,
+        "max_incarnation": 5,
+        "dominant_stage": "mixed_abort_reexecute_plus_wave_underfill"
+      },
+      "effect_raw": null,
+      "soft0_process": {
+        "soft_wait_arms": 0,
+        "wait_for_dependency": 86,
+        "wait_for_full_abort": 7,
+        "refuse_admit": 1344,
+        "partial_abort_win": 30,
+        "partial_abort_attempt": 31,
+        "full_abort_reexecute": 18,
+        "park_resume_full_abort_reexecute": 92,
+        "optimistic_read_count": 8,
+        "ordered_admit_hits": 0,
+        "reexec_entries": 128
+      },
+      "what_must_change": {
+        "at_sites": "mixed_abort_reexecute_plus_wave_underfill",
+        "specfence_levers": [
+          "split policy: program RAW \u2192 wait_for_dependency/ordered_admit; handler chatter \u2192 optimistic_read unless abort spikes",
+          "dependency_aware_admission on Ready|Executing producers without over-serializing independents",
+          "partial_abort over full_abort_reexecute when strips cover"
+        ]
+      }
+    },
+    {
+      "block": 6137495,
+      "label": "soft0_worst_waw_spine",
+      "morphology": "WAW_spine",
+      "n_tx": 60,
+      "gas_used": 7994690,
+      "dag_source": "finegrain_final_rw",
+      "dag": {
+        "n_raw": 0,
+        "n_waw": 32,
+        "n_edges": 32,
+        "longest_chain": 33,
+        "max_wave_width": 28,
+        "mean_wave_width": 1.8181818181818181,
+        "independent_frac": 0.45,
+        "multi_writer_locs": 1,
+        "max_writers_on_loc": 33,
+        "max_conflict_component": 33,
+        "n_levels": 33
+      },
+      "hot_top3": [
+        {
+          "location": 13158572416446100201,
+          "kind": "storage",
+          "n_writers": 33,
+          "n_readers": 33,
+          "touches": 66
+        },
+        {
+          "location": 7579156561365822452,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 33,
+          "touches": 33
+        },
+        {
+          "location": 8766572172681237361,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 33,
+          "touches": 33
+        }
+      ],
+      "kind_hist": {
+        "basic": 89,
+        "storage": 171,
+        "basic_lazy": 4,
+        "code_hash": 16
+      },
+      "timings_ms": {
+        "sequential": 1.09,
+        "occ1": 2.02,
+        "occ8": 1.169,
+        "work_proxy": "sequential",
+        "t_work": 1.09,
+        "pathological_sequential": false,
+        "soft0_sf": 3.313,
+        "soft0_occ": 0.877,
+        "soft0_occ_pathological": false
+      },
+      "upper_bound": {
+        "model": "equal_cost_tx_hops_commit_order_RAW_WAW_DAG",
+        "cores": 8,
+        "speedup_bound_infinite_cores": 1.818,
+        "speedup_bound_p8": 1.818,
+        "ideal_wall_inf_ms": 0.6,
+        "ideal_wall_p8_ms": 0.6,
+        "occ8_over_ideal_p8": 1.949,
+        "occ8_speedup_vs_work": 0.933,
+        "sf_over_finegrain_occ8": 0.353,
+        "soft0_sf_occ_reported": 0.2648205666887015
+      },
+      "occ_shortfall": {
+        "abort_rate": 0.5333333333333333,
+        "occ_aborts": 32,
+        "max_incarnation": 6,
+        "dominant_stage": "execute_validate_full_abort_reexecute_on_WAW_chain"
+      },
+      "effect_raw": null,
+      "soft0_process": {
+        "soft_wait_arms": 0,
+        "wait_for_dependency": 51,
+        "wait_for_full_abort": 0,
+        "refuse_admit": 0,
+        "partial_abort_win": 21,
+        "partial_abort_attempt": 21,
+        "full_abort_reexecute": 10,
+        "park_resume_full_abort_reexecute": 51,
+        "optimistic_read_count": 4,
+        "ordered_admit_hits": 0,
+        "reexec_entries": 66
+      },
+      "what_must_change": {
+        "at_sites": "execute_validate_full_abort_reexecute_on_WAW_chain",
+        "specfence_levers": [
+          "pessimistic_admit / ordered_admit (serial-lane) along multi-writer WAW locations",
+          "dependency_aware_admission refuse_admit of later writers while prior writer Ready|Executing",
+          "partial_abort for incidental RAW side-edges; do not full_abort_reexecute the whole spine",
+          "wait_for_dependency only on unfinished prior writer \u2014 never SoftWait Soft"
+        ]
+      }
+    },
+    {
+      "block": 14396881,
+      "label": "quiet_morph_sf_occ_low",
+      "morphology": "near_independent",
+      "n_tx": 1346,
+      "gas_used": 30020813,
+      "dag_source": "finegrain_final_rw",
+      "dag": {
+        "n_raw": 0,
+        "n_waw": 13,
+        "n_edges": 13,
+        "longest_chain": 5,
+        "max_wave_width": 1337,
+        "mean_wave_width": 269.2,
+        "independent_frac": 0.9888558692421991,
+        "multi_writer_locs": 9,
+        "max_writers_on_loc": 5,
+        "max_conflict_component": 6,
+        "n_levels": 5
+      },
+      "hot_top3": [
+        {
+          "location": 11880556412163541166,
+          "kind": "basic_lazy",
+          "n_writers": 1197,
+          "n_readers": 2,
+          "touches": 1199
+        },
+        {
+          "location": 897568499098753549,
+          "kind": "unknown",
+          "n_writers": 0,
+          "n_readers": 1197,
+          "touches": 1197
+        },
+        {
+          "location": 14562814392964356195,
+          "kind": "basic_lazy",
+          "n_writers": 60,
+          "n_readers": 1,
+          "touches": 61
+        }
+      ],
+      "kind_hist": {
+        "basic": 65,
+        "basic_lazy": 1306,
+        "storage": 86,
+        "code_hash": 1
+      },
+      "timings_ms": {
+        "sequential": 3.757,
+        "occ1": 9.506,
+        "occ8": 4.67,
+        "work_proxy": "sequential",
+        "t_work": 3.757,
+        "pathological_sequential": false,
+        "soft0_sf": 13.974,
+        "soft0_occ": 3.969,
+        "soft0_occ_pathological": false
+      },
+      "upper_bound": {
+        "model": "equal_cost_tx_hops_commit_order_RAW_WAW_DAG",
+        "cores": 8,
+        "speedup_bound_infinite_cores": 269.2,
+        "speedup_bound_p8": 8,
+        "ideal_wall_inf_ms": 0.014,
+        "ideal_wall_p8_ms": 0.47,
+        "occ8_over_ideal_p8": 9.946,
+        "occ8_speedup_vs_work": 0.804,
+        "sf_over_finegrain_occ8": 0.334,
+        "soft0_sf_occ_reported": 0.28403252755323966
+      },
+      "occ_shortfall": {
+        "abort_rate": 0.004457652303120356,
+        "occ_aborts": 6,
+        "max_incarnation": 1,
+        "dominant_stage": "scheduler_meta_overhead"
+      },
+      "effect_raw": null,
+      "soft0_process": {
+        "soft_wait_arms": 0,
+        "wait_for_dependency": 1,
+        "wait_for_full_abort": 0,
+        "refuse_admit": 0,
+        "partial_abort_win": 0,
+        "partial_abort_attempt": 0,
+        "full_abort_reexecute": 2,
+        "park_resume_full_abort_reexecute": 0,
+        "optimistic_read_count": 0,
+        "ordered_admit_hits": 0,
+        "reexec_entries": 2
+      },
+      "what_must_change": {
+        "at_sites": "scheduler_meta_overhead",
+        "specfence_levers": [
+          "keep optimistic_read default; minimize refuse_admit idle tax",
+          "avoid wait_for_dependency and ordered_admit theater on cold locations",
+          "SpecFence should match OCC wall (meta overhead is the only gap)"
+        ]
+      }
+    },
+    {
+      "block": 12047794,
+      "label": "quiet_parity",
+      "morphology": "near_independent",
+      "n_tx": 232,
+      "gas_used": 12486404,
+      "dag_source": "inferred",
+      "dag": {
+        "n_raw": 0,
+        "n_waw": 0,
+        "n_edges": 0,
+        "longest_chain": 1,
+        "max_wave_width": 232,
+        "mean_wave_width": 232.0,
+        "independent_frac": 1.0,
+        "multi_writer_locs": 0,
+        "max_writers_on_loc": 0,
+        "max_conflict_component": 1,
+        "n_levels": 1
+      },
+      "hot_top3": [],
+      "kind_hist": {},
+      "timings_ms": {
+        "sequential": 4.8,
+        "occ1": 5.35,
+        "occ8": 4.26,
+        "work_proxy": "sequential",
+        "t_work": 4.8,
+        "pathological_sequential": false,
+        "soft0_sf": 5.965,
+        "soft0_occ": 4.826,
+        "soft0_occ_pathological": false
+      },
+      "upper_bound": {
+        "model": "equal_cost_tx_hops_commit_order_RAW_WAW_DAG",
+        "cores": 8,
+        "speedup_bound_infinite_cores": 232.0,
+        "speedup_bound_p8": 8,
+        "ideal_wall_inf_ms": 0.021,
+        "ideal_wall_p8_ms": 0.6,
+        "occ8_over_ideal_p8": 7.1,
+        "occ8_speedup_vs_work": 1.127,
+        "sf_over_finegrain_occ8": 0.714,
+        "soft0_sf_occ_reported": 0.8090233995866224
+      },
+      "occ_shortfall": {
+        "abort_rate": 0.0,
+        "occ_aborts": 0,
+        "max_incarnation": 0,
+        "dominant_stage": "scheduler_meta_overhead"
+      },
+      "effect_raw": null,
+      "soft0_process": {
+        "soft_wait_arms": 0,
+        "wait_for_dependency": 0,
+        "wait_for_full_abort": 0,
+        "refuse_admit": 20,
+        "partial_abort_win": 0,
+        "partial_abort_attempt": 0,
+        "full_abort_reexecute": 2,
+        "park_resume_full_abort_reexecute": 0,
+        "optimistic_read_count": 0,
+        "ordered_admit_hits": 0,
+        "reexec_entries": 0
+      },
+      "what_must_change": {
+        "at_sites": "scheduler_meta_overhead",
+        "specfence_levers": [
+          "keep optimistic_read default; minimize refuse_admit idle tax",
+          "avoid wait_for_dependency and ordered_admit theater on cold locations",
+          "SpecFence should match OCC wall (meta overhead is the only gap)"
+        ]
+      },
+      "note": "finegrain snapshot absent (WARN sequential fallback); OCC@8 abort_rate=0 \u2192 treat as independent DAG"
+    }
+  ],
+  "cross_block_summary": {
+    "top_stall_patterns_toward_bound": [
+      {
+        "id": 1,
+        "name": "RAW_fan_out_optimistic_read_waste",
+        "blocks": [
+          14689597
+        ],
+        "essence": "Huge wave width but OCC gets ~0\u20131\u00d7 serial: consumers optimistic_read hot storage, validate fails, full_abort_reexecute cascades. Bound ~8\u00d7 unused."
+      },
+      {
+        "id": 2,
+        "name": "WAW_spine_serializes_makespan",
+        "blocks": [
+          19807137,
+          6196166,
+          6137495
+        ],
+        "essence": "longest_chain \u2248 spine writers; bound speedup only ~1.2\u20132.2\u00d7. OCC still pays abort/reexec on the chain instead of ordered_admit along WAW."
+      },
+      {
+        "id": 3,
+        "name": "mixed_RAW_WAW_underfilled_waves",
+        "blocks": [
+          19606599,
+          19469097,
+          8889776
+        ],
+        "essence": "Bound 6\u20137\u00d7 but OCC ~1\u20132\u00d7: abort_rate 0.2\u20130.4, max_inc high; handler vs program policy not split."
+      },
+      {
+        "id": 4,
+        "name": "wait_for_converts_to_full_abort_reexecute",
+        "blocks": [
+          14689597,
+          19807137,
+          6196166
+        ],
+        "essence": "Soft=0: wait_for_dependency parks then park_resume_full_abort_reexecute \u2248 parks; partial_abort rare on fan_out."
+      },
+      {
+        "id": 5,
+        "name": "quiet_meta_and_refuse_admit_tax",
+        "blocks": [
+          14396881,
+          12047794,
+          2179522
+        ],
+        "essence": "DAG near-independent (bound ~8\u00d7); OCC often meta-slower than serial; SpecFence refuse_admit/meta can help (2179522) or hurt (14396881)."
+      }
+    ],
+    "tps_bottleneck_essence": "Across these ten blocks the parallel upper bound is set by the RAW/WAW conflict DAG under fixed commit order: fan-out blocks have short critical paths and huge wave width (bound \u22488\u00d7) but pure OCC burns that width on optimistic_read \u2192 validate \u2192 full_abort_reexecute; spine blocks are already nearly serial by WAW longest_chain (bound \u22481\u20132\u00d7) so TPS cannot be rescued by more cores\u2014only by ordered_admit/dependency-aware admission along the spine. SpecFence Soft=0 approaches the bound only when wait_for_dependency and partial_abort replace late full_abort_reexecute without refuse_admit idle tax on independents."
+  }
+}

@@ -1,0 +1,68 @@
+{
+  "plant": "specfence-v9.4-sot-partial-close",
+  "head": "c42f96a",
+  "pr": 11,
+  "when": "2026-09-14",
+  "honesty": "fresh Pevm + reset_heat + reset_inter_prior; Soft=0 asserted; drop n_tx==0 (19910734); SF vs OCC @8; LTO off",
+  "wall_to_beat": {
+    "tip": "3687da6",
+    "nonempty_median": 0.6853,
+    "fan_14689597_n3": 0.3482
+  },
+  "all_blocks_n1": {
+    "json": "lab/results/v9.4-sot-partial-all-blocks-n1-sweep.json",
+    "log": "lab/results/v9.4-sot-partial-all-blocks-n1-sweep.run.log",
+    "loaded": 99,
+    "nonempty": 98,
+    "dropped_empty": [19910734],
+    "median_sf_occ": 0.7033,
+    "p10": 0.4136,
+    "p90": 1.2143,
+    "min": 0.2729,
+    "mean": 148.2002,
+    "ge_0_7": 50,
+    "ge_0_95": 29,
+    "ge_1_0": 23,
+    "quiet_n": 36,
+    "quiet_median": 1.0732,
+    "quiet_p10": 0.4329,
+    "quiet_ge1": "19/36",
+    "morph_counts": {"spine": 53, "quiet": 36, "quiet_ish": 9},
+    "soft": 0,
+    "edge_bind": 0,
+    "edge_wait_for": 4875,
+    "waitfor_pin": 5158,
+    "waitfor_aborting": 177,
+    "bind_after_done": 214,
+    "r1_win": 3,
+    "r1_attempt": 2439,
+    "r1_win_rate": 0.0012,
+    "schedule_refuse": 1540,
+    "vs_wall_median_delta": 0.018
+  },
+  "focus_n3": {
+    "json": "lab/results/v9.4-sot-partial-focus-n3-sweep.json",
+    "log": "lab/results/v9.4-sot-partial-focus-n3-sweep.run.log",
+    "blocks": [14689597, 19807137, 2179522, 19606599, 19469097],
+    "cores": 8,
+    "iters": 3,
+    "soft": 0,
+    "named": {
+      "14689597": {"n1_sf_occ": 0.3981, "n3_sf_occ": 0.4485, "n3_bind": 0, "n3_wait": 246, "n3_pin": 274, "n3_aborting": 4, "n3_r1": "0/74", "n3_refuse": 160},
+      "19807137": {"n1_sf_occ": 0.3088, "n3_sf_occ": 0.2308, "n3_bind": 0, "n3_wait": 891, "n3_pin": 971, "n3_aborting": 0, "n3_r1": "0/537", "n3_refuse": 0},
+      "2179522": {"n1_sf_occ": 14330.7365, "n3_sf_occ": 55.4563, "note": "OCC-slow noise; do not advertise the ratio"},
+      "19606599": {"n1_sf_occ": 0.6116, "n3_sf_occ": 0.8312, "n3_bind": 0, "n3_wait": 147, "n3_pin": 153, "n3_aborting": 6, "n3_r1": "0/56", "n3_refuse": 0},
+      "19469097": {"n1_sf_occ": 0.4506, "n3_sf_occ": 0.5075, "n3_bind": 0, "n3_wait": 160, "n3_pin": 161, "n3_aborting": 3, "n3_r1": "0/49", "n3_refuse": 0}
+    },
+    "vs_wall_fan_delta": 0.1003
+  },
+  "bars": {
+    "soft_0": "held",
+    "beat_median_0.685": true,
+    "beat_fan_0.348": true,
+    "product_median_0.95": false,
+    "product_fan_0.90": false,
+    "quiet_p10_0.90": false,
+    "r1_win_50pct": false
+  }
+}

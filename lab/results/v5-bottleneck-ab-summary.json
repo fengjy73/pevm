@@ -1,0 +1,36 @@
+{
+  "date": "2026-09-07",
+  "tip_parent": "582ea20",
+  "block_597": {
+    "lean": {
+      "sf_occ": 0.15254459904614323,
+      "soft_wait_arms": 41,
+      "aborts_sf": 378,
+      "aborts_occ": 80,
+      "evm_sf": 2416,
+      "evm_occ": 1486,
+      "wall_ms_sf": 36.103743,
+      "wall_ms_occ": 5.507431,
+      "force_bind_reabort": 184,
+      "soft_wait_wake_ok": 13,
+      "soft_wait_wake_reabort": 22,
+      "bind_hits": 2305,
+      "spec_read_count": 10436
+    },
+    "nosoft": {
+      "sf_occ": 0.13709555338574145,
+      "soft_wait_arms": 0,
+      "aborts_sf": 228,
+      "aborts_occ": 77,
+      "evm_sf": 1294,
+      "evm_occ": 1559,
+      "wall_ms_sf": 28.0618,
+      "wall_ms_occ": 3.847148,
+      "force_bind_reabort": 110,
+      "soft_wait_wake_ok": 0,
+      "soft_wait_wake_reabort": 0
+    }
+  },
+  "mean_sf_occ_lean": 0.2671615405276737,
+  "mean_sf_occ_nosoft": 0.2681499098811522
+}

@@ -1,0 +1,28 @@
+{
+  "test": "quiet→mixed flip",
+  "blocks": [
+    19606598,
+    19606599
+  ],
+  "rows": [
+    {
+      "block": 19606598,
+      "ok": true,
+      "tps": 29438.17723982474,
+      "soft_wait_arms": 0,
+      "wait_hard": 0,
+      "occ_aborts": 24,
+      "inter_prior_flip_count": 1
+    },
+    {
+      "block": 19606599,
+      "ok": true,
+      "tps": 17019.50606981902,
+      "soft_wait_arms": 0,
+      "wait_hard": 0,
+      "occ_aborts": 239,
+      "inter_prior_flip_count": 2
+    }
+  ],
+  "pass_criteria": "SoftWaits must not stick from quiet→mixed; flip α path exercised (flip_count may be ≥0 depending on morph KL)"
+}

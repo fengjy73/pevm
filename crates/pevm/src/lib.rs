@@ -75,7 +75,7 @@ fn hash_deterministic<T: Hash>(x: T) -> u64 {
 // TODO: It would be nice if we could tie the different cases of
 // memory locations & values at the type level, to prevent lots of
 // matches & potentially dangerous mismatch mistakes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum MemoryValue {
     Basic(AccountBasic),
     CodeHash(B256),
@@ -94,7 +94,7 @@ enum MemoryValue {
     SelfDestructed,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum MemoryEntry {
     Data(TxIncarnation, MemoryValue),
     // When an incarnation is aborted due to a validation failure, the
@@ -220,11 +220,23 @@ mod mv_memory;
 mod pevm;
 pub use pevm::{Pevm, PevmError, PevmResult, execute_revm_sequential};
 mod scheduler;
+pub mod specfence;
+pub use specfence::{
+    AbortEvent, AccountGrainObserve, ConcurrencyMode, ConsumerFirstCross, DagStats,
+    DecisionFieldSnap, EffectClass, EffectLogEntry, EffectStreamDiag, ExecProcessSnapshot,
+    FineGrainCollector, FineGrainSnapshot, HotLocation, L1DagSummary, LearnReport, LocationKind,
+    MaMdProxy, MeasurementMethod, PerTxProcessSnap, RawEdge, RawEffectEdge, ResolvePlan,
+    SpecFenceMetrics, TxRw, TxWorkTotal, VisibilityPolicy, analyze_dag, classify_raw_edges,
+    dependency_edges, effect_raw_longest_chain, effect_raw_max_fanout, estimate_ma_md,
+    filter_effect_edges, hot_locations, kind_histogram, l1_dag_summary, percentile_f64,
+    producer_status_canonical, program_raw_longest_chain,
+};
 mod storage;
 pub use storage::{
     AccountBasic, BlockHashes, Bytecodes, ChainState, EvmAccount, EvmCode, InMemoryStorage,
     Storage, StorageWrapper,
 };
+mod tx_runner;
 mod vm;
 pub use vm::{ExecutionError, PevmTxExecutionResult};
 

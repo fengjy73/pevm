@@ -1,0 +1,409 @@
+all-blocks sweep: 99 candidates, iters=1, process_top=10, out=lab/results/decision-field-99-sf-occ-sweep.json
+[1/99] loading block 46147 …
+  loaded n_tx=1 gas=21000
+  occ        ok=true tps=12042 wall_ms=0.1 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+  specfence  ok=true tps=33209 wall_ms=0.0 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+[2/99] loading block 116525 …
+  loaded n_tx=83 gas=2625335
+  occ        ok=true tps=321125 wall_ms=0.3 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+  specfence  ok=true tps=500996 wall_ms=0.2 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+[3/99] loading block 930196 …
+  loaded n_tx=18 gas=378000
+  occ        ok=true tps=473385 wall_ms=0.0 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+  specfence  ok=true tps=624761 wall_ms=0.0 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+[4/99] loading block 1150000 …
+  loaded n_tx=9 gas=649041
+  occ        ok=true tps=74639 wall_ms=0.1 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+  specfence  ok=true tps=84543 wall_ms=0.1 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+[5/99] loading block 1796867 …
+  loaded n_tx=49 gas=3917663
+  occ        ok=true tps=220462 wall_ms=0.2 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+  specfence  ok=true tps=260086 wall_ms=0.2 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+[6/99] loading block 2179522 …
+  loaded n_tx=222 gas=4698004
+  occ        ok=true tps=106114 wall_ms=2.1 soft=0 aborts=1 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=1
+  specfence  ok=true tps=78357 wall_ms=2.8 soft=0 aborts=1 bind=70 wait=0 unf=33 rewind=1 rebind=0 full=0
+[7/99] loading block 2462997 …
+  loaded n_tx=9 gas=484186
+  occ        ok=true tps=2893 wall_ms=3.1 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+  specfence  ok=true tps=3863 wall_ms=2.3 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+[8/99] loading block 2641321 …
+  loaded n_tx=83 gas=1917429
+  occ        ok=true tps=326815 wall_ms=0.3 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+  specfence  ok=true tps=365747 wall_ms=0.2 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+[9/99] loading block 2674998 …
+  loaded n_tx=16 gas=1915348
+  occ        ok=true tps=78468 wall_ms=0.2 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+  specfence  ok=true tps=114774 wall_ms=0.1 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+[10/99] loading block 2675000 …
+  loaded n_tx=15 gas=1312529
+  occ        ok=true tps=105961 wall_ms=0.1 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+  specfence  ok=true tps=135889 wall_ms=0.1 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+[11/99] loading block 2688148 …
+  loaded n_tx=4 gas=2725844
+  occ        ok=true tps=19966 wall_ms=0.2 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+  specfence  ok=true tps=22420 wall_ms=0.2 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+[12/99] loading block 3356896 …
+  loaded n_tx=176 gas=4033966
+  occ        ok=true tps=212441 wall_ms=0.8 soft=0 aborts=11 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=11
+  specfence  ok=true tps=62476 wall_ms=2.8 soft=0 aborts=20 bind=120 wait=4 unf=213 rewind=18 rebind=0 full=3
+[13/99] loading block 4330482 …
+  loaded n_tx=237 gas=6669817
+  occ        ok=true tps=265896 wall_ms=0.9 soft=0 aborts=11 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=11
+  specfence  ok=true tps=61675 wall_ms=3.8 soft=0 aborts=10 bind=58 wait=5 unf=501 rewind=13 rebind=0 full=1
+[14/99] loading block 4369999 …
+  loaded n_tx=22 gas=6630311
+  occ        ok=true tps=29275 wall_ms=0.8 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+  specfence  ok=true tps=9138 wall_ms=2.4 soft=0 aborts=0 bind=2 wait=0 unf=330 rewind=0 rebind=0 full=0
+[15/99] loading block 4370000 …
+  loaded n_tx=97 gas=6609719
+  occ        ok=true tps=39077 wall_ms=2.5 soft=0 aborts=3 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=3
+  specfence  ok=true tps=12516 wall_ms=7.8 soft=0 aborts=3 bind=1002 wait=3 unf=967 rewind=4 rebind=0 full=1
+[16/99] loading block 4864590 …
+  loaded n_tx=195 gas=7985890
+  occ        ok=true tps=176199 wall_ms=1.1 soft=0 aborts=10 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=10
+  specfence  ok=true tps=42643 wall_ms=4.6 soft=0 aborts=5 bind=44 wait=1 unf=861 rewind=4 rebind=0 full=0
+[17/99] loading block 5283152 …
+  loaded n_tx=150 gas=7979463
+  occ        ok=true tps=93104 wall_ms=1.6 soft=0 aborts=11 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=11
+  specfence  ok=true tps=31137 wall_ms=4.8 soft=0 aborts=9 bind=150 wait=1 unf=959 rewind=7 rebind=0 full=1
+[18/99] loading block 5526571 …
+  loaded n_tx=143 gas=7988261
+  occ        ok=true tps=94442 wall_ms=1.5 soft=0 aborts=30 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=30
+  specfence  ok=true tps=23940 wall_ms=6.0 soft=0 aborts=65 bind=368 wait=17 unf=848 rewind=57 rebind=2 full=18
+[19/99] loading block 5891667 …
+  loaded n_tx=380 gas=7980153
+  occ        ok=true tps=323431 wall_ms=1.2 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+  specfence  ok=true tps=131579 wall_ms=2.9 soft=0 aborts=0 bind=0 wait=0 unf=5 rewind=0 rebind=0 full=0
+[20/99] loading block 6137495 …
+  loaded n_tx=60 gas=7994690
+  occ        ok=true tps=59043 wall_ms=1.0 soft=0 aborts=30 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=30
+  specfence  ok=true tps=14176 wall_ms=4.2 soft=0 aborts=67 bind=465 wait=37 unf=460 rewind=74 rebind=1 full=15
+[21/99] loading block 6196166 …
+  loaded n_tx=108 gas=7975867
+  occ        ok=true tps=76284 wall_ms=1.4 soft=0 aborts=79 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=79
+  specfence  ok=true tps=9638 wall_ms=11.2 soft=0 aborts=145 bind=1575 wait=54 unf=615 rewind=153 rebind=18 full=28
+[22/99] loading block 7279999 …
+  loaded n_tx=122 gas=7998886
+  occ        ok=true tps=82041 wall_ms=1.5 soft=0 aborts=2 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=2
+  specfence  ok=true tps=26387 wall_ms=4.6 soft=0 aborts=2 bind=100 wait=1 unf=876 rewind=3 rebind=0 full=0
+[23/99] loading block 7280000 …
+  loaded n_tx=118 gas=7992790
+  occ        ok=true tps=47331 wall_ms=2.5 soft=0 aborts=35 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=35
+  specfence  ok=true tps=13853 wall_ms=8.5 soft=0 aborts=55 bind=414 wait=36 unf=1234 rewind=83 rebind=1 full=1
+[24/99] loading block 8038679 …
+  loaded n_tx=237 gas=7993635
+  occ        ok=true tps=169201 wall_ms=1.4 soft=0 aborts=8 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=8
+  specfence  ok=true tps=51356 wall_ms=4.6 soft=0 aborts=14 bind=53 wait=1 unf=671 rewind=14 rebind=0 full=0
+[25/99] loading block 8889776 …
+  loaded n_tx=330 gas=9996021
+  occ        ok=true tps=167674 wall_ms=2.0 soft=0 aborts=57 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=57
+  specfence  ok=true tps=31560 wall_ms=10.5 soft=0 aborts=132 bind=909 wait=9 unf=1409 rewind=101 rebind=12 full=35
+[26/99] loading block 9068998 …
+  loaded n_tx=3 gas=3575534
+  occ        ok=true tps=4303 wall_ms=0.7 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+  specfence  ok=true tps=5102 wall_ms=0.6 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+[27/99] loading block 9069000 …
+  loaded n_tx=56 gas=8762935
+  occ        ok=true tps=19648 wall_ms=2.9 soft=0 aborts=1 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=1
+  specfence  ok=true tps=8125 wall_ms=6.9 soft=0 aborts=2 bind=197 wait=1 unf=996 rewind=3 rebind=0 full=0
+[28/99] loading block 10760440 …
+  loaded n_tx=202 gas=12466618
+  occ        ok=true tps=69501 wall_ms=2.9 soft=0 aborts=81 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=81
+  specfence  ok=true tps=17457 wall_ms=11.6 soft=0 aborts=84 bind=1563 wait=40 unf=2124 rewind=82 rebind=0 full=26
+[29/99] loading block 11114732 …
+  loaded n_tx=100 gas=12450745
+  occ        ok=true tps=22152 wall_ms=4.5 soft=0 aborts=17 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=17
+  specfence  ok=true tps=17032 wall_ms=5.9 soft=0 aborts=13 bind=109 wait=7 unf=449 rewind=17 rebind=0 full=0
+[30/99] loading block 11743952 …
+  loaded n_tx=206 gas=11955916
+  occ        ok=true tps=20980 wall_ms=9.8 soft=0 aborts=22 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=22
+  specfence  ok=true tps=13917 wall_ms=14.8 soft=0 aborts=34 bind=696 wait=17 unf=1204 rewind=32 rebind=0 full=12
+[31/99] loading block 11814555 …
+  loaded n_tx=579 gas=12494001
+  occ        ok=true tps=309485 wall_ms=1.9 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+  specfence  ok=true tps=109365 wall_ms=5.3 soft=0 aborts=0 bind=11 wait=0 unf=81 rewind=0 rebind=0 full=0
+[32/99] loading block 12047794 …
+  loaded n_tx=232 gas=12486404
+  occ        ok=true tps=45187 wall_ms=5.1 soft=0 aborts=7 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=7
+  specfence  ok=true tps=42175 wall_ms=5.5 soft=0 aborts=0 bind=0 wait=0 unf=98 rewind=0 rebind=0 full=0
+[33/99] loading block 12159808 …
+  loaded n_tx=180 gas=12478883
+  occ        ok=true tps=36312 wall_ms=5.0 soft=0 aborts=2 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=2
+  specfence  ok=true tps=23100 wall_ms=7.8 soft=0 aborts=3 bind=399 wait=3 unf=605 rewind=3 rebind=0 full=0
+[34/99] loading block 12243999 …
+  loaded n_tx=205 gas=12444977
+  occ        ok=true tps=80434 wall_ms=2.5 soft=0 aborts=16 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=16
+  specfence  ok=true tps=23033 wall_ms=8.9 soft=0 aborts=31 bind=707 wait=8 unf=1616 rewind=27 rebind=0 full=8
+[35/99] loading block 12244000 …
+  loaded n_tx=133 gas=12450737
+  occ        ok=true tps=18480 wall_ms=7.2 soft=0 aborts=41 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=41
+  specfence  ok=true tps=9263 wall_ms=14.4 soft=0 aborts=149 bind=2124 wait=24 unf=1695 rewind=103 rebind=3 full=63
+[36/99] loading block 12300570 …
+  loaded n_tx=687 gas=14934316
+  occ        ok=true tps=298981 wall_ms=2.3 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+  specfence  ok=true tps=127239 wall_ms=5.4 soft=0 aborts=0 bind=3 wait=0 unf=118 rewind=0 rebind=0 full=0
+[37/99] loading block 12459406 …
+  loaded n_tx=201 gas=14994849
+  occ        ok=true tps=36564 wall_ms=5.5 soft=0 aborts=54 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=54
+  specfence  ok=true tps=12507 wall_ms=16.1 soft=0 aborts=101 bind=2202 wait=42 unf=2392 rewind=94 rebind=0 full=33
+[38/99] loading block 12520364 …
+  loaded n_tx=660 gas=14989902
+  occ        ok=true tps=283212 wall_ms=2.3 soft=0 aborts=1 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=1
+  specfence  ok=true tps=84064 wall_ms=7.9 soft=0 aborts=2 bind=31 wait=0 unf=461 rewind=2 rebind=0 full=0
+[39/99] loading block 12522062 …
+  loaded n_tx=177 gas=15028295
+  occ        ok=true tps=87494 wall_ms=2.0 soft=0 aborts=50 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=50
+  specfence  ok=true tps=19026 wall_ms=9.3 soft=0 aborts=80 bind=947 wait=62 unf=1419 rewind=116 rebind=0 full=8
+[40/99] loading block 12964999 …
+  loaded n_tx=145 gas=15026712
+  occ        ok=true tps=23106 wall_ms=6.3 soft=0 aborts=51 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=51
+  specfence  ok=true tps=7966 wall_ms=18.2 soft=0 aborts=124 bind=2889 wait=11 unf=2353 rewind=79 rebind=2 full=52
+[41/99] loading block 12965000 …
+  loaded n_tx=259 gas=30025257
+  occ        ok=true tps=24948 wall_ms=10.4 soft=0 aborts=43 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=43
+  specfence  ok=true tps=13073 wall_ms=19.8 soft=0 aborts=58 bind=1669 wait=18 unf=4385 rewind=50 rebind=0 full=20
+[42/99] loading block 13217637 …
+  loaded n_tx=1100 gas=29985362
+  occ        ok=true tps=239451 wall_ms=4.6 soft=0 aborts=10 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=10
+  specfence  ok=true tps=71200 wall_ms=15.4 soft=0 aborts=7 bind=180 wait=1 unf=1351 rewind=7 rebind=0 full=0
+[43/99] loading block 13287210 …
+  loaded n_tx=1414 gas=29990789
+  occ        ok=true tps=314104 wall_ms=4.5 soft=0 aborts=1 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=1
+  specfence  ok=true tps=100202 wall_ms=14.1 soft=0 aborts=0 bind=20 wait=3 unf=73 rewind=1 rebind=0 full=0
+[44/99] loading block 14029313 …
+  loaded n_tx=724 gas=30074554
+  occ        ok=true tps=203970 wall_ms=3.5 soft=0 aborts=21 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=21
+  specfence  ok=true tps=46184 wall_ms=15.7 soft=0 aborts=30 bind=485 wait=11 unf=2627 rewind=33 rebind=1 full=4
+[45/99] loading block 14334629 …
+  loaded n_tx=819 gas=30135754
+  occ        ok=true tps=191228 wall_ms=4.3 soft=0 aborts=39 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=39
+  specfence  ok=true tps=43373 wall_ms=18.9 soft=0 aborts=42 bind=1275 wait=15 unf=2449 rewind=45 rebind=2 full=8
+[46/99] loading block 14383540 …
+  loaded n_tx=722 gas=30059751
+  occ        ok=true tps=129062 wall_ms=5.6 soft=0 aborts=56 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=56
+  specfence  ok=true tps=40603 wall_ms=17.8 soft=0 aborts=48 bind=1139 wait=18 unf=2606 rewind=45 rebind=1 full=14
+[47/99] loading block 14396881 …
+  loaded n_tx=1346 gas=30020813
+  occ        ok=true tps=322192 wall_ms=4.2 soft=0 aborts=6 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=6
+  specfence  ok=true tps=84998 wall_ms=15.8 soft=0 aborts=4 bind=70 wait=0 unf=370 rewind=4 rebind=0 full=0
+[48/99] loading block 14545870 …
+  loaded n_tx=456 gas=29925884
+  occ        ok=true tps=78605 wall_ms=5.8 soft=0 aborts=69 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=69
+  specfence  ok=true tps=18899 wall_ms=24.1 soft=0 aborts=193 bind=2233 wait=90 unf=3574 rewind=203 rebind=1 full=48
+[49/99] loading block 14683600 …
+  loaded n_tx=660 gas=30021734
+  occ        ok=true tps=99231 wall_ms=6.7 soft=0 aborts=73 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=73
+  specfence  ok=true tps=27058 wall_ms=24.4 soft=0 aborts=139 bind=2230 wait=44 unf=3086 rewind=126 rebind=4 full=42
+[50/99] loading block 14689595 …
+  loaded n_tx=23 gas=2610798
+  occ        ok=true tps=16210 wall_ms=1.4 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+  specfence  ok=true tps=23490 wall_ms=1.0 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+[51/99] loading block 14689596 …
+  loaded n_tx=31 gas=4978248
+  occ        ok=true tps=28967 wall_ms=1.1 soft=0 aborts=12 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=12
+  specfence  ok=true tps=7177 wall_ms=4.3 soft=0 aborts=14 bind=425 wait=7 unf=564 rewind=14 rebind=0 full=5
+[52/99] loading block 14689597 …
+  loaded n_tx=564 gas=30028257
+  occ        ok=true tps=150508 wall_ms=3.7 soft=0 aborts=54 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=54
+  specfence  ok=true tps=27727 wall_ms=20.3 soft=0 aborts=66 bind=1613 wait=79 unf=3329 rewind=122 rebind=0 full=1
+[53/99] loading block 14689598 …
+  loaded n_tx=111 gas=6014758
+  occ        ok=true tps=58056 wall_ms=1.9 soft=0 aborts=5 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=5
+  specfence  ok=true tps=20842 wall_ms=5.3 soft=0 aborts=12 bind=387 wait=0 unf=673 rewind=9 rebind=1 full=2
+[54/99] loading block 14689599 …
+  loaded n_tx=43 gas=1607929
+  occ        ok=true tps=158730 wall_ms=0.3 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+  specfence  ok=true tps=229901 wall_ms=0.2 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+[55/99] loading block 15199017 …
+  loaded n_tx=866 gas=30028395
+  occ        ok=true tps=204927 wall_ms=4.2 soft=0 aborts=9 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=9
+  specfence  ok=true tps=49831 wall_ms=17.4 soft=0 aborts=12 bind=289 wait=2 unf=2377 rewind=13 rebind=1 full=0
+[56/99] loading block 15274915 …
+  loaded n_tx=1226 gas=29928443
+  occ        ok=true tps=293107 wall_ms=4.2 soft=0 aborts=29 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=29
+  specfence  ok=true tps=73857 wall_ms=16.6 soft=0 aborts=33 bind=463 wait=6 unf=965 rewind=35 rebind=0 full=2
+[57/99] loading block 15537393 …
+  loaded n_tx=1 gas=29991429
+  occ        ok=true tps=615 wall_ms=1.6 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+  specfence  ok=true tps=626 wall_ms=1.6 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+[58/99] loading block 15537394 …
+  loaded n_tx=80 gas=29983006
+  occ        ok=true tps=23919 wall_ms=3.3 soft=0 aborts=19 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=19
+  specfence  ok=true tps=15212 wall_ms=5.3 soft=0 aborts=26 bind=484 wait=30 unf=743 rewind=35 rebind=1 full=9
+[59/99] loading block 15538827 …
+  loaded n_tx=823 gas=29981465
+  occ        ok=true tps=174432 wall_ms=4.7 soft=0 aborts=57 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=57
+  specfence  ok=true tps=39536 wall_ms=20.8 soft=0 aborts=96 bind=1290 wait=10 unf=2384 rewind=83 rebind=3 full=20
+[60/99] loading block 15752489 …
+  loaded n_tx=132 gas=8242594
+  occ        ok=true tps=71570 wall_ms=1.8 soft=0 aborts=15 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=15
+  specfence  ok=true tps=24449 wall_ms=5.4 soft=0 aborts=18 bind=522 wait=1 unf=945 rewind=12 rebind=0 full=6
+[61/99] loading block 16146267 …
+  loaded n_tx=473 gas=19204593
+  occ        ok=true tps=125022 wall_ms=3.8 soft=0 aborts=59 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=59
+  specfence  ok=true tps=32276 wall_ms=14.7 soft=0 aborts=132 bind=1387 wait=27 unf=1931 rewind=106 rebind=1 full=47
+[62/99] loading block 16257471 …
+  loaded n_tx=98 gas=20267875
+  occ        ok=true tps=15595 wall_ms=6.3 soft=0 aborts=28 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=28
+  specfence  ok=true tps=5370 wall_ms=18.3 soft=0 aborts=138 bind=1035 wait=14 unf=2150 rewind=110 rebind=88 full=38
+[63/99] loading block 17034869 …
+  loaded n_tx=93 gas=8450250
+  occ        ok=true tps=49476 wall_ms=1.9 soft=0 aborts=21 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=21
+  specfence  ok=true tps=11870 wall_ms=7.8 soft=0 aborts=48 bind=899 wait=22 unf=1164 rewind=36 rebind=0 full=21
+[64/99] loading block 17034870 …
+  loaded n_tx=184 gas=29999074
+  occ        ok=true tps=29676 wall_ms=6.2 soft=0 aborts=54 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=54
+  specfence  ok=true tps=8677 wall_ms=21.2 soft=0 aborts=108 bind=3046 wait=46 unf=3480 rewind=97 rebind=3 full=42
+[65/99] loading block 17666333 …
+  loaded n_tx=961 gas=29983414
+  occ        ok=true tps=149497 wall_ms=6.4 soft=0 aborts=55 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=55
+  specfence  ok=true tps=33329 wall_ms=28.8 soft=0 aborts=121 bind=2789 wait=54 unf=2012 rewind=125 rebind=2 full=37
+[66/99] loading block 18085863 …
+  loaded n_tx=178 gas=17007666
+  occ        ok=true tps=30573 wall_ms=5.8 soft=0 aborts=44 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=44
+  specfence  ok=true tps=9574 wall_ms=18.6 soft=0 aborts=118 bind=2992 wait=62 unf=2018 rewind=112 rebind=5 full=43
+[67/99] loading block 18426253 …
+  loaded n_tx=147 gas=18889343
+  occ        ok=true tps=19199 wall_ms=7.7 soft=0 aborts=23 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=23
+  specfence  ok=true tps=12967 wall_ms=11.3 soft=0 aborts=34 bind=613 wait=12 unf=1928 rewind=27 rebind=0 full=15
+[68/99] loading block 18988207 …
+  loaded n_tx=186 gas=12398324
+  occ        ok=true tps=33827 wall_ms=5.5 soft=0 aborts=55 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=55
+  specfence  ok=true tps=17613 wall_ms=10.6 soft=0 aborts=63 bind=1097 wait=10 unf=1567 rewind=51 rebind=0 full=16
+[69/99] loading block 19426586 …
+  loaded n_tx=127 gas=15757891
+  occ        ok=true tps=24556 wall_ms=5.2 soft=0 aborts=43 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=43
+  specfence  ok=true tps=6990 wall_ms=18.2 soft=0 aborts=106 bind=2494 wait=44 unf=1953 rewind=105 rebind=0 full=35
+[70/99] loading block 19426587 …
+  loaded n_tx=37 gas=2633933
+  occ        ok=true tps=10406 wall_ms=3.6 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+  specfence  ok=true tps=10546 wall_ms=3.5 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+[71/99] loading block 19434587 …
+  loaded n_tx=390 gas=28904241
+  occ        ok=true tps=141 wall_ms=2773.3 soft=0 aborts=148 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=148
+  specfence  ok=true tps=9258 wall_ms=42.1 soft=0 aborts=393 bind=5674 wait=83 unf=4194 rewind=364 rebind=8 full=84
+[72/99] loading block 19444337 …
+  loaded n_tx=417 gas=29999800
+  occ        ok=true tps=62232 wall_ms=6.7 soft=0 aborts=92 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=92
+  specfence  ok=true tps=17200 wall_ms=24.2 soft=0 aborts=153 bind=2304 wait=31 unf=3893 rewind=139 rebind=2 full=31
+[73/99] loading block 19469096 …
+  loaded n_tx=250 gas=11074601
+  occ        ok=true tps=76939 wall_ms=3.2 soft=0 aborts=120 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=120
+  specfence  ok=true tps=15455 wall_ms=16.2 soft=0 aborts=364 bind=1937 wait=180 unf=1364 rewind=427 rebind=2 full=68
+[74/99] loading block 19469097 …
+  loaded n_tx=336 gas=22901234
+  occ        ok=true tps=62021 wall_ms=5.4 soft=0 aborts=94 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=94
+  specfence  ok=true tps=15591 wall_ms=21.6 soft=0 aborts=226 bind=2541 wait=85 unf=2908 rewind=214 rebind=7 full=66
+[75/99] loading block 19469098 …
+  loaded n_tx=268 gas=12378273
+  occ        ok=true tps=72294 wall_ms=3.7 soft=0 aborts=40 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=40
+  specfence  ok=true tps=23006 wall_ms=11.6 soft=0 aborts=84 bind=1040 wait=43 unf=1393 rewind=110 rebind=2 full=7
+[76/99] loading block 19469099 …
+  loaded n_tx=257 gas=20631408
+  occ        ok=true tps=42013 wall_ms=6.1 soft=0 aborts=53 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=53
+  specfence  ok=true tps=15098 wall_ms=17.0 soft=0 aborts=95 bind=1624 wait=35 unf=2562 rewind=101 rebind=0 full=19
+[77/99] loading block 19469101 …
+  loaded n_tx=469 gas=26398517
+  occ        ok=true tps=66295 wall_ms=7.1 soft=0 aborts=60 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=60
+  specfence  ok=true tps=19616 wall_ms=23.9 soft=0 aborts=78 bind=879 wait=32 unf=3671 rewind=93 rebind=1 full=9
+[78/99] loading block 19498855 …
+  loaded n_tx=241 gas=29919049
+  occ        ok=true tps=40916 wall_ms=5.9 soft=0 aborts=56 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=56
+  specfence  ok=true tps=12345 wall_ms=19.5 soft=0 aborts=95 bind=2316 wait=31 unf=2603 rewind=99 rebind=1 full=21
+[79/99] loading block 19505152 …
+  loaded n_tx=417 gas=29999872
+  occ        ok=true tps=70279 wall_ms=5.9 soft=0 aborts=36 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=36
+  specfence  ok=true tps=22362 wall_ms=18.6 soft=0 aborts=64 bind=1686 wait=12 unf=4131 rewind=56 rebind=1 full=17
+[80/99] loading block 19606597 …
+  loaded n_tx=124 gas=11111777
+  occ        ok=true tps=21640 wall_ms=5.7 soft=0 aborts=42 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=42
+  specfence  ok=true tps=6610 wall_ms=18.8 soft=0 aborts=134 bind=2747 wait=31 unf=2020 rewind=80 rebind=0 full=72
+[81/99] loading block 19606598 …
+  loaded n_tx=91 gas=5158128
+  occ        ok=true tps=76405 wall_ms=1.2 soft=0 aborts=6 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=6
+  specfence  ok=true tps=21744 wall_ms=4.2 soft=0 aborts=10 bind=259 wait=2 unf=627 rewind=9 rebind=0 full=1
+[82/99] loading block 19606599 …
+  loaded n_tx=367 gas=29981684
+  occ        ok=true tps=34168 wall_ms=10.7 soft=0 aborts=90 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=90
+  specfence  ok=true tps=10879 wall_ms=33.7 soft=0 aborts=190 bind=4885 wait=48 unf=4699 rewind=142 rebind=4 full=81
+[83/99] loading block 19606600 …
+  loaded n_tx=237 gas=22095693
+  occ        ok=true tps=31749 wall_ms=7.5 soft=0 aborts=53 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=53
+  specfence  ok=true tps=7792 wall_ms=30.4 soft=0 aborts=174 bind=6324 wait=47 unf=3413 rewind=121 rebind=1 full=91
+[84/99] loading block 19638737 …
+  loaded n_tx=381 gas=15932416
+  occ        ok=true tps=90842 wall_ms=4.2 soft=0 aborts=14 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=14
+  specfence  ok=true tps=29966 wall_ms=12.7 soft=0 aborts=45 bind=1464 wait=15 unf=1731 rewind=42 rebind=0 full=14
+[85/99] loading block 19716145 …
+  loaded n_tx=341 gas=29995804
+  occ        ok=true tps=31975 wall_ms=10.7 soft=0 aborts=103 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=103
+  specfence  ok=true tps=12202 wall_ms=27.9 soft=0 aborts=164 bind=3290 wait=67 unf=3791 rewind=155 rebind=4 full=43
+[86/99] loading block 19737292 …
+  loaded n_tx=195 gas=29999921
+  occ        ok=true tps=51095 wall_ms=3.8 soft=0 aborts=29 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=29
+  specfence  ok=true tps=12369 wall_ms=15.8 soft=0 aborts=41 bind=836 wait=15 unf=2545 rewind=41 rebind=0 full=10
+[87/99] loading block 19807137 …
+  loaded n_tx=712 gas=29981386
+  occ        ok=true tps=66767 wall_ms=10.7 soft=0 aborts=572 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=572
+  specfence  ok=true tps=5408 wall_ms=131.7 soft=0 aborts=1825 bind=8853 wait=157 unf=3655 rewind=1872 rebind=113 full=79
+[88/99] loading block 19860366 …
+  loaded n_tx=430 gas=29969358
+  occ        ok=true tps=56813 wall_ms=7.6 soft=0 aborts=84 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=84
+  specfence  ok=true tps=14246 wall_ms=30.2 soft=0 aborts=180 bind=3546 wait=50 unf=4687 rewind=164 rebind=1 full=59
+[89/99] loading block 19910734 …
+  loaded n_tx=0 gas=0
+  occ        ok=true tps=0 wall_ms=0.0 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+  specfence  ok=true tps=0 wall_ms=0.0 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+[90/99] loading block 19917570 …
+  loaded n_tx=116 gas=12889065
+  occ        ok=true tps=46590 wall_ms=2.5 soft=0 aborts=9 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=9
+  specfence  ok=true tps=15589 wall_ms=7.4 soft=0 aborts=24 bind=472 wait=1 unf=1497 rewind=17 rebind=0 full=8
+[91/99] loading block 19923400 …
+  loaded n_tx=24 gas=1624049
+  occ        ok=true tps=27811 wall_ms=0.9 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+  specfence  ok=true tps=31847 wall_ms=0.8 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+[92/99] loading block 19929064 …
+  loaded n_tx=103 gas=7743849
+  occ        ok=true tps=43616 wall_ms=2.4 soft=0 aborts=18 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=18
+  specfence  ok=true tps=14054 wall_ms=7.3 soft=0 aborts=40 bind=928 wait=19 unf=1075 rewind=40 rebind=0 full=13
+[93/99] loading block 19932148 …
+  loaded n_tx=227 gas=14378808
+  occ        ok=true tps=38070 wall_ms=6.0 soft=0 aborts=45 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=45
+  specfence  ok=true tps=16057 wall_ms=14.1 soft=0 aborts=102 bind=1282 wait=28 unf=2297 rewind=96 rebind=0 full=28
+[94/99] loading block 19932703 …
+  loaded n_tx=143 gas=10421765
+  occ        ok=true tps=22212 wall_ms=6.4 soft=0 aborts=22 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=22
+  specfence  ok=true tps=12663 wall_ms=11.3 soft=0 aborts=37 bind=892 wait=9 unf=1375 rewind=31 rebind=0 full=13
+[95/99] loading block 19932810 …
+  loaded n_tx=270 gas=18643597
+  occ        ok=true tps=57388 wall_ms=4.7 soft=0 aborts=42 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=42
+  specfence  ok=true tps=15949 wall_ms=16.9 soft=0 aborts=108 bind=2107 wait=25 unf=2730 rewind=90 rebind=0 full=36
+[96/99] loading block 19933122 …
+  loaded n_tx=45 gas=2056821
+  occ        ok=true tps=49170 wall_ms=0.9 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+  specfence  ok=true tps=65176 wall_ms=0.7 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+[97/99] loading block 19933597 …
+  loaded n_tx=154 gas=12788678
+  occ        ok=true tps=49047 wall_ms=3.1 soft=0 aborts=18 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=18
+  specfence  ok=true tps=18383 wall_ms=8.4 soft=0 aborts=35 bind=873 wait=13 unf=1343 rewind=25 rebind=0 full=16
+[98/99] loading block 19933612 …
+  loaded n_tx=130 gas=11236414
+  occ        ok=true tps=49564 wall_ms=2.6 soft=0 aborts=19 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=19
+  specfence  ok=true tps=11794 wall_ms=11.0 soft=0 aborts=53 bind=1333 wait=19 unf=1743 rewind=54 rebind=0 full=15
+[99/99] loading block 19934116 …
+  loaded n_tx=58 gas=3365857
+  occ        ok=true tps=27394 wall_ms=2.1 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+  specfence  ok=true tps=28815 wall_ms=2.0 soft=0 aborts=0 bind=0 wait=0 unf=0 rewind=0 rebind=0 full=0
+=== process-trace top 10 worst SF/OCC: [19910734, 19807137, 6196166, 14689597, 8889776, 19469096, 12522062, 17666333, 14029313, 15538827] ===
+wrote process lab/results/all-blocks-process-19910734.json
+wrote process lab/results/all-blocks-process-19807137.json
+wrote process lab/results/all-blocks-process-6196166.json
+wrote process lab/results/all-blocks-process-14689597.json
+wrote process lab/results/all-blocks-process-8889776.json
+wrote process lab/results/all-blocks-process-19469096.json
+wrote process lab/results/all-blocks-process-12522062.json
+wrote process lab/results/all-blocks-process-17666333.json
+wrote process lab/results/all-blocks-process-14029313.json
+wrote process lab/results/all-blocks-process-15538827.json
+DONE loaded=99/99 skipped=0 pairs=99 median_sf_occ=0.319 mean=1.176 -> lab/results/decision-field-99-sf-occ-sweep.json

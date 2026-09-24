@@ -1,0 +1,49 @@
+{
+  "block": 14689597,
+  "cores": 8,
+  "base_tip": "83412fe",
+  "cuts": [
+    "Bind-on-Data without is_done park (OCC-like Data consume; SuffixRepair on conflict)",
+    "WaitHard \u2192 BlockingOther steal (no FenceGraph SoftWait Soft arm)",
+    "rem PartialRetryState: UnsafeCell (single-executor) + note_access_certified_checkpoint one-lock",
+    "scheduler done_flags lock-free is_done",
+    "skip has_force_bind DashMap on incarnation 0",
+    "validate checkpoint_opportunity O(1) not O(|reads|)",
+    "lightweight EffectBoundary cp (no BoundarySnapshot alloc)"
+  ],
+  "wall_ms": {
+    "tip_n7_median": 14.1,
+    "tip_n11_median": 14.7,
+    "this_n7_median": 14.0,
+    "this_n11_median": 13.7,
+    "this_n7_min": 13.2,
+    "this_n11_min": 12.8,
+    "occ_median_n7": 3.7,
+    "occ_median_n11": 3.8
+  },
+  "soft_wait_arms_median": {
+    "tip": 0,
+    "this_n7": 0,
+    "this_n11": 0
+  },
+  "profile_buckets_last_iter_approx_ms": {
+    "maybe_wait_tip": 40.6,
+    "maybe_wait_this": 30.5,
+    "handler_this": 51.4,
+    "validate_this": 40.0,
+    "bo_idle_tip": 18.7,
+    "bo_idle_this": 1.6,
+    "softwait_soft_idle_this": 0.0,
+    "rebind_this": 3
+  },
+  "validation": {
+    "lib_tests": 92,
+    "specfence_tests": "23 passed, 13 ignored",
+    "hang": false,
+    "abort_storm": false,
+    "seq_eq_par": true
+  },
+  "stretch_lt15": true,
+  "stretch_lt10": false,
+  "note": "BO idle ~19\u21921.6; maybe_wait ~41\u219230; SoftWait 0; wall N=7 14.1\u219214.0, N=11 14.7\u219213.7. Stretch <10 not met \u2014 residual validate/SuffixRepair + rem/EVM tax vs OCC ~3.7."
+}

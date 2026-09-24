@@ -1,0 +1,766 @@
+{
+  "test": "all ethereum blocks SF vs OCC@8",
+  "head": "f74f875",
+  "cores": 8,
+  "iters": 3,
+  "coverage": {
+    "candidates": 1,
+    "loaded": 1,
+    "skipped": 0,
+    "ok_pairs": 1
+  },
+  "skipped": [],
+  "summary": {
+    "n_pairs": 1,
+    "sf_occ": {
+      "median": 0.26211861122675645,
+      "p10_worst": 0.26211861122675645,
+      "p90": 0.26211861122675645,
+      "min": 0.26211861122675645,
+      "mean": 0.26211861122675645
+    },
+    "wall_ratio_sf_over_occ": {
+      "median": 3.815066756686381,
+      "p90": 3.815066756686381,
+      "min": 3.815066756686381,
+      "mean": 3.815066756686381
+    },
+    "sf_tps": {
+      "median": 20303.17609711398,
+      "p90": 20303.17609711398,
+      "mean": 20303.17609711398
+    },
+    "occ_tps": {
+      "median": 77457.97218324908,
+      "p90": 77457.97218324908,
+      "mean": 77457.97218324908
+    },
+    "sf_wall_ms": {
+      "median": 27.778904999999998,
+      "p90": 27.778904999999998
+    },
+    "occ_wall_ms": {
+      "median": 7.281368,
+      "p90": 7.281368
+    },
+    "morph_counts": {
+      "spine": 1
+    },
+    "soft_wait_arms_nonzero_blocks": [],
+    "worst10_sf_occ": [
+      {
+        "block": 14689597,
+        "n_tx": 564,
+        "gas_used": 30028257,
+        "sf_tps": 20303.17609711398,
+        "occ_tps": 77457.97218324908,
+        "sf_occ": 0.26211861122675645,
+        "sf_wall_ms": 27.778904999999998,
+        "occ_wall_ms": 7.281368,
+        "wall_ratio": 3.815066756686381,
+        "morph_heuristic": "spine",
+        "dominant_metric": "full_abort_reexecute=189",
+        "soft_wait_arms": 0,
+        "edge_ordered_admit": 0,
+        "edge_wait_for": 6,
+        "edge_optimistic_read": 80,
+        "avoid_broadcasts": 137,
+        "rebind_only": 0,
+        "full_abort_reexecute": 189,
+        "rewind_to_cp": 9,
+        "occ_aborts_sf": 189,
+        "occ_aborts_occ": 50,
+        "hotset_size": 19,
+        "wait_park_count": 205,
+        "wait_for_dependency": 9,
+        "wait_for_full_abort": 196,
+        "ordered_admit_after_done": 0,
+        "partial_abort_win": 0,
+        "partial_abort_attempt": 0,
+        "refuse_admit": 2,
+        "park_resume_at_k": 9,
+        "park_resume_full_abort_reexecute": 0
+      }
+    ],
+    "best10_sf_occ": [
+      {
+        "block": 14689597,
+        "n_tx": 564,
+        "gas_used": 30028257,
+        "sf_tps": 20303.17609711398,
+        "occ_tps": 77457.97218324908,
+        "sf_occ": 0.26211861122675645,
+        "sf_wall_ms": 27.778904999999998,
+        "occ_wall_ms": 7.281368,
+        "wall_ratio": 3.815066756686381,
+        "morph_heuristic": "spine",
+        "dominant_metric": "full_abort_reexecute=189",
+        "soft_wait_arms": 0,
+        "edge_ordered_admit": 0,
+        "edge_wait_for": 6,
+        "edge_optimistic_read": 80,
+        "avoid_broadcasts": 137,
+        "rebind_only": 0,
+        "full_abort_reexecute": 189,
+        "rewind_to_cp": 9,
+        "occ_aborts_sf": 189,
+        "occ_aborts_occ": 50,
+        "hotset_size": 19,
+        "wait_park_count": 205,
+        "wait_for_dependency": 9,
+        "wait_for_full_abort": 196,
+        "ordered_admit_after_done": 0,
+        "partial_abort_win": 0,
+        "partial_abort_attempt": 0,
+        "refuse_admit": 2,
+        "park_resume_at_k": 9,
+        "park_resume_full_abort_reexecute": 0
+      }
+    ]
+  },
+  "block_pairs": [
+    {
+      "block": 14689597,
+      "n_tx": 564,
+      "gas_used": 30028257,
+      "sf_tps": 20303.17609711398,
+      "occ_tps": 77457.97218324908,
+      "sf_occ": 0.26211861122675645,
+      "sf_wall_ms": 27.778904999999998,
+      "occ_wall_ms": 7.281368,
+      "wall_ratio": 3.815066756686381,
+      "morph_heuristic": "spine",
+      "dominant_metric": "full_abort_reexecute=189",
+      "soft_wait_arms": 0,
+      "edge_ordered_admit": 0,
+      "edge_wait_for": 6,
+      "edge_optimistic_read": 80,
+      "avoid_broadcasts": 137,
+      "rebind_only": 0,
+      "full_abort_reexecute": 189,
+      "rewind_to_cp": 9,
+      "occ_aborts_sf": 189,
+      "occ_aborts_occ": 50,
+      "hotset_size": 19,
+      "wait_park_count": 205,
+      "wait_for_dependency": 9,
+      "wait_for_full_abort": 196,
+      "ordered_admit_after_done": 0,
+      "partial_abort_win": 0,
+      "partial_abort_attempt": 0,
+      "refuse_admit": 2,
+      "park_resume_at_k": 9,
+      "park_resume_full_abort_reexecute": 0
+    }
+  ],
+  "process_top": [
+    {
+      "block": 14689597,
+      "path": "all-blocks-process-14689597.json",
+      "process_summary": {
+        "optimistic_read_total": 111,
+        "wait_for_total": 7,
+        "ordered_admit_total": 0,
+        "optimistic_read_after_avoid_total": 0,
+        "force_prefix_none_optimistic_read": 0,
+        "independent_optimistic_read_total": 0,
+        "optimistic_read_after_pessimistic_admit_on_hot_l": 0,
+        "reason_histogram": {
+          "optimistic_read_after_avoid": 0,
+          "optimistic_read_canary": 0,
+          "optimistic_read_cold": 111,
+          "optimistic_read_independence": 0,
+          "optimistic_read_inversion": 0,
+          "optimistic_read_plant_tls": 0,
+          "optimistic_read_writer_done": 0,
+          "ordered_admit_published": 0,
+          "wait_for_canary": 0,
+          "wait_for_prefix": 0,
+          "wait_for_serial": 0,
+          "wait_for_writer": 7
+        },
+        "hot_fanout_l": {
+          "location": 17702941225697825771,
+          "ordered_admit": 0,
+          "wait_for": 3,
+          "optimistic_read": 0,
+          "optimistic_read_before_avoid": 0,
+          "optimistic_read_after_avoid": 0,
+          "wait_after_avoid": 3,
+          "ordered_admit_after_avoid": 0,
+          "optimistic_read_after_canary": 0,
+          "first_avoid_seq": 2,
+          "first_canary_seq": 0,
+          "first_pessimistic_admit_seq": 2,
+          "reasons": {
+            "wait_for_writer": 3
+          }
+        },
+        "per_tx_len": 44,
+        "mixed_verb_intra_tx": 6
+      },
+      "wall_ms": 44.812424,
+      "metrics": {
+        "soft_wait_arms": 0,
+        "wait_hard": 7,
+        "occ_aborts": 530,
+        "edge_ordered_admit": 0,
+        "edge_wait_for": 7,
+        "edge_optimistic_read": 111,
+        "avoid_broadcasts": 126,
+        "canary_probes": 0,
+        "independent_optimistic_read": 0,
+        "force_prefix_optimistic_read": 0,
+        "prefer_admit": 0,
+        "multi_spine_admit": 0,
+        "quiet_pessimistic_revoke": 0,
+        "ordered_admit_residual": 0,
+        "canary_reopen": 0,
+        "writer_done_learned": 0,
+        "detect_accesses": 0,
+        "predicted_essential_hits": 118,
+        "pcc_fire_at_a": 7,
+        "pcc_roi_skip": 0,
+        "optimistic_read_occ_fast": 111,
+        "occ_kernel_execs": 5654,
+        "pcc_kernel_execs": 12,
+        "occ_kernel_validates": 3487,
+        "prefix_skip_roi_full_abort": 0,
+        "force_prefix_as_pi": 0,
+        "canary_live_verb": 0,
+        "inc_avoid_hits": 0,
+        "h_or_wait_door": 0,
+        "morph_pessimistic_actuator": 0,
+        "writer_validated_ordered_admit_gate": 0,
+        "flat_edgekey_sot": 0,
+        "writer_identity_preserved": 0,
+        "rebind_only": 0,
+        "full_abort_reexecute": 530,
+        "rewind_to_cp": 6,
+        "evm_entries": 5654,
+        "reexec_entries": 5090,
+        "resume_count": 6,
+        "ordered_admit_hits": 0,
+        "optimistic_read_count": 111,
+        "lean_mode_txs": 5660,
+        "hotset_size": 13,
+        "ready_steal_on_wait": 498,
+        "wait_park_count": 511,
+        "wait_park_ns": 2335004179,
+        "force_ordered_admit_reabort": 0,
+        "fanout_fr_collapse": 0,
+        "fanout_validate_defer": 0,
+        "fanout_absorb": 0,
+        "tx_full_abort_reexecute": 0,
+        "partial_retry_count": 0,
+        "await_at_a_arms": 0,
+        "engagement_switches": 0,
+        "journal_ff_hits": 76,
+        "cold_optimistic_fast": 0,
+        "occ_fast_first": 0,
+        "profile_handler_ns": 0,
+        "profile_maybe_wait_ns": 0,
+        "profile_validate_ns": 0,
+        "profile_scheduler_ns": 0,
+        "wait_for_dependency": 6,
+        "wait_for_full_abort": 505,
+        "refuse_admit": 0,
+        "ordered_admit_after_done": 0,
+        "partial_abort_win": 0,
+        "partial_abort_attempt": 0,
+        "park_resume_at_k": 6,
+        "park_resume_full_abort_reexecute": 0
+      }
+    }
+  ],
+  "rows": [
+    {
+      "block": 14689597,
+      "mode": "occ",
+      "cores": 8,
+      "iters": 3,
+      "ok": true,
+      "error": null,
+      "n_tx": 564,
+      "gas_used": 30028257,
+      "tps": 77457.97218324908,
+      "tps_mean": 86702.68427808331,
+      "tps_p90": 110283.14023029231,
+      "tps_min": 72366.94042070855,
+      "wall_ms": 7.281368,
+      "wall_ms_median": 7.281368,
+      "wall_ms_p90": 7.793614,
+      "wall_ms_min": 5.114109,
+      "wall_ms_mean": 6.729696999999999,
+      "metrics": {
+        "soft_wait_arms": 0,
+        "wait_hard": 0,
+        "occ_aborts": 50,
+        "edge_ordered_admit": 0,
+        "edge_wait_for": 0,
+        "edge_optimistic_read": 0,
+        "avoid_broadcasts": 0,
+        "canary_probes": 0,
+        "independent_optimistic_read": 0,
+        "force_prefix_optimistic_read": 0,
+        "prefer_admit": 0,
+        "multi_spine_admit": 0,
+        "quiet_pessimistic_revoke": 0,
+        "ordered_admit_residual": 0,
+        "canary_reopen": 0,
+        "writer_done_learned": 0,
+        "detect_accesses": 0,
+        "predicted_essential_hits": 0,
+        "pcc_fire_at_a": 0,
+        "pcc_roi_skip": 0,
+        "optimistic_read_occ_fast": 0,
+        "occ_kernel_execs": 0,
+        "pcc_kernel_execs": 0,
+        "occ_kernel_validates": 0,
+        "prefix_skip_roi_full_abort": 0,
+        "force_prefix_as_pi": 0,
+        "canary_live_verb": 0,
+        "inc_avoid_hits": 0,
+        "h_or_wait_door": 0,
+        "morph_pessimistic_actuator": 0,
+        "writer_validated_ordered_admit_gate": 0,
+        "flat_edgekey_sot": 0,
+        "writer_identity_preserved": 0,
+        "rebind_only": 0,
+        "full_abort_reexecute": 50,
+        "rewind_to_cp": 0,
+        "evm_entries": 0,
+        "reexec_entries": 0,
+        "resume_count": 0,
+        "ordered_admit_hits": 0,
+        "optimistic_read_count": 0,
+        "lean_mode_txs": 0,
+        "hotset_size": 0,
+        "ready_steal_on_wait": 0,
+        "wait_park_count": 0,
+        "wait_park_ns": 0,
+        "force_ordered_admit_reabort": 0,
+        "fanout_fr_collapse": 0,
+        "fanout_validate_defer": 0,
+        "fanout_absorb": 0,
+        "tx_full_abort_reexecute": 0,
+        "partial_retry_count": 0,
+        "await_at_a_arms": 0,
+        "engagement_switches": 0,
+        "journal_ff_hits": 0,
+        "cold_optimistic_fast": 0,
+        "occ_fast_first": 0,
+        "profile_handler_ns": 0,
+        "profile_maybe_wait_ns": 0,
+        "profile_validate_ns": 0,
+        "profile_scheduler_ns": 0,
+        "wait_for_dependency": 0,
+        "wait_for_full_abort": 0,
+        "refuse_admit": 0,
+        "ordered_admit_after_done": 0,
+        "partial_abort_win": 0,
+        "partial_abort_attempt": 0,
+        "park_resume_at_k": 0,
+        "park_resume_full_abort_reexecute": 0
+      }
+    },
+    {
+      "block": 14689597,
+      "mode": "specfence",
+      "cores": 8,
+      "iters": 3,
+      "ok": true,
+      "error": null,
+      "n_tx": 564,
+      "gas_used": 30028257,
+      "tps": 20303.17609711398,
+      "tps_mean": 23307.4789649345,
+      "tps_p90": 32402.251198107708,
+      "tps_min": 17217.00959958181,
+      "wall_ms": 27.778904999999998,
+      "wall_ms_median": 27.778904999999998,
+      "wall_ms_p90": 32.758302,
+      "wall_ms_min": 17.406198,
+      "wall_ms_mean": 25.981135,
+      "metrics": {
+        "soft_wait_arms": 0,
+        "wait_hard": 6,
+        "occ_aborts": 189,
+        "edge_ordered_admit": 0,
+        "edge_wait_for": 6,
+        "edge_optimistic_read": 80,
+        "avoid_broadcasts": 137,
+        "canary_probes": 0,
+        "independent_optimistic_read": 0,
+        "force_prefix_optimistic_read": 0,
+        "prefer_admit": 0,
+        "multi_spine_admit": 0,
+        "quiet_pessimistic_revoke": 0,
+        "ordered_admit_residual": 0,
+        "canary_reopen": 0,
+        "writer_done_learned": 0,
+        "detect_accesses": 0,
+        "predicted_essential_hits": 86,
+        "pcc_fire_at_a": 6,
+        "pcc_roi_skip": 0,
+        "optimistic_read_occ_fast": 80,
+        "occ_kernel_execs": 976,
+        "pcc_kernel_execs": 14,
+        "occ_kernel_validates": 2607,
+        "prefix_skip_roi_full_abort": 0,
+        "force_prefix_as_pi": 0,
+        "canary_live_verb": 0,
+        "inc_avoid_hits": 0,
+        "h_or_wait_door": 0,
+        "morph_pessimistic_actuator": 0,
+        "writer_validated_ordered_admit_gate": 0,
+        "flat_edgekey_sot": 0,
+        "writer_identity_preserved": 0,
+        "rebind_only": 0,
+        "full_abort_reexecute": 189,
+        "rewind_to_cp": 9,
+        "evm_entries": 976,
+        "reexec_entries": 412,
+        "resume_count": 9,
+        "ordered_admit_hits": 0,
+        "optimistic_read_count": 88,
+        "lean_mode_txs": 985,
+        "hotset_size": 19,
+        "ready_steal_on_wait": 142,
+        "wait_park_count": 205,
+        "wait_park_ns": 55068075,
+        "force_ordered_admit_reabort": 0,
+        "fanout_fr_collapse": 0,
+        "fanout_validate_defer": 0,
+        "fanout_absorb": 0,
+        "tx_full_abort_reexecute": 0,
+        "partial_retry_count": 0,
+        "await_at_a_arms": 0,
+        "engagement_switches": 0,
+        "journal_ff_hits": 122,
+        "cold_optimistic_fast": 0,
+        "occ_fast_first": 0,
+        "profile_handler_ns": 0,
+        "profile_maybe_wait_ns": 0,
+        "profile_validate_ns": 0,
+        "profile_scheduler_ns": 0,
+        "wait_for_dependency": 9,
+        "wait_for_full_abort": 196,
+        "refuse_admit": 2,
+        "ordered_admit_after_done": 0,
+        "partial_abort_win": 0,
+        "partial_abort_attempt": 0,
+        "park_resume_at_k": 9,
+        "park_resume_full_abort_reexecute": 0
+      },
+      "decision_fields": {
+        "n_decisions": 6,
+        "verb": {
+          "ordered_admit": 0,
+          "wait_for": 6,
+          "optimistic_read": 0
+        },
+        "binary": {
+          "avoid_broadcast": {
+            "false": {
+              "ordered_admit": 0,
+              "wait_for": 6,
+              "optimistic_read": 0
+            },
+            "true": {
+              "ordered_admit": 0,
+              "wait_for": 0,
+              "optimistic_read": 0
+            }
+          },
+          "canary_ok": {
+            "false": {
+              "ordered_admit": 0,
+              "wait_for": 6,
+              "optimistic_read": 0
+            },
+            "true": {
+              "ordered_admit": 0,
+              "wait_for": 0,
+              "optimistic_read": 0
+            }
+          },
+          "clique_gated": {
+            "false": {
+              "ordered_admit": 0,
+              "wait_for": 6,
+              "optimistic_read": 0
+            },
+            "true": {
+              "ordered_admit": 0,
+              "wait_for": 0,
+              "optimistic_read": 0
+            }
+          },
+          "essential_antidep": {
+            "false": {
+              "ordered_admit": 0,
+              "wait_for": 0,
+              "optimistic_read": 0
+            },
+            "true": {
+              "ordered_admit": 0,
+              "wait_for": 6,
+              "optimistic_read": 0
+            }
+          },
+          "force_prefix": {
+            "false": {
+              "ordered_admit": 0,
+              "wait_for": 6,
+              "optimistic_read": 0
+            },
+            "true": {
+              "ordered_admit": 0,
+              "wait_for": 0,
+              "optimistic_read": 0
+            }
+          },
+          "in_hot_set_H": {
+            "false": {
+              "ordered_admit": 0,
+              "wait_for": 6,
+              "optimistic_read": 0
+            },
+            "true": {
+              "ordered_admit": 0,
+              "wait_for": 0,
+              "optimistic_read": 0
+            }
+          },
+          "independence_certified": {
+            "false": {
+              "ordered_admit": 0,
+              "wait_for": 6,
+              "optimistic_read": 0
+            },
+            "true": {
+              "ordered_admit": 0,
+              "wait_for": 0,
+              "optimistic_read": 0
+            }
+          },
+          "is_program": {
+            "false": {
+              "ordered_admit": 0,
+              "wait_for": 0,
+              "optimistic_read": 0
+            },
+            "true": {
+              "ordered_admit": 0,
+              "wait_for": 6,
+              "optimistic_read": 0
+            }
+          },
+          "mode_read": {
+            "false": {
+              "ordered_admit": 0,
+              "wait_for": 0,
+              "optimistic_read": 0
+            },
+            "true": {
+              "ordered_admit": 0,
+              "wait_for": 6,
+              "optimistic_read": 0
+            }
+          },
+          "prior_warm": {
+            "false": {
+              "ordered_admit": 0,
+              "wait_for": 6,
+              "optimistic_read": 0
+            },
+            "true": {
+              "ordered_admit": 0,
+              "wait_for": 0,
+              "optimistic_read": 0
+            }
+          },
+          "reserved": {
+            "false": {
+              "ordered_admit": 0,
+              "wait_for": 0,
+              "optimistic_read": 0
+            },
+            "true": {
+              "ordered_admit": 0,
+              "wait_for": 0,
+              "optimistic_read": 0
+            }
+          },
+          "writer_executing": {
+            "false": {
+              "ordered_admit": 0,
+              "wait_for": 0,
+              "optimistic_read": 0
+            },
+            "true": {
+              "ordered_admit": 0,
+              "wait_for": 6,
+              "optimistic_read": 0
+            }
+          },
+          "writer_present": {
+            "false": {
+              "ordered_admit": 0,
+              "wait_for": 0,
+              "optimistic_read": 0
+            },
+            "true": {
+              "ordered_admit": 0,
+              "wait_for": 6,
+              "optimistic_read": 0
+            }
+          },
+          "writer_published": {
+            "false": {
+              "ordered_admit": 0,
+              "wait_for": 6,
+              "optimistic_read": 0
+            },
+            "true": {
+              "ordered_admit": 0,
+              "wait_for": 0,
+              "optimistic_read": 0
+            }
+          },
+          "writer_ready": {
+            "false": {
+              "ordered_admit": 0,
+              "wait_for": 6,
+              "optimistic_read": 0
+            },
+            "true": {
+              "ordered_admit": 0,
+              "wait_for": 0,
+              "optimistic_read": 0
+            }
+          },
+          "writer_validated": {
+            "false": {
+              "ordered_admit": 0,
+              "wait_for": 6,
+              "optimistic_read": 0
+            },
+            "true": {
+              "ordered_admit": 0,
+              "wait_for": 0,
+              "optimistic_read": 0
+            }
+          }
+        },
+        "k_bucket": {
+          "k0": {
+            "ordered_admit": 0,
+            "wait_for": 0,
+            "optimistic_read": 0
+          },
+          "k16p": {
+            "ordered_admit": 0,
+            "wait_for": 5,
+            "optimistic_read": 0
+          },
+          "k1_3": {
+            "ordered_admit": 0,
+            "wait_for": 0,
+            "optimistic_read": 0
+          },
+          "k4_7": {
+            "ordered_admit": 0,
+            "wait_for": 1,
+            "optimistic_read": 0
+          },
+          "k8_15": {
+            "ordered_admit": 0,
+            "wait_for": 0,
+            "optimistic_read": 0
+          }
+        },
+        "depth_bucket": {
+          "d0": {
+            "ordered_admit": 0,
+            "wait_for": 6,
+            "optimistic_read": 0
+          },
+          "d1_3": {
+            "ordered_admit": 0,
+            "wait_for": 0,
+            "optimistic_read": 0
+          },
+          "d4_7": {
+            "ordered_admit": 0,
+            "wait_for": 0,
+            "optimistic_read": 0
+          },
+          "d8p": {
+            "ordered_admit": 0,
+            "wait_for": 0,
+            "optimistic_read": 0
+          }
+        },
+        "inc_bucket": {
+          "inc0": {
+            "ordered_admit": 0,
+            "wait_for": 0,
+            "optimistic_read": 0
+          },
+          "inc1": {
+            "ordered_admit": 0,
+            "wait_for": 0,
+            "optimistic_read": 0
+          },
+          "inc2p": {
+            "ordered_admit": 0,
+            "wait_for": 6,
+            "optimistic_read": 0
+          }
+        },
+        "writer_status": {
+          "executing": {
+            "ordered_admit": 0,
+            "wait_for": 6,
+            "optimistic_read": 0
+          },
+          "none": {
+            "ordered_admit": 0,
+            "wait_for": 0,
+            "optimistic_read": 0
+          },
+          "other": {
+            "ordered_admit": 0,
+            "wait_for": 0,
+            "optimistic_read": 0
+          },
+          "ready": {
+            "ordered_admit": 0,
+            "wait_for": 0,
+            "optimistic_read": 0
+          },
+          "validated": {
+            "ordered_admit": 0,
+            "wait_for": 0,
+            "optimistic_read": 0
+          }
+        },
+        "edge_kind_wr": {
+          "ordered_admit": 0,
+          "wait_for": 6,
+          "optimistic_read": 0
+        },
+        "quality": {
+          "missed_avoid": 0,
+          "false_fence_wait": 0,
+          "wait_no_writer": 0,
+          "ordered_admit_no_publish": 0,
+          "optimistic_read_essential": 0
+        }
+      }
+    }
+  ],
+  "status": "complete"
+}

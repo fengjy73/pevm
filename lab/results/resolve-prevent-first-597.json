@@ -1,0 +1,69 @@
+{
+  "block": 14689597,
+  "cores": 8,
+  "base_tip": "9836720",
+  "diagnosis": {
+    "first_abort_grain": "incarnation-0 / sticky unfinished published Data \u2192 Bind-no-park (read past unfinished writer) \u2192 validate fail \u2192 SuffixRepair+force_bind",
+    "force_prefix_already": "spin64 + BlockingOther prefer-steal Await then Bind",
+    "gap": "sticky / hot_inc0 only yield-spun then Bind-no-park; prior_inc0 unfinished Data not BO-awaited before first fail"
+  },
+  "cuts": [
+    "unfinished Data: prefer_await = force_prefix || sticky || prior_inc0 \u2192 spin64 + BO prefer-steal Await then Bind (extend force_prefix to incarn0 prior/sticky)",
+    "no-Data unfinished: prior || hot || sticky \u2192 BO Await before SpecRead",
+    "keep ESTIMATE\u2192SpecRead on incarn0 (ESTIMATE\u2192BO wall\u2191)",
+    "keep SoftWait Soft=0; escalate-after-1-reabort; RebindOnly"
+  ],
+  "same_machine_tip_baseline_n7": {
+    "wall_ms_median": 14.0,
+    "occ_aborts_median": 210,
+    "resume_last": 91,
+    "force_bind_reabort_last": 99,
+    "full_restart_last": 99,
+    "soft_wait": 0
+  },
+  "this_n7_trip": {
+    "wall_ms_median": [
+      13.5,
+      13.2,
+      14.2
+    ],
+    "best_wall_ms_median": 13.2,
+    "occ_aborts_median": [
+      201,
+      204,
+      204
+    ],
+    "resume_last": [
+      85,
+      84,
+      77
+    ],
+    "force_bind_reabort_last": [
+      93,
+      96,
+      76
+    ],
+    "full_restart_last": [
+      93,
+      96,
+      76
+    ],
+    "soft_wait": 0
+  },
+  "this_n11": {
+    "wall_ms_median": 13.8,
+    "occ_aborts_median": 200,
+    "resume_last": 101,
+    "force_bind_reabort_last": 100,
+    "soft_wait": 0
+  },
+  "validation": {
+    "lib_tests": 93,
+    "specfence_tests": "23 passed, 13 ignored",
+    "hang": false,
+    "seq_eq_par": true,
+    "soft_wait_soft": 0
+  },
+  "stretch_lt10": false,
+  "note": "PARTIAL SUCCESS vs same-machine tip baseline: resume/fb/full_restart down; wall best 13.2 vs baseline 14.0 (recorded tip 12.8 was hotter box); SoftWait 0; <10 not met."
+}

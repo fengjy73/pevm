@@ -1,0 +1,30 @@
+{
+  "plant": "specfence-v6-essence-full",
+  "honesty": "fresh Pevm + reset_inter_prior; Soft=0; drop n_tx==0",
+  "all_blocks_n1": {
+    "json": "lab/results/v6-essence-all-blocks-sweep.json",
+    "nonempty": 98,
+    "median_sf_occ": 0.7949,
+    "p10": 0.5383,
+    "min": 0.1615,
+    "mean": 2.6025,
+    "ge_0_7": 61,
+    "ge_1_0": 26,
+    "quiet_n": 38,
+    "quiet_median": 1.047,
+    "quiet_p10": 0.6437,
+    "quiet_ge1": "23/38",
+    "soft": 0,
+    "edge_bind": 972,
+    "edge_wait_for": 1047,
+    "occ_aborts_sf": 5474,
+    "occ_aborts_occ": 3771
+  },
+  "named_n1": {
+    "14689597": { "sf_occ": 0.1615, "sf_ms": 28.02, "occ_ms": 4.52, "ab_sf": 624, "ab_occ": 66, "bind": 535, "wait": 20 },
+    "2179522": { "sf_occ": 39.9549, "sf_ms": 1.21, "occ_ms": 48.49, "ab_sf": 0, "ab_occ": 1, "note": "OCC-slow N=1 — do not advertise. Sister named file OCC-fast was 0.238" },
+    "19807137": { "sf_occ": 0.3498, "sf_ms": 46.8, "occ_ms": 16.37, "ab_sf": 1714, "ab_occ": 1146 }
+  },
+  "bar": { "nonempty_median_gt": 0.744, "hit": true, "pc_file": 0.744, "soft": 0 },
+  "note": "Full live plant: empty PE => OCC computer; after abort PE, decide WaitFor/Bind/SerialLane without rem overlay. 14689597 Bind tax still loses that block. Quiet median 1.047."
+}
