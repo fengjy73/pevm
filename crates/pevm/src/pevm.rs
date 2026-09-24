@@ -778,7 +778,12 @@ impl Pevm {
         });
 
         if self.concurrency_mode == ConcurrencyMode::SpecFence {
-            let (report, next) = access_spine.end_block();
+            let (mut report, next) = access_spine.end_block();
+            report.exact_wakes = runnable.exact_wakes();
+            report.idle_parks = runnable.idle_parks();
+            report.help_releases = runnable.help_releases();
+            report.steal_n = runnable.steal_n();
+            report.idle_spins = runnable.idle_spins();
             self.spine_prior = next;
             self.last_spine = report;
         }

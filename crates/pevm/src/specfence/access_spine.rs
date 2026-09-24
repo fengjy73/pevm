@@ -298,6 +298,24 @@ pub struct SpineReport {
     pub tip_already: usize,
     /// Writer indexes carried on the ordered chain (0 when cold).
     pub chain_len: usize,
+    /// High-water mark of concurrent spine owners. IdleStealWake keeps this ≤1.
+    pub spine_cores_max: usize,
+    /// Owners still held at `end_block` (leak if non-zero).
+    pub spine_cores_end: usize,
+    /// Handoff slot claims that entered execution.
+    pub handoff_claims: usize,
+    /// Second core refused because a spine owner was already live.
+    pub claim_denied: usize,
+    /// `unpark` of exactly one idle worker.
+    pub exact_wakes: usize,
+    /// Idle parks (ExactWakeToken, not a broadcast).
+    pub idle_parks: usize,
+    /// HelpRelease picks taken only after AdmitIndep was empty.
+    pub help_releases: usize,
+    /// Cross-core AdmitSteal hits (also mirrored on the metrics snapshot).
+    pub steal_n: usize,
+    /// Scheduler idle entries.
+    pub idle_spins: usize,
 }
 
 /// Shared per-block spine. Workers share it. The Avoid table starts empty.
@@ -332,6 +350,11 @@ pub(crate) struct AccessSpine {
     ordered_handoff: AtomicUsize,
     retain_keeps: AtomicUsize,
     tip_already: AtomicUsize,
+    /// `usize::MAX` when no chain hop owns a core.
+    spine_owner: AtomicUsize,
+    spine_cores_max: AtomicUsize,
+    handoff_claims: AtomicUsize,
+    claim_denied: AtomicUsize,
 }
 
 impl AccessSpine {
@@ -364,7 +387,55 @@ impl AccessSpine {
             ordered_handoff: AtomicUsize::new(0),
             retain_keeps: AtomicUsize::new(0),
             tip_already: AtomicUsize::new(0),
+            spine_owner: AtomicUsize::new(usize::MAX),
+            spine_cores_max: AtomicUsize::new(0),
+            handoff_claims: AtomicUsize::new(0),
+            claim_denied: AtomicUsize::new(0),
         }
+    }
+
+    /// A chain hop already occupies a core. Callers must not start another.
+    #[inline]
+    pub(crate) fn spine_busy(&self) -> bool {
+        self.spine_owner.load(Ordering::Acquire) != usize::MAX
+    }
+
+    /// Claim the single spine owner. Fails closed when another hop is live.
+    #[inline]
+    pub(crate) fn try_acquire(&self, tx: TxIdx) -> bool {
+        match self
+            .spine_owner
+            .compare_exchange(usize::MAX, tx, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => {
+                self.spine_cores_max.fetch_max(1, Ordering::Relaxed);
+                true
+            }
+            Err(cur) if cur == tx => true,
+            Err(_) => {
+                self.claim_denied.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
+    }
+
+    /// Drop ownership when this hop finishes, blocks, or the claim is abandoned.
+    #[inline]
+    pub(crate) fn release_owner_tx(&self, tx: TxIdx) {
+        let _ =
+            self.spine_owner
+                .compare_exchange(tx, usize::MAX, Ordering::AcqRel, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn note_handoff_claim(&self) {
+        self.handoff_claims.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Put `tx` in the slot only when it is empty. Does not count a new publish.
+    #[inline]
+    pub(crate) fn offer_handoff_if_absent(&self, tx: TxIdx) {
+        self.restore_handoff(tx);
     }
 
     /// This tx is on the carried writer chain.
@@ -768,6 +839,15 @@ impl AccessSpine {
             retain_keeps: self.retain_keeps.load(Ordering::Relaxed),
             tip_already: self.tip_already.load(Ordering::Relaxed),
             chain_len: self.ordered_writers.len(),
+            spine_cores_max: self.spine_cores_max.load(Ordering::Relaxed),
+            spine_cores_end: usize::from(self.spine_owner.load(Ordering::Acquire) != usize::MAX),
+            handoff_claims: self.handoff_claims.load(Ordering::Relaxed),
+            claim_denied: self.claim_denied.load(Ordering::Relaxed),
+            exact_wakes: 0,
+            idle_parks: 0,
+            help_releases: 0,
+            steal_n: 0,
+            idle_spins: 0,
         };
         (report, next)
     }
@@ -1102,6 +1182,18 @@ mod tests {
         // One large negative WAR step (14689598→99 style, Δwar = -17).
         let revoke = page_hinkley_step(&mut prior, -17.0);
         assert!(revoke);
+    }
+
+    #[test]
+    fn spine_owner_stays_one() {
+        let spine = AccessSpine::begin(SpinePrior::default(), 4);
+        assert!(spine.try_acquire(3));
+        assert!(!spine.try_acquire(4), "second hop must not share the core");
+        assert!(spine.spine_busy());
+        spine.release_owner_tx(3);
+        assert!(spine.try_acquire(4));
+        spine.release_owner_tx(4);
+        assert!(!spine.spine_busy());
     }
 
     #[test]

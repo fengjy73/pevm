@@ -349,7 +349,7 @@ fn print_focus(pevm: &Pevm, mode_name: &str, i: usize, n: usize, m: &pevm::SpecF
             .unwrap_or(0.0)
     };
     println!(
-        "  focus {mode_name}[{i}] full={} full_from_0={} prefix={} fail_k_n={} fail_k_min={} fail_k_max={} hist={} chain={loc:016x} chain_n={} head_tx={} head_ms={:.3} tail_tx={} tail_ms={:.3} corr={corr:.3} low_q_ms={:.3} high_q_ms={:.3} explore={} began_prior={} detect_a={} avoid_b={} resolve_c={} early_tip={} est_block={} raw_ab={} raw_c={} war_ab={} war_c={} waw_ab={} waw_c={} chain_ab={} chain_c={} protect={} pbo={} replay_after={}",
+        "  focus {mode_name}[{i}] full={} full_from_0={} prefix={} fail_k_n={} fail_k_min={} fail_k_max={} hist={} chain={loc:016x} chain_n={} head_tx={} head_ms={:.3} tail_tx={} tail_ms={:.3} span_ms={:.3} corr={corr:.3} low_q_ms={:.3} high_q_ms={:.3} explore={} began_prior={} detect_a={} avoid_b={} resolve_c={} early_tip={} est_block={} raw_ab={} raw_c={} war_ab={} war_c={} waw_ab={} waw_c={} chain_ab={} chain_c={} protect={} pbo={} replay_after={}",
         m.resolve_full_replay,
         m.full_from_zero,
         m.prefix_resume_n,
@@ -362,6 +362,7 @@ fn print_focus(pevm: &Pevm, mode_name: &str, i: usize, n: usize, m: &pevm::SpecF
         start_ms(head),
         tail.unwrap_or(0),
         start_ms(tail),
+        (start_ms(tail) - start_ms(head)).max(0.0),
         median_ms(&mut low),
         median_ms(&mut high),
         m.explore_n,
@@ -515,7 +516,7 @@ fn run_once(
             if mode_name == "specfence" {
                 print_focus(pevm, mode_name, i, n, &m);
                 println!(
-                    "  spine {mode_name}[{i}] access={} yield_ok={} yield_deadlock={} raw={} waw={} war={} armed={} pins={} revoked={} radar={} defer={} handoff={} retain={} tip_already={} chain={} est_block={} soft={} occ_picks={}",
+                    "  spine {mode_name}[{i}] access={} yield_ok={} yield_deadlock={} raw={} waw={} war={} armed={} pins={} revoked={} radar={} defer={} handoff={} retain={} tip_already={} chain={} est_block={} soft={} occ_picks={} spine_cores_max={} spine_cores_end={} handoff_claims={} claim_denied={} exact_wakes={} idle_parks={} help={} steal={} idle_spins={}",
                     spine.access_events,
                     spine.yield_waits_ok,
                     spine.yield_deadlocks,
@@ -534,6 +535,15 @@ fn run_once(
                     m.estimate_block_sf,
                     m.soft_wait_arms,
                     m.occ_schedule_picks,
+                    spine.spine_cores_max,
+                    spine.spine_cores_end,
+                    spine.handoff_claims,
+                    spine.claim_denied,
+                    spine.exact_wakes,
+                    spine.idle_parks,
+                    spine.help_releases,
+                    spine.steal_n,
+                    spine.idle_spins,
                 );
             }
             IterRow {
@@ -861,8 +871,17 @@ fn main() {
         if primary_is_reuse { "reuse" } else { "cold" }
     );
     println!(
-        "TPS_SUMMARY block={block_no} n={n} cores={cores} iters={iters} occ_tps={occ_tps:.1} sf_tps={sf_tps:.1} ratio={ratio:.3} ge_1_5={} occ_ms={occ_med:.3} sf_ms={primary_sf:.3} est_block={est} soft={soft_arms} occ_picks={occ_picks} access={spine_access} yield_ok={spine_yield_ok} yield_deadlock={spine_yield_deadlock} raw={spine_raw} waw={spine_waw} war={spine_war} armed={spine_armed} pins={spine_pins} revoked={spine_revoked} radar={spine_radar} defer={ordered_defer} handoff={ordered_handoff} retain={retain_keeps} tip_already={tip_already} chain={chain_len}",
-        ratio >= 1.5
+        "TPS_SUMMARY block={block_no} n={n} cores={cores} iters={iters} occ_tps={occ_tps:.1} sf_tps={sf_tps:.1} ratio={ratio:.3} ge_1_5={} occ_ms={occ_med:.3} sf_ms={primary_sf:.3} est_block={est} soft={soft_arms} occ_picks={occ_picks} access={spine_access} yield_ok={spine_yield_ok} yield_deadlock={spine_yield_deadlock} raw={spine_raw} waw={spine_waw} war={spine_war} armed={spine_armed} pins={spine_pins} revoked={spine_revoked} radar={spine_radar} defer={ordered_defer} handoff={ordered_handoff} retain={retain_keeps} tip_already={tip_already} chain={chain_len} spine_cores_max={} spine_cores_end={} handoff_claims={} claim_denied={} exact_wakes={} idle_parks={} help={} steal={} idle_spins={}",
+        ratio >= 1.5,
+        sf.last_spine().spine_cores_max,
+        sf.last_spine().spine_cores_end,
+        sf.last_spine().handoff_claims,
+        sf.last_spine().claim_denied,
+        sf.last_spine().exact_wakes,
+        sf.last_spine().idle_parks,
+        sf.last_spine().help_releases,
+        sf.last_spine().steal_n,
+        sf.last_spine().idle_spins,
     );
 
     let summary = CompareSummary {
