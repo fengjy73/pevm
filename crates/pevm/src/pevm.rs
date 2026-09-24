@@ -639,6 +639,14 @@ impl Pevm {
                 sf_tips.bind_chain_spine(loc, &writers);
                 writers.first().copied()
             });
+            // Radar only. The first in-block touch arms Avoid; block open stays empty.
+            if access_spine.prior().chain_loc != u64::MAX && access_spine.prior().chains.len() >= 2
+            {
+                access_arms.note_region_radar(
+                    access_spine.prior().chain_loc,
+                    &access_spine.prior().chains,
+                );
+            }
             self.last_begin_blocked = ready_edges.blocked_consumers();
             // Thin focus chains are shorter than the ≥32 sticky install, so
             // `inter_prior.crit_chain()` stays empty. The spine still carries
@@ -867,6 +875,11 @@ impl Pevm {
             report.span_end_indep = post_span.span_end_indep;
             report.span_end_false_bits = post_span.span_end_false_bits;
             report.quiet_false_or = post_span.quiet_false_or;
+            report.region_learn_n = access_arms.region_learn_n();
+            report.region_raw_n = access_arms.region_raw_n();
+            report.region_waw_n = access_arms.region_waw_n();
+            report.region_war_n = access_arms.region_war_n();
+            report.region_chain_n = access_arms.region_chain_n();
             self.spine_prior = next;
             self.last_spine = report;
         }
@@ -1630,8 +1643,10 @@ impl Pevm {
             if let Some(wave) = wave {
                 vm.try_apply_park_resume(tx_version.tx_idx, wave);
             }
-            // Known toucher of a protected ℓ: first interpreter entry sees
-            // the published tip. Parking here is not a mid-exec reexec.
+            // First touch of the learned chain arms WaitOnce for later
+            // accesses of that ℓ. The tx stays on the queue; the access
+            // consults the true tip. Not an Estimate gate and not all Indep.
+            vm.region_learn_on_admit(tx_version.tx_idx);
             if !leftover_min && let Some(pred) = vm.protected_admission_blocker(tx_version.tx_idx) {
                 let parked = scheduler.add_wait_for_dependency(tx_version.tx_idx, pred);
                 if parked {

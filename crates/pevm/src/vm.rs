@@ -610,6 +610,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
         {
             return true;
         }
+        if self.specfence.access_arms.is_region_armed(location_hash)
+            && self.specfence.access_arms.is_wait_once(location_hash)
+        {
+            return true;
+        }
         self.specfence.access_arms.non_crit_wait()
             && self.specfence.access_arms.is_wait_once(location_hash)
     }
@@ -696,6 +701,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
         let Some(writer) = self.peek_unpublished_writer(location_hash) else {
             return Ok(());
         };
+        if self.specfence.access_arms.region_learn_on() {
+            self.specfence.access_arms.observe_region_raw(location_hash);
+        }
         self.yield_wait_true_version(ev, writer)
     }
 
@@ -827,11 +835,15 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return Ok(());
         }
         // Thin Soft=0 OCC-shaped: no WaitOnce peer — zero consult tax (ordinals
-        // already noted by basic/storage). A mid-block protected ℓ is the
-        // exception: that access waits for the true tip instead of Opt.
+        // already noted by basic/storage). Two per-access exceptions wait for
+        // the true tip instead of Opt: a mid-block protected ℓ, and a region
+        // learned this block. Neither takes the tx off the queue.
+        let region_access = self.specfence.access_arms.is_region_armed(location_hash)
+            && self.specfence.access_arms.is_wait_once(location_hash);
         if self.sf_occ_shaped
             && !(self.specfence.access_arms.protect_live()
                 && self.specfence.access_arms.is_protected(location_hash))
+            && !region_access
         {
             return Ok(());
         }
@@ -3433,6 +3445,26 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             return;
         }
         self.specfence.spine.on_write_effects(tx, &locs);
+        if self.specfence.access_arms.region_learn_on() {
+            for (loc, val) in write_set {
+                if *loc == beneficiary {
+                    continue;
+                }
+                if matches!(
+                    val,
+                    MemoryValue::LazyRecipient(_) | MemoryValue::LazySender(_)
+                ) {
+                    continue;
+                }
+                if !self.specfence.access_arms.is_learn_loc(*loc) {
+                    continue;
+                }
+                self.specfence.access_arms.observe_region_write(*loc, tx);
+                if self.specfence.spine.has_earlier_reader(*loc, tx) {
+                    self.specfence.access_arms.observe_region_war(*loc);
+                }
+            }
+        }
     }
 
     /// A2 progressive DAG: published Data notifies Blocking waiters (not SoftWait Soft).
@@ -3450,9 +3482,14 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         for &loc in locs {
             let thin = self.specfence.scheduler.block_size() <= crate::specfence::THIN_SHELL_N;
             // Thin WaitOnce/crit DashMap tip; large ChainSpineTip only.
+            // Region Learn exact-wakes waiters of an armed hot edge. The
+            // edge is not `protect_live` — admission must not park the tx.
+            let region_tip = self.specfence.access_arms.is_region_armed(loc)
+                && self.specfence.access_arms.is_wait_once(loc);
             if thin
                 && (self.specfence.access_arms.is_crit_loc(loc)
                     || self.specfence.access_arms.is_wait_once(loc))
+                || region_tip
             {
                 let exact = self
                     .specfence
@@ -3460,6 +3497,11 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     .publish_data(loc, writer, incarnation);
                 for c in exact {
                     self.specfence.wave.push_ready(c);
+                }
+                if !thin && self.specfence.sf_tips.is_chain_loc(loc) {
+                    self.specfence
+                        .ready_edges
+                        .wake_planted_on_publish(writer, self.specfence.wave);
                 }
             } else if self.specfence.sf_tips.is_chain_loc(loc) {
                 let exact = self
@@ -3634,12 +3676,25 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         self.specfence.metrics.record_wait_for_dependency();
     }
 
+    /// First picked member of the learned chain arms WaitOnce for the rest.
+    pub(crate) fn region_learn_on_admit(&self, tx: TxIdx) {
+        if self.specfence.mode != crate::ConcurrencyMode::SpecFence {
+            return;
+        }
+        self.specfence.access_arms.touch_learn_member(tx);
+    }
+
     /// Large protected ℓ: do not enter the interpreter while a nearer
     /// known writer is still unpublished. The first `execute` then reads
     /// the true tip. Not `mark_gated` and not every higher tx — only a
     /// learned toucher of this location. Thin stays on the OCC-shaped path.
     pub(crate) fn protected_admission_blocker(&self, tx: TxIdx) -> Option<TxIdx> {
-        if tx == 0 || self.specfence.scheduler.block_size() <= crate::specfence::THIN_SHELL_N {
+        if tx == 0 {
+            return None;
+        }
+        // Thin stays on the OCC-shaped path. Region Learn waits at the
+        // access, not by parking the whole tx here.
+        if self.specfence.scheduler.block_size() <= crate::specfence::THIN_SHELL_N {
             return None;
         }
         if !self.specfence.access_arms.protect_live() {

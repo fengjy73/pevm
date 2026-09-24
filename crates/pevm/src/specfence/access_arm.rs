@@ -6,7 +6,7 @@
 //! basic-lazy are NeverWait. Sticky Opt is not an arm.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use dashmap::{DashMap, DashSet};
 
@@ -68,6 +68,21 @@ struct ArmRec {
     peer: TxIdx,
 }
 
+/// Four-class bits recorded when Region Learn arms a hot access edge.
+const REGION_RAW: u8 = 1;
+const REGION_WAW: u8 = 2;
+const REGION_WAR: u8 = 4;
+const REGION_CHAIN: u8 = 8;
+
+fn region_learn_from_env() -> bool {
+    !matches!(
+        std::env::var("SPECFENCE_REGION_LEARN_AVOID")
+            .ok()
+            .as_deref(),
+        Some("0" | "false" | "FALSE")
+    )
+}
+
 /// Shared waiter + per-location arm. Not a per-worker copy.
 #[derive(Debug, Default)]
 pub(crate) struct AccessArmTable {
@@ -98,6 +113,21 @@ pub(crate) struct AccessArmTable {
     prior_writers: Mutex<Vec<TxIdx>>,
     /// Detect (a) edges for next pick / next block: (consumer, producer, ℓ).
     wait_edges: Mutex<Vec<(TxIdx, TxIdx, MemoryLocationHash)>>,
+    /// Soft0-RegionLearnAvoid. Default on. `=0` is the same-host knife-off.
+    /// Read per block, not process-cached, so tests can flip it.
+    region_learn: AtomicBool,
+    /// Spine-prior chain. Radar only until the first in-block touch.
+    radar_loc: AtomicU64,
+    radar_writers: Mutex<Vec<TxIdx>>,
+    /// Chain members → region. One lookup on admit, not a scan of every tx.
+    learn_member_loc: DashMap<TxIdx, MemoryLocationHash, BuildIdentityHasher>,
+    /// Class bits per armed region (RAW/WAW/WAR/Chain).
+    region_bits: DashMap<MemoryLocationHash, u8>,
+    region_learn_n: AtomicUsize,
+    region_raw_n: AtomicUsize,
+    region_waw_n: AtomicUsize,
+    region_war_n: AtomicUsize,
+    region_chain_n: AtomicUsize,
 }
 
 impl AccessArmTable {
@@ -105,6 +135,9 @@ impl AccessArmTable {
         let t = Self::default();
         t.crit_loc.store(u64::MAX, Ordering::Relaxed);
         t.prior_loc.store(u64::MAX, Ordering::Relaxed);
+        t.radar_loc.store(u64::MAX, Ordering::Relaxed);
+        t.region_learn
+            .store(region_learn_from_env(), Ordering::Relaxed);
         t
     }
 
@@ -130,6 +163,17 @@ impl AccessArmTable {
         self.prior_loc.store(u64::MAX, Ordering::Relaxed);
         self.prior_writers.lock().unwrap().clear();
         self.wait_edges.lock().unwrap().clear();
+        self.region_learn
+            .store(region_learn_from_env(), Ordering::Relaxed);
+        self.radar_loc.store(u64::MAX, Ordering::Relaxed);
+        self.radar_writers.lock().unwrap().clear();
+        self.learn_member_loc.clear();
+        self.region_bits.clear();
+        self.region_learn_n.store(0, Ordering::Relaxed);
+        self.region_raw_n.store(0, Ordering::Relaxed);
+        self.region_waw_n.store(0, Ordering::Relaxed);
+        self.region_war_n.store(0, Ordering::Relaxed);
+        self.region_chain_n.store(0, Ordering::Relaxed);
         for (loc, tag, k, peer) in prior.access_arm_snapshot() {
             let arm = AccessArm::from_tag(tag);
             if arm == AccessArm::Opt {
@@ -263,6 +307,7 @@ impl AccessArmTable {
     pub(crate) fn note_prior_touchers(&self, loc: MemoryLocationHash, writers: &[TxIdx]) {
         self.prior_loc.store(loc, Ordering::Relaxed);
         *self.prior_writers.lock().unwrap() = writers.to_vec();
+        self.remember_members(loc, writers);
     }
 
     fn install_protect_edges(&self, loc: MemoryLocationHash) {
@@ -283,6 +328,7 @@ impl AccessArmTable {
     pub(crate) fn install_crit_chain(&self, loc: MemoryLocationHash, writers: &[TxIdx]) {
         self.crit_loc.store(loc, Ordering::Relaxed);
         *self.crit_writers.lock().unwrap() = writers.to_vec();
+        self.remember_members(loc, writers);
         self.note_early_waw(loc, 1);
         // note_early_waw may have set the flag before crit was visible to a
         // racing reader; this block is still single-threaded. Recompute so a
@@ -327,6 +373,14 @@ impl AccessArmTable {
         if prior != u64::MAX && self.prior_writers.lock().unwrap().iter().any(|&w| w == tx) {
             return Some(prior);
         }
+        let radar = self.radar_loc.load(Ordering::Relaxed);
+        if self.region_learn_on()
+            && radar != u64::MAX
+            && self.is_protected(radar)
+            && self.radar_writers.lock().unwrap().iter().any(|&w| w == tx)
+        {
+            return Some(radar);
+        }
         None
     }
 
@@ -337,6 +391,15 @@ impl AccessArmTable {
         }
         if self.prior_loc.load(Ordering::Relaxed) == loc {
             return Some(self.prior_writers.lock().unwrap().clone());
+        }
+        if self.region_learn_on()
+            && self.radar_loc.load(Ordering::Relaxed) == loc
+            && self.is_protected(loc)
+        {
+            let w = self.radar_writers.lock().unwrap().clone();
+            if !w.is_empty() {
+                return Some(w);
+            }
         }
         None
     }
@@ -351,11 +414,15 @@ impl AccessArmTable {
         if i == 0 { None } else { Some(writers[i - 1]) }
     }
 
-    /// Avoid-up-front pred for a WaitOnce ℓ: crit chain, arm peer, else the
-    /// per-consumer edge. Arm peer stays 0 for mid-block protect so unrelated
-    /// txs keep the thin OCC-shaped skip; the edge names only that toucher.
+    /// Avoid-up-front pred for a WaitOnce ℓ: crit chain, region-learn chain,
+    /// arm peer, else the per-consumer edge. Arm peer stays 0 for a region
+    /// arm so unrelated txs keep the thin OCC-shaped skip. The region pred
+    /// is the previous writer on that ℓ only — not a whole-tx admission edge.
     pub(crate) fn wait_once_pred(&self, tx: TxIdx, loc: MemoryLocationHash) -> Option<TxIdx> {
         if let Some(p) = self.crit_pred(tx, loc) {
+            return Some(p);
+        }
+        if let Some(p) = self.region_pred(tx, loc) {
             return Some(p);
         }
         if let Some(p) = self.arms.get(&loc).and_then(|e| {
@@ -502,6 +569,249 @@ impl AccessArmTable {
     #[inline]
     pub(crate) fn replay_after_protect_n(&self) -> usize {
         self.replay_after_protect_n.load(Ordering::Relaxed)
+    }
+
+    /// Spine-prior chain. Not an Avoid arm until [`Self::touch_learn_member`].
+    pub(crate) fn note_region_radar(&self, loc: MemoryLocationHash, writers: &[TxIdx]) {
+        if !self.region_learn_on() || writers.len() < 2 {
+            return;
+        }
+        self.radar_loc.store(loc, Ordering::Relaxed);
+        *self.radar_writers.lock().unwrap() = writers.to_vec();
+        self.remember_members(loc, writers);
+    }
+
+    fn remember_members(&self, loc: MemoryLocationHash, writers: &[TxIdx]) {
+        if !self.region_learn_on() {
+            return;
+        }
+        for &w in writers {
+            self.learn_member_loc.insert(w, loc);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn region_learn_on(&self) -> bool {
+        self.region_learn.load(Ordering::Relaxed)
+    }
+
+    /// Tests flip the knife without the process environment.
+    pub(crate) fn force_region_learn(&self, on: bool) {
+        self.region_learn.store(on, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn region_learn_n(&self) -> usize {
+        self.region_learn_n.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn region_raw_n(&self) -> usize {
+        self.region_raw_n.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn region_waw_n(&self) -> usize {
+        self.region_waw_n.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn region_war_n(&self) -> usize {
+        self.region_war_n.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn region_chain_n(&self) -> usize {
+        self.region_chain_n.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn region_bits(&self, loc: MemoryLocationHash) -> u8 {
+        self.region_bits.get(&loc).map(|b| *b).unwrap_or(0)
+    }
+
+    /// True when `loc` is the sticky / prior chain this knife may arm.
+    /// Other locations stay on the existing resolve path.
+    pub(crate) fn is_learn_loc(&self, loc: MemoryLocationHash) -> bool {
+        if !self.region_learn_on() {
+            return false;
+        }
+        let radar = self.radar_loc.load(Ordering::Relaxed);
+        (radar != u64::MAX && radar == loc)
+            || self.is_crit_loc(loc)
+            || self.prior_loc.load(Ordering::Relaxed) == loc
+    }
+
+    /// First in-block touch of a known chain member. Arms WaitOnce at the
+    /// true tip for remaining touchers of that ℓ. Does not read an Estimate
+    /// tip, does not set `protect_live`, and does not take the tx off the queue.
+    pub(crate) fn touch_learn_member(&self, tx: TxIdx) -> bool {
+        if !self.region_learn_on() {
+            return false;
+        }
+        let Some(loc) = self.member_loc(tx) else {
+            return false;
+        };
+        if self.is_never(loc) || self.is_region_armed(loc) {
+            return false;
+        }
+        let bit = if self.chain_len_of(loc) >= 32 {
+            REGION_WAW | REGION_CHAIN
+        } else {
+            REGION_WAW
+        };
+        self.arm_region(loc, bit)
+    }
+
+    /// Second writer, or the first writer of an already-known chain.
+    pub(crate) fn observe_region_write(&self, loc: MemoryLocationHash, tx: TxIdx) -> bool {
+        if !self.is_learn_loc(loc) || self.is_never(loc) {
+            return false;
+        }
+        if self.is_region_armed(loc) {
+            self.set_region_bits(loc, REGION_WAW);
+            return false;
+        }
+        let _ = tx;
+        if self.chain_len_of(loc) < 2 {
+            return false;
+        }
+        let bit = if self.chain_len_of(loc) >= 32 {
+            REGION_WAW | REGION_CHAIN
+        } else {
+            REGION_WAW
+        };
+        self.arm_region(loc, bit)
+    }
+
+    /// RAW evidence on the learned region. No Estimate input.
+    pub(crate) fn observe_region_raw(&self, loc: MemoryLocationHash) -> bool {
+        if !self.is_learn_loc(loc) || self.is_never(loc) {
+            return false;
+        }
+        if self.is_region_armed(loc) {
+            self.set_region_bits(loc, REGION_RAW);
+            return true;
+        }
+        self.arm_region(loc, REGION_RAW)
+    }
+
+    /// WAR evidence: RetainHistory stays on the spine; this arms the later
+    /// writer to the true tip instead of schedule-absorb-only.
+    pub(crate) fn observe_region_war(&self, loc: MemoryLocationHash) -> bool {
+        if !self.is_learn_loc(loc) || self.is_never(loc) {
+            return false;
+        }
+        if self.is_region_armed(loc) {
+            self.set_region_bits(loc, REGION_WAR);
+            return true;
+        }
+        self.arm_region(loc, REGION_WAR)
+    }
+
+    fn member_loc(&self, tx: TxIdx) -> Option<MemoryLocationHash> {
+        self.learn_member_loc.get(&tx).map(|loc| *loc)
+    }
+
+    fn chain_len_of(&self, loc: MemoryLocationHash) -> usize {
+        if self.crit_loc.load(Ordering::Relaxed) == loc {
+            return self.crit_writers.lock().unwrap().len();
+        }
+        if self.radar_loc.load(Ordering::Relaxed) == loc {
+            return self.radar_writers.lock().unwrap().len();
+        }
+        if self.prior_loc.load(Ordering::Relaxed) == loc {
+            return self.prior_writers.lock().unwrap().len();
+        }
+        0
+    }
+
+    fn member_writers(&self, loc: MemoryLocationHash) -> Option<Vec<TxIdx>> {
+        if self.crit_loc.load(Ordering::Relaxed) == loc {
+            let w = self.crit_writers.lock().unwrap().clone();
+            if !w.is_empty() {
+                return Some(w);
+            }
+        }
+        if self.radar_loc.load(Ordering::Relaxed) == loc {
+            let w = self.radar_writers.lock().unwrap().clone();
+            if !w.is_empty() {
+                return Some(w);
+            }
+        }
+        if self.prior_loc.load(Ordering::Relaxed) == loc {
+            let w = self.prior_writers.lock().unwrap().clone();
+            if !w.is_empty() {
+                return Some(w);
+            }
+        }
+        None
+    }
+
+    /// Previous writer on an armed region. Not an admission edge: planting
+    /// these into `wait_edges` would take the whole tx off the queue.
+    pub(crate) fn region_pred(&self, tx: TxIdx, loc: MemoryLocationHash) -> Option<TxIdx> {
+        if !self.is_region_armed(loc) {
+            return None;
+        }
+        let Some(writers) = self.member_writers(loc) else {
+            return None;
+        };
+        let mut w = writers;
+        w.sort_unstable();
+        w.dedup();
+        let i = w.partition_point(|&writer| writer < tx);
+        if i == 0 { None } else { Some(w[i - 1]) }
+    }
+
+    #[inline]
+    pub(crate) fn is_region_armed(&self, loc: MemoryLocationHash) -> bool {
+        self.region_learn_on() && self.region_bits(loc) != 0
+    }
+
+    /// IntraPatch: WaitOnce on this ℓ only. Peer stays 0 and no wait-edge is
+    /// planted, so thin OCC-shaped txs stay on the fast path and admission
+    /// does not park the toucher. The access consults [`Self::region_pred`].
+    fn arm_region(&self, loc: MemoryLocationHash, bits: u8) -> bool {
+        if !self.region_learn_on() || self.is_never(loc) {
+            return false;
+        }
+        // Not `protect_hot`: that sets `protect_live` and the admission
+        // blocker takes the whole tx off the queue until the pred finishes.
+        self.note_early_waw(loc, 1);
+        self.set_region_bits(loc, bits);
+        true
+    }
+
+    fn set_region_bits(&self, loc: MemoryLocationHash, add: u8) {
+        let chain = if self.chain_len_of(loc) >= 32 {
+            REGION_CHAIN
+        } else {
+            0
+        };
+        let mut entry = self.region_bits.entry(loc).or_insert(0);
+        let prev = *entry;
+        let next = prev | add | chain;
+        if next == prev {
+            return;
+        }
+        *entry = next;
+        drop(entry);
+        if prev == 0 {
+            self.region_learn_n.fetch_add(1, Ordering::Relaxed);
+        }
+        if prev & REGION_RAW == 0 && next & REGION_RAW != 0 {
+            self.region_raw_n.fetch_add(1, Ordering::Relaxed);
+        }
+        if prev & REGION_WAW == 0 && next & REGION_WAW != 0 {
+            self.region_waw_n.fetch_add(1, Ordering::Relaxed);
+        }
+        if prev & REGION_WAR == 0 && next & REGION_WAR != 0 {
+            self.region_war_n.fetch_add(1, Ordering::Relaxed);
+        }
+        if prev & REGION_CHAIN == 0 && next & REGION_CHAIN != 0 {
+            self.region_chain_n.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Hot early basic/storage WAW template. The next read of `ℓ` waits
@@ -747,5 +1057,94 @@ mod tests {
         t.note_protect_before_opt();
         assert_eq!(t.replay_after_protect_n(), 1);
         assert_eq!(t.protect_before_opt_n(), 1);
+    }
+
+    #[test]
+    fn region_learn_arms_chain_touchers_without_estimate() {
+        let t = AccessArmTable::new();
+        t.force_region_learn(true);
+        // No Estimate argument: the arm is the writer list and the true tip.
+        t.note_region_radar(11, &[3, 7, 40]);
+        assert!(
+            !t.is_protected(11),
+            "radar is not an Avoid arm at block open"
+        );
+        assert!(t.touch_learn_member(3));
+        assert!(
+            !t.is_protected(11),
+            "region arm must not set protect_live / admission"
+        );
+        assert!(!t.protect_live());
+        assert!(t.is_region_armed(11));
+        assert!(t.is_wait_once(11));
+        assert_eq!(
+            t.known_toucher_loc(40),
+            None,
+            "chain members stay off the admission toucher map"
+        );
+        assert_eq!(
+            t.known_toucher_loc(2),
+            None,
+            "unrelated Indep stays off the region"
+        );
+        assert_eq!(t.wait_once_pred(40, 11), Some(7));
+        assert_eq!(t.region_pred(40, 11), Some(7));
+        assert!(
+            !t.has_wait_once_peer_before(40),
+            "peer stays 0 so thin OCC-shaped is not gated"
+        );
+        assert!(!t.has_wait_once_peer_before(2));
+        assert!(!t.touch_learn_member(7), "one arm per region");
+        assert_eq!(t.region_learn_n(), 1);
+        assert_eq!(t.region_waw_n(), 1);
+        assert_eq!(t.region_chain_n(), 0, "short chain is WAW, not sticky≥32");
+        assert!(t.observe_region_raw(11));
+        assert!(t.observe_region_war(11));
+        assert_eq!(t.region_bits(11) & 1, 1);
+        assert_eq!(t.region_bits(11) & 4, 4);
+        assert!(!t.observe_region_write(99, 1));
+        assert!(
+            !t.is_protected(99),
+            "a cold location is not the learned region"
+        );
+    }
+
+    #[test]
+    fn region_learn_never_waits_beneficiary_and_can_turn_off() {
+        let t = AccessArmTable::new();
+        t.force_region_learn(true);
+        t.note_region_radar(11, &[3, 7, 40]);
+        assert_eq!(t.decide(9, 11, 8, true, false), LiveAct::Skip);
+        assert!(!t.touch_learn_member(3));
+        assert!(!t.observe_region_write(11, 7));
+        assert!(!t.observe_region_raw(11));
+        assert!(!t.is_protected(11));
+        assert!(!t.is_region_armed(11));
+        assert!(!t.protect_live());
+        assert_eq!(t.region_learn_n(), 0);
+
+        let off = AccessArmTable::new();
+        off.force_region_learn(false);
+        off.note_region_radar(11, &[3, 7, 40]);
+        assert!(!off.touch_learn_member(3));
+        assert!(!off.is_protected(11));
+        assert!(!off.is_learn_loc(11));
+    }
+
+    #[test]
+    fn region_learn_long_chain_sets_chain_class() {
+        let t = AccessArmTable::new();
+        t.force_region_learn(true);
+        let writers: Vec<TxIdx> = (1..33).collect();
+        t.note_region_radar(8, &writers);
+        assert!(t.touch_learn_member(1));
+        assert_eq!(t.region_chain_n(), 1);
+        assert_eq!(t.region_waw_n(), 1);
+        assert!(t.is_wait_once(8));
+        assert!(!t.protect_live());
+        assert_eq!(t.wait_once_pred(32, 8), Some(31));
+        assert_eq!(t.region_pred(5, 8), Some(4));
+        assert_eq!(t.known_toucher_loc(5), None);
+        assert_eq!(t.known_toucher_loc(100), None);
     }
 }

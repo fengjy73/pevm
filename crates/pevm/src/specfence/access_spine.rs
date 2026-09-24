@@ -425,6 +425,16 @@ pub struct SpineReport {
     /// `vm.execute` plus `finish_execution` on every other SpecFence attempt.
     pub other_exec_ns: u64,
     pub other_exec_n: u64,
+    /// Regions armed by Soft0-RegionLearnAvoid this block.
+    pub region_learn_n: usize,
+    /// Learned regions whose first class bit included RAW.
+    pub region_raw_n: usize,
+    /// Learned regions whose first class bit included WAW.
+    pub region_waw_n: usize,
+    /// Learned regions whose first class bit included WAR.
+    pub region_war_n: usize,
+    /// Learned regions that are a sticky chain of at least 32 writers.
+    pub region_chain_n: usize,
 }
 
 /// Shared per-block spine. Workers share it. The Avoid table starts empty.
@@ -886,6 +896,13 @@ impl AccessSpine {
         }
     }
 
+    /// A lower reader already bound `loc` before `tx` wrote it.
+    pub(crate) fn has_earlier_reader(&self, loc: MemoryLocationHash, tx: TxIdx) -> bool {
+        self.intra.get(&loc).is_some_and(|rec| {
+            rec.readers.iter().any(|&r| r < tx) || rec.retained.iter().any(|&(r, _)| r < tx)
+        })
+    }
+
     /// True when this location's retained pins must survive a later write.
     pub(crate) fn retained_for(&self, loc: MemoryLocationHash) -> Vec<(TxIdx, TxIdx)> {
         self.intra
@@ -1091,6 +1108,11 @@ impl AccessSpine {
             cut_skip_n: self.cut_skip_n.load(Ordering::Relaxed),
             other_exec_ns: self.other_exec_ns.load(Ordering::Relaxed),
             other_exec_n: self.other_exec_n.load(Ordering::Relaxed),
+            region_learn_n: 0,
+            region_raw_n: 0,
+            region_waw_n: 0,
+            region_war_n: 0,
+            region_chain_n: 0,
         };
         (report, next)
     }

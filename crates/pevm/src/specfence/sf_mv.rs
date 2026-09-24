@@ -179,9 +179,7 @@ impl SfTipTable {
             map.insert(writer, SfTip::Released { incarnation });
         }
         // Clear live_writer only when this writer still owns the claim.
-        let _ = self
-            .live_writer
-            .remove_if(&location, |_, w| *w == writer);
+        let _ = self.live_writer.remove_if(&location, |_, w| *w == writer);
         self.wake_exact(location, writer)
     }
 
@@ -210,13 +208,15 @@ impl SfTipTable {
         if prev == CHAIN_EMPTY {
             self.early_tip_n.fetch_add(1, Ordering::Relaxed);
         }
-        let _ = self.chain_live.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-            if cur == usize::MAX || writer >= cur {
-                Some(writer)
-            } else {
-                None
-            }
-        });
+        let _ = self
+            .chain_live
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                if cur == usize::MAX || writer >= cur {
+                    Some(writer)
+                } else {
+                    None
+                }
+            });
     }
 
     /// Released on ChainSpineTip after true Data publish.
@@ -224,9 +224,12 @@ impl SfTipTable {
         if let Some(slot) = self.chain_flags.get(&writer) {
             slot.store(CHAIN_RELEASED, Ordering::Release);
         }
-        let _ = self
-            .chain_live
-            .compare_exchange(writer, usize::MAX, Ordering::Relaxed, Ordering::Relaxed);
+        let _ = self.chain_live.compare_exchange(
+            writer,
+            usize::MAX,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
     }
 
     /// Clear chain claim on abort (stale Version must not park successors).
@@ -234,9 +237,12 @@ impl SfTipTable {
         if let Some(slot) = self.chain_flags.get(&writer) {
             slot.store(CHAIN_EMPTY, Ordering::Release);
         }
-        let _ = self
-            .chain_live
-            .compare_exchange(writer, usize::MAX, Ordering::Relaxed, Ordering::Relaxed);
+        let _ = self.chain_live.compare_exchange(
+            writer,
+            usize::MAX,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
     }
 
     #[inline]
@@ -248,12 +254,9 @@ impl SfTipTable {
 
     #[inline]
     pub(crate) fn chain_version_or_released(&self, writer: TxIdx) -> bool {
-        self.chain_flags.get(&writer).is_some_and(|s| {
-            matches!(
-                s.load(Ordering::Acquire),
-                CHAIN_VERSION | CHAIN_RELEASED
-            )
-        })
+        self.chain_flags
+            .get(&writer)
+            .is_some_and(|s| matches!(s.load(Ordering::Acquire), CHAIN_VERSION | CHAIN_RELEASED))
     }
 
     /// This incarnation will write `location` and has not published Data yet.
@@ -290,9 +293,9 @@ impl SfTipTable {
         location: MemoryLocationHash,
         tx: TxIdx,
     ) -> Option<TxIdx> {
-        self.open_writers.get(&location).and_then(|v| {
-            v.iter().rev().copied().find(|&w| w < tx)
-        })
+        self.open_writers
+            .get(&location)
+            .and_then(|v| v.iter().rev().copied().find(|&w| w < tx))
     }
 
     /// True unpublished writer of ℓ (structure RAW/WAW), if any.
@@ -329,9 +332,7 @@ impl SfTipTable {
             if let Some(mut map) = self.tips.get_mut(&loc) {
                 map.remove(&writer);
             }
-            let _ = self
-                .live_writer
-                .remove_if(&loc, |_, w| *w == writer);
+            let _ = self.live_writer.remove_if(&loc, |_, w| *w == writer);
             woken.extend(self.wake_exact(loc, writer));
         }
         woken
@@ -350,10 +351,7 @@ impl SfTipTable {
         if self.is_chain_loc(location) {
             return self.chain_released(writer);
         }
-        matches!(
-            self.tip_at(location, writer),
-            Some(SfTip::Released { .. })
-        )
+        matches!(self.tip_at(location, writer), Some(SfTip::Released { .. }))
     }
 
     /// True when a SpecFence version tip exists (Claimed or Released).
@@ -384,11 +382,7 @@ impl SfTipTable {
         }
     }
 
-    pub(crate) fn wake_exact(
-        &self,
-        location: MemoryLocationHash,
-        writer: TxIdx,
-    ) -> Vec<TxIdx> {
+    pub(crate) fn wake_exact(&self, location: MemoryLocationHash, writer: TxIdx) -> Vec<TxIdx> {
         let woken = self
             .waiters
             .remove(&(location, writer))
@@ -631,18 +625,11 @@ impl<'a> SfMvMemory<'a> {
     }
 
     /// True publish for `writer` on `location` (Released tip, ChainSpine, or MvMemory Data).
-    pub(crate) fn true_publish_ready(
-        &self,
-        location: MemoryLocationHash,
-        writer: TxIdx,
-    ) -> bool {
+    pub(crate) fn true_publish_ready(&self, location: MemoryLocationHash, writer: TxIdx) -> bool {
         if self.tips.has_released(location, writer) {
             return true;
         }
-        matches!(
-            self.inner.entry_kind_at(location, writer),
-            "data"
-        )
+        matches!(self.inner.entry_kind_at(location, writer), "data")
     }
 
     fn read_opt(&self, location: MemoryLocationHash, tx: TxIdx) -> SfRead {
