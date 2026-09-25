@@ -18,7 +18,9 @@ enum Phase {
     Executing,
     Executed,
     Committed,
-    Parked { pred: TxIdx },
+    /// `until_commit` waits for the predecessor's validated write. Execution
+    /// alone is not enough: a published incarnation can still fail validation.
+    Parked { pred: TxIdx, until_commit: bool },
 }
 
 struct TxState {
@@ -91,6 +93,10 @@ impl Runtime {
         }
     }
 
+    pub(crate) fn worker_count(&self) -> usize {
+        self.workers
+    }
+
     pub(crate) fn committed(&self) -> usize {
         self.committed.load(Ordering::Acquire)
     }
@@ -152,12 +158,15 @@ impl Runtime {
             .is_some_and(|s| s.phase == Phase::Committed)
     }
 
-    pub(crate) fn tx_open(&self, tx: TxIdx) -> bool {
+    /// Not executed and not committed. Prediction skips writers that already finished.
+    pub(crate) fn still_open(&self, tx: TxIdx) -> bool {
         let inner = self.inner.lock().unwrap();
-        inner
-            .status
-            .get(tx)
-            .is_some_and(|s| s.phase != Phase::Committed)
+        inner.status.get(tx).is_some_and(|s| {
+            matches!(
+                s.phase,
+                Phase::Ready | Phase::Executing | Phase::Parked { .. }
+            )
+        })
     }
 
     pub(crate) fn incarnation(&self, tx: TxIdx) -> usize {
@@ -223,9 +232,17 @@ impl Runtime {
         true
     }
 
-    /// Park `tx` until `pred` publishes. When this attempt already entered the
-    /// interpreter, the incarnation advances because that attempt is discarded.
-    pub(crate) fn park(&self, worker: usize, tx: TxIdx, pred: TxIdx, bump_inc: bool) {
+    /// Park `tx` until `pred` has executed, or until it has committed when
+    /// `until_commit` is set. A read of an armed location uses the latter:
+    /// the final write is the one validation kept.
+    pub(crate) fn park(
+        &self,
+        worker: usize,
+        tx: TxIdx,
+        pred: TxIdx,
+        bump_inc: bool,
+        until_commit: bool,
+    ) {
         let mut inner = self.inner.lock().unwrap();
         if tx >= self.n || pred >= self.n {
             return;
@@ -233,13 +250,20 @@ impl Runtime {
         if bump_inc {
             inner.status[tx].incarnation = inner.status[tx].incarnation.saturating_add(1);
         }
-        let pred_done = matches!(inner.status[pred].phase, Phase::Executed | Phase::Committed);
+        let pred_done = match inner.status[pred].phase {
+            Phase::Committed => true,
+            Phase::Executed => !until_commit,
+            _ => false,
+        };
         if pred_done {
             inner.status[tx].phase = Phase::Ready;
             self.enqueue_locked(&mut inner, worker, tx);
             return;
         }
-        inner.status[tx].phase = Phase::Parked { pred };
+        inner.status[tx].phase = Phase::Parked {
+            pred,
+            until_commit,
+        };
         inner.status[tx].queued = false;
         if !inner.dependents[pred].contains(&tx) {
             inner.dependents[pred].push(tx);
@@ -258,9 +282,19 @@ impl Runtime {
         inner.status[tx].phase = Phase::Executed;
         let deps = std::mem::take(&mut inner.dependents[tx]);
         for d in deps {
-            if matches!(inner.status[d].phase, Phase::Parked { .. }) {
-                inner.status[d].phase = Phase::Ready;
-                self.enqueue_locked(&mut inner, worker, d);
+            match inner.status[d].phase {
+                Phase::Parked {
+                    until_commit: false,
+                    ..
+                } => {
+                    inner.status[d].phase = Phase::Ready;
+                    self.enqueue_locked(&mut inner, worker, d);
+                }
+                Phase::Parked {
+                    until_commit: true,
+                    ..
+                } => inner.dependents[tx].push(d),
+                _ => {}
             }
         }
         drop(inner);
@@ -278,7 +312,12 @@ impl Runtime {
         self.notify();
     }
 
-    pub(crate) fn try_mark_committed(&self, tx: TxIdx, incarnation: usize) -> bool {
+    pub(crate) fn try_mark_committed(
+        &self,
+        worker: usize,
+        tx: TxIdx,
+        incarnation: usize,
+    ) -> bool {
         let mut inner = self.inner.lock().unwrap();
         if self.committed.load(Ordering::Relaxed) != tx {
             return false;
@@ -287,6 +326,23 @@ impl Runtime {
         if st.phase == Phase::Executed && st.incarnation == incarnation {
             st.phase = Phase::Committed;
             self.committed.store(tx + 1, Ordering::Release);
+            let deps = std::mem::take(&mut inner.dependents[tx]);
+            for d in deps {
+                match inner.status[d].phase {
+                    Phase::Parked {
+                        until_commit: true,
+                        ..
+                    } => {
+                        inner.status[d].phase = Phase::Ready;
+                        self.enqueue_locked(&mut inner, worker, d);
+                    }
+                    Phase::Parked {
+                        until_commit: false,
+                        ..
+                    } => inner.dependents[tx].push(d),
+                    _ => {}
+                }
+            }
             true
         } else {
             false
@@ -307,8 +363,16 @@ impl Runtime {
                     }
                     return false;
                 }
-                Phase::Parked { pred } => {
-                    if matches!(inner.status[pred].phase, Phase::Executed | Phase::Committed) {
+                Phase::Parked {
+                    pred,
+                    until_commit,
+                } => {
+                    let pred_done = match inner.status[pred].phase {
+                        Phase::Committed => true,
+                        Phase::Executed => !until_commit,
+                        _ => false,
+                    };
+                    if pred_done {
                         inner.status[tx].phase = Phase::Ready;
                         return self.enqueue_locked(&mut inner, worker, tx);
                     }

@@ -29,6 +29,10 @@ pub(crate) struct SfOrigin {
 #[derive(Clone, Debug)]
 pub(crate) enum SfReadOrigin {
     Mv(SfOrigin),
+    /// Writer identity without the value. A single worker commits a transaction
+    /// before the next one reads, so a matching incarnation still names the
+    /// value validation would have compared.
+    MvId { tx_idx: TxIdx, incarnation: usize },
     Storage,
 }
 
@@ -47,6 +51,12 @@ pub(crate) fn memory_value_eq(a: &MemoryValue, b: &MemoryValue) -> bool {
         (MemoryValue::SelfDestructed, MemoryValue::SelfDestructed) => true,
         _ => false,
     }
+}
+
+pub(crate) struct ReadMismatch {
+    pub(crate) location: MemoryLocationHash,
+    pub(crate) origin_tx: Option<TxIdx>,
+    pub(crate) live_tx: Option<TxIdx>,
 }
 
 pub(crate) const fn is_lazy_value(value: &MemoryValue) -> bool {
@@ -144,10 +154,22 @@ impl SfMv {
 
     /// `None` when every recorded origin still matches the live entry's identity and value.
     pub(crate) fn failing_location(&self, tx_idx: TxIdx) -> Option<MemoryLocationHash> {
+        self.first_mismatch(tx_idx).map(|m| m.location)
+    }
+
+    /// First read whose origin is not the live write. `origin_tx` / `live_tx`
+    /// are `None` when that side is storage or absent.
+    pub(crate) fn first_mismatch(&self, tx_idx: TxIdx) -> Option<ReadMismatch> {
         let last = index_mutex!(self.last_locations, tx_idx);
         for (location, prior_origins) in &last.read {
-            if !origins_still_valid(&self.data, *location, tx_idx, prior_origins) {
-                return Some(*location);
+            if let Some((origin_tx, live_tx)) =
+                mismatch_writers(&self.data, *location, tx_idx, prior_origins)
+            {
+                return Some(ReadMismatch {
+                    location: *location,
+                    origin_tx,
+                    live_tx,
+                });
             }
         }
         None
@@ -173,20 +195,22 @@ impl SfMv {
         let last = index_mutex!(self.last_locations, tx_idx);
         for origins in last.read.values() {
             for origin in origins {
-                if let SfReadOrigin::Mv(mv) = origin {
-                    trace.note_edge(mv.tx_idx, tx_idx);
+                match origin {
+                    SfReadOrigin::Mv(mv) => trace.note_edge(mv.tx_idx, tx_idx),
+                    SfReadOrigin::MvId { tx_idx: writer, .. } => trace.note_edge(*writer, tx_idx),
+                    SfReadOrigin::Storage => {}
                 }
             }
         }
     }
 }
 
-fn origins_still_valid(
+fn mismatch_writers(
     data: &DashMap<MemoryLocationHash, BTreeMap<TxIdx, MemoryEntry>, BuildIdentityHasher>,
     location: MemoryLocationHash,
     tx_idx: TxIdx,
     prior_origins: &SfReadOrigins,
-) -> bool {
+) -> Option<(Option<TxIdx>, Option<TxIdx>)> {
     if let Some(written_transactions) = data.get(&location) {
         let mut iter = written_transactions.range(..tx_idx);
         for prior_origin in prior_origins {
@@ -197,21 +221,43 @@ fn origins_still_valid(
                             || &prior.incarnation != tx_incarnation
                             || !memory_value_eq(value, &prior.value)
                         {
-                            return false;
+                            return Some((Some(prior.tx_idx), Some(*closest_idx)));
                         }
                     }
-                    _ => return false,
+                    Some((closest_idx, _)) => {
+                        return Some((Some(prior.tx_idx), Some(*closest_idx)));
+                    }
+                    None => return Some((Some(prior.tx_idx), None)),
+                },
+                SfReadOrigin::MvId { tx_idx, incarnation } => match iter.next_back() {
+                    Some((closest_idx, MemoryEntry::Data(tx_incarnation, _))) => {
+                        if closest_idx != tx_idx || tx_incarnation != incarnation {
+                            return Some((Some(*tx_idx), Some(*closest_idx)));
+                        }
+                    }
+                    Some((closest_idx, _)) => {
+                        return Some((Some(*tx_idx), Some(*closest_idx)));
+                    }
+                    None => return Some((Some(*tx_idx), None)),
                 },
                 SfReadOrigin::Storage => {
-                    if iter.next_back().is_some() {
-                        return false;
+                    if let Some((closest_idx, _)) = iter.next_back() {
+                        return Some((None, Some(*closest_idx)));
                     }
                 }
             }
         }
-        true
+        None
+    } else if prior_origins.len() == 1 && matches!(prior_origins.last(), Some(SfReadOrigin::Storage))
+    {
+        None
     } else {
-        prior_origins.len() == 1 && matches!(prior_origins.last(), Some(SfReadOrigin::Storage))
+        let origin_tx = prior_origins.iter().find_map(|origin| match origin {
+            SfReadOrigin::Mv(mv) => Some(mv.tx_idx),
+            SfReadOrigin::MvId { tx_idx, .. } => Some(*tx_idx),
+            SfReadOrigin::Storage => None,
+        });
+        Some((origin_tx, None))
     }
 }
 

@@ -72,7 +72,7 @@ One fresh harness run (`SPECFENCE_INBLOCK_TRACE=1`, no warm-up) on this VM:
 
 Three more fresh runs of the same binary, same flag. FullReplay on 15274915 with `code_hash+selector` was 7, 8, 82 at C=4 and 12, 13, 79 at C=8. `(to, selector)` stayed in the 77–91 band, and its longest chain was usually the 997-transaction plain transfer to `0x6262…98ced`. `code_hash+selector` kept the 77-writer spine (`0x7758…0c50`, empty calldata) when that location was not evicted. On 3356896 the longest chain was 17, next to the carry-round length 16, and FullReplay stayed about 8–39.
 
-The low band (FullReplay 7–14 on the big block) meets the ≤12 target. The high band does not, and it is the common outcome. Most of those aborts happen after the location is already armed (`full_replay_after_arm` is close to `full_replay`).
+The low band (FullReplay 7–14 on the big block) meets the ≤12 target. The high band does not, and it is the common outcome. Most of those aborts happen after the location is already armed (`full_replay_after_arm` is close to `full_replay`). Stage 1b shows that counter was sampled after the abort armed the location. The caps hold after the chain fix.
 
 ## Harness
 
@@ -134,7 +134,7 @@ On this 4-core VM, unmodified OCC at C=4 is the first point that beats sequentia
 
 ## Deviations from the design
 
-- **No opcode hook.** Predicted locations are marked running when the transaction starts. The concrete write set is published when the interpreter returns. A sibling that already started can read before that publish. That is why FullReplay is bimodal and why `full_replay_after_arm` stays high. Stage 6 (publish before the interpreter returns) is not in this stage.
+- **No opcode hook.** Predicted locations are marked running when the transaction starts. The concrete write set is published when the interpreter returns. Stage 1 read the bimodal FullReplay as “the next writer has not published yet.” Stage 1b measured a different cause: the reader was not waiting on a chain entry that already existed. See that section. Stage 6 (publish before the interpreter returns) is not in this stage.
 - **Stage 1 scheduling only.** No persistent pool, no learned `C_eff`, no Ideal-ready pool, no late split, no IntraPatch, no QuietExit. The two ablations that need a persistent pool (OCC on that pool, SpecFence with the chain off) are later.
 - **Seeding is strided index order**, not critical-path order. Contiguous chunks made the tail of the block run before the head had published; the stride keeps the first wave at transactions `0..C`.
 - **Beneficiary writes are skipped** by the chain. They are still applied as lazy rewards in multi-version memory.
@@ -144,6 +144,171 @@ On this 4-core VM, unmodified OCC at C=4 is the first point that beats sequentia
 
 ## Open issues
 
-- FullReplay does not stay under the design caps (≤12 on 15274915, ≤5 on 3356896). The chain length does reach the carry-round spines (77 and 17) for `code_hash+selector`, but a reader can still commit a stale read of an armed location when the next writer has not published yet.
-- `(to, selector)` on 15274915 is dominated by a 997-writer plain-transfer recipient. That key did not reduce FullReplay below the old fresh-run 50.
-- Wall-clock comparison with the 128-core host is not meaningful here. C=8 oversubscribes four vCPUs.
+The FullReplay caps and the C=1 overhead are closed in [Stage 1b](#stage-1b). What remains:
+
+- At C=4 and C=8, SpecFence is still slower than unmodified OCC on this VM. C=8 oversubscribes four vCPUs. A wall-clock comparison with the 128-core host is not meaningful here.
+- A few FullReplay remain from cross-class storage overlap. They sit under the caps.
+- `TPS_ideal` is still the workers=1 profile schedule. There is no opcode step trace.
+
+## Stage 1b
+
+Both Stage 1 gates pass on fresh runs. A reader of an armed location now waits until the chain-nearest lower writer has committed its final write. At C=1, SpecFence is within 1.10× of upstream OCC on both blocks, for both class keys. Upstream `vm.rs`, `mv_memory.rs`, `scheduler.rs`, and `pevm.rs` are still byte-identical to `e94b0e3`. No opcode is replaced.
+
+### Abort root cause
+
+`full_replay_after_arm` was sampled at abort time, after `arm_failure`. It counted locations that became armed because the read failed, not locations that were armed when the reader read. The design wait never ran, for two measured reasons.
+
+**The invalidating writer was not in the chain at the read.** On a fresh pre-fix run (`SPECFENCE_ABORT_DIAG=1`, `(to, selector)`, C=4, block 15274915) FullReplay was 78 and the longest chain was 997. The abort log, taken before `arm_failure`:
+
+| Counter | Count |
+| --- | ---: |
+| FullReplay | 78 |
+| `armed_at_read` | 17 |
+| nearest chain writer is the invalidating writer | 12 |
+| invalidating writer is not the nearest | 66 |
+| reason `no_lower_writer` | 61 |
+| reason `ready_published` | 17 |
+
+72 of the 78 aborts are location `0xabd6bb3978815b97`, the basic account of the 997-recipient plain transfer. At the read, that location was not armed and `nearest_lower` was `None` (`read_armed=false`, `read_nearest` absent, reason `no_lower_writer`). By commit the location was armed and the invalidating writer was `Published`. The reader had nothing to wait for.
+
+The chain produced that hole on purpose:
+
+- The first publisher was held in `seen` until a second publisher. A reader of the first write found an empty directory.
+- A classmate that was predicted but had not started was absent until someone published that location.
+- Eviction could drop the spine. Under `(to, selector)` the plain-transfer class is 997 writers, and a chain that is not pinned is an eviction candidate.
+- Sibling prediction on any repeated-class write, including a lazy sender balance, would have marked the whole class as writers of one account. That path was measured and removed. Blind and lazy writes stay reader-visible and are not admission edges.
+
+**`Published` is not the final write.** Validation runs only when the transaction is the commit head, so a published incarnation can still fail and store a different value. On 3356896, `(code_hash, selector)`, C=8, reader 31 read location `0xdff71d59d972d654` with origin none and live writer 4, `read_armed=false`, reason `no_lower_writer`. Readers 66, 67, 69, and 70 then accepted transaction 31's `Published` value (`ready_published`, `read_state=3`) and aborted when transaction 31 rewrote it. The origin index matched the live index; the incarnation and the value did not. A 16-abort mode on that block was the largest class that read the location before the slot was armed. Releasing the wait on the running mark, or on `Published` of an uncommitted incarnation, commits the same stale read.
+
+### What changed in the chain
+
+A reader of an armed location proceeds only when the nearest lower chain writer is committed and published, or has committed without writing that location (a hole). An unarmed location still treats `Published` as enough. Commit is a prefix, so waiting for that writer to commit makes every earlier write final too.
+
+Chain insertion happens before the reader needs it:
+
+- Before workers start, every repeated `Basic(to)` (count ≥ 2, beneficiary skipped) is an armed pinned chain of `Predicted` members. Those members are not admission edges.
+- The first publisher takes a free directory slot immediately. It is not held in `seen` until a second publisher.
+- A read-then-write of a repeated class predicts the other open classmates and sets the admit bit. A blind or lazy publish inserts only the publisher.
+- Contract classes (calldata length ≥ 4) park later classmates on the class head until that head has executed. Plain transfers do not: the 997-recipient chain is already preseeded, and a head barrier would serialize it. Waits go only to a lower index.
+- Validation failure arms the location, notes the conflict writer while it is still open, backfills the previous write set, and keeps the abort residual. Pinned chains (preseed, class open, arm-on-failure, abort residual, two or more writers) are not eviction candidates.
+
+`Phase::Parked` carries `until_commit`. An admission or class-head park ends when the predecessor has executed. An armed-read park ends when the predecessor has committed. `finish_ok` wakes the first kind. `try_mark_committed` wakes the second.
+
+### FullReplay after the fix
+
+Ten fresh runs, no warm-up, timers off, on the binary that has the chain fix. No run landed in the old 77–91 band or the 16-abort band.
+
+| Block | C | Class key | FullReplay, 10 runs | Max |
+| --- | ---: | --- | --- | ---: |
+| 15274915 | 4 | to+selector | 3, 4, 4, 6, 4, 3, 4, 4, 4, 5 | 6 |
+| 15274915 | 8 | to+selector | 7, 5, 6, 4, 4, 4, 6, 3, 3, 3 | 7 |
+| 15274915 | 4 | code_hash+selector | max 4, mostly 3 | 4 |
+| 15274915 | 8 | code_hash+selector | max 4 | 4 |
+| 3356896 | 4 | to+selector | 0 × 10 | 0 |
+| 3356896 | 8 | to+selector | one 1, nine 0 | 1 |
+| 3356896 | 4 | code_hash+selector | max 1 | 1 |
+| 3356896 | 8 | code_hash+selector | max 1 | 1 |
+
+Caps are ≤ 12 and ≤ 5. Both keys meet them. `(code_hash, selector)` has the lower FullReplay on the big block. `(to, selector)` has the lower wall clock once C > 1.
+
+The remaining aborts are cross-class storage overlap: different `(to, selector)` pairs writing the same pool. The class head cannot see that slot until its own interpreter returns, and it does not cover a different class. The width is about C, under the cap.
+
+A later C=1 path (below) does not change the chain when `workers > 1`, except that the deadline clock is read every 64 scheduler spins. Three fresh runs after that change stayed in the same band: 15274915 `(to, selector)` was 5, 5, 4 at C=4 and 2, 4, 6 at C=8; `(code_hash, selector)` at C=8 was 3, 3, 3. The small block was 0 or 1.
+
+### C=1 attribution
+
+`perf` is not installed. The kernel is `6.12.94+` and `linux-tools` for that version is not in the apt index. Attribution uses scoped timers (`SPECFENCE_BUCKETS=1`). The flag is off in the wall-clock scan, and `Guard::start` does not call `Instant::now` when it is off.
+
+The split below is one instrumented pass of block 15274915 at C=1, before the fast path. Timers inflate the wall (10.705 ms here, about 7–7.5 ms untimed on that binary). Read the column as composition, not as the scan median.
+
+| Bucket | ms | Calls | What it is |
+| --- | ---: | ---: | --- |
+| interpreter | 3.781 | | shared with OCC |
+| mv_record | 1.142 | | read-set and write-set record |
+| lazy_eval | 0.538 | | beneficiary rewards |
+| publish | 0.461 | | chain insert on every write |
+| alloc_chain | 0.443 | | 256 chains plus membership |
+| coordinate | 0.182 | 2593 | directory lock and nearest-lower |
+| rescan | 0.149 | | final read-set scan |
+| validate | 0.123 | | origin compare at commit |
+| deadline_clock | 0.081 | 1226 | `Instant::now` once per transaction |
+| mark_running | 0.074 | | predicted → running |
+| sched | 0.070 | | deque pop and park |
+| class_key | 0.066 | | `(to, selector)` hashing |
+| preseed | 0.051 | | repeated-recipient chains |
+| runtime_seed | 0.048 | | phase table and stride seed |
+
+Chain and scheduling (alloc, publish, coordinate, deadline, mark, class, preseed, runtime, sched) are about 1.5 ms. The unbucketed remainder on that binary was the `thread::scope` spawn of the single worker. Shared with OCC: the interpreter, the multi-version record, lazy evaluation, and one validation. SpecFence keeps, when `workers > 1`, a value-carrying origin and a final rescan. OCC stores only the transaction index and the incarnation.
+
+After the C=1 path, the same instrumented pass (wall 6.651 ms on the big block, 0.679 ms on 3356896, still inflated) shows `alloc_chain`, `class_key`, `preseed`, `coordinate`, `mark_running`, and `mv_template` at 0. `publish` is 0.039 ms of empty-loop guard. What remains on the big block: interpreter 3.226, mv_record 0.429, lazy_eval 0.412, writeset 0.285, pre_interp 0.255, validate 0.117, rescan 0.093, sched 0.067. The lazy walk is not quadratic: pre-interpreter guards were 1324 against 1226 transactions, about 98 extra origin steps.
+
+### What the C=1 path skips
+
+When `workers == 1` the previous transaction is committed before the next read, so the chain cannot change a result. That path:
+
+- Builds `LiveChain::untracked`: no directory, and `coordinate` returns before the lock.
+- Skips class hashing, recipient preseed, and the upstream beneficiary-estimate template. The beneficiary is still lazy, so rewards evaluate at the end.
+- Stores `SfReadOrigin::MvId { tx_idx, incarnation }` instead of cloning `MemoryValue` into every origin. `workers > 1` still stores the value and compares it.
+- Reads the deadline every 64 scheduler spins, not once per transaction.
+- Runs the worker inline on the calling thread. `thread::scope` is used only when `workers > 1`. This was the last large gap: the same-process ratio against OCC moved from about 1.15 to about 1.00 before the fresh scan below.
+- Skips admission and the class-head barrier. The published-location vector is empty.
+
+Validation in the commit loop and the final rescan still run at C=1. Identity is enough there because one worker cannot rewrite an incarnation under a later read.
+
+### Wall clock after the fix
+
+Host for this scan: 4 vCPUs, KVM, Intel Xeon family 6 model 143, one thread per core, CPUs 0–3, L3 105 MiB, governor unavailable. The Stage 1 tables were family 6 model 207 with L3 320 MiB, and their absolute milliseconds are lower. The gate is the SF/OCC ratio inside one scan. Release build, `lto=false`, codegen-units 1. K=10 fresh rounds, no warm-up, bootstrap 10,000. SEQ is one workers=1 baseline and is not repeated per C. OCC is `execute_revm_parallel`. C=8 is `--allow-oversub` onto CPUs 0–3.
+
+Command: `scripts/soft0_percore_scan.sh --cpu-list 0-3 --allow-oversub --c-list 1,4,8 --k 10 --profile-k 1 --step-k 1 --skip-build`. The second key sets `SPECFENCE_CLASS_KEY=code_hash`. `seqcheck` and `occcheck` reported `diverge=0` and header gas 29928443. They compare sequential with OCC only. SpecFence equivalence is the Rust test below.
+
+Stage 1 C=1 ratios, for the before column: 15274915 was 6.362/4.792 = 1.33 (`to+selector`) and 7.543/4.508 = 1.67 (`code_hash+selector`). 3356896 was 0.636/0.388 = 1.64 and 0.721/0.393 = 1.83.
+
+#### `(to, selector)`
+
+Block 15274915, `TPS_SEQ` 295576, median 4.148 ms, 95% CI [4.007, 4.299]. C=1 SF/OCC = 5.933/5.654 = 1.05.
+
+| C | TPS_OCC | OCC ms | OCC 95% CI | TPS_SF | SF ms | SF 95% CI | TPS_ideal |
+| ---: | ---: | ---: | --- | ---: | ---: | --- | ---: |
+| 1 | 216822 | 5.654 | [5.539, 6.309] | 206686 | 5.933 | [5.650, 6.185] | 322309 |
+| 4 | 322116 | 3.806 | [3.523, 4.183] | 160115 | 7.657 | [7.306, 7.931] | 885743 |
+| 8 | 283978 | 4.317 | [4.094, 4.606] | 115232 | 10.669 | [7.752, 12.875] | 885743 |
+
+Block 3356896, `TPS_SEQ` 550074, median 0.320 ms, 95% CI [0.308, 0.330]. C=1 SF/OCC = 0.527/0.636 = 0.83.
+
+| C | TPS_OCC | OCC ms | OCC 95% CI | TPS_SF | SF ms | SF 95% CI | TPS_ideal |
+| ---: | ---: | ---: | --- | ---: | ---: | --- | ---: |
+| 1 | 276943 | 0.636 | [0.510, 0.745] | 334091 | 0.527 | [0.511, 0.543] | 683569 |
+| 4 | 288212 | 0.611 | [0.545, 0.667] | 124545 | 1.414 | [1.355, 1.499] | 2731435 |
+| 8 | 271702 | 0.648 | [0.584, 0.697] | 112589 | 1.564 | [1.464, 1.669] | 3842291 |
+
+#### `(code_hash, selector)`
+
+Block 15274915, `TPS_SEQ` 302475, median 4.054 ms, 95% CI [3.869, 4.147]. C=1 SF/OCC = 5.697/5.322 = 1.07.
+
+| C | TPS_OCC | OCC ms | OCC 95% CI | TPS_SF | SF ms | SF 95% CI | TPS_ideal |
+| ---: | ---: | ---: | --- | ---: | ---: | --- | ---: |
+| 1 | 230399 | 5.322 | [5.081, 6.282] | 215208 | 5.697 | [5.527, 5.788] | 327039 |
+| 4 | 317190 | 3.865 | [3.646, 4.110] | 131056 | 9.355 | [9.154, 9.828] | 869604 |
+| 8 | 291178 | 4.211 | [4.064, 4.315] | 114410 | 10.716 | [10.066, 11.471] | 869604 |
+
+Block 3356896, `TPS_SEQ` 550717, median 0.320 ms, 95% CI [0.305, 0.326]. C=1 SF/OCC = 0.510/0.644 = 0.79.
+
+| C | TPS_OCC | OCC ms | OCC 95% CI | TPS_SF | SF ms | SF 95% CI | TPS_ideal |
+| ---: | ---: | ---: | --- | ---: | ---: | --- | ---: |
+| 1 | 273459 | 0.644 | [0.470, 0.671] | 345356 | 0.510 | [0.494, 0.542] | 662459 |
+| 4 | 257339 | 0.684 | [0.637, 0.730] | 100798 | 1.746 | [1.598, 1.772] | 2634731 |
+| 8 | 239381 | 0.735 | [0.695, 0.831] | 89326 | 1.970 | [1.888, 2.026] | 3805241 |
+
+On the big block the SF 95% CI upper is also within 1.09× of the OCC median (6.185/5.654 and 5.788/5.322). On 3356896 the OCC interval is wide; SF's CI upper is below the OCC median for both keys.
+
+### Equivalence
+
+`sf_matches_onchain_focus_blocks` was re-run on the final binary: sequential, unmodified OCC, and SpecFence, both blocks, C=1, 4, and 8, both class keys. Receipt root, logs bloom, and gas matched (3.89s). `sf_seq_par_repeat` (12 runs at C=4 and C=8, both keys, both blocks) passed on that same binary (1.17s). `sload_static_gas_matches_chain_header` still matches header gas 29928443 and 4033966 (0.66s).
+
+### Still open
+
+- At C=4 and C=8 SpecFence remains well above OCC. On 15274915 with `(to, selector)`, C=4 is 7.657 ms against OCC 3.806 ms. That is outside this stage's gate.
+- `(code_hash, selector)` pays a storage lookup while building classes, so it is slower than `(to, selector)` once C > 1.
+- Cross-class RAW still produces a few FullReplay, under the cap.
+- `TPS_ideal` is the workers=1 profile critical path. The step-trace file is a meta line.
+- Absolute milliseconds moved with the host (model 143, L3 105 MiB versus the Stage 1 model 207, L3 320 MiB). Quote the same-scan ratio.

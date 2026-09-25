@@ -51,6 +51,9 @@ impl ClassKeyKind {
 #[derive(Clone)]
 pub(crate) struct ClassGroup {
     pub(crate) members: Vec<TxIdx>,
+    /// Calldata carried a selector. Plain value transfers stay out of the
+    /// class-head barrier; their shared recipient is preseeded instead.
+    pub(crate) contract: bool,
 }
 
 struct Chain {
@@ -59,6 +62,8 @@ struct Chain {
     /// Packed state per tx: low 2 bits are the state, next 16 the incarnation.
     state: Vec<AtomicU64>,
     armed: AtomicBool,
+    /// Class spines and abort locations stay. Eviction must not drop them.
+    pinned: AtomicBool,
     writers: AtomicUsize,
     /// Fixed-point hit/miss used as a chain credit (wait helped vs wait failed).
     ok: AtomicU64,
@@ -75,6 +80,7 @@ impl Chain {
             radar: (0..words).map(|_| AtomicU64::new(0)).collect(),
             state: (0..n).map(|_| AtomicU64::new(0)).collect(),
             armed: AtomicBool::new(false),
+            pinned: AtomicBool::new(false),
             writers: AtomicUsize::new(0),
             ok: AtomicU64::new(1),
             fail: AtomicU64::new(1),
@@ -94,6 +100,7 @@ impl Chain {
             s.store(0, Ordering::Relaxed);
         }
         self.armed.store(false, Ordering::Relaxed);
+        self.pinned.store(false, Ordering::Relaxed);
         self.writers.store(0, Ordering::Relaxed);
         self.ok.store(1, Ordering::Relaxed);
         self.fail.store(1, Ordering::Relaxed);
@@ -163,6 +170,13 @@ struct Directory {
     index: HashMap<u64, usize, FxBuildHasher>,
 }
 
+#[derive(Clone, Copy)]
+struct SlotRef {
+    slot: u16,
+    /// Read-then-write. Blind and lazy touches stay off this bit.
+    admit: bool,
+}
+
 /// First writer of a location that does not yet own a chain slot.
 struct Sighting {
     tx: TxIdx,
@@ -179,11 +193,13 @@ pub(crate) struct LiveChain {
     k_max: AtomicUsize,
     any: AtomicBool,
     class_of_tx: Vec<u16>,
+    /// `Basic(to)` hash per transaction. `0` is a create or an unknown target.
+    to_of: Vec<u64>,
     classes: Vec<ClassGroup>,
     class_hit: Vec<AtomicU64>,
     class_miss: Vec<AtomicU64>,
     class_open: Vec<AtomicBool>,
-    membership: Vec<Mutex<SmallVec<[u16; 4]>>>,
+    membership: Vec<Mutex<SmallVec<[SlotRef; 4]>>>,
     /// Abort cost estimate in nanoseconds. Moves inside [`C_ABORT_MIN`, `C_ABORT_MAX`].
     c_abort_ns: AtomicU64,
     /// Multiplier on the wait threshold. Grows when workers are idle.
@@ -198,6 +214,9 @@ pub(crate) struct LiveChain {
     /// chaining it would report a chain of length `n` and hide real spines.
     skip: std::sync::atomic::AtomicU64,
     skip_on: AtomicBool,
+    /// One worker already runs and commits in index order. The chain would
+    /// only add directory locks and allocations.
+    serial: bool,
 }
 
 impl LiveChain {
@@ -216,6 +235,7 @@ impl LiveChain {
             k_max: AtomicUsize::new(start_k),
             any: AtomicBool::new(false),
             class_of_tx: vec![u16::MAX; n],
+            to_of: vec![0; n],
             classes: Vec::new(),
             class_hit: Vec::new(),
             class_miss: Vec::new(),
@@ -230,6 +250,38 @@ impl LiveChain {
             seen: Mutex::new(HashMap::with_hasher(FxBuildHasher)),
             skip: std::sync::atomic::AtomicU64::new(0),
             skip_on: AtomicBool::new(false),
+            serial: false,
+        }
+    }
+
+    /// No chains and no per-transaction membership. Used when `workers == 1`.
+    pub(crate) fn untracked(n: usize) -> Self {
+        Self {
+            n,
+            chains: Box::new([]),
+            dir: RwLock::new(Directory {
+                index: HashMap::with_hasher(FxBuildHasher),
+            }),
+            used: AtomicUsize::new(0),
+            k_max: AtomicUsize::new(0),
+            any: AtomicBool::new(false),
+            class_of_tx: Vec::new(),
+            to_of: Vec::new(),
+            classes: Vec::new(),
+            class_hit: Vec::new(),
+            class_miss: Vec::new(),
+            class_open: Vec::new(),
+            membership: Vec::new(),
+            c_abort_ns: AtomicU64::new(50_000),
+            wait_scale_q8: AtomicU64::new(256),
+            finished: AtomicUsize::new(0),
+            aborted: AtomicUsize::new(0),
+            idle_polls: AtomicUsize::new(0),
+            busy_polls: AtomicUsize::new(0),
+            seen: Mutex::new(HashMap::with_hasher(FxBuildHasher)),
+            skip: std::sync::atomic::AtomicU64::new(0),
+            skip_on: AtomicBool::new(false),
+            serial: true,
         }
     }
 
@@ -239,18 +291,81 @@ impl LiveChain {
         self.skip_on.store(true, Ordering::Relaxed);
     }
 
-    pub(crate) fn install_classes(&mut self, classes: Vec<ClassGroup>, class_of_tx: Vec<u16>) {
+    pub(crate) fn install_classes(
+        &mut self,
+        classes: Vec<ClassGroup>,
+        class_of_tx: Vec<u16>,
+        to_of: Vec<u64>,
+    ) {
         let n = classes.len();
         self.class_hit = (0..n).map(|_| AtomicU64::new(1)).collect();
         self.class_miss = (0..n).map(|_| AtomicU64::new(1)).collect();
         self.class_open = (0..n).map(|_| AtomicBool::new(true)).collect();
         self.classes = classes;
         self.class_of_tx = class_of_tx;
+        self.to_of = to_of;
+    }
+
+    /// Before any worker runs, every repeated `Basic(to)` is an armed chain.
+    ///
+    /// Members are `Predicted` and are not admission edges. A later
+    /// read-then-write can set the admit bit. Blind and lazy publishes do not.
+    pub(crate) fn preseed_recipients(&self) {
+        let mut groups: HashMap<u64, Vec<TxIdx>, FxBuildHasher> =
+            HashMap::with_hasher(FxBuildHasher);
+        for (tx, &location) in self.to_of.iter().enumerate() {
+            if location == 0 {
+                continue;
+            }
+            if self.skip_on.load(Ordering::Relaxed) && self.skip.load(Ordering::Relaxed) == location
+            {
+                continue;
+            }
+            groups.entry(location).or_default().push(tx);
+        }
+        let mut groups: Vec<_> = groups
+            .into_iter()
+            .filter(|(_, members)| members.len() >= 2)
+            .collect();
+        groups.sort_by_key(|(_, members)| std::cmp::Reverse(members.len()));
+        if groups.is_empty() {
+            return;
+        }
+        let room = (groups.len() + 32).clamp(K_FLOOR, K_LIMIT);
+        let k = self.k_max.load(Ordering::Relaxed);
+        if room > k {
+            self.k_max.store(room, Ordering::Relaxed);
+        }
+        for (location, members) in groups {
+            self.preseed_one(location, &members);
+        }
+    }
+
+    fn preseed_one(&self, location: u64, txs: &[TxIdx]) {
+        let Some(idx) = self.ensure_slot(location, txs.len().clamp(2, K_LIMIT), true) else {
+            return;
+        };
+        let chain = &self.chains[idx];
+        chain.pinned.store(true, Ordering::Relaxed);
+        chain.class_seeded.store(true, Ordering::Relaxed);
+        chain.armed.store(true, Ordering::Release);
+        for &tx in txs {
+            if tx >= self.n {
+                continue;
+            }
+            let (state, _) = Chain::unpack(chain.state[tx].load(Ordering::Acquire));
+            if state == ST_EMPTY {
+                chain.writers.fetch_add(1, Ordering::Relaxed);
+            }
+            chain.set_member(tx);
+            chain.state[tx].store(Chain::pack(ST_PREDICTED, 0), Ordering::Release);
+            self.remember(tx, idx, false);
+        }
     }
 
     /// Radar only. Does not set member bits and does not arm a wait.
     pub(crate) fn install_radar(&self, location: u64, txs: &[TxIdx]) {
-        let Some(idx) = self.ensure_slot(location, 0) else {
+        let Some(idx) = self.ensure_slot(location, 0, false) else {
             return;
         };
         let chain = &self.chains[idx];
@@ -284,15 +399,17 @@ impl LiveChain {
         hit / (hit + miss) >= CLASS_HIT_FLOOR
     }
 
-    fn remember(&self, tx: TxIdx, slot: usize) {
+    fn remember(&self, tx: TxIdx, slot: usize, admit: bool) {
         let mut mem = self.membership[tx].lock().unwrap();
         let slot = slot as u16;
-        if !mem.contains(&slot) {
-            mem.push(slot);
+        if let Some(found) = mem.iter_mut().find(|entry| entry.slot == slot) {
+            found.admit |= admit;
+        } else {
+            mem.push(SlotRef { slot, admit });
         }
     }
 
-    fn ensure_slot(&self, location: u64, priority: usize) -> Option<usize> {
+    fn ensure_slot(&self, location: u64, priority: usize, pin: bool) -> Option<usize> {
         {
             let dir = self.dir.read().unwrap();
             if let Some(&idx) = dir.index.get(&location) {
@@ -301,6 +418,9 @@ impl LiveChain {
         }
         let mut dir = self.dir.write().unwrap();
         if let Some(&idx) = dir.index.get(&location) {
+            if pin {
+                self.chains[idx].pinned.store(true, Ordering::Relaxed);
+            }
             return Some(idx);
         }
         let k_max = self.k_max.load(Ordering::Relaxed).min(K_LIMIT);
@@ -309,6 +429,9 @@ impl LiveChain {
             let idx = used;
             self.chains[idx].reset_slot();
             self.chains[idx].live.store(true, Ordering::Release);
+            if pin {
+                self.chains[idx].pinned.store(true, Ordering::Relaxed);
+            }
             self.used.store(used + 1, Ordering::Relaxed);
             dir.index.insert(location, idx);
             self.any.store(true, Ordering::Release);
@@ -317,7 +440,7 @@ impl LiveChain {
         // Replace the lowest-credit chain when the new location is hotter.
         let mut worst: Option<(usize, u64)> = None;
         for (idx, chain) in self.chains.iter().enumerate().take(used) {
-            if !chain.live.load(Ordering::Relaxed) {
+            if !chain.live.load(Ordering::Relaxed) || chain.pinned.load(Ordering::Relaxed) {
                 continue;
             }
             let credit =
@@ -338,6 +461,9 @@ impl LiveChain {
             self.detach(idx);
             self.chains[idx].reset_slot();
             self.chains[idx].live.store(true, Ordering::Release);
+            if pin {
+                self.chains[idx].pinned.store(true, Ordering::Relaxed);
+            }
             dir.index.retain(|_, v| *v != idx);
             dir.index.insert(location, idx);
             self.any.store(true, Ordering::Release);
@@ -377,6 +503,42 @@ impl LiveChain {
         self.writer_state(location, writer).0 == ST_PUBLISHED
     }
 
+    /// A finished predicted or running writer that never published is a hole.
+    /// Drop it so the next lower writer becomes visible. Published writers stay.
+    pub(crate) fn clear_hole(&self, location: u64, tx: TxIdx) {
+        let Some(idx) = self.slot_of(location) else {
+            return;
+        };
+        if tx >= self.n {
+            return;
+        }
+        let chain = &self.chains[idx];
+        let (state, _) = Chain::unpack(chain.state[tx].load(Ordering::Acquire));
+        if state == ST_PUBLISHED || state == ST_EMPTY {
+            return;
+        }
+        chain.clear_member(tx);
+        chain.state[tx].store(ST_EMPTY, Ordering::Release);
+        if chain.writers.load(Ordering::Relaxed) > 0 {
+            chain.writers.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn member_bit(&self, location: u64, tx: TxIdx) -> bool {
+        let Some(idx) = self.slot_of(location) else {
+            return false;
+        };
+        if tx >= self.n {
+            return false;
+        }
+        let word = tx / 64;
+        let bit = 1u64 << (tx % 64);
+        self.chains[idx]
+            .member
+            .get(word)
+            .is_some_and(|w| w.load(Ordering::Acquire) & bit != 0)
+    }
+
     /// Predicted and running writers wait when the abort cost still beats the wait.
     pub(crate) fn should_wait(&self, location: u64, writer: TxIdx, writer_executing: bool) -> bool {
         let (state, _) = self.writer_state(location, writer);
@@ -405,13 +567,13 @@ impl LiveChain {
 
     /// Predecessor this tx should wait for before it is admitted, if any.
     pub(crate) fn admission_predecessor(&self, tx: TxIdx) -> Option<TxIdx> {
-        if !self.any.load(Ordering::Relaxed) || tx == 0 {
+        if self.serial || !self.any.load(Ordering::Relaxed) || tx == 0 {
             return None;
         }
         let mem = self.membership[tx].lock().unwrap();
         let mut best: Option<TxIdx> = None;
-        for &slot in mem.iter() {
-            let chain = &self.chains[slot as usize];
+        for entry in mem.iter().filter(|entry| entry.admit) {
+            let chain = &self.chains[entry.slot as usize];
             let Some(pred) = chain.nearest_lower(tx) else {
                 continue;
             };
@@ -432,13 +594,43 @@ impl LiveChain {
     }
 
     pub(crate) fn mark_running(&self, tx: TxIdx, incarnation: usize) {
+        if self.serial {
+            return;
+        }
         let mem = self.membership[tx].lock().unwrap().clone();
-        for slot in mem {
-            let chain = &self.chains[slot as usize];
+        for entry in mem {
+            let chain = &self.chains[entry.slot as usize];
             let (state, _) = Chain::unpack(chain.state[tx].load(Ordering::Acquire));
             if state == ST_PREDICTED || state == ST_RUNNING {
                 chain.state[tx].store(Chain::pack(ST_RUNNING, incarnation), Ordering::Release);
             }
+        }
+    }
+
+    /// Lowest-index classmate, when this transaction must not start until that
+    /// head has finished. The head publishes read-then-write locations and
+    /// predicts the rest of the class before those transactions read.
+    ///
+    /// Plain transfers return `None`. Their shared recipient is already a
+    /// preseeded chain, and a head barrier would hold that chain's predicted
+    /// writers behind one transaction.
+    pub(crate) fn class_head(&self, tx: TxIdx) -> Option<TxIdx> {
+        if self.serial {
+            return None;
+        }
+        let class = self.class_of_tx.get(tx).copied().unwrap_or(u16::MAX);
+        if class == u16::MAX {
+            return None;
+        }
+        let group = self.classes.get(class as usize)?;
+        if !group.contract {
+            return None;
+        }
+        let head = *group.members.first()?;
+        if head >= tx {
+            None
+        } else {
+            Some(head)
         }
     }
 
@@ -447,8 +639,9 @@ impl LiveChain {
     /// Read-then-write joins the admission list so the writer waits for the
     /// previous final value. Blind and lazy writes are visible to readers
     /// (member bit, `Published`) and do not make writers wait on each other.
-    /// A location enters the directory on the second writer, or on the first
-    /// read-then-write of a repeated class.
+    /// The publisher itself is inserted on the first write when a slot is
+    /// free. Same-class prediction runs only for a read-then-write: a lazy
+    /// sender write must not mark every classmate as a writer of that account.
     pub(crate) fn publish_write(
         &self,
         tx: TxIdx,
@@ -457,6 +650,9 @@ impl LiveChain {
         rmw: bool,
         tx_open: impl Fn(TxIdx) -> bool,
     ) {
+        if self.serial {
+            return;
+        }
         if self.skip_on.load(Ordering::Relaxed) && self.skip.load(Ordering::Relaxed) == location {
             return;
         }
@@ -478,9 +674,24 @@ impl LiveChain {
             self.mark_published(idx, tx, incarnation, rmw);
             return;
         }
+        // Same-class prediction is a read-then-write edge. Blind and lazy
+        // writes insert only this publisher.
         let open_for_class = rmw && class_len >= 2 && self.class_allows(class);
         let prev = seen.remove(&location);
         if prev.is_none() && !open_for_class {
+            drop(seen);
+            // First publisher is visible immediately when a slot is free.
+            // Readers then wait for that write instead of for a second publisher.
+            if let Some(idx) = self.ensure_slot(location, 1, false) {
+                self.mark_published(idx, tx, incarnation, rmw);
+                return;
+            }
+            let mut seen = self.seen.lock().unwrap();
+            if let Some(idx) = self.slot_of(location) {
+                drop(seen);
+                self.mark_published(idx, tx, incarnation, rmw);
+                return;
+            }
             seen.insert(
                 location,
                 Sighting {
@@ -498,7 +709,7 @@ impl LiveChain {
         } else {
             2
         };
-        let Some(idx) = self.ensure_slot(location, priority) else {
+        let Some(idx) = self.ensure_slot(location, priority, open_for_class) else {
             seen.insert(
                 location,
                 prev.unwrap_or(Sighting {
@@ -515,7 +726,8 @@ impl LiveChain {
         }
         self.mark_published(idx, tx, incarnation, rmw);
         if open_for_class {
-            self.predict_siblings(idx, tx, class, &tx_open);
+            self.chains[idx].pinned.store(true, Ordering::Relaxed);
+            self.predict_siblings(idx, tx, class, &tx_open, rmw);
         }
     }
 
@@ -531,9 +743,16 @@ impl LiveChain {
         chain.set_member(tx);
         chain.state[tx].store(Chain::pack(ST_PUBLISHED, incarnation), Ordering::Release);
         if admit {
-            self.remember(tx, idx);
+            self.remember(tx, idx, true);
+        } else {
+            self.remember(tx, idx, false);
         }
-        if chain.writers.load(Ordering::Relaxed) >= 2 {
+        let writers = chain.writers.load(Ordering::Relaxed);
+        if writers >= 2 || chain.class_seeded.load(Ordering::Relaxed) {
+            chain.pinned.store(true, Ordering::Relaxed);
+            chain.armed.store(true, Ordering::Release);
+        } else if writers >= 1 {
+            // One known writer is already a RAW edge for later readers.
             chain.armed.store(true, Ordering::Release);
         }
     }
@@ -544,11 +763,33 @@ impl LiveChain {
         tx: TxIdx,
         class: u16,
         tx_open: &impl Fn(TxIdx) -> bool,
+        admit: bool,
     ) {
         let chain = &self.chains[idx];
         if chain.class_seeded.swap(true, Ordering::AcqRel) {
             return;
         }
+        chain.pinned.store(true, Ordering::Relaxed);
+        chain.armed.store(true, Ordering::Release);
+        self.insert_same_target(idx, tx, class, tx_open, admit);
+    }
+
+    /// Add classmates that are not on the chain yet.
+    ///
+    /// Safe to call after the chain is already seeded. Blind and lazy callers
+    /// pass `admit = false`.
+    pub(crate) fn insert_same_target(
+        &self,
+        idx: usize,
+        tx: TxIdx,
+        class: u16,
+        tx_open: &impl Fn(TxIdx) -> bool,
+        admit: bool,
+    ) {
+        if class == u16::MAX || idx >= self.chains.len() {
+            return;
+        }
+        let chain = &self.chains[idx];
         chain.armed.store(true, Ordering::Release);
         for &member in &self.classes[class as usize].members {
             if member == tx || member >= self.n || !tx_open(member) {
@@ -559,9 +800,24 @@ impl LiveChain {
                 chain.set_member(member);
                 chain.state[member].store(Chain::pack(ST_PREDICTED, 0), Ordering::Release);
                 chain.writers.fetch_add(1, Ordering::Relaxed);
-                self.remember(member, idx);
+                self.remember(member, idx, admit);
             }
         }
+    }
+
+    /// Abort evidence: the invalidating writer and its same-target classmates
+    /// join the chain even if they have not published yet.
+    pub(crate) fn note_conflict_writer(
+        &self,
+        location: u64,
+        writer: TxIdx,
+        tx_open: impl Fn(TxIdx) -> bool,
+    ) {
+        let Some(idx) = self.slot_of(location) else {
+            return;
+        };
+        let class = self.class_of_tx.get(writer).copied().unwrap_or(u16::MAX);
+        self.insert_same_target(idx, writer, class, &tx_open, false);
     }
 
     /// Drop admission membership for a slot that is about to be reused.
@@ -583,15 +839,16 @@ impl LiveChain {
                 self.membership[tx]
                     .lock()
                     .unwrap()
-                    .retain(|slot| *slot != idx as u16);
+                    .retain(|entry| entry.slot != idx as u16);
             }
         }
     }
 
     /// Validation failed on `location`. Backfill is the caller's mv scan.
     pub(crate) fn arm_failure(&self, location: u64) {
-        if let Some(idx) = self.ensure_slot(location, K_LIMIT) {
+        if let Some(idx) = self.ensure_slot(location, K_LIMIT, true) {
             let chain = &self.chains[idx];
+            chain.pinned.store(true, Ordering::Relaxed);
             chain.armed.store(true, Ordering::Release);
             chain.fail.fetch_add(1, Ordering::Relaxed);
         }
@@ -615,22 +872,27 @@ impl LiveChain {
     /// Previous incarnation's write set becomes a high-confidence prediction.
     pub(crate) fn on_abort_residual(&self, tx: TxIdx, incarnation: usize, locations: &[u64]) {
         for &location in locations {
-            let Some(idx) = self.ensure_slot(location, 8) else {
+            let Some(idx) = self.ensure_slot(location, 8, true) else {
                 continue;
             };
             let chain = &self.chains[idx];
+            chain.pinned.store(true, Ordering::Relaxed);
             chain.set_member(tx);
             chain.state[tx].store(Chain::pack(ST_PREDICTED, incarnation), Ordering::Release);
             chain.armed.store(true, Ordering::Release);
-            self.remember(tx, idx);
+            // Keep an admit bit that a read-then-write already set.
+            self.remember(tx, idx, false);
         }
     }
 
     /// Drop predicted bits the committed tx did not actually write, and wake is external.
     pub(crate) fn hole_clear(&self, tx: TxIdx, written: &[u64]) {
+        if self.serial {
+            return;
+        }
         let mem = self.membership[tx].lock().unwrap().clone();
-        for slot in mem {
-            let chain = &self.chains[slot as usize];
+        for entry in mem {
+            let chain = &self.chains[entry.slot as usize];
             let (state, inc) = Chain::unpack(chain.state[tx].load(Ordering::Acquire));
             if state == ST_PUBLISHED {
                 let _ = (written, inc);
@@ -638,7 +900,7 @@ impl LiveChain {
             }
             chain.clear_member(tx);
             chain.state[tx].store(ST_EMPTY, Ordering::Release);
-            if state == ST_PREDICTED {
+            if state != ST_EMPTY {
                 chain.writers.fetch_sub(1, Ordering::Relaxed);
                 if let Some(&class) = self.class_of_tx.get(tx)
                     && class != u16::MAX
@@ -689,7 +951,16 @@ impl LiveChain {
                 Ordering::Relaxed,
             );
         } else if abort_rate < 0.02 && k > K_FLOOR {
-            k -= 1;
+            let used = self.used.load(Ordering::Relaxed);
+            let pinned = self
+                .chains
+                .iter()
+                .take(used)
+                .filter(|chain| chain.pinned.load(Ordering::Relaxed))
+                .count();
+            if k > pinned.saturating_add(8) {
+                k -= 1;
+            }
         }
         self.k_max.store(k, Ordering::Relaxed);
         let mut scale = self.wait_scale_q8.load(Ordering::Relaxed);
@@ -725,5 +996,75 @@ impl LiveChain {
             .take(used)
             .filter(|c| c.armed.load(Ordering::Relaxed))
             .count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preseed_arms_recipient_without_admission() {
+        let n = 4;
+        let mut live = LiveChain::new(n, ClassKeyKind::ToSelector);
+        live.install_classes(Vec::new(), vec![u16::MAX; n], vec![10, 0, 10, 10]);
+        live.preseed_recipients();
+        assert!(live.is_armed(10));
+        assert_eq!(live.nearest_lower(10, 3), Some(2));
+        assert_eq!(live.nearest_lower(10, 2), Some(0));
+        assert!(live.admission_predecessor(3).is_none());
+        assert_eq!(live.writer_state(10, 0).0, ST_PREDICTED);
+        live.publish_write(0, 0, 10, false, |_| true);
+        assert_eq!(live.writer_state(10, 0).0, ST_PUBLISHED);
+        assert!(live.admission_predecessor(2).is_none());
+    }
+
+    #[test]
+    fn rmw_predicts_class_and_admits_only_read_then_write() {
+        let n = 3;
+        let mut live = LiveChain::new(n, ClassKeyKind::ToSelector);
+        live.install_classes(
+            vec![ClassGroup {
+                members: vec![0, 1, 2],
+                contract: true,
+            }],
+            vec![0, 0, 0],
+            vec![10, 10, 10],
+        );
+        live.publish_write(0, 0, 77, true, |_| true);
+        assert!(live.is_armed(77));
+        assert_eq!(live.nearest_lower(77, 2), Some(1));
+        assert_eq!(live.writer_state(77, 1).0, ST_PREDICTED);
+        assert_eq!(live.admission_predecessor(2), Some(1));
+        assert_eq!(live.class_head(2), Some(0));
+        assert!(live.class_head(0).is_none());
+
+        let mut blind = LiveChain::new(n, ClassKeyKind::ToSelector);
+        blind.install_classes(
+            vec![ClassGroup {
+                members: vec![0, 1, 2],
+                contract: true,
+            }],
+            vec![0, 0, 0],
+            vec![10, 10, 10],
+        );
+        blind.publish_write(0, 0, 88, false, |_| true);
+        assert!(blind.is_armed(88));
+        assert_eq!(blind.writer_state(88, 0).0, ST_PUBLISHED);
+        assert_eq!(blind.writer_state(88, 1).0, ST_EMPTY);
+        assert_eq!(blind.nearest_lower(88, 2), Some(0));
+        assert!(blind.admission_predecessor(1).is_none());
+        assert!(blind.admission_predecessor(2).is_none());
+
+        let mut plain = LiveChain::new(n, ClassKeyKind::ToSelector);
+        plain.install_classes(
+            vec![ClassGroup {
+                members: vec![0, 1, 2],
+                contract: false,
+            }],
+            vec![0, 0, 0],
+            vec![10, 10, 10],
+        );
+        assert!(plain.class_head(2).is_none());
     }
 }
