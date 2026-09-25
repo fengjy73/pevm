@@ -1,20 +1,54 @@
-//! In-block trace. Counters move only when `SPECFENCE_INBLOCK_TRACE` is set,
-//! so the execution hot path does not touch them otherwise.
+//! In-block trace.
+//!
+//! Re-exec and full-replay counts always move. Per-read counters, durations,
+//! and the profile clock move only when their flag is set. The profile flag
+//! is `SPECFENCE_INFLATION`. It is off on the wall-clock path, so that path
+//! does not call `Instant::now`.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+fn flag(name: &str) -> bool {
+    matches!(
+        std::env::var(name).ok().as_deref(),
+        Some("1" | "true" | "TRUE")
+    )
+}
+
 fn enabled_flag() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        matches!(
-            std::env::var("SPECFENCE_INBLOCK_TRACE").ok().as_deref(),
-            Some("1" | "true" | "TRUE")
-        )
-    })
+    *ON.get_or_init(|| flag("SPECFENCE_INBLOCK_TRACE"))
+}
+
+fn profile_flag() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| flag("SPECFENCE_INFLATION"))
+}
+
+/// One interpreter return, kept for the profile dump.
+///
+/// `kind` is 1 only after that incarnation commits. The report keeps the
+/// committed row and ignores the others.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SfAttempt {
+    /// Transaction index.
+    pub tx: u32,
+    /// Incarnation.
+    pub inc: u32,
+    /// 1 after commit, 0 while the attempt is only an interpreter return.
+    pub kind: u8,
+    /// Nanoseconds from interpreter entry to the write-set publish.
+    pub total_ns: u64,
+    /// Locations read.
+    pub reads: Vec<u64>,
+    /// Non-lazy locations written.
+    pub writes: Vec<u64>,
+    /// Lazy locations written. The ideal schedule drops these.
+    pub lazy_writes: Vec<u64>,
 }
 
 pub(crate) struct Trace {
     on: bool,
+    profile: bool,
     pub(crate) exec_entries: AtomicUsize,
     pub(crate) reexec: AtomicUsize,
     pub(crate) full_replay: AtomicUsize,
@@ -22,6 +56,7 @@ pub(crate) struct Trace {
     pub(crate) full_replay_after_arm: AtomicUsize,
     pub(crate) raw_edges: std::sync::Mutex<Vec<(u32, u32)>>,
     pub(crate) tx_ns: std::sync::Mutex<Vec<u64>>,
+    attempts: std::sync::Mutex<Vec<SfAttempt>>,
 }
 
 impl Trace {
@@ -29,19 +64,32 @@ impl Trace {
         let on = enabled_flag();
         Self {
             on,
+            profile: profile_flag(),
             exec_entries: AtomicUsize::new(0),
             reexec: AtomicUsize::new(0),
             full_replay: AtomicUsize::new(0),
             reads_after_arm: AtomicUsize::new(0),
             full_replay_after_arm: AtomicUsize::new(0),
             raw_edges: std::sync::Mutex::new(Vec::new()),
-            tx_ns: std::sync::Mutex::new(vec![0; n]),
+            tx_ns: std::sync::Mutex::new(if on { vec![0; n] } else { Vec::new() }),
+            attempts: std::sync::Mutex::new(Vec::new()),
         }
     }
 
     #[inline]
     pub(crate) const fn enabled(&self) -> bool {
         self.on
+    }
+
+    /// True when a duration or a profile attempt should be recorded.
+    #[inline]
+    pub(crate) const fn timing(&self) -> bool {
+        self.on || self.profile
+    }
+
+    #[inline]
+    pub(crate) const fn profile(&self) -> bool {
+        self.profile
     }
 
     #[inline]
@@ -85,6 +133,44 @@ impl Trace {
             *slot = ns;
         }
     }
+
+    pub(crate) fn note_attempt(
+        &self,
+        tx: usize,
+        inc: usize,
+        total_ns: u64,
+        reads: Vec<u64>,
+        writes: Vec<u64>,
+        lazy_writes: Vec<u64>,
+    ) {
+        if !self.profile {
+            return;
+        }
+        self.attempts.lock().unwrap().push(SfAttempt {
+            tx: tx as u32,
+            inc: inc as u32,
+            kind: 0,
+            total_ns,
+            reads,
+            writes,
+            lazy_writes,
+        });
+    }
+
+    pub(crate) fn note_committed(&self, tx: usize, inc: usize) {
+        if !self.profile {
+            return;
+        }
+        let tx = tx as u32;
+        let inc = inc as u32;
+        let mut attempts = self.attempts.lock().unwrap();
+        for attempt in attempts.iter_mut().rev() {
+            if attempt.tx == tx && attempt.inc == inc {
+                attempt.kind = 1;
+                return;
+            }
+        }
+    }
 }
 
 /// Counters for one `SpecFence` block.
@@ -110,10 +196,20 @@ pub struct SfTrace {
     pub tx_ns: Vec<u64>,
     /// RAW edges `(writer, reader)` observed from consumed origins.
     pub raw_edges: Vec<(u32, u32)>,
+    /// Beneficiary basic-account hash. The ideal schedule drops this location.
+    pub beneficiary: u64,
+    /// Profile attempts. Empty unless `SPECFENCE_INFLATION` is set.
+    pub attempts: Vec<SfAttempt>,
 }
 
 impl Trace {
-    pub(crate) fn snapshot(&self, chain_len: usize, armed: usize, class_key: &str) -> SfTrace {
+    pub(crate) fn snapshot(
+        &self,
+        chain_len: usize,
+        armed: usize,
+        class_key: &str,
+        beneficiary: u64,
+    ) -> SfTrace {
         let (tx_ns, raw_edges) = if self.on {
             (
                 self.tx_ns.lock().unwrap().clone(),
@@ -121,6 +217,11 @@ impl Trace {
             )
         } else {
             (Vec::new(), Vec::new())
+        };
+        let attempts = if self.profile {
+            self.attempts.lock().unwrap().clone()
+        } else {
+            Vec::new()
         };
         SfTrace {
             reexec: self.reexec.load(Ordering::Relaxed),
@@ -133,6 +234,8 @@ impl Trace {
             class_key: class_key.to_string(),
             tx_ns,
             raw_edges,
+            beneficiary,
+            attempts,
         }
     }
 }

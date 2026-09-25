@@ -123,9 +123,8 @@ where
 
     let mv = SfMv::new(n, estimates, lazy);
     let mut live = LiveChain::new(n, options.class_key);
-    live.skip_location(hash_deterministic(MemoryLocation::Basic(
-        block_env.beneficiary,
-    )));
+    let beneficiary = hash_deterministic(MemoryLocation::Basic(block_env.beneficiary));
+    live.skip_location(beneficiary);
     let (groups, class_of) = build_classes(chain, storage, &txs, options.class_key);
     live.install_classes(groups, class_of);
     for (location, writers) in &options.radar {
@@ -286,6 +285,7 @@ where
         live.max_chain_len(),
         live.armed_locations(),
         options.class_key.as_str(),
+        beneficiary,
     );
     *LAST_TRACE.lock().unwrap() = Some(snap);
     Ok(fully)
@@ -325,6 +325,7 @@ fn try_commit(
             return;
         }
         if rt.try_mark_committed(i, inc) {
+            trace.note_committed(i, inc);
             let writes = mv.write_locations(i);
             live.hole_clear(i, &writes);
             live.note_finished(false);

@@ -18,6 +18,7 @@
 3. **已完成** — 前缀卡住的原因：读等待自旋约 1 秒，以及 nonce 阻塞在已提交的 `tx-1` 上后把同一笔交易反复压回队首。改为短等待、阻塞同一发送者的前序，前序已结束则让出前缀。
 4. **已完成** — 盲写和 lazy 写进入读者可见的链，但不进入 admission。受益人账户不进链。播种改为按 worker 跨步，第一波是 `0..C`。
 5. **已完成** — 链上等价（C=1/4/8，两种类键）和 C=4/8 各 12 次 `seq=par` 通过。计数、墙钟和偏差写在 `docs/specfence-v2-stage1.md`。FullReplay 未稳定落在设计上限内，原因是写集合要等解释器返回才发布。
+6. **进行中** — 换用 PR #62 的 scan / report / step-ideal 脚本。OCC 是本树的 `Pevm::execute_revm_parallel`，不引入 `pevm_upstream`。`SfVm::execute` 只在 trace 或 `SPECFENCE_INFLATION` 打开时调用 `Instant::now`。TPS_ideal 在 OCC 没有逐笔探针时改用 workers=1 的 SpecFence profile。旧 fork 另外四段回归（opcode `note_frame_depth`、读历史 clone、reader index、`execute_revm_parallel` 里建 SF 表）本来就不在这条路径上。
 
 ## 未纳入本阶段
 

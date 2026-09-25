@@ -513,7 +513,9 @@ impl<'a, S: crate::Storage, C: PevmChain> SfVm<'a, S, C> {
         incarnation: usize,
         result_slot: &mut Option<PevmTxExecutionResult>,
     ) -> Step {
-        let started = Instant::now();
+        // The clock is the old ExecPhase regression when it runs on every
+        // transaction. Wall-clock runs leave both flags off.
+        let clock = self.trace.timing().then(Instant::now);
         self.trace.note_exec(incarnation);
         self.live.mark_running(tx_idx, incarnation);
         let tx_version = TxVersion {
@@ -689,9 +691,31 @@ impl<'a, S: crate::Storage, C: PevmChain> SfVm<'a, S, C> {
                 .publish_write(tx_idx, incarnation, *location, rmw, |t| self.rt.tx_open(t));
         }
 
+        let elapsed_ns = clock.map(|t| t.elapsed().as_nanos() as u64);
+        if self.trace.profile() {
+            let reads: Vec<u64> = read_set.keys().copied().collect();
+            let mut writes = Vec::new();
+            let mut lazy_writes = Vec::new();
+            for (location, value) in &write_set {
+                if is_lazy_value(value) {
+                    lazy_writes.push(*location);
+                } else {
+                    writes.push(*location);
+                }
+            }
+            self.trace.note_attempt(
+                tx_idx,
+                incarnation,
+                elapsed_ns.unwrap_or(0),
+                reads,
+                writes,
+                lazy_writes,
+            );
+        }
+        if let Some(ns) = elapsed_ns.filter(|_| self.trace.enabled()) {
+            self.trace.note_tx_ns(tx_idx, ns);
+        }
         self.mv.record(&tx_version, read_set, write_set);
-        self.trace
-            .note_tx_ns(tx_idx, started.elapsed().as_nanos() as u64);
 
         let receipt = receipt_from_revm(exec_result);
         let state = state_transitions_from_revm(self.is_eip_161_enabled, state);

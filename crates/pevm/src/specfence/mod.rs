@@ -13,7 +13,7 @@ mod trace;
 mod vm;
 
 pub use engine::{SfClassKey, SfOptions, last_trace, run_sf_block};
-pub use trace::SfTrace;
+pub use trace::{SfAttempt, SfTrace};
 
 /// Revm block environment for an Alloy header. Same mapping upstream uses.
 pub fn block_env(
