@@ -216,6 +216,7 @@ macro_rules! index_mutex {
 
 pub mod chain;
 mod compat;
+pub use compat::get_block_env;
 mod mv_memory;
 mod pevm;
 pub use pevm::{Pevm, PevmError, PevmResult, execute_revm_sequential};

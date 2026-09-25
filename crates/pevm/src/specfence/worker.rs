@@ -310,20 +310,17 @@ pub(crate) fn run_sf_block<F, V>(
                                 phase_v0.elapsed().as_nanos() as u64,
                             );
                             let learn_t0 = Instant::now();
-                            resolve_plan::apply(
-                                plan,
-                                ApplyCtx {
-                                    specfence,
-                                    mv_memory,
-                                    scheduler,
-                                    runnable,
-                                    arms,
-                                    tx_version: &tx_version,
-                                    vis,
-                                    wrote_new_location,
-                                    invalid: &invalid,
-                                },
-                            );
+                            resolve_plan::apply(plan, ApplyCtx {
+                                specfence,
+                                mv_memory,
+                                scheduler,
+                                runnable,
+                                arms,
+                                tx_version: &tx_version,
+                                vis,
+                                wrote_new_location,
+                                invalid: &invalid,
+                            });
                             super::busy_stall::charge_span(
                                 super::busy_stall::KIND_LEARN,
                                 learn_t0.elapsed().as_nanos() as u64,
@@ -334,22 +331,25 @@ pub(crate) fn run_sf_block<F, V>(
                                 learn_t0.elapsed().as_nanos() as u64,
                             );
                         } else {
-                            resolve_plan::apply(
-                                plan,
-                                ApplyCtx {
-                                    specfence,
-                                    mv_memory,
-                                    scheduler,
-                                    runnable,
-                                    arms,
-                                    tx_version: &tx_version,
-                                    vis,
-                                    wrote_new_location,
-                                    invalid: &invalid,
-                                },
-                            );
+                            resolve_plan::apply(plan, ApplyCtx {
+                                specfence,
+                                mv_memory,
+                                scheduler,
+                                runnable,
+                                arms,
+                                tx_version: &tx_version,
+                                vis,
+                                wrote_new_location,
+                                invalid: &invalid,
+                            });
                         }
-                        metrics.add_phase_val(phase_v0.elapsed().as_nanos() as u64);
+                        let val_ns = phase_v0.elapsed().as_nanos() as u64;
+                        metrics.add_phase_val(val_ns);
+                        crate::specfence::inflation::note_val(
+                            tx_version.tx_idx,
+                            tx_version.tx_incarnation as u16,
+                            val_ns,
+                        );
                         note_validate_span(runnable, val_start, origin_ns(specfence));
                         record_post_exec(runnable, outside, phase_t0.elapsed().as_nanos() as u64);
                     }
@@ -434,20 +434,17 @@ pub(crate) fn run_sf_block<F, V>(
                         val_ns,
                     );
                     let learn_t0 = Instant::now();
-                    resolve_plan::apply(
-                        plan,
-                        ApplyCtx {
-                            specfence,
-                            mv_memory,
-                            scheduler,
-                            runnable,
-                            arms,
-                            tx_version: &tx_version,
-                            vis,
-                            wrote_new_location: false,
-                            invalid: &invalid,
-                        },
-                    );
+                    resolve_plan::apply(plan, ApplyCtx {
+                        specfence,
+                        mv_memory,
+                        scheduler,
+                        runnable,
+                        arms,
+                        tx_version: &tx_version,
+                        vis,
+                        wrote_new_location: false,
+                        invalid: &invalid,
+                    });
                     let learn_ns = learn_t0.elapsed().as_nanos() as u64;
                     super::busy_stall::charge_span(
                         super::busy_stall::KIND_LEARN,
@@ -459,22 +456,25 @@ pub(crate) fn run_sf_block<F, V>(
                         learn_ns,
                     );
                 } else {
-                    resolve_plan::apply(
-                        plan,
-                        ApplyCtx {
-                            specfence,
-                            mv_memory,
-                            scheduler,
-                            runnable,
-                            arms,
-                            tx_version: &tx_version,
-                            vis,
-                            wrote_new_location: false,
-                            invalid: &invalid,
-                        },
-                    );
+                    resolve_plan::apply(plan, ApplyCtx {
+                        specfence,
+                        mv_memory,
+                        scheduler,
+                        runnable,
+                        arms,
+                        tx_version: &tx_version,
+                        vis,
+                        wrote_new_location: false,
+                        invalid: &invalid,
+                    });
                 }
-                metrics.add_phase_val(phase_v0.elapsed().as_nanos() as u64);
+                let val_ns = phase_v0.elapsed().as_nanos() as u64;
+                metrics.add_phase_val(val_ns);
+                crate::specfence::inflation::note_val(
+                    tx_version.tx_idx,
+                    tx_version.tx_incarnation as u16,
+                    val_ns,
+                );
                 note_validate_span(runnable, val_start, origin_ns(specfence));
                 record_post_exec(runnable, outside, phase_t0.elapsed().as_nanos() as u64);
                 metrics.add_worker_busy_ns(t0.elapsed().as_nanos() as u64);

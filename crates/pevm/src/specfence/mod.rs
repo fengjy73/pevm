@@ -179,6 +179,7 @@ mod admit_deque;
 mod arm_table;
 mod bayes;
 mod boundary;
+pub(crate) mod busy_stall;
 mod certificate;
 mod collateral;
 mod computer;
@@ -192,8 +193,8 @@ pub(crate) mod feeder;
 mod finegrain;
 mod heat;
 mod hotset;
-pub(crate) mod busy_stall;
 mod ideal_prox;
+pub(crate) mod inflation;
 #[cfg(test)]
 mod kernel;
 mod lane;
@@ -214,6 +215,7 @@ mod runnable_set;
 mod schedule;
 mod sf_mv;
 mod sketch;
+pub(crate) mod step_trace;
 mod visibility;
 mod wave;
 mod worker;
@@ -250,6 +252,10 @@ pub(crate) use boundary::{
     try_arm_safe_absolute_jump_gated, try_consume_nested_ordered_admit_resume,
     with_ordered_admit_snap_tls, with_protocol_tls, with_protocol_tls_journal,
 };
+pub use busy_stall::{BusyStallSnap, enabled as busy_stall_enabled, last_snap as busy_stall_last};
+pub(crate) use busy_stall::{
+    begin as busy_stall_begin, bind as busy_stall_bind, seal as busy_stall_seal,
+};
 pub(crate) use certificate::CertificateTable;
 #[allow(unused_imports)]
 pub(crate) use collateral::{
@@ -283,15 +289,23 @@ pub(crate) use heat::HeatMap;
 pub(crate) use hotset::HotSet;
 #[allow(unused_imports)]
 pub(crate) use hotset::{H_A, H_W};
-pub use busy_stall::{BusyStallSnap, enabled as busy_stall_enabled, last_snap as busy_stall_last};
-pub(crate) use busy_stall::{begin as busy_stall_begin, bind as busy_stall_bind, seal as busy_stall_seal};
 pub(crate) use ideal_prox::IdealProxLog;
 pub use ideal_prox::{
     IdealProxDiff, IdealProxSnap, IdealProxTx, blocker_name, diff_indep, role_name,
 };
+pub use inflation::{
+    Attempt as InflationAttempt, BoundGuard as InflationBoundGuard, BoundarySnap, InflationAlloc,
+    InflationDrain, SeqTx as InflationSeqTx, TAG_OCC, TAG_SEQ_TX, TAG_SEQ_VM, TAG_SF,
+    ValNote as InflationVal, drain as inflation_drain, enabled as inflation_enabled,
+    set_tag as inflation_set_tag,
+};
 pub use resolve_plan::ResolvePlan;
 pub(crate) use runnable_set::RunnableSet;
 pub(crate) use sf_mv::{SfConflictClass, SfMvMemory, SfTip, SfTipTable, classify_wait_conflict};
+pub use step_trace::{
+    TxTrace as StepTxTrace, beneficiary as step_beneficiary, drain as step_drain,
+    enabled as step_trace_enabled,
+};
 pub use visibility::VisibilityPolicy;
 pub(crate) use worker::{SfExec, run_sf_block};
 // kernel.rs museum — tests only; rem-legal SoT is CertificateTable.

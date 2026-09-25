@@ -453,6 +453,7 @@ impl Pevm {
         C: PevmChain + Send + Sync,
         S: Storage + Send + Sync + Debug,
     {
+        let _bound = crate::specfence::inflation::BoundGuard::enter();
         let spec_id = chain
             .get_block_spec(&block.header)
             .map_err(PevmError::BlockSpecError)?;
@@ -735,11 +736,13 @@ impl Pevm {
                 // Zero calls to Scheduler::next_task* / validate_occ_stage.
                 for _ in 0..concurrency_level.into() {
                     scope.spawn(|| {
+                        let worker_i =
+                            sf_worker_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        crate::specfence::inflation::pin_worker(worker_i);
+                        crate::specfence::inflation::mark_worker_enter();
                         let mut vm = Vm::new(
                             chain, spec_id, &block_env, &txs, storage, &mv_memory, specfence,
                         );
-                        let worker_i =
-                            sf_worker_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         crate::specfence::busy_stall::bind(worker_i);
                         crate::specfence::run_sf_block(
                             &scheduler,
@@ -760,17 +763,20 @@ impl Pevm {
                                 )
                             },
                         );
+                        crate::specfence::inflation::mark_worker_exit();
                     });
                 }
                 join_mark = Instant::now();
             } else {
                 for _ in 0..concurrency_level.into() {
                     scope.spawn(|| {
+                        let worker_i =
+                            sf_worker_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        crate::specfence::inflation::pin_worker(worker_i);
+                        crate::specfence::inflation::mark_worker_enter();
                         let mut vm = Vm::new(
                             chain, spec_id, &block_env, &txs, storage, &mv_memory, specfence,
                         );
-                        let worker_i =
-                            sf_worker_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         crate::specfence::busy_stall::bind(worker_i);
                         let profile = crate::specfence::profile_timing_enabled();
                         let occ_mode = self.concurrency_mode == ConcurrencyMode::Occ;
@@ -807,6 +813,11 @@ impl Pevm {
                                     };
                                     let vns = v0.elapsed().as_nanos() as u64;
                                     metrics_inner.add_phase_val(vns);
+                                    crate::specfence::inflation::note_val(
+                                        tx_version.tx_idx,
+                                        tx_version.tx_incarnation as u16,
+                                        vns,
+                                    );
                                     crate::specfence::busy_stall::charge_span(
                                         crate::specfence::busy_stall::KIND_VALIDATE,
                                         vns,
@@ -837,6 +848,7 @@ impl Pevm {
                             }
                         }
                         crate::specfence::busy_stall::worker_exit();
+                        crate::specfence::inflation::mark_worker_exit();
                     });
                 }
             }
@@ -1534,10 +1546,7 @@ impl Pevm {
                     let finish_ns = fin_t0.elapsed().as_nanos() as u64;
                     vm.note_phase_finish(finish_ns);
                     crate::specfence::busy_stall::charge_publish(
-                        finish_ns,
-                        fin_t0,
-                        done_idx,
-                        done_inc,
+                        finish_ns, fin_t0, done_idx, done_inc,
                     );
                     if let Some(wave) = wave {
                         vm.release_ready_edges(done_idx, wave);
@@ -1754,10 +1763,7 @@ impl Pevm {
                     let finish_ns = fin_t0.elapsed().as_nanos() as u64;
                     vm.note_phase_finish(finish_ns);
                     crate::specfence::busy_stall::charge_publish(
-                        finish_ns,
-                        fin_t0,
-                        done_idx,
-                        done_inc,
+                        finish_ns, fin_t0, done_idx, done_inc,
                     );
                     vm.flush_cut_probe(exec_ns, finish_ns);
                     SfExec::Executed { wrote_new_location }
@@ -2925,13 +2931,25 @@ pub fn execute_revm_sequential<S: Storage + Debug, C: PevmChain>(
 
     let mut results: Vec<PevmTxExecutionResult> = Vec::with_capacity(txs.len());
     let mut cumulative_gas_used: u64 = 0;
-    for tx in txs {
+    let probe = crate::specfence::inflation::enabled();
+    for (tx_i, tx) in txs.into_iter().enumerate() {
         // TODO: More concrete error type
+        let t0 = probe.then(Instant::now);
+        let cpu0 = probe.then(crate::specfence::inflation::thread_cpu_ns);
         let ResultAndState { result, state } = evm
             .transact(tx)
             .map_err(|err| ExecutionError::Custom(err.to_string()))?;
+        let transact_ns = t0.map(|t| t.elapsed().as_nanos() as u64).unwrap_or(0);
 
+        let c0 = probe.then(Instant::now);
         evm.ctx().db_mut().commit(state.clone());
+        if probe {
+            let commit_ns = c0.map(|t| t.elapsed().as_nanos() as u64).unwrap_or(0);
+            let cpu_ns = cpu0
+                .map(|c| crate::specfence::inflation::thread_cpu_ns().saturating_sub(c))
+                .unwrap_or(0);
+            crate::specfence::inflation::note_seq(tx_i as u32, transact_ns, commit_ns, cpu_ns);
+        }
 
         let mut execution_result = PevmTxExecutionResult {
             receipt: receipt_from_revm(result),
