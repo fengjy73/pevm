@@ -68,4 +68,30 @@ Not on the SpecFence path: the OCC worker's `next_occ_task` (`OCC_PICK_CALLS` pl
 
 ## Sanity run
 
-Filled after the local scan. See the host line in that section.
+Host: this VM, KVM, 4 logical CPUs, Intel Xeon (family 6 model 207), 1 thread/core, L3 320 MiB, governor unavailable. Pin list `0-3`. C=8 is 8 workers on those 4 CPUs (`--allow-oversub`), so it is not a fair scale-out point.
+
+Build: `cargo build -p pevm --release --config profile.release.lto=false --example specfence_inflation_dig`. System allocator. Wall K=10, no warm-up, fresh engine each round. CI is the report's bootstrap median, 10_000 resamples, seed 0, quantiles 2.5/97.5. `TPS_ideal` uses fork Occ probe samples (profile K=1 and step trace K=1), not upstream per-tx times.
+
+Upstream `execute_revm_parallel` matched `execute_revm_sequential` on both blocks, 3/3 runs at 4 workers (`diverge=0`). Gas on the last receipt was 29928443 and 4033966.
+
+### block 15274915 (1226 txs)
+
+TPS_SEQ (1 core) = 348962, median 3.513 ms, CI [3.432, 3.717].
+
+| C | TPS_OCC | OCC ms | OCC 95% CI | TPS_SF | SF ms | SF 95% CI | TPS_ideal |
+| ---: | ---: | ---: | --- | ---: | ---: | --- | ---: |
+| 1 | 264116 | 4.643 | [4.198, 5.241] | 135812 | 9.028 | [8.578, 9.584] | 202172 |
+| 4 | 372842 | 3.288 | [3.080, 3.623] | 73353 | 16.714 | [16.218, 18.787] | 808286 |
+| 8 | 325597 | 3.766 | [3.692, 3.917] | 35001 | 35.028 | [25.637, 38.862] | 910141 |
+
+### block 3356896 (176 txs)
+
+TPS_SEQ (1 core) = 617508, median 0.285 ms, CI [0.281, 0.299].
+
+| C | TPS_OCC | OCC ms | OCC 95% CI | TPS_SF | SF ms | SF 95% CI | TPS_ideal |
+| ---: | ---: | ---: | --- | ---: | ---: | --- | ---: |
+| 1 | 415374 | 0.424 | [0.407, 0.512] | 159068 | 1.107 | [1.051, 1.155] | 351904 |
+| 4 | 407544 | 0.432 | [0.423, 0.445] | 79679 | 2.209 | [2.000, 2.384] | 1396692 |
+| 8 | 318333 | 0.553 | [0.540, 0.571] | 80667 | 2.182 | [2.063, 2.437] | 2283609 |
+
+Wall `occ` path on every C was `pevm_upstream@e94b0e3 execute_revm_parallel`. Sequential rows exist only in the C=1 file. These absolute milliseconds are this VM's, not the ict21 criterion numbers above.

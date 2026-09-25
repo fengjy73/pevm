@@ -20,6 +20,6 @@
 **步骤：**
 
 1. 已完成：撤回未提交的 OCC 快路径改动。
-2. 进行中：把 `e94b0e3` 的 `crates/pevm` 放进 `crates/pevm_upstream`，harness / 脚本 / 报告改列。
-3. 待做：编译，提交，本机烟测，把数字写进 `docs/occ-regression-vs-upstream.md`。
-4. 待做：代码检视层面的短归因，标出同样落在 SF 执行路径上的回退。不测百分比，不修。
+2. 已完成：`crates/pevm_upstream` 的 `src/` 与 `e94b0e3` 字节相同。墙时 OCC 走它的 `execute_revm_parallel`。
+3. 已完成：本机 C=1/4/8 烟测。C=8 超订。上游 par≡seq，两块 3/3。数字在 `docs/occ-regression-vs-upstream.md`。
+4. 已完成：代码检视列出同样落在 SF `Vm::execute` 上的回退。没有百分比，没有修复。
