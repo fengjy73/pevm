@@ -383,10 +383,23 @@ impl<'a, S: Storage> VmDb<'a, S> {
             .map(|(tx_idx, tx_incarnation)| (tx_idx, tx_incarnation));
         if current == origin {
             let read_origin = match origin {
-                Some((tx_idx, tx_incarnation)) => ReadOrigin::MvMemory(TxVersion {
-                    tx_idx,
-                    tx_incarnation,
-                }),
+                Some((w_idx, w_inc)) => {
+                    let written = self.mv_memory.data.get(&location_hash);
+                    let live_ok = written.as_ref().is_some_and(|map| {
+                        matches!(
+                            map.get(&w_idx),
+                            Some(MemoryEntry::Data(inc, MemoryValue::Storage(live)))
+                                if *inc == w_inc && *live == value
+                        )
+                    });
+                    if !live_ok {
+                        // Origin identity matches, but the snap bytes do not.
+                        // Returning the snap would record an origin validation
+                        // cannot tell from the live value.
+                        return None;
+                    }
+                    ReadOrigin::mv(w_idx, w_inc, MemoryValue::Storage(value))
+                }
                 None => ReadOrigin::Storage,
             };
             // Iter26: FF tip≡FF by construction — arm OrderedAdmit-snap. Attach deferred
@@ -415,10 +428,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
         note_pending_ordered_admit_snap();
         Some((
             value,
-            ReadOrigin::MvMemory(TxVersion {
-                tx_idx: w_idx,
-                tx_incarnation: w_inc,
-            }),
+            ReadOrigin::mv(w_idx, w_inc, MemoryValue::Storage(value)),
         ))
     }
 
@@ -452,10 +462,19 @@ impl<'a, S: Storage> VmDb<'a, S> {
             .map(|(tx_idx, tx_incarnation)| (tx_idx, tx_incarnation));
         if current == origin {
             let read_origin = match origin {
-                Some((tx_idx, tx_incarnation)) => ReadOrigin::MvMemory(TxVersion {
-                    tx_idx,
-                    tx_incarnation,
-                }),
+                Some((w_idx, w_inc)) => {
+                    let written = self.mv_memory.data.get(&location_hash);
+                    let live_ok = written.as_ref().is_some_and(|map| match map.get(&w_idx) {
+                        Some(MemoryEntry::Data(inc, MemoryValue::Basic(live))) if *inc == w_inc => {
+                            live.balance == basic.balance && live.nonce == basic.nonce
+                        }
+                        _ => false,
+                    });
+                    if !live_ok {
+                        return None;
+                    }
+                    ReadOrigin::mv(w_idx, w_inc, MemoryValue::Basic(basic.clone()))
+                }
                 None => ReadOrigin::Storage,
             };
             return Some((basic, code_hash, read_origin));
@@ -476,14 +495,8 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return None;
         }
         self.specfence.metrics.record_value_stable_ff_hit();
-        Some((
-            basic,
-            code_hash,
-            ReadOrigin::MvMemory(TxVersion {
-                tx_idx: w_idx,
-                tx_incarnation: w_inc,
-            }),
-        ))
+        let stored = MemoryValue::Basic(basic.clone());
+        Some((basic, code_hash, ReadOrigin::mv(w_idx, w_inc, stored)))
     }
 
     fn hash_basic(&self, address: &Address) -> MemoryLocationHash {
@@ -2337,7 +2350,7 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return;
         }
         let producer = match origin {
-            Some(ReadOrigin::MvMemory(v)) => Some((v.tx_idx, v.tx_incarnation)),
+            Some(ReadOrigin::MvMemory(v, _)) => Some((v.tx_idx, v.tx_incarnation)),
             _ => None,
         };
         fg.deep_note_db_read(
@@ -2401,10 +2414,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
                         return Err(ReadError::SelfDestructedAccount);
                     }
                     MemoryValue::CodeHash(code_hash) => {
-                        let origin = ReadOrigin::MvMemory(TxVersion {
+                        let origin = ReadOrigin::mv(
                             tx_idx,
                             tx_incarnation,
-                        });
+                            MemoryValue::CodeHash(code_hash),
+                        );
                         Self::push_origin(read_origins, origin.clone())?;
                         self.deep_trace_read(
                             location_hash,
@@ -2707,15 +2721,18 @@ impl<S: Storage> Database for VmDb<'_, S> {
             // Re-snap FF basics into rem. Without this, a second fail after
             // Rewind/ff_head leaves value_snap empty → full_from_0.
             let snap_origin = match &origin {
-                ReadOrigin::MvMemory(v) => Some((v.tx_idx, v.tx_incarnation)),
+                ReadOrigin::MvMemory(v, _) => Some((v.tx_idx, v.tx_incarnation)),
                 ReadOrigin::Storage => None,
             };
-            self.maybe_note_value(location_hash, FfValue::Basic {
-                address,
-                basic: account.clone(),
-                code_hash,
-                origin: snap_origin,
-            });
+            self.maybe_note_value(
+                location_hash,
+                FfValue::Basic {
+                    address,
+                    basic: account.clone(),
+                    code_hash,
+                    origin: snap_origin,
+                },
+            );
             let code = if let Some(code_hash) = &code_hash {
                 if let Some(code) = self.mv_memory.new_bytecodes.get(code_hash) {
                     Some(code.clone())
@@ -2890,10 +2907,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
                         if has_prev_origins && read_origins.len() == new_origins.len() {
                             return Err(ReadError::InconsistentRead);
                         }
-                        let origin = ReadOrigin::MvMemory(TxVersion {
-                            tx_idx: *closest_idx,
-                            tx_incarnation: *tx_incarnation,
-                        });
+                        let origin = ReadOrigin::mv(*closest_idx, *tx_incarnation, value.clone());
                         // Inconsistent: new origin is different from the previous!
                         if has_prev_origins
                             && unsafe { read_origins.get_unchecked(new_origins.len()) } != &origin
@@ -3011,7 +3025,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
                 let mv_origins: Vec<_> = origins_now
                     .iter()
                     .filter_map(|o| match o {
-                        ReadOrigin::MvMemory(v) => Some((v.tx_idx, v.tx_incarnation)),
+                        ReadOrigin::MvMemory(v, _) => Some((v.tx_idx, v.tx_incarnation)),
                         _ => None,
                     })
                     .collect();
@@ -3106,7 +3120,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
             let single = origins.is_some_and(|o| o.len() == 1);
             let origin = if single {
                 match origins.and_then(|o| o.first()) {
-                    Some(ReadOrigin::MvMemory(v)) => Some((v.tx_idx, v.tx_incarnation)),
+                    Some(ReadOrigin::MvMemory(v, _)) => Some((v.tx_idx, v.tx_incarnation)),
                     Some(ReadOrigin::Storage) | None => None,
                 }
             } else {
@@ -3114,12 +3128,15 @@ impl<S: Storage> Database for VmDb<'_, S> {
             };
             // Snap even on OptimisticRead PE-on — WaitForDependency resume needs prefix values
             // (`resolve` overlay was leaving value_snap empty → FullAbortReexecute theater).
-            self.maybe_note_value(location_hash, FfValue::Basic {
-                address,
-                basic: account.clone(),
-                code_hash,
-                origin,
-            });
+            self.maybe_note_value(
+                location_hash,
+                FfValue::Basic {
+                    address,
+                    basic: account.clone(),
+                    code_hash,
+                    origin,
+                },
+            );
             if resolve {
                 self.maybe_early_val(address, location_hash)?;
             }
@@ -3185,15 +3202,18 @@ impl<S: Storage> Database for VmDb<'_, S> {
             );
             self.specfence.metrics.record_journal_ff_hit();
             if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
-                self.maybe_note_value(location_hash, FfValue::Storage {
-                    address,
-                    slot: index,
-                    value,
-                    origin: match self.read_set.get(&location_hash).and_then(|o| o.last()) {
-                        Some(ReadOrigin::MvMemory(v)) => Some((v.tx_idx, v.tx_incarnation)),
-                        _ => None,
+                self.maybe_note_value(
+                    location_hash,
+                    FfValue::Storage {
+                        address,
+                        slot: index,
+                        value,
+                        origin: match self.read_set.get(&location_hash).and_then(|o| o.last()) {
+                            Some(ReadOrigin::MvMemory(v, _)) => Some((v.tx_idx, v.tx_incarnation)),
+                            _ => None,
+                        },
                     },
-                });
+                );
             }
             return Ok(value);
         }
@@ -3274,10 +3294,7 @@ impl<S: Storage> Database for VmDb<'_, S> {
         match tip {
             Some(StorageTip::Live { idx, inc, value }) => {
                 self.specfence.metrics.record_db_heavy_op();
-                let origin = ReadOrigin::MvMemory(TxVersion {
-                    tx_idx: idx,
-                    tx_incarnation: inc,
-                });
+                let origin = ReadOrigin::mv(idx, inc, MemoryValue::Storage(value));
                 Self::push_origin(read_origins, origin.clone())?;
                 if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
                     self.specfence
@@ -3289,12 +3306,15 @@ impl<S: Storage> Database for VmDb<'_, S> {
                     crate::specfence::LocationKind::Storage,
                     Some(&origin),
                 );
-                self.maybe_note_value(location_hash, FfValue::Storage {
-                    address,
-                    slot: index,
-                    value,
-                    origin: Some((idx, inc)),
-                });
+                self.maybe_note_value(
+                    location_hash,
+                    FfValue::Storage {
+                        address,
+                        slot: index,
+                        value,
+                        origin: Some((idx, inc)),
+                    },
+                );
                 if resolve {
                     self.maybe_early_val(address, location_hash)?;
                 }
@@ -3309,22 +3329,22 @@ impl<S: Storage> Database for VmDb<'_, S> {
                     if let Some((idx, inc, v2)) = prior {
                         self.specfence.metrics.record_optimistic_read();
                         self.specfence.metrics.record_db_heavy_op();
-                        let origin = ReadOrigin::MvMemory(TxVersion {
-                            tx_idx: idx,
-                            tx_incarnation: inc,
-                        });
+                        let origin = ReadOrigin::mv(idx, inc, MemoryValue::Storage(v2));
                         Self::push_origin(read_origins, origin.clone())?;
                         self.deep_trace_read(
                             location_hash,
                             crate::specfence::LocationKind::Storage,
                             Some(&origin),
                         );
-                        self.maybe_note_value(location_hash, FfValue::Storage {
-                            address,
-                            slot: index,
-                            value: v2,
-                            origin: Some((idx, inc)),
-                        });
+                        self.maybe_note_value(
+                            location_hash,
+                            FfValue::Storage {
+                                address,
+                                slot: index,
+                                value: v2,
+                                origin: Some((idx, inc)),
+                            },
+                        );
                         self.maybe_early_val(address, location_hash)?;
                         return Ok(v2);
                     }
@@ -3342,10 +3362,8 @@ impl<S: Storage> Database for VmDb<'_, S> {
                                 closest_idx,
                             )
                         {
-                            let origin = ReadOrigin::MvMemory(TxVersion {
-                                tx_idx: closest_idx,
-                                tx_incarnation: inc,
-                            });
+                            let origin =
+                                ReadOrigin::mv(closest_idx, inc, MemoryValue::Storage(pinned));
                             Self::push_origin(read_origins, origin)?;
                             return Ok(pinned);
                         }
@@ -3446,12 +3464,15 @@ impl<S: Storage> Database for VmDb<'_, S> {
         if let Some(t0) = t_store {
             crate::specfence::inflation::add_storage(t0.elapsed().as_nanos() as u64);
         }
-        self.maybe_note_value(location_hash, FfValue::Storage {
-            address,
-            slot: index,
-            value,
-            origin: None,
-        });
+        self.maybe_note_value(
+            location_hash,
+            FfValue::Storage {
+                address,
+                slot: index,
+                value,
+                origin: None,
+            },
+        );
         if resolve {
             self.maybe_early_val(address, location_hash)?;
         }
@@ -4325,10 +4346,11 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                                 all_safe = false;
                                 break;
                             }
-                            ReadOrigin::MvMemory(TxVersion {
-                                tx_idx,
-                                tx_incarnation,
-                            })
+                            let stored = match &ff {
+                                FfValue::Storage { value, .. } => MemoryValue::Storage(*value),
+                                FfValue::Basic { basic, .. } => MemoryValue::Basic(basic.clone()),
+                            };
+                            ReadOrigin::mv(tx_idx, tx_incarnation, stored)
                         }
                         None => ReadOrigin::Storage,
                     }
@@ -4360,10 +4382,11 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         all_safe = false;
                         break;
                     }
-                    ReadOrigin::MvMemory(TxVersion {
-                        tx_idx: w_idx,
-                        tx_incarnation: w_inc,
-                    })
+                    let stored = match &ff {
+                        FfValue::Storage { value, .. } => MemoryValue::Storage(*value),
+                        FfValue::Basic { basic, .. } => MemoryValue::Basic(basic.clone()),
+                    };
+                    ReadOrigin::mv(w_idx, w_inc, stored)
                 } else if origin.is_none() {
                     ReadOrigin::Storage
                 } else {
@@ -4398,10 +4421,13 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     FfValue::Storage { origin, .. } | FfValue::Basic { origin, .. } => *origin,
                 };
                 let read_origin = match origin {
-                    Some((tx_idx, tx_incarnation)) => ReadOrigin::MvMemory(TxVersion {
-                        tx_idx,
-                        tx_incarnation,
-                    }),
+                    Some((tx_idx, tx_incarnation)) => {
+                        let stored = match &ff {
+                            FfValue::Storage { value, .. } => MemoryValue::Storage(*value),
+                            FfValue::Basic { basic, .. } => MemoryValue::Basic(basic.clone()),
+                        };
+                        ReadOrigin::mv(tx_idx, tx_incarnation, stored)
+                    }
                     None => ReadOrigin::Storage,
                 };
                 db.read_set

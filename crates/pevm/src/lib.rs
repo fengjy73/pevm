@@ -162,10 +162,32 @@ struct TxVersion {
 
 // The origin of a memory read. It could be from the live multi-version
 // data structure or from storage (chain state before block execution).
+// `MvMemory` carries the `MemoryValue` the interpreter consumed. The same
+// `(tx_idx, incarnation)` can later publish a different payload (lazy amount
+// rewritten, or Estimate replaced by Data), and identity alone would still match.
 #[derive(Debug, PartialEq, Clone)]
 enum ReadOrigin {
-    MvMemory(TxVersion),
+    MvMemory(TxVersion, MemoryValue),
     Storage,
+}
+
+impl ReadOrigin {
+    pub(crate) fn mv(tx_idx: TxIdx, tx_incarnation: TxIncarnation, value: MemoryValue) -> Self {
+        Self::MvMemory(
+            TxVersion {
+                tx_idx,
+                tx_incarnation,
+            },
+            value,
+        )
+    }
+
+    pub(crate) fn version(&self) -> Option<&TxVersion> {
+        match self {
+            Self::MvMemory(version, _) => Some(version),
+            Self::Storage => None,
+        }
+    }
 }
 
 // Most memory locations only have one read origin. Lazy updated ones like
@@ -223,7 +245,7 @@ mod compat;
 pub use compat::get_block_env;
 mod mv_memory;
 mod pevm;
-pub use pevm::{execute_revm_sequential, Pevm, PevmError, PevmResult};
+pub use pevm::{Pevm, PevmError, PevmResult, execute_revm_sequential};
 
 /// Times SpecFence refused a Commit because a lower writer flagged the read set.
 pub fn specfence_commit_rejects() -> usize {
@@ -237,14 +259,14 @@ pub fn specfence_commit_reject_txs() -> Vec<usize> {
 mod scheduler;
 pub mod specfence;
 pub use specfence::{
-    analyze_dag, classify_raw_edges, dependency_edges, effect_raw_longest_chain,
-    effect_raw_max_fanout, estimate_ma_md, filter_effect_edges, hot_locations, kind_histogram,
-    l1_dag_summary, percentile_f64, producer_status_canonical, program_raw_longest_chain,
     AbortEvent, AccountGrainObserve, ConcurrencyMode, ConsumerFirstCross, DagStats,
     DecisionFieldSnap, EffectClass, EffectLogEntry, EffectStreamDiag, ExecProcessSnapshot,
     FineGrainCollector, FineGrainSnapshot, HotLocation, L1DagSummary, LearnReport, LocationKind,
     MaMdProxy, MeasurementMethod, PerTxProcessSnap, RawEdge, RawEffectEdge, ResolvePlan,
-    SpecFenceMetrics, TxRw, TxWorkTotal, VisibilityPolicy,
+    SpecFenceMetrics, TxRw, TxWorkTotal, VisibilityPolicy, analyze_dag, classify_raw_edges,
+    dependency_edges, effect_raw_longest_chain, effect_raw_max_fanout, estimate_ma_md,
+    filter_effect_edges, hot_locations, kind_histogram, l1_dag_summary, percentile_f64,
+    producer_status_canonical, program_raw_longest_chain,
 };
 mod storage;
 pub use storage::{

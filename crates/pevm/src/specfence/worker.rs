@@ -6,12 +6,12 @@
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+use super::SpecFenceCtx;
+use super::VisibilityPolicy;
 use super::arm_table::ArmTable;
 use super::resolve_plan::{self, ApplyCtx};
 use super::runnable_set::RunnableSet;
 use super::schedule;
-use super::SpecFenceCtx;
-use super::VisibilityPolicy;
 use crate::mv_memory::MvMemory;
 use crate::scheduler::Scheduler;
 use crate::{Task, TxVersion};
@@ -196,15 +196,23 @@ pub(crate) fn run_sf_block<F, V>(
             mark_exit(specfence, runnable);
             break;
         }
-        // Fast complete path: the tally only. A short counter must not scan
-        // every tx before pick; QuietExit on the idle arm reads the flags.
+        // Fast complete path. The tally is not enough: the last core rechecks
+        // every read value. A short counter must not scan before pick while
+        // another core is still inside a task.
         if scheduler.validated_tally_reached()
             && runnable.pending_work() == 0
             && specfence.wave.ready_depth() == 0
             && specfence.spine.handoff_is_empty()
         {
-            mark_exit(specfence, runnable);
-            break;
+            // Someone is still inside a task and will confirm on the way out.
+            // The last idle core must not trust the tally alone: a write can
+            // land without a fan-out and leave a Validated read stale.
+            if runnable.any_running()
+                || confirm_final_reads(scheduler, mv_memory, specfence, runnable)
+            {
+                mark_exit(specfence, runnable);
+                break;
+            }
         }
         let t0 = Instant::now();
         let task = schedule::pick(
@@ -455,8 +463,7 @@ pub(crate) fn run_sf_block<F, V>(
                 }
                 // BlockQuiet before another heal. `pick → None` already
                 // missed one steal probe. Do not yield until the tally moves.
-                if observe_quiet(scheduler, specfence, runnable) {
-                    mark_exit(specfence, runnable);
+                if leave_if_quiet(scheduler, mv_memory, specfence, runnable) {
                     break;
                 }
                 let heal_t0 = Instant::now();
@@ -474,8 +481,7 @@ pub(crate) fn run_sf_block<F, V>(
                 if runnable.span_end_ns() != 0 {
                     runnable.add_post_span_heal_ns(heal_ns);
                 }
-                if observe_quiet(scheduler, specfence, runnable) {
-                    mark_exit(specfence, runnable);
+                if leave_if_quiet(scheduler, mv_memory, specfence, runnable) {
                     break;
                 }
                 // Last-ditch: unfinished + empty queues + no live producer.
@@ -504,8 +510,7 @@ pub(crate) fn run_sf_block<F, V>(
                         continue;
                     }
                 }
-                if observe_quiet(scheduler, specfence, runnable) {
-                    mark_exit(specfence, runnable);
+                if leave_if_quiet(scheduler, mv_memory, specfence, runnable) {
                     break;
                 }
                 if runnable.pending_work() > 0 {
@@ -529,8 +534,7 @@ pub(crate) fn run_sf_block<F, V>(
                     if runnable.pending_work() > 0 {
                         continue;
                     }
-                    if observe_quiet(scheduler, specfence, runnable) {
-                        mark_exit(specfence, runnable);
+                    if leave_if_quiet(scheduler, mv_memory, specfence, runnable) {
                         break;
                     }
                     let park_t0 = Instant::now();
@@ -765,6 +769,88 @@ fn quiet_view(
         unfinished: scheduler.has_unfinished(),
         done_unvalidated: scheduler.has_done_unvalidated(),
     }
+}
+
+/// Settled enough to be the last exit. Stale spine / sleep bits do not count:
+/// the fast path used to leave on the tally alone, and those bits stay set
+/// after every tx is validated.
+fn schedule_settled(v: QuietExitView) -> bool {
+    !v.pending
+        && !v.wave_pending
+        && v.handoff_empty
+        && !v.waiting_live
+        && !v.any_running
+        && !v.unfinished
+        && !v.done_unvalidated
+}
+
+/// Last worker may finish only when every read set matches the published
+/// versions, including the values the interpreter consumed. A missed fan-out
+/// leaves a tx `Validated` with a stale read; this requeues it.
+fn confirm_final_reads(
+    scheduler: &Scheduler,
+    mv_memory: &MvMemory,
+    specfence: SpecFenceCtx<'_>,
+    runnable: &RunnableSet,
+) -> bool {
+    for _ in 0..64 {
+        if !schedule_settled(quiet_view(scheduler, specfence, runnable)) {
+            return false;
+        }
+        let e1 = mv_memory.write_epoch();
+        if e1 & 1 == 1 {
+            std::hint::spin_loop();
+            continue;
+        }
+        let mut bad = Vec::new();
+        for tx in 0..scheduler.block_size() {
+            if !mv_memory.validate_read_locations(tx) {
+                bad.push(tx);
+            }
+        }
+        if mv_memory.write_epoch() != e1 {
+            continue;
+        }
+        if !schedule_settled(quiet_view(scheduler, specfence, runnable)) {
+            return false;
+        }
+        if bad.is_empty() {
+            return true;
+        }
+        for tx in bad {
+            let wake = scheduler.mark_reads_dirty(tx);
+            if wake || !runnable.is_running(tx) {
+                let _ = runnable.wake_idle(tx, super::runnable_set::QueueKind::Revalidate);
+            }
+        }
+        return false;
+    }
+    false
+}
+
+fn leave_if_quiet(
+    scheduler: &Scheduler,
+    mv_memory: &MvMemory,
+    specfence: SpecFenceCtx<'_>,
+    runnable: &RunnableSet,
+) -> bool {
+    let view = quiet_view(scheduler, specfence, runnable);
+    // Another core is still inside validate. This idle core leaves.
+    if quiet_exit(view) && !schedule_settled(view) {
+        let _ = observe_quiet(scheduler, specfence, runnable);
+        mark_exit(specfence, runnable);
+        return true;
+    }
+    if !schedule_settled(view) {
+        let _ = observe_quiet(scheduler, specfence, runnable);
+        return false;
+    }
+    if !confirm_final_reads(scheduler, mv_memory, specfence, runnable) {
+        return false;
+    }
+    let _ = observe_quiet(scheduler, specfence, runnable);
+    mark_exit(specfence, runnable);
+    true
 }
 
 /// Soft=0 QuietExit.
