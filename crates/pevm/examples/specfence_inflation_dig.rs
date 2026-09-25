@@ -4,9 +4,13 @@
 //! (in-memory state in, results out; no state root):
 //!
 //! - `seq`: [`pevm::execute_revm_sequential`] — CacheDB + `transact` + commit.
-//!   Same binary. Not OCC at one worker.
-//! - `occ`: [`Pevm::execute_revm_parallel`] with [`ConcurrencyMode::Occ`]
-//!   (`next_occ_task` / `try_execute` / `validate_occ_stage`).
+//!   Timed only at `workers == 1`. That single 1-core sample is `TPS_SEQ`.
+//! - `occ`: unmodified [`pevm_upstream::Pevm::execute_revm_parallel`] at
+//!   risechain/pevm `e94b0e3` (Block-STM). Same timer as seq and sf: after the
+//!   tx list and block env exist, around the engine call only. Probe modes
+//!   (`SPECFENCE_INFLATION`, `SPECFENCE_STEP_TRACE`) still run the fork's Occ
+//!   path, because upstream has no phase or step hooks. Those rows are not
+//!   `TPS_OCC`.
 //! - `sf`: [`Pevm::execute_revm_parallel`] with [`ConcurrencyMode::SpecFence`]
 //!   (`run_sf_block`). Not the OCC worker loop, and not the `Pevm::execute`
 //!   gas / `n_tx < workers` sequential fallback.
@@ -40,6 +44,7 @@ use pevm::{
     chain::{PevmChain, PevmEthereum},
     execute_revm_sequential,
 };
+use pevm_upstream::chain::PevmChain as UpstreamChain;
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -52,24 +57,48 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn load_shared(data_dir: &Path) -> (Arc<Bytecodes>, Arc<BlockHashes>) {
-    let bytecodes = bincode::serde::decode_from_std_read(
-        &mut GzDecoder::new(BufReader::new(
-            File::open(data_dir.join("bytecodes.bincode.gz")).expect("bytecodes"),
-        )),
+struct Shared {
+    bytecodes: Arc<Bytecodes>,
+    block_hashes: Arc<BlockHashes>,
+    up_bytecodes: Arc<pevm_upstream::Bytecodes>,
+    up_block_hashes: Arc<pevm_upstream::BlockHashes>,
+}
+
+fn decode_bincode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> T {
+    bincode::serde::decode_from_std_read(
+        &mut std::io::Cursor::new(bytes),
         bincode::config::standard(),
     )
-    .map(Arc::new)
-    .expect("decode bytecodes");
-    let block_hashes = Arc::new(match File::open(data_dir.join("block_hashes.bincode")) {
-        Ok(file) => bincode::serde::decode_from_std_read::<BlockHashes, _, _>(
-            &mut BufReader::new(file),
-            bincode::config::standard(),
-        )
-        .unwrap_or_default(),
-        Err(_) => BlockHashes::default(),
+    .expect("bincode")
+}
+
+fn load_shared(data_dir: &Path) -> Shared {
+    let bc_bytes = {
+        let file = File::open(data_dir.join("bytecodes.bincode.gz")).expect("bytecodes");
+        let mut dec = GzDecoder::new(BufReader::new(file));
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut dec, &mut buf).expect("read bytecodes");
+        buf
+    };
+    let bytecodes = Arc::new(decode_bincode::<Bytecodes>(&bc_bytes));
+    let up_bytecodes = Arc::new(decode_bincode::<pevm_upstream::Bytecodes>(&bc_bytes));
+    let hash_bytes = std::fs::read(data_dir.join("block_hashes.bincode")).unwrap_or_default();
+    let block_hashes = Arc::new(if hash_bytes.is_empty() {
+        BlockHashes::default()
+    } else {
+        decode_bincode::<BlockHashes>(&hash_bytes)
     });
-    (bytecodes, block_hashes)
+    let up_block_hashes = Arc::new(if hash_bytes.is_empty() {
+        pevm_upstream::BlockHashes::default()
+    } else {
+        decode_bincode::<pevm_upstream::BlockHashes>(&hash_bytes)
+    });
+    Shared {
+        bytecodes,
+        block_hashes,
+        up_bytecodes,
+        up_block_hashes,
+    }
 }
 
 fn n_tx(block: &Block<<PevmEthereum as PevmChain>::Transaction>) -> usize {
@@ -143,8 +172,16 @@ struct Engine {
 }
 
 const PATH_SEQ: &str = "execute_revm_sequential";
-const PATH_OCC: &str = "execute_revm_parallel/Occ";
+const PATH_OCC_FORK: &str = "execute_revm_parallel/Occ";
+const PATH_OCC_UPSTREAM: &str = "pevm_upstream@e94b0e3 execute_revm_parallel";
 const PATH_SF: &str = "execute_revm_parallel/SpecFence/run_sf_block";
+
+/// Wall timing uses upstream. Inflation and step-trace stay on the fork so the
+/// ideal-schedule probes still see per-tx phases.
+fn occ_uses_upstream() -> bool {
+    !pevm::specfence::inflation_enabled()
+        && std::env::var("SPECFENCE_STEP_TRACE").ok().as_deref() != Some("1")
+}
 
 const ENGINES: [Engine; 3] = [
     Engine {
@@ -156,7 +193,7 @@ const ENGINES: [Engine; 3] = [
     },
     Engine {
         name: "occ",
-        path: PATH_OCC,
+        path: PATH_OCC_FORK,
         mode: ConcurrencyMode::Occ,
         sequential: false,
         tag: pevm::specfence::TAG_OCC,
@@ -175,33 +212,43 @@ struct Loaded {
     block: Block<<PevmEthereum as PevmChain>::Transaction>,
     storage: InMemoryStorage,
     chain: PevmEthereum,
+    up_storage: pevm_upstream::InMemoryStorage,
+    up_chain: pevm_upstream::chain::PevmEthereum,
     n: usize,
     gas_used: u64,
 }
 
-fn load_block(
-    data_dir: &Path,
-    block_no: u64,
-    bytecodes: Arc<Bytecodes>,
-    block_hashes: Arc<BlockHashes>,
-) -> Loaded {
+fn load_block(data_dir: &Path, block_no: u64, shared: &Shared) -> Loaded {
     let dir = data_dir.join("blocks").join(block_no.to_string());
     let block: Block<<PevmEthereum as PevmChain>::Transaction> = serde_json::from_reader(
         BufReader::new(File::open(dir.join("block.json")).expect("block.json")),
     )
     .expect("parse block");
+    let pre = std::fs::read(dir.join("pre_state.json")).expect("pre_state");
     let accounts: HashMap<alloy_primitives::Address, EvmAccount, BuildSuffixHasher> =
-        serde_json::from_reader(BufReader::new(
-            File::open(dir.join("pre_state.json")).expect("pre_state"),
-        ))
-        .expect("parse pre_state");
+        serde_json::from_slice(&pre).expect("parse pre_state");
+    let up_accounts: HashMap<
+        alloy_primitives::Address,
+        pevm_upstream::EvmAccount,
+        pevm_upstream::BuildSuffixHasher,
+    > = serde_json::from_slice(&pre).expect("parse upstream pre_state");
     let gas_used = block.header.gas_used;
     let n = n_tx(&block);
     Loaded {
         block_no,
         block,
-        storage: InMemoryStorage::new(accounts, bytecodes, block_hashes),
+        storage: InMemoryStorage::new(
+            accounts,
+            Arc::clone(&shared.bytecodes),
+            Arc::clone(&shared.block_hashes),
+        ),
         chain: PevmEthereum::mainnet(),
+        up_storage: pevm_upstream::InMemoryStorage::new(
+            up_accounts,
+            Arc::clone(&shared.up_bytecodes),
+            Arc::clone(&shared.up_block_hashes),
+        ),
+        up_chain: pevm_upstream::chain::PevmEthereum::mainnet(),
         n,
         gas_used,
     }
@@ -255,6 +302,81 @@ fn build_inputs(
     (spec_id, block_env, txs)
 }
 
+fn upstream_inputs(
+    loaded: &Loaded,
+) -> (
+    <pevm_upstream::chain::PevmEthereum as UpstreamChain>::EvmSpecId,
+    revm::context::BlockEnv,
+    Vec<<pevm_upstream::chain::PevmEthereum as UpstreamChain>::EvmTx>,
+) {
+    let spec_id = loaded
+        .up_chain
+        .get_block_spec(&loaded.block.header)
+        .expect("upstream block spec");
+    let block_env = pevm::get_block_env(&loaded.block.header, spec_id);
+    let txs = match &loaded.block.transactions {
+        alloy_rpc_types_eth::BlockTransactions::Full(txs) => txs
+            .iter()
+            .map(|tx| loaded.up_chain.get_tx_env(tx).expect("upstream tx env"))
+            .collect(),
+        _ => panic!("block {} has no full tx list", loaded.block_no),
+    };
+    (spec_id, block_env, txs)
+}
+
+fn run_upstream_occ(loaded: &Loaded, workers: usize) -> RunOut {
+    let mut pevm = pevm_upstream::Pevm::default();
+    let cores = NonZeroUsize::new(workers.max(1)).unwrap();
+    let (spec_id, block_env, txs) = upstream_inputs(loaded);
+    let (wall_ms, result) = {
+        let _bound = pevm::specfence::InflationBoundGuard::enter();
+        let t0 = Instant::now();
+        let result = pevm.execute_revm_parallel(
+            &loaded.up_chain,
+            &loaded.up_storage,
+            spec_id,
+            block_env,
+            txs,
+            cores,
+        );
+        (t0.elapsed().as_secs_f64() * 1000.0, result)
+    };
+    match result {
+        Ok(_) => RunOut {
+            wall_ms,
+            ok: true,
+            err: String::new(),
+            est: 0,
+            soft: 0,
+            occ_picks: 0,
+            spine_cores_max: 0,
+            phase_exec_n: 0,
+            phase_exec_ns: 0,
+            phase_pre_ns: 0,
+            phase_interp_ns: 0,
+            phase_post_ns: 0,
+            phase_val_ns: 0,
+            reexec_entries: 0,
+        },
+        Err(e) => RunOut {
+            wall_ms,
+            ok: false,
+            err: e.to_string(),
+            est: 0,
+            soft: 0,
+            occ_picks: 0,
+            spine_cores_max: 0,
+            phase_exec_n: 0,
+            phase_exec_ns: 0,
+            phase_pre_ns: 0,
+            phase_interp_ns: 0,
+            phase_post_ns: 0,
+            phase_val_ns: 0,
+            reexec_entries: 0,
+        },
+    }
+}
+
 fn run_once(
     pevm: &mut Pevm,
     engine: Engine,
@@ -262,6 +384,9 @@ fn run_once(
     workers: usize,
     seq_cpu: usize,
 ) -> RunOut {
+    if engine.name == "occ" && occ_uses_upstream() {
+        return run_upstream_occ(loaded, workers);
+    }
     pevm::specfence::inflation_set_tag(engine.tag);
     let cores = NonZeroUsize::new(workers.max(1)).unwrap();
     // Tx list and block env are inputs. Cloning them is outside the timer
@@ -333,6 +458,7 @@ fn write_row(
     kind: &str,
     round: usize,
     row: &RunOut,
+    path: &str,
     dump: bool,
 ) {
     let snap = if pevm::specfence::inflation_enabled() {
@@ -377,7 +503,7 @@ fn write_row(
         "gas_used": loaded.gas_used,
         "workers": workers,
         "engine": engine.name,
-        "path": engine.path,
+        "path": path,
         "kind": kind,
         "round": round,
         "wall_ms": row.wall_ms,
@@ -443,10 +569,30 @@ impl Rng {
     }
 }
 
-fn engine_selected(name: &str) -> bool {
+fn engine_selected(name: &str, workers: usize) -> bool {
+    // TPS_SEQ is the 1-core baseline, not a column that is re-measured at every C.
+    if name == "seq"
+        && workers != 1
+        && std::env::var("SPECFENCE_INFLATION_SEQ_ALWAYS")
+            .ok()
+            .as_deref()
+            != Some("1")
+    {
+        return false;
+    }
     match std::env::var("SPECFENCE_INFLATION_ENGINES") {
         Ok(s) if !s.trim().is_empty() => s.split(',').any(|p| p.trim() == name),
         _ => true,
+    }
+}
+
+fn timed_path(engine: Engine) -> &'static str {
+    if engine.name == "occ" && occ_uses_upstream() {
+        PATH_OCC_UPSTREAM
+    } else if engine.name == "occ" {
+        PATH_OCC_FORK
+    } else {
+        engine.path
     }
 }
 
@@ -467,25 +613,118 @@ fn run_block(
         rng.shuffle(&mut order);
         for &i in &order {
             let engine = ENGINES[i];
-            if !engine_selected(engine.name) {
+            if !engine_selected(engine.name, workers) {
                 continue;
             }
             let mut pevm = fresh(engine);
             let row = run_once(&mut pevm, engine, loaded, workers, seq_cpu);
-            write_row(out, loaded, workers, engine, "timed", r, &row, dump);
+            write_row(
+                out,
+                loaded,
+                workers,
+                engine,
+                "timed",
+                r,
+                &row,
+                timed_path(engine),
+                dump,
+            );
         }
     }
     if oracle_k > 0 {
         for &engine in &ENGINES {
-            if !engine_selected(engine.name) {
+            if !engine_selected(engine.name, workers) {
                 continue;
             }
             let mut pevm = fresh(engine);
             for r in 0..oracle_k {
                 let row = run_once(&mut pevm, engine, loaded, workers, seq_cpu);
-                write_row(out, loaded, workers, engine, "oracle", r, &row, false);
+                write_row(
+                    out,
+                    loaded,
+                    workers,
+                    engine,
+                    "oracle",
+                    r,
+                    &row,
+                    timed_path(engine),
+                    false,
+                );
             }
         }
+    }
+}
+
+fn occcheck(loaded: &Loaded, workers: usize, n: usize) {
+    let cores = NonZeroUsize::new(workers.max(1)).unwrap();
+    let mut diverge = 0usize;
+    for i in 0..n {
+        let (spec_id, block_env, txs) = upstream_inputs(loaded);
+        let seq = pevm_upstream::execute_revm_sequential(
+            &loaded.up_chain,
+            &loaded.up_storage,
+            spec_id,
+            block_env.clone(),
+            txs.clone(),
+        );
+        let mut pevm = pevm_upstream::Pevm::default();
+        let par = pevm.execute_revm_parallel(
+            &loaded.up_chain,
+            &loaded.up_storage,
+            spec_id,
+            block_env,
+            txs,
+            cores,
+        );
+        match (seq, par) {
+            (Ok(s), Ok(p)) if s == p => {
+                println!(
+                    "occ=seq ok block={} iter={i} txs={} gas={}",
+                    loaded.block_no,
+                    s.len(),
+                    s.last().map(|r| r.receipt.cumulative_gas_used).unwrap_or(0),
+                );
+            }
+            (Ok(s), Ok(p)) => {
+                diverge += 1;
+                println!("occ!=seq block={} iter={i}", loaded.block_no);
+                report_upstream_diverge(&s, &p);
+            }
+            (Err(e), _) => println!("seq err block={} iter={i} {e}", loaded.block_no),
+            (_, Err(e)) => println!("occ err block={} iter={i} {e}", loaded.block_no),
+        }
+    }
+    println!(
+        "OCCCHECK block={} n={n} workers={workers} diverge={diverge} upstream=e94b0e3",
+        loaded.block_no
+    );
+    if diverge > 0 {
+        std::process::exit(1);
+    }
+}
+
+fn report_upstream_diverge(
+    seq: &[pevm_upstream::PevmTxExecutionResult],
+    par: &[pevm_upstream::PevmTxExecutionResult],
+) {
+    if seq.len() != par.len() {
+        println!("  len seq={} par={}", seq.len(), par.len());
+    }
+    let n = seq.len().min(par.len());
+    for i in 0..n {
+        if seq[i] == par[i] {
+            continue;
+        }
+        println!(
+            "  first_tx={i} seq_gas={} par_gas={} seq_logs={} par_logs={} seq_state={} par_state={}",
+            seq[i].receipt.cumulative_gas_used,
+            par[i].receipt.cumulative_gas_used,
+            seq[i].receipt.logs.len(),
+            par[i].receipt.logs.len(),
+            seq[i].state.len(),
+            par[i].state.len(),
+        );
+        return;
     }
 }
 
@@ -576,7 +815,7 @@ fn report_diverge(seq: &[PevmTxExecutionResult], par: &[PevmTxExecutionResult]) 
 fn main() {
     let which = std::env::var("SPECFENCE_INFLATION_WHICH").unwrap_or_else(|_| "scan".into());
     let data_dir = repo_root().join("data/ethereum");
-    let (bytecodes, hashes) = load_shared(&data_dir);
+    let shared = load_shared(&data_dir);
     let workers = env_usize("SPECFENCE_COMPARE_CORES", 4);
     let k = env_usize("SPECFENCE_INFLATION_K", 10);
     let oracle_k = env_usize("SPECFENCE_INFLATION_ORACLE_K", 0);
@@ -616,12 +855,7 @@ fn main() {
         let mut out = File::create(&out_path).expect("step trace out");
         let engine = ENGINES[1];
         for block_no in blocks {
-            let loaded = load_block(
-                &data_dir,
-                block_no,
-                Arc::clone(&bytecodes),
-                Arc::clone(&hashes),
-            );
+            let loaded = load_block(&data_dir, block_no, &shared);
             println!(
                 "STEPTRACE block={block_no} n={} gas={} k={k} path={}",
                 loaded.n, loaded.gas_used, engine.path
@@ -660,9 +894,17 @@ fn main() {
 
     if which == "seqcheck" {
         let block_no = env_usize("SPECFENCE_COMPARE_BLOCK", 15_274_915) as u64;
-        let loaded = load_block(&data_dir, block_no, bytecodes, hashes);
+        let loaded = load_block(&data_dir, block_no, &shared);
         let n = env_usize("SPECFENCE_INFLATION_SEQCHECK_N", 10);
         seqcheck(&loaded, workers, n);
+        return;
+    }
+
+    if which == "occcheck" {
+        let block_no = env_usize("SPECFENCE_COMPARE_BLOCK", 15_274_915) as u64;
+        let loaded = load_block(&data_dir, block_no, &shared);
+        let n = env_usize("SPECFENCE_INFLATION_OCCCHECK_N", 3);
+        occcheck(&loaded, workers, n);
         return;
     }
 
@@ -695,8 +937,9 @@ fn main() {
         "blocks": blocks,
         "seq_cpu": seq_cpu,
         "pin_cpus": std::env::var("SPECFENCE_PIN_CPUS").unwrap_or_default(),
-        "timed_region": "execute_revm_sequential | execute_revm_parallel",
-        "paths": {"seq": PATH_SEQ, "occ": PATH_OCC, "sf": PATH_SF},
+        "timed_region": "execute_revm_sequential | pevm_upstream execute_revm_parallel | fork execute_revm_parallel/SpecFence",
+        "occ_impl": if occ_uses_upstream() { "pevm_upstream@e94b0e3" } else { "fork-probe" },
+        "paths": {"seq": PATH_SEQ, "occ": if occ_uses_upstream() { PATH_OCC_UPSTREAM } else { PATH_OCC_FORK }, "sf": PATH_SF},
         "ge_1_5": false,
     });
     writeln!(out, "{meta}").unwrap();
@@ -706,12 +949,7 @@ fn main() {
             println!("MISSING block={block_no}");
             continue;
         }
-        let loaded = load_block(
-            &data_dir,
-            block_no,
-            Arc::clone(&bytecodes),
-            Arc::clone(&hashes),
-        );
+        let loaded = load_block(&data_dir, block_no, &shared);
         println!(
             "BLOCK {block_no} n={} gas={} workers={workers}",
             loaded.n, loaded.gas_used

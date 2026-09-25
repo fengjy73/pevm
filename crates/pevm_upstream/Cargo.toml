@@ -1,6 +1,9 @@
+# Vendored from https://github.com/risechain/pevm @ e94b0e3df9c0c1b983ed3e4d78b3aefb0b5b7cc0
+# src/ is unmodified. Package name is pevm_upstream so it links beside this workspace's pevm.
+# benches/mainnet.rs adds PEVM_BENCH_CONCURRENCY and imports this package name.
 [package]
 edition.workspace = true
-name = "pevm"
+name = "pevm_upstream"
 version = "0.1.0"
 
 [features]
@@ -9,7 +12,6 @@ defaults = []
 rpc-storage = ["dep:alloy-transport", "dep:reqwest", "dep:tokio"]
 
 global-alloc = ["dep:rpmalloc", "dep:snmalloc-rs", "dep:tikv-jemallocator"]
-inflation-alloc = []
 
 [dependencies]
 alloy-consensus.workspace = true
@@ -21,7 +23,6 @@ alloy-trie.workspace = true
 
 bitflags.workspace = true
 dashmap.workspace = true
-parking_lot.workspace = true
 hashbrown.workspace = true
 rustc-hash.workspace = true
 serde.workspace = true
@@ -46,7 +47,6 @@ snmalloc-rs = { workspace = true, optional = true }
 tikv-jemallocator = { workspace = true, optional = true }
 
 [dev-dependencies]
-pevm_upstream = { path = "../pevm_upstream" }
 bincode.workspace = true
 criterion.workspace = true
 flate2.workspace = true
@@ -66,6 +66,5 @@ workspace = true
 harness = false
 name = "mainnet"
 
-[[bench]]
-harness = false
-name = "gigagas"
+# gigagas.rs is the upstream file, unchanged. It is not a Cargo target: it
+# pulls tests/erc20 and tests/uniswap, which are not part of this vendor.
