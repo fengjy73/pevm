@@ -10,6 +10,6 @@
 
 1. **已完成 — 读设计与基线。** v2 纸是 SoT。v1 在大块只武装已有脊 Handoff 的 crit ℓ，FullReplay 在非脊 hot ℓ。
 2. **已完成 — 实现。** 新 `region_avoid`：radar、E1/E2/E3、每 tx 标志、WaitOnce / OrderedTip / Retain / pass、最后写者发布或跳过后 Drained、逐 region 计数。首轮刀开诊断：武装了非脊 Full ℓ，但 `drained=0` 且 `full_armed` 4–9。原因：预测写者完成但未写该槽被当成数据地板。已改为 `pick_pred`（无数据的完成者继续向下找）+ `on_skip`（唤醒但不计入发布）。
-3. **进行中 — 单测与编译。** 补 pick_pred / skip 计数断言后编译。
-4. **待做 — Soft=0 测量。** 76ed8dc 刀开日志只作诊断，不进门。新二进制重测大块 N=5、薄块 N=3，ABAB。
-5. **待做 — 文档与 PR。** `docs/specfence-soft0-region-learn-avoid-v2.md`，门判决与四类记分。
+3. **已完成 — 单测。** `region_avoid` 三则通过。`pick_pred` 覆盖「写了才是地板 / 没写的完成者跳过 / 地板之上的 live 写者」。
+4. **已完成 — Soft=0 测量。** 二进制 `cace484`。ABAB：大块两轮刀开/关、薄块两轮。门 **FAIL-miss**。`ge_1_5=false`。76ed8dc 刀开不进门。
+5. **已完成 — 文档。** `docs/specfence-soft0-region-learn-avoid-v2.md`。草稿保留到用户验收。
