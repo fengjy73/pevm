@@ -2337,17 +2337,13 @@ fn sstore_protocol_capture_eth_slow<H: revm::interpreter::Host + ?Sized>(
             table.note_post_sstore_gas(plant.tx_idx, gas_remaining);
             if target != Address::ZERO {
                 let loc = hash_deterministic(MemoryLocation::Storage(target, slot));
-                table.note_write_replay(
-                    plant.tx_idx,
-                    loc,
-                    StorageWriteReplay {
-                        address: target,
-                        slot,
-                        original,
-                        present,
-                        gas_remaining_after: gas_remaining,
-                    },
-                );
+                table.note_write_replay(plant.tx_idx, loc, StorageWriteReplay {
+                    address: target,
+                    slot,
+                    original,
+                    present,
+                    gas_remaining_after: gas_remaining,
+                });
             }
             snap.write_replays_at_tip = table.write_replay_values(plant.tx_idx);
             let metrics = unsafe { &*plant.metrics };
@@ -2386,6 +2382,9 @@ where
     CTX::Journal: JournalExt,
 {
     fn initialize_interp(&mut self, interp: &mut Interpreter<EthInterpreter>, context: &mut CTX) {
+        if crate::specfence::step_trace::enabled() {
+            return;
+        }
         try_apply_pending_pc_resume(interp, context, CALL_DEPTH.get());
         // Iter29: Inspector nested frames — consume stash on hash match (no PENDING defer).
         if nested_ordered_admit_stash_armed() {
@@ -2394,6 +2393,9 @@ where
     }
 
     fn step(&mut self, interp: &mut Interpreter<EthInterpreter>, _context: &mut CTX) {
+        if crate::specfence::step_trace::on_step(interp) {
+            return;
+        }
         let n = OPCODE_STEPS.get() + 1;
         OPCODE_STEPS.set(n);
         STEPS_THIS_RUN.set(STEPS_THIS_RUN.get() + 1);
@@ -2415,6 +2417,9 @@ where
     }
 
     fn step_end(&mut self, interp: &mut Interpreter<EthInterpreter>, context: &mut CTX) {
+        if crate::specfence::step_trace::on_step_end() {
+            return;
+        }
         let depth = CALL_DEPTH.get();
         let n = OPCODE_STEPS.get();
         let mut snap = BoundarySnapshot::capture_from_interp(interp, depth, n);
@@ -2493,6 +2498,9 @@ where
     }
 
     fn call(&mut self, context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
+        if crate::specfence::step_trace::enabled() {
+            return None;
+        }
         let parent_depth = CALL_DEPTH.get();
         let depth = parent_depth.saturating_add(1);
         CALL_DEPTH.set(depth);
@@ -2562,6 +2570,9 @@ where
     }
 
     fn call_end(&mut self, _context: &mut CTX, _inputs: &CallInputs, outcome: &mut CallOutcome) {
+        if crate::specfence::step_trace::enabled() {
+            return;
+        }
         let meta = PENDING_CALL_STACK.with(|s| s.borrow_mut().pop());
         if let Some(meta) = meta {
             // Cache successful nested calls (depth > 1) for RewindTo short-circuit.
@@ -2597,6 +2608,9 @@ where
     }
 
     fn create(&mut self, _context: &mut CTX, _inputs: &mut CreateInputs) -> Option<CreateOutcome> {
+        if crate::specfence::step_trace::enabled() {
+            return None;
+        }
         CALL_DEPTH.set(CALL_DEPTH.get().saturating_add(1));
         None
     }
@@ -2631,15 +2645,12 @@ mod m1c_tests {
         hashbrown::HashMap<u64, FfValue, BuildIdentityHasher>,
     ) {
         let mut values = HashMap::with_hasher(BuildIdentityHasher::default());
-        values.insert(
-            1u64,
-            FfValue::Basic {
-                address: Address::ZERO,
-                basic: Default::default(),
-                code_hash: None,
-                origin: None,
-            },
-        );
+        values.insert(1u64, FfValue::Basic {
+            address: Address::ZERO,
+            basic: Default::default(),
+            code_hash: None,
+            origin: None,
+        });
         (
             vec![RegionAccess {
                 tx_idx: 0,
@@ -3035,15 +3046,12 @@ mod m1c_tests {
         hashbrown::HashMap<u64, FfValue, BuildIdentityHasher>,
     ) {
         let mut values = HashMap::with_hasher(BuildIdentityHasher::default());
-        values.insert(
-            7u64,
-            FfValue::Storage {
-                address: Address::ZERO,
-                slot: U256::ZERO,
-                value: U256::from(1),
-                origin: None,
-            },
-        );
+        values.insert(7u64, FfValue::Storage {
+            address: Address::ZERO,
+            slot: U256::ZERO,
+            value: U256::from(1),
+            origin: None,
+        });
         (
             vec![RegionAccess {
                 tx_idx: 0,

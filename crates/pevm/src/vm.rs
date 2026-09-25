@@ -2332,6 +2332,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
 
     fn get_code_hash(&mut self, address: Address) -> Result<Option<B256>, ReadError> {
         let location_hash = hash_deterministic(MemoryLocation::CodeHash(address));
+        crate::specfence::step_trace::note_read(
+            location_hash,
+            crate::specfence::step_trace::kind_code(),
+            address,
+        );
         if self.specfence.mode == crate::ConcurrencyMode::SpecFence && !self.indep_first_cut {
             let _ = self.specfence.access_log.note(self.tx_idx, location_hash);
         }
@@ -2620,7 +2625,15 @@ impl<S: Storage> Database for VmDb<'_, S> {
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         let _split = self.begin_vmdb();
+        if crate::specfence::inflation::reads_on() {
+            crate::specfence::inflation::add_account();
+        }
         let location_hash = self.hash_basic(&address);
+        crate::specfence::step_trace::note_read(
+            location_hash,
+            crate::specfence::step_trace::kind_basic(),
+            address,
+        );
         let access_k =
             if self.specfence.mode == crate::ConcurrencyMode::SpecFence && !self.indep_first_cut {
                 self.specfence.access_log.note(self.tx_idx, location_hash)
@@ -2638,6 +2651,9 @@ impl<S: Storage> Database for VmDb<'_, S> {
         // unnecessarily evaluating its balance here.
         if self.is_lazy {
             if location_hash == self.from_hash {
+                if crate::specfence::inflation::reads_on() {
+                    crate::specfence::inflation::add_lazy();
+                }
                 return Ok(Some(AccountInfo {
                     nonce: self.tx.nonce,
                     balance: U256::MAX,
@@ -2646,6 +2662,9 @@ impl<S: Storage> Database for VmDb<'_, S> {
                     account_id: None,
                 }));
             } else if Some(location_hash) == self.to_hash {
+                if crate::specfence::inflation::reads_on() {
+                    crate::specfence::inflation::add_lazy();
+                }
                 return Ok(None);
             }
         }
@@ -2671,15 +2690,12 @@ impl<S: Storage> Database for VmDb<'_, S> {
                 ReadOrigin::MvMemory(v) => Some((v.tx_idx, v.tx_incarnation)),
                 ReadOrigin::Storage => None,
             };
-            self.maybe_note_value(
-                location_hash,
-                FfValue::Basic {
-                    address,
-                    basic: account.clone(),
-                    code_hash,
-                    origin: snap_origin,
-                },
-            );
+            self.maybe_note_value(location_hash, FfValue::Basic {
+                address,
+                basic: account.clone(),
+                code_hash,
+                origin: snap_origin,
+            });
             let code = if let Some(code_hash) = &code_hash {
                 if let Some(code) = self.mv_memory.new_bytecodes.get(code_hash) {
                     Some(code.clone())
@@ -2723,16 +2739,25 @@ impl<S: Storage> Database for VmDb<'_, S> {
         // (same-shard re-entry corrupts the heap — 19807137).
         let mut history: Vec<(TxIdx, MemoryEntry)> = if self.tx_idx > 0 {
             let _nest = crate::mv_memory::DataNest::enter("basic.history");
-            self.mv_memory
-                .data
-                .get(&location_hash)
+            let timed = crate::specfence::inflation::reads_on();
+            let t_lookup = timed.then(Instant::now);
+            let got = self.mv_memory.data.get(&location_hash);
+            if let Some(t0) = t_lookup {
+                crate::specfence::inflation::add_lookup(t0.elapsed().as_nanos() as u64);
+            }
+            let t_scan = timed.then(Instant::now);
+            let hist = got
                 .map(|written| {
                     written
                         .range(..self.tx_idx)
                         .map(|(k, v)| (*k, v.clone()))
                         .collect()
                 })
-                .unwrap_or_default()
+                .unwrap_or_default();
+            if let Some(t0) = t_scan {
+                crate::specfence::inflation::add_scan(t0.elapsed().as_nanos() as u64);
+            }
+            hist
         } else {
             Vec::new()
         };
@@ -2938,11 +2963,15 @@ impl<S: Storage> Database for VmDb<'_, S> {
             {
                 return Err(ReadError::InconsistentRead);
             }
+            let t_store = crate::specfence::inflation::reads_on().then(Instant::now);
             final_account = match self.storage.basic(&address) {
                 Ok(Some(basic)) => Some(basic),
                 Ok(None) => (balance_addition > U256::ZERO).then(AccountBasic::default),
                 Err(err) => return Err(ReadError::StorageError(err.to_string())),
             };
+            if let Some(t0) = t_store {
+                crate::specfence::inflation::add_storage(t0.elapsed().as_nanos() as u64);
+            }
         }
 
         // Populate read origins on the first read.
@@ -3065,15 +3094,12 @@ impl<S: Storage> Database for VmDb<'_, S> {
             };
             // Snap even on OptimisticRead PE-on — WaitForDependency resume needs prefix values
             // (`resolve` overlay was leaving value_snap empty → FullAbortReexecute theater).
-            self.maybe_note_value(
-                location_hash,
-                FfValue::Basic {
-                    address,
-                    basic: account.clone(),
-                    code_hash,
-                    origin,
-                },
-            );
+            self.maybe_note_value(location_hash, FfValue::Basic {
+                address,
+                basic: account.clone(),
+                code_hash,
+                origin,
+            });
             if resolve {
                 self.maybe_early_val(address, location_hash)?;
             }
@@ -3106,7 +3132,15 @@ impl<S: Storage> Database for VmDb<'_, S> {
 
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
         let _split = self.begin_vmdb();
+        if crate::specfence::inflation::reads_on() {
+            crate::specfence::inflation::add_sload();
+        }
         let location_hash = hash_deterministic(MemoryLocation::Storage(address, index));
+        crate::specfence::step_trace::note_read(
+            location_hash,
+            crate::specfence::step_trace::kind_storage(),
+            address,
+        );
         let access_k =
             if self.specfence.mode == crate::ConcurrencyMode::SpecFence && !self.indep_first_cut {
                 self.specfence.access_log.note(self.tx_idx, location_hash)
@@ -3131,18 +3165,15 @@ impl<S: Storage> Database for VmDb<'_, S> {
             );
             self.specfence.metrics.record_journal_ff_hit();
             if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
-                self.maybe_note_value(
-                    location_hash,
-                    FfValue::Storage {
-                        address,
-                        slot: index,
-                        value,
-                        origin: match self.read_set.get(&location_hash).and_then(|o| o.last()) {
-                            Some(ReadOrigin::MvMemory(v)) => Some((v.tx_idx, v.tx_incarnation)),
-                            _ => None,
-                        },
+                self.maybe_note_value(location_hash, FfValue::Storage {
+                    address,
+                    slot: index,
+                    value,
+                    origin: match self.read_set.get(&location_hash).and_then(|o| o.last()) {
+                        Some(ReadOrigin::MvMemory(v)) => Some((v.tx_idx, v.tx_incarnation)),
+                        _ => None,
                     },
-                );
+                });
             }
             return Ok(value);
         }
@@ -3167,7 +3198,14 @@ impl<S: Storage> Database for VmDb<'_, S> {
         }
         let tip = if self.tx_idx > 0 {
             let _nest = crate::mv_memory::DataNest::enter("storage.tip");
-            self.mv_memory.data.get(&location_hash).and_then(|written| {
+            let timed = crate::specfence::inflation::reads_on();
+            let t_lookup = timed.then(Instant::now);
+            let got = self.mv_memory.data.get(&location_hash);
+            if let Some(t0) = t_lookup {
+                crate::specfence::inflation::add_lookup(t0.elapsed().as_nanos() as u64);
+            }
+            let t_scan = timed.then(Instant::now);
+            let tip = got.and_then(|written| {
                 let (idx, entry) = written.range(..self.tx_idx).next_back()?;
                 match entry {
                     MemoryEntry::Data(inc, MemoryValue::Storage(v)) => {
@@ -3204,7 +3242,11 @@ impl<S: Storage> Database for VmDb<'_, S> {
                     }
                     _ => Some(StorageTip::BadType),
                 }
-            })
+            });
+            if let Some(t0) = t_scan {
+                crate::specfence::inflation::add_scan(t0.elapsed().as_nanos() as u64);
+            }
+            tip
         } else {
             None
         };
@@ -3227,15 +3269,12 @@ impl<S: Storage> Database for VmDb<'_, S> {
                     crate::specfence::LocationKind::Storage,
                     Some(&origin),
                 );
-                self.maybe_note_value(
-                    location_hash,
-                    FfValue::Storage {
-                        address,
-                        slot: index,
-                        value,
-                        origin: Some((idx, inc)),
-                    },
-                );
+                self.maybe_note_value(location_hash, FfValue::Storage {
+                    address,
+                    slot: index,
+                    value,
+                    origin: Some((idx, inc)),
+                });
                 if resolve {
                     self.maybe_early_val(address, location_hash)?;
                 }
@@ -3260,15 +3299,12 @@ impl<S: Storage> Database for VmDb<'_, S> {
                             crate::specfence::LocationKind::Storage,
                             Some(&origin),
                         );
-                        self.maybe_note_value(
-                            location_hash,
-                            FfValue::Storage {
-                                address,
-                                slot: index,
-                                value: v2,
-                                origin: Some((idx, inc)),
-                            },
-                        );
+                        self.maybe_note_value(location_hash, FfValue::Storage {
+                            address,
+                            slot: index,
+                            value: v2,
+                            origin: Some((idx, inc)),
+                        });
                         self.maybe_early_val(address, location_hash)?;
                         return Ok(v2);
                     }
@@ -3382,19 +3418,20 @@ impl<S: Storage> Database for VmDb<'_, S> {
             crate::specfence::LocationKind::Storage,
             Some(&ReadOrigin::Storage),
         );
+        let t_store = crate::specfence::inflation::reads_on().then(Instant::now);
         let value = self
             .storage
             .storage(&address, &index)
             .map_err(|err| ReadError::StorageError(err.to_string()))?;
-        self.maybe_note_value(
-            location_hash,
-            FfValue::Storage {
-                address,
-                slot: index,
-                value,
-                origin: None,
-            },
-        );
+        if let Some(t0) = t_store {
+            crate::specfence::inflation::add_storage(t0.elapsed().as_nanos() as u64);
+        }
+        self.maybe_note_value(location_hash, FfValue::Storage {
+            address,
+            slot: index,
+            value,
+            origin: None,
+        });
         if resolve {
             self.maybe_early_val(address, location_hash)?;
         }
@@ -3844,16 +3881,57 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
         }
     }
 
+    fn record_mv(
+        &self,
+        tx_version: &TxVersion,
+        read_set: ReadSet,
+        write_set: WriteSet,
+    ) -> (bool, smallvec::SmallVec<[MemoryLocationHash; 4]>) {
+        if crate::specfence::inflation::enabled() {
+            crate::specfence::inflation::note_rw(
+                read_set.keys().copied(),
+                write_set.iter().map(|(h, v)| {
+                    (
+                        *h,
+                        matches!(
+                            v,
+                            MemoryValue::LazySender(_) | MemoryValue::LazyRecipient(_)
+                        ),
+                    )
+                }),
+            );
+            let t0 = Instant::now();
+            let out = self.mv_memory.record(tx_version, read_set, write_set);
+            crate::specfence::inflation::note_record(t0.elapsed().as_nanos() as u64);
+            out
+        } else {
+            self.mv_memory.record(tx_version, read_set, write_set)
+        }
+    }
+
     pub(crate) fn execute(
         &mut self,
         tx_version: &TxVersion,
         result_slot: &mut Option<PevmTxExecutionResult>,
     ) -> Result<FinishExecFlags, VmExecutionError> {
         // Measurement only. Drop records pre / interpreter / write-commit.
-        let mut phase = ExecPhase::start(self.specfence.metrics);
+        let mut phase = ExecPhase::start(
+            self.specfence.metrics,
+            tx_version.tx_idx,
+            tx_version.tx_incarnation as u16,
+        );
+        crate::specfence::inflation::note_beneficiary(self.beneficiary_location_hash);
+        crate::specfence::step_trace::beneficiary_store(self.beneficiary_location_hash);
         // SAFETY: A correct scheduler would guarantee this index to be inbound.
         let full_tx = unsafe { self.txs.get_unchecked(tx_version.tx_idx) };
         let tx = self.chain.tx_env(full_tx);
+        if crate::specfence::step_trace::enabled() {
+            let mut selector = [0u8; 4];
+            if tx.data.len() >= 4 {
+                selector.copy_from_slice(&tx.data[..4]);
+            }
+            crate::specfence::step_trace::set_selector(selector);
+        }
 
         let from_hash = hash_deterministic(MemoryLocation::Basic(tx.caller));
         let to_hash = tx
@@ -4534,9 +4612,11 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         }
                     }
                 }
+                let trace = crate::specfence::step_trace::enabled();
                 let result = self.chain.run_pevm_tx(
                     &mut self.evm,
-                    use_inspect && self.specfence.mode == crate::ConcurrencyMode::SpecFence,
+                    (use_inspect && self.specfence.mode == crate::ConcurrencyMode::SpecFence)
+                        || trace,
                 );
                 if did_jump {
                     let applied = resume_was_applied();
@@ -4782,6 +4862,22 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         write_set.push((recipient, MemoryValue::LazyRecipient(amount)));
                     }
                 }
+                if crate::specfence::step_trace::enabled() {
+                    for (loc, value) in &write_set {
+                        let kind = match value {
+                            MemoryValue::LazySender(_) | MemoryValue::LazyRecipient(_) => {
+                                crate::specfence::step_trace::kind_lazy()
+                            }
+                            MemoryValue::Storage(_) => crate::specfence::step_trace::kind_storage(),
+                            MemoryValue::CodeHash(_) | MemoryValue::SelfDestructed => {
+                                crate::specfence::step_trace::kind_code()
+                            }
+                            MemoryValue::Basic(_) => crate::specfence::step_trace::kind_basic(),
+                        };
+                        let force = *loc == from_hash || *loc == self.beneficiary_location_hash;
+                        crate::specfence::step_trace::note_write_if_missing(*loc, kind, force);
+                    }
+                }
 
                 let (is_lazy, optimistic_majority_lazy, read_set, sf_occ_shaped) = {
                     let db = ctx.db_mut();
@@ -4895,7 +4991,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                     };
                     self.note_spine_writes(tx_version.tx_idx, &write_set);
                     let (wrote_new_location, contended) =
-                        self.mv_memory.record(tx_version, read_set, write_set);
+                        self.record_mv(tx_version, read_set, write_set);
                     for loc in tip_locs {
                         let exact = self.specfence.sf_tips.publish_data(
                             loc,
@@ -4941,6 +5037,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         }
                     }
                     let receipt = receipt_from_revm(exec_result);
+                    let gas_used = receipt.cumulative_gas_used;
                     let state = state_transitions_from_revm(self.is_eip_161_enabled, state);
                     if let Some(slot) = result_slot {
                         slot.receipt = receipt;
@@ -4952,6 +5049,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                             state: state.collect(),
                         });
                     }
+                    crate::specfence::inflation::note_gas(gas_used);
                     phase.mark_ok();
                     return Ok(flags);
                 }
@@ -5033,7 +5131,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 }
                 self.note_spine_writes(tx_version.tx_idx, &write_set);
                 let (wrote_new_location, contended) =
-                    self.mv_memory.record(tx_version, read_set, write_set);
+                    self.record_mv(tx_version, read_set, write_set);
                 if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
                     self.specfence
                         .sf_tips
@@ -5154,6 +5252,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 }
 
                 let receipt = receipt_from_revm(exec_result);
+                let gas_used = receipt.cumulative_gas_used;
                 let state = state_transitions_from_revm(self.is_eip_161_enabled, state);
                 if let Some(slot) = result_slot {
                     slot.receipt = receipt;
@@ -5165,6 +5264,7 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                         state: state.collect(),
                     });
                 }
+                crate::specfence::inflation::note_gas(gas_used);
                 phase.mark_ok();
                 Ok(flags)
             }
@@ -5220,6 +5320,8 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
 /// Measurement-only timer for one `vm.execute`. Dropped on every return.
 struct ExecPhase<'a> {
     metrics: &'a crate::specfence::MetricsInner,
+    tx: usize,
+    inc: u16,
     enter: Instant,
     pre_ns: u64,
     interp_ns: u64,
@@ -5236,10 +5338,15 @@ struct ExecPhase<'a> {
 }
 
 impl<'a> ExecPhase<'a> {
-    fn start(metrics: &'a crate::specfence::MetricsInner) -> Self {
+    fn start(metrics: &'a crate::specfence::MetricsInner, tx: usize, inc: u16) -> Self {
+        crate::specfence::inflation::begin_attempt();
+        let enter = Instant::now();
+        crate::specfence::step_trace::begin_tx(tx, inc, enter);
         Self {
             metrics,
-            enter: Instant::now(),
+            tx,
+            inc,
+            enter,
             pre_ns: 0,
             interp_ns: 0,
             interp_t0: None,
@@ -5300,6 +5407,7 @@ impl Drop for ExecPhase<'_> {
         };
         self.metrics
             .add_exec_phase(total, pre, interp, post, self.kind);
+        crate::specfence::step_trace::end_tx(total);
         self.metrics.add_interp_split(
             self.split_probed,
             self.opcode_ns,
@@ -5309,5 +5417,18 @@ impl Drop for ExecPhase<'_> {
             self.vmdb_n,
             self.detect_n,
         );
+        crate::specfence::inflation::commit_exec(crate::specfence::inflation::ExecCut {
+            tx: self.tx,
+            inc: self.inc,
+            kind: self.kind,
+            pre_ns: pre,
+            interp_ns: interp,
+            post_ns: post,
+            total_ns: total,
+            opcode_ns: self.opcode_ns,
+            vmdb_ns: self.vmdb_ns,
+            detect_ns: self.detect_ns,
+            split: self.split_probed,
+        });
     }
 }

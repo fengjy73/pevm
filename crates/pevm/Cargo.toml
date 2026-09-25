@@ -9,6 +9,7 @@ defaults = []
 rpc-storage = ["dep:alloy-transport", "dep:reqwest", "dep:tokio"]
 
 global-alloc = ["dep:rpmalloc", "dep:snmalloc-rs", "dep:tikv-jemallocator"]
+inflation-alloc = []
 
 [dependencies]
 alloy-consensus.workspace = true

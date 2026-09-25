@@ -1,0 +1,12 @@
+HOST cpus=4 model="Intel(R) Xeon(R) Processor" loadavg=0.51 0.83 0.83 1/267 12510 which=seqcheck workers=4 k=1 oracle_k=0 seq_cpu=0 pin=0,1,2,3 dump=false inflation=false reads= os= perf= dag= ge_1_5=false
+seq=par ok block=3356896 iter=0
+seq=par ok block=3356896 iter=1
+seq=par ok block=3356896 iter=2
+seq=par ok block=3356896 iter=3
+seq=par ok block=3356896 iter=4
+seq=par ok block=3356896 iter=5
+seq=par ok block=3356896 iter=6
+seq=par ok block=3356896 iter=7
+seq=par ok block=3356896 iter=8
+seq=par ok block=3356896 iter=9
+SEQCHECK block=3356896 n=10 diverge=0 ge_1_5=false
