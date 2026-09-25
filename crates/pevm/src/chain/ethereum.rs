@@ -245,3 +245,25 @@ impl PevmChain for PevmEthereum {
         spec_id >= SpecId::SPURIOUS_DRAGON
     }
 }
+
+#[cfg(test)]
+mod static_gas {
+    use revm::{bytecode::opcode::SLOAD, database::EmptyDB};
+
+    use super::*;
+
+    fn sload_static_gas(spec_id: SpecId) -> u64 {
+        let evm =
+            PevmEthereum::mainnet().build_evm(spec_id, BlockEnv::default(), EmptyDB::default());
+        evm.instruction.instruction_table[SLOAD as usize].static_gas()
+    }
+
+    /// The shared builder is what sequential execution and upstream OCC use.
+    /// Spurious Dragon `SLOAD` is 200. London's warm base is 100. A wrapper
+    /// installed here with static gas 0 would move both.
+    #[test]
+    fn sload_keeps_spec_static_gas() {
+        assert_eq!(sload_static_gas(SpecId::SPURIOUS_DRAGON), 200);
+        assert_eq!(sload_static_gas(SpecId::LONDON), 100);
+    }
+}
