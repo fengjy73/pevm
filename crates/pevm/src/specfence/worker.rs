@@ -33,6 +33,14 @@ pub(crate) fn run_sf_block<F, V>(
 {
     let metrics = specfence.metrics;
     runnable.bind_worker(worker_i);
+    super::busy_stall::bind(worker_i);
+    struct ProbeExit;
+    impl Drop for ProbeExit {
+        fn drop(&mut self) {
+            super::busy_stall::worker_exit();
+        }
+    }
+    let _probe_exit = ProbeExit;
     // Unpark peers on every exit so a parked worker cannot outlive the scope.
     struct ExitWake<'a>(&'a RunnableSet);
     impl Drop for ExitWake<'_> {
@@ -283,21 +291,64 @@ pub(crate) fn run_sf_block<F, V>(
                         let val_start = origin_ns(specfence);
                         drain_wave(specfence, scheduler, runnable);
                         let phase_v0 = Instant::now();
+                        if super::busy_stall::enabled() {
+                            super::busy_stall::charge(
+                                super::busy_stall::KIND_SCHED,
+                                phase_v0.saturating_duration_since(phase_t0).as_nanos() as u64,
+                                phase_t0,
+                            );
+                        }
                         let (plan, invalid) = validate_to_plan(&tx_version, vis);
-                        resolve_plan::apply(
-                            plan,
-                            ApplyCtx {
-                                specfence,
-                                mv_memory,
-                                scheduler,
-                                runnable,
-                                arms,
-                                tx_version: &tx_version,
-                                vis,
-                                wrote_new_location,
-                                invalid: &invalid,
-                            },
-                        );
+                        if super::busy_stall::enabled() {
+                            super::busy_stall::charge_span(
+                                super::busy_stall::KIND_VALIDATE,
+                                phase_v0.elapsed().as_nanos() as u64,
+                                phase_v0,
+                                tx_idx as u32,
+                                super::busy_stall::PRED_NONE,
+                                tx_version.tx_incarnation as u16,
+                                phase_v0.elapsed().as_nanos() as u64,
+                            );
+                            let learn_t0 = Instant::now();
+                            resolve_plan::apply(
+                                plan,
+                                ApplyCtx {
+                                    specfence,
+                                    mv_memory,
+                                    scheduler,
+                                    runnable,
+                                    arms,
+                                    tx_version: &tx_version,
+                                    vis,
+                                    wrote_new_location,
+                                    invalid: &invalid,
+                                },
+                            );
+                            super::busy_stall::charge_span(
+                                super::busy_stall::KIND_LEARN,
+                                learn_t0.elapsed().as_nanos() as u64,
+                                learn_t0,
+                                tx_idx as u32,
+                                super::busy_stall::PRED_NONE,
+                                tx_version.tx_incarnation as u16,
+                                learn_t0.elapsed().as_nanos() as u64,
+                            );
+                        } else {
+                            resolve_plan::apply(
+                                plan,
+                                ApplyCtx {
+                                    specfence,
+                                    mv_memory,
+                                    scheduler,
+                                    runnable,
+                                    arms,
+                                    tx_version: &tx_version,
+                                    vis,
+                                    wrote_new_location,
+                                    invalid: &invalid,
+                                },
+                            );
+                        }
                         metrics.add_phase_val(phase_v0.elapsed().as_nanos() as u64);
                         note_validate_span(runnable, val_start, origin_ns(specfence));
                         record_post_exec(runnable, outside, phase_t0.elapsed().as_nanos() as u64);
@@ -371,20 +422,58 @@ pub(crate) fn run_sf_block<F, V>(
                 let val_start = origin_ns(specfence);
                 let phase_v0 = Instant::now();
                 let (plan, invalid) = validate_to_plan(&tx_version, vis);
-                resolve_plan::apply(
-                    plan,
-                    ApplyCtx {
-                        specfence,
-                        mv_memory,
-                        scheduler,
-                        runnable,
-                        arms,
-                        tx_version: &tx_version,
-                        vis,
-                        wrote_new_location: false,
-                        invalid: &invalid,
-                    },
-                );
+                if super::busy_stall::enabled() {
+                    let val_ns = phase_v0.elapsed().as_nanos() as u64;
+                    super::busy_stall::charge_span(
+                        super::busy_stall::KIND_VALIDATE,
+                        val_ns,
+                        phase_v0,
+                        tx_version.tx_idx as u32,
+                        super::busy_stall::PRED_NONE,
+                        tx_version.tx_incarnation as u16,
+                        val_ns,
+                    );
+                    let learn_t0 = Instant::now();
+                    resolve_plan::apply(
+                        plan,
+                        ApplyCtx {
+                            specfence,
+                            mv_memory,
+                            scheduler,
+                            runnable,
+                            arms,
+                            tx_version: &tx_version,
+                            vis,
+                            wrote_new_location: false,
+                            invalid: &invalid,
+                        },
+                    );
+                    let learn_ns = learn_t0.elapsed().as_nanos() as u64;
+                    super::busy_stall::charge_span(
+                        super::busy_stall::KIND_LEARN,
+                        learn_ns,
+                        learn_t0,
+                        tx_version.tx_idx as u32,
+                        super::busy_stall::PRED_NONE,
+                        tx_version.tx_incarnation as u16,
+                        learn_ns,
+                    );
+                } else {
+                    resolve_plan::apply(
+                        plan,
+                        ApplyCtx {
+                            specfence,
+                            mv_memory,
+                            scheduler,
+                            runnable,
+                            arms,
+                            tx_version: &tx_version,
+                            vis,
+                            wrote_new_location: false,
+                            invalid: &invalid,
+                        },
+                    );
+                }
                 metrics.add_phase_val(phase_v0.elapsed().as_nanos() as u64);
                 note_validate_span(runnable, val_start, origin_ns(specfence));
                 record_post_exec(runnable, outside, phase_t0.elapsed().as_nanos() as u64);
@@ -424,6 +513,9 @@ pub(crate) fn run_sf_block<F, V>(
                 drain_wave(specfence, scheduler, runnable);
                 let heal_ns = heal_t0.elapsed().as_nanos() as u64;
                 runnable.add_heal_ns(heal_ns);
+                if super::busy_stall::enabled() {
+                    super::busy_stall::charge(super::busy_stall::KIND_SCHED, heal_ns, heal_t0);
+                }
                 if runnable.span_end_ns() != 0 {
                     runnable.add_post_span_heal_ns(heal_ns);
                 }
@@ -447,6 +539,9 @@ pub(crate) fn run_sf_block<F, V>(
                     }
                     let heal_ns = heal_t0.elapsed().as_nanos() as u64;
                     runnable.add_heal_ns(heal_ns);
+                    if super::busy_stall::enabled() {
+                        super::busy_stall::charge(super::busy_stall::KIND_SCHED, heal_ns, heal_t0);
+                    }
                     if runnable.span_end_ns() != 0 {
                         runnable.add_post_span_heal_ns(heal_ns);
                     }
@@ -465,8 +560,16 @@ pub(crate) fn run_sf_block<F, V>(
                 // A short timeout here woke every idle worker together and
                 // raced force-idle recover (large block seq!=par).
                 if runnable.waiting_on_live_producer(specfence.ready_edges, scheduler) {
+                    let spin_t0 = super::busy_stall::enabled().then(Instant::now);
                     for _ in 0..32 {
                         std::hint::spin_loop();
+                    }
+                    if let Some(t0) = spin_t0 {
+                        super::busy_stall::charge(
+                            super::busy_stall::KIND_SPIN,
+                            t0.elapsed().as_nanos() as u64,
+                            t0,
+                        );
                     }
                     if runnable.pending_work() > 0 {
                         continue;
@@ -480,6 +583,23 @@ pub(crate) fn run_sf_block<F, V>(
                     if runnable.span_end_ns() != 0 {
                         runnable.add_post_span_park_ns(park_t0.elapsed().as_nanos() as u64);
                     }
+                    if super::busy_stall::enabled() {
+                        let ns = park_t0.elapsed().as_nanos() as u64;
+                        let kind = if runnable.span_end_ns() != 0 {
+                            super::busy_stall::KIND_STALL_JOIN
+                        } else {
+                            super::busy_stall::KIND_STALL_WAITONCE
+                        };
+                        super::busy_stall::charge_span(
+                            kind,
+                            ns,
+                            park_t0,
+                            super::busy_stall::PRED_NONE,
+                            super::busy_stall::PRED_NONE,
+                            0,
+                            ns,
+                        );
+                    }
                     continue;
                 }
                 // Still unfinished or a tip is unpublished. Back off so the
@@ -488,6 +608,23 @@ pub(crate) fn run_sf_block<F, V>(
                 std::thread::yield_now();
                 if runnable.span_end_ns() != 0 {
                     runnable.add_post_span_yield_ns(yield_t0.elapsed().as_nanos() as u64);
+                }
+                if super::busy_stall::enabled() {
+                    let ns = yield_t0.elapsed().as_nanos() as u64;
+                    let kind = if runnable.span_end_ns() != 0 {
+                        super::busy_stall::KIND_STALL_JOIN
+                    } else {
+                        super::busy_stall::KIND_STALL_NOREADY
+                    };
+                    super::busy_stall::charge_span(
+                        kind,
+                        ns,
+                        yield_t0,
+                        super::busy_stall::PRED_NONE,
+                        super::busy_stall::PRED_NONE,
+                        0,
+                        ns,
+                    );
                 }
             }
         }

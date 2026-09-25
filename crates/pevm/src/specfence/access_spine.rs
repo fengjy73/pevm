@@ -577,6 +577,16 @@ impl AccessSpine {
         self.ordered_writers.binary_search(&tx).is_ok()
     }
 
+    /// Previous ordered writer, if `tx` is not the chain head.
+    pub(crate) fn ordered_pred(&self, tx: TxIdx) -> Option<TxIdx> {
+        let i = self.ordered_writers.binary_search(&tx).ok()?;
+        if i == 0 {
+            None
+        } else {
+            Some(self.ordered_writers[i - 1])
+        }
+    }
+
     /// Index of `tx` on the carried writer chain.
     #[inline]
     pub(crate) fn ordered_pos(&self, tx: TxIdx) -> Option<usize> {

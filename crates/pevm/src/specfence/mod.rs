@@ -192,6 +192,7 @@ pub(crate) mod feeder;
 mod finegrain;
 mod heat;
 mod hotset;
+pub(crate) mod busy_stall;
 mod ideal_prox;
 #[cfg(test)]
 mod kernel;
@@ -282,6 +283,8 @@ pub(crate) use heat::HeatMap;
 pub(crate) use hotset::HotSet;
 #[allow(unused_imports)]
 pub(crate) use hotset::{H_A, H_W};
+pub use busy_stall::{BusyStallSnap, enabled as busy_stall_enabled, last_snap as busy_stall_last};
+pub(crate) use busy_stall::{begin as busy_stall_begin, bind as busy_stall_bind, seal as busy_stall_seal};
 pub(crate) use ideal_prox::IdealProxLog;
 pub use ideal_prox::{
     IdealProxDiff, IdealProxSnap, IdealProxTx, blocker_name, diff_indep, role_name,

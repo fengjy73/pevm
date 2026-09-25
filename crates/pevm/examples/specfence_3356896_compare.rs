@@ -386,6 +386,33 @@ fn print_focus(pevm: &Pevm, mode_name: &str, i: usize, n: usize, m: &pevm::SpecF
     );
 }
 
+fn write_busy_stall(block_no: u64, mode: &str, i: usize, wall_ms: f64) {
+    let snap = pevm::specfence::busy_stall_last();
+    let dir = repo_root().join("results/soft0-busy-stall-dig");
+    std::fs::create_dir_all(&dir).expect("results dir");
+    let path = dir.join(format!("{block_no}-{mode}-iter{i}.json"));
+    let f = File::create(&path).expect("busy stall json");
+    serde_json::to_writer(
+        f,
+        &serde_json::json!({
+            "block": block_no,
+            "mode": mode,
+            "iter": i,
+            "wall_ms": wall_ms,
+            "snap": snap,
+        }),
+    )
+    .expect("write busy stall");
+    let sum: u64 = snap.workers.iter().flat_map(|w| w.ns.iter().copied()).sum();
+    eprintln!(
+        "  busy_stall {mode}[{i}] workers={} spans={} bucket_sum_ms={:.3} -> {}",
+        snap.workers.len(),
+        snap.spans.len(),
+        sum as f64 / 1e6,
+        path.display()
+    );
+}
+
 fn run_once(
     pevm: &mut Pevm,
     mode_name: &str,
@@ -806,6 +833,9 @@ fn main() {
         let occ_row = run_once(&mut occ, "occ", i, &chain, &storage, &block, cores_nz, n);
         occ_walls.push(occ_row.wall_ms);
         last_occ = Some(occ_row.occ_aborts);
+        if pevm::specfence::busy_stall_enabled() {
+            write_busy_stall(block_no, "occ", i, occ_row.wall_ms);
+        }
         rows.push(occ_row);
 
         if cold_each {
@@ -823,6 +853,9 @@ fn main() {
             cores_nz,
             n,
         );
+        if pevm::specfence::busy_stall_enabled() {
+            write_busy_stall(block_no, "specfence", i, sf_row.wall_ms);
+        }
         sf_walls.push(sf_row.wall_ms);
         last_sf = Some((
             sf_row.refuse_admit,

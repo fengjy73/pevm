@@ -212,9 +212,14 @@ struct PickPhase<'a> {
 
 impl Drop for PickPhase<'_> {
     fn drop(&mut self) {
-        if let Some(metrics) = self.metrics {
-            metrics.add_phase_pick(self.t0.elapsed().as_nanos() as u64);
+        if self.metrics.is_none() && !super::busy_stall::enabled() {
+            return;
         }
+        let ns = self.t0.elapsed().as_nanos() as u64;
+        if let Some(metrics) = self.metrics {
+            metrics.add_phase_pick(ns);
+        }
+        super::busy_stall::charge_pick(ns, self.t0);
     }
 }
 
