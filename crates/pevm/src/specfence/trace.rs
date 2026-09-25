@@ -24,6 +24,58 @@ fn profile_flag() -> bool {
     *ON.get_or_init(|| flag("SPECFENCE_INFLATION"))
 }
 
+fn diag_flag() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| flag("SPECFENCE_ABORT_DIAG"))
+}
+
+/// Why `coordinate` let a read proceed or handed the worker back.
+/// Recorded only when `SPECFENCE_ABORT_DIAG` is set, at the reader's read.
+pub(crate) mod coord_reason {
+    pub(crate) const NO_CHAIN: u8 = 1;
+    pub(crate) const NO_LOWER: u8 = 2;
+    pub(crate) const READY_PUB: u8 = 3;
+    pub(crate) const READY_EXEC: u8 = 4;
+    pub(crate) const SKIP_COST: u8 = 5;
+    pub(crate) const WAITED_PUB: u8 = 6;
+    pub(crate) const WAITED_EXEC: u8 = 7;
+    pub(crate) const BLOCK: u8 = 8;
+
+    pub(crate) const fn name(reason: u8) -> &'static str {
+        match reason {
+            NO_CHAIN => "no_chain",
+            NO_LOWER => "no_lower_writer",
+            READY_PUB => "ready_published",
+            READY_EXEC => "ready_executed",
+            SKIP_COST => "skip_cost",
+            WAITED_PUB => "waited_published",
+            WAITED_EXEC => "waited_executed",
+            BLOCK => "blocked",
+            _ => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CoordNote {
+    pub armed: bool,
+    pub nearest: u32,
+    pub state: u8,
+    pub reason: u8,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct AbortNote {
+    pub reader: u32,
+    pub location: u64,
+    pub origin_tx: u32,
+    pub live_tx: u32,
+    pub live_in_chain_now: bool,
+    pub live_state_now: u8,
+    pub armed_now: bool,
+    pub read: Option<CoordNote>,
+}
+
 /// One interpreter return, kept for the profile dump.
 ///
 /// `kind` is 1 only after that incarnation commits. The report keeps the
@@ -57,6 +109,12 @@ pub(crate) struct Trace {
     pub(crate) raw_edges: std::sync::Mutex<Vec<(u32, u32)>>,
     pub(crate) tx_ns: std::sync::Mutex<Vec<u64>>,
     attempts: std::sync::Mutex<Vec<SfAttempt>>,
+    diag: bool,
+    /// Last coordinate decision per `(reader, location)`.
+    decisions: std::sync::Mutex<
+        hashbrown::HashMap<(u32, u64), CoordNote, rustc_hash::FxBuildHasher>,
+    >,
+    aborts: std::sync::Mutex<Vec<AbortNote>>,
 }
 
 impl Trace {
@@ -73,7 +131,121 @@ impl Trace {
             raw_edges: std::sync::Mutex::new(Vec::new()),
             tx_ns: std::sync::Mutex::new(if on { vec![0; n] } else { Vec::new() }),
             attempts: std::sync::Mutex::new(Vec::new()),
+            diag: diag_flag(),
+            decisions: std::sync::Mutex::new(hashbrown::HashMap::with_hasher(
+                rustc_hash::FxBuildHasher,
+            )),
+            aborts: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    #[inline]
+    pub(crate) const fn diag(&self) -> bool {
+        self.diag
+    }
+
+    pub(crate) fn note_coord(
+        &self,
+        tx: usize,
+        location: u64,
+        armed: bool,
+        nearest: u32,
+        state: u8,
+        reason: u8,
+    ) {
+        if !self.diag {
+            return;
+        }
+        self.decisions.lock().unwrap().insert(
+            (tx as u32, location),
+            CoordNote {
+                armed,
+                nearest,
+                state,
+                reason,
+            },
+        );
+    }
+
+    pub(crate) fn note_abort(&self, note: AbortNote) {
+        if !self.diag {
+            return;
+        }
+        let read = self
+            .decisions
+            .lock()
+            .unwrap()
+            .get(&(note.reader, note.location))
+            .copied();
+        let mut note = note;
+        note.read = read;
+        self.aborts.lock().unwrap().push(note);
+    }
+
+    pub(crate) fn dump_aborts(&self) {
+        if !self.diag {
+            return;
+        }
+        let aborts = self.aborts.lock().unwrap();
+        let mut hist: [usize; 9] = [0; 9];
+        let mut armed_at_read = 0usize;
+        let mut nearest_is_live = 0usize;
+        let mut live_missing_at_read = 0usize;
+        let mut no_decision = 0usize;
+        for a in aborts.iter() {
+            let Some(read) = a.read else {
+                no_decision += 1;
+                eprintln!(
+                    "ABORT reader={} loc={:#x} origin={} live={} live_in_chain_now={} live_state_now={} armed_now={} read=NONE",
+                    a.reader,
+                    a.location,
+                    a.origin_tx,
+                    a.live_tx,
+                    a.live_in_chain_now,
+                    a.live_state_now,
+                    a.armed_now,
+                );
+                continue;
+            };
+            if read.armed {
+                armed_at_read += 1;
+            }
+            if read.reason < hist.len() as u8 {
+                hist[read.reason as usize] += 1;
+            }
+            if a.live_tx != u32::MAX && read.nearest == a.live_tx {
+                nearest_is_live += 1;
+            } else if a.live_tx != u32::MAX {
+                live_missing_at_read += 1;
+            }
+            eprintln!(
+                "ABORT reader={} loc={:#x} origin={} live={} live_in_chain_now={} live_state_now={} armed_now={} read_armed={} read_nearest={} read_state={} reason={}",
+                a.reader,
+                a.location,
+                a.origin_tx,
+                a.live_tx,
+                a.live_in_chain_now,
+                a.live_state_now,
+                a.armed_now,
+                read.armed,
+                read.nearest,
+                read.state,
+                coord_reason::name(read.reason),
+            );
+        }
+        eprintln!(
+            "ABORT_SUM n={} armed_at_read={} nearest_is_live={} live_not_nearest={} no_decision={} reasons={}",
+            aborts.len(),
+            armed_at_read,
+            nearest_is_live,
+            live_missing_at_read,
+            no_decision,
+            (1..hist.len())
+                .filter(|&i| hist[i] > 0)
+                .map(|i| format!("{}={}", coord_reason::name(i as u8), hist[i]))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
     }
 
     #[inline]

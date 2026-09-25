@@ -6,6 +6,7 @@
 //! A retained pre-abort value lets an in-flight reader finish; it is not a
 //! commit origin because validation still compares identity and value.
 
+use std::cell::Cell;
 use std::time::Instant;
 
 use alloy_primitives::{Address, B256, TxKind, U256};
@@ -68,55 +69,147 @@ struct VmDb<'a, S: crate::Storage> {
     read_accounts: HashMap<MemoryLocationHash, (AccountBasic, Option<B256>), BuildIdentityHasher>,
     /// Nearest lower transaction from the same sender, if any.
     prev_sender: &'a [Option<TxIdx>],
+    /// Nearest lower writer accepted before the multi-version read.
+    /// `u32::MAX` means there was none.
+    accepted_pred: Cell<u32>,
+    /// One worker commits in index order. Chain waits are skipped.
+    serial: bool,
 }
 
 impl<'a, S: crate::Storage> VmDb<'a, S> {
-    fn read_ready(&self, location: u64, pred: TxIdx) -> bool {
-        // A finished incarnation that did not publish this location will not
-        // do so later. Waiting for it only stalls the reader.
-        self.chain.writer_published(location, pred)
-            || self.rt.is_committed(pred)
-            || self.rt.is_executed(pred)
+    /// Armed locations settle only on the committed write. A `Published`
+    /// incarnation can still fail validation and store a different value.
+    /// Unarmed locations keep the publish mark; nothing has joined the chain
+    /// that a reader was required to wait for.
+    fn settled(&self, location: u64, pred: TxIdx) -> bool {
+        if !self.chain.writer_published(location, pred) {
+            return false;
+        }
+        !self.chain.is_armed(location) || self.rt.committed() > pred
     }
 
+    fn finished_without_write(&self, location: u64, pred: TxIdx) -> bool {
+        let (state, _) = self.chain.writer_state(location, pred);
+        if state == 0 || state == 3 {
+            return false;
+        }
+        // A finished-but-uncommitted attempt can still abort and write.
+        self.rt.committed() > pred
+    }
+
+    #[inline(always)]
     fn coordinate(&self, location: u64) -> Result<(), ReadError> {
+        // One worker commits in order, so a read cannot observe an uncommitted
+        // lower write. Kept inline so the directory lock is not a call.
+        if self.serial {
+            return Ok(());
+        }
+        self.coordinate_chain(location)
+    }
+
+    fn coordinate_chain(&self, location: u64) -> Result<(), ReadError> {
+        let _b = super::buckets::Guard::start(super::buckets::COORD);
         if self.trace.enabled() && self.chain.is_armed(location) {
             self.trace.note_read_after_arm();
         }
+        let result = self.wait_writer(location);
+        let accepted = self
+            .chain
+            .nearest_lower(location, self.tx_idx)
+            .map(|tx| tx as u32)
+            .unwrap_or(u32::MAX);
+        self.accepted_pred.set(accepted);
+        if self.trace.diag() {
+            let (nearest, state, reason) = match result {
+                Ok(()) => {
+                    match self.chain.nearest_lower(location, self.tx_idx) {
+                        Some(pred) => {
+                            let state = self.chain.writer_state(location, pred).0 as u8;
+                            let reason = if self.settled(location, pred) {
+                                super::trace::coord_reason::READY_PUB
+                            } else {
+                                super::trace::coord_reason::SKIP_COST
+                            };
+                            (pred as u32, state, reason)
+                        }
+                        None => (u32::MAX, 0, super::trace::coord_reason::NO_LOWER),
+                    }
+                }
+                Err(_) => {
+                    let pred = self.chain.nearest_lower(location, self.tx_idx);
+                    let state = pred
+                        .map(|tx| self.chain.writer_state(location, tx).0 as u8)
+                        .unwrap_or(0);
+                    (
+                        pred.map(|tx| tx as u32).unwrap_or(u32::MAX),
+                        state,
+                        super::trace::coord_reason::BLOCK,
+                    )
+                }
+            };
+            self.trace.note_coord(
+                self.tx_idx,
+                location,
+                self.chain.is_armed(location),
+                nearest,
+                state,
+                reason,
+            );
+        }
+        result
+    }
+
+    /// Armed locations always wait. Unarmed locations still consult the cost model.
+    fn wait_writer(&self, location: u64) -> Result<(), ReadError> {
         if !self.chain.any() {
             return Ok(());
         }
-        let Some(pred) = self.chain.nearest_lower(location, self.tx_idx) else {
-            return Ok(());
-        };
-        if self.read_ready(location, pred) {
-            return Ok(());
-        }
-        let executing = self.rt.is_executing(pred);
-        if !self.chain.should_wait(location, pred, executing) {
-            return Ok(());
-        }
-        // The predecessor has not started. Hand the worker back so it can run it.
-        if !executing {
+        for _ in 0..8 {
+            let Some(pred) = self.chain.nearest_lower(location, self.tx_idx) else {
+                return Ok(());
+            };
+            if self.settled(location, pred) {
+                return Ok(());
+            }
+            if self.finished_without_write(location, pred) {
+                self.chain.clear_hole(location, pred);
+                continue;
+            }
+            let executing = self.rt.is_executing(pred);
+            let armed = self.chain.is_armed(location);
+            if !armed && !self.chain.should_wait(location, pred, executing) {
+                return Ok(());
+            }
+            if !executing {
+                return Err(ReadError::Blocking(pred));
+            }
+            // Overlap only while the predecessor is inside the interpreter.
+            // 40 × 50µs is the cap; a longer spin holds the worker off the prefix.
+            self.rt.waiting_add(1);
+            for _ in 0..40 {
+                if self.settled(location, pred)
+                    || self.finished_without_write(location, pred)
+                    || !self.rt.is_executing(pred)
+                    || self.rt.all_executors_waiting()
+                {
+                    break;
+                }
+                self.rt.wait_brief();
+            }
+            self.rt.waiting_add(-1);
+            if self.settled(location, pred) {
+                return Ok(());
+            }
+            if self.finished_without_write(location, pred) {
+                self.chain.clear_hole(location, pred);
+                continue;
+            }
             return Err(ReadError::Blocking(pred));
         }
-        // Overlap only while the predecessor is inside the interpreter.
-        // 40 × 50µs is the cap; a longer spin holds the worker off the prefix.
-        self.rt.waiting_add(1);
-        for _ in 0..40 {
-            if self.read_ready(location, pred)
-                || !self.rt.is_executing(pred)
-                || self.rt.all_executors_waiting()
-            {
-                break;
-            }
-            self.rt.wait_brief();
+        match self.chain.nearest_lower(location, self.tx_idx) {
+            Some(pred) if !self.settled(location, pred) => Err(ReadError::Blocking(pred)),
+            _ => Ok(()),
         }
-        self.rt.waiting_add(-1);
-        if self.read_ready(location, pred) {
-            return Ok(());
-        }
-        Err(ReadError::Blocking(pred))
     }
 
     /// Nonce and balance checks block on the previous same-sender transaction.
@@ -185,6 +278,7 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
 
     fn get_code_hash(&mut self, address: Address) -> Result<Option<B256>, ReadError> {
         let location_hash = hash_deterministic(MemoryLocation::CodeHash(address));
+        let serial = self.serial;
         self.coordinate(location_hash)?;
         let read_origins = self.read_set.entry(location_hash).or_default();
         if let Some(written_transactions) = self.mv.data.get(&location_hash)
@@ -196,23 +290,106 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
                     return Err(ReadError::SelfDestructedAccount);
                 }
                 MemoryEntry::Data(tx_incarnation, MemoryValue::CodeHash(code_hash)) => {
+                    confirm_read(
+                        self.chain,
+                        self.rt,
+                        self.tx_idx,
+                        self.accepted_pred.get(),
+                        location_hash,
+                        serial,
+                    )?;
                     Self::push_origin(
                         read_origins,
-                        SfReadOrigin::Mv(SfOrigin {
-                            tx_idx: *tx_idx,
-                            incarnation: *tx_incarnation,
-                            value: MemoryValue::CodeHash(*code_hash),
-                        }),
+                        mv_origin(
+                            serial,
+                            *tx_idx,
+                            *tx_incarnation,
+                            &MemoryValue::CodeHash(*code_hash),
+                        ),
                     )?;
                     return Ok(Some(*code_hash));
                 }
                 MemoryEntry::Data(_, _) => {}
             }
         }
+        confirm_read(
+            self.chain,
+            self.rt,
+            self.tx_idx,
+            self.accepted_pred.get(),
+            location_hash,
+            serial,
+        )?;
         Self::push_origin(read_origins, SfReadOrigin::Storage)?;
         self.storage
             .code_hash(&address)
             .map_err(|err| ReadError::StorageError(err.to_string()))
+    }
+}
+
+#[inline(always)]
+fn confirm_read(
+    chain: &LiveChain,
+    rt: &Runtime,
+    tx_idx: TxIdx,
+    accepted: u32,
+    location: u64,
+    serial: bool,
+) -> Result<(), ReadError> {
+    if serial {
+        return Ok(());
+    }
+    confirm_read_chain(chain, rt, tx_idx, accepted, location)
+}
+
+fn confirm_read_chain(
+    chain: &LiveChain,
+    rt: &Runtime,
+    tx_idx: TxIdx,
+    accepted: u32,
+    location: u64,
+) -> Result<(), ReadError> {
+    let now = chain
+        .nearest_lower(location, tx_idx)
+        .map(|tx| tx as u32)
+        .unwrap_or(u32::MAX);
+    if now != accepted {
+        if now != u32::MAX {
+            let pred = now as TxIdx;
+            if chain.is_armed(location) && !writer_final(chain, rt, location, pred) {
+                return Err(ReadError::Blocking(pred));
+            }
+        }
+        return Err(ReadError::InconsistentRead);
+    }
+    if accepted != u32::MAX {
+        let pred = accepted as TxIdx;
+        if chain.is_armed(location) && !writer_final(chain, rt, location, pred) {
+            return Err(ReadError::Blocking(pred));
+        }
+    }
+    Ok(())
+}
+
+/// The nearest chain writer has either committed its published value or
+/// committed without writing this location (a hole the caller may skip).
+fn writer_final(chain: &LiveChain, rt: &Runtime, location: u64, pred: TxIdx) -> bool {
+    if rt.committed() <= pred {
+        return false;
+    }
+    let (state, _) = chain.writer_state(location, pred);
+    chain.writer_published(location, pred) || (state != 0 && state != 3)
+}
+
+fn mv_origin(serial: bool, tx_idx: TxIdx, incarnation: usize, value: &MemoryValue) -> SfReadOrigin {
+    if serial {
+        SfReadOrigin::MvId { tx_idx, incarnation }
+    } else {
+        SfReadOrigin::Mv(SfOrigin {
+            tx_idx,
+            incarnation,
+            value: value.clone(),
+        })
     }
 }
 
@@ -224,6 +401,16 @@ fn origin_eq(a: &SfReadOrigin, b: &SfReadOrigin) -> bool {
                 && x.incarnation == y.incarnation
                 && memory_value_eq(&x.value, &y.value)
         }
+        (
+            SfReadOrigin::MvId {
+                tx_idx: a,
+                incarnation: ai,
+            },
+            SfReadOrigin::MvId {
+                tx_idx: b,
+                incarnation: bi,
+            },
+        ) => a == b && ai == bi,
         _ => false,
     }
 }
@@ -233,6 +420,7 @@ impl<S: crate::Storage> Database for VmDb<'_, S> {
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         let location_hash = self.hash_basic(&address);
+        let serial = self.serial;
         if self.is_lazy {
             if location_hash == self.from_hash {
                 return Ok(Some(AccountInfo {
@@ -285,11 +473,7 @@ impl<S: crate::Storage> Database for VmDb<'_, S> {
                         if has_prev_origins && read_origins.len() == new_origins.len() {
                             return Err(ReadError::InconsistentRead);
                         }
-                        let origin = SfReadOrigin::Mv(SfOrigin {
-                            tx_idx: *closest_idx,
-                            incarnation: *tx_incarnation,
-                            value: value.clone(),
-                        });
+                        let origin = mv_origin(serial, *closest_idx, *tx_incarnation, value);
                         if has_prev_origins && !origin_eq(&read_origins[new_origins.len()], &origin)
                         {
                             return Err(ReadError::InconsistentRead);
@@ -341,6 +525,14 @@ impl<S: crate::Storage> Database for VmDb<'_, S> {
             };
         }
 
+        confirm_read(
+            self.chain,
+            self.rt,
+            self.tx_idx,
+            self.accepted_pred.get(),
+            location_hash,
+            serial,
+        )?;
         if !has_prev_origins {
             *read_origins = new_origins;
         }
@@ -387,6 +579,7 @@ impl<S: crate::Storage> Database for VmDb<'_, S> {
 
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
         let location_hash = hash_deterministic(MemoryLocation::Storage(address, index));
+        let serial = self.serial;
         self.coordinate(location_hash)?;
         let read_origins = self.read_set.entry(location_hash).or_default();
         if self.tx_idx > 0
@@ -396,13 +589,22 @@ impl<S: crate::Storage> Database for VmDb<'_, S> {
         {
             match entry {
                 MemoryEntry::Data(tx_incarnation, MemoryValue::Storage(value)) => {
+                    confirm_read(
+                        self.chain,
+                        self.rt,
+                        self.tx_idx,
+                        self.accepted_pred.get(),
+                        location_hash,
+                        serial,
+                    )?;
                     Self::push_origin(
                         read_origins,
-                        SfReadOrigin::Mv(SfOrigin {
-                            tx_idx: *closest_idx,
-                            incarnation: *tx_incarnation,
-                            value: MemoryValue::Storage(*value),
-                        }),
+                        mv_origin(
+                            serial,
+                            *closest_idx,
+                            *tx_incarnation,
+                            &MemoryValue::Storage(*value),
+                        ),
                     )?;
                     return Ok(*value);
                 }
@@ -415,6 +617,14 @@ impl<S: crate::Storage> Database for VmDb<'_, S> {
                 _ => return Err(ReadError::InvalidMemoryValueType),
             }
         }
+        confirm_read(
+            self.chain,
+            self.rt,
+            self.tx_idx,
+            self.accepted_pred.get(),
+            location_hash,
+            serial,
+        )?;
         Self::push_origin(read_origins, SfReadOrigin::Storage)?;
         self.storage
             .storage(&address, &index)
@@ -489,6 +699,8 @@ impl<'a, S: crate::Storage, C: PevmChain> SfVm<'a, S, C> {
             read_set: SfReadSet::with_capacity_and_hasher(2, BuildIdentityHasher::default()),
             read_accounts: HashMap::with_capacity_and_hasher(2, BuildIdentityHasher::default()),
             prev_sender,
+            accepted_pred: Cell::new(u32::MAX),
+            serial: rt.worker_count() == 1,
         };
         Self {
             chain,
@@ -518,8 +730,12 @@ impl<'a, S: crate::Storage, C: PevmChain> SfVm<'a, S, C> {
         // The clock is the old ExecPhase regression when it runs on every
         // transaction. Wall-clock runs leave both flags off.
         let clock = self.trace.timing().then(Instant::now);
+        let _pre = super::buckets::Guard::start(super::buckets::PRE);
         self.trace.note_exec(incarnation);
-        self.live.mark_running(tx_idx, incarnation);
+        if !self.evm.ctx().db().serial {
+            let _b = super::buckets::Guard::start(super::buckets::MARK);
+            self.live.mark_running(tx_idx, incarnation);
+        }
         let tx_version = TxVersion {
             tx_idx,
             tx_incarnation: incarnation,
@@ -544,7 +760,10 @@ impl<'a, S: crate::Storage, C: PevmChain> SfVm<'a, S, C> {
             ctx.journal_mut().clear();
         }
 
-        let exec_result = match NoBeneficiaryHandler::<C, _>::default().run(&mut self.evm) {
+        drop(_pre);
+        let exec_result = {
+            let _b = super::buckets::Guard::start(super::buckets::INTERP);
+            match NoBeneficiaryHandler::<C, _>::default().run(&mut self.evm) {
             Ok(result) => result,
             Err(EVMError::Database(read_error)) => return step_from_read(read_error),
             Err(err) => {
@@ -565,8 +784,10 @@ impl<'a, S: crate::Storage, C: PevmChain> SfVm<'a, S, C> {
                 }
                 return Step::Fatal(err);
             }
+        }
         };
 
+        let _writes = super::buckets::Guard::start(super::buckets::WRITESET);
         let mut write_set = WriteSet::with_capacity(6);
         let ctx = self.evm.ctx();
         let state = ctx.journal_mut().finalize();
@@ -682,16 +903,21 @@ impl<'a, S: crate::Storage, C: PevmChain> SfVm<'a, S, C> {
                 .add_lazy_addresses([tx.caller, *tx.kind.to().unwrap()]);
         }
 
-        // Predicted locations were marked Running at entry. The concrete write
-        // set is published when the interpreter returns. There is no opcode hook.
-        let read_keys: Vec<u64> = read_set.keys().copied().collect();
-        for (location, value) in &write_set {
-            // Read-then-write waits for the previous writer. Lazy values are
-            // blind: they join the chain for readers, and writers do not wait.
-            let rmw = read_keys.contains(location) && !is_lazy_value(value);
-            self.live
-                .publish_write(tx_idx, incarnation, *location, rmw, |t| self.rt.tx_open(t));
-        }
+        // Chain publish follows the multi-version record so a reader that
+        // observes `Published` also observes the value. `Running` was set at
+        // entry, which is what an armed reader waits on.
+        let published: Vec<(u64, bool)> = if self.evm.ctx().db().serial {
+            Vec::new()
+        } else {
+            let read_keys: Vec<u64> = read_set.keys().copied().collect();
+            write_set
+                .iter()
+                .map(|(location, value)| {
+                    let rmw = read_keys.contains(location) && !is_lazy_value(value);
+                    (*location, rmw)
+                })
+                .collect()
+        };
 
         let elapsed_ns = clock.map(|t| t.elapsed().as_nanos() as u64);
         if self.trace.profile() {
@@ -717,7 +943,21 @@ impl<'a, S: crate::Storage, C: PevmChain> SfVm<'a, S, C> {
         if let Some(ns) = elapsed_ns.filter(|_| self.trace.enabled()) {
             self.trace.note_tx_ns(tx_idx, ns);
         }
-        self.mv.record(&tx_version, read_set, write_set);
+        drop(_writes);
+        {
+            let _b = super::buckets::Guard::start(super::buckets::RECORD);
+            self.mv.record(&tx_version, read_set, write_set);
+        }
+        {
+            let _b = super::buckets::Guard::start(super::buckets::PUBLISH);
+            for (location, rmw) in published {
+                // Read-then-write waits for the previous writer. Lazy values are
+                // blind: they join the chain for readers, and writers do not wait.
+                self.live.publish_write(tx_idx, incarnation, location, rmw, |t| {
+                    self.rt.still_open(t)
+                });
+            }
+        }
 
         let receipt = receipt_from_revm(exec_result);
         let state = state_transitions_from_revm(self.is_eip_161_enabled, state);

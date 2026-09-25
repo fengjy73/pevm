@@ -27,7 +27,7 @@ use crate::{PevmError, PevmResult};
 use super::live_chain::{ClassGroup, ClassKeyKind, LiveChain};
 use super::mv::SfMv;
 use super::rt::Runtime;
-use super::trace::{SfTrace, Trace};
+use super::trace::{AbortNote, SfTrace, Trace};
 use super::vm::{SfVm, Step};
 
 /// Which class key the in-block predictor uses.
@@ -107,32 +107,59 @@ where
 
     let n = txs.len();
     let workers = usize::from(options.concurrency).max(1).min(n.max(1));
-    let template = chain.build_mv_memory(&block_env, &txs);
-    let estimates: Vec<_> = template
-        .data
-        .iter()
-        .map(|entry| {
-            (
-                *entry.key(),
-                entry.value().keys().copied().collect::<Vec<_>>(),
-            )
-        })
-        .collect();
-    let lazy: Vec<_> = template.consume_lazy_addresses().into_iter().collect();
-    drop(template);
-
-    let mv = SfMv::new(n, estimates, lazy);
-    let mut live = LiveChain::new(n, options.class_key);
+    let serial = workers == 1;
+    // One worker never races a pre-seeded estimate. Building the upstream
+    // memory just to copy the beneficiary's `0..n` estimates is a second
+    // allocation of the same map. The beneficiary still has to be lazy so
+    // rewards evaluate at the end of the block.
+    let mv = if serial {
+        SfMv::new(n, std::iter::empty(), [block_env.beneficiary])
+    } else {
+        let template = {
+            let _b = super::buckets::Guard::start(super::buckets::TEMPLATE);
+            chain.build_mv_memory(&block_env, &txs)
+        };
+        let estimates: Vec<_> = template
+            .data
+            .iter()
+            .map(|entry| {
+                (
+                    *entry.key(),
+                    entry.value().keys().copied().collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        let lazy: Vec<_> = template.consume_lazy_addresses().into_iter().collect();
+        drop(template);
+        SfMv::new(n, estimates, lazy)
+    };
     let beneficiary = hash_deterministic(MemoryLocation::Basic(block_env.beneficiary));
+    let mut live = if serial {
+        LiveChain::untracked(n)
+    } else {
+        let _b = super::buckets::Guard::start(super::buckets::ALLOC);
+        LiveChain::new(n, options.class_key)
+    };
     live.skip_location(beneficiary);
-    let (groups, class_of) = build_classes(chain, storage, &txs, options.class_key);
-    live.install_classes(groups, class_of);
+    if !serial {
+        let (groups, class_of, to_of) = {
+            let _b = super::buckets::Guard::start(super::buckets::CLASS);
+            build_classes(chain, storage, &txs, options.class_key)
+        };
+        live.install_classes(groups, class_of, to_of);
+        let _b = super::buckets::Guard::start(super::buckets::PRESEED);
+        live.preseed_recipients();
+    }
     for (location, writers) in &options.radar {
         live.install_radar(*location, writers);
     }
     let live = live;
-    let rt = Runtime::new(n, workers);
-    rt.seed();
+    let rt = {
+        let _b = super::buckets::Guard::start(super::buckets::RUNTIME);
+        let rt = Runtime::new(n, workers);
+        rt.seed();
+        rt
+    };
     let prev_sender = previous_senders(chain, &txs);
     // Radar chain heads are seeded by pushing the lowest radar member later;
     // with an empty radar this is a no-op. Index seeding already ran.
@@ -143,51 +170,66 @@ where
     let started = Instant::now();
     let deadline = Duration::from_secs(120);
 
-    thread::scope(|scope| {
-        for worker in 0..workers {
-            let mv = &mv;
-            let live = &live;
-            let rt = &rt;
-            let trace = &trace;
-            let results = &results;
-            let abort = &abort;
-            let commit_mu = &commit_mu;
-            let txs = &txs;
-            let block_env = &block_env;
-            let prev_sender = prev_sender.as_slice();
-            scope.spawn(move || {
+    let prev_sender_slice = prev_sender.as_slice();
+    let mv = &mv;
+    let live = &live;
+    let rt = &rt;
+    let trace = &trace;
+    let commit_mu = &commit_mu;
+    let drive = |worker: usize| {
                 let mut vm = SfVm::new(
                     chain,
                     spec_id,
-                    block_env,
-                    txs,
+                    &block_env,
+                    txs.as_slice(),
                     storage,
                     mv,
                     live,
                     rt,
                     trace,
-                    prev_sender,
+                    prev_sender_slice,
                 );
                 let mut idle = 0u32;
+                let mut spins = 0u32;
                 while rt.committed() < n && !rt.aborted() {
-                    if started.elapsed() > deadline {
-                        rt.request_abort();
-                        break;
+                    spins = spins.wrapping_add(1);
+                    if spins.is_multiple_of(64) {
+                        let _b = super::buckets::Guard::start(super::buckets::DEADLINE);
+                        if started.elapsed() > deadline {
+                            rt.request_abort();
+                            break;
+                        }
                     }
                     try_commit(worker, n, rt, mv, live, trace, commit_mu);
-                    if let Some((tx, inc)) = rt.pop(worker) {
+                    let popped = {
+                        let _b = super::buckets::Guard::start(super::buckets::SCHED);
+                        rt.pop(worker)
+                    };
+                    if let Some((tx, inc)) = popped {
                         idle = 0;
                         live.note_idle(false);
-                        if let Some(pred) = live.admission_predecessor(tx)
-                            && !rt.is_executing(pred)
-                            && !rt.is_committed(pred)
-                            && !rt.is_executed(pred)
-                        {
-                            // Not admitted: the predecessor has not started.
-                            // Tier A still starts the tx once the predecessor is executing;
-                            // that case falls through because `is_executing` is true.
-                            rt.park(worker, tx, pred, false);
-                            continue;
+                        if !serial {
+                            if let Some(pred) = live.admission_predecessor(tx)
+                                && !rt.is_executing(pred)
+                                && !rt.is_committed(pred)
+                                && !rt.is_executed(pred)
+                            {
+                                // Not admitted: the predecessor has not started.
+                                // Tier A still starts the tx once the predecessor is executing;
+                                // that case falls through because `is_executing` is true.
+                                rt.park(worker, tx, pred, false, false);
+                                continue;
+                            }
+                            if let Some(head) = live.class_head(tx)
+                                && !rt.is_committed(head)
+                                && !rt.is_executed(head)
+                            {
+                                // The class head publishes read-then-write locations
+                                // before classmates read them. Incarnation stays: this
+                                // attempt has not entered the interpreter.
+                                rt.park(worker, tx, head, false, false);
+                                continue;
+                            }
                         }
                         rt.executing_add(1);
                         let incarnation = inc;
@@ -207,10 +249,13 @@ where
                             Step::Done => rt.finish_ok(worker, tx),
                             Step::Yield => rt.defer(tx),
                             Step::Block(pred) => {
-                                if pred >= n || rt.is_committed(pred) || rt.is_executed(pred) {
+                                if pred >= n || rt.committed() > pred {
                                     rt.defer(tx);
                                 } else {
-                                    rt.park(worker, tx, pred, false);
+                                    // Armed reads block until the predecessor commits.
+                                    // Waking on `Executed` reused a publish that
+                                    // validation later replaced.
+                                    rt.park(worker, tx, pred, false, true);
                                 }
                             }
                             Step::Retry => unreachable!("retry is consumed above"),
@@ -241,9 +286,16 @@ where
                         }
                     }
                 }
-            });
-        }
-    });
+    };
+    if serial {
+        drive(0);
+    } else {
+        thread::scope(|scope| {
+            for worker in 0..workers {
+                scope.spawn(move || drive(worker));
+            }
+        });
+    }
 
     if let Some(kind) = abort.get() {
         return match kind {
@@ -261,12 +313,15 @@ where
         return Err(PevmError::UnreachableError);
     }
 
-    for tx in 0..n {
-        if let Some(loc) = mv.failing_location(tx) {
-            eprintln!("specfence final read set mismatch tx={tx} loc={loc}");
-            return Err(PevmError::UnreachableError);
+    {
+        let _b = super::buckets::Guard::start(super::buckets::RESCAN);
+        for tx in 0..n {
+            if let Some(loc) = mv.failing_location(tx) {
+                eprintln!("specfence final read set mismatch tx={tx} loc={loc}");
+                return Err(PevmError::UnreachableError);
+            }
+            mv.collect_edges(tx, &trace);
         }
-        mv.collect_edges(tx, &trace);
     }
 
     let mut fully = Vec::with_capacity(n);
@@ -279,8 +334,13 @@ where
         fully.push(execution_result);
     }
 
-    evaluate_lazy(chain, storage, spec_id, &txs, &mv, &mut fully)?;
+    {
+        let _b = super::buckets::Guard::start(super::buckets::LAZY);
+        evaluate_lazy(chain, storage, spec_id, &txs, &mv, &mut fully)?;
+    }
 
+    trace.dump_aborts();
+    super::buckets::dump();
     let snap = trace.snapshot(
         live.max_chain_len(),
         live.armed_locations(),
@@ -312,19 +372,44 @@ fn try_commit(
             return;
         }
         let inc = rt.incarnation(i);
-        if let Some(loc) = mv.failing_location(i) {
+        let mismatch_loc = {
+            let _b = super::buckets::Guard::start(super::buckets::VALIDATE);
+            mv.failing_location(i)
+        };
+        if let Some(loc) = mismatch_loc {
             let armed = live.is_armed(loc);
+            let mismatch = mv.first_mismatch(i);
+            if trace.diag() {
+                let live_tx = mismatch.as_ref().and_then(|m| m.live_tx);
+                let origin_tx = mismatch.as_ref().and_then(|m| m.origin_tx);
+                let state = live_tx
+                    .map(|tx| live.writer_state(loc, tx).0 as u8)
+                    .unwrap_or(0);
+                trace.note_abort(AbortNote {
+                    reader: i as u32,
+                    location: loc,
+                    origin_tx: origin_tx.map(|tx| tx as u32).unwrap_or(u32::MAX),
+                    live_tx: live_tx.map(|tx| tx as u32).unwrap_or(u32::MAX),
+                    live_in_chain_now: live_tx.is_some_and(|tx| live.member_bit(loc, tx)),
+                    live_state_now: state,
+                    armed_now: armed,
+                    read: None,
+                });
+            }
             let writes = mv.write_locations(i);
             mv.convert_writes_to_estimates(i);
             live.arm_failure(loc);
             backfill(mv, live, loc);
+            if let Some(writer) = mismatch.as_ref().and_then(|item| item.live_tx) {
+                live.note_conflict_writer(loc, writer, |t| rt.still_open(t));
+            }
             live.on_abort_residual(i, inc.saturating_add(1), &writes);
             trace.note_full_replay(armed);
             live.note_finished(true);
             rt.requeue_abort(worker, i);
             return;
         }
-        if rt.try_mark_committed(i, inc) {
+        if rt.try_mark_committed(worker, i, inc) {
             trace.note_committed(i, inc);
             let writes = mv.write_locations(i);
             live.hole_clear(i, &writes);
@@ -362,34 +447,42 @@ fn build_classes<S: Storage, C: PevmChain>(
     storage: &S,
     txs: &[C::EvmTx],
     kind: ClassKeyKind,
-) -> (Vec<ClassGroup>, Vec<u16>) {
-    let mut groups: HashMap<u64, Vec<TxIdx>, FxBuildHasher> = HashMap::with_hasher(FxBuildHasher);
-    let mut keys = Vec::with_capacity(txs.len());
-    for tx in txs {
+) -> (Vec<ClassGroup>, Vec<u16>, Vec<u64>) {
+    let mut groups: HashMap<u64, (bool, Vec<TxIdx>), FxBuildHasher> =
+        HashMap::with_hasher(FxBuildHasher);
+    let mut to_of = Vec::with_capacity(txs.len());
+    for (i, tx) in txs.iter().enumerate() {
         let env: &TxEnv = chain.tx_env(tx);
         let to = match env.kind {
             TxKind::Call(to) => Some(to),
             TxKind::Create => None,
         };
         let mut selector = [0u8; 4];
-        if env.data.len() >= 4 {
+        let contract = env.data.len() >= 4;
+        if contract {
             selector.copy_from_slice(&env.data[..4]);
         }
-        let code = to
-            .and_then(|addr| storage.code_hash(&addr).ok().flatten())
-            .unwrap_or_default();
+        let to_hash = to
+            .map(|addr| hash_deterministic(MemoryLocation::Basic(addr)))
+            .unwrap_or(0);
+        to_of.push(to_hash);
         let key = match kind {
             ClassKeyKind::ToSelector => hash_deterministic((to, selector)),
-            ClassKeyKind::CodeHashSelector => hash_deterministic((code, selector)),
+            ClassKeyKind::CodeHashSelector => {
+                let code = to
+                    .and_then(|addr| storage.code_hash(&addr).ok().flatten())
+                    .unwrap_or_default();
+                hash_deterministic((code, selector))
+            }
         };
-        keys.push(key);
         if to.is_some() {
-            groups.entry(key).or_default().push(keys.len() - 1);
+            let entry = groups.entry(key).or_insert_with(|| (contract, Vec::new()));
+            entry.1.push(i);
         }
     }
     let mut class_of = vec![u16::MAX; txs.len()];
     let mut out = Vec::new();
-    for members in groups.into_values() {
+    for (contract, members) in groups.into_values() {
         if members.len() < 2 || out.len() >= u16::MAX as usize {
             continue;
         }
@@ -397,10 +490,9 @@ fn build_classes<S: Storage, C: PevmChain>(
         for &tx in &members {
             class_of[tx] = id;
         }
-        out.push(ClassGroup { members });
+        out.push(ClassGroup { members, contract });
     }
-    let _ = keys;
-    (out, class_of)
+    (out, class_of, to_of)
 }
 
 fn evaluate_lazy<S: Storage, C: PevmChain>(
