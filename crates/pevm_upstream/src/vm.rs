@@ -1,0 +1,789 @@
+use alloy_primitives::{Address, B256, TxKind, U256};
+use alloy_rpc_types_eth::Receipt;
+use hashbrown::HashMap;
+use revm::{
+    Database,
+    context::{
+        BlockEnv, ContextSetters, ContextTr, DBErrorMarker, JournalTr, TxEnv,
+        result::{EVMError, ExecutionResult, InvalidTransaction},
+    },
+    handler::{EvmTr, FrameResult, Handler},
+    primitives::KECCAK_EMPTY,
+    state::{AccountInfo, Bytecode, EvmState},
+};
+use smallvec::SmallVec;
+
+use crate::{
+    AccountBasic, BuildIdentityHasher, BuildSuffixHasher, EvmAccount, FinishExecFlags, MemoryEntry,
+    MemoryLocation, MemoryLocationHash, MemoryValue, ReadOrigin, ReadOrigins, ReadSet, Storage,
+    TxIdx, TxVersion, WriteSet, chain::PevmChain, hash_deterministic, mv_memory::MvMemory,
+};
+
+/// The execution error from the underlying EVM executor.
+// Will there be DB errors outside of read?
+pub type ExecutionError = EVMError<ReadError>;
+
+/// Represents the state transitions of the EVM accounts after execution.
+/// If the value is [None], it indicates that the account is marked for removal.
+/// If the value is [`Some(new_state)`], it indicates that the account has become [`new_state`].
+type EvmStateTransitions = HashMap<Address, Option<EvmAccount>, BuildSuffixHasher>;
+
+/// Execution result of a transaction
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PevmTxExecutionResult {
+    /// Receipt of execution
+    // TODO: Consider promoting to [ReceiptEnvelope] if there is high demand
+    pub receipt: Receipt,
+    /// State that got updated
+    pub state: EvmStateTransitions,
+}
+
+/// Convert Revm's execution result into a standard receipt.
+/// Note that the cumulative gas used in the receipt is preset to the gas used in this transaction.
+/// It should be post-processed with the remaining transactions in the block.
+pub(crate) fn receipt_from_revm<H>(result: ExecutionResult<H>) -> Receipt {
+    Receipt {
+        status: result.is_success().into(),
+        cumulative_gas_used: result.tx_gas_used(),
+        logs: result.into_logs(),
+    }
+}
+
+/// Convert Revm's state transitions into PEVM's state transitions.
+pub(crate) fn state_transitions_from_revm(
+    is_eip_161_enabled: bool,
+    state: EvmState,
+) -> impl Iterator<Item = (Address, Option<EvmAccount>)> {
+    state
+        .into_iter()
+        .filter(|(_, account)| account.is_touched())
+        .map(move |(address, account)| {
+            if account.is_selfdestructed() || account.is_empty() && is_eip_161_enabled {
+                (address, None)
+            } else {
+                (address, Some(EvmAccount::from(account)))
+            }
+        })
+}
+
+pub(crate) enum VmExecutionError {
+    Retry,
+    FallbackToSequential,
+    Blocking(TxIdx),
+    ExecutionError(ExecutionError),
+}
+
+/// Errors when reading a memory location.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ReadError {
+    /// Cannot read memory location from storage.
+    // TODO: More concrete type
+    #[error("Failed reading memory from storage: {0}")]
+    StorageError(String),
+    /// This memory location has been written by a lower transaction.
+    #[error("Read of memory location is blocked by tx #{0}")]
+    Blocking(TxIdx),
+    /// There has been an inconsistent read like reading the same
+    /// location from storage in the first call but from [`VmMemory`] in
+    /// the next.
+    #[error("Inconsistent read")]
+    InconsistentRead,
+    /// Found an invalid nonce, like the first transaction of a sender
+    /// not having a (+1) nonce from storage.
+    #[error("Tx #{0} has invalid nonce")]
+    InvalidNonce(TxIdx),
+    /// Read a self-destructed account that is very hard to handle, as
+    /// there is no performant way to mark all storage slots as cleared.
+    #[error("Tried to read self-destructed account")]
+    SelfDestructedAccount,
+    /// The stored memory value type doesn't match its location type.
+    // TODO: Handle this at the type level?
+    #[error("Invalid type of stored memory value")]
+    InvalidMemoryValueType,
+}
+
+impl DBErrorMarker for ReadError {}
+
+impl From<ReadError> for VmExecutionError {
+    fn from(err: ReadError) -> Self {
+        match err {
+            ReadError::InconsistentRead => Self::Retry,
+            ReadError::SelfDestructedAccount => Self::FallbackToSequential,
+            ReadError::Blocking(tx_idx) => Self::Blocking(tx_idx),
+            _ => Self::ExecutionError(EVMError::Database(err)),
+        }
+    }
+}
+
+// A database interface that intercepts reads while executing a specific
+// transaction with Revm. It provides values from the multi-version data
+// structure & storage, and tracks the read set of the current execution.
+struct VmDb<'a, S: Storage> {
+    storage: &'a S,
+    mv_memory: &'a MvMemory,
+    tx_idx: TxIdx,
+    tx: &'a TxEnv,
+    from_hash: MemoryLocationHash,
+    to_hash: Option<MemoryLocationHash>,
+    to_code_hash: Option<B256>,
+    // Indicates if we lazy update this transaction.
+    // Only applied to raw transfers' senders & recipients at the moment.
+    is_lazy: bool,
+    // Whether to enforce the sender-nonce ordering check for this transaction.
+    // False for transaction types with no nonce (e.g. OP deposits).
+    has_nonce: bool,
+    read_set: ReadSet,
+    // TODO: Clearer type for [AccountBasic] plus code hash
+    read_accounts: HashMap<MemoryLocationHash, (AccountBasic, Option<B256>), BuildIdentityHasher>,
+}
+
+impl<'a, S: Storage> VmDb<'a, S> {
+    // Reset per-transaction fields for allocation reuse.
+    // Must be called before each transaction execution.
+    fn set_tx(
+        &mut self,
+        tx_idx: TxIdx,
+        tx: &'a TxEnv,
+        from_hash: MemoryLocationHash,
+        to_hash: Option<MemoryLocationHash>,
+        has_nonce: bool,
+    ) -> Result<(), ReadError> {
+        self.tx_idx = tx_idx;
+        self.tx = tx;
+        self.from_hash = from_hash;
+        self.to_hash = to_hash;
+        self.to_code_hash = None;
+        self.is_lazy = false;
+        self.has_nonce = has_nonce;
+        self.read_set.clear();
+        self.read_accounts.clear();
+        if let TxKind::Call(to) = tx.kind {
+            self.to_code_hash = self.get_code_hash(to)?;
+
+            // We only lazy update raw transfers that already have the sender
+            // or recipient in [MvMemory] since sequentially evaluating memory
+            // locations with only one entry is much costlier than fully
+            // evaluating it concurrently.
+            // TODO: Only lazy update in block syncing mode, not for block
+            // building.
+            self.is_lazy = self.to_code_hash.is_none()
+                && (self.mv_memory.data.contains_key(&from_hash)
+                    || self.mv_memory.data.contains_key(&to_hash.unwrap()));
+        }
+        Ok(())
+    }
+
+    fn hash_basic(&self, address: &Address) -> MemoryLocationHash {
+        if address == &self.tx.caller {
+            return self.from_hash;
+        }
+        if let TxKind::Call(to) = &self.tx.kind
+            && to == address
+        {
+            return self.to_hash.unwrap();
+        }
+        hash_deterministic(MemoryLocation::Basic(*address))
+    }
+
+    // Push a new read origin. Return an error when there's already
+    // an origin but doesn't match the new one to force re-execution.
+    fn push_origin(read_origins: &mut ReadOrigins, origin: ReadOrigin) -> Result<(), ReadError> {
+        if let Some(prev_origin) = read_origins.last() {
+            if prev_origin != &origin {
+                return Err(ReadError::InconsistentRead);
+            }
+        } else {
+            read_origins.push(origin);
+        }
+        Ok(())
+    }
+
+    fn get_code_hash(&mut self, address: Address) -> Result<Option<B256>, ReadError> {
+        let location_hash = hash_deterministic(MemoryLocation::CodeHash(address));
+        let read_origins = self.read_set.entry(location_hash).or_default();
+
+        // Try to read the latest code hash in [MvMemory]
+        // TODO: Memoize read locations (expected to be small) here in [Vm] to avoid
+        // contention in [MvMemory]
+        if let Some(written_transactions) = self.mv_memory.data.get(&location_hash)
+            && let Some((tx_idx, MemoryEntry::Data(tx_incarnation, value))) =
+                written_transactions.range(..self.tx_idx).next_back()
+        {
+            match value {
+                MemoryValue::SelfDestructed => {
+                    return Err(ReadError::SelfDestructedAccount);
+                }
+                MemoryValue::CodeHash(code_hash) => {
+                    Self::push_origin(
+                        read_origins,
+                        ReadOrigin::MvMemory(TxVersion {
+                            tx_idx: *tx_idx,
+                            tx_incarnation: *tx_incarnation,
+                        }),
+                    )?;
+                    return Ok(Some(*code_hash));
+                }
+                _ => {}
+            }
+        };
+
+        // Fallback to storage
+        Self::push_origin(read_origins, ReadOrigin::Storage)?;
+        self.storage
+            .code_hash(&address)
+            .map_err(|err| ReadError::StorageError(err.to_string()))
+    }
+}
+
+impl<S: Storage> Database for VmDb<'_, S> {
+    type Error = ReadError;
+
+    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        let location_hash = self.hash_basic(&address);
+
+        // We return a mock for non-contract addresses (for lazy updates) to avoid
+        // unnecessarily evaluating its balance here.
+        if self.is_lazy {
+            if location_hash == self.from_hash {
+                return Ok(Some(AccountInfo {
+                    nonce: self.tx.nonce,
+                    balance: U256::MAX,
+                    code: None,
+                    code_hash: KECCAK_EMPTY,
+                    account_id: None,
+                }));
+            } else if Some(location_hash) == self.to_hash {
+                return Ok(None);
+            }
+        }
+
+        let read_origins = self.read_set.entry(location_hash).or_default();
+        let has_prev_origins = !read_origins.is_empty();
+        // We accumulate new origins to either:
+        // - match with the previous origins to check consistency
+        // - register origins on the first read
+        let mut new_origins = SmallVec::new();
+
+        let mut final_account = None;
+        let mut balance_addition = U256::ZERO;
+        // The sign of [balance_addition] since it can be negative for lazy senders.
+        let mut positive_addition = true;
+        let mut nonce_addition = 0;
+
+        // Try reading from multi-version data
+        if self.tx_idx > 0
+            && let Some(written_transactions) = self.mv_memory.data.get(&location_hash)
+        {
+            let mut iter = written_transactions.range(..self.tx_idx);
+
+            // Fully evaluate lazy updates
+            loop {
+                match iter.next_back() {
+                    Some((blocking_idx, MemoryEntry::Estimate)) => {
+                        return Err(ReadError::Blocking(*blocking_idx));
+                    }
+                    Some((closest_idx, MemoryEntry::Data(tx_incarnation, value))) => {
+                        // About to push a new origin
+                        // Inconsistent: new origin will be longer than the previous!
+                        if has_prev_origins && read_origins.len() == new_origins.len() {
+                            return Err(ReadError::InconsistentRead);
+                        }
+                        let origin = ReadOrigin::MvMemory(TxVersion {
+                            tx_idx: *closest_idx,
+                            tx_incarnation: *tx_incarnation,
+                        });
+                        // Inconsistent: new origin is different from the previous!
+                        if has_prev_origins
+                            && unsafe { read_origins.get_unchecked(new_origins.len()) } != &origin
+                        {
+                            return Err(ReadError::InconsistentRead);
+                        }
+                        new_origins.push(origin);
+                        match value {
+                            MemoryValue::Basic(basic) => {
+                                // TODO: Return [SelfDestructedAccount] if [basic] is
+                                // [SelfDestructed]?
+                                // For now we are betting on [code_hash] triggering the
+                                // sequential fallback when we read a self-destructed contract.
+                                final_account = Some(basic.clone());
+                                break;
+                            }
+                            MemoryValue::LazyRecipient(addition) => {
+                                if positive_addition {
+                                    balance_addition = balance_addition.saturating_add(*addition);
+                                } else {
+                                    positive_addition = *addition >= balance_addition;
+                                    balance_addition = balance_addition.abs_diff(*addition);
+                                }
+                            }
+                            MemoryValue::LazySender(subtraction) => {
+                                if positive_addition {
+                                    positive_addition = balance_addition >= *subtraction;
+                                    balance_addition = balance_addition.abs_diff(*subtraction);
+                                } else {
+                                    balance_addition =
+                                        balance_addition.saturating_add(*subtraction);
+                                }
+                                nonce_addition += 1;
+                            }
+                            _ => return Err(ReadError::InvalidMemoryValueType),
+                        }
+                    }
+                    None => {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Fall back to storage
+        if final_account.is_none() {
+            // Populate [Storage] on the first read
+            if !has_prev_origins {
+                new_origins.push(ReadOrigin::Storage);
+            }
+            // Inconsistent: previous origin is longer or didn't read
+            // from storage for the last origin.
+            else if read_origins.len() != new_origins.len() + 1
+                || read_origins.last() != Some(&ReadOrigin::Storage)
+            {
+                return Err(ReadError::InconsistentRead);
+            }
+            final_account = match self.storage.basic(&address) {
+                Ok(Some(basic)) => Some(basic),
+                Ok(None) => (balance_addition > U256::ZERO).then(AccountBasic::default),
+                Err(err) => return Err(ReadError::StorageError(err.to_string())),
+            };
+        }
+
+        // Populate read origins on the first read.
+        // Otherwise [read_origins] matches [new_origins] already.
+        if !has_prev_origins {
+            *read_origins = new_origins;
+        }
+
+        if let Some(mut account) = final_account {
+            // Check sender nonce
+            account.nonce += nonce_addition;
+            if self.has_nonce && location_hash == self.from_hash && self.tx.nonce != account.nonce {
+                return if self.tx_idx > 0 {
+                    // TODO: Better retry strategy -- immediately, to the
+                    // closest sender tx, to the missing sender tx, etc.
+                    Err(ReadError::Blocking(self.tx_idx - 1))
+                } else {
+                    Err(ReadError::InvalidNonce(self.tx_idx))
+                };
+            }
+
+            // Fully evaluate the account and register it to read cache
+            // to later check if they have changed (been written to).
+            if positive_addition {
+                account.balance = account.balance.saturating_add(balance_addition);
+            } else {
+                account.balance = account.balance.saturating_sub(balance_addition);
+            };
+
+            let code_hash = if Some(location_hash) == self.to_hash {
+                self.to_code_hash
+            } else {
+                self.get_code_hash(address)?
+            };
+            let code = if let Some(code_hash) = &code_hash {
+                if let Some(code) = self.mv_memory.new_bytecodes.get(code_hash) {
+                    Some(code.clone())
+                } else {
+                    match self.storage.code_by_hash(code_hash) {
+                        Ok(code) => code.map(Bytecode::from),
+                        Err(err) => return Err(ReadError::StorageError(err.to_string())),
+                    }
+                }
+            } else {
+                None
+            };
+            self.read_accounts
+                .insert(location_hash, (account.clone(), code_hash));
+
+            return Ok(Some(AccountInfo {
+                balance: account.balance,
+                nonce: account.nonce,
+                code_hash: code_hash.unwrap_or(KECCAK_EMPTY),
+                code,
+                account_id: None,
+            }));
+        }
+
+        Ok(None)
+    }
+
+    fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        match self
+            .storage
+            .code_by_hash(&code_hash)
+            .map_err(|err| ReadError::StorageError(err.to_string()))?
+        {
+            Some(evm_code) => Ok(Bytecode::from(evm_code)),
+            None => Ok(Bytecode::default()),
+        }
+    }
+
+    fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        let location_hash = hash_deterministic(MemoryLocation::Storage(address, index));
+
+        let read_origins = self.read_set.entry(location_hash).or_default();
+
+        // Try reading from multi-version data
+        if self.tx_idx > 0
+            && let Some(written_transactions) = self.mv_memory.data.get(&location_hash)
+            && let Some((closest_idx, entry)) =
+                written_transactions.range(..self.tx_idx).next_back()
+        {
+            match entry {
+                MemoryEntry::Data(tx_incarnation, MemoryValue::Storage(value)) => {
+                    Self::push_origin(
+                        read_origins,
+                        ReadOrigin::MvMemory(TxVersion {
+                            tx_idx: *closest_idx,
+                            tx_incarnation: *tx_incarnation,
+                        }),
+                    )?;
+                    return Ok(*value);
+                }
+                MemoryEntry::Estimate => return Err(ReadError::Blocking(*closest_idx)),
+                _ => return Err(ReadError::InvalidMemoryValueType),
+            }
+        }
+
+        // Fall back to storage
+        Self::push_origin(read_origins, ReadOrigin::Storage)?;
+        self.storage
+            .storage(&address, &index)
+            .map_err(|err| ReadError::StorageError(err.to_string()))
+    }
+
+    fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
+        self.storage
+            .block_hash(&number)
+            .map_err(|err| ReadError::StorageError(err.to_string()))
+    }
+}
+
+// Per-worker execution VM. Holds all block-level state and a reusable EVM.
+pub(crate) struct Vm<'a, S: Storage, C: PevmChain> {
+    // Shared block-level state
+    chain: &'a C,
+    is_eip_161_enabled: bool,
+    block_env: &'a BlockEnv,
+    txs: &'a [C::EvmTx],
+    mv_memory: &'a MvMemory,
+    beneficiary_location_hash: MemoryLocationHash,
+    // Dedicated EVM for the worker, reset before each transaction exectution.
+    evm: C::Evm<VmDb<'a, S>>,
+}
+
+impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
+    pub(crate) fn new(
+        chain: &'a C,
+        spec_id: C::EvmSpecId,
+        block_env: &'a BlockEnv,
+        txs: &'a [C::EvmTx],
+        storage: &'a S,
+        mv_memory: &'a MvMemory,
+    ) -> Self {
+        // The DB is initialised with mock values; each transaction execution
+        // [VmDb::set_tx] the intended transaction before executing.
+        let db = VmDb {
+            storage,
+            mv_memory,
+            tx_idx: 0,
+            // SAFETY: txs is non-empty (checked by the caller before spawning threads).
+            tx: chain.tx_env(unsafe { txs.get_unchecked(0) }),
+            from_hash: 0,
+            to_hash: None,
+            to_code_hash: None,
+            is_lazy: false,
+            has_nonce: true,
+            // Unless it is a raw transfer that is lazy updated, we'll
+            // read at least from the sender and recipient accounts.
+            read_set: ReadSet::with_capacity_and_hasher(2, BuildIdentityHasher::default()),
+            read_accounts: HashMap::with_capacity_and_hasher(2, BuildIdentityHasher::default()),
+        };
+        Self {
+            chain,
+            is_eip_161_enabled: chain.is_eip_161_enabled(spec_id),
+            block_env,
+            txs,
+            mv_memory,
+            beneficiary_location_hash: hash_deterministic(MemoryLocation::Basic(
+                block_env.beneficiary,
+            )),
+            evm: chain.build_evm(spec_id, block_env.clone(), db),
+        }
+    }
+
+    // Execute a transaction. This can read from memory but cannot modify any state.
+    // A successful execution returns:
+    //   - A write-set consisting of memory locations and their updated values.
+    //   - A read-set consisting of memory locations and their origins.
+    //
+    // An execution may observe a read dependency on a lower transaction. This happens
+    // when the last incarnation of the dependency wrote to a memory location that
+    // this transaction reads, but it aborted before the read. In this case, the
+    // dependency index is returned via [blocking_tx_idx]. An execution task for this
+    // transaction is re-scheduled after the blocking dependency finishes its
+    // next incarnation.
+    //
+    // When a transaction attempts to write a value to a location, the location and
+    // value are added to the write set, possibly replacing a pair with a prior value
+    // (if it is not the first time the transaction wrote to this location during the
+    // execution).
+    pub(crate) fn execute(
+        &mut self,
+        tx_version: &TxVersion,
+        result_slot: &mut Option<PevmTxExecutionResult>,
+    ) -> Result<FinishExecFlags, VmExecutionError> {
+        // SAFETY: A correct scheduler would guarantee this index to be inbound.
+        let full_tx = unsafe { self.txs.get_unchecked(tx_version.tx_idx) };
+        let tx = self.chain.tx_env(full_tx);
+
+        let from_hash = hash_deterministic(MemoryLocation::Basic(tx.caller));
+        let to_hash = tx
+            .kind
+            .to()
+            .map(|to| hash_deterministic(MemoryLocation::Basic(*to)));
+
+        let has_nonce = self.chain.has_nonce(&mut self.evm, full_tx);
+
+        // Prepare state for execution
+        {
+            let ctx = self.evm.ctx();
+
+            ctx.db_mut()
+                .set_tx(tx_version.tx_idx, tx, from_hash, to_hash, has_nonce)
+                .map_err(VmExecutionError::from)?;
+
+            ctx.set_tx(full_tx.clone());
+
+            // We reset the journal when we finalise it into the result state on a
+            // successful execution but not on errors. Always reset here to be sure.
+            ctx.journal_mut().clear();
+        }
+
+        match NoBeneficiaryHandler::<C, _>::default().run(&mut self.evm) {
+            Ok(exec_result) => {
+                // There are at least six locations most of the time: the sender,
+                // the recipient, and up to four fee recipients (beneficiary, base fee,
+                // L1 fee, operator fee on OP Stack chains).
+                let mut write_set = WriteSet::with_capacity(6);
+
+                let ctx = self.evm.ctx();
+                let state = ctx.journal_mut().finalize();
+
+                for (address, account) in &state {
+                    if account.is_selfdestructed() {
+                        // TODO: Also write [SelfDestructed] to the basic location?
+                        // For now we are betting on [code_hash] triggering the sequential
+                        // fallback when we read a self-destructed contract.
+                        write_set.push((
+                            hash_deterministic(MemoryLocation::CodeHash(*address)),
+                            MemoryValue::SelfDestructed,
+                        ));
+                        continue;
+                    }
+
+                    if account.is_touched() {
+                        let account_location_hash =
+                            hash_deterministic(MemoryLocation::Basic(*address));
+                        let read_account = ctx.db().read_accounts.get(&account_location_hash);
+
+                        let has_code = !account.info.is_empty_code_hash();
+                        let is_new_code = has_code
+                            && read_account.is_none_or(|(_, code_hash)| code_hash.is_none());
+
+                        // Write new account changes
+                        if is_new_code
+                            || read_account.is_none()
+                            || read_account.is_some_and(|(basic, _)| {
+                                basic.nonce != account.info.nonce
+                                    || basic.balance != account.info.balance
+                            })
+                        {
+                            if ctx.db().is_lazy {
+                                if account_location_hash == from_hash {
+                                    write_set.push((
+                                        account_location_hash,
+                                        MemoryValue::LazySender(U256::MAX - account.info.balance),
+                                    ));
+                                } else if Some(account_location_hash) == to_hash {
+                                    write_set.push((
+                                        account_location_hash,
+                                        MemoryValue::LazyRecipient(tx.value),
+                                    ));
+                                }
+                            }
+                            // We don't register empty accounts after [SPURIOUS_DRAGON]
+                            // as they are cleared. This can only happen via 2 ways:
+                            // 1. Self-destruction which is handled by an if above.
+                            // 2. Sending 0 ETH to an empty account, which we treat as a
+                            // non-write here. A later read would trace back to storage
+                            // and return a [None], i.e., [LoadedAsNotExisting]. Without
+                            // this check it would write then read a [Some] default
+                            // account, which may yield a wrong gas fee, etc.
+                            else if !self.is_eip_161_enabled || !account.is_empty() {
+                                write_set.push((
+                                    account_location_hash,
+                                    MemoryValue::Basic(AccountBasic {
+                                        balance: account.info.balance,
+                                        nonce: account.info.nonce,
+                                    }),
+                                ));
+                            }
+                        }
+
+                        // Write new contract
+                        if is_new_code {
+                            write_set.push((
+                                hash_deterministic(MemoryLocation::CodeHash(*address)),
+                                MemoryValue::CodeHash(account.info.code_hash),
+                            ));
+                            self.mv_memory
+                                .new_bytecodes
+                                .entry(account.info.code_hash)
+                                .or_insert_with(|| account.info.code.clone().unwrap());
+                        }
+                    }
+
+                    // TODO: We should move this changed check to our read set like for account info?
+                    for (slot, value) in account.changed_storage_slots() {
+                        write_set.push((
+                            hash_deterministic(MemoryLocation::Storage(*address, *slot)),
+                            MemoryValue::Storage(value.present_value),
+                        ));
+                    }
+                }
+
+                // Rewards
+                let mut gas_price = if let Some(priority_fee) = tx.gas_priority_fee {
+                    std::cmp::min(
+                        tx.gas_price,
+                        priority_fee.saturating_add(self.block_env.basefee as u128),
+                    )
+                } else {
+                    tx.gas_price
+                };
+                if self.is_eip_161_enabled {
+                    gas_price = gas_price.saturating_sub(self.block_env.basefee as u128);
+                }
+                let rewards = self.chain.get_rewards(
+                    self.beneficiary_location_hash,
+                    U256::from(exec_result.tx_gas_used()),
+                    U256::from(gas_price),
+                    self.block_env.basefee,
+                    full_tx,
+                );
+                for (recipient, amount) in rewards {
+                    if let Some((_, value)) = write_set
+                        .iter_mut()
+                        .find(|(location, _)| location == &recipient)
+                    {
+                        match value {
+                            MemoryValue::Basic(basic) => {
+                                basic.balance = basic.balance.saturating_add(amount)
+                            }
+                            MemoryValue::LazySender(subtraction) => {
+                                *subtraction = subtraction.saturating_sub(amount)
+                            }
+                            MemoryValue::LazyRecipient(addition) => {
+                                *addition = addition.saturating_add(amount)
+                            }
+                            _ => return Err(ReadError::InvalidMemoryValueType.into()),
+                        }
+                    } else {
+                        write_set.push((recipient, MemoryValue::LazyRecipient(amount)));
+                    }
+                }
+
+                let (is_lazy, read_set) = {
+                    let db = ctx.db_mut();
+                    (db.is_lazy, std::mem::take(&mut db.read_set))
+                };
+
+                if is_lazy {
+                    self.mv_memory
+                        .add_lazy_addresses([tx.caller, *tx.kind.to().unwrap()]);
+                }
+
+                let mut flags = if tx_version.tx_idx > 0 && !is_lazy {
+                    FinishExecFlags::NeedValidation
+                } else {
+                    FinishExecFlags::empty()
+                };
+
+                if self.mv_memory.record(tx_version, read_set, write_set) {
+                    flags |= FinishExecFlags::WroteNewLocation;
+                }
+
+                let receipt = receipt_from_revm(exec_result);
+                let state = state_transitions_from_revm(self.is_eip_161_enabled, state);
+                if let Some(slot) = result_slot {
+                    slot.receipt = receipt;
+                    slot.state.clear();
+                    slot.state.extend(state);
+                } else {
+                    *result_slot = Some(PevmTxExecutionResult {
+                        receipt,
+                        state: state.collect(),
+                    });
+                }
+                Ok(flags)
+            }
+            Err(EVMError::Database(read_error)) => Err(VmExecutionError::from(read_error)),
+            Err(err) => {
+                // Optimistically retry in case some previous internal transactions send
+                // more fund to the sender but hasn't been executed yet.
+                // TODO: Let users define this behaviour through a mode enum or something.
+                // Since this retry is safe for syncing canonical blocks but can deadlock
+                // on new or faulty blocks. We can skip the transaction for new blocks and
+                // error out after a number of tries for the latter.
+                if tx_version.tx_idx > 0
+                    && matches!(
+                        err,
+                        EVMError::Transaction(
+                            InvalidTransaction::LackOfFundForMaxFee { .. }
+                                | InvalidTransaction::NonceTooHigh { .. }
+                        )
+                    )
+                {
+                    Err(VmExecutionError::Blocking(tx_version.tx_idx - 1))
+                } else {
+                    Err(VmExecutionError::ExecutionError(err))
+                }
+            }
+        }
+    }
+}
+
+struct NoBeneficiaryHandler<C, DB> {
+    _phantom: core::marker::PhantomData<(C, DB)>,
+}
+
+impl<C, DB> Default for NoBeneficiaryHandler<C, DB> {
+    fn default() -> Self {
+        Self {
+            _phantom: core::marker::PhantomData,
+        }
+    }
+}
+
+impl<C: PevmChain, DB: Database> Handler for NoBeneficiaryHandler<C, DB> {
+    type Evm = C::Evm<DB>;
+    type Error = EVMError<DB::Error, InvalidTransaction>;
+    type HaltReason = C::EvmHaltReason;
+
+    fn reward_beneficiary(
+        &self,
+        _: &mut Self::Evm,
+        _: &mut FrameResult,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}

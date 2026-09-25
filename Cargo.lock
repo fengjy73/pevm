@@ -3438,6 +3438,7 @@ dependencies = [
  "op-alloy-rpc-types",
  "op-revm",
  "parking_lot",
+ "pevm_upstream",
  "rand 0.10.1",
  "rayon",
  "reqwest",
@@ -3474,6 +3475,45 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "pevm_upstream"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-primitives",
+ "alloy-provider",
+ "alloy-rlp",
+ "alloy-rpc-types-eth",
+ "alloy-transport",
+ "alloy-trie",
+ "bincode",
+ "bitflags",
+ "criterion",
+ "dashmap",
+ "flate2",
+ "hashbrown 0.17.0",
+ "op-alloy-consensus",
+ "op-alloy-network",
+ "op-alloy-rpc-types",
+ "op-revm",
+ "rand 0.10.1",
+ "rayon",
+ "reqwest",
+ "revm",
+ "revm-statetest-types",
+ "revme",
+ "rpmalloc",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "snmalloc-rs",
+ "thiserror 2.0.18",
+ "tikv-jemallocator",
+ "tokio",
+ "walkdir",
 ]
 
 [[package]]

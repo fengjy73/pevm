@@ -115,13 +115,24 @@ def sample_block(rows: list[dict], engine: str, kind: str = "timed") -> dict[int
 
 def walls_aligned(rows: list[dict], kind: str = "timed") -> dict[str, list[float]]:
     by = {e: sample_block(rows, e, kind) for e in ("seq", "occ", "sf")}
-    rounds = sorted(set(by["seq"]) & set(by["occ"]) & set(by["sf"]))
+    present = [e for e in ("seq", "occ", "sf") if by[e]]
+    if not present:
+        rounds: list[int] = []
+    else:
+        rounds = sorted(set.intersection(*(set(by[e]) for e in present)))
+
+    def walls(engine: str) -> list[float]:
+        return [by[engine][r]["wall_ms"] for r in rounds if r in by[engine]]
+
+    def rowset(engine: str) -> list[dict]:
+        return [by[engine][r] for r in rounds if r in by[engine]]
+
     return {
         "rounds": rounds,
-        "seq": [by["seq"][r]["wall_ms"] for r in rounds],
-        "occ": [by["occ"][r]["wall_ms"] for r in rounds],
-        "sf": [by["sf"][r]["wall_ms"] for r in rounds],
-        "rows": {e: [by[e][r] for r in rounds] for e in by},
+        "seq": walls("seq"),
+        "occ": walls("occ"),
+        "sf": walls("sf"),
+        "rows": {e: rowset(e) for e in ("seq", "occ", "sf")},
     }
 
 
@@ -462,13 +473,16 @@ def analyze_block(
     aligned = walls_aligned(wall_rows, "timed")
     n_tx = int(wall_rows[0]["n_tx"]) if wall_rows else 0
     gas = int(wall_rows[0]["gas_used"]) if wall_rows else 0
-    path = {e: (aligned["rows"][e][0].get("path") if aligned["rounds"] else None) for e in ("seq", "occ", "sf")}
+    path = {
+        e: (aligned["rows"][e][0].get("path") if aligned["rows"][e] else None)
+        for e in ("seq", "occ", "sf")
+    }
     fallback = any(r.get("product_gate_fallback") for r in wall_rows)
     engines = {}
     for i, name in enumerate(("seq", "occ", "sf")):
         engines[name] = engine_summary(aligned[name], n_tx, SEED + i)
         engines[name]["path"] = path[name]
-        if aligned["rounds"]:
+        if aligned["rows"][name]:
             row0 = aligned["rows"][name][0]
             engines[name]["est"] = [r["est"] for r in aligned["rows"][name]]
             engines[name]["soft"] = [r["soft"] for r in aligned["rows"][name]]
@@ -499,19 +513,21 @@ def analyze_block(
     ratios = {}
     ge = False
     if aligned["rounds"]:
-        s_occ, s_occ_lo, s_occ_hi = paired_ratio_ci(aligned["seq"], aligned["occ"], SEED + 11)
-        s_sf, s_sf_lo, s_sf_hi = paired_ratio_ci(aligned["seq"], aligned["sf"], SEED + 12)
-        r, r_lo, r_hi = paired_ratio_ci(aligned["occ"], aligned["sf"], SEED + 13)
-        ge = r_lo > 1.5
-        ratios = {
-            "S_occ": s_occ,
-            "S_occ_ci95": [s_occ_lo, s_occ_hi],
-            "S_sf": s_sf,
-            "S_sf_ci95": [s_sf_lo, s_sf_hi],
-            "R": r,
-            "R_ci95": [r_lo, r_hi],
-            "ge_1_5": ge,
-        }
+        ratios = {}
+        if aligned["seq"] and aligned["occ"]:
+            s_occ, s_occ_lo, s_occ_hi = paired_ratio_ci(aligned["seq"], aligned["occ"], SEED + 11)
+            ratios["S_occ"] = s_occ
+            ratios["S_occ_ci95"] = [s_occ_lo, s_occ_hi]
+        if aligned["seq"] and aligned["sf"]:
+            s_sf, s_sf_lo, s_sf_hi = paired_ratio_ci(aligned["seq"], aligned["sf"], SEED + 12)
+            ratios["S_sf"] = s_sf
+            ratios["S_sf_ci95"] = [s_sf_lo, s_sf_hi]
+        if aligned["occ"] and aligned["sf"]:
+            r, r_lo, r_hi = paired_ratio_ci(aligned["occ"], aligned["sf"], SEED + 13)
+            ratios["R"] = r
+            ratios["R_ci95"] = [r_lo, r_hi]
+            ge = r_lo > 1.5
+            ratios["ge_1_5"] = ge
     oracle = walls_aligned(wall_rows, "oracle")
     oracle_sum = None
     if oracle["rounds"]:
@@ -775,6 +791,52 @@ def analyze_block(
     return out
 
 
+def _ci(v) -> str:
+    if not isinstance(v, list) or len(v) != 2 or v[0] is None:
+        return ""
+    return f"[{v[0]:.3f}, {v[1]:.3f}]"
+
+
+def curves_markdown(rows: list[dict]) -> str:
+    """TPS_SEQ once per block. Per-C columns are OCC, SF, and ideal."""
+    by: dict[int, list[dict]] = {}
+    for row in rows:
+        by.setdefault(int(row["block"]), []).append(row)
+    lines = [
+        "TPS_SEQ is the 1-core sequential baseline. It is not re-measured at each C.",
+        "TPS_OCC is unmodified pevm_upstream at e94b0e3. TPS_SF is this fork.",
+        "",
+    ]
+    for block, rs in by.items():
+        rs.sort(key=lambda r: int(r["c"] or 0))
+        head = rs[0]
+        lines.append(f"### block {block}  n_tx={head.get('n_tx')}")
+        lines.append("")
+        lines.append(
+            f"TPS_SEQ (workers=1) = {_fmt(head.get('tps_seq'))}  "
+            f"median {_fmt(head.get('tps_seq_median_ms'))} ms  "
+            f"CI {_ci(head.get('tps_seq_ci95_ms'))}"
+        )
+        lines.append("")
+        lines.append("| C | TPS_OCC | OCC ms | OCC 95% CI | TPS_SF | SF ms | SF 95% CI | TPS_ideal |")
+        lines.append("| ---: | ---: | ---: | --- | ---: | ---: | --- | ---: |")
+        for r in rs:
+            lines.append(
+                "| {c} | {occ} | {oms} | {oci} | {sf} | {sms} | {sci} | {ideal} |".format(
+                    c=r.get("c"),
+                    occ=_fmt(r.get("tps_occ")),
+                    oms=_fmt(r.get("occ_median_ms")),
+                    oci=_ci(r.get("occ_ci95_ms")),
+                    sf=_fmt(r.get("tps_sf")),
+                    sms=_fmt(r.get("sf_median_ms")),
+                    sci=_ci(r.get("sf_ci95_ms")),
+                    ideal=_fmt(r.get("tps_ideal") or r.get("tps_ideal_tx")),
+                )
+            )
+        lines.append("")
+    return "\n".join(lines)
+
+
 def markdown_block(rep: dict) -> str:
     lines = []
     b = rep["block"]
@@ -791,13 +853,21 @@ def markdown_block(rep: dict) -> str:
             f"| {e} | `{s.get('path')}` | {s['median_ms']:.3f} | [{ci[0]:.3f}, {ci[1]:.3f}] | {s['min_ms']:.3f} | {s['max_ms']:.3f} | {s['tps']:.0f} |"
         )
     r = rep.get("ratios") or {}
-    if r:
+    if r.get("R") is not None:
         lines.append("")
-        lines.append(
-            f"S_occ={r['S_occ']:.3f} CI[{r['S_occ_ci95'][0]:.3f}, {r['S_occ_ci95'][1]:.3f}]  "
-            f"S_sf={r['S_sf']:.3f} CI[{r['S_sf_ci95'][0]:.3f}, {r['S_sf_ci95'][1]:.3f}]  "
-            f"R={r['R']:.3f} CI[{r['R_ci95'][0]:.3f}, {r['R_ci95'][1]:.3f}]  ge_1_5={r['ge_1_5']}"
+        bits = []
+        if r.get("S_occ") is not None:
+            bits.append(
+                f"S_occ={r['S_occ']:.3f} CI[{r['S_occ_ci95'][0]:.3f}, {r['S_occ_ci95'][1]:.3f}]"
+            )
+        if r.get("S_sf") is not None:
+            bits.append(
+                f"S_sf={r['S_sf']:.3f} CI[{r['S_sf_ci95'][0]:.3f}, {r['S_sf_ci95'][1]:.3f}]"
+            )
+        bits.append(
+            f"R={r['R']:.3f} CI[{r['R_ci95'][0]:.3f}, {r['R_ci95'][1]:.3f}]  ge_1_5={r.get('ge_1_5')}"
         )
+        lines.append("  ".join(bits))
     st = rep["same_timer"]
     lines.append("")
     lines.append(
@@ -854,41 +924,66 @@ def main() -> None:
     if args.curves:
         files = sorted(args.curves.glob("C*.json"))
         rows = []
+        seq_base: dict[int, dict] = {}
+        parsed = []
         for f in files:
             doc = json.loads(f.read_text())
             for b in doc.get("blocks", []):
-                rows.append(
-                    {
-                        "c": doc.get("workers"),
-                        "cpus": doc.get("cpus"),
-                        "block": b["block"],
-                        "n_tx": b["n_tx"],
-                        "tps_seq": b["engines"]["seq"].get("tps"),
-                        "tps_occ": b["engines"]["occ"].get("tps"),
-                        "tps_sf": b["engines"]["sf"].get("tps"),
-                        "tps_ideal": b.get("tps_ideal"),
-                        "tps_ideal_tx": b.get("tps_ideal_tx") or b.get("tps_ideal"),
-                        "tps_ideal_step": b.get("tps_ideal_step"),
-                        "ideal_step_ms": b.get("ideal_step_ms"),
-                        "l_step_ms": b.get("l_step_ms"),
-                        "l_crit_ms": b["same_timer"].get("l_crit_ms"),
-                        "proximity_occ": b["parallel"]["occ"].get("proximity"),
-                        "proximity_sf": b["parallel"]["sf"].get("proximity"),
-                        "proximity_occ_step": b["parallel"]["occ"].get("proximity_step"),
-                        "proximity_sf_step": b["parallel"]["sf"].get("proximity_step"),
-                        "S_occ": (b.get("ratios") or {}).get("S_occ"),
-                        "S_sf": (b.get("ratios") or {}).get("S_sf"),
-                        "R": (b.get("ratios") or {}).get("R"),
-                        "R_ci95": (b.get("ratios") or {}).get("R_ci95"),
-                        "ge_1_5": b.get("ge_1_5"),
-                        "ideal_seq_ms": b["same_timer"].get("ideal_seq_ms"),
-                        "lb_ms": b["same_timer"].get("lb_ms"),
-                    }
-                )
-        out = {"curves": rows, "ge_1_5": any(r["ge_1_5"] for r in rows)}
+                parsed.append((doc, b))
+                if doc.get("workers") == 1 and b["engines"]["seq"].get("n"):
+                    seq_base[int(b["block"])] = b["engines"]["seq"]
+        for doc, b in parsed:
+            seq = seq_base.get(int(b["block"]), {})
+            rows.append(
+                {
+                    "c": doc.get("workers"),
+                    "cpus": doc.get("cpus"),
+                    "block": b["block"],
+                    "n_tx": b["n_tx"],
+                    # One 1-core value, copied onto every C. Not re-measured per C.
+                    "tps_seq": seq.get("tps"),
+                    "tps_seq_median_ms": seq.get("median_ms"),
+                    "tps_seq_ci95_ms": seq.get("ci95_ms"),
+                    "tps_seq_workers": 1 if seq else None,
+                    "tps_occ": b["engines"]["occ"].get("tps"),
+                    "occ_median_ms": b["engines"]["occ"].get("median_ms"),
+                    "occ_ci95_ms": b["engines"]["occ"].get("ci95_ms"),
+                    "occ_tps_ci95": b["engines"]["occ"].get("tps_ci95"),
+                    "occ_path": b["engines"]["occ"].get("path"),
+                    "tps_sf": b["engines"]["sf"].get("tps"),
+                    "sf_median_ms": b["engines"]["sf"].get("median_ms"),
+                    "sf_ci95_ms": b["engines"]["sf"].get("ci95_ms"),
+                    "sf_tps_ci95": b["engines"]["sf"].get("tps_ci95"),
+                    "tps_ideal": b.get("tps_ideal"),
+                    "tps_ideal_tx": b.get("tps_ideal_tx") or b.get("tps_ideal"),
+                    "tps_ideal_step": b.get("tps_ideal_step"),
+                    "ideal_step_ms": b.get("ideal_step_ms"),
+                    "l_step_ms": b.get("l_step_ms"),
+                    "l_crit_ms": b["same_timer"].get("l_crit_ms"),
+                    "proximity_occ": b["parallel"]["occ"].get("proximity"),
+                    "proximity_sf": b["parallel"]["sf"].get("proximity"),
+                    "proximity_occ_step": b["parallel"]["occ"].get("proximity_step"),
+                    "proximity_sf_step": b["parallel"]["sf"].get("proximity_step"),
+                    "S_occ": (b.get("ratios") or {}).get("S_occ"),
+                    "S_sf": (b.get("ratios") or {}).get("S_sf"),
+                    "R": (b.get("ratios") or {}).get("R"),
+                    "R_ci95": (b.get("ratios") or {}).get("R_ci95"),
+                    "ge_1_5": b.get("ge_1_5"),
+                    "ideal_seq_ms": b["same_timer"].get("ideal_seq_ms"),
+                    "lb_ms": b["same_timer"].get("lb_ms"),
+                }
+            )
+        out = {
+            "curves": rows,
+            "ge_1_5": any(r["ge_1_5"] for r in rows),
+            "tps_seq_note": "TPS_SEQ is the workers=1 sequential median, not a per-C measurement. TPS_OCC is pevm_upstream@e94b0e3. TPS_SF is this fork.",
+        }
         text = json.dumps(out, indent=2)
         if args.out:
             args.out.write_text(text + "\n")
+            md = curves_markdown(rows)
+            args.out.with_suffix(".md").write_text(md + "\n")
+            print(md)
         print(text)
         return
     if not args.wall or not args.out or not args.cores:

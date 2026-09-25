@@ -1,23 +1,25 @@
 #!/usr/bin/env bash
-# Soft=0 per-core scan for SEQ / OCC / SpecFence.
+# Soft=0 per-core scan.
 #
-# Pins `workers` to C distinct physical cores (one cpu per core, SMT siblings
-# skipped via `lscpu -p`). Refuses C above the physical-core count.
-# 8-on-4 is only available as an explicit oversubscription contrast:
-#   scripts/soft0_percore_scan.sh --oversub 8:0,1,2,3
+# Columns:
+#   TPS_SEQ   one 1-core sequential baseline (not repeated at each C)
+#   TPS_OCC   unmodified pevm_upstream @ e94b0e3, execute_revm_parallel
+#   TPS_SF    this fork, execute_revm_parallel / SpecFence
+#   TPS_ideal(C)
 #
-# Timed region is the engine entry after the tx list is built:
-#   seq  execute_revm_sequential
-#   occ  execute_revm_parallel / Occ
-#   sf   execute_revm_parallel / SpecFence / run_sf_block
-# No untimed warm-up. Every one of K runs is a fresh engine. Oracle reuse is
-# off unless --oracle-k is set, and those rows are labeled oracle.
+# Pins the process with taskset to a configurable CPU list.
+# Default list is 128-255 (ict21 node1). Override for a smaller machine:
+#   PEVM_CPU_LIST=0-3 scripts/soft0_percore_scan.sh --c-list 1,4
+#   scripts/soft0_percore_scan.sh --cpu-list 0-3 --allow-oversub --c-list 1,4,8
+#
+# Timed region is the engine entry after the tx list is built.
+# No untimed warm-up. Every one of K runs is a fresh engine.
 #
 # Focus blocks only: 15274915 and 3356896.
 #
 # Usage:
 #   scripts/soft0_percore_scan.sh
-#   scripts/soft0_percore_scan.sh --c-list 1,2,4 --k 10 --profile-k 10
+#   scripts/soft0_percore_scan.sh --cpu-list 0-3 --c-list 1,4 --k 10
 #   scripts/soft0_percore_scan.sh --oversub 8:0,1,2,3 --k 10
 #   scripts/soft0_percore_scan.sh --extra-probes --c-list 1,4 --k 10 --profile-k 3
 #
@@ -40,10 +42,15 @@ SKIP_BUILD=0
 FORCE=1
 STEP_K=3
 TIMEOUT_S=180
+# ict21 node1. This VM overrides with --cpu-list 0-3.
+CPU_LIST="${PEVM_CPU_LIST:-128-255}"
+ALLOW_OVERSUB=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --c-list) C_LIST="$2"; shift 2 ;;
+    --cpu-list) CPU_LIST="$2"; shift 2 ;;
+    --allow-oversub) ALLOW_OVERSUB=1; shift ;;
     --k) K="$2"; shift 2 ;;
     --profile-k) PROFILE_K="$2"; shift 2 ;;
     --oracle-k) ORACLE_K="$2"; shift 2 ;;
@@ -81,32 +88,34 @@ if [[ ! -x "$BIN" ]]; then
   exit 1
 fi
 
-physical_cpus() {
-  if command -v lscpu >/dev/null 2>&1; then
-    # First hardware thread of each (socket, core). Skips SMT siblings.
-    lscpu -p=CPU,CORE,SOCKET | awk -F, 'NF && $1 !~ /^#/ { k=$3":"$2; if (!seen[k]++) print $1 }'
-    return
-  fi
-  local cpu core sib first
-  for cpu in /sys/devices/system/cpu/cpu[0-9]*; do
-    [[ -f "$cpu/topology/thread_siblings_list" ]] || continue
-    sib="$(cat "$cpu/topology/thread_siblings_list")"
-    first="${sib%%,*}"
-    id="${cpu##*cpu}"
-    if [[ "$id" == "$first" ]]; then
-      echo "$id"
+expand_cpu_list() {
+  local spec="$1" part start end i
+  IFS=',' read -ra parts <<< "$spec"
+  for part in "${parts[@]}"; do
+    part="${part// /}"
+    [[ -n "$part" ]] || continue
+    if [[ "$part" == *-* ]]; then
+      start="${part%%-*}"
+      end="${part##*-}"
+      for ((i = start; i <= end; i++)); do
+        echo "$i"
+      done
+    else
+      echo "$part"
     fi
   done
 }
 
-mapfile -t PHYS < <(physical_cpus)
+mapfile -t PHYS < <(expand_cpu_list "$CPU_LIST")
 if [[ "${#PHYS[@]}" -eq 0 ]]; then
-  echo "no physical cpus discovered" >&2
+  echo "empty CPU list: $CPU_LIST" >&2
   exit 1
 fi
 
 {
-  echo "physical_cpus=${PHYS[*]}"
+  echo "cpu_list=$CPU_LIST"
+  echo "pin_cpus=${PHYS[*]}"
+  echo "allow_oversub=$ALLOW_OVERSUB"
   echo "nproc=$(nproc)"
   echo "loadavg=$(cat /proc/loadavg 2>/dev/null || true)"
   echo "model=$(awk -F: '/model name/{print $2; exit}' /proc/cpuinfo | sed 's/^ //')"
@@ -259,10 +268,16 @@ collect_step_trace
 SEQ_PROFILE=""
 for c in ${C_LIST//,/ }; do
   if (( c > ${#PHYS[@]} )); then
-    echo "SKIP C=$c : host has ${#PHYS[@]} physical cores; refusing oversubscription"
-    continue
+    if [[ "$ALLOW_OVERSUB" -eq 1 ]]; then
+      echo "OVERSUB C=$c onto ${#PHYS[@]} cpus from list $CPU_LIST"
+      mapfile -t chosen < <(printf '%s\n' "${PHYS[@]}")
+    else
+      echo "SKIP C=$c : CPU list has ${#PHYS[@]} cpus ($CPU_LIST); pass --allow-oversub to run anyway"
+      continue
+    fi
+  else
+    mapfile -t chosen < <(printf '%s\n' "${PHYS[@]:0:c}")
   fi
-  mapfile -t chosen < <(printf '%s\n' "${PHYS[@]:0:c}")
   cpus_csv="$(join_by_comma "${chosen[@]}")"
   wall="$OUT/wall-c${c}.jsonl"
   profile="$OUT/profile-c${c}.jsonl"
@@ -302,6 +317,16 @@ if (( ${#PHYS[@]} >= 1 )); then
     export SPECFENCE_COMPARE_BLOCK="$b"
     echo "SEQCHECK block=$b workers=${#pin4[@]} cpus=$cpus_csv"
     taskset -c "$cpus_csv" "$BIN" | tee "$OUT/seqcheck-${b}.txt"
+  done
+  clear_probe_env
+  export SPECFENCE_INFLATION_WHICH=occcheck
+  export SPECFENCE_COMPARE_CORES="${#pin4[@]}"
+  export SPECFENCE_PIN_CPUS="$cpus_csv"
+  export SPECFENCE_INFLATION_OCCCHECK_N=3
+  for b in 15274915 3356896; do
+    export SPECFENCE_COMPARE_BLOCK="$b"
+    echo "OCCCHECK upstream par==seq block=$b workers=${#pin4[@]} cpus=$cpus_csv"
+    taskset -c "$cpus_csv" "$BIN" | tee "$OUT/occcheck-${b}.txt"
   done
 fi
 
