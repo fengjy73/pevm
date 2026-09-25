@@ -120,12 +120,19 @@ def walls_aligned(rows: list[dict], kind: str = "timed") -> dict[str, list[float
         rounds: list[int] = []
     else:
         rounds = sorted(set.intersection(*(set(by[e]) for e in present)))
+
+    def walls(engine: str) -> list[float]:
+        return [by[engine][r]["wall_ms"] for r in rounds if r in by[engine]]
+
+    def rowset(engine: str) -> list[dict]:
+        return [by[engine][r] for r in rounds if r in by[engine]]
+
     return {
         "rounds": rounds,
-        "seq": [by["seq"][r]["wall_ms"] for r in rounds],
-        "occ": [by["occ"][r]["wall_ms"] for r in rounds],
-        "sf": [by["sf"][r]["wall_ms"] for r in rounds],
-        "rows": {e: [by[e][r] for r in rounds] for e in by},
+        "seq": walls("seq"),
+        "occ": walls("occ"),
+        "sf": walls("sf"),
+        "rows": {e: rowset(e) for e in ("seq", "occ", "sf")},
     }
 
 
@@ -466,13 +473,16 @@ def analyze_block(
     aligned = walls_aligned(wall_rows, "timed")
     n_tx = int(wall_rows[0]["n_tx"]) if wall_rows else 0
     gas = int(wall_rows[0]["gas_used"]) if wall_rows else 0
-    path = {e: (aligned["rows"][e][0].get("path") if aligned["rounds"] else None) for e in ("seq", "occ", "sf")}
+    path = {
+        e: (aligned["rows"][e][0].get("path") if aligned["rows"][e] else None)
+        for e in ("seq", "occ", "sf")
+    }
     fallback = any(r.get("product_gate_fallback") for r in wall_rows)
     engines = {}
     for i, name in enumerate(("seq", "occ", "sf")):
         engines[name] = engine_summary(aligned[name], n_tx, SEED + i)
         engines[name]["path"] = path[name]
-        if aligned["rounds"]:
+        if aligned["rows"][name]:
             row0 = aligned["rows"][name][0]
             engines[name]["est"] = [r["est"] for r in aligned["rows"][name]]
             engines[name]["soft"] = [r["soft"] for r in aligned["rows"][name]]
