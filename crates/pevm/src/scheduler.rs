@@ -1,8 +1,8 @@
 use std::{
     cmp::min,
     sync::{
-        Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
+        Mutex,
     },
     thread,
     time::Instant,
@@ -11,8 +11,8 @@ use std::{
 use smallvec::SmallVec;
 
 use crate::{
+    specfence::{profile_timing_enabled, FenceGraph, ReadyEdgeTable, WaveParkTable},
     FinishExecFlags, IncarnationStatus, Task, TxIdx, TxStatus, TxVersion,
-    specfence::{FenceGraph, ReadyEdgeTable, WaveParkTable, profile_timing_enabled},
 };
 
 /// After refuse, steal one nearby independent. No full-block scan (PRIMARY tax).
@@ -23,6 +23,33 @@ enum MinRun {
     Hit(TxIdx),
     Empty,
     Busy,
+}
+
+pub(crate) static COMMIT_REJECTS: AtomicUsize = AtomicUsize::new(0);
+const REJECT_CAP: usize = 32;
+static REJECT_TX: [AtomicUsize; REJECT_CAP] = [const { AtomicUsize::new(usize::MAX) }; REJECT_CAP];
+
+/// Times a Commit was refused because a lower writer flagged the read set.
+pub(crate) fn commit_rejects() -> usize {
+    COMMIT_REJECTS.load(Ordering::Relaxed)
+}
+
+/// First rejected transaction indexes, in the order they were refused.
+pub(crate) fn commit_reject_txs() -> Vec<usize> {
+    let n = commit_rejects().min(REJECT_CAP);
+    (0..n)
+        .map(|i| REJECT_TX[i].load(Ordering::Relaxed))
+        .collect()
+}
+
+/// Outcome of [`Scheduler::try_commit_if_clean`].
+pub(crate) enum CommitGate {
+    /// Read set was not flagged. Status is `Validated` and `on_commit` ran.
+    Committed,
+    /// A lower writer flagged this incarnation. Status stays `Executed`.
+    Rejected,
+    /// Incarnation moved or status is no longer `Executed`.
+    Closed,
 }
 
 // The Pevm collaborative scheduler coordinates execution & validation
@@ -105,6 +132,7 @@ impl Scheduler {
                     Mutex::new(TxStatus {
                         incarnation: 0,
                         status: IncarnationStatus::ReadyToExecute,
+                        reads_dirty: false,
                     })
                 })
                 .collect(),
@@ -238,6 +266,7 @@ impl Scheduler {
                     // Fall through: Aborting/Validated canary; ProducerStage reserved.
                 }
                 tx.status = IncarnationStatus::Executing;
+                tx.reads_dirty = false;
                 self.set_done_flag(tx_idx, false);
                 return Some(TxVersion {
                     tx_idx,
@@ -400,6 +429,7 @@ impl Scheduler {
                     crate::specfence::busy_stall::time_lock_acq(acq);
                     if tx.status == IncarnationStatus::ReadyToExecute {
                         tx.status = IncarnationStatus::Executing;
+                        tx.reads_dirty = false;
                         self.set_done_flag(tx_idx, false);
                         if let Some(wave) = wave {
                             wave.note_ready_steal_if_after_park();
@@ -857,6 +887,61 @@ impl Scheduler {
         } else {
             None
         }
+    }
+
+    /// Lower writer published a location this tx may have read.
+    ///
+    /// `Executed` (owner still inside validate, runnable state `ST_RUNNING`):
+    /// set [`TxStatus::reads_dirty`] and return false. `wake_idle` would drop
+    /// the request. The owner's commit observes the flag under this mutex.
+    ///
+    /// `Validated`: demote and return true so the caller can queue revalidate.
+    /// Commit publishes runnable `DONE` before releasing this mutex, so the
+    /// wake observes `DONE` rather than `ST_RUNNING`.
+    pub(crate) fn mark_reads_dirty(&self, tx_idx: TxIdx) -> bool {
+        if tx_idx >= self.block_size {
+            return false;
+        }
+        let mut tx = index_mutex!(self.transactions_status, tx_idx);
+        tx.reads_dirty = true;
+        if tx.status == IncarnationStatus::Validated {
+            tx.status = IncarnationStatus::Executed;
+            self.num_validated.fetch_sub(1, Ordering::Relaxed);
+            self.set_validated_flag(tx_idx, false);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Commit `Executed` → `Validated` only when no lower writer has flagged
+    /// the read set. `on_commit` runs before the status mutex is released
+    /// (publish runnable DONE).
+    pub(crate) fn try_commit_if_clean(
+        &self,
+        tx_version: &TxVersion,
+        on_commit: impl FnOnce(),
+    ) -> CommitGate {
+        if tx_version.tx_idx >= self.block_size {
+            return CommitGate::Closed;
+        }
+        let mut tx = index_mutex!(self.transactions_status, tx_version.tx_idx);
+        if tx.incarnation != tx_version.tx_incarnation || tx.status != IncarnationStatus::Executed {
+            return CommitGate::Closed;
+        }
+        if tx.reads_dirty {
+            tx.reads_dirty = false;
+            let i = COMMIT_REJECTS.fetch_add(1, Ordering::Relaxed);
+            if i < REJECT_CAP {
+                REJECT_TX[i].store(tx_version.tx_idx, Ordering::Relaxed);
+            }
+            return CommitGate::Rejected;
+        }
+        tx.status = IncarnationStatus::Validated;
+        self.num_validated.fetch_add(1, Ordering::Relaxed);
+        self.set_validated_flag(tx_version.tx_idx, true);
+        on_commit();
+        CommitGate::Committed
     }
 
     /// Counter reached `block_size`. Does not scan flags.
@@ -1530,5 +1615,43 @@ mod tests {
             !s.add_wait_for_dependency(1, 0),
             "writer already Done must not wait_for_dependency forever"
         );
+    }
+
+    #[test]
+    fn commit_observes_reads_dirty_while_owner_running() {
+        let s = Scheduler::new(2);
+        let v = s.try_execute(1).expect("reader");
+        let _ = s.finish_execution(v.clone(), crate::FinishExecFlags::NeedValidation);
+        assert!(s.is_executed(1));
+        // Writer publishes while the owner is still ST_RUNNING: wake_idle
+        // would drop, so the flag is the handoff.
+        assert!(
+            !s.mark_reads_dirty(1),
+            "Executed owner is not woken; the flag blocks commit"
+        );
+        let mut published_done = false;
+        assert!(
+            matches!(
+                s.try_commit_if_clean(&v, || published_done = true),
+                CommitGate::Rejected
+            ),
+            "stale Commit must not stick"
+        );
+        assert!(!published_done);
+        assert!(s.is_executed(1));
+        assert!(!s.is_validated(1));
+        // Flag is one-shot. A recheck that still matches may commit,
+        // and DONE is published under the status lock.
+        assert!(matches!(
+            s.try_commit_if_clean(&v, || published_done = true),
+            CommitGate::Committed
+        ));
+        assert!(published_done);
+        assert!(s.is_validated(1));
+        // Post-commit publish demotes and asks for a wake. DONE is already
+        // visible, so wake_idle is not refused.
+        assert!(s.mark_reads_dirty(1));
+        assert!(s.is_executed(1));
+        assert!(!s.is_validated(1));
     }
 }

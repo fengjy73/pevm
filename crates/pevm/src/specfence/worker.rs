@@ -6,12 +6,12 @@
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use super::SpecFenceCtx;
-use super::VisibilityPolicy;
 use super::arm_table::ArmTable;
 use super::resolve_plan::{self, ApplyCtx};
 use super::runnable_set::RunnableSet;
 use super::schedule;
+use super::SpecFenceCtx;
+use super::VisibilityPolicy;
 use crate::mv_memory::MvMemory;
 use crate::scheduler::Scheduler;
 use crate::{Task, TxVersion};
@@ -298,50 +298,29 @@ pub(crate) fn run_sf_block<F, V>(
                                 phase_t0,
                             );
                         }
-                        let (plan, invalid) = validate_to_plan(&tx_version, vis);
+                        let resolve_t0 = Instant::now();
+                        apply_resolving(
+                            &tx_version,
+                            vis,
+                            wrote_new_location,
+                            specfence,
+                            mv_memory,
+                            scheduler,
+                            runnable,
+                            arms,
+                            &mut validate_to_plan,
+                        );
                         if super::busy_stall::enabled() {
+                            let ns = resolve_t0.elapsed().as_nanos() as u64;
                             super::busy_stall::charge_span(
                                 super::busy_stall::KIND_VALIDATE,
-                                phase_v0.elapsed().as_nanos() as u64,
-                                phase_v0,
+                                ns,
+                                resolve_t0,
                                 tx_idx as u32,
                                 super::busy_stall::PRED_NONE,
                                 tx_version.tx_incarnation as u16,
-                                phase_v0.elapsed().as_nanos() as u64,
+                                ns,
                             );
-                            let learn_t0 = Instant::now();
-                            resolve_plan::apply(plan, ApplyCtx {
-                                specfence,
-                                mv_memory,
-                                scheduler,
-                                runnable,
-                                arms,
-                                tx_version: &tx_version,
-                                vis,
-                                wrote_new_location,
-                                invalid: &invalid,
-                            });
-                            super::busy_stall::charge_span(
-                                super::busy_stall::KIND_LEARN,
-                                learn_t0.elapsed().as_nanos() as u64,
-                                learn_t0,
-                                tx_idx as u32,
-                                super::busy_stall::PRED_NONE,
-                                tx_version.tx_incarnation as u16,
-                                learn_t0.elapsed().as_nanos() as u64,
-                            );
-                        } else {
-                            resolve_plan::apply(plan, ApplyCtx {
-                                specfence,
-                                mv_memory,
-                                scheduler,
-                                runnable,
-                                arms,
-                                tx_version: &tx_version,
-                                vis,
-                                wrote_new_location,
-                                invalid: &invalid,
-                            });
                         }
                         let val_ns = phase_v0.elapsed().as_nanos() as u64;
                         metrics.add_phase_val(val_ns);
@@ -421,7 +400,17 @@ pub(crate) fn run_sf_block<F, V>(
                 let phase_t0 = Instant::now();
                 let val_start = origin_ns(specfence);
                 let phase_v0 = Instant::now();
-                let (plan, invalid) = validate_to_plan(&tx_version, vis);
+                apply_resolving(
+                    &tx_version,
+                    vis,
+                    false,
+                    specfence,
+                    mv_memory,
+                    scheduler,
+                    runnable,
+                    arms,
+                    &mut validate_to_plan,
+                );
                 if super::busy_stall::enabled() {
                     let val_ns = phase_v0.elapsed().as_nanos() as u64;
                     super::busy_stall::charge_span(
@@ -433,40 +422,6 @@ pub(crate) fn run_sf_block<F, V>(
                         tx_version.tx_incarnation as u16,
                         val_ns,
                     );
-                    let learn_t0 = Instant::now();
-                    resolve_plan::apply(plan, ApplyCtx {
-                        specfence,
-                        mv_memory,
-                        scheduler,
-                        runnable,
-                        arms,
-                        tx_version: &tx_version,
-                        vis,
-                        wrote_new_location: false,
-                        invalid: &invalid,
-                    });
-                    let learn_ns = learn_t0.elapsed().as_nanos() as u64;
-                    super::busy_stall::charge_span(
-                        super::busy_stall::KIND_LEARN,
-                        learn_ns,
-                        learn_t0,
-                        tx_version.tx_idx as u32,
-                        super::busy_stall::PRED_NONE,
-                        tx_version.tx_incarnation as u16,
-                        learn_ns,
-                    );
-                } else {
-                    resolve_plan::apply(plan, ApplyCtx {
-                        specfence,
-                        mv_memory,
-                        scheduler,
-                        runnable,
-                        arms,
-                        tx_version: &tx_version,
-                        vis,
-                        wrote_new_location: false,
-                        invalid: &invalid,
-                    });
                 }
                 let val_ns = phase_v0.elapsed().as_nanos() as u64;
                 metrics.add_phase_val(val_ns);
@@ -629,6 +584,66 @@ pub(crate) fn run_sf_block<F, V>(
             }
         }
     }
+}
+
+/// Validate and apply until a Commit is accepted or the plan aborts.
+///
+/// A Commit computed before a lower writer's publish is rejected via
+/// [`Scheduler::try_commit_if_clean`]. Re-validate instead of sticking it.
+fn apply_resolving(
+    tx_version: &TxVersion,
+    vis: VisibilityPolicy,
+    wrote_new_location: bool,
+    specfence: SpecFenceCtx<'_>,
+    mv_memory: &MvMemory,
+    scheduler: &Scheduler,
+    runnable: &RunnableSet,
+    arms: &ArmTable,
+    validate_to_plan: &mut impl FnMut(
+        &TxVersion,
+        VisibilityPolicy,
+    ) -> (super::ResolvePlan, Vec<crate::MemoryLocationHash>),
+) {
+    for _ in 0..8 {
+        let (plan, invalid) = validate_to_plan(tx_version, vis);
+        let retry = resolve_plan::apply(
+            plan,
+            ApplyCtx {
+                specfence,
+                mv_memory,
+                scheduler,
+                runnable,
+                arms,
+                tx_version,
+                vis,
+                wrote_new_location,
+                invalid: &invalid,
+            },
+        );
+        if !retry {
+            return;
+        }
+    }
+    let (plan, invalid) = validate_to_plan(tx_version, vis);
+    let plan = if plan.commits() {
+        super::ResolvePlan::FullReplay
+    } else {
+        plan
+    };
+    let _ = resolve_plan::apply(
+        plan,
+        ApplyCtx {
+            specfence,
+            mv_memory,
+            scheduler,
+            runnable,
+            arms,
+            tx_version,
+            vis,
+            wrote_new_location,
+            invalid: &invalid,
+        },
+    );
 }
 
 fn origin_ns(specfence: SpecFenceCtx<'_>) -> u64 {

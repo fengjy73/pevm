@@ -194,6 +194,7 @@ mod finegrain;
 mod heat;
 mod hotset;
 mod ideal_prox;
+pub(crate) mod inblock_trace;
 pub(crate) mod inflation;
 #[cfg(test)]
 mod kernel;
@@ -293,6 +294,7 @@ pub(crate) use ideal_prox::IdealProxLog;
 pub use ideal_prox::{
     IdealProxDiff, IdealProxSnap, IdealProxTx, blocker_name, diff_indep, role_name,
 };
+pub use inblock_trace::{InblockSnap, reset as inblock_reset, snapshot as inblock_snapshot};
 pub use inflation::{
     Attempt as InflationAttempt, BoundGuard as InflationBoundGuard, BoundarySnap, InflationAlloc,
     InflationDrain, SeqTx as InflationSeqTx, TAG_OCC, TAG_SEQ_TX, TAG_SEQ_VM, TAG_SF,
