@@ -10,6 +10,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, RwLock};
 
+use alloy_primitives::U256;
 use hashbrown::HashMap;
 use rustc_hash::FxBuildHasher;
 use smallvec::SmallVec;
@@ -29,6 +30,9 @@ const ST_EMPTY: u64 = 0;
 const ST_PREDICTED: u64 = 1;
 const ST_RUNNING: u64 = 2;
 const ST_PUBLISHED: u64 = 3;
+/// Packed above the incarnation. A delta is an input-determined credit and
+/// is not a read or admission blocker.
+const KIND_DELTA: u64 = 1 << 18;
 
 /// How transactions are grouped before a location is predicted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +74,8 @@ struct Chain {
     fail: AtomicU64,
     class_seeded: AtomicBool,
     live: AtomicBool,
+    /// Basic-account hash this slot was allocated for.
+    loc: AtomicU64,
 }
 
 impl Chain {
@@ -86,6 +92,7 @@ impl Chain {
             fail: AtomicU64::new(1),
             class_seeded: AtomicBool::new(false),
             live: AtomicBool::new(false),
+            loc: AtomicU64::new(0),
         }
     }
 
@@ -106,6 +113,7 @@ impl Chain {
         self.fail.store(1, Ordering::Relaxed);
         self.class_seeded.store(false, Ordering::Relaxed);
         self.live.store(false, Ordering::Relaxed);
+        self.loc.store(0, Ordering::Relaxed);
     }
 
     fn set_member(&self, tx: TxIdx) {
@@ -149,12 +157,51 @@ impl Chain {
         }
     }
 
-    const fn pack(state: u64, incarnation: usize) -> u64 {
-        state | ((incarnation as u64 & 0xffff) << 2)
+    /// Highest member below `tx` that is not an input-determined credit.
+    fn nearest_blocker(&self, tx: TxIdx) -> Option<TxIdx> {
+        if tx == 0 {
+            return None;
+        }
+        let mut i = tx - 1;
+        loop {
+            let word = i / 64;
+            let bit = i % 64;
+            let mask = if bit == 63 {
+                u64::MAX
+            } else {
+                (1u64 << (bit + 1)) - 1
+            };
+            let mut bits = self.member[word].load(Ordering::Acquire) & mask;
+            while bits != 0 {
+                let highest = 63 - bits.leading_zeros() as usize;
+                let member = word * 64 + highest;
+                if member < self.state.len() {
+                    let raw = self.state[member].load(Ordering::Acquire);
+                    let (state, _) = Self::unpack(raw);
+                    if state != ST_EMPTY && !Self::is_delta(raw) {
+                        return Some(member);
+                    }
+                }
+                bits &= !(1u64 << highest);
+            }
+            if word == 0 {
+                return None;
+            }
+            i = word * 64 - 1;
+        }
+    }
+
+    const fn pack(state: u64, incarnation: usize, delta: bool) -> u64 {
+        let kind = if delta { KIND_DELTA } else { 0 };
+        state | ((incarnation as u64 & 0xffff) << 2) | kind
     }
 
     const fn unpack(raw: u64) -> (u64, usize) {
         (raw & 0b11, ((raw >> 2) & 0xffff) as usize)
+    }
+
+    const fn is_delta(raw: u64) -> bool {
+        raw & KIND_DELTA != 0
     }
 
     fn popcount(&self) -> usize {
@@ -220,6 +267,10 @@ pub(crate) struct LiveChain {
     /// One worker already runs and commits in index order. The chain would
     /// only add directory locks and allocations.
     serial: bool,
+    /// `plain[tx]` is a value credit to `to_of[tx]` whose amount is `credits[tx]`.
+    /// The recipient has no code, so the credit does not read that account.
+    plain: Vec<bool>,
+    credits: Vec<[AtomicU64; 4]>,
 }
 
 impl LiveChain {
@@ -255,6 +306,8 @@ impl LiveChain {
             skip: std::sync::atomic::AtomicU64::new(0),
             skip_on: AtomicBool::new(false),
             serial: false,
+            plain: Vec::new(),
+            credits: Vec::new(),
         }
     }
 
@@ -287,7 +340,45 @@ impl LiveChain {
             skip: std::sync::atomic::AtomicU64::new(0),
             skip_on: AtomicBool::new(false),
             serial: true,
+            plain: Vec::new(),
+            credits: Vec::new(),
         }
+    }
+
+    /// Input amounts for plain credits. Called before workers start.
+    pub(crate) fn install_credits(&mut self, values: Vec<U256>, plain: Vec<bool>) {
+        self.credits = values
+            .into_iter()
+            .map(|value| {
+                let limbs = value.as_limbs();
+                [
+                    AtomicU64::new(limbs[0]),
+                    AtomicU64::new(limbs[1]),
+                    AtomicU64::new(limbs[2]),
+                    AtomicU64::new(limbs[3]),
+                ]
+            })
+            .collect();
+        self.plain = plain;
+    }
+
+    fn credit_of(&self, tx: TxIdx) -> U256 {
+        let Some(slot) = self.credits.get(tx) else {
+            return U256::ZERO;
+        };
+        U256::from_limbs([
+            slot[0].load(Ordering::Relaxed),
+            slot[1].load(Ordering::Relaxed),
+            slot[2].load(Ordering::Relaxed),
+            slot[3].load(Ordering::Relaxed),
+        ])
+    }
+
+    /// Plain transfer credit onto `location`: recipient has no code, amount is tx value.
+    fn is_plain_credit(&self, location: u64, tx: TxIdx) -> bool {
+        self.plain.get(tx).copied().unwrap_or(false)
+            && self.to_of.get(tx).copied() == Some(location)
+            && location != 0
     }
 
     /// Ignore this location in the ordered chains. Used for the beneficiary.
@@ -364,7 +455,8 @@ impl LiveChain {
                 chain.writers.fetch_add(1, Ordering::Relaxed);
             }
             chain.set_member(tx);
-            chain.state[tx].store(Chain::pack(ST_PREDICTED, 0), Ordering::Release);
+            let delta = self.is_plain_credit(location, tx);
+            chain.state[tx].store(Chain::pack(ST_PREDICTED, 0, delta), Ordering::Release);
             self.remember(tx, idx, false);
         }
     }
@@ -434,6 +526,7 @@ impl LiveChain {
         if used < k_max {
             let idx = used;
             self.chains[idx].reset_slot();
+            self.chains[idx].loc.store(location, Ordering::Relaxed);
             self.chains[idx].live.store(true, Ordering::Release);
             if pin {
                 self.chains[idx].pinned.store(true, Ordering::Relaxed);
@@ -466,6 +559,7 @@ impl LiveChain {
         {
             self.detach(idx);
             self.chains[idx].reset_slot();
+            self.chains[idx].loc.store(location, Ordering::Relaxed);
             self.chains[idx].live.store(true, Ordering::Release);
             if pin {
                 self.chains[idx].pinned.store(true, Ordering::Relaxed);
@@ -488,6 +582,97 @@ impl LiveChain {
     pub(crate) fn nearest_lower(&self, location: u64, tx: TxIdx) -> Option<TxIdx> {
         let idx = self.slot_of(location)?;
         self.chains[idx].nearest_lower(tx)
+    }
+
+    /// Nearest lower read-modify-write member. Delta credits are not blockers.
+    pub(crate) fn nearest_blocker(&self, location: u64, tx: TxIdx) -> Option<TxIdx> {
+        let idx = self.slot_of(location)?;
+        self.chains[idx].nearest_blocker(tx)
+    }
+
+    pub(crate) fn member_is_delta(&self, location: u64, tx: TxIdx) -> bool {
+        let Some(idx) = self.slot_of(location) else {
+            return false;
+        };
+        if tx >= self.n {
+            return false;
+        }
+        Chain::is_delta(self.chains[idx].state[tx].load(Ordering::Acquire))
+    }
+
+    /// Delta members in `[start, end)`, with the input credit.
+    pub(crate) fn for_each_delta(
+        &self,
+        location: u64,
+        start: TxIdx,
+        end: TxIdx,
+        mut f: impl FnMut(TxIdx, U256),
+    ) {
+        if self.serial || start >= end {
+            return;
+        }
+        let Some(idx) = self.slot_of(location) else {
+            return;
+        };
+        let chain = &self.chains[idx];
+        let last = end.min(self.n);
+        let mut tx = start;
+        while tx < last {
+            let word = tx / 64;
+            let bits = chain
+                .member
+                .get(word)
+                .map(|w| w.load(Ordering::Acquire))
+                .unwrap_or(0);
+            if bits == 0 {
+                tx = (word + 1) * 64;
+                continue;
+            }
+            let base = word * 64;
+            let mut bit = tx - base;
+            while bit < 64 && base + bit < last {
+                if bits & (1u64 << bit) != 0 {
+                    let member = base + bit;
+                    let raw = chain.state[member].load(Ordering::Acquire);
+                    if Chain::is_delta(raw) && Chain::unpack(raw).0 != ST_EMPTY {
+                        f(member, self.credit_of(member));
+                    }
+                }
+                bit += 1;
+            }
+            tx = (word + 1) * 64;
+        }
+    }
+
+    /// `(location, tx, kind)` for the timeline. Kind 1 is a delta.
+    pub(crate) fn visit_members(&self, mut f: impl FnMut(u64, TxIdx, u8)) {
+        if self.serial || !self.any.load(Ordering::Relaxed) {
+            return;
+        }
+        let dir = self.dir.read().unwrap();
+        for (&location, &idx) in &dir.index {
+            let chain = &self.chains[idx];
+            for (word_i, word) in chain.member.iter().enumerate() {
+                let bits = word.load(Ordering::Relaxed);
+                if bits == 0 {
+                    continue;
+                }
+                for bit in 0..64 {
+                    if bits & (1u64 << bit) == 0 {
+                        continue;
+                    }
+                    let tx = word_i * 64 + bit;
+                    if tx >= self.n {
+                        break;
+                    }
+                    let raw = chain.state[tx].load(Ordering::Relaxed);
+                    if Chain::unpack(raw).0 == ST_EMPTY {
+                        continue;
+                    }
+                    f(location, tx, u8::from(Chain::is_delta(raw)));
+                }
+            }
+        }
     }
 
     pub(crate) fn is_armed(&self, location: u64) -> bool {
@@ -580,7 +765,7 @@ impl LiveChain {
         let mut best: Option<TxIdx> = None;
         for entry in mem.iter().filter(|entry| entry.admit) {
             let chain = &self.chains[entry.slot as usize];
-            let Some(pred) = chain.nearest_lower(tx) else {
+            let Some(pred) = chain.nearest_blocker(tx) else {
                 continue;
             };
             let (state, _) = Chain::unpack(chain.state[pred].load(Ordering::Acquire));
@@ -606,9 +791,13 @@ impl LiveChain {
         let mem = self.membership[tx].lock().unwrap().clone();
         for entry in mem {
             let chain = &self.chains[entry.slot as usize];
-            let (state, _) = Chain::unpack(chain.state[tx].load(Ordering::Acquire));
+            let raw = chain.state[tx].load(Ordering::Acquire);
+            let (state, _) = Chain::unpack(raw);
             if state == ST_PREDICTED || state == ST_RUNNING {
-                chain.state[tx].store(Chain::pack(ST_RUNNING, incarnation), Ordering::Release);
+                chain.state[tx].store(
+                    Chain::pack(ST_RUNNING, incarnation, Chain::is_delta(raw)),
+                    Ordering::Release,
+                );
             }
         }
     }
@@ -747,6 +936,7 @@ impl LiveChain {
         incarnation: usize,
         location: u64,
         rmw: bool,
+        lazy_credit: bool,
         tx_open: impl Fn(TxIdx) -> bool,
     ) {
         if self.serial {
@@ -756,7 +946,7 @@ impl LiveChain {
             return;
         }
         if let Some(idx) = self.slot_of(location) {
-            self.mark_published(idx, tx, incarnation, rmw);
+            self.mark_published(idx, tx, incarnation, rmw, lazy_credit);
             return;
         }
         let class = self.class_of_tx.get(tx).copied().unwrap_or(u16::MAX);
@@ -770,7 +960,7 @@ impl LiveChain {
         let mut seen = self.seen.lock().unwrap();
         if let Some(idx) = self.slot_of(location) {
             drop(seen);
-            self.mark_published(idx, tx, incarnation, rmw);
+            self.mark_published(idx, tx, incarnation, rmw, lazy_credit);
             return;
         }
         // Same-class prediction is a read-then-write edge. Blind and lazy
@@ -782,13 +972,13 @@ impl LiveChain {
             // First publisher is visible immediately when a slot is free.
             // Readers then wait for that write instead of for a second publisher.
             if let Some(idx) = self.ensure_slot(location, 1, false) {
-                self.mark_published(idx, tx, incarnation, rmw);
+                self.mark_published(idx, tx, incarnation, rmw, lazy_credit);
                 return;
             }
             let mut seen = self.seen.lock().unwrap();
             if let Some(idx) = self.slot_of(location) {
                 drop(seen);
-                self.mark_published(idx, tx, incarnation, rmw);
+                self.mark_published(idx, tx, incarnation, rmw, lazy_credit);
                 return;
             }
             seen.insert(
@@ -821,27 +1011,43 @@ impl LiveChain {
         };
         drop(seen);
         if let Some(prev) = prev {
-            self.mark_published(idx, prev.tx, prev.incarnation, prev.rmw);
+            self.mark_published(idx, prev.tx, prev.incarnation, prev.rmw, false);
         }
-        self.mark_published(idx, tx, incarnation, rmw);
+        self.mark_published(idx, tx, incarnation, rmw, lazy_credit);
         if open_for_class {
             self.chains[idx].pinned.store(true, Ordering::Relaxed);
             self.predict_siblings(idx, tx, class, &tx_open, rmw);
         }
     }
 
-    fn mark_published(&self, idx: usize, tx: TxIdx, incarnation: usize, admit: bool) {
+    fn mark_published(
+        &self,
+        idx: usize,
+        tx: TxIdx,
+        incarnation: usize,
+        rmw: bool,
+        lazy_credit: bool,
+    ) {
         if tx >= self.n {
             return;
         }
         let chain = &self.chains[idx];
-        let prev = Chain::unpack(chain.state[tx].load(Ordering::Acquire)).0;
+        let raw = chain.state[tx].load(Ordering::Acquire);
+        let prev = Chain::unpack(raw).0;
         if prev == ST_EMPTY {
             chain.writers.fetch_add(1, Ordering::Relaxed);
         }
         chain.set_member(tx);
-        chain.state[tx].store(Chain::pack(ST_PUBLISHED, incarnation), Ordering::Release);
-        if admit {
+        // A predicted credit stays a delta when the write is still a lazy
+        // credit. A non-lazy write is an RMW and becomes a blocker.
+        let loc = chain.loc.load(Ordering::Relaxed);
+        let delta = lazy_credit && !rmw && (Chain::is_delta(raw) || self.is_plain_credit(loc, tx));
+        chain.state[tx].store(
+            Chain::pack(ST_PUBLISHED, incarnation, delta),
+            Ordering::Release,
+        );
+        // Deltas are not admission edges. RMW joins the admission list.
+        if rmw && !delta {
             self.remember(tx, idx, true);
         } else {
             self.remember(tx, idx, false);
@@ -909,9 +1115,13 @@ impl LiveChain {
             let (state, _) = Chain::unpack(chain.state[member].load(Ordering::Acquire));
             if state == ST_EMPTY {
                 chain.set_member(member);
-                chain.state[member].store(Chain::pack(ST_PREDICTED, 0), Ordering::Release);
+                let loc = chain.loc.load(Ordering::Relaxed);
+                let delta = self.is_plain_credit(loc, member);
+                chain.state[member].store(Chain::pack(ST_PREDICTED, 0, delta), Ordering::Release);
                 chain.writers.fetch_add(1, Ordering::Relaxed);
-                self.remember(member, idx, admit);
+                // A plain credit is not an admission edge even when the class
+                // was opened by a conflict.
+                self.remember(member, idx, admit && !delta);
             }
         }
     }
@@ -965,7 +1175,13 @@ impl LiveChain {
         }
     }
 
-    pub(crate) fn note_backfill_writer(&self, location: u64, tx: TxIdx, incarnation: usize) {
+    pub(crate) fn note_backfill_writer(
+        &self,
+        location: u64,
+        tx: TxIdx,
+        incarnation: usize,
+        delta: bool,
+    ) {
         let Some(idx) = self.slot_of(location) else {
             return;
         };
@@ -976,7 +1192,10 @@ impl LiveChain {
             chain.writers.fetch_add(1, Ordering::Relaxed);
         }
         if state != ST_PUBLISHED {
-            chain.state[tx].store(Chain::pack(ST_PUBLISHED, incarnation), Ordering::Release);
+            chain.state[tx].store(
+                Chain::pack(ST_PUBLISHED, incarnation, delta),
+                Ordering::Release,
+            );
         }
     }
 
@@ -989,7 +1208,11 @@ impl LiveChain {
             let chain = &self.chains[idx];
             chain.pinned.store(true, Ordering::Relaxed);
             chain.set_member(tx);
-            chain.state[tx].store(Chain::pack(ST_PREDICTED, incarnation), Ordering::Release);
+            let delta = self.is_plain_credit(location, tx);
+            chain.state[tx].store(
+                Chain::pack(ST_PREDICTED, incarnation, delta),
+                Ordering::Release,
+            );
             chain.armed.store(true, Ordering::Release);
             // Keep an admit bit that a read-then-write already set.
             self.remember(tx, idx, false);
@@ -1113,6 +1336,7 @@ impl LiveChain {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_primitives::U256;
 
     #[test]
     fn preseed_arms_recipient_without_admission() {
@@ -1125,7 +1349,7 @@ mod tests {
         assert_eq!(live.nearest_lower(10, 2), Some(0));
         assert!(live.admission_predecessor(3).is_none());
         assert_eq!(live.writer_state(10, 0).0, ST_PREDICTED);
-        live.publish_write(0, 0, 10, false, |_| true);
+        live.publish_write(0, 0, 10, false, false, |_| true);
         assert_eq!(live.writer_state(10, 0).0, ST_PUBLISHED);
         assert!(live.admission_predecessor(2).is_none());
     }
@@ -1142,7 +1366,7 @@ mod tests {
             vec![0, 0, 0],
             vec![10, 10, 10],
         );
-        live.publish_write(0, 0, 77, true, |_| true);
+        live.publish_write(0, 0, 77, true, false, |_| true);
         assert!(live.is_armed(77));
         // No conflict yet: only the publisher is a writer. Classmates are not
         // predicted, and the class head does not run.
@@ -1169,7 +1393,7 @@ mod tests {
             vec![0, 0, 0],
             vec![10, 10, 10],
         );
-        blind.publish_write(0, 0, 88, false, |_| true);
+        blind.publish_write(0, 0, 88, false, false, |_| true);
         assert!(blind.is_armed(88));
         assert_eq!(blind.writer_state(88, 0).0, ST_PUBLISHED);
         assert_eq!(blind.writer_state(88, 1).0, ST_EMPTY);
@@ -1187,5 +1411,40 @@ mod tests {
             vec![10, 10, 10],
         );
         assert!(plain.class_head(2).is_none());
+    }
+
+    #[test]
+    fn plain_credit_does_not_block_or_admit() {
+        let n = 4;
+        let location = 10u64;
+        let mut live = LiveChain::new(n, ClassKeyKind::ToSelector);
+        live.install_classes(
+            Vec::new(),
+            vec![u16::MAX; n],
+            vec![location, location, location, 0],
+        );
+        live.install_credits(
+            vec![U256::from(5), U256::from(7), U256::from(9), U256::ZERO],
+            vec![true, true, true, false],
+        );
+        live.preseed_recipients();
+        assert!(live.member_is_delta(location, 0));
+        assert!(live.member_is_delta(location, 2));
+        assert_eq!(live.nearest_lower(location, 3), Some(2));
+        assert_eq!(live.nearest_blocker(location, 3), None);
+        assert!(live.admission_predecessor(2).is_none());
+        live.publish_write(1, 0, location, true, false, |_| true);
+        assert!(!live.member_is_delta(location, 1));
+        assert_eq!(live.nearest_blocker(location, 3), Some(1));
+        live.publish_write(0, 0, location, false, true, |_| true);
+        assert!(live.member_is_delta(location, 0));
+        assert!(live.admission_predecessor(3).is_none());
+        let mut seen = Vec::new();
+        live.for_each_delta(location, 0, 3, |tx, amount| seen.push((tx, amount)));
+        assert!(
+            seen.iter()
+                .any(|(tx, amount)| *tx == 2 && *amount == U256::from(9))
+        );
+        assert!(seen.iter().all(|(tx, _)| *tx != 1));
     }
 }

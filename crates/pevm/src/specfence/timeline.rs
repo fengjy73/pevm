@@ -324,7 +324,21 @@ impl Timeline {
             }
             let _ = write!(file, "[{tx},{loc},{lazy}]");
         }
-        let _ = write!(file, "],\"sender\":[");
+        let _ = write!(file, "],\"members\":[");
+        let mut member_i = 0usize;
+        live.visit_members(|loc, tx, kind| {
+            if member_i > 0 {
+                let _ = write!(file, ",");
+            }
+            member_i += 1;
+            let _ = write!(file, "[{loc},{tx},{kind}]");
+        });
+        let _ = write!(
+            file,
+            "],\"delta_mismatch\":{},\"delta_abort\":{},\"sender\":[",
+            trace.delta_mismatch.load(Ordering::Relaxed),
+            trace.delta_abort.load(Ordering::Relaxed),
+        );
         first = true;
         for (tx, prev) in prev_sender.iter().enumerate() {
             let Some(prev) = prev else {

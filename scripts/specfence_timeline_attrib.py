@@ -232,13 +232,34 @@ def park_rows(spans: list[dict]) -> list[dict]:
     return [sp for sp in spans if sp["kind"] == PARK]
 
 
+def merge_coverage(intervals: list[tuple[int, int]]) -> int:
+    """Wall-clock union of [t0, t1). Overlapping residences count once."""
+    if not intervals:
+        return 0
+    ordered = sorted((a, b) for a, b in intervals if b > a)
+    if not ordered:
+        return 0
+    total = 0
+    cur_a, cur_b = ordered[0]
+    for a, b in ordered[1:]:
+        if a <= cur_b:
+            cur_b = max(cur_b, b)
+        else:
+            total += cur_b - cur_a
+            cur_a, cur_b = a, b
+    total += cur_b - cur_a
+    return total
+
+
 def group_parks(parks: list[dict]) -> list[dict]:
     box: dict[tuple, int] = defaultdict(int)
     cnt: dict[tuple, int] = defaultdict(int)
+    spans: dict[tuple, list[tuple[int, int]]] = defaultdict(list)
     for sp in parks:
         key = (sp["reason"], sp["loc"], sp["class"] if sp["class"] is not None else -1)
         box[key] += sp["ns"]
         cnt[key] += 1
+        spans[key].append((sp["t0"], sp["t1"]))
     rows = []
     for (reason, loc, cls), ns in box.items():
         rows.append(
@@ -248,12 +269,37 @@ def group_parks(parks: list[dict]) -> list[dict]:
                 "loc": f"{loc:016x}" if loc else "-",
                 "class": cls,
                 "ns": ns,
-                "n": cnt[(reason, loc, cls if cls != -1 else -1)],
+                "coverage_ns": merge_coverage(spans[(reason, loc, cls)]),
+                "n": cnt[(reason, loc, cls)],
             }
         )
     # fix count key: class -1 was stored as -1 in both
-    rows.sort(key=lambda r: -r["ns"])
+    rows.sort(key=lambda r: -r["coverage_ns"])
     return rows
+
+
+def park_coverage(parks: list[dict]) -> dict[str, dict]:
+    """Residence sum can exceed wall × threads: a parked tx keeps its clock
+    while the worker runs something else, and many txs overlap.
+
+    Coverage is the union of those intervals and cannot exceed the wall.
+    """
+    by_reason: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    residence: dict[str, int] = defaultdict(int)
+    counts: dict[str, int] = defaultdict(int)
+    for sp in parks:
+        name = REASON.get(sp["reason"], str(sp["reason"]))
+        by_reason[name].append((sp["t0"], sp["t1"]))
+        residence[name] += sp["ns"]
+        counts[name] += 1
+    out = {}
+    for name, intervals in by_reason.items():
+        out[name] = {
+            "n": counts[name],
+            "residence_ms": ms(residence[name]),
+            "coverage_ms": ms(merge_coverage(intervals)),
+        }
+    return out
 
 
 def armed_excess(parks: list[dict], txs: list[dict]) -> dict:
@@ -479,6 +525,85 @@ def critical_path(txs: list[dict], parks: list[dict], true_edges: list[tuple[int
     return segs
 
 
+def writer_chain(row: dict, txs: list[dict]) -> dict:
+    """Non-lazy writers of the hottest location.
+
+    A hop is one non-lazy writer to the next higher one. Intervening writes
+    are chain members between them. `kind` 1 in `members` is a delta and is
+    not a blocker; kind 0 (or a dump with no kinds) counts as a blocker.
+    """
+    ben = int(row.get("beneficiary") or 0)
+    by_loc: dict[int, list[tuple[int, bool]]] = defaultdict(list)
+    for tx, loc, lazy in row.get("writes") or []:
+        loc = int(loc)
+        if loc == ben:
+            continue
+        by_loc[loc].append((int(tx), bool(lazy)))
+    if not by_loc:
+        return {}
+    loc, writers = max(by_loc.items(), key=lambda kv: sum(1 for _tx, lazy in kv[1] if not lazy))
+    nonlazy = sorted({tx for tx, lazy in writers if not lazy})
+    lazy_set = {tx for tx, lazy in writers if lazy}
+    kinds: dict[int, int] = {}
+    for raw in row.get("members") or []:
+        mloc, mtx, kind = int(raw[0]), int(raw[1]), int(raw[2])
+        if mloc == loc:
+            kinds[mtx] = kind
+    hops = []
+    gap_ns = 0
+    after_prev_end = 0
+    blockers = []
+    intervening = []
+    exec_ns = 0
+    for tx in nonlazy:
+        meta = txs[tx] if tx < len(txs) else None
+        if meta and meta["start"] is not None and meta["end"] is not None and meta["end"] >= meta["start"]:
+            exec_ns += meta["end"] - meta["start"]
+    for a, b in zip(nonlazy, nonlazy[1:]):
+        left = txs[a] if a < len(txs) else None
+        right = txs[b] if b < len(txs) else None
+        if left and right and left["end"] is not None and right["start"] is not None:
+            gap = right["start"] - left["end"]
+            gap_ns += max(0, gap)
+            if right["start"] >= left["end"]:
+                after_prev_end += 1
+        between = range(a + 1, b)
+        n_between = 0
+        n_block = 0
+        for tx in between:
+            wrote = tx in lazy_set or tx in set(nonlazy)
+            known = tx in kinds
+            if not wrote and not known:
+                continue
+            n_between += 1
+            # No kind dump: every intervening writer was a blocker.
+            if not kinds or kinds.get(tx, 0) == 0:
+                n_block += 1
+        intervening.append(n_between)
+        blockers.append(n_block)
+        hops.append(1)
+    starts = [txs[tx]["start"] for tx in nonlazy if tx < len(txs) and txs[tx]["start"] is not None]
+    ends = [txs[tx]["end"] for tx in nonlazy if tx < len(txs) and txs[tx]["end"] is not None]
+    span = (max(ends) - min(starts)) if starts and ends else 0
+
+    def avg(xs: list[int]) -> float:
+        return (sum(xs) / len(xs)) if xs else 0.0
+
+    return {
+        "loc": f"{loc:016x}",
+        "writers": len(nonlazy),
+        "exec_ms": ms(exec_ns),
+        "span_ms": ms(span),
+        "hops": len(hops),
+        "hops_after_prev_end": after_prev_end,
+        "gap_ms": ms(gap_ns),
+        "intervening_per_hop": round(avg(intervening), 2),
+        "blockers_per_hop": round(avg(blockers), 2),
+        "intervening_max": max(intervening) if intervening else 0,
+        "blockers_max": max(blockers) if blockers else 0,
+    }
+
+
 def cyc_ms(row: dict) -> dict[str, float]:
     cycles = row.get("cyc") or []
     scale = float(row.get("ns_per_cycle") or 0.0)
@@ -536,6 +661,8 @@ def analyze(row: dict) -> dict:
         park_by[name] += sp["ns"]
         park_n[name] += 1
     top = group_parks(parks)[:12]
+    coverage = park_coverage(parks)
+    chain = writer_chain(row, txs)
     inline_by: dict[str, int] = defaultdict(int)
     for sp in spans:
         if sp["kind"] == INLINE:
@@ -577,6 +704,8 @@ def analyze(row: dict) -> dict:
         "post_ms": post,
         "park_ms": {k: ms(v) for k, v in park_by.items()},
         "park_n": dict(park_n),
+        "park_coverage": coverage,
+        "writer_chain": chain,
         "inline_ms": {k: ms(v) for k, v in inline_by.items()},
         "armed": excess,
         "class_head": false_class,
@@ -621,6 +750,14 @@ def main() -> None:
         ])
         print("  post", {k: round(v, 3) for k, v in rep_row["post_ms"].items()})
         print("  park_ms", {k: round(v, 3) for k, v in rep_row["park_ms"].items()}, "n", rep_row["park_n"])
+        print(
+            "  park_coverage",
+            {
+                k: (round(v["coverage_ms"], 3), round(v["residence_ms"], 3), v["n"])
+                for k, v in rep_row["park_coverage"].items()
+            },
+        )
+        print("  writer_chain", rep_row["writer_chain"])
         print("  inline_ms", {k: round(v, 3) for k, v in rep_row["inline_ms"].items()})
         print("  armed", rep_row["armed"])
         print("  class_head", rep_row["class_head"])
@@ -628,7 +765,14 @@ def main() -> None:
         print("  cyc_ms", {k: round(v, 3) for k, v in rep_row["cyc_ms"].items()})
         print("  cp", {k: round(v, 3) for k, v in rep_row["cp_ms"].items()})
         print("  top", [
-            (t["reason"], t["loc"], t["class"], round(t["ns"] / 1e6, 3), t["n"])
+            (
+                t["reason"],
+                t["loc"],
+                t["class"],
+                round(t["coverage_ns"] / 1e6, 3),
+                round(t["ns"] / 1e6, 3),
+                t["n"],
+            )
             for t in rep_row["top_parks"][:8]
         ])
 

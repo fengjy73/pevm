@@ -195,6 +195,8 @@ struct RunOut {
     tx_ns: Vec<u64>,
     raw_edges: Vec<(u32, u32)>,
     beneficiary: u64,
+    delta_mismatch: usize,
+    delta_abort: usize,
     attempts: Vec<SfAttempt>,
 }
 
@@ -256,6 +258,8 @@ fn run_once(loaded: &Loaded, engine: &str, workers: usize, seq_cpus: &[usize]) -
         tx_ns: Vec::new(),
         raw_edges: Vec::new(),
         beneficiary: 0,
+        delta_mismatch: 0,
+        delta_abort: 0,
         attempts: Vec::new(),
     };
     if engine == "sf"
@@ -272,6 +276,8 @@ fn run_once(loaded: &Loaded, engine: &str, workers: usize, seq_cpus: &[usize]) -
         out.tx_ns = trace.tx_ns;
         out.raw_edges = trace.raw_edges;
         out.beneficiary = trace.beneficiary;
+        out.delta_mismatch = trace.delta_mismatch;
+        out.delta_abort = trace.delta_abort;
         out.attempts = trace.attempts;
     }
     let _ = result;
@@ -347,6 +353,8 @@ fn write_row(
         "reads_after_arm": row.reads_after_arm,
         "full_replay_after_arm": row.full_replay_after_arm,
         "chain_len": row.chain_len,
+        "delta_mismatch": row.delta_mismatch,
+        "delta_abort": row.delta_abort,
         "armed": row.armed,
         "exec_entries": row.exec_entries,
         "class_key": row.class_key,
@@ -366,7 +374,7 @@ fn write_row(
     });
     writeln!(out, "{line}").expect("write row");
     println!(
-        "ROW block={} engine={} round={} workers={} wall_ms={:.3} ok={} reexec={} full_replay={} chain_len={} class_key={}",
+        "ROW block={} engine={} round={} workers={} wall_ms={:.3} ok={} reexec={} full_replay={} chain_len={} delta_mismatch={} delta_abort={} class_key={}",
         loaded.block_no,
         engine,
         round,
@@ -376,6 +384,8 @@ fn write_row(
         row.reexec,
         row.full_replay,
         row.chain_len,
+        row.delta_mismatch,
+        row.delta_abort,
         row.class_key,
     );
 }
