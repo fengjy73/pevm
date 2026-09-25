@@ -293,6 +293,12 @@ where
                         rt.finish_ok(worker, tx);
                         if !serial {
                             close_from(worker, tx, n, rt, mv, live, trace, commit_mu, tl);
+                            // The next RMW on this location is ready once this
+                            // write is final. Pull it onto this worker so the
+                            // chain does not wait out unrelated queue delay.
+                            for succ in live.rmw_successors(tx) {
+                                rt.boost(worker, succ);
+                            }
                         }
                     }
                     Step::Yield => rt.defer(tx),

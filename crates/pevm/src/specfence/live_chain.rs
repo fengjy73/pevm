@@ -191,6 +191,36 @@ impl Chain {
         }
     }
 
+    /// Lowest member above `tx` that is not an input-determined credit.
+    fn next_blocker(&self, tx: TxIdx) -> Option<TxIdx> {
+        let mut i = tx.saturating_add(1);
+        if i >= self.state.len() {
+            return None;
+        }
+        loop {
+            let word = i / 64;
+            if word >= self.member.len() {
+                return None;
+            }
+            let bit = i % 64;
+            let mut bits = self.member[word].load(Ordering::Acquire) & (!0u64 << bit);
+            while bits != 0 {
+                let lowest = bits.trailing_zeros() as usize;
+                let member = word * 64 + lowest;
+                if member >= self.state.len() {
+                    return None;
+                }
+                let raw = self.state[member].load(Ordering::Acquire);
+                let (state, _) = Self::unpack(raw);
+                if state != ST_EMPTY && !Self::is_delta(raw) {
+                    return Some(member);
+                }
+                bits &= !(1u64 << lowest);
+            }
+            i = (word + 1) * 64;
+        }
+    }
+
     const fn pack(state: u64, incarnation: usize, delta: bool) -> u64 {
         let kind = if delta { KIND_DELTA } else { 0 };
         state | ((incarnation as u64 & 0xffff) << 2) | kind
@@ -588,6 +618,37 @@ impl LiveChain {
     pub(crate) fn nearest_blocker(&self, location: u64, tx: TxIdx) -> Option<TxIdx> {
         let idx = self.slot_of(location)?;
         self.chains[idx].nearest_blocker(tx)
+    }
+
+    /// Next RMW member above `tx` on each chain where `tx` itself is an RMW.
+    ///
+    /// The worker that just finished `tx` runs these next, so a serial
+    /// read-modify-write chain does not sit behind unrelated work.
+    pub(crate) fn rmw_successors(&self, tx: TxIdx) -> Vec<TxIdx> {
+        if self.serial || tx >= self.n {
+            return Vec::new();
+        }
+        let slots: Vec<u16> = self.membership[tx]
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|entry| entry.slot)
+            .collect();
+        let mut out = Vec::new();
+        for slot in slots {
+            let chain = &self.chains[slot as usize];
+            let raw = chain.state[tx].load(Ordering::Acquire);
+            let (state, _) = Chain::unpack(raw);
+            if state == ST_EMPTY || Chain::is_delta(raw) {
+                continue;
+            }
+            if let Some(next) = chain.next_blocker(tx)
+                && !out.contains(&next)
+            {
+                out.push(next);
+            }
+        }
+        out
     }
 
     pub(crate) fn member_is_delta(&self, location: u64, tx: TxIdx) -> bool {
@@ -1446,5 +1507,20 @@ mod tests {
                 .any(|(tx, amount)| *tx == 2 && *amount == U256::from(9))
         );
         assert!(seen.iter().all(|(tx, _)| *tx != 1));
+    }
+
+    #[test]
+    fn rmw_successor_skips_a_plain_credit() {
+        let n = 4;
+        let location = 10u64;
+        let mut live = LiveChain::new(n, ClassKeyKind::ToSelector);
+        live.install_classes(Vec::new(), vec![u16::MAX; n], vec![location; n]);
+        live.install_credits(
+            vec![U256::from(1), U256::ZERO, U256::from(4), U256::ZERO],
+            vec![true, false, true, false],
+        );
+        live.preseed_recipients();
+        assert_eq!(live.rmw_successors(1), vec![3]);
+        assert!(live.rmw_successors(0).is_empty());
     }
 }
