@@ -199,6 +199,9 @@ pub(crate) struct LiveChain {
     class_hit: Vec<AtomicU64>,
     class_miss: Vec<AtomicU64>,
     class_open: Vec<AtomicBool>,
+    /// Same-class head and sibling prediction stay off until this block records
+    /// a validation failure or abort for that class.
+    class_barrier: Vec<AtomicBool>,
     membership: Vec<Mutex<SmallVec<[SlotRef; 4]>>>,
     /// Abort cost estimate in nanoseconds. Moves inside [`C_ABORT_MIN`, `C_ABORT_MAX`].
     c_abort_ns: AtomicU64,
@@ -240,6 +243,7 @@ impl LiveChain {
             class_hit: Vec::new(),
             class_miss: Vec::new(),
             class_open: Vec::new(),
+            class_barrier: Vec::new(),
             membership: (0..n).map(|_| Mutex::new(SmallVec::new())).collect(),
             c_abort_ns: AtomicU64::new(50_000),
             wait_scale_q8: AtomicU64::new(256),
@@ -271,6 +275,7 @@ impl LiveChain {
             class_hit: Vec::new(),
             class_miss: Vec::new(),
             class_open: Vec::new(),
+            class_barrier: Vec::new(),
             membership: Vec::new(),
             c_abort_ns: AtomicU64::new(50_000),
             wait_scale_q8: AtomicU64::new(256),
@@ -301,6 +306,7 @@ impl LiveChain {
         self.class_hit = (0..n).map(|_| AtomicU64::new(1)).collect();
         self.class_miss = (0..n).map(|_| AtomicU64::new(1)).collect();
         self.class_open = (0..n).map(|_| AtomicBool::new(true)).collect();
+        self.class_barrier = (0..n).map(|_| AtomicBool::new(false)).collect();
         self.classes = classes;
         self.class_of_tx = class_of_tx;
         self.to_of = to_of;
@@ -630,8 +636,101 @@ impl LiveChain {
         if !group.contract {
             return None;
         }
+        // Off until this block has a conflict on the class. Classmates that
+        // do not share a location are not serialized by default.
+        if !self
+            .class_barrier
+            .get(class as usize)
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            return None;
+        }
         let head = *group.members.first()?;
         if head >= tx { None } else { Some(head) }
+    }
+
+    /// Turn the class-head barrier and same-class sibling prediction on.
+    pub(crate) fn note_class_conflict(&self, class: u16) {
+        if class == u16::MAX {
+            return;
+        }
+        if let Some(flag) = self.class_barrier.get(class as usize) {
+            flag.store(true, Ordering::Release);
+        }
+    }
+
+    /// `true` when a member in `[start, end)` is not yet a final write or a final hole.
+    ///
+    /// `start` is one past the read-from origin, or zero when the read saw
+    /// storage. Members below the origin are that writer's dependency, not
+    /// this reader's. `resolved(tx, chain_incarnation, published)` is the test.
+    pub(crate) fn any_unresolved_between(
+        &self,
+        location: u64,
+        start: TxIdx,
+        end: TxIdx,
+        mut resolved: impl FnMut(TxIdx, usize, bool) -> bool,
+    ) -> bool {
+        if self.serial || start >= end {
+            return false;
+        }
+        let Some(idx) = self.slot_of(location) else {
+            return false;
+        };
+        let chain = &self.chains[idx];
+        if !chain.armed.load(Ordering::Relaxed) {
+            return false;
+        }
+        let last = end.min(self.n);
+        let mut tx = start;
+        while tx < last {
+            let word = tx / 64;
+            let bits = chain
+                .member
+                .get(word)
+                .map(|w| w.load(Ordering::Acquire))
+                .unwrap_or(0);
+            if bits == 0 {
+                tx = (word + 1) * 64;
+                continue;
+            }
+            let base = word * 64;
+            let mut bit = tx - base;
+            while bit < 64 && base + bit < last {
+                if bits & (1u64 << bit) != 0 {
+                    let member = base + bit;
+                    let (state, inc) = Chain::unpack(chain.state[member].load(Ordering::Acquire));
+                    if state != ST_EMPTY && !resolved(member, inc, state == ST_PUBLISHED) {
+                        return true;
+                    }
+                }
+                bit += 1;
+            }
+            tx = (word + 1) * 64;
+        }
+        false
+    }
+
+    /// Locations this transaction is still a chain member of.
+    pub(crate) fn member_locations(&self, tx: TxIdx) -> Vec<u64> {
+        if self.serial || tx >= self.membership.len() {
+            return Vec::new();
+        }
+        let slots: Vec<u16> = self.membership[tx]
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|entry| entry.slot)
+            .collect();
+        if slots.is_empty() {
+            return Vec::new();
+        }
+        let dir = self.dir.read().unwrap();
+        dir.index
+            .iter()
+            .filter(|(_, slot)| slots.contains(&(**slot as u16)))
+            .map(|(location, _)| *location)
+            .collect()
     }
 
     /// Publish one write into the ordered chain.
@@ -765,6 +864,18 @@ impl LiveChain {
         tx_open: &impl Fn(TxIdx) -> bool,
         admit: bool,
     ) {
+        if class == u16::MAX {
+            return;
+        }
+        // No conflict in this class yet. The publisher is already on the chain;
+        // classmates are not guessed to be writers of this location.
+        if !self
+            .class_barrier
+            .get(class as usize)
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            return;
+        }
         let chain = &self.chains[idx];
         if chain.class_seeded.swap(true, Ordering::AcqRel) {
             return;
@@ -1033,9 +1144,19 @@ mod tests {
         );
         live.publish_write(0, 0, 77, true, |_| true);
         assert!(live.is_armed(77));
+        // No conflict yet: only the publisher is a writer. Classmates are not
+        // predicted, and the class head does not run.
+        assert_eq!(live.nearest_lower(77, 2), Some(0));
+        assert_eq!(live.writer_state(77, 1).0, ST_EMPTY);
+        assert!(live.admission_predecessor(2).is_none());
+        assert!(live.class_head(2).is_none());
+        live.note_class_conflict(0);
+        live.note_conflict_writer(77, 0, |_| true);
         assert_eq!(live.nearest_lower(77, 2), Some(1));
         assert_eq!(live.writer_state(77, 1).0, ST_PREDICTED);
-        assert_eq!(live.admission_predecessor(2), Some(1));
+        // Evidence inserts the classmate but does not add an admission edge.
+        // The class head is the barrier, and only after this conflict.
+        assert!(live.admission_predecessor(2).is_none());
         assert_eq!(live.class_head(2), Some(0));
         assert!(live.class_head(0).is_none());
 

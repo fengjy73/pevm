@@ -79,15 +79,18 @@ struct VmDb<'a, S: crate::Storage> {
 }
 
 impl<'a, S: crate::Storage> VmDb<'a, S> {
-    /// Armed locations settle only on the committed write. A `Published`
-    /// incarnation can still fail validation and store a different value.
-    /// Unarmed locations keep the publish mark; nothing has joined the chain
-    /// that a reader was required to wait for.
+    /// Armed locations settle on the final published incarnation, not on commit.
+    /// A published incarnation that has not closed can still be aborted.
+    /// Unarmed locations keep the publish mark.
     fn settled(&self, location: u64, pred: TxIdx) -> bool {
         if !self.chain.writer_published(location, pred) {
             return false;
         }
-        !self.chain.is_armed(location) || self.rt.committed() > pred
+        if !self.chain.is_armed(location) {
+            return true;
+        }
+        let (_, inc) = self.chain.writer_state(location, pred);
+        self.rt.is_final_inc(pred, inc)
     }
 
     fn finished_without_write(&self, location: u64, pred: TxIdx) -> bool {
@@ -95,8 +98,9 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
         if state == 0 || state == 3 {
             return false;
         }
-        // A finished-but-uncommitted attempt can still abort and write.
-        self.rt.committed() > pred
+        // Predicted or running, and this transaction's incarnation is final
+        // without a publish. Abort clears the flag, so a retry can still write.
+        self.rt.is_final_any(pred)
     }
 
     #[inline(always)]
@@ -241,7 +245,7 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
     /// Blocking on `tx-1` retries forever once that unrelated transaction has committed.
     fn sender_block(&self) -> ReadError {
         match self.prev_sender.get(self.tx_idx).copied().flatten() {
-            Some(pred) if !self.rt.is_committed(pred) && !self.rt.is_executed(pred) => {
+            Some(pred) if !self.rt.is_committed(pred) && !self.rt.is_final_any(pred) => {
                 super::timeline::set_block(super::timeline::NONCE, self.from_hash);
                 ReadError::Blocking(pred)
             }
@@ -402,14 +406,14 @@ fn confirm_read_chain(
     Ok(())
 }
 
-/// The nearest chain writer has either committed its published value or
-/// committed without writing this location (a hole the caller may skip).
+/// The nearest chain writer has a final published value, or is final without
+/// writing this location (a hole the caller may skip). Commit is not required.
 fn writer_final(chain: &LiveChain, rt: &Runtime, location: u64, pred: TxIdx) -> bool {
-    if rt.committed() <= pred {
-        return false;
+    let (state, inc) = chain.writer_state(location, pred);
+    if chain.writer_published(location, pred) {
+        return rt.is_final_inc(pred, inc);
     }
-    let (state, _) = chain.writer_state(location, pred);
-    chain.writer_published(location, pred) || (state != 0 && state != 3)
+    state != 0 && rt.is_final_any(pred)
 }
 
 fn mv_origin(serial: bool, tx_idx: TxIdx, incarnation: usize, value: &MemoryValue) -> SfReadOrigin {
@@ -766,6 +770,7 @@ impl<'a, S: crate::Storage, C: PevmChain> SfVm<'a, S, C> {
     ) -> Step {
         // The clock is the old ExecPhase regression when it runs on every
         // transaction. Wall-clock runs leave both flags off.
+        super::timeline::set_block(super::timeline::OTHER, 0);
         let mut exec_span = super::timeline::ExecSpan::begin(tx_idx);
         let clock = self.trace.timing().then(Instant::now);
         let _c_pre = super::timeline::CycGuard::enter(exec_span.hot(), super::timeline::CYC_PRE);
@@ -818,7 +823,7 @@ impl<'a, S: crate::Storage, C: PevmChain> SfVm<'a, S, C> {
                     ) {
                         if let Some(pred) = self.prev_sender.get(tx_idx).copied().flatten()
                             && !self.rt.is_committed(pred)
-                            && !self.rt.is_executed(pred)
+                            && !self.rt.is_final_any(pred)
                         {
                             super::timeline::set_block(super::timeline::NONCE, from_hash);
                             return Step::Block(pred);
@@ -1059,5 +1064,30 @@ impl<C: PevmChain, DB: Database> Handler for NoBeneficiaryHandler<C, DB> {
         _: &mut FrameResult,
     ) -> Result<(), Self::Error> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::writer_final;
+    use crate::specfence::live_chain::{ClassKeyKind, LiveChain};
+    use crate::specfence::rt::Runtime;
+
+    #[test]
+    fn armed_reader_accepts_a_final_write_before_commit() {
+        let n = 2;
+        let location = 10u64;
+        let mut live = LiveChain::new(n, ClassKeyKind::ToSelector);
+        live.install_classes(Vec::new(), vec![u16::MAX; n], vec![location, location]);
+        live.preseed_recipients();
+        live.publish_write(0, 0, location, false, |_| true);
+        let rt = Runtime::new(n, 2);
+        rt.seed();
+        assert_eq!(rt.pop(0).unwrap().0, 0);
+        rt.finish_ok(0, 0);
+        assert!(!writer_final(&live, &rt, location, 0));
+        assert!(rt.mark_validated(0, 0));
+        assert!(writer_final(&live, &rt, location, 0));
+        assert_eq!(rt.committed(), 0);
     }
 }

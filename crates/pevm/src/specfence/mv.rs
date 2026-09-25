@@ -80,6 +80,11 @@ type LazyAddresses = HashSet<Address, BuildSuffixHasher>;
 pub(crate) struct SfMv {
     pub(crate) data: DashMap<MemoryLocationHash, BTreeMap<TxIdx, MemoryEntry>, BuildIdentityHasher>,
     last_locations: Vec<Mutex<LastLocations>>,
+    /// Readers whose recorded origin names this writer. Not drained: a failed
+    /// close must be able to try again.
+    final_waiters: Vec<Mutex<Vec<TxIdx>>>,
+    /// Transactions that recorded a read of this location, in either order.
+    read_index: DashMap<MemoryLocationHash, Vec<TxIdx>, BuildIdentityHasher>,
     lazy_addresses: Mutex<LazyAddresses>,
     pub(crate) new_bytecodes: DashMap<B256, revm::state::Bytecode, BuildSuffixHasher>,
 }
@@ -103,6 +108,8 @@ impl SfMv {
         Self {
             data,
             last_locations: (0..block_size).map(|_| Mutex::default()).collect(),
+            final_waiters: (0..block_size).map(|_| Mutex::new(Vec::new())).collect(),
+            read_index: DashMap::default(),
             lazy_addresses: Mutex::new(LazyAddresses::from_iter(lazy_addresses)),
             new_bytecodes: DashMap::default(),
         }
@@ -137,6 +144,10 @@ impl SfMv {
             }
         }
 
+        for (location, origins) in &last_locations.read {
+            self.note_read(tx_version.tx_idx, *location, origins);
+        }
+
         let mut wrote_new_location = false;
         for (location, value) in write_set {
             self.data.entry(location).or_default().insert(
@@ -149,6 +160,89 @@ impl SfMv {
             }
         }
         wrote_new_location
+    }
+
+    fn note_read(&self, reader: TxIdx, location: MemoryLocationHash, origins: &SfReadOrigins) {
+        let mut readers = self.read_index.entry(location).or_default();
+        if !readers.contains(&reader) {
+            readers.push(reader);
+        }
+        drop(readers);
+        for origin in origins {
+            let Some(writer) = origin_tx(origin) else {
+                continue;
+            };
+            if writer >= reader || writer >= self.final_waiters.len() {
+                continue;
+            }
+            let mut waiters = index_mutex!(self.final_waiters, writer);
+            if !waiters.contains(&reader) {
+                waiters.push(reader);
+            }
+        }
+    }
+
+    pub(crate) fn waiters_of(&self, tx_idx: TxIdx) -> Vec<TxIdx> {
+        if tx_idx >= self.final_waiters.len() {
+            return Vec::new();
+        }
+        index_mutex!(self.final_waiters, tx_idx).clone()
+    }
+
+    pub(crate) fn readers_of(&self, location: MemoryLocationHash) -> Vec<TxIdx> {
+        self.read_index
+            .get(&location)
+            .map(|readers| readers.clone())
+            .unwrap_or_default()
+    }
+
+    /// `(location, read-from writer)`. `None` means the read saw storage.
+    pub(crate) fn read_floors(&self, tx_idx: TxIdx) -> Vec<(MemoryLocationHash, Option<TxIdx>)> {
+        if tx_idx >= self.last_locations.len() {
+            return Vec::new();
+        }
+        let last = index_mutex!(self.last_locations, tx_idx);
+        last.read
+            .iter()
+            .map(|(location, origins)| {
+                let floor = origins.iter().filter_map(origin_tx).max();
+                (*location, floor)
+            })
+            .collect()
+    }
+
+    /// Every multi-version origin names a final incarnation. Storage is final.
+    /// Does not itself walk the writer chain; the caller does that.
+    pub(crate) fn origins_final(
+        &self,
+        tx_idx: TxIdx,
+        mut is_final: impl FnMut(TxIdx, usize) -> bool,
+    ) -> bool {
+        if tx_idx >= self.last_locations.len() {
+            return false;
+        }
+        let last = index_mutex!(self.last_locations, tx_idx);
+        for origins in last.read.values() {
+            for origin in origins {
+                match origin {
+                    SfReadOrigin::Storage => {}
+                    SfReadOrigin::Mv(mv) => {
+                        if !is_final(mv.tx_idx, mv.incarnation) {
+                            return false;
+                        }
+                    }
+                    SfReadOrigin::MvId {
+                        tx_idx,
+                        incarnation,
+                    } => {
+                        if !is_final(*tx_idx, *incarnation) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        true
     }
 
     pub(crate) fn write_locations(&self, tx_idx: TxIdx) -> Vec<MemoryLocationHash> {
@@ -239,6 +333,14 @@ impl SfMv {
                 }
             }
         }
+    }
+}
+
+const fn origin_tx(origin: &SfReadOrigin) -> Option<TxIdx> {
+    match origin {
+        SfReadOrigin::Mv(mv) => Some(mv.tx_idx),
+        SfReadOrigin::MvId { tx_idx, .. } => Some(*tx_idx),
+        SfReadOrigin::Storage => None,
     }
 }
 

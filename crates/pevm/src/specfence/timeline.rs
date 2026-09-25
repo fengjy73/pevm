@@ -447,9 +447,8 @@ impl Drop for ExecSpan {
 
 #[inline]
 pub(crate) fn set_block(reason: u8, loc: u64) {
-    if on() {
-        BLOCK.with(|c| c.set((reason, loc)));
-    }
+    // The park path reads this even when the timeline dump is off.
+    BLOCK.with(|c| c.set((reason, loc)));
 }
 
 pub(crate) fn block_wait() -> (u8, u64) {
