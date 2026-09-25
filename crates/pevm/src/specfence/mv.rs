@@ -32,7 +32,10 @@ pub(crate) enum SfReadOrigin {
     /// Writer identity without the value. A single worker commits a transaction
     /// before the next one reads, so a matching incarnation still names the
     /// value validation would have compared.
-    MvId { tx_idx: TxIdx, incarnation: usize },
+    MvId {
+        tx_idx: TxIdx,
+        incarnation: usize,
+    },
     Storage,
 }
 
@@ -187,6 +190,40 @@ impl SfMv {
         std::mem::take(&mut *self.lazy_addresses.lock().unwrap()).into_iter()
     }
 
+    /// Read origins and write locations for the attribution DAG.
+    ///
+    /// `on_read` receives `u32::MAX` when the origin is storage. `on_write`
+    /// marks lazy balance updates, which commute and are not writer-chain edges.
+    pub(crate) fn visit_io(
+        &self,
+        n: usize,
+        mut on_read: impl FnMut(usize, u64, u32),
+        mut on_write: impl FnMut(usize, u64, bool),
+    ) {
+        for tx in 0..n.min(self.last_locations.len()) {
+            let last = index_mutex!(self.last_locations, tx);
+            for (location, origins) in &last.read {
+                for origin in origins {
+                    let writer = match origin {
+                        SfReadOrigin::Mv(mv) => mv.tx_idx as u32,
+                        SfReadOrigin::MvId { tx_idx, .. } => *tx_idx as u32,
+                        SfReadOrigin::Storage => u32::MAX,
+                    };
+                    on_read(tx, *location, writer);
+                }
+            }
+            for location in &last.write {
+                let lazy = self.data.get(location).is_some_and(|written| {
+                    matches!(
+                        written.get(&tx),
+                        Some(MemoryEntry::Data(_, value)) if is_lazy_value(value)
+                    )
+                });
+                on_write(tx, *location, lazy);
+            }
+        }
+    }
+
     /// Record RAW edges from the committed read set. Trace-only.
     pub(crate) fn collect_edges(&self, tx_idx: TxIdx, trace: &Trace) {
         if !trace.enabled() {
@@ -229,7 +266,10 @@ fn mismatch_writers(
                     }
                     None => return Some((Some(prior.tx_idx), None)),
                 },
-                SfReadOrigin::MvId { tx_idx, incarnation } => match iter.next_back() {
+                SfReadOrigin::MvId {
+                    tx_idx,
+                    incarnation,
+                } => match iter.next_back() {
                     Some((closest_idx, MemoryEntry::Data(tx_incarnation, _))) => {
                         if closest_idx != tx_idx || tx_incarnation != incarnation {
                             return Some((Some(*tx_idx), Some(*closest_idx)));
@@ -248,7 +288,8 @@ fn mismatch_writers(
             }
         }
         None
-    } else if prior_origins.len() == 1 && matches!(prior_origins.last(), Some(SfReadOrigin::Storage))
+    } else if prior_origins.len() == 1
+        && matches!(prior_origins.last(), Some(SfReadOrigin::Storage))
     {
         None
     } else {

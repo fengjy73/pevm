@@ -16,10 +16,17 @@ mod engine;
 mod live_chain;
 mod mv;
 mod rt;
+mod timeline;
 mod trace;
 mod vm;
 
 pub use engine::{SfClassKey, SfOptions, last_trace, run_sf_block};
+
+/// Block number written into a `SPECFENCE_TIMELINE` dump. Ignored when the
+/// timeline flag is off.
+pub fn set_timeline_block(block: u64) {
+    timeline::set_block_label(block);
+}
 pub use trace::{SfAttempt, SfTrace};
 
 /// Revm block environment for an Alloy header. Same mapping upstream uses.

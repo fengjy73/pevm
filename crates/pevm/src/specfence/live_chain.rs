@@ -614,6 +614,10 @@ impl LiveChain {
     /// Plain transfers return `None`. Their shared recipient is already a
     /// preseeded chain, and a head barrier would hold that chain's predicted
     /// writers behind one transaction.
+    pub(crate) fn class_id(&self, tx: TxIdx) -> u16 {
+        self.class_of_tx.get(tx).copied().unwrap_or(u16::MAX)
+    }
+
     pub(crate) fn class_head(&self, tx: TxIdx) -> Option<TxIdx> {
         if self.serial {
             return None;
@@ -627,11 +631,7 @@ impl LiveChain {
             return None;
         }
         let head = *group.members.first()?;
-        if head >= tx {
-            None
-        } else {
-            Some(head)
-        }
+        if head >= tx { None } else { Some(head) }
     }
 
     /// Publish one write into the ordered chain.

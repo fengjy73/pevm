@@ -20,7 +20,10 @@ enum Phase {
     Committed,
     /// `until_commit` waits for the predecessor's validated write. Execution
     /// alone is not enough: a published incarnation can still fail validation.
-    Parked { pred: TxIdx, until_commit: bool },
+    Parked {
+        pred: TxIdx,
+        until_commit: bool,
+    },
 }
 
 struct TxState {
@@ -257,13 +260,11 @@ impl Runtime {
         };
         if pred_done {
             inner.status[tx].phase = Phase::Ready;
+            super::timeline::note_wake(tx);
             self.enqueue_locked(&mut inner, worker, tx);
             return;
         }
-        inner.status[tx].phase = Phase::Parked {
-            pred,
-            until_commit,
-        };
+        inner.status[tx].phase = Phase::Parked { pred, until_commit };
         inner.status[tx].queued = false;
         if !inner.dependents[pred].contains(&tx) {
             inner.dependents[pred].push(tx);
@@ -288,11 +289,11 @@ impl Runtime {
                     ..
                 } => {
                     inner.status[d].phase = Phase::Ready;
+                    super::timeline::note_wake(d);
                     self.enqueue_locked(&mut inner, worker, d);
                 }
                 Phase::Parked {
-                    until_commit: true,
-                    ..
+                    until_commit: true, ..
                 } => inner.dependents[tx].push(d),
                 _ => {}
             }
@@ -312,12 +313,7 @@ impl Runtime {
         self.notify();
     }
 
-    pub(crate) fn try_mark_committed(
-        &self,
-        worker: usize,
-        tx: TxIdx,
-        incarnation: usize,
-    ) -> bool {
+    pub(crate) fn try_mark_committed(&self, worker: usize, tx: TxIdx, incarnation: usize) -> bool {
         let mut inner = self.inner.lock().unwrap();
         if self.committed.load(Ordering::Relaxed) != tx {
             return false;
@@ -330,10 +326,10 @@ impl Runtime {
             for d in deps {
                 match inner.status[d].phase {
                     Phase::Parked {
-                        until_commit: true,
-                        ..
+                        until_commit: true, ..
                     } => {
                         inner.status[d].phase = Phase::Ready;
+                        super::timeline::note_wake(d);
                         self.enqueue_locked(&mut inner, worker, d);
                     }
                     Phase::Parked {
@@ -363,10 +359,7 @@ impl Runtime {
                     }
                     return false;
                 }
-                Phase::Parked {
-                    pred,
-                    until_commit,
-                } => {
+                Phase::Parked { pred, until_commit } => {
                     let pred_done = match inner.status[pred].phase {
                         Phase::Committed => true,
                         Phase::Executed => !until_commit,
@@ -374,6 +367,7 @@ impl Runtime {
                     };
                     if pred_done {
                         inner.status[tx].phase = Phase::Ready;
+                        super::timeline::note_wake(tx);
                         return self.enqueue_locked(&mut inner, worker, tx);
                     }
                     if inner.status[pred].phase == Phase::Ready && !inner.status[pred].queued {

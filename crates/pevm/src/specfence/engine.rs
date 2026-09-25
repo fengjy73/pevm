@@ -108,6 +108,9 @@ where
     let n = txs.len();
     let workers = usize::from(options.concurrency).max(1).min(n.max(1));
     let serial = workers == 1;
+    let timeline = super::timeline::Timeline::start(n, workers);
+    super::timeline::bind(0);
+    let t_setup = super::timeline::stamp();
     // One worker never races a pre-seeded estimate. Building the upstream
     // memory just to copy the beneficiary's `0..n` estimates is a second
     // allocation of the same map. The beneficiary still has to be lazy so
@@ -167,8 +170,10 @@ where
     let results = Results::new(n);
     let abort: OnceLock<AbortKind> = OnceLock::new();
     let commit_mu = Mutex::new(());
+    super::timeline::post_span(super::timeline::SETUP, t_setup);
     let started = Instant::now();
     let deadline = Duration::from_secs(120);
+    let tl = super::timeline::vm_enabled();
 
     let prev_sender_slice = prev_sender.as_slice();
     let mv = &mv;
@@ -177,115 +182,166 @@ where
     let trace = &trace;
     let commit_mu = &commit_mu;
     let drive = |worker: usize| {
-                let mut vm = SfVm::new(
-                    chain,
-                    spec_id,
-                    &block_env,
-                    txs.as_slice(),
-                    storage,
-                    mv,
-                    live,
-                    rt,
-                    trace,
-                    prev_sender_slice,
-                );
-                let mut idle = 0u32;
-                let mut spins = 0u32;
-                while rt.committed() < n && !rt.aborted() {
-                    spins = spins.wrapping_add(1);
-                    if spins.is_multiple_of(64) {
-                        let _b = super::buckets::Guard::start(super::buckets::DEADLINE);
-                        if started.elapsed() > deadline {
-                            rt.request_abort();
-                            break;
-                        }
+        super::timeline::bind(worker);
+        let mut vm = SfVm::new(
+            chain,
+            spec_id,
+            &block_env,
+            txs.as_slice(),
+            storage,
+            mv,
+            live,
+            rt,
+            trace,
+            prev_sender_slice,
+        );
+        let mut idle = 0u32;
+        let mut spins = 0u32;
+        let mut idle_since = 0u64;
+        let mut idle_waited = false;
+        while rt.committed() < n && !rt.aborted() {
+            spins = spins.wrapping_add(1);
+            if spins.is_multiple_of(64) {
+                let _b = super::buckets::Guard::start(super::buckets::DEADLINE);
+                if started.elapsed() > deadline {
+                    rt.request_abort();
+                    break;
+                }
+            }
+            try_commit(worker, n, rt, mv, live, trace, commit_mu, tl);
+            let popped = {
+                let _c = super::timeline::CycGuard::enter(tl, super::timeline::CYC_SCHED);
+                let _b = super::buckets::Guard::start(super::buckets::SCHED);
+                rt.pop(worker)
+            };
+            if let Some((tx, inc)) = popped {
+                idle = 0;
+                live.note_idle(false);
+                if tl {
+                    if idle_since != 0 {
+                        super::timeline::idle_span(idle_since, idle_waited);
+                        idle_since = 0;
+                        idle_waited = false;
                     }
-                    try_commit(worker, n, rt, mv, live, trace, commit_mu);
-                    let popped = {
-                        let _b = super::buckets::Guard::start(super::buckets::SCHED);
-                        rt.pop(worker)
-                    };
-                    if let Some((tx, inc)) = popped {
-                        idle = 0;
-                        live.note_idle(false);
-                        if !serial {
-                            if let Some(pred) = live.admission_predecessor(tx)
-                                && !rt.is_executing(pred)
-                                && !rt.is_committed(pred)
-                                && !rt.is_executed(pred)
-                            {
-                                // Not admitted: the predecessor has not started.
-                                // Tier A still starts the tx once the predecessor is executing;
-                                // that case falls through because `is_executing` is true.
-                                rt.park(worker, tx, pred, false, false);
-                                continue;
-                            }
-                            if let Some(head) = live.class_head(tx)
-                                && !rt.is_committed(head)
-                                && !rt.is_executed(head)
-                            {
-                                // The class head publishes read-then-write locations
-                                // before classmates read them. Incarnation stays: this
-                                // attempt has not entered the interpreter.
-                                rt.park(worker, tx, head, false, false);
-                                continue;
-                            }
+                    super::timeline::close_park(tx);
+                }
+                if !serial {
+                    if let Some(pred) = live.admission_predecessor(tx)
+                        && !rt.is_executing(pred)
+                        && !rt.is_committed(pred)
+                        && !rt.is_executed(pred)
+                    {
+                        // Not admitted: the predecessor has not started.
+                        // Tier A still starts the tx once the predecessor is executing;
+                        // that case falls through because `is_executing` is true.
+                        if tl {
+                            super::timeline::open_park(
+                                tx,
+                                pred,
+                                0,
+                                live.class_id(tx),
+                                super::timeline::ADMIT,
+                            );
                         }
-                        rt.executing_add(1);
-                        let incarnation = inc;
-                        let mut guard = 0;
-                        let step = loop {
-                            guard += 1;
-                            if guard > 8 {
-                                break Step::Yield;
-                            }
-                            match vm.execute(tx, incarnation, unsafe { &mut *results.slot(tx) }) {
-                                Step::Retry => continue,
-                                other => break other,
-                            }
-                        };
-                        rt.executing_add(-1);
-                        match step {
-                            Step::Done => rt.finish_ok(worker, tx),
-                            Step::Yield => rt.defer(tx),
-                            Step::Block(pred) => {
-                                if pred >= n || rt.committed() > pred {
-                                    rt.defer(tx);
-                                } else {
-                                    // Armed reads block until the predecessor commits.
-                                    // Waking on `Executed` reused a publish that
-                                    // validation later replaced.
-                                    rt.park(worker, tx, pred, false, true);
-                                }
-                            }
-                            Step::Retry => unreachable!("retry is consumed above"),
-                            Step::Fallback => {
-                                rt.request_abort();
-                                let _ = abort.set(AbortKind::Fallback);
-                            }
-                            Step::Fatal(err) => {
-                                rt.request_abort();
-                                let _ = abort.set(AbortKind::Fatal(err));
-                            }
+                        rt.park(worker, tx, pred, false, false);
+                        continue;
+                    }
+                    if let Some(head) = live.class_head(tx)
+                        && !rt.is_committed(head)
+                        && !rt.is_executed(head)
+                    {
+                        // The class head publishes read-then-write locations
+                        // before classmates read them. Incarnation stays: this
+                        // attempt has not entered the interpreter.
+                        if tl {
+                            super::timeline::open_park(
+                                tx,
+                                head,
+                                0,
+                                live.class_id(tx),
+                                super::timeline::CLASS,
+                            );
                         }
-                        try_commit(worker, n, rt, mv, live, trace, commit_mu);
-                    } else {
-                        idle += 1;
-                        live.note_idle(true);
-                        try_commit(worker, n, rt, mv, live, trace, commit_mu);
-                        if rt.committed() == n {
-                            break;
-                        }
-                        if !rt.rescue(worker) {
-                            if idle > 8 {
-                                rt.wait_brief();
-                                idle = 0;
-                            } else {
-                                thread::yield_now();
-                            }
-                        }
+                        rt.park(worker, tx, head, false, false);
+                        continue;
                     }
                 }
+                rt.executing_add(1);
+                let incarnation = inc;
+                let mut guard = 0;
+                let step = loop {
+                    guard += 1;
+                    if guard > 8 {
+                        break Step::Yield;
+                    }
+                    match vm.execute(tx, incarnation, unsafe { &mut *results.slot(tx) }) {
+                        Step::Retry => continue,
+                        other => break other,
+                    }
+                };
+                rt.executing_add(-1);
+                match step {
+                    Step::Done => rt.finish_ok(worker, tx),
+                    Step::Yield => rt.defer(tx),
+                    Step::Block(pred) => {
+                        if pred >= n || rt.committed() > pred {
+                            rt.defer(tx);
+                        } else {
+                            // Armed reads block until the predecessor commits.
+                            // Waking on `Executed` reused a publish that
+                            // validation later replaced.
+                            if tl {
+                                let (reason, loc) = super::timeline::block_wait();
+                                super::timeline::open_park(
+                                    tx,
+                                    pred,
+                                    loc,
+                                    live.class_id(tx),
+                                    if reason == 0 {
+                                        super::timeline::OTHER
+                                    } else {
+                                        reason
+                                    },
+                                );
+                            }
+                            rt.park(worker, tx, pred, false, true);
+                        }
+                    }
+                    Step::Retry => unreachable!("retry is consumed above"),
+                    Step::Fallback => {
+                        rt.request_abort();
+                        let _ = abort.set(AbortKind::Fallback);
+                    }
+                    Step::Fatal(err) => {
+                        rt.request_abort();
+                        let _ = abort.set(AbortKind::Fatal(err));
+                    }
+                }
+                try_commit(worker, n, rt, mv, live, trace, commit_mu, tl);
+            } else {
+                idle += 1;
+                live.note_idle(true);
+                if tl && idle_since == 0 {
+                    idle_since = super::timeline::stamp();
+                }
+                try_commit(worker, n, rt, mv, live, trace, commit_mu, tl);
+                if rt.committed() == n {
+                    break;
+                }
+                if !rt.rescue(worker) {
+                    if idle > 8 {
+                        rt.wait_brief();
+                        idle_waited = true;
+                        idle = 0;
+                    } else {
+                        thread::yield_now();
+                    }
+                }
+            }
+        }
+        if tl && idle_since != 0 {
+            super::timeline::idle_span(idle_since, idle_waited);
+        }
     };
     if serial {
         drive(0);
@@ -313,6 +369,7 @@ where
         return Err(PevmError::UnreachableError);
     }
 
+    let t_post = super::timeline::stamp();
     {
         let _b = super::buckets::Guard::start(super::buckets::RESCAN);
         for tx in 0..n {
@@ -323,6 +380,7 @@ where
             mv.collect_edges(tx, &trace);
         }
     }
+    super::timeline::post_span(super::timeline::RESCAN, t_post);
 
     let mut fully = Vec::with_capacity(n);
     let mut cumulative_gas_used: u64 = 0;
@@ -334,13 +392,27 @@ where
         fully.push(execution_result);
     }
 
+    let t_lazy = super::timeline::stamp();
     {
         let _b = super::buckets::Guard::start(super::buckets::LAZY);
         evaluate_lazy(chain, storage, spec_id, &txs, &mv, &mut fully)?;
     }
+    super::timeline::post_span(super::timeline::LAZY, t_lazy);
 
     trace.dump_aborts();
     super::buckets::dump();
+    timeline.dump(
+        options.class_key.as_str(),
+        trace.full_replay.load(std::sync::atomic::Ordering::Relaxed),
+        trace.reexec.load(std::sync::atomic::Ordering::Relaxed),
+        live.max_chain_len(),
+        live.armed_locations(),
+        beneficiary,
+        live,
+        mv,
+        prev_sender_slice,
+        trace,
+    );
     let snap = trace.snapshot(
         live.max_chain_len(),
         live.armed_locations(),
@@ -359,6 +431,7 @@ fn try_commit(
     live: &LiveChain,
     trace: &Trace,
     commit_mu: &Mutex<()>,
+    tl: bool,
 ) {
     let Ok(_guard) = commit_mu.try_lock() else {
         return;
@@ -372,10 +445,14 @@ fn try_commit(
             return;
         }
         let inc = rt.incarnation(i);
+        let t_val = if tl { super::timeline::stamp() } else { 0 };
         let mismatch_loc = {
             let _b = super::buckets::Guard::start(super::buckets::VALIDATE);
             mv.failing_location(i)
         };
+        if tl {
+            super::timeline::validate_span(i, t_val);
+        }
         if let Some(loc) = mismatch_loc {
             let armed = live.is_armed(loc);
             let mismatch = mv.first_mismatch(i);
@@ -410,6 +487,7 @@ fn try_commit(
             return;
         }
         if rt.try_mark_committed(worker, i, inc) {
+            super::timeline::note_commit(i);
             trace.note_committed(i, inc);
             let writes = mv.write_locations(i);
             live.hole_clear(i, &writes);

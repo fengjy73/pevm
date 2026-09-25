@@ -74,6 +74,8 @@ struct VmDb<'a, S: crate::Storage> {
     accepted_pred: Cell<u32>,
     /// One worker commits in index order. Chain waits are skipped.
     serial: bool,
+    /// Worker-local copy. Timed runs leave this false and skip the timeline clock.
+    tl_on: bool,
 }
 
 impl<'a, S: crate::Storage> VmDb<'a, S> {
@@ -108,6 +110,7 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
     }
 
     fn coordinate_chain(&self, location: u64) -> Result<(), ReadError> {
+        let c0 = super::timeline::cyc_enter(self.tl_on);
         let _b = super::buckets::Guard::start(super::buckets::COORD);
         if self.trace.enabled() && self.chain.is_armed(location) {
             self.trace.note_read_after_arm();
@@ -121,20 +124,18 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
         self.accepted_pred.set(accepted);
         if self.trace.diag() {
             let (nearest, state, reason) = match result {
-                Ok(()) => {
-                    match self.chain.nearest_lower(location, self.tx_idx) {
-                        Some(pred) => {
-                            let state = self.chain.writer_state(location, pred).0 as u8;
-                            let reason = if self.settled(location, pred) {
-                                super::trace::coord_reason::READY_PUB
-                            } else {
-                                super::trace::coord_reason::SKIP_COST
-                            };
-                            (pred as u32, state, reason)
-                        }
-                        None => (u32::MAX, 0, super::trace::coord_reason::NO_LOWER),
+                Ok(()) => match self.chain.nearest_lower(location, self.tx_idx) {
+                    Some(pred) => {
+                        let state = self.chain.writer_state(location, pred).0 as u8;
+                        let reason = if self.settled(location, pred) {
+                            super::trace::coord_reason::READY_PUB
+                        } else {
+                            super::trace::coord_reason::SKIP_COST
+                        };
+                        (pred as u32, state, reason)
                     }
-                }
+                    None => (u32::MAX, 0, super::trace::coord_reason::NO_LOWER),
+                },
                 Err(_) => {
                     let pred = self.chain.nearest_lower(location, self.tx_idx);
                     let state = pred
@@ -156,6 +157,7 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
                 reason,
             );
         }
+        super::timeline::cyc_leave(super::timeline::CYC_COORD, c0);
         result
     }
 
@@ -180,11 +182,22 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
             if !armed && !self.chain.should_wait(location, pred, executing) {
                 return Ok(());
             }
+            let reason = if armed {
+                super::timeline::ARMED
+            } else {
+                super::timeline::UNARMED
+            };
             if !executing {
+                super::timeline::set_block(reason, location);
                 return Err(ReadError::Blocking(pred));
             }
             // Overlap only while the predecessor is inside the interpreter.
             // 40 × 50µs is the cap; a longer spin holds the worker off the prefix.
+            let t_inline = if self.tl_on {
+                super::timeline::stamp()
+            } else {
+                0
+            };
             self.rt.waiting_add(1);
             for _ in 0..40 {
                 if self.settled(location, pred)
@@ -197,6 +210,7 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
                 self.rt.wait_brief();
             }
             self.rt.waiting_add(-1);
+            super::timeline::inline_wait(self.tx_idx, pred, location, reason, t_inline);
             if self.settled(location, pred) {
                 return Ok(());
             }
@@ -204,10 +218,21 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
                 self.chain.clear_hole(location, pred);
                 continue;
             }
+            super::timeline::set_block(reason, location);
             return Err(ReadError::Blocking(pred));
         }
         match self.chain.nearest_lower(location, self.tx_idx) {
-            Some(pred) if !self.settled(location, pred) => Err(ReadError::Blocking(pred)),
+            Some(pred) if !self.settled(location, pred) => {
+                super::timeline::set_block(
+                    if self.chain.is_armed(location) {
+                        super::timeline::ARMED
+                    } else {
+                        super::timeline::UNARMED
+                    },
+                    location,
+                );
+                Err(ReadError::Blocking(pred))
+            }
             _ => Ok(()),
         }
     }
@@ -217,6 +242,7 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
     fn sender_block(&self) -> ReadError {
         match self.prev_sender.get(self.tx_idx).copied().flatten() {
             Some(pred) if !self.rt.is_committed(pred) && !self.rt.is_executed(pred) => {
+                super::timeline::set_block(super::timeline::NONCE, self.from_hash);
                 ReadError::Blocking(pred)
             }
             None => ReadError::InvalidNonce(self.tx_idx),
@@ -285,7 +311,10 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
             && let Some((tx_idx, entry)) = written_transactions.range(..self.tx_idx).next_back()
         {
             match entry {
-                MemoryEntry::Estimate => return Err(ReadError::Blocking(*tx_idx)),
+                MemoryEntry::Estimate => {
+                    super::timeline::set_block(super::timeline::ESTIMATE, location_hash);
+                    return Err(ReadError::Blocking(*tx_idx));
+                }
                 MemoryEntry::Data(_, MemoryValue::SelfDestructed) => {
                     return Err(ReadError::SelfDestructedAccount);
                 }
@@ -357,6 +386,7 @@ fn confirm_read_chain(
         if now != u32::MAX {
             let pred = now as TxIdx;
             if chain.is_armed(location) && !writer_final(chain, rt, location, pred) {
+                super::timeline::set_block(super::timeline::ARMED, location);
                 return Err(ReadError::Blocking(pred));
             }
         }
@@ -365,6 +395,7 @@ fn confirm_read_chain(
     if accepted != u32::MAX {
         let pred = accepted as TxIdx;
         if chain.is_armed(location) && !writer_final(chain, rt, location, pred) {
+            super::timeline::set_block(super::timeline::ARMED, location);
             return Err(ReadError::Blocking(pred));
         }
     }
@@ -383,7 +414,10 @@ fn writer_final(chain: &LiveChain, rt: &Runtime, location: u64, pred: TxIdx) -> 
 
 fn mv_origin(serial: bool, tx_idx: TxIdx, incarnation: usize, value: &MemoryValue) -> SfReadOrigin {
     if serial {
-        SfReadOrigin::MvId { tx_idx, incarnation }
+        SfReadOrigin::MvId {
+            tx_idx,
+            incarnation,
+        }
     } else {
         SfReadOrigin::Mv(SfOrigin {
             tx_idx,
@@ -467,6 +501,7 @@ impl<S: crate::Storage> Database for VmDb<'_, S> {
                                 account_id: None,
                             }));
                         }
+                        super::timeline::set_block(super::timeline::ESTIMATE, location_hash);
                         return Err(ReadError::Blocking(*blocking_idx));
                     }
                     Some((closest_idx, MemoryEntry::Data(tx_incarnation, value))) => {
@@ -612,6 +647,7 @@ impl<S: crate::Storage> Database for VmDb<'_, S> {
                     if let Some(value) = retained_storage(read_origins) {
                         return Ok(value);
                     }
+                    super::timeline::set_block(super::timeline::ESTIMATE, location_hash);
                     return Err(ReadError::Blocking(*closest_idx));
                 }
                 _ => return Err(ReadError::InvalidMemoryValueType),
@@ -701,6 +737,7 @@ impl<'a, S: crate::Storage, C: PevmChain> SfVm<'a, S, C> {
             prev_sender,
             accepted_pred: Cell::new(u32::MAX),
             serial: rt.worker_count() == 1,
+            tl_on: super::timeline::vm_enabled(),
         };
         Self {
             chain,
@@ -729,10 +766,14 @@ impl<'a, S: crate::Storage, C: PevmChain> SfVm<'a, S, C> {
     ) -> Step {
         // The clock is the old ExecPhase regression when it runs on every
         // transaction. Wall-clock runs leave both flags off.
+        let mut exec_span = super::timeline::ExecSpan::begin(tx_idx);
         let clock = self.trace.timing().then(Instant::now);
+        let _c_pre = super::timeline::CycGuard::enter(exec_span.hot(), super::timeline::CYC_PRE);
         let _pre = super::buckets::Guard::start(super::buckets::PRE);
         self.trace.note_exec(incarnation);
         if !self.evm.ctx().db().serial {
+            let _c_mark =
+                super::timeline::CycGuard::enter(exec_span.hot(), super::timeline::CYC_MARK);
             let _b = super::buckets::Guard::start(super::buckets::MARK);
             self.live.mark_running(tx_idx, incarnation);
         }
@@ -761,32 +802,36 @@ impl<'a, S: crate::Storage, C: PevmChain> SfVm<'a, S, C> {
         }
 
         drop(_pre);
+        drop(_c_pre);
         let exec_result = {
             let _b = super::buckets::Guard::start(super::buckets::INTERP);
             match NoBeneficiaryHandler::<C, _>::default().run(&mut self.evm) {
-            Ok(result) => result,
-            Err(EVMError::Database(read_error)) => return step_from_read(read_error),
-            Err(err) => {
-                if matches!(
-                    err,
-                    EVMError::Transaction(
-                        InvalidTransaction::LackOfFundForMaxFee { .. }
-                            | InvalidTransaction::NonceTooHigh { .. }
-                    )
-                ) {
-                    if let Some(pred) = self.prev_sender.get(tx_idx).copied().flatten()
-                        && !self.rt.is_committed(pred)
-                        && !self.rt.is_executed(pred)
-                    {
-                        return Step::Block(pred);
+                Ok(result) => result,
+                Err(EVMError::Database(read_error)) => return step_from_read(read_error),
+                Err(err) => {
+                    if matches!(
+                        err,
+                        EVMError::Transaction(
+                            InvalidTransaction::LackOfFundForMaxFee { .. }
+                                | InvalidTransaction::NonceTooHigh { .. }
+                        )
+                    ) {
+                        if let Some(pred) = self.prev_sender.get(tx_idx).copied().flatten()
+                            && !self.rt.is_committed(pred)
+                            && !self.rt.is_executed(pred)
+                        {
+                            super::timeline::set_block(super::timeline::NONCE, from_hash);
+                            return Step::Block(pred);
+                        }
+                        return Step::Yield;
                     }
-                    return Step::Yield;
+                    return Step::Fatal(err);
                 }
-                return Step::Fatal(err);
             }
-        }
         };
 
+        let _c_write =
+            super::timeline::CycGuard::enter(exec_span.hot(), super::timeline::CYC_WRITE);
         let _writes = super::buckets::Guard::start(super::buckets::WRITESET);
         let mut write_set = WriteSet::with_capacity(6);
         let ctx = self.evm.ctx();
@@ -944,18 +989,24 @@ impl<'a, S: crate::Storage, C: PevmChain> SfVm<'a, S, C> {
             self.trace.note_tx_ns(tx_idx, ns);
         }
         drop(_writes);
+        drop(_c_write);
         {
+            let _c_rec =
+                super::timeline::CycGuard::enter(exec_span.hot(), super::timeline::CYC_RECORD);
             let _b = super::buckets::Guard::start(super::buckets::RECORD);
             self.mv.record(&tx_version, read_set, write_set);
         }
         {
+            let _c_pub =
+                super::timeline::CycGuard::enter(exec_span.hot(), super::timeline::CYC_PUBLISH);
             let _b = super::buckets::Guard::start(super::buckets::PUBLISH);
             for (location, rmw) in published {
                 // Read-then-write waits for the previous writer. Lazy values are
                 // blind: they join the chain for readers, and writers do not wait.
-                self.live.publish_write(tx_idx, incarnation, location, rmw, |t| {
-                    self.rt.still_open(t)
-                });
+                self.live
+                    .publish_write(tx_idx, incarnation, location, rmw, |t| {
+                        self.rt.still_open(t)
+                    });
             }
         }
 
@@ -971,6 +1022,7 @@ impl<'a, S: crate::Storage, C: PevmChain> SfVm<'a, S, C> {
                 state: state.collect(),
             });
         }
+        exec_span.done = true;
         Step::Done
     }
 }

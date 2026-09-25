@@ -111,9 +111,8 @@ pub(crate) struct Trace {
     attempts: std::sync::Mutex<Vec<SfAttempt>>,
     diag: bool,
     /// Last coordinate decision per `(reader, location)`.
-    decisions: std::sync::Mutex<
-        hashbrown::HashMap<(u32, u64), CoordNote, rustc_hash::FxBuildHasher>,
-    >,
+    decisions:
+        std::sync::Mutex<hashbrown::HashMap<(u32, u64), CoordNote, rustc_hash::FxBuildHasher>>,
     aborts: std::sync::Mutex<Vec<AbortNote>>,
 }
 

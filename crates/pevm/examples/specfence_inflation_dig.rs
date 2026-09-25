@@ -222,14 +222,17 @@ fn run_once(loaded: &Loaded, engine: &str, workers: usize, seq_cpus: &[usize]) -
                 cores,
             )
         }
-        "sf" => run_sf_block(
-            &chain,
-            &loaded.storage,
-            loaded.spec_id,
-            loaded.block_env.clone(),
-            loaded.txs.clone(),
-            SfOptions::fresh(cores, class_key()),
-        ),
+        "sf" => {
+            pevm::specfence::set_timeline_block(loaded.block_no);
+            run_sf_block(
+                &chain,
+                &loaded.storage,
+                loaded.spec_id,
+                loaded.block_env.clone(),
+                loaded.txs.clone(),
+                SfOptions::fresh(cores, class_key()),
+            )
+        }
         other => panic!("unknown engine {other}"),
     };
     let wall_ms = started.elapsed().as_secs_f64() * 1000.0;

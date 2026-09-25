@@ -88,12 +88,7 @@ pub(crate) fn dump() {
     for i in 0..N {
         let ns = NS[i].load(Ordering::Relaxed);
         let calls = CALLS[i].load(Ordering::Relaxed);
-        eprint!(
-            " {}={:.3}ms/{}",
-            NAMES[i],
-            ns as f64 / 1_000_000.0,
-            calls
-        );
+        eprint!(" {}={:.3}ms/{}", NAMES[i], ns as f64 / 1_000_000.0, calls);
         NS[i].store(0, Ordering::Relaxed);
         CALLS[i].store(0, Ordering::Relaxed);
     }
