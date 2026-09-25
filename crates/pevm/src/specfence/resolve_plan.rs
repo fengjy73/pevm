@@ -7,12 +7,12 @@ use crate::mv_memory::MvMemory;
 use crate::scheduler::Scheduler;
 use crate::{MemoryLocationHash, MemoryValue, TxVersion};
 
-use super::SpecFenceCtx;
-use super::VisibilityPolicy;
 use super::arm_table::ArmTable;
-use super::collateral::{ConflictClass, classify_first_conflict, location_is_lazy};
+use super::collateral::{classify_first_conflict, location_is_lazy, ConflictClass};
 use super::runnable_set::{QueueKind, RunnableSet};
 use super::sf_mv::SfConflictClass;
+use super::SpecFenceCtx;
+use super::VisibilityPolicy;
 
 /// Structured validate outcome. Replaces “bool valid → abort” as the SF root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -58,7 +58,28 @@ pub(crate) struct ApplyCtx<'a> {
 
 /// Apply a plan: certificates, queues, release, learn. Never returns a
 /// Block-STM `Task` — the worker always picks from [`RunnableSet`].
-pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
+///
+/// Returns true when a Commit plan was rejected because a lower writer
+/// flagged the read set. The caller must validate again. The incarnation
+/// stays `Executed` and the runnable claim stays `ST_RUNNING`.
+pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) -> bool {
+    if plan.commits() {
+        match ctx.scheduler.try_commit_if_clean(ctx.tx_version, || {
+            ctx.runnable.mark_done(ctx.tx_version.tx_idx);
+        }) {
+            crate::scheduler::CommitGate::Rejected => return true,
+            crate::scheduler::CommitGate::Closed => {
+                // Only drop our claim. A newer incarnation may already be
+                // Executing on this index; releasing that ST_RUNNING steals it.
+                let tx = ctx.tx_version.tx_idx;
+                if ctx.scheduler.is_aborting(tx) || ctx.scheduler.is_ready(tx) {
+                    ctx.runnable.release_running(tx);
+                }
+                return false;
+            }
+            crate::scheduler::CommitGate::Committed => {}
+        }
+    }
     let tx = ctx.tx_version.tx_idx;
     ctx.specfence.metrics.record_resolve_plan(plan);
     ctx.specfence.metrics.record_resolve_apply();
@@ -96,6 +117,7 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
                     ctx.specfence.access_arms.note_replay_after_protect();
                 }
             } else if ctx.specfence.access_arms.protect_hot(loc) {
+                crate::specfence::inblock_trace::note_arm(tx, *ctx.specfence.exec_origin);
                 // Writers already observed this block. Prior-chain touchers
                 // are edged inside protect_hot. Arm peer stays 0.
                 let seen = ctx.specfence.ready_edges.writers_of(loc);
@@ -118,14 +140,14 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
             if let Some(l) = loc {
                 ctx.specfence.certificates.note_success(tx, l);
             }
-            ctx.scheduler
-                .finish_validation_sf(ctx.tx_version, false, None);
+            // Validated + runnable DONE were published under the status mutex
+            // in `try_commit_if_clean`. Do not finish_validation again.
             release_successors(&ctx, tx);
             // Every published write can invalidate a higher reader, including
             // a re-execution that rewrites the same locations (not only
             // WroteNewLocation). Block-STM did this via validation_idx.
+            // The flag covers the owner who is still `ST_RUNNING`.
             enqueue_higher_revalidate(&ctx, tx);
-            ctx.runnable.mark_done(tx);
         }
         ResolvePlan::PartialAbortRewind => {
             // (c) Resolve after fail — live mistake found; prefix from fail_k.
@@ -292,6 +314,7 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
             }
         }
     }
+    false
 }
 
 /// Raise a Detect edge on an observed non-lazy WAW. Thin `hops=0` must
@@ -723,8 +746,12 @@ fn enqueue_revalidate(ctx: &ApplyCtx<'_>, reader: crate::TxIdx) -> bool {
     }
     // Demote before the worker loop samples all_validated, otherwise the
     // last Commit exits every core and the revalidate never runs.
-    let _ = ctx.scheduler.prepare_revalidate(reader);
-    let _ = ctx.runnable.wake_idle(reader, QueueKind::Revalidate);
+    // `ST_RUNNING` owners ignore wake_idle. The dirty flag is what their
+    // commit observes under the status mutex.
+    let need_wake = ctx.scheduler.mark_reads_dirty(reader);
+    if need_wake {
+        let _ = ctx.runnable.wake_idle(reader, QueueKind::Revalidate);
+    }
     true
 }
 

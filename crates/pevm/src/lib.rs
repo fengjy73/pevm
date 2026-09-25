@@ -140,6 +140,10 @@ enum IncarnationStatus {
 struct TxStatus {
     incarnation: TxIncarnation,
     status: IncarnationStatus,
+    /// A lower writer published after this incarnation recorded its read set.
+    /// Commit must not stick while this is set: the owner's `wake_idle` is
+    /// refused for `ST_RUNNING`, so the flag is the handoff.
+    reads_dirty: bool,
 }
 
 // We maintain an in-memory multi-version data structure that stores for
@@ -219,18 +223,28 @@ mod compat;
 pub use compat::get_block_env;
 mod mv_memory;
 mod pevm;
-pub use pevm::{Pevm, PevmError, PevmResult, execute_revm_sequential};
+pub use pevm::{execute_revm_sequential, Pevm, PevmError, PevmResult};
+
+/// Times SpecFence refused a Commit because a lower writer flagged the read set.
+pub fn specfence_commit_rejects() -> usize {
+    scheduler::commit_rejects()
+}
+
+/// First transaction indexes whose Commit was refused by [`specfence_commit_rejects`].
+pub fn specfence_commit_reject_txs() -> Vec<usize> {
+    scheduler::commit_reject_txs()
+}
 mod scheduler;
 pub mod specfence;
 pub use specfence::{
+    analyze_dag, classify_raw_edges, dependency_edges, effect_raw_longest_chain,
+    effect_raw_max_fanout, estimate_ma_md, filter_effect_edges, hot_locations, kind_histogram,
+    l1_dag_summary, percentile_f64, producer_status_canonical, program_raw_longest_chain,
     AbortEvent, AccountGrainObserve, ConcurrencyMode, ConsumerFirstCross, DagStats,
     DecisionFieldSnap, EffectClass, EffectLogEntry, EffectStreamDiag, ExecProcessSnapshot,
     FineGrainCollector, FineGrainSnapshot, HotLocation, L1DagSummary, LearnReport, LocationKind,
     MaMdProxy, MeasurementMethod, PerTxProcessSnap, RawEdge, RawEffectEdge, ResolvePlan,
-    SpecFenceMetrics, TxRw, TxWorkTotal, VisibilityPolicy, analyze_dag, classify_raw_edges,
-    dependency_edges, effect_raw_longest_chain, effect_raw_max_fanout, estimate_ma_md,
-    filter_effect_edges, hot_locations, kind_histogram, l1_dag_summary, percentile_f64,
-    producer_status_canonical, program_raw_longest_chain,
+    SpecFenceMetrics, TxRw, TxWorkTotal, VisibilityPolicy,
 };
 mod storage;
 pub use storage::{

@@ -564,6 +564,9 @@ impl Pevm {
         let access_arms = crate::specfence::AccessArmTable::new();
         let sf_tips = crate::specfence::SfTipTable::new();
         // Soft=0: prior is radar only. Avoid table inside the spine starts empty.
+        if self.concurrency_mode == ConcurrencyMode::SpecFence {
+            crate::specfence::inblock_reset();
+        }
         let access_spine =
             crate::specfence::AccessSpine::begin(self.spine_prior.clone(), concurrency_level.get());
         let lanes = crate::specfence::LaneTable::new();

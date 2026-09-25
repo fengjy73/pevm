@@ -935,9 +935,15 @@ impl<'a, S: Storage> VmDb<'a, S> {
                     .find(|&w| w < self.tx_idx)
             })
         else {
+            if protected {
+                crate::specfence::inblock_trace::note_consult_no_pred();
+            }
             return Ok(());
         };
         if pred >= self.tx_idx {
+            if protected {
+                crate::specfence::inblock_trace::note_consult_opt();
+            }
             return Ok(());
         }
         // Four-class: Chain (sticky≥32) | WAW (early-k) | RAW (else WaitOnce).
@@ -971,6 +977,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
         // Soft=0 forbids Blocking park / Estimate Block / Rewind.
         if thin {
             if !executing && !has_sf_tip {
+                if protected {
+                    crate::specfence::inblock_trace::note_consult_opt();
+                }
                 return Ok(());
             }
             self.specfence.sf_tips.record_wait_once_consume();
@@ -1012,6 +1021,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
             }
             // Soft=0 thin: no Blocking park; Opt-fallthrough (Learn raises Avoid).
             // Do not register_waiter — ungated finish never wakes DashMap waiters.
+            if protected {
+                crate::specfence::inblock_trace::note_consult_opt();
+            }
             return Ok(());
         }
         // Protected read found an unfinished writer the last published tip
@@ -1096,6 +1108,9 @@ impl<'a, S: Storage> VmDb<'a, S> {
             // dependency, not an Estimate mutex and not a core-pinning spin).
             let unpublished = protected && !finished && !sf.true_publish_ready(location_hash, pred);
             if !unpublished {
+                if protected {
+                    crate::specfence::inblock_trace::note_consult_opt();
+                }
                 return Ok(());
             }
         }
@@ -1158,7 +1173,12 @@ impl<'a, S: Storage> VmDb<'a, S> {
                 Err(self.park_publish_wait(location_hash, pred))
             }
             crate::specfence::LiveAct::Retry => Err(ReadError::InconsistentRead),
-            crate::specfence::LiveAct::Skip => Ok(()),
+            crate::specfence::LiveAct::Skip => {
+                if protected {
+                    crate::specfence::inblock_trace::note_consult_opt();
+                }
+                Ok(())
+            }
         }
     }
 

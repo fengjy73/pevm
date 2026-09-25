@@ -35,10 +35,9 @@ use alloy_rpc_types_eth::Block;
 use flate2::bufread::GzDecoder;
 use hashbrown::HashMap;
 use pevm::{
-    BlockHashes, BuildSuffixHasher, Bytecodes, ConcurrencyMode, EvmAccount, InMemoryStorage, Pevm,
-    PevmTxExecutionResult,
     chain::{PevmChain, PevmEthereum},
-    execute_revm_sequential,
+    execute_revm_sequential, BlockHashes, BuildSuffixHasher, Bytecodes, ConcurrencyMode,
+    EvmAccount, InMemoryStorage, Pevm, PevmTxExecutionResult,
 };
 
 fn repo_root() -> PathBuf {
@@ -500,11 +499,21 @@ fn seqcheck(loaded: &Loaded, workers: usize, n: usize) {
         let seq = checker.execute(&loaded.chain, &loaded.storage, &loaded.block, cores, true);
         match (par, seq) {
             (Ok(p), Ok(s)) if p == s => {
-                println!("seq=par ok block={} iter={i}", loaded.block_no);
+                println!(
+                    "seq=par ok block={} iter={i} commit_rejects={} reject_txs={:?}",
+                    loaded.block_no,
+                    pevm::specfence_commit_rejects(),
+                    pevm::specfence_commit_reject_txs(),
+                );
             }
             (Ok(p), Ok(s)) => {
                 diverge += 1;
-                println!("seq!=par block={} iter={i}", loaded.block_no);
+                println!(
+                    "seq!=par block={} iter={i} commit_rejects={} reject_txs={:?}",
+                    loaded.block_no,
+                    pevm::specfence_commit_rejects(),
+                    pevm::specfence_commit_reject_txs(),
+                );
                 report_diverge(&s, &p);
             }
             (Err(e), _) => println!("par err block={} iter={i} {e}", loaded.block_no),
@@ -515,6 +524,120 @@ fn seqcheck(loaded: &Loaded, workers: usize, n: usize) {
         "SEQCHECK block={} n={n} diverge={diverge} ge_1_5=false",
         loaded.block_no
     );
+}
+
+fn inblock_once(loaded: &Loaded, workers: usize) {
+    let cores = NonZeroUsize::new(workers.max(1)).unwrap();
+    let mut pevm = Pevm::with_concurrency_mode(ConcurrencyMode::SpecFence);
+    pevm.reset_heat();
+    pevm.reset_inter_prior();
+    for label in ["fresh", "carry"] {
+        let t0 = std::time::Instant::now();
+        let result = pevm.execute(&loaded.chain, &loaded.storage, &loaded.block, cores, false);
+        let wall_ms = t0.elapsed().as_secs_f64() * 1e3;
+        let ok = result.is_ok();
+        println!(
+            "INBLOCK block={} label={label} workers={workers} n={} ok={ok} wall_ms={wall_ms:.3}",
+            loaded.block_no, loaded.n
+        );
+        print_inblock(&pevm);
+    }
+}
+
+fn print_inblock(pevm: &Pevm) {
+    let m = pevm.last_specfence_metrics();
+    let spine = pevm.last_spine();
+    let trace = pevm::specfence::inblock_snapshot();
+    let incs = pevm.last_incarnations();
+    println!(
+        "  reexec_entries={} incarnation_gt0={} full_replay={} resolve_after_fail={} protect_n={} protect_before_opt={} replay_after_protect={}",
+        m.reexec_entries,
+        m.incarnation_gt0,
+        m.resolve_full_replay,
+        m.sf_resolve_after_fail_n,
+        m.sf_protect_n,
+        m.sf_protect_before_opt_n,
+        m.sf_replay_after_protect_n,
+    );
+    println!(
+        "  wait_once={} wait_suppressed={} wait_once_consume={} detect_before={} avoid_publish={} visibility_opt={} ordered_tip={}",
+        m.access_wait_once,
+        m.access_wait_suppressed,
+        m.sf_wait_once_consume_n,
+        m.sf_detect_before_n,
+        m.sf_avoid_publish_n,
+        m.visibility_opt,
+        m.visibility_ordered_tip,
+    );
+    println!(
+        "  spine chain_len={} armed_locs={} indep_first_cuts={} prior_radar_only={} ordered_defer={} ordered_handoff={} raw={} waw={} war={}",
+        spine.chain_len,
+        spine.armed_locs,
+        spine.indep_first_cuts,
+        spine.prior_radar_only,
+        spine.ordered_defer,
+        spine.ordered_handoff,
+        spine.raw_n,
+        spine.waw_n,
+        spine.war_n,
+    );
+    let first_arm = if trace.first_arm_tx == usize::MAX {
+        "none".to_string()
+    } else {
+        trace.first_arm_tx.to_string()
+    };
+    println!(
+        "  trace arm_n={} first_arm_tx={first_arm} first_arm_ns={} consult_no_pred={} consult_opt={}",
+        trace.arm_n, trace.first_arm_ns, trace.consult_no_pred, trace.consult_opt,
+    );
+    if incs.is_empty() {
+        println!("  inc_hist empty");
+        return;
+    }
+    let mut hist = [0usize; 5];
+    for &inc in incs {
+        hist[inc.min(4)] += 1;
+    }
+    println!(
+        "  inc_hist 0={} 1={} 2={} 3={} 4+={}",
+        hist[0], hist[1], hist[2], hist[3], hist[4]
+    );
+    let n = incs.len();
+    for b in 0..10 {
+        let lo = b * n / 10;
+        let hi = (b + 1) * n / 10;
+        let sum: usize = incs[lo..hi].iter().copied().sum();
+        let gt0 = incs[lo..hi].iter().filter(|&&x| x > 0).count();
+        println!("  decile {b} tx[{lo},{hi}) reexec_sum={sum} txs_gt0={gt0}");
+    }
+    let arm_ns = trace.first_arm_ns;
+    let starts = pevm.last_tx_first_start();
+    if arm_ns > 0 && starts.len() == incs.len() {
+        let mut before = 0usize;
+        let mut after = 0usize;
+        let mut before_re = 0usize;
+        let mut after_re = 0usize;
+        for (tx, &inc) in incs.iter().enumerate() {
+            let started = starts[tx];
+            if started == 0 {
+                continue;
+            }
+            if started < arm_ns {
+                before += 1;
+                if inc > 0 {
+                    before_re += 1;
+                }
+            } else {
+                after += 1;
+                if inc > 0 {
+                    after_re += 1;
+                }
+            }
+        }
+        println!(
+            "  start_vs_first_arm before={before} before_reexec={before_re} after={after} after_reexec={after_re}"
+        );
+    }
 }
 
 fn brief_acct(v: Option<&Option<EvmAccount>>) -> String {
@@ -540,11 +663,13 @@ fn report_diverge(seq: &[PevmTxExecutionResult], par: &[PevmTxExecutionResult]) 
             continue;
         }
         println!(
-            "  first_tx={i} seq_gas={} par_gas={} seq_logs={} par_logs={} seq_state={} par_state={}",
+            "  first_tx={i} seq_gas={} par_gas={} seq_logs={} par_logs={} seq_status={:?} par_status={:?} seq_state={} par_state={}",
             seq[i].receipt.cumulative_gas_used,
             par[i].receipt.cumulative_gas_used,
             seq[i].receipt.logs.len(),
             par[i].receipt.logs.len(),
+            seq[i].receipt.status,
+            par[i].receipt.status,
             seq[i].state.len(),
             par[i].state.len(),
         );
@@ -655,6 +780,13 @@ fn main() {
             }
         }
         println!("wrote {out_path}");
+        return;
+    }
+
+    if which == "inblock" {
+        let block_no = env_usize("SPECFENCE_COMPARE_BLOCK", 15_274_915) as u64;
+        let loaded = load_block(&data_dir, block_no, bytecodes, hashes);
+        inblock_once(&loaded, workers);
         return;
     }
 
