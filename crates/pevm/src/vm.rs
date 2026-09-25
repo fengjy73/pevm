@@ -180,6 +180,17 @@ pub(crate) struct VmDb<'a, S: Storage> {
     /// Thin Soft=0: no WaitOnce peer before this tx → OCC-shaped execute
     /// (skip consult body / engagement / museum; keep access_log ordinals).
     sf_occ_shaped: bool,
+    /// RegionAvoid v2: predicted toucher. False skips every region lookup.
+    region_on: bool,
+    /// Predicted writer of a radar location (arm on first access).
+    region_writer: bool,
+    region_locs: [MemoryLocationHash; 4],
+    region_nlocs: u8,
+    /// Locations this incarnation already decided. `u64::MAX` is empty.
+    region_seen0: Cell<u64>,
+    region_seen1: Cell<u64>,
+    region_seen2: Cell<u64>,
+    region_seen3: Cell<u64>,
     /// SpecFence visibility for this incarnation (Opt / WaitReleased / OrderedTip).
     vis: VisibilityPolicy,
     /// PCC overlay armed for the current access (PE ∩ ROI). OptimisticRead = OCC read.
@@ -193,6 +204,11 @@ pub(crate) struct VmDb<'a, S: Storage> {
     read_set: ReadSet,
     // TODO: Clearer type for [AccountBasic] plus code hash
     read_accounts: HashMap<MemoryLocationHash, (AccountBasic, Option<B256>), BuildIdentityHasher>,
+}
+
+enum RegionHop {
+    Again,
+    Settled(Result<(), ReadError>),
 }
 
 impl<'a, S: Storage> VmDb<'a, S> {
@@ -253,6 +269,15 @@ impl<'a, S: Storage> VmDb<'a, S> {
             VisibilityPolicy::Opt
         };
         self.has_nonce = has_nonce;
+        let bind = self.specfence.region.bind(tx_idx);
+        self.region_on = bind.on;
+        self.region_writer = bind.writer;
+        self.region_locs = bind.locs;
+        self.region_nlocs = bind.nlocs;
+        self.region_seen0.set(u64::MAX);
+        self.region_seen1.set(u64::MAX);
+        self.region_seen2.set(u64::MAX);
+        self.region_seen3.set(u64::MAX);
         self.read_set.clear();
         self.read_accounts.clear();
         self.pcc_armed.set(false);
@@ -663,6 +688,265 @@ impl<'a, S: Storage> VmDb<'a, S> {
         }
     }
 
+    fn region_seen(&self, loc: MemoryLocationHash) -> bool {
+        let hit = |cell: &Cell<u64>| {
+            let v = cell.get();
+            v != u64::MAX && v == loc
+        };
+        hit(&self.region_seen0)
+            || hit(&self.region_seen1)
+            || hit(&self.region_seen2)
+            || hit(&self.region_seen3)
+    }
+
+    fn region_mark(&self, loc: MemoryLocationHash) {
+        for cell in [
+            &self.region_seen0,
+            &self.region_seen1,
+            &self.region_seen2,
+            &self.region_seen3,
+        ] {
+            if cell.get() == u64::MAX {
+                cell.set(loc);
+                return;
+            }
+            if cell.get() == loc {
+                return;
+            }
+        }
+    }
+
+    /// Predecessor liveness at the true tip. Estimate is not a wait reason.
+    fn region_pred_state(
+        &self,
+        loc: MemoryLocationHash,
+        pred: Option<TxIdx>,
+    ) -> crate::specfence::PredState {
+        let Some(pred) = pred else {
+            return crate::specfence::PredState::None;
+        };
+        if pred >= self.tx_idx {
+            return crate::specfence::PredState::None;
+        }
+        let done =
+            self.specfence.scheduler.is_done(pred) || self.specfence.scheduler.is_validated(pred);
+        let sf = crate::specfence::SfMvMemory::new(self.mv_memory, self.specfence.sf_tips);
+        if sf.true_publish_ready(loc, pred) {
+            return crate::specfence::PredState::Published;
+        }
+        if done {
+            return crate::specfence::PredState::None;
+        }
+        let executing = self.specfence.scheduler.is_executing(pred);
+        let has_tip = self.specfence.sf_tips.has_version_or_released(loc, pred)
+            || self
+                .specfence
+                .sf_tips
+                .live_writer(loc)
+                .is_some_and(|w| w == pred);
+        if executing || has_tip {
+            return crate::specfence::PredState::Live;
+        }
+        let started = self
+            .specfence
+            .tx_first_start
+            .get(pred)
+            .is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        if started {
+            crate::specfence::PredState::Left
+        } else {
+            crate::specfence::PredState::Unstarted
+        }
+    }
+
+    /// In-frame hop while the predecessor is executing. ExactWake if it leaves
+    /// unpublished. A finish with no write of `loc` is not a data floor.
+    fn region_wait(
+        &self,
+        loc: MemoryLocationHash,
+        pred: TxIdx,
+        view: &crate::specfence::RegionView,
+        ordered: bool,
+    ) -> RegionHop {
+        let started = Instant::now();
+        let op = crate::specfence::RegionOp::Wait { ordered };
+        let workers = self.specfence.spine.workers();
+        if self.specfence.region.in_frame_saturated(workers)
+            || !self.specfence.scheduler.is_executing(pred)
+        {
+            return self.region_finish_hop(loc, pred, view, op, 0);
+        }
+        self.specfence.region.enter_frame();
+        let mut i = 0u32;
+        let published = loop {
+            if i % 32 == 0 {
+                let sf = crate::specfence::SfMvMemory::new(self.mv_memory, self.specfence.sf_tips);
+                if sf.true_publish_ready(loc, pred) {
+                    break true;
+                }
+            }
+            let executing = self.specfence.scheduler.is_executing(pred);
+            let elapsed = started.elapsed();
+            if !executing && i > 16 {
+                let sf = crate::specfence::SfMvMemory::new(self.mv_memory, self.specfence.sf_tips);
+                break sf.true_publish_ready(loc, pred);
+            }
+            if elapsed > std::time::Duration::from_millis(2) {
+                let sf = crate::specfence::SfMvMemory::new(self.mv_memory, self.specfence.sf_tips);
+                break sf.true_publish_ready(loc, pred);
+            }
+            if i % 64 == 0 {
+                std::thread::yield_now();
+            } else {
+                std::hint::spin_loop();
+            }
+            i = i.wrapping_add(1);
+        };
+        self.specfence.region.leave_frame();
+        let ns = started.elapsed().as_nanos() as u64;
+        if published {
+            view.note(op, ns);
+            RegionHop::Settled(Ok(()))
+        } else if self.region_tx_done(pred) {
+            RegionHop::Again
+        } else {
+            self.region_finish_hop(loc, pred, view, op, ns)
+        }
+    }
+
+    fn region_finish_hop(
+        &self,
+        loc: MemoryLocationHash,
+        pred: TxIdx,
+        view: &crate::specfence::RegionView,
+        op: crate::specfence::RegionOp,
+        ns: u64,
+    ) -> RegionHop {
+        let sf = crate::specfence::SfMvMemory::new(self.mv_memory, self.specfence.sf_tips);
+        if sf.true_publish_ready(loc, pred) {
+            view.note(op, ns);
+            return RegionHop::Settled(Ok(()));
+        }
+        if self.region_tx_done(pred) {
+            return RegionHop::Again;
+        }
+        view.note(op, ns);
+        self.specfence
+            .sf_tips
+            .register_waiter(loc, pred, self.tx_idx);
+        if sf.true_publish_ready(loc, pred) {
+            let _ = self.specfence.sf_tips.wake_exact(loc, pred);
+            return RegionHop::Settled(Ok(()));
+        }
+        if self.region_tx_done(pred) {
+            let _ = self.specfence.sf_tips.wake_exact(loc, pred);
+            return RegionHop::Again;
+        }
+        self.specfence
+            .ready_edges
+            .note_ungated_wait_on(self.tx_idx, pred);
+        RegionHop::Settled(Err(self.park_publish_wait(loc, pred)))
+    }
+
+    fn region_tx_done(&self, tx: TxIdx) -> bool {
+        self.specfence.scheduler.is_done(tx) || self.specfence.scheduler.is_validated(tx)
+    }
+
+    /// Predicted hop, plus a nearer live open writer that is not behind a real write.
+    fn region_pick(
+        &self,
+        view: &crate::specfence::RegionView,
+        loc: MemoryLocationHash,
+    ) -> Option<TxIdx> {
+        let sf = crate::specfence::SfMvMemory::new(self.mv_memory, self.specfence.sf_tips);
+        let wrote = |w: TxIdx| sf.true_publish_ready(loc, w);
+        let done = |w: TxIdx| self.region_tx_done(w);
+        let open = self.specfence.sf_tips.nearest_open_before(loc, self.tx_idx);
+        let live = self
+            .specfence
+            .sf_tips
+            .live_writer(loc)
+            .filter(|&w| w < self.tx_idx);
+        let extra = match (open, live) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        view.pick_pred(self.tx_idx, wrote, done, extra)
+    }
+
+    /// Off-spine edge decision. Non-touchers return on `region_on == false`.
+    fn region_on_access(&self, address: Address, loc: MemoryLocationHash) -> Result<(), ReadError> {
+        if !self.region_on || self.is_lazy || address == self.specfence.beneficiary {
+            return Ok(());
+        }
+        let region = self.specfence.region;
+        if self.region_writer {
+            let n = self.region_nlocs as usize;
+            for i in 0..n {
+                if self.region_locs[i] == loc && !region.loc_armed(loc) {
+                    region.try_arm(self.tx_idx, loc);
+                    break;
+                }
+            }
+        }
+        if !region.any_armed() {
+            return Ok(());
+        }
+        if self.region_seen(loc) {
+            region.note_later_pass(self.tx_idx, loc);
+            return Ok(());
+        }
+        let Some(view) = region.view(self.tx_idx, loc) else {
+            return Ok(());
+        };
+        for _ in 0..4 {
+            let pred = self.region_pick(&view, loc);
+            if let Some(p) = pred {
+                let sf = crate::specfence::SfMvMemory::new(self.mv_memory, self.specfence.sf_tips);
+                if self.region_tx_done(p) && !sf.true_publish_ready(loc, p) {
+                    continue;
+                }
+            }
+            let state = self.region_pred_state(loc, pred);
+            match view.decide(state) {
+                crate::specfence::RegionOp::Pass => {
+                    self.region_mark(loc);
+                    view.note(crate::specfence::RegionOp::Pass, 0);
+                    return Ok(());
+                }
+                crate::specfence::RegionOp::Unstarted => {
+                    self.region_mark(loc);
+                    view.note(crate::specfence::RegionOp::Unstarted, 0);
+                    return Ok(());
+                }
+                crate::specfence::RegionOp::Retain => {
+                    self.region_mark(loc);
+                    view.note(crate::specfence::RegionOp::Retain, 0);
+                    return Ok(());
+                }
+                crate::specfence::RegionOp::Wait { ordered } => {
+                    let Some(pred) = pred else {
+                        self.region_mark(loc);
+                        view.note(crate::specfence::RegionOp::Pass, 0);
+                        return Ok(());
+                    };
+                    match self.region_wait(loc, pred, &view, ordered) {
+                        RegionHop::Again => continue,
+                        RegionHop::Settled(result) => {
+                            self.region_mark(loc);
+                            return result;
+                        }
+                    }
+                }
+            }
+        }
+        self.region_mark(loc);
+        view.note(crate::specfence::RegionOp::Pass, 0);
+        Ok(())
+    }
+
     /// Structural read: emit [`AccessEvent`](crate::specfence::AccessEvent) and, on a
     /// real unpublished lower writer, WaitTrueVersion inside this host call.
     /// The interpreter frame stays up because this returns `Ok` after the tip
@@ -696,6 +980,11 @@ impl<'a, S: Storage> VmDb<'a, S> {
         let Some(writer) = self.peek_unpublished_writer(location_hash) else {
             return Ok(());
         };
+        if self.specfence.region.enabled() {
+            self.specfence
+                .region
+                .note_raw_evidence(self.tx_idx, location_hash, writer);
+        }
         self.yield_wait_true_version(ev, writer)
     }
 
@@ -2583,6 +2872,9 @@ impl<S: Storage> Database for VmDb<'_, S> {
                 0
             };
         let mut cut = self.begin_cut_read(location_hash);
+        if self.region_on {
+            self.region_on_access(address, location_hash)?;
+        }
         self.spine_before_read(address, location_hash, access_k)?;
         self.consult_ungated_wait_once(address, location_hash, access_k)?;
         cut.mark_detect();
@@ -3069,6 +3361,9 @@ impl<S: Storage> Database for VmDb<'_, S> {
                 0
             };
         let mut cut = self.begin_cut_read(location_hash);
+        if self.region_on {
+            self.region_on_access(address, location_hash)?;
+        }
         self.spine_before_read(address, location_hash, access_k)?;
         self.consult_ungated_wait_once(address, location_hash, access_k)?;
         cut.mark_detect();
@@ -3528,6 +3823,14 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
             split_vmdb_n: Cell::new(0),
             split_detect_n: Cell::new(0),
             sf_occ_shaped: false,
+            region_on: false,
+            region_writer: false,
+            region_locs: [u64::MAX; 4],
+            region_nlocs: 0,
+            region_seen0: Cell::new(u64::MAX),
+            region_seen1: Cell::new(u64::MAX),
+            region_seen2: Cell::new(u64::MAX),
+            region_seen3: Cell::new(u64::MAX),
             vis: VisibilityPolicy::Opt,
             pcc_armed: Cell::new(false),
             optimistic_read_this_tx: Cell::new(0),
@@ -4978,6 +5281,38 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
                 self.note_spine_writes(tx_version.tx_idx, &write_set);
                 let (wrote_new_location, contended) =
                     self.mv_memory.record(tx_version, read_set, write_set);
+                if self.specfence.region.any_armed() {
+                    let (region_writer, region_locs, region_nlocs) = {
+                        let ctx = self.evm.ctx();
+                        let db = ctx.db();
+                        (db.region_writer, db.region_locs, db.region_nlocs)
+                    };
+                    for &loc in &effective_write_locs {
+                        let woken = self.specfence.region.on_publish(
+                            loc,
+                            tx_version.tx_idx,
+                            self.specfence.sf_tips,
+                        );
+                        for c in woken {
+                            self.specfence.wave.push_ready(c);
+                        }
+                    }
+                    if region_writer {
+                        for loc in region_locs.into_iter().take(region_nlocs as usize) {
+                            if effective_write_locs.contains(&loc) {
+                                continue;
+                            }
+                            let woken = self.specfence.region.on_skip(
+                                loc,
+                                tx_version.tx_idx,
+                                self.specfence.sf_tips,
+                            );
+                            for c in woken {
+                                self.specfence.wave.push_ready(c);
+                            }
+                        }
+                    }
+                }
                 if self.specfence.mode == crate::ConcurrencyMode::SpecFence {
                     self.specfence
                         .sf_tips

@@ -195,6 +195,10 @@ pub struct Pevm {
     spine_prior: crate::specfence::SpinePrior,
     /// Last SpecFence block's spine counters (Soft=0 report).
     last_spine: crate::specfence::SpineReport,
+    /// Next-block off-spine region radar. Empty when v2 is off.
+    region_prior: crate::specfence::RegionRadarPrior,
+    /// Per-iteration RegionAvoid v2 line from the last SpecFence block.
+    last_region_report: String,
 }
 
 impl Default for Pevm {
@@ -225,6 +229,8 @@ impl Default for Pevm {
             finegrain: FineGrainCollector::new(),
             spine_prior: crate::specfence::SpinePrior::default(),
             last_spine: crate::specfence::SpineReport::default(),
+            region_prior: crate::specfence::RegionRadarPrior::default(),
+            last_region_report: String::new(),
         }
     }
 }
@@ -366,6 +372,13 @@ impl Pevm {
     pub fn reset_inter_prior(&mut self) {
         self.inter_prior.reset();
         self.cost_policy.reset();
+        self.region_prior = crate::specfence::RegionRadarPrior::default();
+    }
+
+    /// RegionLearnAvoid v2 counters for the last SpecFence block.
+    /// `enabled=0` when `SPECFENCE_REGION_LEARN_AVOID_V2=0`.
+    pub fn last_region_report(&self) -> &str {
+        &self.last_region_report
     }
 
     /// B3/B2 learning report from the last SpecFence block.
@@ -684,6 +697,15 @@ impl Pevm {
         }
         let finegrain_ref = self.finegrain_enabled.then_some(&self.finegrain);
         let ideal_prox = crate::specfence::IdealProxLog::new(block_size);
+        let beneficiary_hash = hash_deterministic(MemoryLocation::Basic(block_env.beneficiary));
+        let region_avoid = crate::specfence::RegionAvoid::begin(
+            self.concurrency_mode == ConcurrencyMode::SpecFence,
+            block_size,
+            &self.region_prior,
+            access_arms.crit_loc_hash(),
+            access_spine.ordered_loc_hash(),
+            beneficiary_hash,
+        );
         let specfence = SpecFenceCtx {
             mode: self.concurrency_mode,
             hints: &hints,
@@ -717,6 +739,7 @@ impl Pevm {
             tx_first_start: &tx_first_start,
             exec_origin: &exec_origin,
             spine: &access_spine,
+            region: &region_avoid,
             ideal_prox: &ideal_prox,
         };
 
@@ -1141,6 +1164,12 @@ impl Pevm {
                 }
             }
             self.inter_prior.pack_crit_chain(packed);
+            if self.concurrency_mode == ConcurrencyMode::SpecFence {
+                let (next_radar, region_line) =
+                    region_avoid.finish(&self.last_location_writers, &self.region_prior);
+                self.region_prior = next_radar;
+                self.last_region_report = region_line;
+            }
             let ready_w = ready_edges.ready_width_mean();
             let idle = ready_edges.idle_core_ns();
             let refuse = ready_edges.refuse_count();

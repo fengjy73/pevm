@@ -589,6 +589,12 @@ impl AccessSpine {
         self.ordered_loc != u64::MAX && self.ordered_loc == loc && !self.ordered_writers.is_empty()
     }
 
+    /// Ordered-spine location hash, or `u64::MAX` when this block has none.
+    #[inline]
+    pub(crate) fn ordered_loc_hash(&self) -> MemoryLocationHash {
+        self.ordered_loc
+    }
+
     /// One ungated non-chain first execute took the cheap Opt path.
     #[inline]
     pub(crate) fn note_indep_first_cut(&self) {
