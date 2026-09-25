@@ -76,10 +76,11 @@ mkdir -p "$OUT"
 BIN="$ROOT/target/release/examples/specfence_inflation_dig"
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
+  # required-features does not enable the feature by itself.
   if command -v rustup >/dev/null 2>&1 && rustup toolchain list 2>/dev/null | grep -q '^stable'; then
-    cargo +stable build -p pevm --release --config 'profile.release.lto=false' --example specfence_inflation_dig
+    cargo +stable build -p pevm --release --features specfence --config 'profile.release.lto=false' --example specfence_inflation_dig
   else
-    cargo build -p pevm --release --config 'profile.release.lto=false' --example specfence_inflation_dig
+    cargo build -p pevm --release --features specfence --config 'profile.release.lto=false' --example specfence_inflation_dig
   fi
 fi
 
