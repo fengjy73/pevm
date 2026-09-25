@@ -199,7 +199,9 @@ impl Scheduler {
         ready: Option<&ReadyEdgeTable>,
     ) -> Option<TxVersion> {
         if tx_idx < self.block_size {
+            let acq = crate::specfence::busy_stall::lock_t0();
             let mut tx = index_mutex!(self.transactions_status, tx_idx);
+            crate::specfence::busy_stall::time_lock_acq(acq);
             if tx.status == IncarnationStatus::ReadyToExecute {
                 // Ungated / A0: OCC-class pick — no ReadyEdge refuse probe.
                 if let Some(edges) = ready
@@ -335,6 +337,19 @@ impl Scheduler {
                 }
                 thread::yield_now();
                 let ns = idle_t0.elapsed().as_nanos() as u64;
+                crate::specfence::busy_stall::charge_nested(
+                    if busy {
+                        crate::specfence::busy_stall::KIND_STALL_WAITONCE
+                    } else {
+                        crate::specfence::busy_stall::KIND_STALL_NOREADY
+                    },
+                    ns,
+                    idle_t0,
+                    crate::specfence::busy_stall::PRED_NONE,
+                    crate::specfence::busy_stall::PRED_NONE,
+                    0,
+                    true,
+                );
                 if let Some(edges) = ready {
                     edges.add_yield_ns(ns);
                     if profile_timing_enabled() {
@@ -380,7 +395,9 @@ impl Scheduler {
                         edges.note_skip_gate(tx_idx);
                         continue;
                     }
+                    let acq = crate::specfence::busy_stall::lock_t0();
                     let mut tx = index_mutex!(self.transactions_status, tx_idx);
+                    crate::specfence::busy_stall::time_lock_acq(acq);
                     if tx.status == IncarnationStatus::ReadyToExecute {
                         tx.status = IncarnationStatus::Executing;
                         self.set_done_flag(tx_idx, false);
@@ -955,7 +972,9 @@ impl Scheduler {
         wave: Option<&WaveParkTable>,
         fence: Option<&FenceGraph>,
     ) -> Option<Task> {
+        let acq = crate::specfence::busy_stall::lock_t0();
         let mut tx = index_mutex!(self.transactions_status, tx_version.tx_idx);
+        crate::specfence::busy_stall::time_lock_acq(acq);
         debug_assert_eq!(tx.status, IncarnationStatus::Executing);
         debug_assert_eq!(tx.incarnation, tx_version.tx_incarnation);
 

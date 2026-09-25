@@ -725,6 +725,7 @@ impl Pevm {
             .map(|t0| t0.elapsed().as_nanos() as u64)
             .unwrap_or(0);
         let sf_worker_seq = std::sync::atomic::AtomicUsize::new(0);
+        crate::specfence::busy_stall::begin(exec_origin);
         // Join probe starts after the last spawn. `thread::scope` joins after
         // this closure returns, so the stamp is the host wait's start.
         let mut join_mark = exec_origin;
@@ -739,6 +740,7 @@ impl Pevm {
                         );
                         let worker_i =
                             sf_worker_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        crate::specfence::busy_stall::bind(worker_i);
                         crate::specfence::run_sf_block(
                             &scheduler,
                             &mv_memory,
@@ -767,12 +769,16 @@ impl Pevm {
                         let mut vm = Vm::new(
                             chain, spec_id, &block_env, &txs, storage, &mv_memory, specfence,
                         );
+                        let worker_i =
+                            sf_worker_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        crate::specfence::busy_stall::bind(worker_i);
                         let profile = crate::specfence::profile_timing_enabled();
                         let occ_mode = self.concurrency_mode == ConcurrencyMode::Occ;
                         let mut pick_t0 = Instant::now();
                         let mut task = crate::specfence::next_occ_task(&scheduler);
                         let mut pick_ns = pick_t0.elapsed().as_nanos() as u64;
                         metrics_inner.add_phase_pick(pick_ns);
+                        crate::specfence::busy_stall::charge_pick(pick_ns, pick_t0);
                         if profile {
                             metrics_inner.add_profile_scheduler_ns(pick_ns);
                         }
@@ -801,6 +807,15 @@ impl Pevm {
                                     };
                                     let vns = v0.elapsed().as_nanos() as u64;
                                     metrics_inner.add_phase_val(vns);
+                                    crate::specfence::busy_stall::charge_span(
+                                        crate::specfence::busy_stall::KIND_VALIDATE,
+                                        vns,
+                                        v0,
+                                        tx_version.tx_idx as u32,
+                                        crate::specfence::busy_stall::PRED_NONE,
+                                        tx_version.tx_incarnation as u16,
+                                        vns,
+                                    );
                                     if profile {
                                         metrics_inner.add_profile_validate_ns(vns);
                                     }
@@ -815,15 +830,18 @@ impl Pevm {
                                 task = crate::specfence::next_occ_task(&scheduler);
                                 pick_ns = pick_t0.elapsed().as_nanos() as u64;
                                 metrics_inner.add_phase_pick(pick_ns);
+                                crate::specfence::busy_stall::charge_pick(pick_ns, pick_t0);
                                 if profile {
                                     metrics_inner.add_profile_scheduler_ns(pick_ns);
                                 }
                             }
                         }
+                        crate::specfence::busy_stall::worker_exit();
                     });
                 }
             }
         });
+        crate::specfence::busy_stall::seal();
 
         if self.concurrency_mode == ConcurrencyMode::SpecFence {
             let (mut report, next) = access_spine.end_block();
@@ -1480,17 +1498,47 @@ impl Pevm {
                 vm.try_apply_park_resume(tx_version.tx_idx, wave);
             }
             let exec_t0 = (tx_version.tx_incarnation > 0).then(Instant::now);
+            let probe_on = crate::specfence::busy_stall::enabled();
+            let probe_t = probe_on.then(Instant::now);
+            let probe_partial = probe_on
+                && tx_version.tx_incarnation > 0
+                && vm.probe_partial_reexec(tx_version.tx_idx);
+            let probe_pred = if probe_on {
+                vm.probe_ordered_pred(tx_version.tx_idx)
+            } else {
+                None
+            };
             return match vm.execute(&tx_version, result_slot) {
                 Ok(flags) => {
                     if let Some(t0) = exec_t0 {
                         vm.note_hot_reexec_ns(tx_version.tx_idx, t0.elapsed().as_nanos() as u64);
                     }
+                    if let Some(t0) = probe_t {
+                        crate::specfence::busy_stall::charge_exec(
+                            true,
+                            tx_version.tx_incarnation,
+                            probe_partial,
+                            t0.elapsed().as_nanos() as u64,
+                            t0,
+                            tx_version.tx_idx,
+                            probe_pred,
+                            None,
+                        );
+                    }
                     // PublishWrite ≈ incarnation finished: wake location waiters + ready.
                     let done_idx = tx_version.tx_idx;
+                    let done_inc = tx_version.tx_incarnation;
                     let fin_t0 = Instant::now();
                     let task =
                         scheduler.finish_execution_with_wave_fence(tx_version, flags, wave, fence);
-                    vm.note_phase_finish(fin_t0.elapsed().as_nanos() as u64);
+                    let finish_ns = fin_t0.elapsed().as_nanos() as u64;
+                    vm.note_phase_finish(finish_ns);
+                    crate::specfence::busy_stall::charge_publish(
+                        finish_ns,
+                        fin_t0,
+                        done_idx,
+                        done_inc,
+                    );
                     if let Some(wave) = wave {
                         vm.release_ready_edges(done_idx, wave);
                     }
@@ -1501,6 +1549,18 @@ impl Pevm {
                     task
                 }
                 Err(VmExecutionError::Retry) => {
+                    if let Some(t0) = probe_t {
+                        crate::specfence::busy_stall::charge_exec(
+                            false,
+                            tx_version.tx_incarnation,
+                            probe_partial,
+                            t0.elapsed().as_nanos() as u64,
+                            t0,
+                            tx_version.tx_idx,
+                            probe_pred,
+                            None,
+                        );
+                    }
                     if self.abort_reason.get().is_none() {
                         continue;
                     }
@@ -1513,6 +1573,18 @@ impl Pevm {
                     None
                 }
                 Err(VmExecutionError::Blocking(blocking_tx_idx)) => {
+                    if let Some(t0) = probe_t {
+                        crate::specfence::busy_stall::charge_exec(
+                            false,
+                            tx_version.tx_incarnation,
+                            probe_partial,
+                            t0.elapsed().as_nanos() as u64,
+                            t0,
+                            tx_version.tx_idx,
+                            probe_pred,
+                            Some(blocking_tx_idx),
+                        );
+                    }
                     // M2/P4: WaitHard registered park+(location,k) in Vm (SpecFence).
                     let pending = vm.take_pending_park();
                     let park_loc = pending.map(|p| p.location).unwrap_or(0);
@@ -1641,28 +1713,70 @@ impl Pevm {
             }
             let exec_t0 = (tx_version.tx_incarnation > 0).then(Instant::now);
             let cut_t0 = Instant::now();
+            let probe_on = crate::specfence::busy_stall::enabled();
+            let probe_partial = probe_on
+                && tx_version.tx_incarnation > 0
+                && vm.probe_partial_reexec(tx_version.tx_idx);
+            let probe_pred = if probe_on {
+                vm.probe_ordered_pred(tx_version.tx_idx)
+            } else {
+                None
+            };
             return match vm.execute(
                 &tx_version,
                 self.execution_results.slot_mut(tx_version.tx_idx),
             ) {
                 Ok(flags) => {
                     let exec_ns = cut_t0.elapsed().as_nanos() as u64;
+                    if probe_on {
+                        crate::specfence::busy_stall::charge_exec(
+                            true,
+                            tx_version.tx_incarnation,
+                            probe_partial,
+                            exec_ns,
+                            cut_t0,
+                            tx_version.tx_idx,
+                            probe_pred,
+                            None,
+                        );
+                    }
                     if let Some(t0) = exec_t0 {
                         vm.note_hot_reexec_ns(tx_version.tx_idx, t0.elapsed().as_nanos() as u64);
                     }
                     let wrote_new_location =
                         flags.contains(crate::FinishExecFlags::WroteNewLocation);
+                    let done_idx = tx_version.tx_idx;
+                    let done_inc = tx_version.tx_incarnation;
                     let fence = crate::specfence::fence_for_mode(ConcurrencyMode::SpecFence, dag);
                     let fin_t0 = Instant::now();
                     let _ =
                         scheduler.finish_execution_with_wave_fence(tx_version, flags, wave, fence);
                     let finish_ns = fin_t0.elapsed().as_nanos() as u64;
                     vm.note_phase_finish(finish_ns);
+                    crate::specfence::busy_stall::charge_publish(
+                        finish_ns,
+                        fin_t0,
+                        done_idx,
+                        done_inc,
+                    );
                     vm.flush_cut_probe(exec_ns, finish_ns);
                     SfExec::Executed { wrote_new_location }
                 }
                 Err(VmExecutionError::Retry) => {
-                    vm.flush_cut_probe(cut_t0.elapsed().as_nanos() as u64, 0);
+                    let exec_ns = cut_t0.elapsed().as_nanos() as u64;
+                    if probe_on {
+                        crate::specfence::busy_stall::charge_exec(
+                            false,
+                            tx_version.tx_incarnation,
+                            probe_partial,
+                            exec_ns,
+                            cut_t0,
+                            tx_version.tx_idx,
+                            probe_pred,
+                            None,
+                        );
+                    }
+                    vm.flush_cut_probe(exec_ns, 0);
                     if self.abort_reason.get().is_none() {
                         retry_n += 1;
                         continue;
@@ -1677,7 +1791,20 @@ impl Pevm {
                     SfExec::Fatal
                 }
                 Err(VmExecutionError::Blocking(blocking_tx_idx)) => {
-                    vm.flush_cut_probe(cut_t0.elapsed().as_nanos() as u64, 0);
+                    let exec_ns = cut_t0.elapsed().as_nanos() as u64;
+                    if probe_on {
+                        crate::specfence::busy_stall::charge_exec(
+                            false,
+                            tx_version.tx_incarnation,
+                            probe_partial,
+                            exec_ns,
+                            cut_t0,
+                            tx_version.tx_idx,
+                            probe_pred,
+                            Some(blocking_tx_idx),
+                        );
+                    }
+                    vm.flush_cut_probe(exec_ns, 0);
                     let pending = vm.take_pending_park();
                     let park_kind = pending
                         .map(|p| p.kind)

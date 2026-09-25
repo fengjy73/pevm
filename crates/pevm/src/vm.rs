@@ -685,6 +685,14 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return Ok(());
         }
         let _detect = self.begin_kept_detect();
+        // Probe only. Off: this returns before Instant::now.
+        let _busy = crate::specfence::busy_stall::guard(
+            crate::specfence::busy_stall::KIND_DETECT,
+            self.tx_idx,
+            usize::MAX,
+            self.tx_incarnation as u16,
+            false,
+        );
         let ev = crate::specfence::AccessEvent {
             tx: self.tx_idx,
             loc: location_hash,
@@ -751,6 +759,14 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return Err(ReadError::YieldWait(writer));
         }
         let started = Instant::now();
+        let _stall = crate::specfence::busy_stall::guard_at(
+            crate::specfence::busy_stall::KIND_STALL_HANDOFF,
+            started,
+            self.tx_idx,
+            writer,
+            self.tx_incarnation as u16,
+            true,
+        );
         let mut i = 0u32;
         let mut executing = self.specfence.scheduler.is_executing(writer);
         loop {
@@ -853,6 +869,13 @@ impl<'a, S: Storage> VmDb<'a, S> {
             return Ok(());
         }
         let _detect = self.begin_kept_detect();
+        let _busy = crate::specfence::busy_stall::guard(
+            crate::specfence::busy_stall::KIND_DETECT,
+            self.tx_idx,
+            usize::MAX,
+            self.tx_incarnation as u16,
+            false,
+        );
         let thin = self.specfence.scheduler.block_size() <= crate::specfence::THIN_SHELL_N;
         // Checkpoint before this read so fail_k can RewindTo (large blocks).
         // Thin shell skips RewindTo — do not pay rem tax for unused cps.
@@ -953,6 +976,13 @@ impl<'a, S: Storage> VmDb<'a, S> {
             self.specfence.sf_tips.record_wait_once_consume();
             if executing {
                 const SPIN: usize = 4_096;
+                let _spin = crate::specfence::busy_stall::guard(
+                    crate::specfence::busy_stall::KIND_STALL_WAITONCE,
+                    self.tx_idx,
+                    pred,
+                    self.tx_incarnation as u16,
+                    true,
+                );
                 for i in 0..SPIN {
                     if self.specfence.scheduler.is_done(pred)
                         || self.specfence.scheduler.is_validated(pred)
@@ -991,6 +1021,14 @@ impl<'a, S: Storage> VmDb<'a, S> {
         if unfinished.is_some() {
             self.specfence.sf_tips.record_wait_once_consume();
             let started = Instant::now();
+            let _stall = crate::specfence::busy_stall::guard_at(
+                crate::specfence::busy_stall::KIND_STALL_COMMIT,
+                started,
+                self.tx_idx,
+                pred,
+                self.tx_incarnation as u16,
+                true,
+            );
             let mut i = 0u32;
             let mut executing = true;
             loop {
@@ -1065,6 +1103,13 @@ impl<'a, S: Storage> VmDb<'a, S> {
         // ChainSpineTip: brief Released poll (not long busy-spin) before park.
         if self.specfence.sf_tips.is_chain_loc(location_hash) && (executing || has_sf_tip) {
             const SPIN: usize = 512;
+            let _spin = crate::specfence::busy_stall::guard(
+                crate::specfence::busy_stall::KIND_STALL_HANDOFF,
+                self.tx_idx,
+                pred,
+                self.tx_incarnation as u16,
+                true,
+            );
             for i in 0..SPIN {
                 if self.specfence.scheduler.is_done(pred)
                     || self.specfence.scheduler.is_validated(pred)
@@ -3764,6 +3809,17 @@ impl<'a, S: Storage, C: PevmChain> Vm<'a, S, C> {
     // execution).
     pub(crate) fn note_phase_finish(&self, ns: u64) {
         self.specfence.metrics.add_phase_finish(ns);
+    }
+
+    /// Rewind or fast-forward resume. Measurement label only.
+    pub(crate) fn probe_partial_reexec(&self, tx: crate::TxIdx) -> bool {
+        self.specfence.partial_retry.is_rewind_resume(tx)
+            || self.specfence.partial_retry.has_ff_head(tx)
+    }
+
+    /// Ordered-spine predecessor. Measurement label only.
+    pub(crate) fn probe_ordered_pred(&self, tx: crate::TxIdx) -> Option<crate::TxIdx> {
+        self.specfence.spine.ordered_pred(tx)
     }
 
     /// Move this attempt's first-cut timers onto the spine, then zero them.
