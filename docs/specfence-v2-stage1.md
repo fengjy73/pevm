@@ -312,3 +312,199 @@ On the big block the SF 95% CI upper is also within 1.09× of the OCC median (6.
 - Cross-class RAW still produces a few FullReplay, under the cap.
 - `TPS_ideal` is the workers=1 profile critical path. The step-trace file is a meta line.
 - Absolute milliseconds moved with the host (model 143, L3 105 MiB versus the Stage 1 model 207, L3 320 MiB). Quote the same-scan ratio.
+
+## Stage 1c
+
+The C=4 gate is not met. On a fresh K=10 scan of the binary below, SpecFence at C=4 is slower than upstream OCC at C=4, and slower than SpecFence at C=1, on both blocks and both class keys. FullReplay on 15274915 stays at most 8. On 3356896 it is 0 in 39 of the 40 multi-worker rounds; one `(to, selector)` C=8 round is 16, above the cap of 5.
+
+What the timelines showed, and what the code now does, is still the useful result. Armed reads were waiting for the producer's commit. They now wait for that incarnation's read-from finality. The wall stays on the preseeded nearest-lower chain: 997 members, 77 real writers, and every next writer still starts only after the previous writer has finished executing.
+
+Upstream `vm.rs`, `mv_memory.rs`, `scheduler.rs`, and `pevm.rs` are byte-identical to `e94b0e3`. No opcode is replaced.
+
+### Attribution before the wake-rule change
+
+One instrumented run per cell, `SPECFENCE_TIMELINE=1`, fresh state, no warm-up. The internal `wall_ns` excludes rdtsc calibration and the JSON dump. Timers are off in the K=10 scan below; these walls are the before column on this host, and they are higher than an untimed run of the same binary.
+
+Host: 4 vCPUs, KVM, Intel Xeon family 6 model 207, one thread per core, CPUs 0–3, L3 320 MiB (cache size 327680 KB), L2 8 MiB. This is the Stage 1 host, not the Stage 1b host (family 6 model 143, L3 105 MiB). Absolute milliseconds are not comparable across those two machines.
+
+The list schedule built from this run's per-transaction `(end − start)` costs sits close to the wall (ratio 1.03–2.36 in the timeline report). Those costs already include in-transaction chain waits, and the report's critical-path walker over-counts (`cp_cover` from 1.59 to 84). That makespan is not Ideal_C. The segment that explains the wall is the writer chain, measured directly from publish order.
+
+#### Writer chain
+
+Non-lazy writers of the hottest location. A hop is the gap from one writer's execution end to the next writer's execution start. Commit lag is the time that writer sat executed and not yet committed.
+
+| Block | C | Class key | Wall ms | Writers | Exec sum ms | Span ms | Hops after previous commit | Gap ms | Commit lag ms |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | --- | ---: | ---: |
+| 15274915 | 4 | to+selector | 7.091 | 77 | 0.596 | 4.182 | 76/76 | 3.586 | 3.495 |
+| 15274915 | 8 | to+selector | 11.372 | 77 | 0.665 | 7.305 | 74/76 | 6.639 | 6.561 |
+| 15274915 | 4 | code_hash+selector | 11.136 | 77 | 0.695 | 7.448 | 76/76 | 6.754 | 6.651 |
+| 15274915 | 8 | code_hash+selector | 12.377 | 77 | 0.645 | 9.010 | 76/76 | 8.365 | 8.261 |
+| 3356896 | 4 | to+selector | 1.595 | 17 | 0.209 | 0.896 | 16/16 | 0.687 | 0.489 |
+| 3356896 | 8 | to+selector | 2.102 | 16 | 0.199 | 0.541 | 13/15 | 0.342 | 0.323 |
+| 3356896 | 4 | code_hash+selector | 2.301 | 17 | 0.274 | 1.404 | 15/16 | 1.130 | 0.044 |
+| 3356896 | 8 | code_hash+selector | 2.691 | 17 | 0.296 | 1.831 | 15/16 | 1.535 | 0.191 |
+
+On 15274915 the location is `0xabd6bb3978815b97`, the basic account of the 997-recipient plain transfer (`chain_len` 997). On 3356896 it is `0xdff71d59d972d654`. DAG edges on the big block, `(to, selector)`: 112 RAW, about 1146 WAW, about 110 WAR, 15 sender, and 2 lazy WAW. Lazy beneficiary updates are not on this chain.
+
+Of the 3.586 ms between consecutive writers at C=4 `(to, selector)`, 3.495 ms (97%) is the previous writer waiting to commit. The time from that commit to the next writer's start is 0.091 ms. At C=8 the same split is 6.561 of 6.639 ms. The 77 writers' own execution is 0.60–0.70 ms. Raising C lengthens the span (4.18 ms to 7.31 ms) because commit is one prefix and every hop waits for it.
+
+#### Worker time and top waits
+
+Thread-sum milliseconds. Park time overlaps across workers, so it is not a share of the wall. Validation is the compare, not the commit lag.
+
+| Block | C | Key | Exec | Validate | Idle | Spin | Queue | Park thread-sum (reason: ms / n) |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 15274915 | 4 | to | 12.082 | 0.342 | 5.748 | 0.089 | 1.689 | armed 206.4/114, nonce 9.90/8, class-head 6.31/8 |
+| 15274915 | 8 | to | 23.140 | 0.702 | 38.798 | 2.420 | 3.620 | armed 2570/490, nonce 19.1/11, admission 16.5/12, class-head 15.5/13 |
+| 15274915 | 4 | code_hash | 11.977 | 0.575 | 18.638 | 0.524 | 2.471 | admission 4220/1064, armed 347/111, class-head 6.53/13 |
+| 15274915 | 8 | code_hash | 13.364 | 0.590 | 50.424 | 7.045 | 1.950 | admission 5276/1070, armed 463/112, class-head 15.4/21 |
+| 3356896 | 4 | to | 1.708 | 0.080 | 1.035 | 0.026 | 0.385 | nonce 13.1/32, armed 10.7/38, class-head 0.56/3 |
+| 3356896 | 8 | to | 2.433 | 0.106 | 4.766 | 0.663 | 0.163 | nonce 24.7/36, armed 18.0/37, admission 9.59/15 |
+| 3356896 | 4 | code_hash | 1.693 | 0.102 | 3.382 | 0.067 | 0.325 | admission 132/151, armed 14.3/22 |
+| 3356896 | 8 | code_hash | 2.154 | 0.118 | 8.555 | 1.512 | 0.358 | admission 142/150, armed 18.6/26 |
+
+Per-worker execute on 15274915 `(to, selector)` C=4 is 3.02, 3.10, 2.85, and 3.11 ms. The parallel phase is about 5.4 ms against a 7.09 ms wall. Commit-lag median on that cell is 2.36 ms (p90 2.76 ms).
+
+Top waits by `(reason, location, class)`, thread-sum:
+
+| Cell | Reason | Location | Class | ms | Parks |
+| --- | --- | --- | --- | ---: | ---: |
+| 15274915 C=4 to | armed read | `abd6bb3978815b97` | 6 | 167.1 | 76 |
+| 15274915 C=4 to | armed read | `de1644810b012b46` | 10 | 11.1 | 4 |
+| 15274915 C=4 to | armed read | `693c76ebc9d30041` | 2 | 9.3 | 11 |
+| 15274915 C=4 to | nonce / sender | `483a65c8273c8219` | — | 5.0 | 3 |
+| 15274915 C=4 code_hash | admission | — | 6 | 4220 | 1064 |
+| 15274915 C=4 code_hash | armed read | `abd6bb3978815b97` | 2 | 327.1 | 76 |
+| 3356896 C=4 to | armed read | `5e72d1250f2f8e02` | 24 | 4.1 | 15 |
+| 3356896 C=4 to | nonce / sender | `8d66eb7a3b2d4996` | 37 | 2.5 | 9 |
+| 3356896 C=4 code_hash | admission | — | 3 | 129.2 | 146 |
+| 3356896 C=4 code_hash | armed read | `5e72d1250f2f8e02` | 2 | 13.5 | 13 |
+
+Class-head parks with no true read-from or sender edge: 5 of 8 (3.06 of 6.31 ms) on 15274915 `(to, selector)` C=4, and 9 of 13 (4.04 of 6.53 ms) on `(code_hash, selector)` C=4. There is no admission park on `(to, selector)` C=4. `(code_hash, selector)` hashes an empty code with selector 0 into one class, so transfers and EOAs share class 6 and the same-class RMW prediction admits them.
+
+Cycle time inside execution on 15274915 `(to, selector)` C=4: publish 1.92 ms, record 1.75 ms, pre-interpreter 1.34 ms, scheduler 1.14 ms, coordinate 0.73 ms. The 77-writer execution sum is 0.60 ms. Bookkeeping is real thread time. It is not the 4.18 ms span.
+
+#### Hypotheses
+
+- **(a) Confirmed.** On 15274915 `(to, selector)` C=4, all 76 writer hops start after the previous writer's commit. Commit lag is 3.495 of the 3.586 ms inter-hop gap, 97%. At C=8 it is 6.561 of 6.639 ms. On 3356896 `(to, selector)` C=4 it is 16/16 hops and 0.489 of 0.687 ms. Armed-read parks that start only after the producer has finished are 15.6 of 206 ms (7.6%) on the big-block C=4 cell; the rest of that thread-sum is readers parked before the producer finishes, which is the same commit-prefix queue forming early.
+- **(b) The class-head barrier is not the wall. Same-class admission is, for one key.** Class-head thread-sum is 6.3 ms on the big block at C=4, and about half of those parks have no true edge. `(code_hash, selector)` admission on class 6 is 4220 ms across 1064 parks. That is a serialized classmate queue, and it is why that key's writer span is 7.45 ms rather than 4.18 ms.
+- **(c) Confirmed as the mechanism of (a).** Validation CPU is 0.34 ms on the big block at C=4. The delay is that the compare runs when the transaction becomes the commit head, so a published write is not final and every armed reader waits for the prefix. Commit-lag p50 is 2.36 ms.
+- **(d) Real, and smaller than the chain.** Publish, record, and coordinate are inside the execution sum. They do not account for a 4.18 ms span built from 0.60 ms of writer execution. Value-carrying origins stay: the compare in PR #65 is the soundness check, and deleting them was not justified by this split.
+
+### Root cause
+
+Commit is a single prefix, and an armed read treated "the nearest lower chain writer has committed" as the signal that the write was final. On `0xabd6bb3978815b97` the chain is preseeded with 997 predicted recipients. The 77 transactions that actually write it then run one after another, each waiting out the commit lag of the previous one. Four workers do not shorten that chain. Eight workers, oversubscribed on four CPUs, make the prefix slower, so the span grows from 4.18 ms to 7.31 ms and the wall grows with it.
+
+The C=1 path never enters this machinery. `workers == 1` uses `LiveChain::untracked`, skips class keys and preseed, and stores index origins. C=1 parity with OCC does not say the multi-worker chain is cheap.
+
+### What changed
+
+- **Dependency-closed finality.** An incarnation's write is final when that incarnation has finished, every read it consumed is storage or a final incarnation, and the value-and-identity compare passed. `validated[tx]` holds that incarnation, or `usize::MAX` after an abort or an estimate replacement. An armed reader waits until the nearest lower chain member is a final write or a final hole. `until_commit` is gone. Admission and the class head still wake on execution. Commit stores the same validated incarnation so a committed transaction is final, and then wakes anyone still parked.
+- **Early validation off the commit head.** `close_from` runs when an incarnation finishes and again when a dependency becomes final. Origins that are final, and no unresolved chain member between the origin and the reader, mark the incarnation and walk its readers. A mismatch aborts immediately and cascades executed readers whose origins no longer match. The commit loop skips the compare when the incarnation is already final. If it is not, the loop compares once, and a passing transaction is marked final so the prefix does not wait. After the commit lock drops, each newly final transaction fans out to readers that were chain-blocked. The final rescan is unchanged.
+- **A storage read does not block on lower preseed members.** The read already observed no lower write. A member that publishes later revokes the reader. Blocking that read on every preseeded index below it tied finality back to the commit prefix.
+- **Class head and same-class sibling prediction start off.** A validation failure sets the barrier on the reader class and the writer class, then inserts still-open classmates with `admit = false`. Repeated `Basic(to)` preseed stays. Those members are known writers of one account, and removing the preseed brought FullReplay back to 15–21 without lowering the wall.
+- **Hole clearing walks the whole prefix of final non-writers.** A cap of eight holes requeued the reader once per handful of preseeded members and put that chain back on the critical path. The loop stops if it would clear more holes than the reader's index.
+
+`workers == 1` still skips the chain, the class hash, preseed, and value-carrying origins.
+
+### Finality
+
+**Finality is the read-from closure, and the graph has no cycles.** Storage is final. An incarnation is final only after execution, a passing value-and-identity compare, and every consumed origin being final. Reads name a lower transaction index, so the edges point backward. Abort and estimate replacement clear `validated[tx]` and bump the incarnation. A reader that observed the old incarnation fails the compare.
+
+**Commit stays a prefix for receipts and state.** It is not the wakeup. `try_mark_committed` writes the validated incarnation, so commit implies final. A transaction can be final while lower transactions are still uncommitted.
+
+**The chain-nearest member is the wait, including a member that has not started.** A published member is ready when that incarnation is final. A predicted or running member that finishes without a write is a final hole and leaves the chain. Members below the read-from origin belong to that writer; they do not block this reader. A predicted member between the origin and the reader still blocks, because it may publish a write the reader has not seen. Unit tests cover a cascade that closes before any commit, a final hole, a lower member that does not block, a predicted gap that does block until it finishes, and a reader that wakes while the commit prefix is still below it.
+
+**A writer that appears later revokes higher executed readers.** Publish walks readers above the new writer. An executed reader whose origin no longer matches aborts, and its readers cascade, under the same lock as commit. A reader that has not finished is left to its own read. A higher index cannot be committed before every lower index, so a revoked reader is not already in the output. Estimates and aborts clear finality before the re-execution.
+
+**WAR adds no ordering edge.** RAW and WAW use the nearest lower chain writer. A writer inserted between the recorded origin and the reader fails the value compare or the publish-time revoke.
+
+**Early validation is the same compare.** It may run as soon as the origins are final. The commit head repeats it when the flag is unset. The rescan after the prefix still walks every transaction.
+
+### Wall clock after the change
+
+The post-fix timeline (same internal clock, 15274915, `(to, selector)`, C=4) has wall 7.685 ms and FullReplay 5. All 87 armed parks start before the producer finishes executing. None start after the producer's commit. The 77 writers still span 4.549 ms against 0.649 ms of execution, and all 76 hops start after the previous writer's execution end. 47 of 76 also happen to start after that writer's commit, because the preseeded holes in between take longer than the commit; the commit is no longer what the hop waits for. The small block's 35 armed parks likewise all start before the producer finishes.
+
+K=10 scan of this binary, timers off, no warm-up, bootstrap 10,000. SEQ is one workers=1 baseline and is not repeated per C. OCC is `execute_revm_parallel`. Build is `lto=false`, codegen-units 1. C=8 is `--allow-oversub` onto CPUs 0–3.
+
+```bash
+scripts/soft0_percore_scan.sh --cpu-list 0-3 --allow-oversub --c-list 1,4,8 --k 10 --profile-k 1 --step-k 1 --out results/stage1c-scan-to
+SPECFENCE_CLASS_KEY=code_hash scripts/soft0_percore_scan.sh --cpu-list 0-3 --allow-oversub --c-list 1,4,8 --k 10 --profile-k 1 --step-k 1 --skip-build --out results/stage1c-scan-code
+```
+
+`seqcheck` and `occcheck` reported `diverge=0` on both blocks for both output directories. They compare sequential with OCC. Ideal_C is `ideal_seq_ms`, the list-schedule makespan of the workers=1 profile. On 15274915 it equals the critical path at C=4 (1.163 ms and 1.173 ms), so it does not fall further at C=8.
+
+#### `(to, selector)`
+
+Block 15274915, `TPS_SEQ` 348231, median 3.521 ms, 95% CI [3.436, 3.710].
+
+| C | OCC ms | OCC 95% CI | SF ms | SF 95% CI | Ideal_C ms | SF/OCC | SF/Ideal_C |
+| ---: | ---: | --- | ---: | --- | ---: | ---: | ---: |
+| 1 | 4.895 | [4.689, 5.500] | 5.580 | [5.447, 5.720] | 3.063 | 1.14 | 1.82 |
+| 4 | 3.376 | [3.207, 3.685] | 6.049 | [5.850, 6.325] | 1.163 | 1.79 | 5.20 |
+| 8 | 3.891 | [3.762, 4.073] | 7.093 | [6.755, 7.868] | 1.163 | 1.82 | 6.10 |
+
+Block 3356896, `TPS_SEQ` 665722, median 0.264 ms, 95% CI [0.260, 0.273].
+
+| C | OCC ms | OCC 95% CI | SF ms | SF 95% CI | Ideal_C ms | SF/OCC | SF/Ideal_C |
+| ---: | ---: | --- | ---: | --- | ---: | ---: | ---: |
+| 1 | 0.491 | [0.432, 0.528] | 0.517 | [0.506, 0.557] | 0.217 | 1.05 | 2.39 |
+| 4 | 0.603 | [0.520, 0.650] | 1.189 | [1.086, 1.296] | 0.055 | 1.97 | 21.8 |
+| 8 | 0.613 | [0.585, 0.634] | 1.264 | [1.184, 1.573] | 0.035 | 2.06 | 36.0 |
+
+SF C=4 / SF C=1 is 6.049/5.580 = 1.08 on 15274915 and 1.189/0.517 = 2.30 on 3356896.
+
+#### `(code_hash, selector)`
+
+Block 15274915, `TPS_SEQ` 344890, median 3.555 ms, 95% CI [3.475, 3.727].
+
+| C | OCC ms | OCC 95% CI | SF ms | SF 95% CI | Ideal_C ms | SF/OCC | SF/Ideal_C |
+| ---: | ---: | --- | ---: | --- | ---: | ---: | ---: |
+| 1 | 4.905 | [4.631, 5.448] | 5.690 | [5.419, 5.837] | 3.080 | 1.16 | 1.85 |
+| 4 | 3.200 | [3.008, 3.805] | 6.645 | [6.325, 6.936] | 1.173 | 2.08 | 5.66 |
+| 8 | 3.822 | [3.746, 4.119] | 7.214 | [7.014, 7.680] | 1.173 | 1.89 | 6.15 |
+
+Block 3356896, `TPS_SEQ` 659488, median 0.267 ms, 95% CI [0.263, 0.279].
+
+| C | OCC ms | OCC 95% CI | SF ms | SF 95% CI | Ideal_C ms | SF/OCC | SF/Ideal_C |
+| ---: | ---: | --- | ---: | --- | ---: | ---: | ---: |
+| 1 | 0.463 | [0.423, 0.519] | 0.512 | [0.506, 0.540] | 0.218 | 1.10 | 2.35 |
+| 4 | 0.601 | [0.527, 0.685] | 1.057 | [1.036, 1.112] | 0.055 | 1.76 | 19.3 |
+| 8 | 0.632 | [0.604, 0.937] | 1.284 | [1.246, 1.469] | 0.035 | 2.03 | 37.0 |
+
+SF C=4 / SF C=1 is 6.645/5.690 = 1.17 on 15274915 and 1.057/0.512 = 2.07 on 3356896.
+
+#### FullReplay, ten rounds
+
+| Block | C | Class key | FullReplay | Max |
+| --- | ---: | --- | --- | ---: |
+| 15274915 | 4 | to+selector | 4, 5, 6, 6, 5, 3, 5, 5, 6, 5 | 6 |
+| 15274915 | 8 | to+selector | 6, 6, 7, 7, 6, 6, 7, 3, 8, 7 | 8 |
+| 15274915 | 4 | code_hash+selector | 6, 6, 6, 4, 5, 5, 5, 6, 7, 7 | 7 |
+| 15274915 | 8 | code_hash+selector | 7, 6, 6, 7, 7, 4, 5, 6, 5, 6 | 7 |
+| 3356896 | 4 | to+selector | 0 × 10 | 0 |
+| 3356896 | 8 | to+selector | 0, 16, then 0 × 8 | 16 |
+| 3356896 | 4 | code_hash+selector | 0 × 10 | 0 |
+| 3356896 | 8 | code_hash+selector | 0 × 10 | 0 |
+
+The round with 16 also re-executed 16 times (`chain_len` 17, `armed` 101, `exec_entries` 258, wall 1.778 ms). The other nine rounds at that cell are 0. C=1 is 0 on every round because that path does not arm the chain.
+
+### Equivalence
+
+Release tests on this tree, `lto=fat`, `--test-threads=1`:
+
+```bash
+cargo +stable test -p pevm --release --features specfence --test specfence_stage1 --test sload_static_gas -- --test-threads=1 sf_matches_onchain_focus_blocks sf_seq_par_repeat sload_static_gas_matches_chain_header
+```
+
+`sf_matches_onchain_focus_blocks` and `sf_seq_par_repeat` passed in the same process (3.75s). The first compares sequential, unmodified OCC, and SpecFence on both blocks at C=1, 4, and 8, for both class keys. The second repeats `seq=par` at C=4 and C=8. `sload_static_gas_matches_chain_header` passed (0.50s) and still matches header gas 29928443 and 4033966.
+
+### Still open
+
+- **The C=4 gate fails on every cell of this scan.** SF C=4 is 1.76× to 2.08× OCC C=4, and 1.08× to 2.30× SF C=1. SF/Ideal_C at C=4 is 5.20 and 5.66 on 15274915, and 21.8 and 19.3 on 3356896. At C=8 those ratios are 6.10, 6.15, 36.0, and 37.0.
+- **The remaining critical path is the preseeded nearest-lower chain.** Finality removed the commit gate. It did not let the next recipient writer start before the previous writer, and the predicted members between them, have finished. On the post-fix timeline that span is 4.55 ms against 0.65 ms of writer execution.
+- **Skipping that chain missed the FullReplay caps and did not cut the wall.** One fresh probe each, this host, timers off. Removing preseed: FullReplay 17 and 19 (`to+selector`, the two blocks) and 15 and 21 (`code_hash+selector`), walls still about 7.1 ms and 1.3 ms. Treating a not-started predicted member as absent: FullReplay 34 and 23, and with stealing also disabled 58 and 68. An in-flight execution window with stealing disabled either stopped the prefix (committed 80 of 1226) or finished slower (about 9.2 ms and 2.0 ms). Those runs were reverted. The chain still treats a predicted member as unresolved, and stealing stays on.
+- **One 3356896 C=8 round exceeds the cap of 5.** FullReplay 16, against nine zeros in the same cell. The big-block maximum in this scan is 8, inside the cap of 12.
+- **Multi-worker tax dominates the small block.** At C=1 the interpreter is a few tenths of a millisecond. Chain publish, the value-carrying record, thread spawn, and the preseed walk make C=4 slower than C=1 and slower than OCC.
+- **`(code_hash, selector)` still pays a storage lookup while building classes.** Evidence-gated sibling prediction removed the thousand-park admission queue from the design. The K=10 wall is still above `(to, selector)` on the big block (6.645 ms versus 6.049 ms at C=4).
+

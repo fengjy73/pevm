@@ -18,9 +18,13 @@ enum Phase {
     Executing,
     Executed,
     Committed,
-    /// `until_commit` waits for the predecessor's validated write. Execution
-    /// alone is not enough: a published incarnation can still fail validation.
-    Parked { pred: TxIdx, until_commit: bool },
+    /// `until_final` waits until the predecessor's incarnation is
+    /// dependency-closed. Execution alone is not enough: a published
+    /// incarnation can still be aborted. Commit is not required.
+    Parked {
+        pred: TxIdx,
+        until_final: bool,
+    },
 }
 
 struct TxState {
@@ -39,6 +43,10 @@ pub(crate) struct Runtime {
     inner: Mutex<Inner>,
     deques: Vec<LocalDeque>,
     committed: AtomicUsize,
+    /// `usize::MAX` means this transaction's current incarnation is not final.
+    /// A stored incarnation is final: execution finished, its reads came from
+    /// final origins or storage, and validation kept that incarnation.
+    validated: Vec<AtomicUsize>,
     executing: AtomicUsize,
     waiting: AtomicUsize,
     mu: Mutex<()>,
@@ -64,6 +72,7 @@ impl Runtime {
             }),
             deques: (0..workers).map(|_| LocalDeque::with_capacity(n)).collect(),
             committed: AtomicUsize::new(0),
+            validated: (0..n).map(|_| AtomicUsize::new(usize::MAX)).collect(),
             executing: AtomicUsize::new(0),
             waiting: AtomicUsize::new(0),
             mu: Mutex::new(()),
@@ -173,6 +182,44 @@ impl Runtime {
         self.inner.lock().unwrap().status[tx].incarnation
     }
 
+    /// This incarnation finished, its origins are final, and it has not been aborted.
+    pub(crate) fn is_final_inc(&self, tx: TxIdx, inc: usize) -> bool {
+        inc != usize::MAX
+            && self
+                .validated
+                .get(tx)
+                .is_some_and(|slot| slot.load(Ordering::Acquire) == inc)
+    }
+
+    pub(crate) fn is_final_any(&self, tx: TxIdx) -> bool {
+        self.validated
+            .get(tx)
+            .is_some_and(|slot| slot.load(Ordering::Acquire) != usize::MAX)
+    }
+
+    fn pred_final_locked(&self, inner: &Inner, pred: TxIdx) -> bool {
+        let inc = inner.status[pred].incarnation;
+        self.is_final_inc(pred, inc)
+    }
+
+    /// Record that `inc` is the final incarnation. Fails if this transaction
+    /// was aborted or re-queued since the caller observed `inc`.
+    pub(crate) fn mark_validated(&self, tx: TxIdx, inc: usize) -> bool {
+        if tx >= self.n || inc == usize::MAX {
+            return false;
+        }
+        let inner = self.inner.lock().unwrap();
+        let st = &inner.status[tx];
+        if st.incarnation != inc {
+            return false;
+        }
+        if !matches!(st.phase, Phase::Executed | Phase::Committed) {
+            return false;
+        }
+        self.validated[tx].store(inc, Ordering::Release);
+        true
+    }
+
     pub(crate) fn is_executed(&self, tx: TxIdx) -> bool {
         let inner = self.inner.lock().unwrap();
         matches!(inner.status[tx].phase, Phase::Executed | Phase::Committed)
@@ -232,16 +279,16 @@ impl Runtime {
         true
     }
 
-    /// Park `tx` until `pred` has executed, or until it has committed when
-    /// `until_commit` is set. A read of an armed location uses the latter:
-    /// the final write is the one validation kept.
+    /// Park `tx` until `pred` has executed, or until that incarnation is final
+    /// when `until_final` is set. Armed reads, nonce, and estimates use the
+    /// latter. Commit is not the wakeup.
     pub(crate) fn park(
         &self,
         worker: usize,
         tx: TxIdx,
         pred: TxIdx,
         bump_inc: bool,
-        until_commit: bool,
+        until_final: bool,
     ) {
         let mut inner = self.inner.lock().unwrap();
         if tx >= self.n || pred >= self.n {
@@ -249,21 +296,16 @@ impl Runtime {
         }
         if bump_inc {
             inner.status[tx].incarnation = inner.status[tx].incarnation.saturating_add(1);
+            self.validated[tx].store(usize::MAX, Ordering::Release);
         }
-        let pred_done = match inner.status[pred].phase {
-            Phase::Committed => true,
-            Phase::Executed => !until_commit,
-            _ => false,
-        };
+        let pred_done = self.pred_satisfied(&inner, pred, until_final);
         if pred_done {
             inner.status[tx].phase = Phase::Ready;
+            super::timeline::note_wake(tx);
             self.enqueue_locked(&mut inner, worker, tx);
             return;
         }
-        inner.status[tx].phase = Phase::Parked {
-            pred,
-            until_commit,
-        };
+        inner.status[tx].phase = Phase::Parked { pred, until_final };
         inner.status[tx].queued = false;
         if !inner.dependents[pred].contains(&tx) {
             inner.dependents[pred].push(tx);
@@ -271,6 +313,14 @@ impl Runtime {
         let pred_ready = inner.status[pred].phase == Phase::Ready && !inner.status[pred].queued;
         if pred_ready {
             self.enqueue_locked(&mut inner, worker, pred);
+        }
+    }
+
+    fn pred_satisfied(&self, inner: &Inner, pred: TxIdx, until_final: bool) -> bool {
+        match inner.status[pred].phase {
+            Phase::Committed => true,
+            Phase::Executed => !until_final || self.pred_final_locked(inner, pred),
+            _ => false,
         }
     }
 
@@ -284,15 +334,14 @@ impl Runtime {
         for d in deps {
             match inner.status[d].phase {
                 Phase::Parked {
-                    until_commit: false,
-                    ..
+                    until_final: false, ..
                 } => {
                     inner.status[d].phase = Phase::Ready;
+                    super::timeline::note_wake(d);
                     self.enqueue_locked(&mut inner, worker, d);
                 }
                 Phase::Parked {
-                    until_commit: true,
-                    ..
+                    until_final: true, ..
                 } => inner.dependents[tx].push(d),
                 _ => {}
             }
@@ -301,9 +350,46 @@ impl Runtime {
         self.notify();
     }
 
+    /// Wake readers parked on this transaction's final incarnation.
+    ///
+    /// Commit is not required. Callers store the validated incarnation first.
+    pub(crate) fn note_final(&self, worker: usize, tx: TxIdx) {
+        if !self.is_final_any(tx) {
+            return;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        if tx >= self.n {
+            return;
+        }
+        self.wake_final_locked(&mut inner, worker, tx);
+        drop(inner);
+        self.notify();
+    }
+
+    fn wake_final_locked(&self, inner: &mut Inner, worker: usize, tx: TxIdx) {
+        let deps = std::mem::take(&mut inner.dependents[tx]);
+        for d in deps {
+            match inner.status[d].phase {
+                Phase::Parked {
+                    until_final: true, ..
+                } => {
+                    inner.status[d].phase = Phase::Ready;
+                    super::timeline::note_wake(d);
+                    self.enqueue_locked(inner, worker, d);
+                }
+                Phase::Parked {
+                    until_final: false, ..
+                } => inner.dependents[tx].push(d),
+                _ => {}
+            }
+        }
+    }
+
     /// Validation failed. The next incarnation is queued on `worker`.
+    /// The previous incarnation is no longer final.
     pub(crate) fn requeue_abort(&self, worker: usize, tx: TxIdx) {
         let mut inner = self.inner.lock().unwrap();
+        self.validated[tx].store(usize::MAX, Ordering::Release);
         inner.status[tx].incarnation = inner.status[tx].incarnation.saturating_add(1);
         inner.status[tx].phase = Phase::Ready;
         inner.status[tx].queued = false;
@@ -312,12 +398,7 @@ impl Runtime {
         self.notify();
     }
 
-    pub(crate) fn try_mark_committed(
-        &self,
-        worker: usize,
-        tx: TxIdx,
-        incarnation: usize,
-    ) -> bool {
+    pub(crate) fn try_mark_committed(&self, worker: usize, tx: TxIdx, incarnation: usize) -> bool {
         let mut inner = self.inner.lock().unwrap();
         if self.committed.load(Ordering::Relaxed) != tx {
             return false;
@@ -325,24 +406,9 @@ impl Runtime {
         let st = &mut inner.status[tx];
         if st.phase == Phase::Executed && st.incarnation == incarnation {
             st.phase = Phase::Committed;
+            self.validated[tx].store(incarnation, Ordering::Release);
             self.committed.store(tx + 1, Ordering::Release);
-            let deps = std::mem::take(&mut inner.dependents[tx]);
-            for d in deps {
-                match inner.status[d].phase {
-                    Phase::Parked {
-                        until_commit: true,
-                        ..
-                    } => {
-                        inner.status[d].phase = Phase::Ready;
-                        self.enqueue_locked(&mut inner, worker, d);
-                    }
-                    Phase::Parked {
-                        until_commit: false,
-                        ..
-                    } => inner.dependents[tx].push(d),
-                    _ => {}
-                }
-            }
+            self.wake_final_locked(&mut inner, worker, tx);
             true
         } else {
             false
@@ -363,17 +429,11 @@ impl Runtime {
                     }
                     return false;
                 }
-                Phase::Parked {
-                    pred,
-                    until_commit,
-                } => {
-                    let pred_done = match inner.status[pred].phase {
-                        Phase::Committed => true,
-                        Phase::Executed => !until_commit,
-                        _ => false,
-                    };
+                Phase::Parked { pred, until_final } => {
+                    let pred_done = self.pred_satisfied(&inner, pred, until_final);
                     if pred_done {
                         inner.status[tx].phase = Phase::Ready;
+                        super::timeline::note_wake(tx);
                         return self.enqueue_locked(&mut inner, worker, tx);
                     }
                     if inner.status[pred].phase == Phase::Ready && !inner.status[pred].queued {
@@ -384,5 +444,28 @@ impl Runtime {
             }
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Runtime;
+
+    #[test]
+    fn final_incarnation_wakes_before_commit() {
+        let rt = Runtime::new(2, 2);
+        rt.seed();
+        let (tx0, inc) = rt.pop(0).unwrap();
+        let (tx1, _) = rt.pop(1).unwrap();
+        assert_eq!((tx0, tx1), (0, 1));
+        rt.park(1, 1, 0, false, true);
+        rt.finish_ok(0, 0);
+        assert!(rt.pop(0).is_none());
+        assert!(rt.pop(1).is_none());
+        assert_eq!(rt.committed(), 0);
+        assert!(rt.mark_validated(0, inc));
+        rt.note_final(0, 0);
+        assert_eq!(rt.pop(0).unwrap().0, 1);
+        assert_eq!(rt.committed(), 0);
     }
 }
