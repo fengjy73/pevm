@@ -66,34 +66,63 @@ Three more fresh runs of the same binary, same flag. FullReplay on 15274915 with
 
 The low band (FullReplay 7–14 on the big block) meets the ≤12 target. The high band does not, and it is the common outcome. Most of those aborts happen after the location is already armed (`full_replay_after_arm` is close to `full_replay`).
 
+## Harness
+
+The scan and report are the PR #62 scripts (`scripts/soft0_percore_scan.sh`, `scripts/specfence_inflation_report.py`, `scripts/specfence_step_ideal.py`). OCC is native `Pevm::execute_revm_parallel`. There is no separate upstream crate. The build passes `--features specfence` because Cargo does not enable an example's `required-features` on its own.
+
+`TPS_SEQ` is the workers=1 sequential median, copied onto every C. `TPS_OCC` is that native path. `TPS_SF` is `run_sf_block`. `TPS_ideal` is the report's critical-path list schedule. Native OCC records no per-transaction probe, so the schedule uses the workers=1 SpecFence profile (`SPECFENCE_INFLATION=1`): committed-incarnation `total_ns`, with beneficiary and lazy writes dropped. Wall rows leave `attempts` empty. There is no opcode hook, so the step-trace file is a meta line and `TPS_ideal_step` is absent.
+
+The old fork's regressed hunks that sat on the SpecFence path are not in this tree:
+
+- `SfVm::execute` calls `Instant::now` only when `SPECFENCE_INBLOCK_TRACE` or `SPECFENCE_INFLATION` is set.
+- `NoBeneficiaryHandler` only skips the beneficiary reward. It does not note frame depth per opcode.
+- Account reads walk the multi-version map in place.
+- `record` stores the read set and the write locations. It does not keep a reader index.
+- `execute_revm_parallel` does not build SpecFence tables. SpecFence is a separate entry point.
+
 ## Wall clock
 
-Host: this VM, not ict21. 4 vCPUs, KVM, Intel Xeon model 207 family 6, one thread per core, CPUs 0–3. C=8 is pinned with `--oversub 8:0,1,2,3`, so it shares those four CPUs. Seven fresh rounds, no warm-up. Median and 95% bootstrap interval. `TPS_SEQ` is the C=1 sequential median, used as the single 1-core baseline at every worker count. `TPS_ideal(C)` is a list schedule of the traced per-transaction durations and RAW edges from the single trace run above (those durations include time spent waiting inside the interpreter).
+Host: this VM, not ict21. 4 vCPUs, KVM, Intel Xeon family 6 model 207, one thread per core, CPUs 0–3, L3 320 MiB, governor unavailable. Release build with `lto=false` (codegen-units stays 1). Ten fresh wall rounds, one profile round, bootstrap of 10,000. No warm-up. C=8 is `--allow-oversub` onto CPUs 0–3, so it does not add cores.
 
-| Block | C | Engine | Median ms | 95% CI | TPS | TPS_SEQ | TPS_ideal |
-| --- | ---: | --- | ---: | --- | ---: | ---: | ---: |
-| 3356896 | 1 | SEQ | 0.262 | 0.258–0.297 | 671103 | 671103 | |
-| 3356896 | 1 | OCC | 0.501 | 0.425–0.640 | 351075 | 671103 | |
-| 3356896 | 1 | SF to+selector | 0.617 | 0.582–0.646 | 285273 | 671103 | 484583 |
-| 3356896 | 1 | SF code_hash+selector | 0.680 | 0.630–0.736 | 258946 | 671103 | 468726 |
-| 3356896 | 4 | OCC | 0.526 | 0.512–0.588 | 334498 | 671103 | |
-| 3356896 | 4 | SF to+selector | 1.342 | 1.062–1.463 | 131167 | 671103 | 360908 |
-| 3356896 | 4 | SF code_hash+selector | 1.423 | 1.383–1.523 | 123717 | 671103 | 707637 |
-| 3356896 | 8 | OCC | 0.740 | 0.637–0.928 | 237949 | 671103 | |
-| 3356896 | 8 | SF to+selector | 1.388 | 1.365–1.578 | 126845 | 671103 | 484068 |
-| 3356896 | 8 | SF code_hash+selector | 1.605 | 1.413–1.615 | 109645 | 671103 | 1194686 |
-| 15274915 | 1 | SEQ | 3.580 | 3.504–3.860 | 342492 | 342492 | |
-| 15274915 | 1 | OCC | 4.904 | 4.559–5.332 | 250019 | 342492 | |
-| 15274915 | 1 | SF to+selector | 6.454 | 6.046–8.165 | 189947 | 342492 | 252787 |
-| 15274915 | 1 | SF code_hash+selector | 7.637 | 7.014–8.880 | 160525 | 342492 | 208320 |
-| 15274915 | 4 | OCC | 3.413 | 3.252–4.041 | 359186 | 342492 | |
-| 15274915 | 4 | SF to+selector | 7.077 | 5.675–8.014 | 173236 | 342492 | 437046 |
-| 15274915 | 4 | SF code_hash+selector | 8.614 | 8.511–10.171 | 142321 | 342492 | 400401 |
-| 15274915 | 8 | OCC | 3.837 | 3.752–5.485 | 319551 | 342492 | |
-| 15274915 | 8 | SF to+selector | 7.322 | 6.546–7.837 | 167447 | 342492 | 577204 |
-| 15274915 | 8 | SF code_hash+selector | 8.377 | 7.843–10.185 | 146349 | 342492 | 546073 |
+Command: `scripts/soft0_percore_scan.sh --cpu-list 0-3 --allow-oversub --c-list 1,4,8 --k 10 --profile-k 1 --step-k 1`. The second class key is the same command with `SPECFENCE_CLASS_KEY=code_hash` and `--skip-build`. Sequential and OCC do not read the class key; each scan still remeasures them, so the two tables are separate samples.
 
-On this 4-core VM, unmodified OCC at C=4 is the first point that beats sequential on the big block. SpecFence is slower than both. C=8 does not add CPUs.
+### `(to, selector)`
+
+Block 15274915, `TPS_SEQ` 344919, median 3.554 ms, 95% CI [3.507, 3.813].
+
+| C | TPS_OCC | OCC ms | OCC 95% CI | TPS_SF | SF ms | SF 95% CI | TPS_ideal |
+| ---: | ---: | ---: | --- | ---: | ---: | --- | ---: |
+| 1 | 255851 | 4.792 | [4.574, 5.391] | 192717 | 6.362 | [6.123, 6.687] | 345861 |
+| 4 | 379762 | 3.229 | [3.074, 3.598] | 212740 | 5.763 | [5.617, 6.087] | 1040559 |
+| 8 | 336283 | 3.646 | [3.543, 3.738] | 155960 | 7.861 | [7.579, 8.276] | 1040559 |
+
+Block 3356896, `TPS_SEQ` 664210, median 0.265 ms, 95% CI [0.263, 0.267].
+
+| C | TPS_OCC | OCC ms | OCC 95% CI | TPS_SF | SF ms | SF 95% CI | TPS_ideal |
+| ---: | ---: | ---: | --- | ---: | ---: | --- | ---: |
+| 1 | 453393 | 0.388 | [0.371, 0.398] | 276634 | 0.636 | [0.626, 0.643] | 636717 |
+| 4 | 329567 | 0.535 | [0.477, 0.710] | 156490 | 1.126 | [0.944, 1.233] | 2530299 |
+| 8 | 301059 | 0.585 | [0.563, 0.632] | 134898 | 1.305 | [1.257, 1.413] | 4185593 |
+
+### `(code_hash, selector)`
+
+Block 15274915, `TPS_SEQ` 330903, median 3.705 ms, 95% CI [3.582, 3.899].
+
+| C | TPS_OCC | OCC ms | OCC 95% CI | TPS_SF | SF ms | SF 95% CI | TPS_ideal |
+| ---: | ---: | ---: | --- | ---: | ---: | --- | ---: |
+| 1 | 272182 | 4.508 | [4.307, 5.375] | 162577 | 7.543 | [7.366, 8.281] | 265987 |
+| 4 | 375366 | 3.266 | [3.059, 3.420] | 141284 | 8.678 | [8.250, 9.169] | 1012037 |
+| 8 | 302556 | 4.053 | [3.697, 4.634] | 152853 | 8.026 | [7.203, 8.779] | 1012037 |
+
+Block 3356896, `TPS_SEQ` 648196, median 0.272 ms, 95% CI [0.266, 0.277].
+
+| C | TPS_OCC | OCC ms | OCC 95% CI | TPS_SF | SF ms | SF 95% CI | TPS_ideal |
+| ---: | ---: | ---: | --- | ---: | ---: | --- | ---: |
+| 1 | 447612 | 0.393 | [0.372, 0.407] | 244100 | 0.721 | [0.708, 0.741] | 447037 |
+| 4 | 304229 | 0.579 | [0.530, 0.729] | 123323 | 1.427 | [1.357, 1.454] | 1784157 |
+| 8 | 278692 | 0.632 | [0.575, 0.682] | 118466 | 1.486 | [1.404, 1.609] | 2674162 |
+
+On this 4-core VM, unmodified OCC at C=4 is the first point that beats sequential on the big block. SpecFence is slower than both. C=8 does not add CPUs. On 15274915 the ideal makespan already equals the critical path at C=4 (1.178 ms for `to+selector`, 1.211 ms for `code_hash+selector`), so `TPS_ideal` does not rise from C=4 to C=8. The profile covered every transaction (`missing_txs=0`). `seqcheck` and `occcheck` both reported `diverge=0` and the header gas (29928443 and 4033966).
 
 ## Deviations from the design
 
@@ -102,7 +131,7 @@ On this 4-core VM, unmodified OCC at C=4 is the first point that beats sequentia
 - **Seeding is strided index order**, not critical-path order. Contiguous chunks made the tail of the block run before the head had published; the stride keeps the first wave at transactions `0..C`.
 - **Beneficiary writes are skipped** by the chain. They are still applied as lazy rewards in multi-version memory.
 - **The online controller is a small AIMD tick**, not the full Part 2 concurrency controller. Safety bounds are the constants `K` in `[8, 256]`, abort-cost in `[5µs, 2ms]`, and class-hit floor 0.15. A plain-transfer class can be hundreds of transactions; its eviction priority is capped at 32 so it does not displace a location that has already failed validation.
-- **`TPS_ideal` is transaction-level**, from `scripts/specfence_step_ideal.py`. The reference script's opcode-step schedule needs a step trace this stage does not record.
+- **`TPS_ideal` is the PR #62 critical-path schedule of SpecFence workers=1 profile attempts.** Native OCC has no per-transaction probe, and this stage does not record an opcode step trace, so `TPS_ideal_step` is absent. Beneficiary and lazy writes are dropped from the DAG, matching that report.
 - **Nonce and balance waits use the previous same-sender transaction**, not `tx-1`. Blocking on `tx-1` after that unrelated transaction had committed spun the worker and stalled the commit prefix.
 
 ## Open issues
