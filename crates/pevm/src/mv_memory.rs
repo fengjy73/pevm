@@ -1,7 +1,10 @@
 use std::{
     cell::Cell,
     collections::{BTreeMap, BTreeSet, HashSet},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use alloy_primitives::{Address, B256};
@@ -78,10 +81,14 @@ pub struct MvMemory {
     /// Prior incarnation write-set (Bohm-lite residual) for OrderedAdmit/WaitHard placeholders.
     residual_write_sets: DashMap<TxIdx, Vec<MemoryLocationHash>, BuildIdentityHasher>,
     /// Values copied out before Estimate so a WAR reader can re-read the tip
-    /// it bound. The live entry is still Estimate, so validation fails closed
-    /// if the writer publishes a new incarnation.
+    /// it bound. The origin stores those bytes. Validation fails while the
+    /// live entry is Estimate, or when a later Data under the same incarnation
+    /// carries a different value.
     retained_history:
         DashMap<MemoryLocationHash, Vec<(TxIdx, TxIncarnation, MemoryValue)>, BuildIdentityHasher>,
+    /// Seqlock for publishes. Odd means a write is in progress. Exit confirmation
+    /// retries when the epoch changes so it cannot miss the last write.
+    write_epoch: AtomicU64,
 }
 
 impl MvMemory {
@@ -118,7 +125,20 @@ impl MvMemory {
             aborted_incarnations: DashMap::default(),
             residual_write_sets: DashMap::default(),
             retained_history: DashMap::default(),
+            write_epoch: AtomicU64::new(0),
         }
+    }
+
+    pub(crate) fn write_epoch(&self) -> u64 {
+        self.write_epoch.load(Ordering::Acquire)
+    }
+
+    fn begin_publish(&self) {
+        self.write_epoch.fetch_add(1, Ordering::Release);
+    }
+
+    fn end_publish(&self) {
+        self.write_epoch.fetch_add(1, Ordering::Release);
     }
 
     /// Copy one aborted Data value. The caller still installs Estimate.
@@ -280,6 +300,7 @@ impl MvMemory {
         let mut wrote_new_location = false;
         let mut contended = SmallVec::<[MemoryLocationHash; 4]>::new();
 
+        self.begin_publish();
         for (location, value) in write_set {
             {
                 let mut written_transactions = self.data.entry(location).or_default();
@@ -299,6 +320,7 @@ impl MvMemory {
                 wrote_new_location = true;
             }
         }
+        self.end_publish();
 
         // M3: residual WŜ publish moved to pevm success path for SpecFence only
         // (avoid OCC/PCC behavior change). See MvMemory::publish_ws_prior.
@@ -348,8 +370,8 @@ impl MvMemory {
         if let Some(written_transactions) = self.data.get(&location) {
             let mut iter = written_transactions.range(..tx_idx);
             for prior_origin in prior_origins {
-                if let ReadOrigin::MvMemory(prior_version) = prior_origin {
-                    if let Some((closest_idx, MemoryEntry::Data(tx_incarnation, ..))) =
+                if let ReadOrigin::MvMemory(prior_version, prior_value) = prior_origin {
+                    if let Some((closest_idx, MemoryEntry::Data(tx_incarnation, value))) =
                         iter.next_back()
                     {
                         if self.is_aborted_incarnation(*closest_idx, *tx_incarnation) {
@@ -357,6 +379,7 @@ impl MvMemory {
                         }
                         if closest_idx != &prior_version.tx_idx
                             || &prior_version.tx_incarnation != tx_incarnation
+                            || value != prior_value
                         {
                             return false;
                         }
@@ -492,9 +515,11 @@ impl MvMemory {
             let Some(prior_origins) = locs.read.get(&location) else {
                 return false;
             };
-            // Iter6: single-origin or last MvMemory in lazy multi-origin chain.
+            // The value stored on the origin is what the interpreter consumed.
+            // The live slot at that tx index may already have been rewritten
+            // under the same incarnation, so it is not the read.
             let mv = prior_origins.iter().rev().find_map(|o| match o {
-                ReadOrigin::MvMemory(v) => Some(v.clone()),
+                ReadOrigin::MvMemory(v, value) => Some((v.clone(), value.clone())),
                 _ => None,
             });
             match mv {
@@ -505,18 +530,8 @@ impl MvMemory {
         let Some(cur) = self.current_data_value(tx_idx, location) else {
             return false;
         };
-        let Some(written) = self.data.get(&location) else {
-            return false;
-        };
-        let Some(MemoryEntry::Data(inc, prior_val)) = written.get(&prior.tx_idx) else {
-            return false;
-        };
-        // Incarnation must match the value that was read. Aborted-but-still-Data
-        // is OK for same-output compare (Iter6); reincarnated → snap path.
-        if *inc != prior.tx_incarnation {
-            return false;
-        }
-        match (prior_val, &cur) {
+        let (_prior, prior_val) = prior;
+        match (&prior_val, &cur) {
             (MemoryValue::Storage(a), MemoryValue::Storage(b)) => a == b,
             (MemoryValue::Basic(a), MemoryValue::Basic(b)) => {
                 a.balance == b.balance && a.nonce == b.nonce
@@ -551,18 +566,15 @@ impl MvMemory {
         tx_idx: TxIdx,
         location: MemoryLocationHash,
     ) -> Option<crate::ReadOrigins> {
-        use crate::{ReadOrigin, ReadOrigins, TxVersion};
+        use crate::{ReadOrigin, ReadOrigins};
         let mut origins = ReadOrigins::new();
         if let Some(written_transactions) = self.data.get(&location) {
             match written_transactions.range(..tx_idx).next_back() {
-                Some((closest_idx, MemoryEntry::Data(tx_incarnation, ..))) => {
+                Some((closest_idx, MemoryEntry::Data(tx_incarnation, value))) => {
                     if self.is_aborted_incarnation(*closest_idx, *tx_incarnation) {
                         return None;
                     }
-                    origins.push(ReadOrigin::MvMemory(TxVersion {
-                        tx_idx: *closest_idx,
-                        tx_incarnation: *tx_incarnation,
-                    }));
+                    origins.push(ReadOrigin::mv(*closest_idx, *tx_incarnation, value.clone()));
                 }
                 Some((_, MemoryEntry::Estimate)) => return None,
                 None => origins.push(ReadOrigin::Storage),
@@ -737,6 +749,7 @@ impl MvMemory {
     ) {
         let writes = self.write_locations(tx_idx);
         self.residual_write_sets.insert(tx_idx, writes.clone());
+        self.begin_publish();
         for location in &writes {
             if keep(*location) {
                 let snap = self
@@ -754,6 +767,7 @@ impl MvMemory {
                 written_transactions.insert(tx_idx, MemoryEntry::Estimate);
             }
         }
+        self.end_publish();
     }
 
     /// SpecFence Spec v1 §6.1 selective invalidate.
@@ -773,17 +787,20 @@ impl MvMemory {
         self.residual_write_sets.insert(tx_idx, writes.clone());
 
         let Some(inc) = incarnation else {
+            self.begin_publish();
             for location in &writes {
                 if let Some(mut written_transactions) = self.data.get_mut(location) {
                     written_transactions.insert(tx_idx, MemoryEntry::Estimate);
                 }
             }
+            self.end_publish();
             return (writes, true);
         };
 
         self.mark_incarnation_aborted(tx_idx, inc);
 
         let mut estimated = Vec::new();
+        self.begin_publish();
         for location in writes {
             if self.has_higher_reader(tx_idx, location) {
                 if let Some(mut written_transactions) = self.data.get_mut(&location) {
@@ -793,6 +810,7 @@ impl MvMemory {
             }
             // else: keep Data; aborted stamp detects late readers.
         }
+        self.end_publish();
         (estimated, false)
     }
 
@@ -815,16 +833,106 @@ impl MvMemory {
         let writes = self.write_locations(tx_idx);
         self.residual_write_sets.insert(tx_idx, writes);
         let mut estimated = Vec::with_capacity(suffix.len());
+        self.begin_publish();
         for &location in suffix {
             if let Some(mut written_transactions) = self.data.get_mut(&location) {
                 written_transactions.insert(tx_idx, MemoryEntry::Estimate);
             }
             estimated.push(location);
         }
+        self.end_publish();
         estimated
     }
 
     pub(crate) fn consume_lazy_addresses(&self) -> impl IntoIterator<Item = Address> {
         std::mem::take(&mut *self.lazy_addresses.lock().unwrap()).into_iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ReadOrigin, ReadOrigins, TxVersion};
+    use alloy_primitives::U256;
+
+    fn read_of(loc: MemoryLocationHash, origin: ReadOrigin) -> ReadSet {
+        let mut origins = ReadOrigins::new();
+        origins.push(origin);
+        let mut reads = ReadSet::default();
+        reads.insert(loc, origins);
+        reads
+    }
+
+    #[test]
+    fn same_incarnation_rewrite_fails_validation() {
+        let mv = MvMemory::new(2, std::iter::empty(), std::iter::empty());
+        let loc = 7u64;
+        let writer = TxVersion {
+            tx_idx: 0,
+            tx_incarnation: 0,
+        };
+        mv.record(
+            &writer,
+            ReadSet::default(),
+            vec![(loc, MemoryValue::LazySender(U256::from(100u64)))],
+        );
+        mv.record(
+            &TxVersion {
+                tx_idx: 1,
+                tx_incarnation: 0,
+            },
+            read_of(
+                loc,
+                ReadOrigin::mv(0, 0, MemoryValue::LazySender(U256::from(100u64))),
+            ),
+            Vec::new(),
+        );
+        assert!(mv.validate_read_locations(1));
+        mv.record(
+            &writer,
+            ReadSet::default(),
+            vec![(loc, MemoryValue::LazySender(U256::from(50u64)))],
+        );
+        assert!(
+            !mv.validate_read_locations(1),
+            "same incarnation published a different lazy amount"
+        );
+    }
+
+    #[test]
+    fn estimate_replaced_under_same_incarnation_fails_validation() {
+        let mv = MvMemory::new(2, std::iter::empty(), std::iter::empty());
+        let loc = 9u64;
+        let writer = TxVersion {
+            tx_idx: 0,
+            tx_incarnation: 0,
+        };
+        mv.record(
+            &writer,
+            ReadSet::default(),
+            vec![(loc, MemoryValue::Storage(U256::from(3u64)))],
+        );
+        mv.record(
+            &TxVersion {
+                tx_idx: 1,
+                tx_incarnation: 0,
+            },
+            read_of(
+                loc,
+                ReadOrigin::mv(0, 0, MemoryValue::Storage(U256::from(3u64))),
+            ),
+            Vec::new(),
+        );
+        mv.invalidate_partial_suffix(0, &[loc]);
+        assert!(!mv.validate_read_locations(1));
+        mv.record(
+            &writer,
+            ReadSet::default(),
+            vec![(loc, MemoryValue::Storage(U256::from(8u64)))],
+        );
+        assert!(
+            !mv.validate_read_locations(1),
+            "Estimate replaced by a different Data value under the same incarnation"
+        );
     }
 }

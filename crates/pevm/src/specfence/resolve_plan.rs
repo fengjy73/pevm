@@ -7,12 +7,12 @@ use crate::mv_memory::MvMemory;
 use crate::scheduler::Scheduler;
 use crate::{MemoryLocationHash, MemoryValue, TxVersion};
 
-use super::arm_table::ArmTable;
-use super::collateral::{classify_first_conflict, location_is_lazy, ConflictClass};
-use super::runnable_set::{QueueKind, RunnableSet};
-use super::sf_mv::SfConflictClass;
 use super::SpecFenceCtx;
 use super::VisibilityPolicy;
+use super::arm_table::ArmTable;
+use super::collateral::{ConflictClass, classify_first_conflict, location_is_lazy};
+use super::runnable_set::{QueueKind, RunnableSet};
+use super::sf_mv::SfConflictClass;
 
 /// Structured validate outcome. Replaces “bool valid → abort” as the SF root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -71,8 +71,14 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) -> bool {
             crate::scheduler::CommitGate::Closed => {
                 // Only drop our claim. A newer incarnation may already be
                 // Executing on this index; releasing that ST_RUNNING steals it.
+                // tx0 and lazy txs are marked Validated inside finish_execution,
+                // before this lock, so Commit never reaches `Committed` and
+                // would otherwise skip the higher-reader fan-out.
                 let tx = ctx.tx_version.tx_idx;
-                if ctx.scheduler.is_aborting(tx) || ctx.scheduler.is_ready(tx) {
+                if ctx.scheduler.is_validated(tx) {
+                    enqueue_higher_revalidate(&ctx, tx);
+                    ctx.runnable.mark_done(tx);
+                } else if ctx.scheduler.is_aborting(tx) || ctx.scheduler.is_ready(tx) {
                     ctx.runnable.release_running(tx);
                 }
                 return false;
