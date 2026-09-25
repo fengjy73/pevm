@@ -84,6 +84,8 @@ struct Slot {
     wait_ns: AtomicU64,
     resolves: AtomicUsize,
     published: Mutex<Vec<TxIdx>>,
+    /// Predicted writers that finished this block without a write of `loc`.
+    skipped: Mutex<Vec<TxIdx>>,
 }
 
 impl Slot {
@@ -104,6 +106,7 @@ impl Slot {
             wait_ns: AtomicU64::new(0),
             resolves: AtomicUsize::new(0),
             published: Mutex::new(Vec::new()),
+            skipped: Mutex::new(Vec::new()),
         }
     }
 }
@@ -165,7 +168,6 @@ impl RegionBind {
 /// Armed-slot view for one access. Counters live on the slot.
 pub(crate) struct RegionView {
     slot: Arc<Slot>,
-    pub(crate) pred: Option<TxIdx>,
     is_writer: bool,
     higher_writer: bool,
 }
@@ -211,6 +213,33 @@ impl RegionView {
                 }
             }
         }
+    }
+
+    /// Nearest lower predicted writer who has not published this location.
+    /// A done writer with no data is not a floor. `extra` is a live open
+    /// writer observed outside the predicted list; it wins only when it sits
+    /// strictly above any real data floor and closer than the predicted hop.
+    pub(crate) fn pick_pred(
+        &self,
+        tx: TxIdx,
+        wrote: impl Fn(TxIdx) -> bool,
+        done: impl Fn(TxIdx) -> bool,
+        extra: Option<TxIdx>,
+    ) -> Option<TxIdx> {
+        let i = self.slot.writers.partition_point(|&w| w < tx);
+        let extra = extra.filter(|&e| e < tx && !done(e) && !wrote(e));
+        for &w in self.slot.writers[..i].iter().rev() {
+            if wrote(w) {
+                return extra.filter(|&e| e > w);
+            }
+            if !done(w) {
+                return match extra {
+                    Some(e) if e > w => Some(e),
+                    _ => Some(w),
+                };
+            }
+        }
+        extra
     }
 }
 
@@ -538,11 +567,9 @@ impl RegionAvoid {
             return None;
         }
         let is_writer = slot.writers.binary_search(&tx).is_ok();
-        let pred = nearest_lower(&slot.writers, tx);
         let higher_writer = slot.writers.iter().any(|&w| w > tx);
         Some(RegionView {
             slot,
-            pred,
             is_writer,
             higher_writer,
         })
@@ -572,11 +599,32 @@ impl RegionAvoid {
         }
     }
 
-    /// Last predicted writer published ⇒ Drained. Wakes exact waiters of this edge.
+    /// Real write of an armed location. Counts toward Drained and wakes the edge.
     pub(crate) fn on_publish(
         &self,
         loc: MemoryLocationHash,
         writer: TxIdx,
+        tips: &SfTipTable,
+    ) -> Vec<TxIdx> {
+        self.account(loc, writer, true, tips)
+    }
+
+    /// Predicted writer finished without storing `loc`. Wakes anyone parked on
+    /// that hop so they can pick the next real writer. Does not count as data.
+    pub(crate) fn on_skip(
+        &self,
+        loc: MemoryLocationHash,
+        writer: TxIdx,
+        tips: &SfTipTable,
+    ) -> Vec<TxIdx> {
+        self.account(loc, writer, false, tips)
+    }
+
+    fn account(
+        &self,
+        loc: MemoryLocationHash,
+        writer: TxIdx,
+        wrote: bool,
         tips: &SfTipTable,
     ) -> Vec<TxIdx> {
         if !self.enabled || !self.any_armed() || !self.armed_has(loc) {
@@ -586,10 +634,17 @@ impl RegionAvoid {
             && slot.writers.binary_search(&writer).is_ok()
         {
             let mut published = slot.published.lock().unwrap();
-            if !published.contains(&writer) {
-                published.push(writer);
+            let mut skipped = slot.skipped.lock().unwrap();
+            if wrote {
+                if !published.contains(&writer) {
+                    published.push(writer);
+                }
+                skipped.retain(|&w| w != writer);
+            } else if !published.contains(&writer) && !skipped.contains(&writer) {
+                skipped.push(writer);
             }
-            if !slot.writers.is_empty() && published.len() >= slot.writers.len() {
+            let accounted = published.len() + skipped.len();
+            if !slot.writers.is_empty() && accounted >= slot.writers.len() {
                 slot.drained.store(true, Ordering::Release);
             }
         }
@@ -766,11 +821,6 @@ fn merge_txs(a: &[TxIdx], b: &[TxIdx]) -> Vec<TxIdx> {
     out
 }
 
-fn nearest_lower(writers: &[TxIdx], tx: TxIdx) -> Option<TxIdx> {
-    let i = writers.partition_point(|&w| w < tx);
-    if i == 0 { None } else { Some(writers[i - 1]) }
-}
-
 fn flag_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| match std::env::var("SPECFENCE_REGION_LEARN_AVOID_V2") {
@@ -833,7 +883,29 @@ mod tests {
         assert_eq!(t.flags[9].load(Ordering::Relaxed), FLAG_ARMED);
         assert!(t.bind(0).on == false);
         let view = t.view(6, 11).expect("reader consults after arm");
-        assert_eq!(view.pred, Some(4));
+        let open = |_: TxIdx| false;
+        let not_done = |_: TxIdx| false;
+        assert_eq!(view.pick_pred(6, open, not_done, None), Some(4));
+        assert_eq!(
+            view.pick_pred(6, |w| w == 4, |w| w == 4, None),
+            None,
+            "a real write is the floor"
+        );
+        assert_eq!(
+            view.pick_pred(6, open, |w| w == 4, None),
+            Some(1),
+            "done without a write is not a floor"
+        );
+        assert_eq!(
+            view.pick_pred(6, |w| w == 1, |w| w == 1, Some(5)),
+            Some(5),
+            "live writer above the floor is the hop"
+        );
+        assert_eq!(
+            view.pick_pred(6, |w| w == 4, |w| w == 4, Some(2)),
+            None,
+            "live writer behind the floor is ignored"
+        );
         assert_eq!(
             view.decide(PredState::Live),
             RegionOp::Wait { ordered: false }
@@ -841,12 +913,15 @@ mod tests {
         assert_eq!(view.decide(PredState::Unstarted), RegionOp::Unstarted);
         assert_eq!(view.decide(PredState::Published), RegionOp::Retain);
         let w = t.view(9, 11).expect("later writer");
-        assert_eq!(w.pred, Some(4));
+        assert_eq!(w.pick_pred(9, open, not_done, None), Some(4));
         assert_eq!(w.decide(PredState::Live), RegionOp::Wait { ordered: true });
         let tips = SfTipTable::new();
         t.on_publish(11, 1, &tips);
-        t.on_publish(11, 4, &tips);
-        assert!(!t.slot(11).unwrap().drained.load(Ordering::Relaxed));
+        t.on_skip(11, 4, &tips);
+        assert!(
+            !t.slot(11).unwrap().drained.load(Ordering::Relaxed),
+            "a skip is not a publish"
+        );
         t.on_publish(11, 9, &tips);
         assert!(t.slot(11).unwrap().drained.load(Ordering::Relaxed));
         let after = t.view(6, 11).unwrap();
