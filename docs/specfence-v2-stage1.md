@@ -508,3 +508,180 @@ cargo +stable test -p pevm --release --features specfence --test specfence_stage
 - **Multi-worker tax dominates the small block.** At C=1 the interpreter is a few tenths of a millisecond. Chain publish, the value-carrying record, thread spawn, and the preseed walk make C=4 slower than C=1 and slower than OCC.
 - **`(code_hash, selector)` still pays a storage lookup while building classes.** Evidence-gated sibling prediction removed the thousand-park admission queue from the design. The K=10 wall is still above `(to, selector)` on the big block (6.645 ms versus 6.049 ms at C=4).
 
+## Stage 1d
+
+The C=4 wall gate is still open. Typing plain-transfer credits, and then running the next read-modify-write on the worker that published the previous one, cut the hot location's span. On the instrumented 15274915 `(to, selector)` C=4 run the span went from 4.693 ms to 1.522 ms, which is 2.20× the 0.691 ms those 77 writers spent executing. The untimed K=10 wall on that cell went from Stage 1c's 6.049 ms to 5.744 ms, and that is still 1.73× OCC C=4 (3.317 ms). SF C=4 is faster than SF C=1 on `(to, selector)` (5.744 vs 5.871) and slower on `(code_hash, selector)` (6.253 vs 5.792). FullReplay on 15274915 stays at most 12. On 3356896 two `(code_hash, selector)` rounds are 10 and 9.
+
+Upstream `vm.rs`, `mv_memory.rs`, `scheduler.rs`, and `pevm.rs` are byte-identical to `e94b0e3`. No opcode is replaced.
+
+### Admission was a residence sum
+
+Stage 1c reported `(code_hash, selector)` admission as 4220 ms across 1064 parks. That figure adds park residences that overlap in time. One worker's wait is counted once per parked transaction, so the sum can exceed the wall and can exceed wall × threads. 4220 / 1064 is a 3.967 ms mean residence. The raw timeline of that historical run is not in the repo, so its interval union cannot be rebuilt; the union is at most the 11.136 ms wall of that cell.
+
+The timeline script now reports coverage: the union of `[t0, t1)` for a reason. Coverage cannot exceed the wall. Re-running the Stage 1c binary on this host, with the same internal clock, gives `(code_hash, selector)` C=4 admission coverage of 0.084 ms from one park. `(to, selector)` C=4 admission coverage is 0.079 ms, also one park. Admission is not a serializer under either key. Predicted classmates that are only deltas therefore did not get a second typing rule. A delta already is not an admission edge: the admit bit is set only for an RMW member.
+
+### Two accounts were one hash in the Stage 1c note
+
+The writer-chain script picks the location with the most non-lazy writers. On 15274915 that location is `0xabd6bb3978815b97`, the basic account of `0x7758e507850da48cd47df1fb5f875c23e3340c50`. That account has code (`code_hash` `0x3980451255e493e58008161f3645447b7f50756ea57a9af29b3dae54da936f0d`). The block sends it 77 empty-input calls with nonzero value, transactions 116 through 1219. The chain dump after this change has 77 members, all kind 0 (RMW), and the write list has 77 non-lazy writes and no lazy credit. Consecutive writers have no chain member between them, so blockers per hop are 0. The 4.7 ms span was queue delay between RMW writers, not a wait for a dozen intervening deposits.
+
+The 997 plain transfers go to `0x6262998ced04146fa42253a5c0af90ca02dfd2a3`, location `0x7ec8be01af547316`. Prestate has balance and nonce and no code. The chain dump is 996 kind-1 deltas and one kind-0 member. The write list is 996 lazy credits and one non-lazy write, the first touch, which stores an absolute basic account because a lazy credit is used only once the account is already in multi-version memory. Stage 1c attached the 997-recipient description to `0xabd6bb3978815b97`. Removing preseed was aimed at that description. The contract chain does not contain those deposits.
+
+### What the chain does now
+
+- **A member is an RMW or an input-determined delta.** An RMW reads the location and writes it non-lazily: a sender nonce or balance debit, and contract storage. A delta is an additive credit whose amount comes from the transaction input and does not need a read. Preseed marks a plain call to an account whose code hash is absent or `KECCAK_EMPTY` as a delta, and stores `tx.value` as the predicted amount. Publish keeps the delta bit only when the write is a `LazyRecipient` and the transaction did not also read the location. Any other write clears the bit, so a predicted delta that stores an absolute basic account becomes an RMW. The beneficiary location stays off the chain. A lazy reward on some other account is an ordinary `LazyRecipient` in multi-version memory; the fold includes it when it falls in the span.
+- **An armed read waits for the nearest lower RMW.** `nearest_blocker` walks down the chain and skips delta members. The consumed basic account is that RMW's value, or the storage value when no lower RMW exists, plus the net of the deltas in between. A delta that has executed contributes its `LazyRecipient` or `LazySender`. A delta that has not executed contributes the input amount. The origin `SfReadOrigin::Folded` records the base transaction, incarnation, and value, each folded delta transaction and amount, and the consumed `AccountBasic`. The net is the same reverse-order lazy arithmetic as `basic()`.
+- **Deltas are not admission edges, and preseed stays.** WAW and RAW among RMW members still use the nearest lower RMW's final write. WAR adds no edge. A folded reader's incarnation is not final until the base and every folded delta are final, so the next RMW's final write has checked the gap. The read itself does not wait for those deltas to execute.
+- **The next RMW runs on the worker that published the previous one.** Typing does not shorten `0xabd6bb3978815b97`, because every member there is an RMW. After `close_from`, the publishing worker pushes the next non-delta chain member onto the bottom of its own deque, even when another deque already holds a copy. The losing pop sees a phase other than Ready and skips. A duplicate entry cannot execute twice. On the post-boost timeline all 77 writers of that location ran on worker 0.
+
+### Soundness
+
+The read graph stays acyclic: every origin names a lower index.
+
+A delta is not a blocker, so a reader may add predicted amounts before those transactions run. The origin lists every folded delta and the amount used, the RMW or storage base, and the consumed basic account. Early validation and the final rescan recompute the same reverse net from the final multi-version values and require equality with the consumed value. A finished transaction with no write of the location contributes 0. A non-lazy write inside the span, a changed lazy amount, or a new lower RMW fails the compare. The reader aborts, and publish-time revoke plus the existing reader cascade drop anyone who consumed it. Commit is still a prefix, so a speculative sum is not part of the output.
+
+Unit tests:
+
+- `failed_delta_does_not_match_the_prediction` — a sealed transaction with no write contributes 0, and the folded balance no longer matches.
+- `predicted_delta_that_becomes_rmw_mismatches` — a non-lazy write in the span fails even when the balance happens to match the prediction.
+- `rmw_writer_appearing_below_mismatches_the_folded_base` — a new lower RMW changes the base the fold was taken from.
+- `beneficiary_lazy_reward_interleaves_with_a_predicted_delta` — a lazy reward in the span is part of the net, and a different reward amount fails the compare.
+- `plain_credit_does_not_block_or_admit` and `rmw_successor_skips_a_plain_credit` — a delta is neither the wait nor the admission predecessor, and the successor walk steps over it.
+
+On the K=10 scan every SpecFence round recorded `delta_mismatch = 0` and `delta_abort = 0`. One instrumented 3356896 C=8 `(to, selector)` timeline recorded one mismatch and one abort (FullReplay 6). The ten untimed rounds of that cell are 0 or 1, and their counters are 0.
+
+### Timelines
+
+One instrumented run per cell, `SPECFENCE_TIMELINE=1`, fresh state, no warm-up. `wall_ns` excludes the JSON dump. The before column is the Stage 1c binary. The after column is this branch, including the successor boost. Timers are off in the K=10 scan. Host is the Stage 1c host: 4 vCPUs, KVM, Intel Xeon family 6 model 207, one thread per core, CPUs 0–3, L3 320 MiB, L2 8 MiB. `perf` is not available on this guest.
+
+#### Hot location, 15274915, C=4, `(to, selector)`
+
+Location `0xabd6bb3978815b97`, 77 RMW writers, 0 intervening members, 0 blockers per hop, 76/76 hops start after the previous writer's execution end.
+
+| | Before | Typing only | Typing and boost |
+| --- | ---: | ---: | ---: |
+| Internal wall ms | 7.980 | 8.065 | 7.345 |
+| Exec sum ms | 0.899 | 0.753 | 0.691 |
+| Span ms | 4.693 | 5.144 | 1.522 |
+| Span / exec | 5.22 | 6.83 | 2.20 |
+| Gap sum ms | 3.794 | 4.391 | 0.830 |
+| Hop p50 µs | 7.6 | 5.5 | 4.1 |
+| Hop max µs | 2180 (122→129, workers 0→1) | 1264 (129→131, workers 1→3) | 344 (1139→1160, worker 0) |
+| Workers used | 0–3 | 0–3 | 0 |
+| FullReplay | 5 | 5 | 5 |
+| Delta mismatch / abort | — | 0 / 0 | 0 / 0 |
+
+Typing alone left the span at 5.144 ms. The five longest before-hops were 3.11 of the 3.79 ms gap, and the next writer was Ready on another worker's deque. After the boost the whole chain stays on worker 0. The two remaining gaps above 100 µs are 344 µs and 120 µs, both on that worker.
+
+`(code_hash, selector)` C=4 on the same location, after the boost: exec 0.764 ms, span 2.230 ms, gap 1.465 ms, ratio 2.92, FullReplay 5, delta counters 0. That single run does not sit as close to 2× as the `(to, selector)` run.
+
+#### Split, before and after the boost
+
+Park cells are coverage ms, then residence ms, then park count. Coverage is the interval union. Residence is the old overlapping sum. Execute includes inline waits. Bookkeeping is the residual inside the parallel phase. Commit lag is the median time from execution end to commit.
+
+| Block | C | Key | | Wall | Exec | Validate | Idle | Book | Parallel | Commit p50 µs | Armed coverage | Nonce coverage |
+| --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| 15274915 | 4 | to | before | 7.980 | 11.123 | 0.398 | 2.879 | 10.785 | 6.299 | 1799 | 5.653 / 170.983 / 96 | 2.527 / 12.712 / 8 |
+| 15274915 | 4 | to | after | 7.345 | 12.069 | 0.366 | 1.157 | 7.877 | 5.465 | 629 | 2.214 / 14.608 / 34 | 1.663 / 7.531 / 8 |
+| 15274915 | 4 | code_hash | before | 9.008 | 12.922 | 0.351 | 3.722 | 10.984 | 7.000 | 2551 | 6.196 / 179.985 / 99 | 4.601 / 16.145 / 9 |
+| 15274915 | 4 | code_hash | after | 9.726 | 13.928 | 0.345 | 5.419 | 12.099 | 7.953 | 3308 | 7.128 / 261.397 / 100 | 3.312 / 11.635 / 8 |
+| 15274915 | 8 | to | before | 15.536 | 20.942 | 1.628 | 61.389 | 19.688 | 13.756 | 4.8 | 12.954 / 6700 / 1117 | 2.737 / 13.475 / 9 |
+| 15274915 | 8 | to | after | 10.275 | 28.359 | 0.814 | 13.047 | 22.383 | 8.078 | 2770 | 5.805 / 63.341 / 42 | 4.408 / 31.804 / 11 |
+| 15274915 | 8 | code_hash | before | 11.378 | 19.665 | 0.553 | 15.875 | 39.998 | 9.514 | 4651 | 7.397 / 1271 / 411 | 7.132 / 22.048 / 8 |
+| 15274915 | 8 | code_hash | after | 9.205 | 23.228 | 1.044 | 9.290 | 23.854 | 7.177 | 2900 | 4.372 / 77.288 / 83 | 3.248 / 10.956 / 6 |
+| 3356896 | 4 | to | before | 1.604 | 1.851 | 0.071 | 0.500 | 2.660 | 1.280 | 145 | 0.918 / 7.762 / 34 | 0.792 / 9.874 / 30 |
+| 3356896 | 4 | to | after | 1.667 | 2.094 | 0.081 | 0.509 | 2.647 | 1.333 | 151 | 0.957 / 3.949 / 15 | 0.788 / 8.207 / 29 |
+| 3356896 | 4 | code_hash | before | 1.940 | 1.695 | 0.059 | 0.891 | 3.865 | 1.634 | 343 | 1.158 / 14.775 / 40 | 1.140 / 14.032 / 37 |
+| 3356896 | 4 | code_hash | after | 1.578 | 2.061 | 0.074 | 0.326 | 2.629 | 1.275 | 77 | 0.739 / 3.020 / 13 | 0.846 / 6.259 / 28 |
+| 3356896 | 8 | to | before | 2.661 | 7.215 | 0.141 | 1.511 | 9.122 | 2.284 | 284 | 1.691 / 31.138 / 38 | 1.536 / 45.055 / 45 |
+| 3356896 | 8 | to | after | 2.746 | 6.739 | 0.737 | 2.688 | 8.857 | 2.399 | 496 | 1.762 / 13.656 / 16 | 1.425 / 24.797 / 27 |
+| 3356896 | 8 | code_hash | before | 3.112 | 1.791 | 0.040 | 3.348 | 16.918 | 2.778 | 1039 | 2.096 / 37.494 / 43 | 2.114 / 44.735 / 41 |
+| 3356896 | 8 | code_hash | after | 2.364 | 7.791 | 0.182 | 2.465 | 5.933 | 2.049 | 886 | 1.147 / 6.942 / 17 | 1.504 / 13.316 / 20 |
+
+Post-phase on 15274915 `(to, selector)` C=4 after the boost: setup 1.113 ms, rescan 0.152 ms, lazy evaluation 0.615 ms. The critical-path walker on that run attributes 2.55 ms to armed reads that start before the producer finishes, 1.64 ms to execution, 0.91 ms to the post phase, 0.86 ms to worker gaps, and 0.73 ms to schedule gaps. The hottest armed coverage is no longer `0xabd6bb3978815b97` (1.00 ms). It is `0x3002e6fbbca936f8` (1.89 ms), `0x693c76ebc9d30041` (1.85 ms), and `0x23e73edfbbb8a5ef` (1.81 ms), with nonce coverage 1.66 ms.
+
+Small-block hot location `0xdff71d59d972d654`, after the boost, C=4 `(to, selector)`: 17 writers, exec 0.282 ms, span 1.001 ms, gap 0.719 ms. C=4 `(code_hash, selector)`: exec 0.283 ms, span 0.756 ms.
+
+### Wall clock
+
+K=10, no warm-up, bootstrap 10,000, timers off. SEQ is one workers=1 baseline and is not repeated per C. OCC is `execute_revm_parallel`. Build is `lto=false`, codegen-units 1. C=8 is `--allow-oversub` onto CPUs 0–3. Ideal_C is `ideal_seq_ms` from the workers=1 profile.
+
+```bash
+scripts/soft0_percore_scan.sh --cpu-list 0-3 --allow-oversub --c-list 1,4,8 --k 10 --profile-k 1 --step-k 1 --out results/stage1d-scan-to
+SPECFENCE_CLASS_KEY=code_hash scripts/soft0_percore_scan.sh --cpu-list 0-3 --allow-oversub --c-list 1,4,8 --k 10 --profile-k 1 --step-k 1 --skip-build --out results/stage1d-scan-code
+```
+
+`seqcheck` and `occcheck` reported `diverge=0` on both blocks for both output directories. Ratios below are from this scan only.
+
+#### `(to, selector)`
+
+Block 15274915, `TPS_SEQ` 351977, median 3.483 ms, 95% CI [3.463, 3.602].
+
+| C | OCC ms | OCC 95% CI | SF ms | SF 95% CI | Ideal_C ms | SF/OCC | SF/Ideal_C |
+| ---: | ---: | --- | ---: | --- | ---: | ---: | ---: |
+| 1 | 4.948 | [4.355, 5.361] | 5.871 | [5.648, 6.023] | 3.145 | 1.19 | 1.87 |
+| 4 | 3.317 | [3.230, 3.521] | 5.744 | [5.529, 5.975] | 1.153 | 1.73 | 4.98 |
+| 8 | 3.747 | [3.611, 3.839] | 7.249 | [6.990, 7.489] | 1.153 | 1.93 | 6.29 |
+
+Block 3356896, `TPS_SEQ` 659959, median 0.267 ms, 95% CI [0.259, 0.271].
+
+| C | OCC ms | OCC 95% CI | SF ms | SF 95% CI | Ideal_C ms | SF/OCC | SF/Ideal_C |
+| ---: | ---: | --- | ---: | --- | ---: | ---: | ---: |
+| 1 | 0.456 | [0.426, 0.548] | 0.535 | [0.530, 0.572] | 0.234 | 1.17 | 2.29 |
+| 4 | 0.606 | [0.583, 0.656] | 1.196 | [1.132, 1.279] | 0.059 | 1.97 | 20.4 |
+| 8 | 0.634 | [0.598, 0.869] | 1.348 | [1.279, 1.468] | 0.041 | 2.13 | 33.0 |
+
+SF C=4 / SF C=1 is 5.744/5.871 = 0.98 on 15274915 and 1.196/0.535 = 2.24 on 3356896.
+
+#### `(code_hash, selector)`
+
+Block 15274915, `TPS_SEQ` 351767, median 3.485 ms, 95% CI [3.420, 3.565].
+
+| C | OCC ms | OCC 95% CI | SF ms | SF 95% CI | Ideal_C ms | SF/OCC | SF/Ideal_C |
+| ---: | ---: | --- | ---: | --- | ---: | ---: | ---: |
+| 1 | 4.784 | [4.555, 5.431] | 5.792 | [5.578, 5.861] | 3.201 | 1.21 | 1.81 |
+| 4 | 3.225 | [3.112, 3.636] | 6.253 | [5.797, 6.670] | 1.191 | 1.94 | 5.25 |
+| 8 | 3.696 | [3.493, 4.147] | 7.364 | [6.986, 7.871] | 1.191 | 1.99 | 6.18 |
+
+Block 3356896, `TPS_SEQ` 671348, median 0.262 ms, 95% CI [0.258, 0.265].
+
+| C | OCC ms | OCC 95% CI | SF ms | SF 95% CI | Ideal_C ms | SF/OCC | SF/Ideal_C |
+| ---: | ---: | --- | ---: | --- | ---: | ---: | ---: |
+| 1 | 0.450 | [0.399, 0.519] | 0.541 | [0.532, 0.562] | 0.243 | 1.20 | 2.23 |
+| 4 | 0.595 | [0.527, 0.678] | 1.175 | [1.101, 1.322] | 0.061 | 1.97 | 19.2 |
+| 8 | 0.588 | [0.558, 0.679] | 1.317 | [1.253, 1.438] | 0.045 | 2.24 | 29.3 |
+
+SF C=4 / SF C=1 is 6.253/5.792 = 1.08 on 15274915 and 1.175/0.541 = 2.17 on 3356896.
+
+#### FullReplay, ten rounds
+
+| Block | C | Class key | FullReplay | Max |
+| --- | ---: | --- | --- | ---: |
+| 15274915 | 4 | to+selector | 6, 6, 7, 6, 6, 6, 5, 6, 5, 6 | 7 |
+| 15274915 | 8 | to+selector | 7, 6, 6, 7, 7, 8, 6, 9, 6, 8 | 9 |
+| 15274915 | 4 | code_hash+selector | 5, 4, 7, 8, 9, 6, 4, 6, 6, 5 | 9 |
+| 15274915 | 8 | code_hash+selector | 7, 10, 12, 6, 7, 8, 6, 8, 8, 6 | 12 |
+| 3356896 | 4 | to+selector | 0 × 10 | 0 |
+| 3356896 | 8 | to+selector | 0, 1, 1, 0, 1, then 0 × 5 | 1 |
+| 3356896 | 4 | code_hash+selector | 0 × 7, 10, 0, 0 | 10 |
+| 3356896 | 8 | code_hash+selector | 0, 9, then 0 × 8 | 9 |
+
+The round with 10 re-executed 21 times (`chain_len` 17, `armed` 110, `exec_entries` 231, wall 1.401 ms, `delta_mismatch` 0). The round with 9 re-executed 15 times (wall 1.298 ms, `delta_mismatch` 0). C=1 is 0 on every round.
+
+### Equivalence
+
+Release tests on this tree, `--test-threads=1`:
+
+```bash
+cargo +stable test -p pevm --release --features specfence --test specfence_stage1 --test sload_static_gas -- --test-threads=1 sf_matches_onchain_focus_blocks sf_seq_par_repeat sload_static_gas_matches_chain_header
+```
+
+`sload_static_gas_matches_chain_header` passed (0.58s) and still matches header gas 29928443 and 4033966. `sf_matches_onchain_focus_blocks` and `sf_seq_par_repeat` passed in the same process (3.67s). The first compares sequential, unmodified OCC, and SpecFence on both blocks at C=1, 4, and 8, for both class keys. The second repeats `seq=par` at C=4 and C=8. The four fold tests and the two chain tests above passed with the rest of `specfence::` (19 tests).
+
+### Still open
+
+- **SF C=4 is still slower than OCC C=4 on 15274915.** Same-scan SF/OCC is 1.73 `(to, selector)` and 1.94 `(code_hash, selector)`. SF/Ideal_C at C=4 is 4.98 and 5.25. At C=8 those ratios are 6.29 and 6.18. Stage 1c's `(to, selector)` C=4 median was 6.049 ms on this host; this scan's median is 5.744 ms. The span cut of about 3 ms did not come off the untimed wall.
+- **SF C=4 beats SF C=1 on one key.** 0.98× on 15274915 `(to, selector)`. 1.08× on `(code_hash, selector)`, so that key still slows down as C grows from 1 to 4.
+- **The contract chain is no longer the long span, and other waits are.** After the boost, `0xabd6bb3978815b97` is 1.52 ms against 0.69 ms of execution on the `(to, selector)` C=4 timeline. Armed coverage on three other locations and the nonce chains is still about 1.7–1.9 ms each. Bookkeeping inside the parallel phase is 7.88 ms of thread time. Those are the next measurements, not another preseed experiment.
+- **3356896 stays overhead-bound, and two rounds miss the FullReplay cap.** C=4 walls are 1.196 ms and 1.175 ms against OCC 0.606 ms and 0.595 ms. This block is not gated on that wall. FullReplay is 0 on both C=4 and C=8 `(to, selector)` except three 1s at C=8. `(code_hash, selector)` has one round of 10 at C=4 and one round of 9 at C=8, both with `delta_mismatch` 0. The other 18 rounds at those cells are 0.
+- **A first touch of an existing empty account is an RMW.** Classification from "no code" predicts a delta. The engine writes an absolute basic account when the recipient is not yet in multi-version memory, and publish clears the delta bit. Readers who folded the prediction abort. Widening the lazy path so that first touch stays a delta would change account-creation gas. The 996 credits on `0x7ec8be01af547316` produced no mismatch in this scan.
+

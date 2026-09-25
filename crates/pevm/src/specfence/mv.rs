@@ -13,8 +13,8 @@ use alloy_primitives::{Address, B256, U256};
 use dashmap::DashMap;
 
 use crate::{
-    BuildIdentityHasher, BuildSuffixHasher, MemoryEntry, MemoryLocationHash, MemoryValue, TxIdx,
-    TxVersion, WriteSet,
+    AccountBasic, BuildIdentityHasher, BuildSuffixHasher, MemoryEntry, MemoryLocationHash,
+    MemoryValue, TxIdx, TxVersion, WriteSet,
 };
 
 use super::trace::Trace;
@@ -24,6 +24,27 @@ pub(crate) struct SfOrigin {
     pub(crate) tx_idx: TxIdx,
     pub(crate) incarnation: usize,
     pub(crate) value: MemoryValue,
+}
+
+/// One commutative credit folded into a read before that transaction finished.
+#[derive(Clone, Debug)]
+pub(crate) struct DeltaFold {
+    pub(crate) tx_idx: TxIdx,
+    pub(crate) amount: U256,
+}
+
+/// Consumed account after adding input-determined credits to an RMW or storage base.
+///
+/// `usize::MAX` is not stored here. Validation treats a delta as final when
+/// any incarnation of `tx_idx` is final (`is_final` is called with `usize::MAX`).
+#[derive(Clone, Debug)]
+pub(crate) struct FoldedRead {
+    pub(crate) base_tx: Option<TxIdx>,
+    pub(crate) base_incarnation: usize,
+    /// Account before the lazy credits. Storage is a [`MemoryValue::Basic`].
+    pub(crate) base: MemoryValue,
+    pub(crate) deltas: smallvec::SmallVec<[DeltaFold; 4]>,
+    pub(crate) consumed: AccountBasic,
 }
 
 #[derive(Clone, Debug)]
@@ -37,6 +58,41 @@ pub(crate) enum SfReadOrigin {
         incarnation: usize,
     },
     Storage,
+    /// RMW base plus the delta credits the interpreter added.
+    Folded(FoldedRead),
+}
+
+/// `ops` is highest transaction index first, matching the lazy read walk.
+pub(crate) fn net_lazy(ops: &[(bool, U256)]) -> (bool, U256, u64) {
+    let mut balance_addition = U256::ZERO;
+    let mut positive_addition = true;
+    let mut nonce_addition = 0u64;
+    for &(is_sender, amount) in ops {
+        if is_sender {
+            if positive_addition {
+                positive_addition = balance_addition >= amount;
+                balance_addition = balance_addition.abs_diff(amount);
+            } else {
+                balance_addition = balance_addition.saturating_add(amount);
+            }
+            nonce_addition += 1;
+        } else if positive_addition {
+            balance_addition = balance_addition.saturating_add(amount);
+        } else {
+            positive_addition = amount >= balance_addition;
+            balance_addition = balance_addition.abs_diff(amount);
+        }
+    }
+    (positive_addition, balance_addition, nonce_addition)
+}
+
+pub(crate) fn apply_net(account: &mut AccountBasic, positive: bool, addition: U256, nonce: u64) {
+    account.nonce = account.nonce.saturating_add(nonce);
+    if positive {
+        account.balance = account.balance.saturating_add(addition);
+    } else {
+        account.balance = account.balance.saturating_sub(addition);
+    }
 }
 
 pub(crate) type SfReadOrigins = smallvec::SmallVec<[SfReadOrigin; 1]>;
@@ -73,6 +129,8 @@ pub(crate) const fn is_lazy_value(value: &MemoryValue) -> bool {
 struct LastLocations {
     read: SfReadSet,
     write: Vec<MemoryLocationHash>,
+    /// `record` has run for this incarnation. An absent location then contributes 0.
+    sealed: bool,
 }
 
 type LazyAddresses = HashSet<Address, BuildSuffixHasher>;
@@ -129,6 +187,7 @@ impl SfMv {
         write_set: WriteSet,
     ) -> bool {
         let mut last_locations = index_mutex!(self.last_locations, tx_version.tx_idx);
+        last_locations.sealed = true;
         last_locations.read = read_set;
 
         let mut last_location_idx = 0;
@@ -168,10 +227,7 @@ impl SfMv {
             readers.push(reader);
         }
         drop(readers);
-        for origin in origins {
-            let Some(writer) = origin_tx(origin) else {
-                continue;
-            };
+        for writer in origin_dependencies(origins) {
             if writer >= reader || writer >= self.final_waiters.len() {
                 continue;
             }
@@ -180,6 +236,15 @@ impl SfMv {
                 waiters.push(reader);
             }
         }
+    }
+
+    /// Executed, and this location is not in the write set. The credit is 0.
+    pub(crate) fn sealed_without(&self, tx_idx: TxIdx, location: MemoryLocationHash) -> bool {
+        if tx_idx >= self.last_locations.len() {
+            return false;
+        }
+        let last = index_mutex!(self.last_locations, tx_idx);
+        last.sealed && !last.write.contains(&location)
     }
 
     pub(crate) fn waiters_of(&self, tx_idx: TxIdx) -> Vec<TxIdx> {
@@ -239,6 +304,19 @@ impl SfMv {
                             return false;
                         }
                     }
+                    SfReadOrigin::Folded(fold) => {
+                        if let Some(tx) = fold.base_tx
+                            && !is_final(tx, fold.base_incarnation)
+                        {
+                            return false;
+                        }
+                        for delta in &fold.deltas {
+                            // `usize::MAX` asks the caller for any final incarnation.
+                            if !is_final(delta.tx_idx, usize::MAX) {
+                                return false;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -250,6 +328,16 @@ impl SfMv {
     }
 
     /// `None` when every recorded origin still matches the live entry's identity and value.
+    pub(crate) fn origin_is_folded(&self, tx_idx: TxIdx, location: MemoryLocationHash) -> bool {
+        if tx_idx >= self.last_locations.len() {
+            return false;
+        }
+        let last = index_mutex!(self.last_locations, tx_idx);
+        last.read
+            .get(&location)
+            .is_some_and(|origins| matches!(origins.first(), Some(SfReadOrigin::Folded(_))))
+    }
+
     pub(crate) fn failing_location(&self, tx_idx: TxIdx) -> Option<MemoryLocationHash> {
         self.first_mismatch(tx_idx).map(|m| m.location)
     }
@@ -260,7 +348,7 @@ impl SfMv {
         let last = index_mutex!(self.last_locations, tx_idx);
         for (location, prior_origins) in &last.read {
             if let Some((origin_tx, live_tx)) =
-                mismatch_writers(&self.data, *location, tx_idx, prior_origins)
+                mismatch_writers(self, *location, tx_idx, prior_origins)
             {
                 return Some(ReadMismatch {
                     location: *location,
@@ -302,6 +390,9 @@ impl SfMv {
                         SfReadOrigin::Mv(mv) => mv.tx_idx as u32,
                         SfReadOrigin::MvId { tx_idx, .. } => *tx_idx as u32,
                         SfReadOrigin::Storage => u32::MAX,
+                        SfReadOrigin::Folded(fold) => {
+                            fold.base_tx.map(|tx| tx as u32).unwrap_or(u32::MAX)
+                        }
                     };
                     on_read(tx, *location, writer);
                 }
@@ -330,6 +421,11 @@ impl SfMv {
                     SfReadOrigin::Mv(mv) => trace.note_edge(mv.tx_idx, tx_idx),
                     SfReadOrigin::MvId { tx_idx: writer, .. } => trace.note_edge(*writer, tx_idx),
                     SfReadOrigin::Storage => {}
+                    SfReadOrigin::Folded(fold) => {
+                        if let Some(writer) = fold.base_tx {
+                            trace.note_edge(writer, tx_idx);
+                        }
+                    }
                 }
             }
         }
@@ -341,15 +437,40 @@ const fn origin_tx(origin: &SfReadOrigin) -> Option<TxIdx> {
         SfReadOrigin::Mv(mv) => Some(mv.tx_idx),
         SfReadOrigin::MvId { tx_idx, .. } => Some(*tx_idx),
         SfReadOrigin::Storage => None,
+        SfReadOrigin::Folded(fold) => fold.base_tx,
     }
 }
 
+fn origin_dependencies(origins: &SfReadOrigins) -> Vec<TxIdx> {
+    let mut out = Vec::new();
+    for origin in origins {
+        match origin {
+            SfReadOrigin::Mv(mv) => out.push(mv.tx_idx),
+            SfReadOrigin::MvId { tx_idx, .. } => out.push(*tx_idx),
+            SfReadOrigin::Storage => {}
+            SfReadOrigin::Folded(fold) => {
+                if let Some(tx) = fold.base_tx {
+                    out.push(tx);
+                }
+                for delta in &fold.deltas {
+                    out.push(delta.tx_idx);
+                }
+            }
+        }
+    }
+    out
+}
+
 fn mismatch_writers(
-    data: &DashMap<MemoryLocationHash, BTreeMap<TxIdx, MemoryEntry>, BuildIdentityHasher>,
+    mv: &SfMv,
     location: MemoryLocationHash,
     tx_idx: TxIdx,
     prior_origins: &SfReadOrigins,
 ) -> Option<(Option<TxIdx>, Option<TxIdx>)> {
+    if let Some(SfReadOrigin::Folded(fold)) = prior_origins.first() {
+        return fold_mismatch(mv, location, tx_idx, fold);
+    }
+    let data = &mv.data;
     if let Some(written_transactions) = data.get(&location) {
         let mut iter = written_transactions.range(..tx_idx);
         for prior_origin in prior_origins {
@@ -387,6 +508,9 @@ fn mismatch_writers(
                         return Some((None, Some(*closest_idx)));
                     }
                 }
+                SfReadOrigin::Folded(_) => {
+                    return Some((origin_tx(prior_origin), None));
+                }
             }
         }
         None
@@ -395,12 +519,81 @@ fn mismatch_writers(
     {
         None
     } else {
-        let origin_tx = prior_origins.iter().find_map(|origin| match origin {
-            SfReadOrigin::Mv(mv) => Some(mv.tx_idx),
-            SfReadOrigin::MvId { tx_idx, .. } => Some(*tx_idx),
-            SfReadOrigin::Storage => None,
-        });
+        let origin_tx = prior_origins.iter().find_map(origin_tx);
         Some((origin_tx, None))
+    }
+}
+
+fn fold_mismatch(
+    mv: &SfMv,
+    location: MemoryLocationHash,
+    reader: TxIdx,
+    fold: &FoldedRead,
+) -> Option<(Option<TxIdx>, Option<TxIdx>)> {
+    let start = fold.base_tx.map(|tx| tx.saturating_add(1)).unwrap_or(0);
+    if let Some(base_tx) = fold.base_tx {
+        let ok = mv.data.get(&location).is_some_and(|written| {
+            matches!(
+                written.get(&base_tx),
+                Some(MemoryEntry::Data(inc, value))
+                    if *inc == fold.base_incarnation && memory_value_eq(value, &fold.base)
+            )
+        });
+        if !ok {
+            let live = mv
+                .data
+                .get(&location)
+                .and_then(|written| written.range(..reader).next_back().map(|(tx, _)| *tx));
+            return Some((Some(base_tx), live));
+        }
+    }
+    let mut ops: Vec<(TxIdx, bool, U256)> = Vec::new();
+    if let Some(written) = mv.data.get(&location) {
+        for (tx, entry) in written.range(start..reader) {
+            match entry {
+                MemoryEntry::Data(_, MemoryValue::LazyRecipient(amount)) => {
+                    ops.push((*tx, false, *amount));
+                }
+                MemoryEntry::Data(_, MemoryValue::LazySender(amount)) => {
+                    ops.push((*tx, true, *amount));
+                }
+                MemoryEntry::Estimate => return Some((fold.base_tx, Some(*tx))),
+                MemoryEntry::Data(_, _) => return Some((fold.base_tx, Some(*tx))),
+            }
+        }
+    }
+    for delta in &fold.deltas {
+        if ops.iter().any(|(tx, _, _)| *tx == delta.tx_idx) {
+            continue;
+        }
+        let amount = if mv.sealed_without(delta.tx_idx, location) {
+            U256::ZERO
+        } else {
+            delta.amount
+        };
+        ops.push((delta.tx_idx, false, amount));
+    }
+    ops.sort_by(|left, right| right.0.cmp(&left.0));
+    let net_ops: Vec<(bool, U256)> = ops
+        .iter()
+        .map(|(_, sender, amount)| (*sender, *amount))
+        .collect();
+    let (positive, addition, nonce) = net_lazy(&net_ops);
+    let MemoryValue::Basic(mut account) = fold.base.clone() else {
+        return Some((fold.base_tx, None));
+    };
+    apply_net(&mut account, positive, addition, nonce);
+    if account == fold.consumed {
+        None
+    } else {
+        let live = ops.first().map(|(tx, _, _)| *tx).or(fold.base_tx);
+        Some((
+            fold.deltas
+                .first()
+                .map(|delta| delta.tx_idx)
+                .or(fold.base_tx),
+            live,
+        ))
     }
 }
 
@@ -505,5 +698,156 @@ mod tests {
             vec![(loc(), MemoryValue::Storage(U256::from(8)))],
         );
         assert!(mv.failing_location(1).is_some());
+    }
+
+    fn basic(balance: u64) -> MemoryValue {
+        MemoryValue::Basic(AccountBasic {
+            balance: U256::from(balance),
+            nonce: 0,
+        })
+    }
+
+    fn folded(
+        base_tx: Option<usize>,
+        base_balance: u64,
+        deltas: &[(usize, u64)],
+        consumed: u64,
+    ) -> SfReadOrigin {
+        SfReadOrigin::Folded(FoldedRead {
+            base_tx,
+            base_incarnation: 0,
+            base: basic(base_balance),
+            deltas: deltas
+                .iter()
+                .map(|(tx, amount)| DeltaFold {
+                    tx_idx: *tx,
+                    amount: U256::from(*amount),
+                })
+                .collect(),
+            consumed: AccountBasic {
+                balance: U256::from(consumed),
+                nonce: 0,
+            },
+        })
+    }
+
+    fn read_folded(mv: &SfMv, reader: usize, origin: SfReadOrigin) {
+        let mut reads = SfReadSet::default();
+        reads.insert(loc(), smallvec::smallvec![origin]);
+        mv.record(
+            &TxVersion {
+                tx_idx: reader,
+                tx_incarnation: 0,
+            },
+            reads,
+            vec![],
+        );
+    }
+
+    #[test]
+    fn failed_delta_does_not_match_the_prediction() {
+        let mv = SfMv::new(3, [], []);
+        mv.record(
+            &TxVersion {
+                tx_idx: 0,
+                tx_incarnation: 0,
+            },
+            SfReadSet::default(),
+            vec![(loc(), basic(100))],
+        );
+        // tx 1 was predicted to credit 40 and then sealed without that write.
+        mv.record(
+            &TxVersion {
+                tx_idx: 1,
+                tx_incarnation: 0,
+            },
+            SfReadSet::default(),
+            vec![],
+        );
+        read_folded(&mv, 2, folded(Some(0), 100, &[(1, 40)], 140));
+        assert!(mv.failing_location(2).is_some());
+    }
+
+    #[test]
+    fn predicted_delta_that_becomes_rmw_mismatches() {
+        let mv = SfMv::new(3, [], []);
+        mv.record(
+            &TxVersion {
+                tx_idx: 0,
+                tx_incarnation: 0,
+            },
+            SfReadSet::default(),
+            vec![(loc(), basic(100))],
+        );
+        mv.record(
+            &TxVersion {
+                tx_idx: 1,
+                tx_incarnation: 0,
+            },
+            SfReadSet::default(),
+            vec![(loc(), basic(999))],
+        );
+        read_folded(&mv, 2, folded(Some(0), 100, &[(1, 40)], 140));
+        assert!(mv.failing_location(2).is_some());
+    }
+
+    #[test]
+    fn rmw_writer_appearing_below_mismatches_the_folded_base() {
+        let mv = SfMv::new(4, [], []);
+        mv.record(
+            &TxVersion {
+                tx_idx: 0,
+                tx_incarnation: 0,
+            },
+            SfReadSet::default(),
+            vec![(loc(), basic(100))],
+        );
+        read_folded(&mv, 3, folded(Some(0), 100, &[(2, 5)], 105));
+        assert!(mv.failing_location(3).is_none());
+        mv.record(
+            &TxVersion {
+                tx_idx: 1,
+                tx_incarnation: 0,
+            },
+            SfReadSet::default(),
+            vec![(loc(), basic(50))],
+        );
+        assert!(mv.failing_location(3).is_some());
+    }
+
+    #[test]
+    fn beneficiary_lazy_reward_interleaves_with_a_predicted_delta() {
+        let mv = SfMv::new(4, [], []);
+        mv.record(
+            &TxVersion {
+                tx_idx: 0,
+                tx_incarnation: 0,
+            },
+            SfReadSet::default(),
+            vec![(loc(), basic(100))],
+        );
+        // Gas reward landed on this account before the predicted transfer.
+        mv.record(
+            &TxVersion {
+                tx_idx: 1,
+                tx_incarnation: 0,
+            },
+            SfReadSet::default(),
+            vec![(loc(), MemoryValue::LazyRecipient(U256::from(7)))],
+        );
+        read_folded(&mv, 3, folded(Some(0), 100, &[(1, 7), (2, 5)], 112));
+        assert!(
+            mv.failing_location(3).is_none(),
+            "executed reward plus predicted credit"
+        );
+        mv.record(
+            &TxVersion {
+                tx_idx: 1,
+                tx_incarnation: 0,
+            },
+            SfReadSet::default(),
+            vec![(loc(), MemoryValue::LazyRecipient(U256::from(9)))],
+        );
+        assert!(mv.failing_location(3).is_some());
     }
 }

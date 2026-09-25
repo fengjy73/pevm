@@ -37,7 +37,7 @@ use crate::{
 use super::live_chain::LiveChain;
 use super::mv::{
     SfMv, SfOrigin, SfReadOrigin, SfReadOrigins, SfReadSet, is_lazy_value, memory_value_eq,
-    retained_storage,
+    net_lazy, retained_storage,
 };
 use super::rt::Runtime;
 use super::trace::Trace;
@@ -122,13 +122,13 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
         let result = self.wait_writer(location);
         let accepted = self
             .chain
-            .nearest_lower(location, self.tx_idx)
+            .nearest_blocker(location, self.tx_idx)
             .map(|tx| tx as u32)
             .unwrap_or(u32::MAX);
         self.accepted_pred.set(accepted);
         if self.trace.diag() {
             let (nearest, state, reason) = match result {
-                Ok(()) => match self.chain.nearest_lower(location, self.tx_idx) {
+                Ok(()) => match self.chain.nearest_blocker(location, self.tx_idx) {
                     Some(pred) => {
                         let state = self.chain.writer_state(location, pred).0 as u8;
                         let reason = if self.settled(location, pred) {
@@ -141,7 +141,7 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
                     None => (u32::MAX, 0, super::trace::coord_reason::NO_LOWER),
                 },
                 Err(_) => {
-                    let pred = self.chain.nearest_lower(location, self.tx_idx);
+                    let pred = self.chain.nearest_blocker(location, self.tx_idx);
                     let state = pred
                         .map(|tx| self.chain.writer_state(location, tx).0 as u8)
                         .unwrap_or(0);
@@ -175,7 +175,7 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
         // put the preseeded recipient chain back on the critical path.
         let mut holes = 0usize;
         loop {
-            let Some(pred) = self.chain.nearest_lower(location, self.tx_idx) else {
+            let Some(pred) = self.chain.nearest_blocker(location, self.tx_idx) else {
                 return Ok(());
             };
             if self.settled(location, pred) {
@@ -377,7 +377,7 @@ fn confirm_read_chain(
     location: u64,
 ) -> Result<(), ReadError> {
     let now = chain
-        .nearest_lower(location, tx_idx)
+        .nearest_blocker(location, tx_idx)
         .map(|tx| tx as u32)
         .unwrap_or(u32::MAX);
     if now != accepted {
@@ -425,6 +425,32 @@ fn mv_origin(serial: bool, tx_idx: TxIdx, incarnation: usize, value: &MemoryValu
     }
 }
 
+fn install_fold(
+    read_origins: &mut SfReadOrigins,
+    replay_folded: bool,
+    base_tx: Option<(TxIdx, usize)>,
+    base_account: Option<&AccountBasic>,
+    folds: &smallvec::SmallVec<[super::mv::DeltaFold; 4]>,
+    consumed: &AccountBasic,
+) -> Result<(), ReadError> {
+    let fold = SfReadOrigin::Folded(super::mv::FoldedRead {
+        base_tx: base_tx.map(|(tx, _)| tx),
+        base_incarnation: base_tx.map(|(_, inc)| inc).unwrap_or(0),
+        base: MemoryValue::Basic(base_account.cloned().unwrap_or_default()),
+        deltas: folds.clone(),
+        consumed: consumed.clone(),
+    });
+    if replay_folded {
+        if !origin_eq(read_origins.first().unwrap(), &fold) {
+            return Err(ReadError::InconsistentRead);
+        }
+    } else {
+        read_origins.clear();
+        read_origins.push(fold);
+    }
+    Ok(())
+}
+
 fn origin_eq(a: &SfReadOrigin, b: &SfReadOrigin) -> bool {
     match (a, b) {
         (SfReadOrigin::Storage, SfReadOrigin::Storage) => true,
@@ -443,6 +469,17 @@ fn origin_eq(a: &SfReadOrigin, b: &SfReadOrigin) -> bool {
                 incarnation: bi,
             },
         ) => a == b && ai == bi,
+        (SfReadOrigin::Folded(a), SfReadOrigin::Folded(b)) => {
+            a.base_tx == b.base_tx
+                && a.base_incarnation == b.base_incarnation
+                && memory_value_eq(&a.base, &b.base)
+                && a.consumed == b.consumed
+                && a.deltas.len() == b.deltas.len()
+                && a.deltas
+                    .iter()
+                    .zip(b.deltas.iter())
+                    .all(|(left, right)| left.tx_idx == right.tx_idx && left.amount == right.amount)
+        }
         _ => false,
     }
 }
@@ -471,11 +508,15 @@ impl<S: crate::Storage> Database for VmDb<'_, S> {
 
         let read_origins = self.read_set.entry(location_hash).or_default();
         let has_prev_origins = !read_origins.is_empty();
+        let replay_folded =
+            has_prev_origins && matches!(read_origins.first(), Some(SfReadOrigin::Folded(_)));
         let mut new_origins = SmallVec::new();
         let mut final_account = None;
         let mut balance_addition = U256::ZERO;
         let mut positive_addition = true;
         let mut nonce_addition = 0u64;
+        let mut lazy_ops: Vec<(TxIdx, bool, U256)> = Vec::new();
+        let mut base_tx: Option<(TxIdx, usize)> = None;
 
         if self.tx_idx > 0
             && let Some(written_transactions) = self.mv.data.get(&location_hash)
@@ -503,21 +544,26 @@ impl<S: crate::Storage> Database for VmDb<'_, S> {
                         return Err(ReadError::Blocking(*blocking_idx));
                     }
                     Some((closest_idx, MemoryEntry::Data(tx_incarnation, value))) => {
-                        if has_prev_origins && read_origins.len() == new_origins.len() {
-                            return Err(ReadError::InconsistentRead);
+                        if !replay_folded {
+                            if has_prev_origins && read_origins.len() == new_origins.len() {
+                                return Err(ReadError::InconsistentRead);
+                            }
+                            let origin = mv_origin(serial, *closest_idx, *tx_incarnation, value);
+                            if has_prev_origins
+                                && !origin_eq(&read_origins[new_origins.len()], &origin)
+                            {
+                                return Err(ReadError::InconsistentRead);
+                            }
+                            new_origins.push(origin);
                         }
-                        let origin = mv_origin(serial, *closest_idx, *tx_incarnation, value);
-                        if has_prev_origins && !origin_eq(&read_origins[new_origins.len()], &origin)
-                        {
-                            return Err(ReadError::InconsistentRead);
-                        }
-                        new_origins.push(origin);
                         match value {
                             MemoryValue::Basic(basic) => {
+                                base_tx = Some((*closest_idx, *tx_incarnation));
                                 final_account = Some(basic.clone());
                                 break;
                             }
                             MemoryValue::LazyRecipient(addition) => {
+                                lazy_ops.push((*closest_idx, false, *addition));
                                 if positive_addition {
                                     balance_addition = balance_addition.saturating_add(*addition);
                                 } else {
@@ -526,6 +572,7 @@ impl<S: crate::Storage> Database for VmDb<'_, S> {
                                 }
                             }
                             MemoryValue::LazySender(subtraction) => {
+                                lazy_ops.push((*closest_idx, true, *subtraction));
                                 if positive_addition {
                                     positive_addition = balance_addition >= *subtraction;
                                     balance_addition = balance_addition.abs_diff(*subtraction);
@@ -543,8 +590,50 @@ impl<S: crate::Storage> Database for VmDb<'_, S> {
             }
         }
 
+        let mut folds: smallvec::SmallVec<[super::mv::DeltaFold; 4]> = smallvec::SmallVec::new();
+        if !serial {
+            let start = base_tx.map(|(tx, _)| tx.saturating_add(1)).unwrap_or(0);
+            self.chain
+                .for_each_delta(location_hash, start, self.tx_idx, |tx, amount| {
+                    let used = lazy_ops
+                        .iter()
+                        .find(|(seen, sender, _)| *seen == tx && !*sender)
+                        .map(|(_, _, executed)| *executed)
+                        .unwrap_or(amount);
+                    folds.push(super::mv::DeltaFold {
+                        tx_idx: tx,
+                        amount: used,
+                    });
+                });
+        }
+        let folding = folds
+            .iter()
+            .any(|delta| lazy_ops.iter().all(|(seen, _, _)| *seen != delta.tx_idx));
+        if folding {
+            if has_prev_origins && !replay_folded {
+                return Err(ReadError::InconsistentRead);
+            }
+            let mut ops = lazy_ops.clone();
+            for delta in &folds {
+                if lazy_ops.iter().all(|(seen, _, _)| *seen != delta.tx_idx) {
+                    ops.push((delta.tx_idx, false, delta.amount));
+                }
+            }
+            ops.sort_by(|left, right| right.0.cmp(&left.0));
+            let net_ops: Vec<(bool, U256)> = ops
+                .iter()
+                .map(|(_, sender, amount)| (*sender, *amount))
+                .collect();
+            let (positive, addition, nonce) = net_lazy(&net_ops);
+            positive_addition = positive;
+            balance_addition = addition;
+            nonce_addition = nonce;
+        }
+
         if final_account.is_none() {
-            if !has_prev_origins {
+            if folding || replay_folded {
+                // The folded origin replaces the storage marker.
+            } else if !has_prev_origins {
                 new_origins.push(SfReadOrigin::Storage);
             } else if read_origins.len() != new_origins.len() + 1
                 || !matches!(read_origins.last(), Some(SfReadOrigin::Storage))
@@ -566,7 +655,8 @@ impl<S: crate::Storage> Database for VmDb<'_, S> {
             location_hash,
             serial,
         )?;
-        if !has_prev_origins {
+        let base_account = final_account.clone();
+        if !folding && !has_prev_origins {
             *read_origins = new_origins;
         }
 
@@ -579,6 +669,16 @@ impl<S: crate::Storage> Database for VmDb<'_, S> {
                 account.balance = account.balance.saturating_add(balance_addition);
             } else {
                 account.balance = account.balance.saturating_sub(balance_addition);
+            }
+            if folding {
+                install_fold(
+                    read_origins,
+                    replay_folded,
+                    base_tx,
+                    base_account.as_ref(),
+                    &folds,
+                    &account,
+                )?;
             }
             let code_hash = if Some(location_hash) == self.to_hash {
                 self.to_code_hash
@@ -595,6 +695,19 @@ impl<S: crate::Storage> Database for VmDb<'_, S> {
                 code,
                 account_id: None,
             }));
+        }
+        if folding {
+            // No account was visible. The origin still names every predicted
+            // credit, so a later non-zero write fails the value compare.
+            let empty = AccountBasic::default();
+            install_fold(
+                read_origins,
+                replay_folded,
+                base_tx,
+                base_account.as_ref(),
+                &folds,
+                &empty,
+            )?;
         }
         Ok(None)
     }
@@ -950,15 +1063,16 @@ impl<'a, S: crate::Storage, C: PevmChain> SfVm<'a, S, C> {
         // Chain publish follows the multi-version record so a reader that
         // observes `Published` also observes the value. `Running` was set at
         // entry, which is what an armed reader waits on.
-        let published: Vec<(u64, bool)> = if self.evm.ctx().db().serial {
+        let published: Vec<(u64, bool, bool)> = if self.evm.ctx().db().serial {
             Vec::new()
         } else {
             let read_keys: Vec<u64> = read_set.keys().copied().collect();
             write_set
                 .iter()
                 .map(|(location, value)| {
+                    let lazy_credit = matches!(value, MemoryValue::LazyRecipient(_));
                     let rmw = read_keys.contains(location) && !is_lazy_value(value);
-                    (*location, rmw)
+                    (*location, rmw, lazy_credit)
                 })
                 .collect()
         };
@@ -999,11 +1113,11 @@ impl<'a, S: crate::Storage, C: PevmChain> SfVm<'a, S, C> {
             let _c_pub =
                 super::timeline::CycGuard::enter(exec_span.hot(), super::timeline::CYC_PUBLISH);
             let _b = super::buckets::Guard::start(super::buckets::PUBLISH);
-            for (location, rmw) in published {
-                // Read-then-write waits for the previous writer. Lazy values are
-                // blind: they join the chain for readers, and writers do not wait.
+            for (location, rmw, lazy_credit) in published {
+                // Read-then-write waits for the previous RMW writer. A lazy
+                // credit stays a delta and is not an admission edge.
                 self.live
-                    .publish_write(tx_idx, incarnation, location, rmw, |t| {
+                    .publish_write(tx_idx, incarnation, location, rmw, lazy_credit, |t| {
                         self.rt.still_open(t)
                     });
             }
@@ -1074,7 +1188,7 @@ mod tests {
         let mut live = LiveChain::new(n, ClassKeyKind::ToSelector);
         live.install_classes(Vec::new(), vec![u16::MAX; n], vec![location, location]);
         live.preseed_recipients();
-        live.publish_write(0, 0, location, false, |_| true);
+        live.publish_write(0, 0, location, false, false, |_| true);
         let rt = Runtime::new(n, 2);
         rt.seed();
         assert_eq!(rt.pop(0).unwrap().0, 0);

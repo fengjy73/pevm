@@ -146,11 +146,12 @@ where
     };
     live.skip_location(beneficiary);
     if !serial {
-        let (groups, class_of, to_of) = {
+        let (groups, class_of, to_of, values, plain) = {
             let _b = super::buckets::Guard::start(super::buckets::CLASS);
             build_classes(chain, storage, &txs, options.class_key)
         };
         live.install_classes(groups, class_of, to_of);
+        live.install_credits(values, plain);
         let _b = super::buckets::Guard::start(super::buckets::PRESEED);
         live.preseed_recipients();
     }
@@ -292,6 +293,12 @@ where
                         rt.finish_ok(worker, tx);
                         if !serial {
                             close_from(worker, tx, n, rt, mv, live, trace, commit_mu, tl);
+                            // The next RMW on this location is ready once this
+                            // write is final. Pull it onto this worker so the
+                            // chain does not wait out unrelated queue delay.
+                            for succ in live.rmw_successors(tx) {
+                                rt.boost(worker, succ);
+                            }
                         }
                     }
                     Step::Yield => rt.defer(tx),
@@ -618,7 +625,13 @@ fn close_from(
             settled[tx] = true;
             continue;
         }
-        if !mv.origins_final(tx, |writer, writer_inc| rt.is_final_inc(writer, writer_inc)) {
+        if !mv.origins_final(tx, |writer, writer_inc| {
+            if writer_inc == usize::MAX {
+                rt.is_final_any(writer)
+            } else {
+                rt.is_final_inc(writer, writer_inc)
+            }
+        }) {
             continue;
         }
         if chain_blocks(tx, mv, live, rt) {
@@ -699,6 +712,14 @@ fn abort_one(
         return false;
     };
     let loc = mismatch.location;
+    if mv.origin_is_folded(tx, loc) {
+        trace
+            .delta_mismatch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        trace
+            .delta_abort
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let armed = live.is_armed(loc);
     if trace.diag() {
         let live_tx = mismatch.live_tx;
@@ -738,8 +759,9 @@ fn backfill(mv: &SfMv, live: &LiveChain, location: u64) {
         return;
     };
     for (tx, entry) in written.iter() {
-        if let MemoryEntry::Data(inc, _) = entry {
-            live.note_backfill_writer(location, *tx, *inc);
+        if let MemoryEntry::Data(inc, value) = entry {
+            let delta = matches!(value, MemoryValue::LazyRecipient(_));
+            live.note_backfill_writer(location, *tx, *inc, delta);
         }
     }
 }
@@ -759,10 +781,12 @@ fn build_classes<S: Storage, C: PevmChain>(
     storage: &S,
     txs: &[C::EvmTx],
     kind: ClassKeyKind,
-) -> (Vec<ClassGroup>, Vec<u16>, Vec<u64>) {
+) -> (Vec<ClassGroup>, Vec<u16>, Vec<u64>, Vec<U256>, Vec<bool>) {
     let mut groups: HashMap<u64, (bool, Vec<TxIdx>), FxBuildHasher> =
         HashMap::with_hasher(FxBuildHasher);
     let mut to_of = Vec::with_capacity(txs.len());
+    let mut values = Vec::with_capacity(txs.len());
+    let mut plain = Vec::with_capacity(txs.len());
     for (i, tx) in txs.iter().enumerate() {
         let env: &TxEnv = chain.tx_env(tx);
         let to = match env.kind {
@@ -778,6 +802,17 @@ fn build_classes<S: Storage, C: PevmChain>(
             .map(|addr| hash_deterministic(MemoryLocation::Basic(addr)))
             .unwrap_or(0);
         to_of.push(to_hash);
+        values.push(env.value);
+        let code_empty = match to {
+            Some(addr) => match storage.code_hash(&addr) {
+                Ok(None) => true,
+                Ok(Some(hash)) => hash == revm::primitives::KECCAK_EMPTY,
+                Err(_) => false,
+            },
+            None => false,
+        };
+        // A call to an account with no code credits `value` and does not read it.
+        plain.push(to.is_some() && code_empty);
         let key = match kind {
             ClassKeyKind::ToSelector => hash_deterministic((to, selector)),
             ClassKeyKind::CodeHashSelector => {
@@ -804,7 +839,7 @@ fn build_classes<S: Storage, C: PevmChain>(
         }
         out.push(ClassGroup { members, contract });
     }
-    (out, class_of, to_of)
+    (out, class_of, to_of, values, plain)
 }
 
 fn evaluate_lazy<S: Storage, C: PevmChain>(
@@ -1049,7 +1084,7 @@ mod tests {
 
         assert_eq!(rt.pop(0).unwrap().0, 0);
         record_write(&mv, 0, location, 1);
-        live.publish_write(0, 0, location, false, |_| true);
+        live.publish_write(0, 0, location, false, false, |_| true);
         rt.finish_ok(0, 0);
         close_from(0, 0, n, &rt, &mv, &live, &trace, &commit_mu, false);
         assert!(rt.is_final_inc(0, 0));
@@ -1063,7 +1098,7 @@ mod tests {
 
         assert_eq!(rt.pop(1).unwrap().0, 1);
         record_write(&mv, 1, location, 9);
-        live.publish_write(1, 0, location, true, |_| true);
+        live.publish_write(1, 0, location, true, false, |_| true);
         assert_eq!(live.nearest_lower(location, 2), Some(1));
         revoke_writes(1, 1, n, &rt, &mv, &live, &trace, &commit_mu);
         assert!(!rt.is_final_any(2), "stale reader stays final");
@@ -1117,7 +1152,7 @@ mod tests {
         );
         live.preseed_recipients();
         assert_eq!(live.nearest_lower(location, 2), Some(1));
-        live.publish_write(0, 0, location, false, |_| true);
+        live.publish_write(0, 0, location, false, false, |_| true);
 
         let rt = Runtime::new(n, 2);
         rt.seed();
@@ -1144,7 +1179,7 @@ mod tests {
             vec![location, location, location],
         );
         live.preseed_recipients();
-        live.publish_write(1, 0, location, false, |_| true);
+        live.publish_write(1, 0, location, false, false, |_| true);
         let rt = Runtime::new(n, 1);
         let trace = Trace::new(n);
         let commit_mu = Mutex::new(());
@@ -1180,7 +1215,7 @@ mod tests {
             vec![location, location, location],
         );
         live.preseed_recipients();
-        live.publish_write(0, 0, location, false, |_| true);
+        live.publish_write(0, 0, location, false, false, |_| true);
         let rt = Runtime::new(n, 1);
         let trace = Trace::new(n);
         let commit_mu = Mutex::new(());

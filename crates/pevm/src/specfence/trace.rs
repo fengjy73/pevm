@@ -106,6 +106,10 @@ pub(crate) struct Trace {
     pub(crate) full_replay: AtomicUsize,
     pub(crate) reads_after_arm: AtomicUsize,
     pub(crate) full_replay_after_arm: AtomicUsize,
+    /// Folded credit did not match the final delta.
+    pub(crate) delta_mismatch: AtomicUsize,
+    /// Those mismatches that aborted the reader.
+    pub(crate) delta_abort: AtomicUsize,
     pub(crate) raw_edges: std::sync::Mutex<Vec<(u32, u32)>>,
     pub(crate) tx_ns: std::sync::Mutex<Vec<u64>>,
     attempts: std::sync::Mutex<Vec<SfAttempt>>,
@@ -127,6 +131,8 @@ impl Trace {
             full_replay: AtomicUsize::new(0),
             reads_after_arm: AtomicUsize::new(0),
             full_replay_after_arm: AtomicUsize::new(0),
+            delta_mismatch: AtomicUsize::new(0),
+            delta_abort: AtomicUsize::new(0),
             raw_edges: std::sync::Mutex::new(Vec::new()),
             tx_ns: std::sync::Mutex::new(if on { vec![0; n] } else { Vec::new() }),
             attempts: std::sync::Mutex::new(Vec::new()),
@@ -369,6 +375,10 @@ pub struct SfTrace {
     pub raw_edges: Vec<(u32, u32)>,
     /// Beneficiary basic-account hash. The ideal schedule drops this location.
     pub beneficiary: u64,
+    /// Folded credits whose final amount differed from the prediction.
+    pub delta_mismatch: usize,
+    /// Reader aborts caused by those mismatches.
+    pub delta_abort: usize,
     /// Profile attempts. Empty unless `SPECFENCE_INFLATION` is set.
     pub attempts: Vec<SfAttempt>,
 }
@@ -406,6 +416,8 @@ impl Trace {
             tx_ns,
             raw_edges,
             beneficiary,
+            delta_mismatch: self.delta_mismatch.load(Ordering::Relaxed),
+            delta_abort: self.delta_abort.load(Ordering::Relaxed),
             attempts,
         }
     }

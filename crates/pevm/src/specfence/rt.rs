@@ -269,6 +269,23 @@ impl Runtime {
         None
     }
 
+    /// Run `tx` on this worker next, even if another deque already holds a copy.
+    ///
+    /// The extra copy is skipped when it is popped: only a `Ready` task starts.
+    /// Used to keep a read-modify-write chain on the worker that published the
+    /// previous write, instead of leaving the successor under unrelated work.
+    pub(crate) fn boost(&self, worker: usize, tx: TxIdx) {
+        let mut inner = self.inner.lock().unwrap();
+        if tx >= self.n {
+            return;
+        }
+        if inner.status[tx].phase != Phase::Ready {
+            return;
+        }
+        inner.status[tx].queued = true;
+        self.deques[worker].push_bottom(tx);
+    }
+
     fn enqueue_locked(&self, inner: &mut Inner, worker: usize, tx: TxIdx) -> bool {
         let st = &mut inner.status[tx];
         if st.phase != Phase::Ready || st.queued {
