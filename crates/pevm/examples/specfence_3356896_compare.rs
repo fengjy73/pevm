@@ -541,6 +541,10 @@ fn run_once(
             let spine = pevm.last_spine();
             if mode_name == "specfence" {
                 print_focus(pevm, mode_name, i, n, &m);
+                let region_line = pevm.last_region_report();
+                if !region_line.is_empty() {
+                    println!("  regionv2 {mode_name}[{i}] {region_line}");
+                }
                 println!(
                     "  spine {mode_name}[{i}] access={} yield_ok={} yield_deadlock={} raw={} waw={} war={} armed={} pins={} revoked={} radar={} defer={} handoff={} retain={} tip_already={} chain={} est_block={} soft={} occ_picks={} spine_cores_max={} spine_cores_end={} handoff_claims={} claim_denied={} exact_wakes={} idle_parks={} help={} steal={} idle_spins={} local_pops={} steal_top_ns={} end_block_ns={} wake_miss={} admit_seed_ns={} join_wait_ns={} join_mark_origin_ns={} idle_ns={} heal_ns={} post_exec_validate_ns={} post_exec_in_span_ns={} span_head={} span_tail={} span_end_ns={} last_exec_ns={} last_val_ns={} quiet_true_ns={} last_exit_ns={} ps_exec_ns={} ps_val_ns={} ps_heal_ns={} ps_yield_ns={} ps_park_ns={} ps_steal_ns={} ps_exec_n={} ps_idle_n={} se_unstarted={} se_unfinished={} se_owed={} se_running={} se_pending={} se_indep={} se_bits={} qf_or={} first_cut={}",
                     spine.access_events,

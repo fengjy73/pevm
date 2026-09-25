@@ -205,6 +205,7 @@ mod process;
 mod producer_stage;
 mod ready_edge;
 mod region;
+mod region_avoid;
 mod rem;
 mod repair;
 mod resolve;
@@ -285,6 +286,9 @@ pub(crate) use hotset::{H_A, H_W};
 pub(crate) use ideal_prox::IdealProxLog;
 pub use ideal_prox::{
     IdealProxDiff, IdealProxSnap, IdealProxTx, blocker_name, diff_indep, role_name,
+};
+pub(crate) use region_avoid::{
+    PredState, RegionAvoid, RegionBind, RegionOp, RegionRadarPrior, RegionView,
 };
 pub use resolve_plan::ResolvePlan;
 pub(crate) use runnable_set::RunnableSet;
@@ -757,6 +761,8 @@ pub(crate) struct SpecFenceCtx<'a> {
     pub exec_origin: &'a std::time::Instant,
     /// AccessEvent three-primitive spine. Avoid starts empty each block.
     pub spine: &'a AccessSpine,
+    /// Off-spine RegionLearnAvoid v2. Disabled when the env flag is off.
+    pub region: &'a RegionAvoid,
     /// IdealProximityDiff log. Empty unless the env flag is on.
     pub ideal_prox: &'a ideal_prox::IdealProxLog,
 }

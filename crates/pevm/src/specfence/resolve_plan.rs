@@ -91,6 +91,13 @@ pub(crate) fn apply(plan: ResolvePlan, ctx: ApplyCtx<'_>) {
             if ctx.specfence.access_arms.is_never(loc) || location_is_lazy(ctx.mv_memory, tx, loc) {
                 continue;
             }
+            if ctx.specfence.region.enabled() {
+                let peer = ctx
+                    .mv_memory
+                    .last_writer_before(loc, tx)
+                    .filter(|&w| w < tx);
+                ctx.specfence.region.on_resolve(loc, tx, full, peer);
+            }
             if ctx.specfence.access_arms.is_protected(loc) {
                 if full {
                     ctx.specfence.access_arms.note_replay_after_protect();
