@@ -6,6 +6,10 @@ version = "0.1.0"
 [features]
 defaults = []
 
+# SpecFence parallel engine. Compiled out entirely when this feature is off.
+# Upstream OCC (`Pevm::execute` / `execute_revm_parallel`) does not call into it.
+specfence = []
+
 rpc-storage = ["dep:alloy-transport", "dep:reqwest", "dep:tokio"]
 
 global-alloc = ["dep:rpmalloc", "dep:snmalloc-rs", "dep:tikv-jemallocator"]
@@ -58,6 +62,10 @@ walkdir.workspace = true
 
 [lints]
 workspace = true
+
+[[example]]
+name = "specfence_inflation_dig"
+required-features = ["specfence"]
 
 [[bench]]
 harness = false

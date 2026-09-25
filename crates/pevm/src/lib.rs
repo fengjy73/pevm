@@ -228,5 +228,8 @@ pub use storage::{
 mod vm;
 pub use vm::{ExecutionError, PevmTxExecutionResult};
 
+#[cfg(feature = "specfence")]
+pub mod specfence;
+
 #[cfg(feature = "rpc-storage")]
 pub use storage::{RpcStorage, RpcStorageError};
