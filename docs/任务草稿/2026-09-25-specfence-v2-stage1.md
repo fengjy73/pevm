@@ -19,6 +19,7 @@
 4. **已完成** — 盲写和 lazy 写进入读者可见的链，但不进入 admission。受益人账户不进链。播种改为按 worker 跨步，第一波是 `0..C`。
 5. **已完成** — 链上等价（C=1/4/8，两种类键）和 C=4/8 各 12 次 `seq=par` 通过。计数、墙钟和偏差写在 `docs/specfence-v2-stage1.md`。FullReplay 未稳定落在设计上限内，原因是写集合要等解释器返回才发布。
 6. **已完成** — 换用 PR #62 的 scan / report / step-ideal。OCC 是本树的 `Pevm::execute_revm_parallel`。墙钟表在 `docs/specfence-v2-stage1.md`。`seqcheck` 与 `occcheck` 的 `diverge=0`。FullReplay 上限仍未稳定达到。
+7. **已完成** — 没有 opcode 替换。`sload_keeps_spec_static_gas` 锁定 200 和 100。`sload_static_gas_matches_chain_header` 在 feature 关（0.58s）和开（0.57s）都通过：两块 gas 对得上头，London 收据根也对得上。Spurious Dragon 收据根含状态根，引擎不重建，这块对 gas 和 bloom。
 
 ## 未纳入本阶段
 

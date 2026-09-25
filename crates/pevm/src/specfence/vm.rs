@@ -503,6 +503,8 @@ impl<'a, S: crate::Storage, C: PevmChain> SfVm<'a, S, C> {
             beneficiary_location_hash: hash_deterministic(MemoryLocation::Basic(
                 block_env.beneficiary,
             )),
+            // Stock builder. An opcode wrapper, if one is added later, is
+            // installed on this EVM only and keeps `static_gas()`.
             evm: chain.build_evm(spec_id, block_env.clone(), db),
         }
     }

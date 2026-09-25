@@ -11,6 +11,14 @@ Stage 1 adds a SpecFence engine beside upstream Block-STM. The base is risechain
 
 `cargo check -p pevm` without the feature does not compile the module. `Pevm::execute` and `execute_revm_parallel` do not call it. SpecFence owns its multi-version memory, its VM, and its scheduler. It reuses upstream types (`MemoryValue`, `MemoryEntry`, `PevmChain`) but does not patch them.
 
+## Opcode gas
+
+The old fork's on-chain miss (PR #66) was `Instruction::new(sload_handler, 0)` installed from `PevmEthereum::build_evm`. `insert_instruction` replaces static gas with the handler. The interpreter charges that static gas before the handler, and stock `SLOAD` does not charge it again, so every `SLOAD` lost 200 on Spurious Dragon and the warm 100 on London. Sequential execution used the same builder, so `seq == par` still failed the header.
+
+This tree does not replace opcodes. `build_evm` is the stock mainnet builder. A later wrapper has to stay on the SpecFence EVM and copy the table's `static_gas()`.
+
+`sload_keeps_spec_static_gas` reads that table: Spurious Dragon `SLOAD` is 200, London is 100. `sload_static_gas_matches_chain_header` runs sequential execution and upstream OCC, and with `--features specfence` also SpecFence, on 3356896 and 15274915. Gas matches the header on both. London also matches the receipt root. Spurious Dragon receipts still embed the post-state root (pre-EIP-658), which this engine does not rebuild, so that block checks gas and the logs bloom. The test passed with the feature off (0.58s) and on (0.57s).
+
 ## What was rewritten
 
 The old fork (`cursor/specfence-exit-validation-47a7`) had patched the shared OCC files. This stage rewrites the pieces the v1.1 note keeps:

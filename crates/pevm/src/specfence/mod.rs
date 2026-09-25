@@ -3,6 +3,12 @@
 //! Built beside upstream Block-STM. `Pevm::execute` and `execute_revm_parallel`
 //! do not call this module. With the `specfence` feature off, this module is
 //! not compiled.
+//!
+//! Opcode or host wrappers belong on this engine only. `PevmChain::build_evm`
+//! stays the stock builder, so sequential execution and upstream OCC never see
+//! them. A replacement must keep the table's `static_gas()` for that spec.
+//! The interpreter charges that static gas before the handler, and stock
+//! `SLOAD` does not charge it again.
 
 mod deque;
 mod engine;
