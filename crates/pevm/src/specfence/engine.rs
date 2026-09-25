@@ -446,19 +446,24 @@ fn try_commit(
     commit_mu: &Mutex<()>,
     tl: bool,
 ) {
-    let Ok(_guard) = commit_mu.try_lock() else {
+    let Ok(guard) = commit_mu.try_lock() else {
         return;
     };
+    // Transactions this call made final. Propagation runs after the lock is
+    // released: a reader that was blocked on a gap member has to close now,
+    // not when the prefix reaches the reader.
+    let mut just_final = Vec::new();
     loop {
         let i = rt.committed();
         if i >= n {
-            return;
+            break;
         }
         if !rt.is_executed(i) {
-            return;
+            break;
         }
         let inc = rt.incarnation(i);
-        if !rt.is_final_inc(i, inc) {
+        let was_final = rt.is_final_inc(i, inc);
+        if !was_final {
             let t_val = if tl { super::timeline::stamp() } else { 0 };
             let mismatch = {
                 let _b = super::buckets::Guard::start(super::buckets::VALIDATE);
@@ -471,26 +476,34 @@ fn try_commit(
                 if abort_one(worker, i, rt, mv, live, trace) {
                     cascade_readers(worker, i, n, rt, mv, live, trace);
                 }
+                drop(guard);
+                for tx in just_final {
+                    close_from(worker, tx, n, rt, mv, live, trace, commit_mu, tl);
+                }
                 return;
             }
             // Every lower transaction is already committed, so it is final.
             // Do not stall the prefix on a flag the early path missed.
+            // Hole clearing waits until propagation has seen the membership.
             if rt.mark_validated(i, inc) {
-                let writes = mv.write_locations(i);
-                live.hole_clear(i, &writes);
                 rt.note_final(worker, i);
             }
         }
         if rt.try_mark_committed(worker, i, inc) {
             super::timeline::note_commit(i);
             trace.note_committed(i, inc);
-            let writes = mv.write_locations(i);
-            live.hole_clear(i, &writes);
             live.note_finished(false);
             rt.notify();
+            if !was_final {
+                just_final.push(i);
+            }
         } else {
-            return;
+            break;
         }
+    }
+    drop(guard);
+    for tx in just_final {
+        close_from(worker, tx, n, rt, mv, live, trace, commit_mu, tl);
     }
 }
 
@@ -573,7 +586,16 @@ fn close_from(
         if tx >= n || settled[tx] {
             continue;
         }
-        if !rt.is_executed(tx) || rt.is_final_any(tx) {
+        if rt.is_final_any(tx) {
+            // Commit can be the first time this incarnation is final. Readers
+            // parked on a gap member, or executed and chain-blocked, did not
+            // get a close attempt yet. Already-final readers are skipped so
+            // each edge is walked once.
+            settled[tx] = true;
+            release_final(worker, tx, &mut queue, rt, mv, live);
+            continue;
+        }
+        if !rt.is_executed(tx) {
             settled[tx] = true;
             continue;
         }
@@ -606,30 +628,47 @@ fn close_from(
             continue;
         }
         settled[tx] = true;
-        let member_locs = live.member_locations(tx);
-        let writes = mv.write_locations(tx);
-        live.hole_clear(tx, &writes);
         rt.note_final(worker, tx);
-        for waiter in mv.waiters_of(tx) {
-            if waiter > tx {
-                queue.push_back(waiter);
-            }
+        release_final(worker, tx, &mut queue, rt, mv, live);
+    }
+}
+
+/// Drop chain holes, then queue executed readers that are not final yet.
+fn release_final(
+    _worker: usize,
+    tx: TxIdx,
+    queue: &mut std::collections::VecDeque<TxIdx>,
+    rt: &Runtime,
+    mv: &SfMv,
+    live: &LiveChain,
+) {
+    let member_locs = live.member_locations(tx);
+    let writes = mv.write_locations(tx);
+    live.hole_clear(tx, &writes);
+    let mut push = |reader: TxIdx| {
+        if reader > tx && rt.is_executed(reader) && !rt.is_final_any(reader) {
+            queue.push_back(reader);
         }
-        for location in member_locs {
-            for reader in mv.readers_of(location) {
-                if reader > tx {
-                    queue.push_back(reader);
-                }
-            }
+    };
+    for waiter in mv.waiters_of(tx) {
+        push(waiter);
+    }
+    for location in member_locs {
+        for reader in mv.readers_of(location) {
+            push(reader);
         }
     }
 }
 
 fn chain_blocks(tx: TxIdx, mv: &SfMv, live: &LiveChain, rt: &Runtime) -> bool {
     for (location, origin) in mv.read_floors(tx) {
-        // One past the writer this read consumed. Storage has no origin, so
-        // every still-open lower member can still publish the value.
-        let start = origin.map(|writer| writer.saturating_add(1)).unwrap_or(0);
+        // Storage already observed no lower write. A member that publishes
+        // later revokes this reader. Blocking on every preseeded index below
+        // a storage read ties finality to the commit prefix.
+        let Some(writer) = origin else {
+            continue;
+        };
+        let start = writer.saturating_add(1);
         if live.any_unresolved_between(location, start, tx, |member, inc, published| {
             if published {
                 rt.is_final_inc(member, inc)
@@ -884,7 +923,7 @@ mod tests {
     use super::super::mv::{SfMv, SfOrigin, SfReadOrigin, SfReadSet};
     use super::super::rt::Runtime;
     use super::super::trace::Trace;
-    use super::{close_from, revoke_writes};
+    use super::{close_from, revoke_writes, try_commit};
 
     fn storage(value: u64) -> MemoryValue {
         MemoryValue::Storage(U256::from(value))
@@ -942,6 +981,31 @@ mod tests {
     ) {
         rt.finish_ok(0, tx);
         close_from(0, tx, n, rt, mv, live, trace, commit_mu, false);
+    }
+
+    #[test]
+    fn commit_unblocks_a_reader_before_the_prefix_reaches_it() {
+        let n = 3;
+        let mv = SfMv::new(n, std::iter::empty(), std::iter::empty());
+        let live = LiveChain::untracked(n);
+        let rt = Runtime::new(n, 1);
+        let trace = Trace::new(n);
+        let commit_mu = Mutex::new(());
+        rt.seed();
+        assert_eq!(rt.pop(0).unwrap().0, 0);
+        record_write(&mv, 0, 11, 4);
+        rt.finish_ok(0, 0);
+        assert_eq!(rt.pop(0).unwrap().0, 1);
+        rt.defer(1);
+        assert_eq!(rt.pop(0).unwrap().0, 2);
+        record_edge(&mv, 2, 11, 0, 4, None);
+        rt.finish_ok(0, 2);
+        close_from(0, 2, n, &rt, &mv, &live, &trace, &commit_mu, false);
+        assert!(!rt.is_final_any(2));
+        try_commit(0, n, &rt, &mv, &live, &trace, &commit_mu, false);
+        assert!(rt.is_final_inc(0, 0));
+        assert_eq!(rt.committed(), 1);
+        assert!(rt.is_final_inc(2, 0));
     }
 
     #[test]
@@ -1086,9 +1150,11 @@ mod tests {
         let commit_mu = Mutex::new(());
         rt.seed();
 
-        // tx0 stays predicted and not final. It is below tx2's origin.
+        // tx0 has finished executing but was not closed, so it stays a
+        // predicted member and is not final. It is below tx2's origin.
         assert_eq!(rt.pop(0).unwrap().0, 0);
-        rt.defer(0);
+        rt.finish_ok(0, 0);
+        assert!(!rt.is_final_any(0));
         assert_eq!(rt.pop(0).unwrap().0, 1);
         record_write(&mv, 1, location, 4);
         rt.finish_ok(0, 1);

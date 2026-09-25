@@ -661,9 +661,9 @@ impl LiveChain {
 
     /// `true` when a member in `[start, end)` is not yet a final write or a final hole.
     ///
-    /// `start` is one past the read-from origin, or zero when the read saw
-    /// storage. Members below the origin are that writer's dependency, not
-    /// this reader's. `resolved(tx, chain_incarnation, published)` is the test.
+    /// `start` is one past the read-from origin. Members below the origin are
+    /// that writer's dependency, not this reader's.
+    /// `resolved(tx, chain_incarnation, published)` is the test.
     pub(crate) fn any_unresolved_between(
         &self,
         location: u64,

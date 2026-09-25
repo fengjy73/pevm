@@ -170,7 +170,11 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
         if !self.chain.any() {
             return Ok(());
         }
-        for _ in 0..8 {
+        // Every final hole in front of the read is dropped before parking.
+        // A fixed cap here requeued the reader once per handful of holes and
+        // put the preseeded recipient chain back on the critical path.
+        let mut holes = 0usize;
+        loop {
             let Some(pred) = self.chain.nearest_lower(location, self.tx_idx) else {
                 return Ok(());
             };
@@ -179,6 +183,10 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
             }
             if self.finished_without_write(location, pred) {
                 self.chain.clear_hole(location, pred);
+                holes += 1;
+                if holes > self.tx_idx {
+                    return Ok(());
+                }
                 continue;
             }
             let executing = self.rt.is_executing(pred);
@@ -224,20 +232,6 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
             }
             super::timeline::set_block(reason, location);
             return Err(ReadError::Blocking(pred));
-        }
-        match self.chain.nearest_lower(location, self.tx_idx) {
-            Some(pred) if !self.settled(location, pred) => {
-                super::timeline::set_block(
-                    if self.chain.is_armed(location) {
-                        super::timeline::ARMED
-                    } else {
-                        super::timeline::UNARMED
-                    },
-                    location,
-                );
-                Err(ReadError::Blocking(pred))
-            }
-            _ => Ok(()),
         }
     }
 
