@@ -29,9 +29,19 @@
 2. **已完成** — 链成员分型。无代码收款方的 `tx.value` 在预置时标成增量。发布时若不是 lazy credit 则改回 RMW。验证不等则 abort 并撤销读者。
 3. **已完成** — `nearest_blocker` 跳过增量。折入值用 `net_lazy`，原点是 `SfReadOrigin::Folded`。
 4. **已完成** — `fold_mismatch` 用最终版本重算。终局性仍等折进的增量。单测四例已过。
-5. **进行中** — 发布构建、前后时间线、K=10 扫描、等价测试、Stage 1d 文档、PR。
+5. **已完成** — 时间线、K=10、等价测试、Stage 1d 文档。PR #70。
+
+## 结果
+
+- admission 的 4220 ms 是重叠驻留之和。Stage 1c 二进制重跑后 `(code_hash, selector)` C=4 的 coverage 是 0.084 ms。未再给类键加一套增量分型。
+- `0xabd6bb3978815b97` 是 77 笔有代码调用，全是 RMW。997 笔空代码转账在 `0x7ec8be01af547316`（996 增量 + 1 RMW）。
+- 只分型时热位置跨度 5.144 ms。后继 RMW 推到发布者队底之后，`(to, selector)` C=4 跨度 1.522 ms / 执行 0.691 ms = 2.20 倍，76 跳的阻塞成员都是 0，跳间隙合计 0.830 ms。
+- K=10（本机 model 207，4 vCPU，L3 320 MiB）：15274915 `(to)` C=4 SF 5.744 ms、OCC 3.317 ms，SF/OCC 1.73；SF C=4 / SF C=1 = 0.98。`(code_hash)` C=4 SF/OCC 1.94，SF C=4 / SF C=1 = 1.08。FullReplay 15274915 最大 12；3356896 `(code_hash)` 有一轮 10 和一轮 9，`delta_mismatch` 为 0。扫描内每轮 delta 计数为 0。
+- 等价：`sload_static_gas_matches_chain_header` 0.58s，`sf_matches_onchain_focus_blocks` 与 `sf_seq_par_repeat` 3.67s。
 
 ## 未决
 
-- 门是否通过要等新鲜扫描。
-- 3356896 的固定开销不在本阶段消掉。
+- 15274915 的 SF C=4 墙钟仍高于 OCC C=4。跨度降了约 3 ms，无计时墙钟只从 6.049 ms 到 5.744 ms。
+- `(code_hash, selector)` 的 C=4 仍慢于 C=1。该键一次时间线上的跨度比是 2.92。
+- 3356896 的固定开销不在本阶段消掉。两轮 `(code_hash)` FullReplay 超过 5，且不是增量预测失败。
+- 草稿保留到用户验收。
