@@ -575,18 +575,20 @@ pub(crate) fn note_commit(tx: TxIdx) {
     }
 }
 
-pub(crate) fn idle_span(t0: u64, waited: bool) {
+pub(crate) fn idle_span(t0: u64, waited: bool, ready: usize) {
     if t0 == 0 {
         return;
     }
     let Some(inner) = inner() else {
         return;
     };
+    // `pred` carries the ready-queue depth at the end of the idle span so a
+    // commit-frontier gap can be told apart from a worker with nothing to run.
     push(
         if waited { IDLE } else { SPIN },
+        u8::from(ready > 0),
         0,
-        0,
-        0,
+        ready as u32,
         0,
         0,
         t0,

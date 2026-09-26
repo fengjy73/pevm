@@ -125,7 +125,12 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
 
     fn coordinate_chain(&self, location: u64) -> Result<(), ReadError> {
         let c0 = super::timeline::cyc_enter(self.tl_on);
-        let _b = super::buckets::Guard::start(super::buckets::COORD);
+        let bucket = if self.chain.is_armed(location) {
+            super::buckets::WAIT_ARMED
+        } else {
+            super::buckets::WAIT_CHAIN
+        };
+        let _b = super::buckets::WaitGuard::start(bucket);
         if self.trace.enabled() && self.chain.is_armed(location) {
             self.trace.note_read_after_arm();
         }
@@ -221,6 +226,7 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
     /// Nonce and balance checks block on the previous same-sender transaction.
     /// Blocking on `tx-1` retries forever once that unrelated transaction has committed.
     fn sender_block(&self) -> ReadError {
+        let _w = super::buckets::WaitGuard::start(super::buckets::WAIT_ADMIT);
         match self.prev_sender.get(self.tx_idx).copied().flatten() {
             Some(pred) if !self.rt.is_committed(pred) && !self.rt.is_final_any(pred) => {
                 super::timeline::set_block(super::timeline::NONCE, self.from_hash);
@@ -316,12 +322,13 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
         let serial = self.serial;
         self.coordinate(location_hash)?;
         let read_origins = self.read_set.entry(location_hash).or_default();
-        if let Some(written_transactions) = self.mv.data.get(&location_hash)
+        if let Some(written_transactions) = self.mv.read_location(&location_hash)
             && let Some((tx_idx, entry)) = written_transactions.range(..self.tx_idx).next_back()
         {
             match entry {
                 MemoryEntry::Estimate => {
                     super::timeline::set_block(super::timeline::ESTIMATE, location_hash);
+                    super::buckets::hit(super::buckets::WAIT_ESTIMATE);
                     return Err(ReadError::Blocking(*tx_idx));
                 }
                 MemoryEntry::Data(_, MemoryValue::SelfDestructed) => {
@@ -369,7 +376,7 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
     fn code_hash_untracked(&mut self, address: Address) -> Result<Option<B256>, ReadError> {
         let location_hash = hash_deterministic(MemoryLocation::CodeHash(address));
         if self.tx_idx > 0
-            && let Some(written) = self.mv.data.get(&location_hash)
+            && let Some(written) = self.mv.read_location(&location_hash)
             && let Some((_, entry)) = written.range(..self.tx_idx).next_back()
         {
             match entry {
@@ -402,7 +409,7 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
         let mut nonce_addition = 0u64;
         let mut final_account = None;
         if self.tx_idx > 0
-            && let Some(written) = self.mv.data.get(&location_hash)
+            && let Some(written) = self.mv.read_location(&location_hash)
         {
             let mut iter = written.range(..self.tx_idx);
             loop {
@@ -479,7 +486,7 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
         location_hash: MemoryLocationHash,
     ) -> Result<U256, ReadError> {
         if self.tx_idx > 0
-            && let Some(written) = self.mv.data.get(&location_hash)
+            && let Some(written) = self.mv.read_location(&location_hash)
             && let Some((_, entry)) = written.range(..self.tx_idx).next_back()
         {
             match entry {
@@ -864,7 +871,7 @@ impl<S: crate::Storage> Database for VmDb<'_, S> {
         let written_transactions = {
             let _b = super::buckets::Guard::start(super::buckets::READ_MV);
             if self.tx_idx > 0 {
-                self.mv.data.get(&location_hash)
+                self.mv.read_location(&location_hash)
             } else {
                 None
             }
@@ -890,6 +897,7 @@ impl<S: crate::Storage> Database for VmDb<'_, S> {
                             }));
                         }
                         super::timeline::set_block(super::timeline::ESTIMATE, location_hash);
+                        super::buckets::hit(super::buckets::WAIT_ESTIMATE);
                         return Err(ReadError::Blocking(*blocking_idx));
                     }
                     Some((closest_idx, MemoryEntry::Data(tx_incarnation, value))) => {
@@ -1091,7 +1099,7 @@ impl<S: crate::Storage> Database for VmDb<'_, S> {
         let written_transactions = {
             let _b = super::buckets::Guard::start(super::buckets::READ_MV);
             if self.tx_idx > 0 {
-                self.mv.data.get(&location_hash)
+                self.mv.read_location(&location_hash)
             } else {
                 None
             }
@@ -1126,6 +1134,7 @@ impl<S: crate::Storage> Database for VmDb<'_, S> {
                         return Ok(value);
                     }
                     super::timeline::set_block(super::timeline::ESTIMATE, location_hash);
+                    super::buckets::hit(super::buckets::WAIT_ESTIMATE);
                     return Err(ReadError::Blocking(*closest_idx));
                 }
                 _ => return Err(ReadError::InvalidMemoryValueType),
@@ -1281,38 +1290,48 @@ impl<'a, S: crate::Storage, C: PevmChain> SfVm<'a, S, C> {
         };
         let class_t0 = super::buckets::stamp();
         let interp_t0 = self.trace.profile().then(Instant::now);
-        let exec_result = {
-            let _b = super::buckets::Guard::start(super::buckets::INTERP);
-            match NoBeneficiaryHandler::<C, _>::default().run(&mut self.evm) {
-                Ok(result) => result,
-                Err(EVMError::Database(read_error)) => return step_from_read(read_error),
-                Err(err) => {
-                    if matches!(
-                        err,
-                        EVMError::Transaction(
-                            InvalidTransaction::LackOfFundForMaxFee { .. }
-                                | InvalidTransaction::NonceTooHigh { .. }
-                        )
-                    ) {
-                        if let Some(pred) = self.prev_sender.get(tx_idx).copied().flatten()
-                            && !self.rt.is_committed(pred)
-                            && !self.rt.is_final_any(pred)
-                        {
-                            super::timeline::set_block(super::timeline::NONCE, from_hash);
-                            return Step::Block(pred);
-                        }
-                        return Step::Yield;
+        let mut interp = super::buckets::InterpGuard::start();
+        let exec_result = match NoBeneficiaryHandler::<C, _>::default().run(&mut self.evm) {
+            Ok(result) => result,
+            Err(EVMError::Database(read_error)) => {
+                let excluded = interp.finish();
+                let _ = (class_t0, excluded);
+                return step_from_read(read_error);
+            }
+            Err(err) => {
+                let _ = interp.finish();
+                if matches!(
+                    err,
+                    EVMError::Transaction(
+                        InvalidTransaction::LackOfFundForMaxFee { .. }
+                            | InvalidTransaction::NonceTooHigh { .. }
+                    )
+                ) {
+                    if let Some(pred) = self.prev_sender.get(tx_idx).copied().flatten()
+                        && !self.rt.is_committed(pred)
+                        && !self.rt.is_final_any(pred)
+                    {
+                        super::timeline::set_block(super::timeline::NONCE, from_hash);
+                        return Step::Block(pred);
                     }
-                    return Step::Fatal(err);
+                    return Step::Yield;
                 }
+                return Step::Fatal(err);
             }
         };
+        let excluded = interp.finish();
         let interp_ns = interp_t0
-            .map(|t| t.elapsed().as_nanos() as u64)
+            .map(|t| (t.elapsed().as_nanos() as u64).saturating_sub(excluded))
             .unwrap_or(0);
-        super::buckets::add_since(class_bucket, class_t0);
-        if incarnation > 0 {
-            super::buckets::add_since(super::buckets::CLASS_REEXEC, class_t0);
+        let class_net =
+            class_t0.map(|t0| (t0.elapsed().as_nanos() as u64).saturating_sub(excluded));
+        if let Some(net) = class_net {
+            super::buckets::add_ns(class_bucket, net);
+        }
+        if incarnation > 0
+            && let Some(net) = class_net
+        {
+            super::buckets::add_ns(super::buckets::CLASS_REEXEC, net);
         }
 
         let _c_write =
