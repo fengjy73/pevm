@@ -90,6 +90,9 @@ pub struct SfAttempt {
     pub kind: u8,
     /// Nanoseconds from interpreter entry to the write-set publish.
     pub total_ns: u64,
+    /// Nanoseconds inside the interpreter, excluding publish. Zero when the
+    /// profile flag is off.
+    pub interp_ns: u64,
     /// Locations read.
     pub reads: Vec<u64>,
     /// Non-lazy locations written.
@@ -416,6 +419,7 @@ impl Trace {
         tx: usize,
         inc: usize,
         total_ns: u64,
+        interp_ns: u64,
         reads: Vec<u64>,
         writes: Vec<u64>,
         lazy_writes: Vec<u64>,
@@ -428,6 +432,7 @@ impl Trace {
             inc: inc as u32,
             kind: 0,
             total_ns,
+            interp_ns,
             reads,
             writes,
             lazy_writes,

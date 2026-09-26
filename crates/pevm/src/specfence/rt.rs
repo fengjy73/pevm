@@ -4,7 +4,7 @@
 //! LIFO, thieves pop FIFO. Status transitions sit behind one mutex so a park
 //! and a publish cannot lose a wakeup. The mutex is not held across the EVM.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
@@ -30,6 +30,26 @@ enum Phase {
     },
 }
 
+const PH_READY: u8 = 0;
+const PH_EXEC: u8 = 1;
+const PH_DONE: u8 = 2;
+const PH_COMMIT: u8 = 3;
+const PH_STICKY: u8 = 4;
+const PH_PARK: u8 = 5;
+
+/// What a blocked worker should do with the predecessor chain.
+#[derive(Debug)]
+pub(crate) enum Claim {
+    /// `tx` is marked `Executing` for this worker. Run it before the reader resumes.
+    Run(TxIdx, usize),
+    /// `tx` is inside the interpreter. Park on it.
+    Wait(TxIdx),
+    /// `tx` has finished executing and is not final. The reader seals it.
+    Seal(TxIdx),
+    /// The predecessor already finished. Retry the reader.
+    Done,
+}
+
 struct TxState {
     incarnation: usize,
     phase: Phase,
@@ -53,7 +73,6 @@ pub(crate) struct Runtime {
     /// final origins or storage, and validation kept that incarnation.
     validated: Vec<AtomicUsize>,
     executing: AtomicUsize,
-    waiting: AtomicUsize,
     mu: Mutex<()>,
     /// Idle workers inside the active set wait here.
     cv: Condvar,
@@ -74,10 +93,13 @@ pub(crate) struct Runtime {
     /// does not change the active set.
     gap_ema: AtomicU64,
     exec_ema: AtomicU64,
-    /// Ready-queue width, in 1/256 of a transaction. The active set follows this.
+    /// Ready-queue width, in 1/256 of a transaction. Recorded, not a shrink input.
     width_ema_q8: AtomicU64,
-    grow_streak: AtomicUsize,
     shrink_streak: AtomicUsize,
+    /// Phase mirror. `is_executing` reads this instead of the scheduler mutex.
+    phases: Vec<AtomicU8>,
+    /// Deque entries skipped because the task was no longer `Ready`.
+    pop_skips: AtomicUsize,
     control_tick: AtomicUsize,
     ready_depth: AtomicUsize,
     /// Tasks moved off a worker that is staying on a chain handoff.
@@ -109,7 +131,6 @@ impl Runtime {
             committed: AtomicUsize::new(0),
             validated: (0..n).map(|_| AtomicUsize::new(usize::MAX)).collect(),
             executing: AtomicUsize::new(0),
-            waiting: AtomicUsize::new(0),
             mu: Mutex::new(()),
             cv: Condvar::new(),
             sleep_cv: Condvar::new(),
@@ -124,8 +145,9 @@ impl Runtime {
             gap_ema: AtomicU64::new(0),
             exec_ema: AtomicU64::new(1),
             width_ema_q8: AtomicU64::new(0),
-            grow_streak: AtomicUsize::new(0),
             shrink_streak: AtomicUsize::new(0),
+            phases: (0..n).map(|_| AtomicU8::new(PH_READY)).collect(),
+            pop_skips: AtomicUsize::new(0),
             control_tick: AtomicUsize::new(0),
             ready_depth: AtomicUsize::new(0),
             injector: Mutex::new(Vec::new()),
@@ -175,7 +197,7 @@ impl Runtime {
             return;
         }
         let mut inner = self.inner.lock().unwrap();
-        inner.status[tx].phase = Phase::Committed;
+        self.set_phase(&mut inner, tx, Phase::Committed);
         self.validated[tx].store(0, Ordering::Release);
         self.committed.store(tx + 1, Ordering::Release);
     }
@@ -278,16 +300,19 @@ impl Runtime {
         self.injector.lock().unwrap().pop()
     }
 
-    /// Grow and shrink from the measured ready width.
+    /// Grow and shrink from work that is queued or inside the interpreter.
     ///
-    /// The width is an exponential moving average of the ready queue. One
-    /// sample above the set grows it. Shrinking waits for two decisions where
-    /// the average sits at least two below the set and the live queue is
-    /// smaller than the set. A chain hop is not an input.
+    /// The ready queue alone collapses the set in the middle of the block:
+    /// tasks leave the queue when they start, and a decayed average of that
+    /// dip ratchets the set down to 1 while other workers are still running.
+    /// The floor is `ready + executing`. Shrinking waits for two decisions.
+    /// A chain hop is not an input. The moving average is only a trace.
     pub(crate) fn maybe_grow(&self) {
         let ready = self.ready_now();
+        let inflight = self.executing.load(Ordering::Relaxed);
+        let width_now = ready.saturating_add(inflight);
         let prev = self.width_ema_q8.load(Ordering::Relaxed);
-        let sample = (ready as u64).saturating_mul(256);
+        let sample = (width_now as u64).saturating_mul(256);
         let next = if prev == 0 {
             sample
         } else {
@@ -300,23 +325,19 @@ impl Runtime {
         if tick % period != period - 1 {
             return;
         }
-        let width = ((next + 128) / 256) as usize;
         let mut active = self.active.load(Ordering::Relaxed);
         let cap = self.workers;
-        if width > active {
+        let floor = width_now.clamp(1, cap);
+        if floor > active {
             self.shrink_streak.store(0, Ordering::Relaxed);
-            self.grow_streak.fetch_add(1, Ordering::Relaxed);
-            active = width.min(cap);
-        } else if active > 1 && width + 1 < active && ready < active {
-            self.grow_streak.store(0, Ordering::Relaxed);
+            active = floor;
+        } else if active > floor {
             let streak = self.shrink_streak.fetch_add(1, Ordering::Relaxed) + 1;
             if streak >= 2 {
-                let floor = ready.max(1);
-                active = width.max(floor).min(active - 1).max(1);
+                active = floor;
                 self.shrink_streak.store(0, Ordering::Relaxed);
             }
         } else {
-            self.grow_streak.store(0, Ordering::Relaxed);
             self.shrink_streak.store(0, Ordering::Relaxed);
         }
         active = active.clamp(1, cap);
@@ -396,25 +417,6 @@ impl Runtime {
         }
     }
 
-    pub(crate) fn waiting_add(&self, delta: isize) {
-        if delta > 0 {
-            self.waiting.fetch_add(delta as usize, Ordering::Relaxed);
-        } else {
-            self.waiting.fetch_sub((-delta) as usize, Ordering::Relaxed);
-        }
-    }
-
-    pub(crate) fn all_executors_waiting(&self) -> bool {
-        let waiting = self.waiting.load(Ordering::Relaxed);
-        let executing = self.executing.load(Ordering::Relaxed);
-        executing > 0 && waiting >= executing
-    }
-
-    pub(crate) fn wait_brief(&self) {
-        let guard = self.mu.lock().unwrap();
-        let _ = self.cv.wait_timeout(guard, Duration::from_micros(50));
-    }
-
     #[allow(dead_code)]
     pub(crate) fn notify(&self) {
         let _guard = self.mu.lock().unwrap();
@@ -424,28 +426,40 @@ impl Runtime {
     }
 
     pub(crate) fn is_executing(&self, tx: TxIdx) -> bool {
-        let inner = self.inner.lock().unwrap();
-        inner
-            .status
+        self.phases
             .get(tx)
-            .is_some_and(|s| s.phase == Phase::Executing)
+            .is_some_and(|phase| phase.load(Ordering::Acquire) == PH_EXEC)
     }
 
     pub(crate) fn is_committed(&self, tx: TxIdx) -> bool {
-        let inner = self.inner.lock().unwrap();
-        inner
-            .status
+        self.phases
             .get(tx)
-            .is_some_and(|s| s.phase == Phase::Committed)
+            .is_some_and(|phase| phase.load(Ordering::Acquire) == PH_COMMIT)
+    }
+
+    pub(crate) fn pop_skips(&self) -> usize {
+        self.pop_skips.load(Ordering::Relaxed)
+    }
+
+    fn set_phase(&self, inner: &mut Inner, tx: usize, phase: Phase) {
+        inner.status[tx].phase = phase;
+        let bits = match &inner.status[tx].phase {
+            Phase::Ready => PH_READY,
+            Phase::Executing => PH_EXEC,
+            Phase::Executed => PH_DONE,
+            Phase::Committed => PH_COMMIT,
+            Phase::Sticky => PH_STICKY,
+            Phase::Parked { .. } => PH_PARK,
+        };
+        self.phases[tx].store(bits, Ordering::Release);
     }
 
     /// Not executed and not committed. Prediction skips writers that already finished.
     pub(crate) fn still_open(&self, tx: TxIdx) -> bool {
-        let inner = self.inner.lock().unwrap();
-        inner.status.get(tx).is_some_and(|s| {
+        self.phases.get(tx).is_some_and(|phase| {
             matches!(
-                s.phase,
-                Phase::Ready | Phase::Executing | Phase::Sticky | Phase::Parked { .. }
+                phase.load(Ordering::Acquire),
+                PH_READY | PH_EXEC | PH_STICKY | PH_PARK
             )
         })
     }
@@ -493,9 +507,9 @@ impl Runtime {
     }
 
     pub(crate) fn is_executed(&self, tx: TxIdx) -> bool {
-        let inner = self.inner.lock().unwrap();
-        matches!(inner.status[tx].phase, Phase::Executed | Phase::Committed)
-            && inner.status[tx].phase == Phase::Executed
+        self.phases
+            .get(tx)
+            .is_some_and(|phase| phase.load(Ordering::Acquire) == PH_DONE)
     }
 
     /// Drop an in-flight attempt without queueing it again.
@@ -508,7 +522,7 @@ impl Runtime {
             return;
         }
         if inner.status[tx].phase == Phase::Executing {
-            inner.status[tx].phase = Phase::Ready;
+            self.set_phase(&mut inner, tx, Phase::Ready);
             inner.status[tx].queued = false;
         }
     }
@@ -531,20 +545,25 @@ impl Runtime {
                     found
                 })
                 .or_else(|| self.pop_injector())?;
-            let mut inner = self.inner.lock().unwrap();
             if tx >= self.n {
                 continue;
             }
+            if self.phases[tx].load(Ordering::Acquire) != PH_READY {
+                self.pop_skips.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let mut inner = self.inner.lock().unwrap();
             let was_queued = inner.status[tx].queued;
             inner.status[tx].queued = false;
             if inner.status[tx].phase == Phase::Ready {
-                inner.status[tx].phase = Phase::Executing;
+                self.set_phase(&mut inner, tx, Phase::Executing);
                 if was_queued {
                     self.dec_ready();
                 }
                 let inc = inner.status[tx].incarnation;
                 return Some((tx, inc));
             }
+            self.pop_skips.fetch_add(1, Ordering::Relaxed);
         }
         None
     }
@@ -568,7 +587,7 @@ impl Runtime {
             inner.status[tx].queued = false;
             self.dec_ready();
         }
-        inner.status[tx].phase = Phase::Sticky;
+        self.set_phase(&mut inner, tx, Phase::Sticky);
         inner.sticky[owner].push(tx);
         self.sticky_flag[owner].store(true, Ordering::Release);
         drop(inner);
@@ -591,7 +610,7 @@ impl Runtime {
         if tx >= self.n || inner.status[tx].phase != Phase::Executing {
             return false;
         }
-        inner.status[tx].phase = Phase::Executed;
+        self.set_phase(&mut inner, tx, Phase::Executed);
         let deps = std::mem::take(&mut inner.dependents[tx]);
         let mut woke = false;
         for dep in deps {
@@ -602,7 +621,7 @@ impl Runtime {
                 Phase::Parked {
                     until_final: false, ..
                 } => {
-                    inner.status[dep].phase = Phase::Ready;
+                    self.set_phase(&mut inner, dep, Phase::Ready);
                     super::timeline::note_wake(dep);
                     woke |= self.enqueue_locked(&mut inner, worker, dep);
                 }
@@ -632,7 +651,7 @@ impl Runtime {
                     inner.status[tx].queued = false;
                     self.dec_ready();
                 }
-                inner.status[tx].phase = Phase::Sticky;
+                self.set_phase(inner, tx, Phase::Sticky);
                 inner.sticky[worker].push(tx);
                 self.sticky_flag[worker].store(true, Ordering::Release);
                 true
@@ -671,7 +690,7 @@ impl Runtime {
                 inner.status[tx].queued = false;
                 self.dec_ready();
             }
-            inner.status[tx].phase = Phase::Sticky;
+            self.set_phase(&mut inner, tx, Phase::Sticky);
             inner.sticky[worker].push(tx);
             self.sticky_flag[worker].store(true, Ordering::Release);
         }
@@ -692,7 +711,7 @@ impl Runtime {
             if inner.status[tx].phase != Phase::Sticky {
                 continue;
             }
-            inner.status[tx].phase = Phase::Executing;
+            self.set_phase(&mut inner, tx, Phase::Executing);
             inner.status[tx].queued = false;
             let inc = inner.status[tx].incarnation;
             return Some((tx, inc));
@@ -715,7 +734,7 @@ impl Runtime {
                 continue;
             }
             if inner.status[tx].phase == Phase::Sticky {
-                inner.status[tx].phase = Phase::Ready;
+                self.set_phase(&mut inner, tx, Phase::Ready);
                 inner.status[tx].queued = false;
                 enqueued |= self.enqueue_locked(&mut inner, worker, tx);
             }
@@ -780,20 +799,146 @@ impl Runtime {
         }
         let pred_done = self.pred_satisfied(&inner, pred, until_final);
         if pred_done {
-            inner.status[tx].phase = Phase::Ready;
+            self.set_phase(&mut inner, tx, Phase::Ready);
             super::timeline::note_wake(tx);
             self.enqueue_locked(&mut inner, worker, tx);
             return;
         }
-        inner.status[tx].phase = Phase::Parked { pred, until_final };
+        self.set_phase(&mut inner, tx, Phase::Parked { pred, until_final });
         inner.status[tx].queued = false;
         if !inner.dependents[pred].contains(&tx) {
             inner.dependents[pred].push(tx);
         }
+        // Readers already parked on `tx` are waiting on a task that just
+        // left the interpreter. Point them at the predecessor that is
+        // actually executing, or at the ready task this worker will run.
+        self.retarget_waiters(&mut inner, worker, tx);
         let pred_ready = inner.status[pred].phase == Phase::Ready && !inner.status[pred].queued;
         if pred_ready {
             self.enqueue_locked(&mut inner, worker, pred);
         }
+    }
+
+    /// Follow parked links to the task that is not itself waiting.
+    fn follow(&self, inner: &Inner, start: TxIdx) -> TxIdx {
+        let mut tx = start;
+        for _ in 0..self.n {
+            match inner.status.get(tx).map(|st| st.phase) {
+                Some(Phase::Parked { pred, .. }) if pred != tx && pred < self.n => tx = pred,
+                _ => return tx,
+            }
+        }
+        start
+    }
+
+    fn retarget_waiters(&self, inner: &mut Inner, worker: usize, tx: TxIdx) {
+        let Some(pred) = (match inner.status[tx].phase {
+            Phase::Parked { pred, .. } => Some(pred),
+            _ => None,
+        }) else {
+            return;
+        };
+        let root = self.follow(inner, pred);
+        let waiting = std::mem::take(&mut inner.dependents[tx]);
+        let mut keep = Vec::new();
+        for d in waiting {
+            if d >= self.n {
+                continue;
+            }
+            match inner.status[d].phase {
+                Phase::Parked { .. } => {
+                    if self.pred_satisfied(inner, root, false) {
+                        self.set_phase(inner, d, Phase::Ready);
+                        super::timeline::note_wake(d);
+                        self.enqueue_locked(inner, worker, d);
+                    } else if d != root {
+                        self.set_phase(
+                            inner,
+                            d,
+                            Phase::Parked {
+                                pred: root,
+                                until_final: false,
+                            },
+                        );
+                        if !inner.dependents[root].contains(&d) {
+                            inner.dependents[root].push(d);
+                        }
+                    }
+                }
+                _ => keep.push(d),
+            }
+        }
+        inner.dependents[tx] = keep;
+    }
+
+    /// The blocking predecessor is not in the interpreter. Run the first
+    /// ready task in its park chain, or report the one that is executing.
+    pub(crate) fn claim_blocker(&self, _worker: usize, pred: TxIdx) -> Claim {
+        let mut inner = self.inner.lock().unwrap();
+        let mut tx = pred;
+        for _ in 0..self.n {
+            if tx >= self.n {
+                return Claim::Wait(pred.min(self.n.saturating_sub(1)));
+            }
+            match inner.status[tx].phase {
+                Phase::Executing => return Claim::Wait(tx),
+                Phase::Committed => return Claim::Done,
+                Phase::Executed => {
+                    let inc = inner.status[tx].incarnation;
+                    if self.is_final_inc(tx, inc) {
+                        return Claim::Done;
+                    }
+                    // Finished, not final. The reader seals it. Waiting here
+                    // parks on a transaction that is not in the interpreter.
+                    return Claim::Seal(tx);
+                }
+                Phase::Parked { pred: next, .. } => {
+                    if next == tx || next >= self.n {
+                        return Claim::Wait(tx);
+                    }
+                    tx = next;
+                }
+                Phase::Ready | Phase::Sticky => {
+                    self.take_over(&mut inner, tx);
+                    let inc = inner.status[tx].incarnation;
+                    return Claim::Run(tx, inc);
+                }
+            }
+        }
+        Claim::Wait(pred.min(self.n.saturating_sub(1)))
+    }
+
+    fn take_over(&self, inner: &mut Inner, tx: TxIdx) {
+        if inner.status[tx].queued {
+            inner.status[tx].queued = false;
+            self.dec_ready();
+        }
+        for slot in &mut inner.sticky {
+            if slot.contains(&tx) {
+                slot.retain(|item| *item != tx);
+            }
+        }
+        for (worker, slot) in inner.sticky.iter().enumerate() {
+            if slot.is_empty() {
+                self.sticky_flag[worker].store(false, Ordering::Release);
+            }
+        }
+        self.set_phase(inner, tx, Phase::Executing);
+    }
+
+    /// The predecessor finished between the block and the claim. Run `tx` again.
+    pub(crate) fn retry_now(&self, worker: usize, tx: TxIdx) {
+        let mut inner = self.inner.lock().unwrap();
+        if tx >= self.n {
+            return;
+        }
+        if inner.status[tx].phase == Phase::Executing {
+            self.set_phase(&mut inner, tx, Phase::Ready);
+            inner.status[tx].queued = false;
+            self.enqueue_locked(&mut inner, worker, tx);
+        }
+        drop(inner);
+        self.poke_work();
     }
 
     fn pred_satisfied(&self, inner: &Inner, pred: TxIdx, until_final: bool) -> bool {
@@ -809,14 +954,14 @@ impl Runtime {
         if inner.status[tx].phase != Phase::Executing {
             return;
         }
-        inner.status[tx].phase = Phase::Executed;
+        self.set_phase(&mut inner, tx, Phase::Executed);
         let deps = std::mem::take(&mut inner.dependents[tx]);
         for d in deps {
             match inner.status[d].phase {
                 Phase::Parked {
                     until_final: false, ..
                 } => {
-                    inner.status[d].phase = Phase::Ready;
+                    self.set_phase(&mut inner, d, Phase::Ready);
                     super::timeline::note_wake(d);
                     self.enqueue_locked(&mut inner, worker, d);
                 }
@@ -853,7 +998,7 @@ impl Runtime {
                 Phase::Parked {
                     until_final: true, ..
                 } => {
-                    inner.status[d].phase = Phase::Ready;
+                    self.set_phase(inner, d, Phase::Ready);
                     super::timeline::note_wake(d);
                     self.enqueue_locked(inner, worker, d);
                 }
@@ -871,7 +1016,7 @@ impl Runtime {
         let mut inner = self.inner.lock().unwrap();
         self.validated[tx].store(usize::MAX, Ordering::Release);
         inner.status[tx].incarnation = inner.status[tx].incarnation.saturating_add(1);
-        inner.status[tx].phase = Phase::Ready;
+        self.set_phase(&mut inner, tx, Phase::Ready);
         inner.status[tx].queued = false;
         self.enqueue_locked(&mut inner, worker, tx);
         drop(inner);
@@ -883,9 +1028,10 @@ impl Runtime {
         if self.committed.load(Ordering::Relaxed) != tx {
             return false;
         }
-        let st = &mut inner.status[tx];
-        if st.phase == Phase::Executed && st.incarnation == incarnation {
-            st.phase = Phase::Committed;
+        let ready_to_commit = inner.status[tx].phase == Phase::Executed
+            && inner.status[tx].incarnation == incarnation;
+        if ready_to_commit {
+            self.set_phase(&mut inner, tx, Phase::Committed);
             self.validated[tx].store(incarnation, Ordering::Release);
             self.committed.store(tx + 1, Ordering::Release);
             self.wake_final_locked(&mut inner, worker, tx);
@@ -923,7 +1069,7 @@ impl Runtime {
                 Phase::Parked { pred, until_final } => {
                     let pred_done = self.pred_satisfied(&inner, pred, until_final);
                     if pred_done {
-                        inner.status[tx].phase = Phase::Ready;
+                        self.set_phase(&mut inner, tx, Phase::Ready);
                         super::timeline::note_wake(tx);
                         return self.enqueue_locked(&mut inner, worker, tx);
                     }
@@ -936,11 +1082,20 @@ impl Runtime {
         }
         false
     }
+
+    #[cfg(test)]
+    fn parked_pred(&self, tx: TxIdx) -> Option<TxIdx> {
+        let inner = self.inner.lock().unwrap();
+        match inner.status.get(tx).map(|state| state.phase) {
+            Some(Phase::Parked { pred, .. }) => Some(pred),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Runtime;
+    use super::{Claim, Runtime};
 
     #[test]
     fn final_incarnation_wakes_before_commit() {
@@ -1021,5 +1176,123 @@ mod tests {
             got.iter().any(|tx| *tx == 2 || *tx == 4 || *tx == 6),
             "spilled={got:?}"
         );
+    }
+
+    #[test]
+    fn claim_runs_a_predecessor_that_is_not_executing() {
+        let rt = Runtime::new(4, 2);
+        rt.seed();
+        let (tx, _) = rt.pop(0).unwrap();
+        assert_eq!(tx, 0);
+        match rt.claim_blocker(1, 2) {
+            Claim::Run(got, inc) => {
+                assert_eq!(got, 2);
+                assert_eq!(inc, 0);
+            }
+            other => panic!("expected to run tx 2, {other:?}"),
+        }
+        assert!(rt.is_executing(2));
+        while let Some((tx, _)) = rt.pop(0) {
+            assert_ne!(tx, 2);
+        }
+        assert!(rt.pop(1).is_none() || rt.is_executing(2));
+    }
+
+    #[test]
+    fn claim_follows_a_parked_predecessor_to_a_ready_root() {
+        let rt = Runtime::new(3, 2);
+        rt.park(0, 1, 0, false, false);
+        assert_eq!(rt.parked_pred(1), Some(0));
+        match rt.claim_blocker(1, 1) {
+            Claim::Run(0, _) => {}
+            other => panic!("expected to run tx 0, {other:?}"),
+        }
+        assert!(rt.is_executing(0));
+        assert_eq!(rt.parked_pred(1), Some(0));
+    }
+
+    #[test]
+    fn parking_retargets_a_reader_onto_the_running_root() {
+        let rt = Runtime::new(3, 2);
+        rt.seed();
+        let (tx, _) = rt.pop(0).unwrap();
+        assert_eq!(tx, 0);
+        let (tx, _) = rt.pop(1).unwrap();
+        assert_eq!(tx, 1);
+        rt.park(1, 1, 0, false, false);
+        assert_eq!(rt.parked_pred(1), Some(0));
+        match rt.claim_blocker(0, 2) {
+            Claim::Run(2, _) => {}
+            other => panic!("expected to run tx 2, {other:?}"),
+        }
+        rt.park(0, 0, 2, false, false);
+        assert_eq!(
+            rt.parked_pred(1),
+            Some(2),
+            "reader must not keep waiting on a parked predecessor"
+        );
+        assert!(rt.is_executing(2));
+    }
+
+    #[test]
+    fn reader_parks_on_the_executing_root_of_a_parked_chain() {
+        let rt = Runtime::new(4, 2);
+        rt.seed();
+        rt.park(0, 1, 0, false, false);
+        rt.park(0, 2, 1, false, false);
+        let root = match rt.claim_blocker(1, 2) {
+            Claim::Run(root, _) => root,
+            other => panic!("expected the ready root, {other:?}"),
+        };
+        assert_eq!(root, 0);
+        assert!(rt.is_executing(0));
+        let pred = 2;
+        let on = if rt.is_executing(pred) { pred } else { root };
+        rt.park(1, 3, on, false, false);
+        let parked_on = rt.parked_pred(3).expect("reader stays parked");
+        assert!(
+            rt.is_executing(parked_on),
+            "parked on {parked_on}, which is not executing"
+        );
+        assert_eq!(parked_on, 0);
+    }
+
+    #[test]
+    fn executed_predecessor_is_sealed_instead_of_parked() {
+        let rt = Runtime::new(2, 2);
+        rt.seed();
+        let (tx, _) = rt.pop(0).unwrap();
+        assert_eq!(tx, 0);
+        rt.finish_ok(0, 0);
+        assert!(
+            matches!(rt.claim_blocker(1, 0), Claim::Seal(0)),
+            "a finished predecessor is not a park target"
+        );
+    }
+
+    #[test]
+    fn claim_waits_while_the_predecessor_executes() {
+        let rt = Runtime::new(2, 2);
+        rt.seed();
+        let (tx, _) = rt.pop(0).unwrap();
+        assert_eq!(tx, 0);
+        assert!(matches!(rt.claim_blocker(1, 0), Claim::Wait(0)));
+    }
+
+    #[test]
+    fn executing_count_keeps_the_active_set() {
+        let rt = Runtime::new(8, 4);
+        rt.seed();
+        rt.maybe_grow();
+        assert_eq!(rt.active_now(), 4);
+        for w in 0..4 {
+            while rt.pop(w).is_some() {}
+        }
+        assert_eq!(rt.ready_now(), 0);
+        rt.executing_add(4);
+        for _ in 0..32 {
+            rt.maybe_grow();
+        }
+        assert_eq!(rt.active_now(), 4, "in-flight work must hold the set");
     }
 }

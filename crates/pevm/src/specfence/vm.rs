@@ -204,42 +204,15 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
             if !armed && !self.chain.should_wait(location, pred, executing) {
                 return Ok(());
             }
+            // Park instead of sleeping in the interpreter. The old 40×50µs
+            // condvar loop was thread time charged to the interpreter and
+            // grew with the number of workers, because a reader only entered
+            // it while its predecessor was executing on another core.
             let reason = if armed {
                 super::timeline::ARMED
             } else {
                 super::timeline::UNARMED
             };
-            if !executing {
-                super::timeline::set_block(reason, location);
-                return Err(ReadError::Blocking(pred));
-            }
-            // Overlap only while the predecessor is inside the interpreter.
-            // 40 × 50µs is the cap; a longer spin holds the worker off the prefix.
-            let t_inline = if self.tl_on {
-                super::timeline::stamp()
-            } else {
-                0
-            };
-            self.rt.waiting_add(1);
-            for _ in 0..40 {
-                if self.settled(location, pred)
-                    || self.finished_without_write(location, pred)
-                    || !self.rt.is_executing(pred)
-                    || self.rt.all_executors_waiting()
-                {
-                    break;
-                }
-                self.rt.wait_brief();
-            }
-            self.rt.waiting_add(-1);
-            super::timeline::inline_wait(self.tx_idx, pred, location, reason, t_inline);
-            if self.settled(location, pred) {
-                return Ok(());
-            }
-            if self.finished_without_write(location, pred) {
-                self.chain.clear_hole(location, pred);
-                continue;
-            }
             super::timeline::set_block(reason, location);
             return Err(ReadError::Blocking(pred));
         }
@@ -550,6 +523,18 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
     }
 
     fn cached_basic(&mut self, address: &Address) -> Result<Option<AccountBasic>, ReadError> {
+        if super::share::cache_on() {
+            if let Some(hit) = self.mv.base.lookup_basic(address) {
+                return Ok(hit);
+            }
+            let _b = super::buckets::Guard::start(super::buckets::READ_BASE);
+            let basic = self
+                .storage
+                .basic(address)
+                .map_err(|err| ReadError::StorageError(err.to_string()))?;
+            self.mv.base.insert_basic(*address, basic.clone());
+            return Ok(basic);
+        }
         if let Some(hit) = self.basic_cache.get(address) {
             return Ok(hit.clone());
         }
@@ -581,9 +566,18 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
             self.code_cache.insert(code_hash, code.clone());
             return Ok(Some(code));
         }
+        if super::share::code_on()
+            && let Some(code) = self.mv.codes.get(&code_hash)
+        {
+            self.code_cache.insert(code_hash, code.clone());
+            return Ok(Some(code));
+        }
         match self.storage.code_by_hash(&code_hash) {
             Ok(Some(evm_code)) => {
                 let code = Bytecode::from(evm_code);
+                if super::share::code_on() {
+                    self.mv.codes.insert(code_hash, code.clone());
+                }
                 self.code_cache.insert(code_hash, code.clone());
                 Ok(Some(code))
             }
@@ -629,6 +623,18 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
         }
         super::buckets::hit(super::buckets::READ_COLD);
         self.note_storage_origin(location_hash)?;
+        if super::share::cache_on() {
+            if let Some(hit) = self.mv.base.lookup_code_hash(&address) {
+                return Ok(hit);
+            }
+            let _b = super::buckets::Guard::start(super::buckets::READ_BASE);
+            let hash = self
+                .storage
+                .code_hash(&address)
+                .map_err(|err| ReadError::StorageError(err.to_string()))?;
+            self.mv.base.insert_code_hash(address, hash);
+            return Ok(hash);
+        }
         if let Some(hit) = self.code_hash_cache.get(&address) {
             return Ok(*hit);
         }
@@ -648,6 +654,18 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
         location_hash: MemoryLocationHash,
     ) -> Result<U256, ReadError> {
         self.note_storage_origin(location_hash)?;
+        if super::share::cache_on() {
+            if let Some(value) = self.mv.base.lookup_slot(&address, &index) {
+                return Ok(value);
+            }
+            let _b = super::buckets::Guard::start(super::buckets::READ_BASE);
+            let value = self
+                .storage
+                .storage(&address, &index)
+                .map_err(|err| ReadError::StorageError(err.to_string()))?;
+            self.mv.base.insert_slot(address, index, value);
+            return Ok(value);
+        }
         if let Some(value) = self.slot_cache.get(&(address, index)) {
             return Ok(*value);
         }
@@ -1262,6 +1280,7 @@ impl<'a, S: crate::Storage, C: PevmChain> SfVm<'a, S, C> {
             super::buckets::CLASS_OTHER
         };
         let class_t0 = super::buckets::stamp();
+        let interp_t0 = self.trace.profile().then(Instant::now);
         let exec_result = {
             let _b = super::buckets::Guard::start(super::buckets::INTERP);
             match NoBeneficiaryHandler::<C, _>::default().run(&mut self.evm) {
@@ -1288,6 +1307,9 @@ impl<'a, S: crate::Storage, C: PevmChain> SfVm<'a, S, C> {
                 }
             }
         };
+        let interp_ns = interp_t0
+            .map(|t| t.elapsed().as_nanos() as u64)
+            .unwrap_or(0);
         super::buckets::add_since(class_bucket, class_t0);
         if incarnation > 0 {
             super::buckets::add_since(super::buckets::CLASS_REEXEC, class_t0);
@@ -1450,6 +1472,7 @@ impl<'a, S: crate::Storage, C: PevmChain> SfVm<'a, S, C> {
                 tx_idx,
                 incarnation,
                 elapsed_ns.unwrap_or(0),
+                interp_ns,
                 reads,
                 writes,
                 lazy_writes,

@@ -167,6 +167,16 @@ where
         live.install_radar(*location, writers);
     }
     let live = live;
+    if !serial {
+        super::share::prefill(
+            chain,
+            storage,
+            block_env.beneficiary,
+            txs.as_slice(),
+            &mv.codes,
+            &mv.base,
+        );
+    }
     let rt = {
         let _b = super::buckets::Guard::start(super::buckets::RUNTIME);
         let rt = Runtime::new(n, workers);
@@ -261,17 +271,19 @@ where
                         let loc = live.to_hash_of(tx);
                         if !anchor_done && !mv.data.contains_key(&loc) {
                             live.set_delay(tx, super::live_chain::DELAY_ANCHOR);
-                            rt.boost(worker, anchor);
-                            if tl {
-                                super::timeline::open_park(
-                                    tx,
-                                    anchor,
-                                    loc,
-                                    live.class_id(tx),
-                                    super::timeline::OTHER,
-                                );
+                            if let Depend::Run(root, inc) = depend(
+                                rt,
+                                worker,
+                                tx,
+                                anchor,
+                                false,
+                                tl,
+                                loc,
+                                live.class_id(tx),
+                                super::timeline::OTHER,
+                            ) {
+                                immediate = Some((root, inc));
                             }
-                            rt.park(worker, tx, anchor, false, false);
                             for done_tx in pending_close.drain(..) {
                                 close_from(worker, done_tx, n, rt, mv, live, trace, commit_mu, tl);
                             }
@@ -287,17 +299,19 @@ where
                         // Tier A still starts the tx once the predecessor is executing;
                         // that case falls through because `is_executing` is true.
                         live.set_delay(tx, super::live_chain::DELAY_ADMIT);
-                        rt.boost(worker, pred);
-                        if tl {
-                            super::timeline::open_park(
-                                tx,
-                                pred,
-                                0,
-                                live.class_id(tx),
-                                super::timeline::ADMIT,
-                            );
+                        if let Depend::Run(root, inc) = depend(
+                            rt,
+                            worker,
+                            tx,
+                            pred,
+                            false,
+                            tl,
+                            0,
+                            live.class_id(tx),
+                            super::timeline::ADMIT,
+                        ) {
+                            immediate = Some((root, inc));
                         }
-                        rt.park(worker, tx, pred, false, false);
                         for done_tx in pending_close.drain(..) {
                             close_from(worker, done_tx, n, rt, mv, live, trace, commit_mu, tl);
                         }
@@ -311,17 +325,19 @@ where
                         // before classmates read them. Incarnation stays: this
                         // attempt has not entered the interpreter.
                         live.set_delay(tx, super::live_chain::DELAY_CLASS);
-                        rt.boost(worker, head);
-                        if tl {
-                            super::timeline::open_park(
-                                tx,
-                                head,
-                                0,
-                                live.class_id(tx),
-                                super::timeline::CLASS,
-                            );
+                        if let Depend::Run(root, inc) = depend(
+                            rt,
+                            worker,
+                            tx,
+                            head,
+                            false,
+                            tl,
+                            0,
+                            live.class_id(tx),
+                            super::timeline::CLASS,
+                        ) {
+                            immediate = Some((root, inc));
                         }
-                        rt.park(worker, tx, head, false, false);
                         for done_tx in pending_close.drain(..) {
                             close_from(worker, done_tx, n, rt, mv, live, trace, commit_mu, tl);
                         }
@@ -415,34 +431,54 @@ where
                                 super::live_chain::DELAY_BLOCK
                             };
                             live.set_delay(tx, delay);
-                            // The predecessor is why this transaction cannot
-                            // run. Put it on this worker's deque so the wait
-                            // is one execution, not the rest of that worker's
-                            // stride. A copy already queued elsewhere is skipped
-                            // when it is popped, because only Ready starts.
-                            rt.boost(worker, pred);
-                            let owner = live.chain_owner(loc).filter(|owner| *owner != worker);
-                            if let Some(owner) = owner
-                                && rt.handoff_sticky(owner, tx)
-                            {
-                                // The publisher runs this RMW next, without a
-                                // stealable queue entry and without waking a
-                                // worker that is outside the active set.
+                            let parked_reason = if reason == 0 {
+                                super::timeline::OTHER
                             } else {
-                                if tl {
-                                    super::timeline::open_park(
-                                        tx,
-                                        pred,
-                                        loc,
-                                        live.class_id(tx),
-                                        if reason == 0 {
-                                            super::timeline::OTHER
-                                        } else {
-                                            reason
-                                        },
+                                reason
+                            };
+                            match rt.claim_blocker(worker, pred) {
+                                super::rt::Claim::Done => rt.retry_now(worker, tx),
+                                super::rt::Claim::Seal(done_tx) => {
+                                    // The predecessor has left the interpreter.
+                                    // Seal it here instead of parking on it.
+                                    let _ = seal_fast(
+                                        worker, done_tx, n, rt, mv, live, trace, commit_mu,
                                     );
+                                    rt.retry_now(worker, tx);
                                 }
-                                rt.park(worker, tx, pred, false, until_final);
+                                super::rt::Claim::Run(root, inc) => {
+                                    // The predecessor chain is not in the
+                                    // interpreter. Wait on the root this
+                                    // worker is about to run, never on a
+                                    // parked link.
+                                    let on = if rt.is_executing(pred) { pred } else { root };
+                                    let until = until_final && on == pred;
+                                    rt.park(worker, tx, on, false, until);
+                                    immediate = Some((root, inc));
+                                }
+                                super::rt::Claim::Wait(exec_tx) => {
+                                    let owner =
+                                        live.chain_owner(loc).filter(|owner| *owner != worker);
+                                    if let Some(owner) = owner
+                                        && rt.handoff_sticky(owner, tx)
+                                    {
+                                        // The chain owner runs this reader next.
+                                        // The blocking transaction is already
+                                        // inside the interpreter.
+                                    } else {
+                                        if tl {
+                                            super::timeline::open_park(
+                                                tx,
+                                                exec_tx,
+                                                loc,
+                                                live.class_id(tx),
+                                                parked_reason,
+                                            );
+                                        }
+                                        let until = until_final && exec_tx == pred;
+                                        rt.park(worker, tx, exec_tx, false, until);
+                                    }
+                                }
                             }
                         }
                     }
@@ -599,6 +635,9 @@ where
         trace.note_hot(loc, hops, same, gap, exec_ns, span);
     }
     trace.dump_aborts();
+    if super::buckets::on() {
+        eprintln!("SCHED_SKIPS {}", rt.pop_skips());
+    }
     super::buckets::dump();
     timeline.dump(
         options.class_key.as_str(),
@@ -627,6 +666,51 @@ where
     }
     *LAST_TRACE.lock().unwrap() = Some(snap);
     Ok(fully)
+}
+
+enum Depend {
+    Retry,
+    Run(TxIdx, usize),
+    Wait,
+}
+
+/// Park `tx` on a predecessor that is in the interpreter, or arrange to run
+/// the ready task the predecessor is transitively waiting on.
+fn depend(
+    rt: &Runtime,
+    worker: usize,
+    tx: TxIdx,
+    pred: TxIdx,
+    until_final: bool,
+    tl: bool,
+    loc: u64,
+    class: u16,
+    reason: u8,
+) -> Depend {
+    match rt.claim_blocker(worker, pred) {
+        super::rt::Claim::Done | super::rt::Claim::Seal(_) => {
+            // Admission, anchor, and class waits release on execution, not
+            // finality. A finished predecessor is enough.
+            rt.retry_now(worker, tx);
+            Depend::Retry
+        }
+        super::rt::Claim::Run(root, inc) => {
+            // `pred` may itself be parked. The reader waits on the task that
+            // is in the interpreter, which this worker is about to run.
+            let on = if rt.is_executing(pred) { pred } else { root };
+            let until = until_final && on == pred;
+            rt.park(worker, tx, on, false, until);
+            Depend::Run(root, inc)
+        }
+        super::rt::Claim::Wait(exec_tx) => {
+            if tl {
+                super::timeline::open_park(tx, exec_tx, loc, class, reason);
+            }
+            let until = until_final && exec_tx == pred;
+            rt.park(worker, tx, exec_tx, false, until);
+            Depend::Wait
+        }
+    }
 }
 
 /// Keep chain tails and later plain credits off the public deques.
