@@ -15,12 +15,15 @@ mod deque;
 mod engine;
 mod live_chain;
 mod mv;
+mod pool;
 mod rt;
 mod timeline;
 mod trace;
 mod vm;
 
 pub use engine::{SfClassKey, SfOptions, last_trace, run_sf_block};
+pub use pool::{parse_cpu_spec, prepare as prepare_workers};
+pub use trace::DeltaNote;
 
 /// Block number written into a `SPECFENCE_TIMELINE` dump. Ignored when the
 /// timeline flag is off.

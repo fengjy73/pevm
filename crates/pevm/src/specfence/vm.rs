@@ -74,6 +74,8 @@ struct VmDb<'a, S: crate::Storage> {
     accepted_pred: Cell<u32>,
     /// One worker commits in index order. Chain waits are skipped.
     serial: bool,
+    /// Record read origins. Wall-clock serial skips the map.
+    track: bool,
     /// Worker-local copy. Timed runs leave this false and skip the timeline clock.
     tl_on: bool,
 }
@@ -270,6 +272,11 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
             self.is_lazy = self.to_code_hash.is_none()
                 && (self.mv.data.contains_key(&from_hash)
                     || self.mv.data.contains_key(&to_hash.unwrap()));
+            if !self.serial
+                && let Some(loc) = to_hash
+            {
+                self.chain.note_lazy_decision(tx_idx, loc, self.is_lazy);
+            }
         }
         Ok(())
     }
@@ -301,6 +308,9 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
     }
 
     fn get_code_hash(&mut self, address: Address) -> Result<Option<B256>, ReadError> {
+        if !self.track {
+            return self.code_hash_untracked(address);
+        }
         let location_hash = hash_deterministic(MemoryLocation::CodeHash(address));
         let serial = self.serial;
         self.coordinate(location_hash)?;
@@ -350,6 +360,135 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
         Self::push_origin(read_origins, SfReadOrigin::Storage)?;
         self.storage
             .code_hash(&address)
+            .map_err(|err| ReadError::StorageError(err.to_string()))
+    }
+
+    /// Code hash without a read-set entry. Serial execution already published
+    /// every lower write.
+    fn code_hash_untracked(&mut self, address: Address) -> Result<Option<B256>, ReadError> {
+        let location_hash = hash_deterministic(MemoryLocation::CodeHash(address));
+        if self.tx_idx > 0
+            && let Some(written) = self.mv.data.get(&location_hash)
+            && let Some((_, entry)) = written.range(..self.tx_idx).next_back()
+        {
+            match entry {
+                MemoryEntry::Data(_, MemoryValue::SelfDestructed) => {
+                    return Err(ReadError::SelfDestructedAccount);
+                }
+                MemoryEntry::Data(_, MemoryValue::CodeHash(code_hash)) => {
+                    return Ok(Some(*code_hash));
+                }
+                MemoryEntry::Estimate => {}
+                MemoryEntry::Data(_, _) => {}
+            }
+        }
+        self.storage
+            .code_hash(&address)
+            .map_err(|err| ReadError::StorageError(err.to_string()))
+    }
+}
+
+impl<'a, S: crate::Storage> VmDb<'a, S> {
+    /// Account read that does not record an origin. Used when one worker runs
+    /// the block in order and the harness is not building the ideal DAG.
+    fn basic_untracked(
+        &mut self,
+        address: Address,
+        location_hash: MemoryLocationHash,
+    ) -> Result<Option<AccountInfo>, ReadError> {
+        let mut balance_addition = U256::ZERO;
+        let mut positive_addition = true;
+        let mut nonce_addition = 0u64;
+        let mut final_account = None;
+        if self.tx_idx > 0
+            && let Some(written) = self.mv.data.get(&location_hash)
+        {
+            let mut iter = written.range(..self.tx_idx);
+            loop {
+                match iter.next_back() {
+                    Some((_, MemoryEntry::Estimate)) => break,
+                    Some((_, MemoryEntry::Data(_, value))) => match value {
+                        MemoryValue::Basic(basic) => {
+                            final_account = Some(basic.clone());
+                            break;
+                        }
+                        MemoryValue::LazyRecipient(addition) => {
+                            if positive_addition {
+                                balance_addition = balance_addition.saturating_add(*addition);
+                            } else {
+                                positive_addition = *addition >= balance_addition;
+                                balance_addition = balance_addition.abs_diff(*addition);
+                            }
+                        }
+                        MemoryValue::LazySender(subtraction) => {
+                            if positive_addition {
+                                positive_addition = balance_addition >= *subtraction;
+                                balance_addition = balance_addition.abs_diff(*subtraction);
+                            } else {
+                                balance_addition = balance_addition.saturating_add(*subtraction);
+                            }
+                            nonce_addition += 1;
+                        }
+                        _ => return Err(ReadError::InvalidMemoryValueType),
+                    },
+                    None => break,
+                }
+            }
+        }
+        if final_account.is_none() {
+            final_account = match self.storage.basic(&address) {
+                Ok(Some(basic)) => Some(basic),
+                Ok(None) => (balance_addition > U256::ZERO).then(AccountBasic::default),
+                Err(err) => return Err(ReadError::StorageError(err.to_string())),
+            };
+        }
+        let Some(mut account) = final_account else {
+            return Ok(None);
+        };
+        account.nonce += nonce_addition;
+        if self.has_nonce && location_hash == self.from_hash && self.tx.nonce != account.nonce {
+            return Err(self.sender_block());
+        }
+        if positive_addition {
+            account.balance = account.balance.saturating_add(balance_addition);
+        } else {
+            account.balance = account.balance.saturating_sub(balance_addition);
+        }
+        let code_hash = if Some(location_hash) == self.to_hash {
+            self.to_code_hash
+        } else {
+            self.code_hash_untracked(address)?
+        };
+        let code = code_for(self, code_hash)?;
+        self.read_accounts
+            .insert(location_hash, (account.clone(), code_hash));
+        Ok(Some(AccountInfo {
+            balance: account.balance,
+            nonce: account.nonce,
+            code_hash: code_hash.unwrap_or(KECCAK_EMPTY),
+            code,
+            account_id: None,
+        }))
+    }
+
+    fn storage_untracked(
+        &mut self,
+        address: Address,
+        index: U256,
+        location_hash: MemoryLocationHash,
+    ) -> Result<U256, ReadError> {
+        if self.tx_idx > 0
+            && let Some(written) = self.mv.data.get(&location_hash)
+            && let Some((_, entry)) = written.range(..self.tx_idx).next_back()
+        {
+            match entry {
+                MemoryEntry::Data(_, MemoryValue::Storage(value)) => return Ok(*value),
+                MemoryEntry::Estimate => {}
+                _ => return Err(ReadError::InvalidMemoryValueType),
+            }
+        }
+        self.storage
+            .storage(&address, &index)
             .map_err(|err| ReadError::StorageError(err.to_string()))
     }
 }
@@ -502,6 +641,10 @@ impl<S: crate::Storage> Database for VmDb<'_, S> {
             } else if Some(location_hash) == self.to_hash {
                 return Ok(None);
             }
+        }
+
+        if !self.track {
+            return self.basic_untracked(address, location_hash);
         }
 
         self.coordinate(location_hash)?;
@@ -725,6 +868,9 @@ impl<S: crate::Storage> Database for VmDb<'_, S> {
 
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
         let location_hash = hash_deterministic(MemoryLocation::Storage(address, index));
+        if !self.track {
+            return self.storage_untracked(address, index, location_hash);
+        }
         let serial = self.serial;
         self.coordinate(location_hash)?;
         let read_origins = self.read_set.entry(location_hash).or_default();
@@ -848,6 +994,7 @@ impl<'a, S: crate::Storage, C: PevmChain> SfVm<'a, S, C> {
             prev_sender,
             accepted_pred: Cell::new(u32::MAX),
             serial: rt.worker_count() == 1,
+            track: rt.worker_count() != 1 || trace.profile() || trace.enabled(),
             tl_on: super::timeline::vm_enabled(),
         };
         Self {

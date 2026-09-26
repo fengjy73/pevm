@@ -9,7 +9,6 @@
 use std::cell::UnsafeCell;
 use std::num::NonZeroUsize;
 use std::sync::{Mutex, OnceLock};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use alloy_primitives::{Address, TxKind, U256};
@@ -162,13 +161,18 @@ where
     let rt = {
         let _b = super::buckets::Guard::start(super::buckets::RUNTIME);
         let rt = Runtime::new(n, workers);
-        rt.seed();
+        if !serial {
+            rt.seed();
+        }
         rt
     };
     let prev_sender = previous_senders(chain, &txs);
     // Radar chain heads are seeded by pushing the lowest radar member later;
     // with an empty radar this is a no-op. Index seeding already ran.
     let trace = Trace::new(n);
+    let track_reads = !serial || trace.profile() || trace.enabled();
+    mv.set_track_reads(track_reads);
+    mv.set_index_reads(!serial);
     let results = Results::new(n);
     let abort: OnceLock<AbortKind> = OnceLock::new();
     let commit_mu = Mutex::new(());
@@ -197,27 +201,42 @@ where
             trace,
             prev_sender_slice,
         );
-        let mut idle = 0u32;
         let mut spins = 0u32;
         let mut idle_since = 0u64;
         let mut idle_waited = false;
+        let mut immediate: Option<(TxIdx, usize)> = None;
+        let mut pending_close: Vec<TxIdx> = Vec::new();
+        let mut idle_ticket = 0usize;
         while rt.committed() < n && !rt.aborted() {
-            spins = spins.wrapping_add(1);
-            if spins.is_multiple_of(64) {
-                let _b = super::buckets::Guard::start(super::buckets::DEADLINE);
-                if started.elapsed() > deadline {
-                    rt.request_abort();
+            let handed = immediate.is_some();
+            let popped = if let Some(pair) = immediate.take() {
+                Some(pair)
+            } else {
+                if rt.wait_inactive(worker) {
                     break;
                 }
-            }
-            try_commit(worker, n, rt, mv, live, trace, commit_mu, tl);
-            let popped = {
-                let _c = super::timeline::CycGuard::enter(tl, super::timeline::CYC_SCHED);
-                let _b = super::buckets::Guard::start(super::buckets::SCHED);
-                rt.pop(worker)
+                spins = spins.wrapping_add(1);
+                if spins.is_multiple_of(64) {
+                    let _b = super::buckets::Guard::start(super::buckets::DEADLINE);
+                    if started.elapsed() > deadline {
+                        rt.request_abort();
+                        break;
+                    }
+                }
+                try_commit(worker, n, rt, mv, live, trace, commit_mu, tl);
+                // Sample before the pop. A wake that arrives after this and
+                // after an empty pop changes the ticket, so the idle wait
+                // returns instead of sleeping out the timeout.
+                idle_ticket = rt.work_ticket();
+                let found = {
+                    let _c = super::timeline::CycGuard::enter(tl, super::timeline::CYC_SCHED);
+                    let _b = super::buckets::Guard::start(super::buckets::SCHED);
+                    rt.take_sticky(worker).or_else(|| rt.pop(worker))
+                };
+                found
             };
             if let Some((tx, inc)) = popped {
-                idle = 0;
+                rt.note_busy();
                 live.note_idle(false);
                 if tl {
                     if idle_since != 0 {
@@ -228,6 +247,26 @@ where
                     super::timeline::close_park(tx);
                 }
                 if !serial {
+                    if let Some(anchor) = live.lazy_anchor(tx) {
+                        let anchor_done = rt.is_executed(anchor) || rt.is_committed(anchor);
+                        let loc = live.to_hash_of(tx);
+                        if !anchor_done && !mv.data.contains_key(&loc) {
+                            if tl {
+                                super::timeline::open_park(
+                                    tx,
+                                    anchor,
+                                    loc,
+                                    live.class_id(tx),
+                                    super::timeline::OTHER,
+                                );
+                            }
+                            rt.park(worker, tx, anchor, false, false);
+                            for done_tx in pending_close.drain(..) {
+                                close_from(worker, done_tx, n, rt, mv, live, trace, commit_mu, tl);
+                            }
+                            continue;
+                        }
+                    }
                     if let Some(pred) = live.admission_predecessor(tx)
                         && !rt.is_executing(pred)
                         && !rt.is_committed(pred)
@@ -246,6 +285,9 @@ where
                             );
                         }
                         rt.park(worker, tx, pred, false, false);
+                        for done_tx in pending_close.drain(..) {
+                            close_from(worker, done_tx, n, rt, mv, live, trace, commit_mu, tl);
+                        }
                         continue;
                     }
                     if let Some(head) = live.class_head(tx)
@@ -265,10 +307,19 @@ where
                             );
                         }
                         rt.park(worker, tx, head, false, false);
+                        for done_tx in pending_close.drain(..) {
+                            close_from(worker, done_tx, n, rt, mv, live, trace, commit_mu, tl);
+                        }
                         continue;
                     }
                 }
                 rt.executing_add(1);
+                let t0 = started.elapsed().as_nanos() as u64;
+                let hop = if serial {
+                    None
+                } else {
+                    live.observe_rmw_start(tx, worker, t0)
+                };
                 let incarnation = inc;
                 let mut guard = 0;
                 let step = loop {
@@ -285,19 +336,46 @@ where
                 match step {
                     Step::Done => {
                         if !serial {
-                            // A write that landed under a higher executed reader
-                            // invalidates that reader before this incarnation
-                            // can become final.
-                            revoke_writes(worker, tx, n, rt, mv, live, trace, commit_mu);
+                            let t1 = started.elapsed().as_nanos() as u64;
+                            live.observe_rmw_end(tx, worker, t1);
+                            if let Some((same, gap, piped)) = hop {
+                                trace.note_hop(same, gap, piped);
+                                rt.observe_hop_time(gap, t1.saturating_sub(t0));
+                            }
                         }
-                        rt.finish_ok(worker, tx);
-                        if !serial {
-                            close_from(worker, tx, n, rt, mv, live, trace, commit_mu, tl);
-                            // The next RMW on this location is ready once this
-                            // write is final. Pull it onto this worker so the
-                            // chain does not wait out unrelated queue delay.
-                            for succ in live.rmw_successors(tx) {
-                                rt.boost(worker, succ);
+                        if serial {
+                            rt.finish_ok(worker, tx);
+                        } else {
+                            // Revoke higher readers before this incarnation is
+                            // final. The next RMW is claimed onto this worker
+                            // before any thief can pop it, then sealed so the
+                            // successor does not wait on a wakeup.
+                            let succs = live.rmw_successors(tx);
+                            revoke_writes(worker, tx, n, rt, mv, live, trace, commit_mu);
+                            if rt.finish_and_stick(worker, tx, &succs)
+                                && seal_fast(worker, tx, n, rt, mv, live, trace, commit_mu)
+                            {
+                                if let Some(next) = rt.take_sticky(worker) {
+                                    pending_close.push(tx);
+                                    immediate = Some(next);
+                                } else {
+                                    pending_close.push(tx);
+                                    for done_tx in pending_close.drain(..) {
+                                        close_from(
+                                            worker, done_tx, n, rt, mv, live, trace, commit_mu, tl,
+                                        );
+                                    }
+                                    if !handed {
+                                        rt.maybe_grow();
+                                    }
+                                }
+                            } else {
+                                rt.unstick(worker);
+                                for done_tx in pending_close.drain(..) {
+                                    close_from(
+                                        worker, done_tx, n, rt, mv, live, trace, commit_mu, tl,
+                                    );
+                                }
                             }
                         }
                     }
@@ -311,20 +389,29 @@ where
                             // incarnation is final, which is not its commit.
                             let (reason, loc) = super::timeline::block_wait();
                             let until_final = reason != super::timeline::UNARMED;
-                            if tl {
-                                super::timeline::open_park(
-                                    tx,
-                                    pred,
-                                    loc,
-                                    live.class_id(tx),
-                                    if reason == 0 {
-                                        super::timeline::OTHER
-                                    } else {
-                                        reason
-                                    },
-                                );
+                            let owner = live.chain_owner(loc).filter(|owner| *owner != worker);
+                            if let Some(owner) = owner
+                                && rt.handoff_sticky(owner, tx)
+                            {
+                                // The publisher runs this RMW next, without a
+                                // stealable queue entry and without waking a
+                                // worker that is outside the active set.
+                            } else {
+                                if tl {
+                                    super::timeline::open_park(
+                                        tx,
+                                        pred,
+                                        loc,
+                                        live.class_id(tx),
+                                        if reason == 0 {
+                                            super::timeline::OTHER
+                                        } else {
+                                            reason
+                                        },
+                                    );
+                                }
+                                rt.park(worker, tx, pred, false, until_final);
                             }
-                            rt.park(worker, tx, pred, false, until_final);
                         }
                     }
                     Step::Retry => unreachable!("retry is consumed above"),
@@ -337,25 +424,23 @@ where
                         let _ = abort.set(AbortKind::Fatal(err));
                     }
                 }
-                try_commit(worker, n, rt, mv, live, trace, commit_mu, tl);
+                if immediate.is_none() {
+                    try_commit(worker, n, rt, mv, live, trace, commit_mu, tl);
+                }
             } else {
-                idle += 1;
+                let ticket = idle_ticket;
+                rt.note_idle_sample();
                 live.note_idle(true);
                 if tl && idle_since == 0 {
                     idle_since = super::timeline::stamp();
                 }
                 try_commit(worker, n, rt, mv, live, trace, commit_mu, tl);
-                if rt.committed() == n {
+                if rt.committed() == n || rt.aborted() {
                     break;
                 }
                 if !rt.rescue(worker) {
-                    if idle > 8 {
-                        rt.wait_brief();
-                        idle_waited = true;
-                        idle = 0;
-                    } else {
-                        thread::yield_now();
-                    }
+                    rt.wait_work(ticket);
+                    idle_waited = true;
                 }
             }
         }
@@ -364,13 +449,61 @@ where
         }
     };
     if serial {
-        drive(0);
-    } else {
-        thread::scope(|scope| {
-            for worker in 0..workers {
-                scope.spawn(move || drive(worker));
+        super::timeline::bind(0);
+        let mut vm = SfVm::new(
+            chain,
+            spec_id,
+            &block_env,
+            txs.as_slice(),
+            storage,
+            mv,
+            live,
+            rt,
+            trace,
+            prev_sender_slice,
+        );
+        for tx in 0..n {
+            if started.elapsed() > deadline {
+                rt.request_abort();
+                let _ = abort.set(AbortKind::Fallback);
+                break;
             }
-        });
+            let mut guard = 0;
+            loop {
+                guard += 1;
+                if guard > 8 {
+                    rt.request_abort();
+                    let _ = abort.set(AbortKind::Fallback);
+                    break;
+                }
+                match vm.execute(tx, 0, unsafe { &mut *results.slot(tx) }) {
+                    Step::Done => {
+                        rt.commit_serial(tx);
+                        // Profile rows use kind=1 as the committed attempt.
+                        // The parallel prefix does this inside try_commit.
+                        trace.note_committed(tx, 0);
+                        break;
+                    }
+                    Step::Retry | Step::Yield | Step::Block(_) => continue,
+                    Step::Fallback => {
+                        rt.request_abort();
+                        let _ = abort.set(AbortKind::Fallback);
+                        break;
+                    }
+                    Step::Fatal(err) => {
+                        rt.request_abort();
+                        let _ = abort.set(AbortKind::Fatal(err));
+                        break;
+                    }
+                }
+            }
+            if rt.aborted() {
+                break;
+            }
+        }
+    } else {
+        hold_chains(rt, live, n);
+        super::pool::dispatch(workers, &drive);
     }
 
     if let Some(kind) = abort.get() {
@@ -390,7 +523,7 @@ where
     }
 
     let t_post = super::timeline::stamp();
-    {
+    if mv.tracks_reads() {
         let _b = super::buckets::Guard::start(super::buckets::RESCAN);
         for tx in 0..n {
             if let Some(loc) = mv.failing_location(tx) {
@@ -419,6 +552,15 @@ where
     }
     super::timeline::post_span(super::timeline::LAZY, t_lazy);
 
+    trace.note_sched(
+        rt.active_now(),
+        rt.peak_active(),
+        rt.parked_count(),
+        rt.woken_count(),
+    );
+    if let Some((loc, hops, same, gap, exec_ns, span)) = live.hottest() {
+        trace.note_hot(loc, hops, same, gap, exec_ns, span);
+    }
     trace.dump_aborts();
     super::buckets::dump();
     timeline.dump(
@@ -441,6 +583,51 @@ where
     );
     *LAST_TRACE.lock().unwrap() = Some(snap);
     Ok(fully)
+}
+
+/// Keep chain tails and later plain credits off the public deques.
+fn hold_chains(rt: &Runtime, live: &LiveChain, n: usize) {
+    for tx in 0..n {
+        for succ in live.rmw_successors(tx) {
+            rt.hold_ready(succ, tx, true);
+        }
+    }
+    for tx in 0..n {
+        if let Some(anchor) = live.lazy_anchor(tx) {
+            rt.hold_ready(tx, anchor, false);
+        }
+    }
+}
+
+/// Validate and mark `tx` final so a sticky successor can run on this worker.
+fn seal_fast(
+    worker: usize,
+    tx: TxIdx,
+    n: usize,
+    rt: &Runtime,
+    mv: &SfMv,
+    live: &LiveChain,
+    trace: &Trace,
+    commit_mu: &Mutex<()>,
+) -> bool {
+    let inc = rt.incarnation(tx);
+    let mismatch = {
+        let _b = super::buckets::Guard::start(super::buckets::VALIDATE);
+        mv.failing_location(tx)
+    };
+    if mismatch.is_some() {
+        let Ok(_guard) = commit_mu.lock() else {
+            return false;
+        };
+        if abort_one(worker, tx, rt, mv, live, trace) {
+            cascade_readers(worker, tx, n, rt, mv, live, trace);
+        }
+        return false;
+    }
+    if rt.mark_validated(tx, inc) {
+        rt.note_final(worker, tx);
+    }
+    true
 }
 
 fn try_commit(
@@ -500,7 +687,6 @@ fn try_commit(
             super::timeline::note_commit(i);
             trace.note_committed(i, inc);
             live.note_finished(false);
-            rt.notify();
             if !was_final {
                 just_final.push(i);
             }
@@ -719,6 +905,7 @@ fn abort_one(
         trace
             .delta_abort
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        trace.note_delta(tx, loc, mismatch.live_tx, mv.fold_reason(tx, loc));
     }
     let armed = live.is_armed(loc);
     if trace.diag() {
@@ -812,7 +999,9 @@ fn build_classes<S: Storage, C: PevmChain>(
             None => false,
         };
         // A call to an account with no code credits `value` and does not read it.
-        plain.push(to.is_some() && code_empty);
+        // A self-call writes a lazy debit, not that credit.
+        let self_call = to.is_some_and(|addr| addr == env.caller);
+        plain.push(to.is_some() && code_empty && !self_call);
         let key = match kind {
             ClassKeyKind::ToSelector => hash_deterministic((to, selector)),
             ClassKeyKind::CodeHashSelector => {

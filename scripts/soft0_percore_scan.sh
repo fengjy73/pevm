@@ -192,7 +192,7 @@ run_bin() {
   esac
   echo "RUN mode=$mode workers=$workers cpus=$cpus_csv k=$k out=$outfile"
   set +e
-  timeout --foreground "$TIMEOUT_S" taskset -c "$cpus_csv" "$BIN"
+  timeout --foreground "$TIMEOUT_S" taskset -c "$cpus_csv" "$BIN" --workers "$workers" --cpu-list "$cpus_csv"
   local rc=$?
   set -e
   if [[ "$rc" -eq 124 ]]; then

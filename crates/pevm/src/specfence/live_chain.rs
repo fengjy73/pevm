@@ -76,6 +76,15 @@ struct Chain {
     live: AtomicBool,
     /// Basic-account hash this slot was allocated for.
     loc: AtomicU64,
+    /// End of the previous non-delta execution on this chain, nanoseconds.
+    last_end_ns: AtomicU64,
+    last_start_ns: AtomicU64,
+    last_worker: AtomicUsize,
+    hop_n: AtomicUsize,
+    hop_same: AtomicUsize,
+    hop_gap_max: AtomicU64,
+    hop_exec_ns: AtomicU64,
+    hop_origin_ns: AtomicU64,
 }
 
 impl Chain {
@@ -93,6 +102,14 @@ impl Chain {
             class_seeded: AtomicBool::new(false),
             live: AtomicBool::new(false),
             loc: AtomicU64::new(0),
+            last_end_ns: AtomicU64::new(0),
+            last_start_ns: AtomicU64::new(0),
+            last_worker: AtomicUsize::new(0),
+            hop_n: AtomicUsize::new(0),
+            hop_same: AtomicUsize::new(0),
+            hop_gap_max: AtomicU64::new(0),
+            hop_exec_ns: AtomicU64::new(0),
+            hop_origin_ns: AtomicU64::new(0),
         }
     }
 
@@ -114,6 +131,14 @@ impl Chain {
         self.class_seeded.store(false, Ordering::Relaxed);
         self.live.store(false, Ordering::Relaxed);
         self.loc.store(0, Ordering::Relaxed);
+        self.last_end_ns.store(0, Ordering::Relaxed);
+        self.last_start_ns.store(0, Ordering::Relaxed);
+        self.last_worker.store(0, Ordering::Relaxed);
+        self.hop_n.store(0, Ordering::Relaxed);
+        self.hop_same.store(0, Ordering::Relaxed);
+        self.hop_gap_max.store(0, Ordering::Relaxed);
+        self.hop_exec_ns.store(0, Ordering::Relaxed);
+        self.hop_origin_ns.store(0, Ordering::Relaxed);
     }
 
     fn set_member(&self, tx: TxIdx) {
@@ -301,6 +326,9 @@ pub(crate) struct LiveChain {
     /// The recipient has no code, so the credit does not read that account.
     plain: Vec<bool>,
     credits: Vec<[AtomicU64; 4]>,
+    /// Lowest plain writer that must publish before this tx can run lazily.
+    /// `usize::MAX` means there is no gate.
+    anchor: Vec<AtomicUsize>,
 }
 
 impl LiveChain {
@@ -338,6 +366,7 @@ impl LiveChain {
             serial: false,
             plain: Vec::new(),
             credits: Vec::new(),
+            anchor: (0..n).map(|_| AtomicUsize::new(usize::MAX)).collect(),
         }
     }
 
@@ -372,6 +401,7 @@ impl LiveChain {
             serial: true,
             plain: Vec::new(),
             credits: Vec::new(),
+            anchor: Vec::new(),
         }
     }
 
@@ -476,6 +506,7 @@ impl LiveChain {
         chain.pinned.store(true, Ordering::Relaxed);
         chain.class_seeded.store(true, Ordering::Relaxed);
         chain.armed.store(true, Ordering::Release);
+        let mut anchor: Option<TxIdx> = None;
         for &tx in txs {
             if tx >= self.n {
                 continue;
@@ -485,10 +516,180 @@ impl LiveChain {
                 chain.writers.fetch_add(1, Ordering::Relaxed);
             }
             chain.set_member(tx);
-            let delta = self.is_plain_credit(location, tx);
+            // The first plain credit stores an absolute account: multi-version
+            // memory does not contain the recipient yet, so the interpreter
+            // does not take the lazy path. Predicting that write as `tx.value`
+            // is the timed `delta_mismatch`. Later plain credits are deltas,
+            // and they wait until this anchor has published.
+            let plain = self.is_plain_credit(location, tx);
+            let delta = plain && anchor.is_some();
+            if plain && anchor.is_none() {
+                anchor = Some(tx);
+            }
+            if let (true, Some(first)) = (delta, anchor) {
+                self.anchor[tx].store(first, Ordering::Relaxed);
+            }
             chain.state[tx].store(Chain::pack(ST_PREDICTED, 0, delta), Ordering::Release);
             self.remember(tx, idx, false);
         }
+    }
+
+    /// Plain credit that must not start until `anchor` has written the location.
+    pub(crate) fn lazy_anchor(&self, tx: TxIdx) -> Option<TxIdx> {
+        let anchor = self.anchor.get(tx)?.load(Ordering::Relaxed);
+        (anchor != usize::MAX).then_some(anchor)
+    }
+
+    pub(crate) fn to_hash_of(&self, tx: TxIdx) -> u64 {
+        self.to_of.get(tx).copied().unwrap_or(0)
+    }
+
+    /// A predicted delta that is not actually lazy becomes an RMW before the
+    /// interpreter runs, so new readers do not fold `tx.value`.
+    pub(crate) fn note_lazy_decision(&self, tx: TxIdx, location: u64, is_lazy: bool) {
+        if self.serial || is_lazy {
+            return;
+        }
+        let Some(idx) = self.slot_of(location) else {
+            return;
+        };
+        if tx >= self.n {
+            return;
+        }
+        let chain = &self.chains[idx];
+        let raw = chain.state[tx].load(Ordering::Acquire);
+        if !Chain::is_delta(raw) {
+            return;
+        }
+        let (state, inc) = Chain::unpack(raw);
+        chain.state[tx].store(Chain::pack(state, inc, false), Ordering::Release);
+        if let Some(slot) = self.anchor.get(tx) {
+            slot.store(usize::MAX, Ordering::Relaxed);
+        }
+    }
+
+    /// Gap from the previous RMW on each chain this transaction writes.
+    /// Returns `(same_worker, gap_ns, pipelined)` for the hottest hop, if any.
+    pub(crate) fn observe_rmw_start(
+        &self,
+        tx: TxIdx,
+        worker: usize,
+        now_ns: u64,
+    ) -> Option<(bool, u64, bool)> {
+        if self.serial || tx >= self.n {
+            return None;
+        }
+        let slots: Vec<u16> = self.membership[tx]
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|entry| entry.slot)
+            .collect();
+        let mut best: Option<(bool, u64, bool)> = None;
+        for slot in slots {
+            let chain = &self.chains[slot as usize];
+            let raw = chain.state[tx].load(Ordering::Acquire);
+            let (state, _) = Chain::unpack(raw);
+            if state == ST_EMPTY || Chain::is_delta(raw) {
+                continue;
+            }
+            let prev_end = chain.last_end_ns.load(Ordering::Acquire);
+            let prev_worker = chain.last_worker.load(Ordering::Acquire);
+            let _ = chain.hop_origin_ns.compare_exchange(
+                0,
+                now_ns,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+            chain.last_start_ns.store(now_ns, Ordering::Relaxed);
+            if prev_end == 0 {
+                continue;
+            }
+            let same = prev_worker == worker;
+            let (gap, pipelined) = if now_ns < prev_end {
+                (0, true)
+            } else {
+                (now_ns - prev_end, false)
+            };
+            chain.hop_n.fetch_add(1, Ordering::Relaxed);
+            if same {
+                chain.hop_same.fetch_add(1, Ordering::Relaxed);
+            }
+            chain.hop_gap_max.fetch_max(gap, Ordering::Relaxed);
+            if best.is_none_or(|(_, prev_gap, _)| gap >= prev_gap) {
+                best = Some((same, gap, pipelined));
+            }
+        }
+        best
+    }
+
+    pub(crate) fn observe_rmw_end(&self, tx: TxIdx, worker: usize, now_ns: u64) {
+        if self.serial || tx >= self.n {
+            return;
+        }
+        let slots: Vec<u16> = self.membership[tx]
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|entry| entry.slot)
+            .collect();
+        for slot in slots {
+            let chain = &self.chains[slot as usize];
+            let raw = chain.state[tx].load(Ordering::Acquire);
+            let (state, _) = Chain::unpack(raw);
+            if state == ST_EMPTY || Chain::is_delta(raw) {
+                continue;
+            }
+            let start = chain.last_start_ns.load(Ordering::Relaxed);
+            if now_ns > start && start != 0 {
+                chain
+                    .hop_exec_ns
+                    .fetch_add(now_ns - start, Ordering::Relaxed);
+            }
+            chain.last_end_ns.store(now_ns, Ordering::Release);
+            chain.last_worker.store(worker, Ordering::Release);
+        }
+    }
+
+    /// Worker that published the previous RMW, once one has finished.
+    pub(crate) fn chain_owner(&self, location: u64) -> Option<usize> {
+        let idx = self.slot_of(location)?;
+        let chain = &self.chains[idx];
+        if chain.last_end_ns.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        Some(chain.last_worker.load(Ordering::Acquire))
+    }
+
+    /// The chain with the most RMW hops. Span is the first start to the last end.
+    pub(crate) fn hottest(&self) -> Option<(u64, usize, usize, u64, u64, u64)> {
+        let used = self.used.load(Ordering::Relaxed).min(self.chains.len());
+        let mut best: Option<(usize, usize)> = None;
+        for (idx, chain) in self.chains.iter().enumerate().take(used) {
+            if !chain.live.load(Ordering::Relaxed) {
+                continue;
+            }
+            let hops = chain.hop_n.load(Ordering::Relaxed);
+            if hops == 0 {
+                continue;
+            }
+            if best.is_none_or(|(_, n)| hops > n) {
+                best = Some((idx, hops));
+            }
+        }
+        let (idx, hops) = best?;
+        let chain = &self.chains[idx];
+        let origin = chain.hop_origin_ns.load(Ordering::Relaxed);
+        let end = chain.last_end_ns.load(Ordering::Relaxed);
+        let span = end.saturating_sub(origin);
+        Some((
+            chain.loc.load(Ordering::Relaxed),
+            hops,
+            chain.hop_same.load(Ordering::Relaxed),
+            chain.hop_gap_max.load(Ordering::Relaxed),
+            chain.hop_exec_ns.load(Ordering::Relaxed),
+            span,
+        ))
     }
 
     /// Radar only. Does not set member bits and does not arm a wait.
@@ -1489,10 +1690,13 @@ mod tests {
             vec![true, true, true, false],
         );
         live.preseed_recipients();
-        assert!(live.member_is_delta(location, 0));
+        // The first plain writer is an absolute touch, not a predicted credit.
+        assert!(!live.member_is_delta(location, 0));
         assert!(live.member_is_delta(location, 2));
+        assert_eq!(live.lazy_anchor(2), Some(0));
+        assert_eq!(live.lazy_anchor(0), None);
         assert_eq!(live.nearest_lower(location, 3), Some(2));
-        assert_eq!(live.nearest_blocker(location, 3), None);
+        assert_eq!(live.nearest_blocker(location, 3), Some(0));
         assert!(live.admission_predecessor(2).is_none());
         live.publish_write(1, 0, location, true, false, |_| true);
         assert!(!live.member_is_delta(location, 1));
@@ -1521,6 +1725,38 @@ mod tests {
         );
         live.preseed_recipients();
         assert_eq!(live.rmw_successors(1), vec![3]);
-        assert!(live.rmw_successors(0).is_empty());
+        // Tx 0 is the absolute first touch, so the next RMW is tx 1.
+        assert_eq!(live.rmw_successors(0), vec![1]);
+        assert!(live.rmw_successors(2).is_empty());
+    }
+
+    #[test]
+    fn first_plain_touch_is_not_a_predicted_delta() {
+        let n = 3;
+        let location = 42u64;
+        let mut live = LiveChain::new(n, ClassKeyKind::ToSelector);
+        live.install_classes(Vec::new(), vec![u16::MAX; n], vec![location; n]);
+        live.install_credits(
+            vec![U256::from(10), U256::from(11), U256::from(12)],
+            vec![true, true, true],
+        );
+        live.preseed_recipients();
+        assert!(!live.member_is_delta(location, 0));
+        assert!(live.member_is_delta(location, 1));
+        assert!(live.member_is_delta(location, 2));
+        assert_eq!(live.lazy_anchor(1), Some(0));
+        assert_eq!(live.lazy_anchor(2), Some(0));
+        let mut folded = Vec::new();
+        live.for_each_delta(location, 0, 3, |tx, amount| folded.push((tx, amount)));
+        assert!(folded.iter().all(|(tx, _)| *tx != 0));
+        assert!(
+            folded
+                .iter()
+                .any(|(tx, amount)| *tx == 1 && *amount == U256::from(11))
+        );
+        // A non-lazy execution drops the prediction before readers can fold it.
+        live.note_lazy_decision(1, location, false);
+        assert!(!live.member_is_delta(location, 1));
+        assert_eq!(live.lazy_anchor(1), None);
     }
 }
