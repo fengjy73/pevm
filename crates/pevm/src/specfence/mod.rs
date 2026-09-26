@@ -18,6 +18,7 @@ mod live_chain;
 mod mv;
 mod pool;
 mod rt;
+mod share;
 mod timeline;
 mod trace;
 mod vm;

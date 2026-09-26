@@ -148,6 +148,10 @@ pub(crate) struct SfMv {
     read_index: DashMap<MemoryLocationHash, Vec<TxIdx>, BuildIdentityHasher>,
     lazy_addresses: Mutex<LazyAddresses>,
     pub(crate) new_bytecodes: DashMap<B256, revm::state::Bytecode, BuildSuffixHasher>,
+    /// Analyzed code shared by every worker. Empty when the flag is off.
+    pub(crate) codes: super::share::CodeShare,
+    /// Read-mostly base state. Empty when the flag is off.
+    pub(crate) base: super::share::BaseShare,
     /// Keep per-transaction read origins. Wall-clock serial turns this off.
     track_reads: AtomicBool,
     /// Insert readers into the location index. Serial never validates concurrently.
@@ -183,6 +187,8 @@ impl SfMv {
             read_index: DashMap::default(),
             lazy_addresses: Mutex::new(LazyAddresses::from_iter(lazy_addresses)),
             new_bytecodes: DashMap::default(),
+            codes: super::share::CodeShare::new(),
+            base: super::share::BaseShare::new(),
             track_reads: AtomicBool::new(true),
             index_reads: AtomicBool::new(true),
             present,

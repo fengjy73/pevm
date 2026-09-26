@@ -361,20 +361,27 @@ pub(crate) struct LiveChain {
     gap_reason: AtomicU8,
     /// Identifies this block's directory for the worker-local slot cache.
     epoch: u64,
+    /// Bumped on every directory insert or replacement. `used` does not move
+    /// when a full table replaces a slot, and a cached miss would hide it.
+    dir_gen: AtomicU64,
 }
 
 struct SlotCache {
     epoch: u64,
     used: usize,
+    seen_gen: u64,
     map: HashMap<u64, u32, FxBuildHasher>,
 }
 
 thread_local! {
-    static SLOT_CACHE: RefCell<SlotCache> = RefCell::new(SlotCache {
-        epoch: 0,
-        used: usize::MAX,
-        map: HashMap::with_hasher(FxBuildHasher),
-    });
+    static SLOT_CACHE: RefCell<SlotCache> = const {
+        RefCell::new(SlotCache {
+            epoch: 0,
+            used: usize::MAX,
+            seen_gen: 0,
+            map: HashMap::with_hasher(FxBuildHasher),
+        })
+    };
 }
 
 impl LiveChain {
@@ -423,6 +430,7 @@ impl LiveChain {
             gap_prev: AtomicUsize::new(0),
             gap_reason: AtomicU8::new(DELAY_NONE),
             epoch: NEXT_EPOCH.fetch_add(1, Ordering::Relaxed),
+            dir_gen: AtomicU64::new(1),
         }
     }
 
@@ -468,6 +476,7 @@ impl LiveChain {
             gap_prev: AtomicUsize::new(0),
             gap_reason: AtomicU8::new(DELAY_NONE),
             epoch: 0,
+            dir_gen: AtomicU64::new(1),
         }
     }
 
@@ -903,6 +912,7 @@ impl LiveChain {
             self.present.insert(location);
             dir.index.insert(location, idx);
             self.any.store(true, Ordering::Release);
+            self.dir_gen.fetch_add(1, Ordering::Release);
             return Some(idx);
         }
         // Replace the lowest-credit chain when the new location is hotter.
@@ -937,6 +947,7 @@ impl LiveChain {
             self.present.insert(location);
             dir.index.insert(location, idx);
             self.any.store(true, Ordering::Release);
+            self.dir_gen.fetch_add(1, Ordering::Release);
             return Some(idx);
         }
         None
@@ -953,12 +964,14 @@ impl LiveChain {
         }
         let used = self.used.load(Ordering::Relaxed);
         let epoch = self.epoch;
+        let seen_gen = self.dir_gen.load(Ordering::Acquire);
         SLOT_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
-            if cache.epoch != epoch || cache.used != used {
+            if cache.epoch != epoch || cache.used != used || cache.seen_gen != seen_gen {
                 cache.map.clear();
                 cache.epoch = epoch;
                 cache.used = used;
+                cache.seen_gen = seen_gen;
             }
             if let Some(&idx) = cache.map.get(&location) {
                 return (idx != u32::MAX).then_some(idx as usize);
@@ -1560,8 +1573,27 @@ impl LiveChain {
         let Some(idx) = self.slot_of(location) else {
             return;
         };
+        self.observe_writer(idx, writer);
         let class = self.class_of_tx.get(writer).copied().unwrap_or(u16::MAX);
         self.insert_same_target(idx, writer, class, &tx_open, false);
+    }
+
+    /// The abort's writer joins the chain even when it has not published yet.
+    fn observe_writer(&self, idx: usize, writer: TxIdx) {
+        if writer >= self.n || idx >= self.chains.len() {
+            return;
+        }
+        let chain = &self.chains[idx];
+        let (state, _) = Chain::unpack(chain.state[writer].load(Ordering::Acquire));
+        if state != ST_EMPTY {
+            return;
+        }
+        chain.set_member(writer);
+        let loc = chain.loc.load(Ordering::Relaxed);
+        let delta = self.is_plain_credit(loc, writer);
+        chain.state[writer].store(Chain::pack(ST_PREDICTED, 0, delta), Ordering::Release);
+        chain.writers.fetch_add(1, Ordering::Relaxed);
+        self.remember(writer, idx, false);
     }
 
     /// Drop admission membership for a slot that is about to be reused.
@@ -1935,5 +1967,22 @@ mod tests {
         live.note_lazy_decision(1, location, false);
         assert!(!live.member_is_delta(location, 1));
         assert_eq!(live.lazy_anchor(1), None);
+    }
+
+    #[test]
+    fn replaced_chain_is_visible_after_a_cached_miss() {
+        let n = 256;
+        let live = LiveChain::new(n, ClassKeyKind::ToSelector);
+        for loc in 1..=8 {
+            live.publish_write(0, 0, loc, false, false, |_| false);
+        }
+        assert!(live.slot_of(99).is_none());
+        live.arm_failure(99);
+        assert!(
+            live.is_armed(99),
+            "a cached miss must not hide a chain installed by replacement"
+        );
+        live.note_conflict_writer(99, 3, |_| true);
+        assert_ne!(live.writer_state(99, 3).0, ST_EMPTY);
     }
 }

@@ -13,13 +13,182 @@
 //! ```
 
 use std::{
+    alloc::{GlobalAlloc, Layout, System},
     fs::File,
     io::{BufReader, Write},
     num::NonZeroUsize,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
     time::Instant,
 };
+
+/// Process allocator for both OCC and `SpecFence`. Chosen once from
+/// `SPECFENCE_ALLOCATOR` or `--allocator`, with no heap traffic, because this
+/// runs inside `alloc`.
+struct PickedAlloc {
+    kind: AtomicU8,
+}
+
+static MIMALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+unsafe impl GlobalAlloc for PickedAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if self.use_mi() {
+            unsafe { MIMALLOC.alloc(layout) }
+        } else {
+            unsafe { System.alloc(layout) }
+        }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if self.use_mi() {
+            unsafe { MIMALLOC.dealloc(ptr, layout) }
+        } else {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        if self.use_mi() {
+            unsafe { MIMALLOC.alloc_zeroed(layout) }
+        } else {
+            unsafe { System.alloc_zeroed(layout) }
+        }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        if self.use_mi() {
+            unsafe { MIMALLOC.realloc(ptr, layout, new_size) }
+        } else {
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+}
+
+impl PickedAlloc {
+    fn use_mi(&self) -> bool {
+        let mut kind = self.kind.load(Ordering::Relaxed);
+        if kind == 0 {
+            kind = decide_allocator();
+            let _ = self
+                .kind
+                .compare_exchange(0, kind, Ordering::Relaxed, Ordering::Relaxed);
+            kind = self.kind.load(Ordering::Relaxed);
+        }
+        kind == 2
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: PickedAlloc = PickedAlloc {
+    kind: AtomicU8::new(0),
+};
+
+unsafe extern "C" {
+    fn open(path: *const i8, flags: i32) -> i32;
+    fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
+    fn close(fd: i32) -> i32;
+}
+
+/// `1` system malloc, `2` mimalloc.
+fn decide_allocator() -> u8 {
+    if env_entry_eq(c"/proc/self/environ", b"SPECFENCE_ALLOCATOR", b"mimalloc")
+        || argv_requests_mimalloc()
+    {
+        2
+    } else {
+        1
+    }
+}
+
+fn allocator_name() -> &'static str {
+    if ALLOCATOR.use_mi() {
+        "mimalloc"
+    } else {
+        "system"
+    }
+}
+
+fn env_entry_eq(path: &std::ffi::CStr, key: &[u8], value: &[u8]) -> bool {
+    let mut storage = [0u8; 1 << 16];
+    let Some(bytes) = read_proc(path, &mut storage) else {
+        return false;
+    };
+    let needle_len = key.len() + 1 + value.len();
+    let mut i = 0;
+    while i < bytes.len() {
+        let start = i;
+        while i < bytes.len() && bytes[i] != 0 {
+            i += 1;
+        }
+        let entry = &bytes[start..i];
+        if entry.len() == needle_len
+            && entry.starts_with(key)
+            && entry[key.len()] == b'='
+            && &entry[key.len() + 1..] == value
+        {
+            return true;
+        }
+        if i < bytes.len() {
+            i += 1;
+        }
+    }
+    false
+}
+
+fn argv_requests_mimalloc() -> bool {
+    let mut storage = [0u8; 1 << 16];
+    let Some(bytes) = read_proc(c"/proc/self/cmdline", &mut storage) else {
+        return false;
+    };
+    let mut i = 0;
+    let mut prev: &[u8] = b"";
+    while i < bytes.len() {
+        let start = i;
+        while i < bytes.len() && bytes[i] != 0 {
+            i += 1;
+        }
+        let arg = &bytes[start..i];
+        if arg == b"--allocator=mimalloc" || (prev == b"--allocator" && arg == b"mimalloc") {
+            return true;
+        }
+        prev = arg;
+        if i < bytes.len() {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Read a `/proc` file into `buf`. `None` when the file does not fit, so a
+/// truncated scan cannot pick the wrong allocator. No heap traffic.
+fn read_proc<'a>(path: &std::ffi::CStr, buf: &'a mut [u8]) -> Option<&'a [u8]> {
+    let fd = unsafe { open(path.as_ptr(), 0) };
+    if fd < 0 {
+        return None;
+    }
+    let mut filled = 0usize;
+    loop {
+        if filled == buf.len() {
+            unsafe { close(fd) };
+            return None;
+        }
+        let n = unsafe { read(fd, buf[filled..].as_mut_ptr(), buf.len() - filled) };
+        if n < 0 {
+            unsafe { close(fd) };
+            return None;
+        }
+        if n == 0 {
+            break;
+        }
+        filled += n as usize;
+    }
+    unsafe { close(fd) };
+    Some(&buf[..filled])
+}
 
 use alloy_primitives::Address;
 use alloy_rpc_types_eth::Block;
@@ -354,6 +523,7 @@ fn attempts_json(attempts: &[SfAttempt]) -> serde_json::Value {
                     "inc": a.inc,
                     "kind": a.kind,
                     "total_ns": a.total_ns,
+                    "interp_ns": a.interp_ns,
                     "reads": a.reads,
                     "writes": a.writes,
                     "lazy_writes": a.lazy_writes,
@@ -618,8 +788,123 @@ fn apply_cli() -> Cli {
     Cli { cpu_list, workers }
 }
 
+fn harness_line() {
+    let code = std::env::var("SPECFENCE_SHARED_CODE").ok();
+    let cache = std::env::var("SPECFENCE_SHARED_CACHE").ok();
+    let name = allocator_name();
+    if std::env::var("SPECFENCE_ALLOCATOR").ok().as_deref() == Some("mimalloc")
+        && name != "mimalloc"
+    {
+        eprintln!("HARNESS allocator request mimalloc was not applied");
+    }
+    println!(
+        "HARNESS allocator={name} shared_code={} shared_cache={}",
+        code.as_deref().unwrap_or("1"),
+        cache.as_deref().unwrap_or("1"),
+    );
+}
+
+fn rank_block(loaded: &Loaded, workers: usize, pin: &[usize], seq_cpus: &[usize]) {
+    if std::env::var("SPECFENCE_FORCE_PARALLEL").ok().as_deref() == Some("1") {
+        eprintln!("rank refuses SPECFENCE_FORCE_PARALLEL; the fast leg must stay serial");
+        std::process::exit(2);
+    }
+    if std::env::var("SPECFENCE_INFLATION").ok().as_deref() != Some("1") {
+        eprintln!("rank needs SPECFENCE_INFLATION=1 so attempts carry interp_ns");
+        std::process::exit(2);
+    }
+    pevm::specfence::prepare_workers(seq_cpus, 1);
+    let fast = run_once(loaded, "sf", 1, seq_cpus);
+    let mut fast_ns = vec![0u64; loaded.n];
+    for attempt in &fast.attempts {
+        if attempt.kind == 1 {
+            fast_ns[attempt.tx as usize] = attempt.interp_ns;
+        }
+    }
+    pevm::specfence::prepare_workers(pin, workers);
+    let par = run_once(loaded, "sf", workers, seq_cpus);
+    let mut par_ns = vec![0u64; loaded.n];
+    let mut attempts_n = vec![0u32; loaded.n];
+    let mut reads_n = vec![0usize; loaded.n];
+    let mut writes_n = vec![0usize; loaded.n];
+    let mut write0 = vec![0u64; loaded.n];
+    for attempt in &par.attempts {
+        let i = attempt.tx as usize;
+        if i >= loaded.n {
+            continue;
+        }
+        par_ns[i] = par_ns[i].saturating_add(attempt.interp_ns);
+        attempts_n[i] = attempts_n[i].saturating_add(1);
+        if attempt.kind == 1 {
+            reads_n[i] = attempt.reads.len();
+            writes_n[i] = attempt.writes.len() + attempt.lazy_writes.len();
+            write0[i] = attempt
+                .writes
+                .first()
+                .or(attempt.lazy_writes.first())
+                .copied()
+                .unwrap_or(0);
+        }
+    }
+    let mut order: Vec<usize> = (0..loaded.n).collect();
+    order.sort_by(|&a, &b| {
+        let ra = ratio(par_ns[a], fast_ns[a]);
+        let rb = ratio(par_ns[b], fast_ns[b]);
+        rb.partial_cmp(&ra).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let fast_sum: u64 = fast_ns.iter().sum();
+    let par_sum: u64 = par_ns.iter().sum();
+    println!(
+        "RANK_SUM block={} workers={workers} n={} fast_interp_ms={:.3} par_interp_ms={:.3} ratio={:.3} wall_fast_ms={:.3} wall_par_ms={:.3} ok={} {}",
+        loaded.block_no,
+        loaded.n,
+        fast_sum as f64 / 1e6,
+        par_sum as f64 / 1e6,
+        ratio(par_sum, fast_sum),
+        fast.wall_ms,
+        par.wall_ms,
+        fast.ok && par.ok,
+        allocator_name(),
+    );
+    for tx in order.into_iter().take(10) {
+        let env = &loaded.txs[tx];
+        let to = env
+            .kind
+            .to()
+            .map(|a| format!("{a}"))
+            .unwrap_or_else(|| "create".to_string());
+        let selector = if env.data.len() >= 4 {
+            format!(
+                "0x{:02x}{:02x}{:02x}{:02x}",
+                env.data[0], env.data[1], env.data[2], env.data[3]
+            )
+        } else {
+            "transfer".to_string()
+        };
+        println!(
+            "RANK tx={tx} to={to} sel={selector} fast_us={:.1} par_us={:.1} ratio={:.2} attempts={} reads={} writes={} write0={:#x}",
+            fast_ns[tx] as f64 / 1e3,
+            par_ns[tx] as f64 / 1e3,
+            ratio(par_ns[tx], fast_ns[tx]),
+            attempts_n[tx],
+            reads_n[tx],
+            writes_n[tx],
+            write0[tx],
+        );
+    }
+}
+
+fn ratio(numer: u64, denom: u64) -> f64 {
+    if denom == 0 {
+        0.0
+    } else {
+        numer as f64 / denom as f64
+    }
+}
+
 fn main() {
     let cli = apply_cli();
+    harness_line();
     let which = env_str("SPECFENCE_INFLATION_WHICH", "scan");
     let workers = cli
         .workers
@@ -695,7 +980,7 @@ fn main() {
         }
         return;
     }
-    if which != "scan" {
+    if which != "scan" && which != "rank" {
         eprintln!("unknown WHICH={which}");
         std::process::exit(2);
     }
@@ -708,14 +993,21 @@ fn main() {
         Some(list) => parse_cpus(&list),
         None => parse_cpus(&std::env::var("SPECFENCE_PIN_CPUS").unwrap_or_default()),
     };
-    // Threads are created here, before the timed rounds. `dispatch` reuses
-    // this pool when the environment list is empty or already applied.
-    pevm::specfence::prepare_workers(&pin, workers);
     let seq_cpus = if pin.is_empty() || pin.contains(&seq_cpu) {
         vec![seq_cpu]
     } else {
         vec![pin[0]]
     };
+    if which == "rank" {
+        for block_no in blocks {
+            let loaded = load_block(block_no);
+            rank_block(&loaded, workers, &pin, &seq_cpus);
+        }
+        return;
+    }
+    // Threads are created here, before the timed rounds. `dispatch` reuses
+    // this pool when the environment list is empty or already applied.
+    pevm::specfence::prepare_workers(&pin, workers);
     let out_path = std::env::var("SPECFENCE_INFLATION_OUT").ok();
     let mut out_file;
     let mut stdout = std::io::stdout();
