@@ -13,181 +13,43 @@
 //! ```
 
 use std::{
-    alloc::{GlobalAlloc, Layout, System},
     fs::File,
     io::{BufReader, Write},
     num::NonZeroUsize,
     path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicU8, Ordering},
-    },
+    sync::Arc,
     time::Instant,
 };
 
-/// Process allocator for both OCC and `SpecFence`. Chosen once from
-/// `SPECFENCE_ALLOCATOR` or `--allocator`, with no heap traffic, because this
-/// runs inside `alloc`.
-struct PickedAlloc {
-    kind: AtomicU8,
-}
-
-static MIMALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
-unsafe impl GlobalAlloc for PickedAlloc {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if self.use_mi() {
-            unsafe { MIMALLOC.alloc(layout) }
-        } else {
-            unsafe { System.alloc(layout) }
-        }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if self.use_mi() {
-            unsafe { MIMALLOC.dealloc(ptr, layout) }
-        } else {
-            unsafe { System.dealloc(ptr, layout) }
-        }
-    }
-
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        if self.use_mi() {
-            unsafe { MIMALLOC.alloc_zeroed(layout) }
-        } else {
-            unsafe { System.alloc_zeroed(layout) }
-        }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if self.use_mi() {
-            unsafe { MIMALLOC.realloc(ptr, layout, new_size) }
-        } else {
-            unsafe { System.realloc(ptr, layout, new_size) }
-        }
-    }
-}
-
-impl PickedAlloc {
-    fn use_mi(&self) -> bool {
-        let mut kind = self.kind.load(Ordering::Relaxed);
-        if kind == 0 {
-            kind = decide_allocator();
-            let _ = self
-                .kind
-                .compare_exchange(0, kind, Ordering::Relaxed, Ordering::Relaxed);
-            kind = self.kind.load(Ordering::Relaxed);
-        }
-        kind == 2
-    }
-}
-
+/// Mimalloc, selected at compile time. The default binary does not install a
+/// global allocator: a runtime branch inside `alloc` slowed every engine,
+/// sequential execution included.
+#[cfg(feature = "specfence-mimalloc")]
 #[global_allocator]
-static ALLOCATOR: PickedAlloc = PickedAlloc {
-    kind: AtomicU8::new(0),
-};
-
-unsafe extern "C" {
-    fn open(path: *const i8, flags: i32) -> i32;
-    fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
-    fn close(fd: i32) -> i32;
-}
-
-/// `1` system malloc, `2` mimalloc.
-fn decide_allocator() -> u8 {
-    if env_entry_eq(c"/proc/self/environ", b"SPECFENCE_ALLOCATOR", b"mimalloc")
-        || argv_requests_mimalloc()
-    {
-        2
-    } else {
-        1
-    }
-}
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn allocator_name() -> &'static str {
-    if ALLOCATOR.use_mi() {
+    if cfg!(feature = "specfence-mimalloc") {
         "mimalloc"
     } else {
         "system"
     }
 }
 
-fn env_entry_eq(path: &std::ffi::CStr, key: &[u8], value: &[u8]) -> bool {
-    let mut storage = [0u8; 1 << 16];
-    let Some(bytes) = read_proc(path, &mut storage) else {
-        return false;
-    };
-    let needle_len = key.len() + 1 + value.len();
-    let mut i = 0;
-    while i < bytes.len() {
-        let start = i;
-        while i < bytes.len() && bytes[i] != 0 {
-            i += 1;
-        }
-        let entry = &bytes[start..i];
-        if entry.len() == needle_len
-            && entry.starts_with(key)
-            && entry[key.len()] == b'='
-            && &entry[key.len() + 1..] == value
-        {
+fn allocator_requested_mimalloc() -> bool {
+    if std::env::var("SPECFENCE_ALLOCATOR").ok().as_deref() == Some("mimalloc") {
+        return true;
+    }
+    let mut args = std::env::args();
+    while let Some(arg) = args.next() {
+        if arg == "--allocator=mimalloc" {
             return true;
         }
-        if i < bytes.len() {
-            i += 1;
+        if arg == "--allocator" && args.next().as_deref() == Some("mimalloc") {
+            return true;
         }
     }
     false
-}
-
-fn argv_requests_mimalloc() -> bool {
-    let mut storage = [0u8; 1 << 16];
-    let Some(bytes) = read_proc(c"/proc/self/cmdline", &mut storage) else {
-        return false;
-    };
-    let mut i = 0;
-    let mut prev: &[u8] = b"";
-    while i < bytes.len() {
-        let start = i;
-        while i < bytes.len() && bytes[i] != 0 {
-            i += 1;
-        }
-        let arg = &bytes[start..i];
-        if arg == b"--allocator=mimalloc" || (prev == b"--allocator" && arg == b"mimalloc") {
-            return true;
-        }
-        prev = arg;
-        if i < bytes.len() {
-            i += 1;
-        }
-    }
-    false
-}
-
-/// Read a `/proc` file into `buf`. `None` when the file does not fit, so a
-/// truncated scan cannot pick the wrong allocator. No heap traffic.
-fn read_proc<'a>(path: &std::ffi::CStr, buf: &'a mut [u8]) -> Option<&'a [u8]> {
-    let fd = unsafe { open(path.as_ptr(), 0) };
-    if fd < 0 {
-        return None;
-    }
-    let mut filled = 0usize;
-    loop {
-        if filled == buf.len() {
-            unsafe { close(fd) };
-            return None;
-        }
-        let n = unsafe { read(fd, buf[filled..].as_mut_ptr(), buf.len() - filled) };
-        if n < 0 {
-            unsafe { close(fd) };
-            return None;
-        }
-        if n == 0 {
-            break;
-        }
-        filled += n as usize;
-    }
-    unsafe { close(fd) };
-    Some(&buf[..filled])
 }
 
 use alloy_primitives::Address;
@@ -792,10 +654,11 @@ fn harness_line() {
     let code = std::env::var("SPECFENCE_SHARED_CODE").ok();
     let cache = std::env::var("SPECFENCE_SHARED_CACHE").ok();
     let name = allocator_name();
-    if std::env::var("SPECFENCE_ALLOCATOR").ok().as_deref() == Some("mimalloc")
-        && name != "mimalloc"
-    {
-        eprintln!("HARNESS allocator request mimalloc was not applied");
+    if allocator_requested_mimalloc() && name != "mimalloc" {
+        eprintln!(
+            "HARNESS allocator mimalloc needs --features specfence-mimalloc; this binary uses system malloc"
+        );
+        std::process::exit(2);
     }
     println!(
         "HARNESS allocator={name} shared_code={} shared_cache={}",

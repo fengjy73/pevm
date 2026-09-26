@@ -9,6 +9,9 @@ defaults = []
 # SpecFence parallel engine. Compiled out entirely when this feature is off.
 # Upstream OCC (`Pevm::execute` / `execute_revm_parallel`) does not call into it.
 specfence = []
+# Compile the inflation harness with mimalloc as the global allocator.
+# The default harness does not install a global allocator at all.
+specfence-mimalloc = []
 
 rpc-storage = ["dep:alloy-transport", "dep:reqwest", "dep:tokio"]
 
