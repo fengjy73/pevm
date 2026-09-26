@@ -29,12 +29,13 @@
 3. **已完成** — 粘性 RMW 交接、阻塞时交回链主、活跃集从 1 按就绪深度加倍。
 4. **已完成** — 第一笔普通转账是锚点 RMW，后续增量等该位置写入后再跑。单测 `first_plain_touch_is_not_a_predicted_delta`。
 5. **已完成** — 墙钟 C=1 不记读起源、不建读索引、不重扫。
-6. **进行中** — 正确性已过一轮；本机 K=10 与文档还没写完。OCC 不进池：`Scheduler::try_execute` / `try_validate` 在冻结的上游文件里是私有的。
+6. **已完成** — 空 pop 期间到达的唤醒不再睡满 200 ms。本机 K=10 与 `docs/specfence-v2-stage2.md` 已写入。OCC 不进池：`Scheduler::try_execute` / `try_validate` 在冻结的上游文件里是私有的。串行 profile 在 `commit_serial` 之后把 attempt 标成 `kind=1`，Ideal_C 才能从这份 profile 算出来。
 
 ## 结果
 
-（测量后填写）
+本机 4 vCPU，K=10，无预热。15274915 `(to, selector)` 中位：C=1 SEQ 3.456、OCC 5.346、SF 4.069；C=4 OCC 3.267、SF 6.711；C=8 OCC 3.870、SF 7.672。热链 `0xabd6bb3978815b97` 在 C=4 与 C=8 都是 76/76，跨度/执行 1.33 与 1.99，C=4 最大跳间隔 19.7 µs，C=8 为 211 µs。`delta_mismatch` 全表为 0。C=1 的 SF/OCC 为 0.76。反缩放与 C=4 对 OCC 的拉伸门未过，原因写在 stage 2 文档。数字与命令以该文档为准。
 
 ## 未决
 
-- 本机只有 4 个 vCPU。C=16/32 只能超订，ict21 才是权威数。
+- 本机只有 4 个 vCPU。C=8 是超订，C=16/32 未测。ict21 才是权威数。
+- 反缩放门和 C=4 ≤ OCC C=4 在本机未过。不要为了让比值通过而放慢 C=1。
