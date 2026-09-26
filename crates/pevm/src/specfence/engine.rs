@@ -206,6 +206,7 @@ where
         let mut idle_waited = false;
         let mut immediate: Option<(TxIdx, usize)> = None;
         let mut pending_close: Vec<TxIdx> = Vec::new();
+        let mut idle_ticket = 0usize;
         while rt.committed() < n && !rt.aborted() {
             let handed = immediate.is_some();
             let popped = if let Some(pair) = immediate.take() {
@@ -223,6 +224,10 @@ where
                     }
                 }
                 try_commit(worker, n, rt, mv, live, trace, commit_mu, tl);
+                // Sample before the pop. A wake that arrives after this and
+                // after an empty pop changes the ticket, so the idle wait
+                // returns instead of sleeping out the timeout.
+                idle_ticket = rt.work_ticket();
                 let found = {
                     let _c = super::timeline::CycGuard::enter(tl, super::timeline::CYC_SCHED);
                     let _b = super::buckets::Guard::start(super::buckets::SCHED);
@@ -423,6 +428,7 @@ where
                     try_commit(worker, n, rt, mv, live, trace, commit_mu, tl);
                 }
             } else {
+                let ticket = idle_ticket;
                 rt.note_idle_sample();
                 live.note_idle(true);
                 if tl && idle_since == 0 {
@@ -433,7 +439,7 @@ where
                     break;
                 }
                 if !rt.rescue(worker) {
-                    rt.wait_work();
+                    rt.wait_work(ticket);
                     idle_waited = true;
                 }
             }

@@ -77,6 +77,8 @@ pub(crate) struct Runtime {
     idle_hi_q8: AtomicU64,
     control_tick: AtomicUsize,
     ready_depth: AtomicUsize,
+    /// Bumped under `mu` on every wake of the work condvar.
+    work_seq: AtomicUsize,
     sticky_flag: Vec<AtomicBool>,
 }
 
@@ -117,6 +119,7 @@ impl Runtime {
             idle_hi_q8: AtomicU64::new(128),
             control_tick: AtomicUsize::new(0),
             ready_depth: AtomicUsize::new(0),
+            work_seq: AtomicUsize::new(0),
             sticky_flag: (0..workers).map(|_| AtomicBool::new(false)).collect(),
         }
     }
@@ -163,8 +166,14 @@ impl Runtime {
 
     pub(crate) fn request_abort(&self) {
         self.abort.store(true, Ordering::Release);
+        let _guard = self.mu.lock().unwrap();
+        self.work_seq.fetch_add(1, Ordering::Release);
         self.cv.notify_all();
         self.sleep_cv.notify_all();
+    }
+
+    pub(crate) fn work_ticket(&self) -> usize {
+        self.work_seq.load(Ordering::Acquire)
     }
 
     pub(crate) fn active_now(&self) -> usize {
@@ -283,6 +292,7 @@ impl Runtime {
             self.idle_hi_q8.store(next_hi as u64, Ordering::Relaxed);
         }
         active = active.clamp(1, cap);
+        let _guard = self.mu.lock().unwrap();
         let prev = self.active.swap(active, Ordering::Release);
         self.peak_active.fetch_max(active, Ordering::Relaxed);
         if active > prev {
@@ -313,15 +323,25 @@ impl Runtime {
     }
 
     /// Park an active worker that found nothing to run. Not a spin.
-    pub(crate) fn wait_work(&self) {
+    ///
+    /// `ticket` is `work_ticket()` from before the last empty pop. A wake that
+    /// landed in between returns immediately instead of sleeping the timeout.
+    pub(crate) fn wait_work(&self, ticket: usize) {
         let guard = self.mu.lock().unwrap();
+        if self.work_seq.load(Ordering::Acquire) != ticket
+            || self.aborted()
+            || self.committed() >= self.n
+        {
+            return;
+        }
         self.parked.fetch_add(1, Ordering::Relaxed);
-        self.note_idle_sample();
         let _ = self.cv.wait_timeout(guard, Duration::from_millis(200));
         self.woken.fetch_add(1, Ordering::Relaxed);
     }
 
     fn poke_work(&self) {
+        let _guard = self.mu.lock().unwrap();
+        self.work_seq.fetch_add(1, Ordering::Release);
         self.cv.notify_one();
     }
 
@@ -367,6 +387,8 @@ impl Runtime {
 
     #[allow(dead_code)]
     pub(crate) fn notify(&self) {
+        let _guard = self.mu.lock().unwrap();
+        self.work_seq.fetch_add(1, Ordering::Release);
         self.cv.notify_all();
         self.sleep_cv.notify_all();
     }
@@ -518,7 +540,11 @@ impl Runtime {
         self.sticky_flag[owner].store(true, Ordering::Release);
         drop(inner);
         // The owner is inside the active set. If it is idle it waits on `cv`,
-        // not on the inactive-worker condvar.
+        // not on the inactive-worker condvar. The sequence is published under
+        // the same mutex the waiter holds, so the wake cannot land early and
+        // be lost.
+        let _guard = self.mu.lock().unwrap();
+        self.work_seq.fetch_add(1, Ordering::Release);
         self.cv.notify_all();
         true
     }
@@ -832,11 +858,13 @@ impl Runtime {
             self.wake_final_locked(&mut inner, worker, tx);
             let finished = self.committed.load(Ordering::Relaxed) == self.n;
             drop(inner);
+            let _guard = self.mu.lock().unwrap();
+            self.work_seq.fetch_add(1, Ordering::Release);
             if finished {
                 self.cv.notify_all();
                 self.sleep_cv.notify_all();
             } else {
-                self.poke_work();
+                self.cv.notify_one();
             }
             true
         } else {
