@@ -6,7 +6,10 @@
 
 use std::{
     collections::{BTreeMap, HashSet},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use alloy_primitives::{Address, B256, U256};
@@ -145,6 +148,10 @@ pub(crate) struct SfMv {
     read_index: DashMap<MemoryLocationHash, Vec<TxIdx>, BuildIdentityHasher>,
     lazy_addresses: Mutex<LazyAddresses>,
     pub(crate) new_bytecodes: DashMap<B256, revm::state::Bytecode, BuildSuffixHasher>,
+    /// Keep per-transaction read origins. Wall-clock serial turns this off.
+    track_reads: AtomicBool,
+    /// Insert readers into the location index. Serial never validates concurrently.
+    index_reads: AtomicBool,
 }
 
 impl SfMv {
@@ -170,7 +177,21 @@ impl SfMv {
             read_index: DashMap::default(),
             lazy_addresses: Mutex::new(LazyAddresses::from_iter(lazy_addresses)),
             new_bytecodes: DashMap::default(),
+            track_reads: AtomicBool::new(true),
+            index_reads: AtomicBool::new(true),
         }
+    }
+
+    pub(crate) fn set_track_reads(&self, on: bool) {
+        self.track_reads.store(on, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_index_reads(&self, on: bool) {
+        self.index_reads.store(on, Ordering::Relaxed);
+    }
+
+    pub(crate) fn tracks_reads(&self) -> bool {
+        self.track_reads.load(Ordering::Relaxed)
     }
 
     pub(crate) fn add_lazy_addresses(&self, new_lazy_addresses: impl IntoIterator<Item = Address>) {
@@ -188,7 +209,11 @@ impl SfMv {
     ) -> bool {
         let mut last_locations = index_mutex!(self.last_locations, tx_version.tx_idx);
         last_locations.sealed = true;
-        last_locations.read = read_set;
+        if self.track_reads.load(Ordering::Relaxed) {
+            last_locations.read = read_set;
+        } else {
+            last_locations.read.clear();
+        }
 
         let mut last_location_idx = 0;
         while last_location_idx < last_locations.write.len() {
@@ -203,8 +228,10 @@ impl SfMv {
             }
         }
 
-        for (location, origins) in &last_locations.read {
-            self.note_read(tx_version.tx_idx, *location, origins);
+        if self.index_reads.load(Ordering::Relaxed) {
+            for (location, origins) in &last_locations.read {
+                self.note_read(tx_version.tx_idx, *location, origins);
+            }
         }
 
         let mut wrote_new_location = false;
@@ -328,6 +355,23 @@ impl SfMv {
     }
 
     /// `None` when every recorded origin still matches the live entry's identity and value.
+    /// Why a folded origin does not match. `0` when it matches or was not folded.
+    pub(crate) fn fold_reason(&self, tx_idx: TxIdx, location: MemoryLocationHash) -> u8 {
+        if tx_idx >= self.last_locations.len() {
+            return 0;
+        }
+        let fold = {
+            let last = index_mutex!(self.last_locations, tx_idx);
+            match last.read.get(&location).and_then(|origins| origins.first()) {
+                Some(SfReadOrigin::Folded(fold)) => fold.clone(),
+                _ => return 0,
+            }
+        };
+        fold_mismatch(self, location, tx_idx, &fold)
+            .map(|(_, _, reason)| reason)
+            .unwrap_or(0)
+    }
+
     pub(crate) fn origin_is_folded(&self, tx_idx: TxIdx, location: MemoryLocationHash) -> bool {
         if tx_idx >= self.last_locations.len() {
             return false;
@@ -468,7 +512,7 @@ fn mismatch_writers(
     prior_origins: &SfReadOrigins,
 ) -> Option<(Option<TxIdx>, Option<TxIdx>)> {
     if let Some(SfReadOrigin::Folded(fold)) = prior_origins.first() {
-        return fold_mismatch(mv, location, tx_idx, fold);
+        return fold_mismatch(mv, location, tx_idx, fold).map(|(origin, live, _)| (origin, live));
     }
     let data = &mv.data;
     if let Some(written_transactions) = data.get(&location) {
@@ -524,12 +568,18 @@ fn mismatch_writers(
     }
 }
 
+pub(crate) const DELTA_BASE: u8 = 1;
+pub(crate) const DELTA_NON_LAZY: u8 = 2;
+pub(crate) const DELTA_AMOUNT: u8 = 3;
+pub(crate) const DELTA_ESTIMATE: u8 = 4;
+pub(crate) const DELTA_SEALED: u8 = 5;
+
 fn fold_mismatch(
     mv: &SfMv,
     location: MemoryLocationHash,
     reader: TxIdx,
     fold: &FoldedRead,
-) -> Option<(Option<TxIdx>, Option<TxIdx>)> {
+) -> Option<(Option<TxIdx>, Option<TxIdx>, u8)> {
     let start = fold.base_tx.map(|tx| tx.saturating_add(1)).unwrap_or(0);
     if let Some(base_tx) = fold.base_tx {
         let ok = mv.data.get(&location).is_some_and(|written| {
@@ -544,7 +594,7 @@ fn fold_mismatch(
                 .data
                 .get(&location)
                 .and_then(|written| written.range(..reader).next_back().map(|(tx, _)| *tx));
-            return Some((Some(base_tx), live));
+            return Some((Some(base_tx), live, DELTA_BASE));
         }
     }
     let mut ops: Vec<(TxIdx, bool, U256)> = Vec::new();
@@ -557,16 +607,18 @@ fn fold_mismatch(
                 MemoryEntry::Data(_, MemoryValue::LazySender(amount)) => {
                     ops.push((*tx, true, *amount));
                 }
-                MemoryEntry::Estimate => return Some((fold.base_tx, Some(*tx))),
-                MemoryEntry::Data(_, _) => return Some((fold.base_tx, Some(*tx))),
+                MemoryEntry::Estimate => return Some((fold.base_tx, Some(*tx), DELTA_ESTIMATE)),
+                MemoryEntry::Data(_, _) => return Some((fold.base_tx, Some(*tx), DELTA_NON_LAZY)),
             }
         }
     }
+    let mut sealed = false;
     for delta in &fold.deltas {
         if ops.iter().any(|(tx, _, _)| *tx == delta.tx_idx) {
             continue;
         }
         let amount = if mv.sealed_without(delta.tx_idx, location) {
+            sealed = true;
             U256::ZERO
         } else {
             delta.amount
@@ -580,7 +632,7 @@ fn fold_mismatch(
         .collect();
     let (positive, addition, nonce) = net_lazy(&net_ops);
     let MemoryValue::Basic(mut account) = fold.base.clone() else {
-        return Some((fold.base_tx, None));
+        return Some((fold.base_tx, None, DELTA_BASE));
     };
     apply_net(&mut account, positive, addition, nonce);
     if account == fold.consumed {
@@ -593,6 +645,7 @@ fn fold_mismatch(
                 .map(|delta| delta.tx_idx)
                 .or(fold.base_tx),
             live,
+            if sealed { DELTA_SEALED } else { DELTA_AMOUNT },
         ))
     }
 }

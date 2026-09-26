@@ -197,6 +197,21 @@ struct RunOut {
     beneficiary: u64,
     delta_mismatch: usize,
     delta_abort: usize,
+    learned_active: usize,
+    learned_peak: usize,
+    parked: usize,
+    woken: usize,
+    hops: usize,
+    hops_same_worker: usize,
+    hop_gap_max_ns: u64,
+    pipelined_hops: usize,
+    hot_location: u64,
+    hot_hops: usize,
+    hot_same: usize,
+    hot_gap_max_ns: u64,
+    hot_exec_ns: u64,
+    hot_span_ns: u64,
+    delta_notes: Vec<pevm::specfence::DeltaNote>,
     attempts: Vec<SfAttempt>,
 }
 
@@ -260,6 +275,21 @@ fn run_once(loaded: &Loaded, engine: &str, workers: usize, seq_cpus: &[usize]) -
         beneficiary: 0,
         delta_mismatch: 0,
         delta_abort: 0,
+        learned_active: 0,
+        learned_peak: 0,
+        parked: 0,
+        woken: 0,
+        hops: 0,
+        hops_same_worker: 0,
+        hop_gap_max_ns: 0,
+        pipelined_hops: 0,
+        hot_location: 0,
+        hot_hops: 0,
+        hot_same: 0,
+        hot_gap_max_ns: 0,
+        hot_exec_ns: 0,
+        hot_span_ns: 0,
+        delta_notes: Vec::new(),
         attempts: Vec::new(),
     };
     if engine == "sf"
@@ -278,6 +308,21 @@ fn run_once(loaded: &Loaded, engine: &str, workers: usize, seq_cpus: &[usize]) -
         out.beneficiary = trace.beneficiary;
         out.delta_mismatch = trace.delta_mismatch;
         out.delta_abort = trace.delta_abort;
+        out.learned_active = trace.learned_active;
+        out.learned_peak = trace.learned_peak;
+        out.parked = trace.parked;
+        out.woken = trace.woken;
+        out.hops = trace.hops;
+        out.hops_same_worker = trace.hops_same_worker;
+        out.hop_gap_max_ns = trace.hop_gap_max_ns;
+        out.pipelined_hops = trace.pipelined_hops;
+        out.hot_location = trace.hot_location;
+        out.hot_hops = trace.hot_hops;
+        out.hot_same = trace.hot_same;
+        out.hot_gap_max_ns = trace.hot_gap_max_ns;
+        out.hot_exec_ns = trace.hot_exec_ns;
+        out.hot_span_ns = trace.hot_span_ns;
+        out.delta_notes = trace.delta_notes;
         out.attempts = trace.attempts;
     }
     let _ = result;
@@ -355,6 +400,26 @@ fn write_row(
         "chain_len": row.chain_len,
         "delta_mismatch": row.delta_mismatch,
         "delta_abort": row.delta_abort,
+        "learned_active": row.learned_active,
+        "learned_peak": row.learned_peak,
+        "parked": row.parked,
+        "woken": row.woken,
+        "hops": row.hops,
+        "hops_same_worker": row.hops_same_worker,
+        "hop_gap_max_ns": row.hop_gap_max_ns,
+        "pipelined_hops": row.pipelined_hops,
+        "hot_location": row.hot_location,
+        "hot_hops": row.hot_hops,
+        "hot_same": row.hot_same,
+        "hot_gap_max_ns": row.hot_gap_max_ns,
+        "hot_exec_ns": row.hot_exec_ns,
+        "hot_span_ns": row.hot_span_ns,
+        "delta_notes": row.delta_notes.iter().map(|note| serde_json::json!({
+            "reader": note.reader,
+            "location": note.location,
+            "writer": note.writer,
+            "reason": note.reason,
+        })).collect::<Vec<_>>(),
         "armed": row.armed,
         "exec_entries": row.exec_entries,
         "class_key": row.class_key,
@@ -374,7 +439,7 @@ fn write_row(
     });
     writeln!(out, "{line}").expect("write row");
     println!(
-        "ROW block={} engine={} round={} workers={} wall_ms={:.3} ok={} reexec={} full_replay={} chain_len={} delta_mismatch={} delta_abort={} class_key={}",
+        "ROW block={} engine={} round={} workers={} wall_ms={:.3} ok={} reexec={} full_replay={} chain_len={} delta_mismatch={} delta_abort={} learned_active={} hops={} hops_same={} hop_gap_max_ns={} hot={:#x} hot_hops={}/{} hot_gap_us={:.1} hot_span_us={:.1} hot_exec_us={:.1} class_key={}",
         loaded.block_no,
         engine,
         round,
@@ -386,6 +451,16 @@ fn write_row(
         row.chain_len,
         row.delta_mismatch,
         row.delta_abort,
+        row.learned_active,
+        row.hops,
+        row.hops_same_worker,
+        row.hop_gap_max_ns,
+        row.hot_location,
+        row.hot_same,
+        row.hot_hops,
+        row.hot_gap_max_ns as f64 / 1000.0,
+        row.hot_span_ns as f64 / 1000.0,
+        row.hot_exec_ns as f64 / 1000.0,
         row.class_key,
     );
 }
@@ -492,9 +567,37 @@ fn receipt_check(loaded: &Loaded, workers: usize, n: usize, label: &str) {
     }
 }
 
+struct Cli {
+    cpu_list: Option<String>,
+    workers: Option<usize>,
+}
+
+fn apply_cli() -> Cli {
+    let mut cpu_list = None;
+    let mut workers = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        let (key, inline) = if let Some((key, value)) = arg.split_once('=') {
+            (key, Some(value.to_string()))
+        } else {
+            (arg.as_str(), None)
+        };
+        let mut value = || inline.clone().or_else(|| args.next()).unwrap_or_default();
+        match key {
+            "--cpu-list" => cpu_list = Some(value()),
+            "--workers" => workers = value().parse().ok(),
+            _ => {}
+        }
+    }
+    Cli { cpu_list, workers }
+}
+
 fn main() {
+    let cli = apply_cli();
     let which = env_str("SPECFENCE_INFLATION_WHICH", "scan");
-    let workers = env_usize("SPECFENCE_COMPARE_CORES", 4);
+    let workers = cli
+        .workers
+        .unwrap_or_else(|| env_usize("SPECFENCE_COMPARE_CORES", 4));
     let blocks = block_list();
     if which == "steptrace" {
         let out_path = std::env::var("SPECFENCE_INFLATION_OUT").ok();
@@ -542,7 +645,13 @@ fn main() {
     let seq_cpu = env_usize("SPECFENCE_INFLATION_SEQ_CPU", 0);
     let seed = env_usize("SPECFENCE_INFLATION_SEED", 1) as u64;
     let dump = std::env::var("SPECFENCE_INFLATION_DUMP").ok().as_deref() == Some("1");
-    let pin = parse_cpus(&std::env::var("SPECFENCE_PIN_CPUS").unwrap_or_default());
+    let pin = match cli.cpu_list {
+        Some(list) => parse_cpus(&list),
+        None => parse_cpus(&std::env::var("SPECFENCE_PIN_CPUS").unwrap_or_default()),
+    };
+    // Threads are created here, before the timed rounds. `dispatch` reuses
+    // this pool when the environment list is empty or already applied.
+    pevm::specfence::prepare_workers(&pin, workers);
     let seq_cpus = if pin.is_empty() || pin.contains(&seq_cpu) {
         vec![seq_cpu]
     } else {

@@ -5,7 +5,7 @@
 //! is `SPECFENCE_INFLATION`. It is off on the wall-clock path, so that path
 //! does not call `Instant::now`.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 fn flag(name: &str) -> bool {
     matches!(
@@ -98,6 +98,19 @@ pub struct SfAttempt {
     pub lazy_writes: Vec<u64>,
 }
 
+/// One folded read whose final value did not match the prediction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeltaNote {
+    /// Transaction that folded the prediction.
+    pub reader: u32,
+    /// Basic-account hash.
+    pub location: u64,
+    /// Writer the validator blamed. `u32::MAX` when that side is absent.
+    pub writer: u32,
+    /// 1 base changed, 2 non-lazy write in the span, 3 amount, 4 estimate, 5 sealed without the credit.
+    pub reason: u8,
+}
+
 pub(crate) struct Trace {
     on: bool,
     profile: bool,
@@ -110,6 +123,21 @@ pub(crate) struct Trace {
     pub(crate) delta_mismatch: AtomicUsize,
     /// Those mismatches that aborted the reader.
     pub(crate) delta_abort: AtomicUsize,
+    pub(crate) learned_active: AtomicUsize,
+    pub(crate) learned_peak: AtomicUsize,
+    pub(crate) parked: AtomicUsize,
+    pub(crate) woken: AtomicUsize,
+    pub(crate) hops: AtomicUsize,
+    pub(crate) hops_same_worker: AtomicUsize,
+    pub(crate) hop_gap_max_ns: AtomicU64,
+    pub(crate) pipelined_hops: AtomicUsize,
+    hot_loc: AtomicU64,
+    hot_hops: AtomicUsize,
+    hot_same: AtomicUsize,
+    hot_gap: AtomicU64,
+    hot_exec: AtomicU64,
+    hot_span: AtomicU64,
+    delta_notes: std::sync::Mutex<Vec<DeltaNote>>,
     pub(crate) raw_edges: std::sync::Mutex<Vec<(u32, u32)>>,
     pub(crate) tx_ns: std::sync::Mutex<Vec<u64>>,
     attempts: std::sync::Mutex<Vec<SfAttempt>>,
@@ -133,6 +161,21 @@ impl Trace {
             full_replay_after_arm: AtomicUsize::new(0),
             delta_mismatch: AtomicUsize::new(0),
             delta_abort: AtomicUsize::new(0),
+            learned_active: AtomicUsize::new(0),
+            learned_peak: AtomicUsize::new(0),
+            parked: AtomicUsize::new(0),
+            woken: AtomicUsize::new(0),
+            hops: AtomicUsize::new(0),
+            hops_same_worker: AtomicUsize::new(0),
+            hop_gap_max_ns: AtomicU64::new(0),
+            pipelined_hops: AtomicUsize::new(0),
+            hot_loc: AtomicU64::new(0),
+            hot_hops: AtomicUsize::new(0),
+            hot_same: AtomicUsize::new(0),
+            hot_gap: AtomicU64::new(0),
+            hot_exec: AtomicU64::new(0),
+            hot_span: AtomicU64::new(0),
+            delta_notes: std::sync::Mutex::new(Vec::new()),
             raw_edges: std::sync::Mutex::new(Vec::new()),
             tx_ns: std::sync::Mutex::new(if on { vec![0; n] } else { Vec::new() }),
             attempts: std::sync::Mutex::new(Vec::new()),
@@ -270,6 +313,63 @@ impl Trace {
     }
 
     #[inline]
+    pub(crate) fn note_hop(&self, same_worker: bool, gap_ns: u64, pipelined: bool) {
+        self.hops.fetch_add(1, Ordering::Relaxed);
+        if same_worker {
+            self.hops_same_worker.fetch_add(1, Ordering::Relaxed);
+        }
+        if pipelined {
+            self.pipelined_hops.fetch_add(1, Ordering::Relaxed);
+        }
+        let _ = self
+            .hop_gap_max_ns
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                (gap_ns > cur).then_some(gap_ns)
+            });
+    }
+
+    pub(crate) fn note_delta(
+        &self,
+        reader: usize,
+        location: u64,
+        writer: Option<usize>,
+        reason: u8,
+    ) {
+        if self.delta_notes.lock().unwrap().len() >= 8 {
+            return;
+        }
+        self.delta_notes.lock().unwrap().push(DeltaNote {
+            reader: reader as u32,
+            location,
+            writer: writer.map(|tx| tx as u32).unwrap_or(u32::MAX),
+            reason,
+        });
+    }
+
+    pub(crate) fn note_hot(
+        &self,
+        location: u64,
+        hops: usize,
+        same: usize,
+        gap_ns: u64,
+        exec_ns: u64,
+        span_ns: u64,
+    ) {
+        self.hot_loc.store(location, Ordering::Relaxed);
+        self.hot_hops.store(hops, Ordering::Relaxed);
+        self.hot_same.store(same, Ordering::Relaxed);
+        self.hot_gap.store(gap_ns, Ordering::Relaxed);
+        self.hot_exec.store(exec_ns, Ordering::Relaxed);
+        self.hot_span.store(span_ns, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_sched(&self, active: usize, peak: usize, parked: usize, woken: usize) {
+        self.learned_active.store(active, Ordering::Relaxed);
+        self.learned_peak.store(peak, Ordering::Relaxed);
+        self.parked.store(parked, Ordering::Relaxed);
+        self.woken.store(woken, Ordering::Relaxed);
+    }
+
     pub(crate) fn note_exec(&self, incarnation: usize) {
         self.exec_entries.fetch_add(1, Ordering::Relaxed);
         if incarnation > 0 {
@@ -379,6 +479,36 @@ pub struct SfTrace {
     pub delta_mismatch: usize,
     /// Reader aborts caused by those mismatches.
     pub delta_abort: usize,
+    /// Active workers at the end of the block.
+    pub learned_active: usize,
+    /// Highest active-set size during the block.
+    pub learned_peak: usize,
+    /// Times a worker parked on a condvar.
+    pub parked: usize,
+    /// Times a parked worker was woken.
+    pub woken: usize,
+    /// RMW hops with a previous writer on the same location.
+    pub hops: usize,
+    /// Those hops whose previous writer ran on this worker.
+    pub hops_same_worker: usize,
+    /// Longest gap from the previous RMW end to this RMW start.
+    pub hop_gap_max_ns: u64,
+    /// Hops that started before the previous RMW finished.
+    pub pipelined_hops: usize,
+    /// Location with the most RMW hops.
+    pub hot_location: u64,
+    /// Hops on that location.
+    pub hot_hops: usize,
+    /// Those hops whose previous writer was this worker.
+    pub hot_same: usize,
+    /// Longest hop gap on that location.
+    pub hot_gap_max_ns: u64,
+    /// Sum of RMW execution on that location.
+    pub hot_exec_ns: u64,
+    /// First RMW start to last RMW end on that location.
+    pub hot_span_ns: u64,
+    /// Up to eight folded mismatches, with the reader, location, and reason.
+    pub delta_notes: Vec<DeltaNote>,
     /// Profile attempts. Empty unless `SPECFENCE_INFLATION` is set.
     pub attempts: Vec<SfAttempt>,
 }
@@ -418,6 +548,21 @@ impl Trace {
             beneficiary,
             delta_mismatch: self.delta_mismatch.load(Ordering::Relaxed),
             delta_abort: self.delta_abort.load(Ordering::Relaxed),
+            learned_active: self.learned_active.load(Ordering::Relaxed),
+            learned_peak: self.learned_peak.load(Ordering::Relaxed),
+            parked: self.parked.load(Ordering::Relaxed),
+            woken: self.woken.load(Ordering::Relaxed),
+            hops: self.hops.load(Ordering::Relaxed),
+            hops_same_worker: self.hops_same_worker.load(Ordering::Relaxed),
+            hop_gap_max_ns: self.hop_gap_max_ns.load(Ordering::Relaxed),
+            pipelined_hops: self.pipelined_hops.load(Ordering::Relaxed),
+            hot_location: self.hot_loc.load(Ordering::Relaxed),
+            hot_hops: self.hot_hops.load(Ordering::Relaxed),
+            hot_same: self.hot_same.load(Ordering::Relaxed),
+            hot_gap_max_ns: self.hot_gap.load(Ordering::Relaxed),
+            hot_exec_ns: self.hot_exec.load(Ordering::Relaxed),
+            hot_span_ns: self.hot_span.load(Ordering::Relaxed),
+            delta_notes: self.delta_notes.lock().unwrap().clone(),
             attempts,
         }
     }
