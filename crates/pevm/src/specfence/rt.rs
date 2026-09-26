@@ -1,8 +1,10 @@
-//! Index-seeded Chase-Lev scheduler and the commit prefix.
+//! Lowest-index scheduler and the commit prefix.
 //!
-//! Tasks are transaction indexes. Each worker owns one deque. The owner pops
-//! LIFO, thieves pop FIFO. Status transitions sit behind one mutex so a park
-//! and a publish cannot lose a wakeup. The mutex is not held across the EVM.
+//! Tasks are transaction indexes. Each worker owns one queue ordered by index.
+//! A pop takes the lowest ready index anywhere, and a thief takes that same
+//! lowest index rather than the oldest entry on a victim. Status transitions
+//! sit behind one mutex so a park and a publish cannot lose a wakeup. The
+//! mutex is not held across the EVM.
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -10,7 +12,7 @@ use std::time::Duration;
 
 use crate::TxIdx;
 
-use super::deque::LocalDeque;
+use super::deque::IndexQueue;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
@@ -73,7 +75,7 @@ struct Inner {
 pub(crate) struct Runtime {
     n: usize,
     inner: Mutex<Inner>,
-    deques: Vec<LocalDeque>,
+    deques: Vec<IndexQueue>,
     committed: AtomicUsize,
     /// `usize::MAX` means this transaction's current incarnation is not final.
     /// A stored incarnation is final: execution finished, its reads came from
@@ -110,15 +112,17 @@ pub(crate) struct Runtime {
     control_tick: AtomicUsize,
     ready_depth: AtomicUsize,
     /// Tasks moved off a worker that is staying on a chain handoff.
-    injector: Mutex<Vec<TxIdx>>,
-    /// `injector` length, so an empty pop does not take that mutex.
-    injector_len: AtomicUsize,
+    injector: IndexQueue,
     /// Who may enter the interpreter for this transaction, and whether they have.
     exec_gate: Vec<AtomicUsize>,
     /// Set while the worker is inside a condvar wait. An unstarted task owned
     /// by an idle worker is claimable; stealing from a worker that is about to
     /// enter would bounce the task and never run it.
     worker_idle: Vec<AtomicBool>,
+    /// Transaction this worker has bound and not yet left. `0` means none,
+    /// otherwise `tx + 1`. A task whose owner is busy on a different index is
+    /// not in the interpreter and must be claimable.
+    worker_task: Vec<AtomicUsize>,
     /// Active-set size at each control decision, in order, capped.
     active_samples: Mutex<Vec<u16>>,
     /// Bumped under `mu` on every wake of the work condvar.
@@ -142,7 +146,7 @@ impl Runtime {
                 dependents: (0..n).map(|_| Vec::new()).collect(),
                 sticky: (0..workers).map(|_| Vec::new()).collect(),
             }),
-            deques: (0..workers).map(|_| LocalDeque::with_capacity(n)).collect(),
+            deques: (0..workers).map(|_| IndexQueue::new()).collect(),
             committed: AtomicUsize::new(0),
             validated: (0..n).map(|_| AtomicUsize::new(usize::MAX)).collect(),
             executing: AtomicUsize::new(0),
@@ -165,20 +169,20 @@ impl Runtime {
             pop_skips: AtomicUsize::new(0),
             control_tick: AtomicUsize::new(0),
             ready_depth: AtomicUsize::new(0),
-            injector: Mutex::new(Vec::new()),
-            injector_len: AtomicUsize::new(0),
+            injector: IndexQueue::new(),
             exec_gate: (0..n).map(|_| AtomicUsize::new(0)).collect(),
             worker_idle: (0..workers).map(|_| AtomicBool::new(false)).collect(),
+            worker_task: (0..workers).map(|_| AtomicUsize::new(0)).collect(),
             active_samples: Mutex::new(Vec::new()),
             work_seq: AtomicUsize::new(0),
             sticky_flag: (0..workers).map(|_| AtomicBool::new(false)).collect(),
         }
     }
 
-    /// Strided index seeding. Worker `w` owns `w, w+C, w+2C, ...`, pushed
-    /// high-to-low so the owner LIFO runs the lowest index first. The first
-    /// wave is transactions `0..C`, which lets a class head publish before
-    /// later strides start.
+    /// Strided index seeding. Worker `w` owns `w, w+C, w+2C, ...`. The queue
+    /// is ordered by index, so the first pop is the lowest ready transaction,
+    /// not the most recently pushed one. The first wave is transactions
+    /// `0..C`, which lets a class head publish before later strides start.
     ///
     /// A commit window that hid the tail was measured on 15274915. Readers
     /// three transactions apart still aborted, and the hot-chain gap grew,
@@ -192,10 +196,10 @@ impl Runtime {
                 owned.push(tx);
                 tx += self.workers;
             }
-            for tx in owned.into_iter().rev() {
+            for tx in owned {
                 inner.status[tx].queued = true;
                 self.ready_depth.fetch_add(1, Ordering::Relaxed);
-                self.deques[w].push_bottom(tx);
+                self.deques[w].push(tx);
             }
         }
         // Every seeded task is ready. Leaving `active` at 1 parks the other
@@ -302,34 +306,19 @@ impl Runtime {
     /// Move this worker's stealable tasks onto the shared injector.
     ///
     /// Called when the worker is about to stay on a chain handoff. Those
-    /// tasks would otherwise sit under the handoff until this worker popped
-    /// again. Only the owner pops its bottom, so the move is safe.
+    /// tasks would otherwise sit in this worker's queue until it popped again.
     pub(crate) fn spill_owned(&self, worker: usize) {
         if worker >= self.workers {
             return;
         }
-        let mut moved = Vec::new();
-        while let Some(tx) = self.deques[worker].pop_bottom() {
-            moved.push(tx);
-        }
+        let moved = self.deques[worker].drain();
         if moved.is_empty() {
             return;
         }
-        let mut queue = self.injector.lock().unwrap();
-        queue.extend(moved);
-        self.injector_len.store(queue.len(), Ordering::Release);
-        drop(queue);
-        self.poke_work();
-    }
-
-    fn pop_injector(&self) -> Option<TxIdx> {
-        if self.injector_len.load(Ordering::Acquire) == 0 {
-            return None;
+        for tx in moved {
+            self.injector.push(tx);
         }
-        let mut queue = self.injector.lock().unwrap();
-        let tx = queue.pop();
-        self.injector_len.store(queue.len(), Ordering::Release);
-        tx
+        self.poke_work();
     }
 
     /// Grow and shrink from work that is queued or inside the interpreter.
@@ -498,6 +487,12 @@ impl Runtime {
     }
 
     fn set_phase(&self, inner: &mut Inner, tx: usize, phase: Phase) {
+        let leaving_exec = inner.status[tx].phase == Phase::Executing && phase != Phase::Executing;
+        let owner_gate = if leaving_exec {
+            self.exec_gate[tx].load(Ordering::Acquire)
+        } else {
+            0
+        };
         inner.status[tx].phase = phase;
         let bits = match &inner.status[tx].phase {
             Phase::Ready => PH_READY,
@@ -510,6 +505,14 @@ impl Runtime {
         self.phases[tx].store(bits, Ordering::Release);
         if bits != PH_EXEC {
             self.exec_gate[tx].store(0, Ordering::Release);
+            if leaving_exec && owner_gate != 0 {
+                let id = owner_gate >> 1;
+                if id > 0
+                    && let Some(slot) = self.worker_task.get(id - 1)
+                {
+                    let _ = slot.compare_exchange(tx + 1, 0, Ordering::AcqRel, Ordering::Relaxed);
+                }
+            }
         }
     }
 
@@ -570,20 +573,6 @@ impl Runtime {
         }
     }
 
-    fn owner_is_idle(&self, tx: TxIdx) -> bool {
-        let cur = self.exec_gate[tx].load(Ordering::Acquire);
-        if cur & GATE_RUNNING != 0 {
-            return false;
-        }
-        let id = cur >> 1;
-        if id == 0 {
-            return false;
-        }
-        self.worker_idle
-            .get(id - 1)
-            .is_some_and(|flag| flag.load(Ordering::Acquire))
-    }
-
     fn steal_unstarted(&self, worker: usize, tx: TxIdx) -> bool {
         if tx >= self.n {
             return false;
@@ -604,6 +593,16 @@ impl Runtime {
                 .compare_exchange(cur, mine, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
+                let old = cur >> 1;
+                if old > 0
+                    && old - 1 != worker
+                    && let Some(slot) = self.worker_task.get(old - 1)
+                {
+                    let _ = slot.compare_exchange(tx + 1, 0, Ordering::AcqRel, Ordering::Relaxed);
+                }
+                if let Some(slot) = self.worker_task.get(worker) {
+                    slot.store(tx + 1, Ordering::Release);
+                }
                 return self.exec_gate[tx].load(Ordering::Acquire) & GATE_RUNNING == 0;
             }
         }
@@ -611,6 +610,99 @@ impl Runtime {
 
     fn bind_owner(&self, worker: usize, tx: TxIdx) {
         self.exec_gate[tx].store(gate_pack(worker, false), Ordering::Release);
+        if let Some(slot) = self.worker_task.get(worker) {
+            slot.store(tx + 1, Ordering::Release);
+        }
+    }
+
+    /// The owner has bound `tx` and has not gone idle. It is in the pre-check,
+    /// about to enter the interpreter. Stealing here bounces the task.
+    fn owner_busy_on(&self, tx: TxIdx) -> bool {
+        let cur = self.exec_gate[tx].load(Ordering::Acquire);
+        if cur == 0 || cur & GATE_RUNNING != 0 {
+            return false;
+        }
+        let id = cur >> 1;
+        if id == 0 {
+            return false;
+        }
+        let owner = id - 1;
+        let on_task = self
+            .worker_task
+            .get(owner)
+            .is_some_and(|slot| slot.load(Ordering::Acquire) == tx + 1);
+        let idle = self
+            .worker_idle
+            .get(owner)
+            .is_some_and(|flag| flag.load(Ordering::Acquire));
+        on_task && !idle
+    }
+
+    /// Drop every queued copy. Hints skip a queue that cannot hold `tx`.
+    fn unqueue(&self, tx: usize) {
+        for queue in &self.deques {
+            let hint = queue.hint();
+            if hint != usize::MAX && hint <= tx {
+                queue.remove(tx);
+            }
+        }
+        let hint = self.injector.hint();
+        if hint != usize::MAX && hint <= tx {
+            self.injector.remove(tx);
+        }
+    }
+
+    /// This worker's lowest index, else the lowest index on any other queue.
+    fn pop_one(&self, worker: usize) -> Option<usize> {
+        if let Some(queue) = self.deques.get(worker) {
+            let hint = queue.hint();
+            if hint != usize::MAX
+                && let Some(tx) = queue.pop_if_lowest(hint)
+            {
+                return Some(tx);
+            }
+        }
+        let spins = self.workers.saturating_mul(4).max(8);
+        for _ in 0..spins {
+            let mut best = usize::MAX;
+            let mut from_injector = false;
+            let mut owner = 0usize;
+            for w in 0..self.workers {
+                if w == worker {
+                    continue;
+                }
+                let hint = self.deques[w].hint();
+                if hint < best {
+                    best = hint;
+                    from_injector = false;
+                    owner = w;
+                }
+            }
+            let inj = self.injector.hint();
+            if inj < best {
+                best = inj;
+                from_injector = true;
+            }
+            if best == usize::MAX {
+                // The owner's hint can move between the first try and here.
+                if let Some(queue) = self.deques.get(worker) {
+                    let hint = queue.hint();
+                    if hint != usize::MAX {
+                        return queue.pop_if_lowest(hint);
+                    }
+                }
+                return None;
+            }
+            let got = if from_injector {
+                self.injector.pop_if_lowest(best)
+            } else {
+                self.deques[owner].pop_if_lowest(best)
+            };
+            if let Some(tx) = got {
+                return Some(tx);
+            }
+        }
+        None
     }
 
     /// Not executed and not committed. Prediction skips writers that already finished.
@@ -689,21 +781,9 @@ impl Runtime {
     pub(crate) fn pop(&self, worker: usize) -> Option<(TxIdx, usize)> {
         let limit = self.n.saturating_mul(2).max(64);
         for _ in 0..limit {
-            let tx = self.deques[worker]
-                .pop_bottom()
-                .or_else(|| {
-                    let n = self.workers;
-                    let mut found = None;
-                    for k in 1..n {
-                        let victim = (worker + k) % n;
-                        if let Some(tx) = self.deques[victim].pop_top() {
-                            found = Some(tx);
-                            break;
-                        }
-                    }
-                    found
-                })
-                .or_else(|| self.pop_injector())?;
+            let Some(tx) = self.pop_one(worker) else {
+                return None;
+            };
             if tx >= self.n {
                 continue;
             }
@@ -811,6 +891,7 @@ impl Runtime {
                     inner.status[tx].queued = false;
                     self.dec_ready();
                 }
+                self.unqueue(tx);
                 self.set_phase(inner, tx, Phase::Sticky);
                 inner.sticky[worker].push(tx);
                 self.sticky_flag[worker].store(true, Ordering::Release);
@@ -822,8 +903,10 @@ impl Runtime {
 
     /// The commit-prefix transaction, if it is not inside the interpreter.
     ///
-    /// Later ready work must not keep this task on a deque the workers do not
-    /// pop. A parked prefix is replaced by the unstarted task it is waiting on.
+    /// Ready and sticky copies are removed from every queue, including a queue
+    /// whose owner is inside a later transaction. An executing copy is taken
+    /// when its owner is idle or busy on a different index. A parked prefix is
+    /// replaced by the unstarted task it is waiting on.
     pub(crate) fn claim_commit_frontier(&self, worker: usize) -> Option<(TxIdx, usize)> {
         let tx = self.committed();
         if tx >= self.n {
@@ -831,32 +914,30 @@ impl Runtime {
         }
         let phase = self.phases[tx].load(Ordering::Acquire);
         if phase == PH_EXEC {
-            if self.interpreter_running(tx) {
+            if self.interpreter_running(tx) || self.owner_busy_on(tx) {
                 return None;
             }
             let inner = self.inner.lock().unwrap();
-            if inner.status[tx].phase != Phase::Executing || self.interpreter_running(tx) {
+            if inner.status[tx].phase != Phase::Executing
+                || self.interpreter_running(tx)
+                || self.owner_busy_on(tx)
+            {
                 return None;
             }
-            // The owner is on its way into the interpreter. Stealing here
-            // bounces the frontier between workers.
-            if !self.owner_is_idle(tx) || !self.steal_unstarted(worker, tx) {
+            if self.exec_gate[tx].load(Ordering::Acquire) == 0 {
+                self.bind_owner(worker, tx);
+            } else if !self.steal_unstarted(worker, tx) {
                 return None;
             }
             let inc = inner.status[tx].incarnation;
             return Some((tx, inc));
         }
-        if phase == PH_READY {
+        if phase == PH_READY || phase == PH_STICKY {
             let mut inner = self.inner.lock().unwrap();
-            if inner.status[tx].phase != Phase::Ready {
+            if !matches!(inner.status[tx].phase, Phase::Ready | Phase::Sticky) {
                 return None;
             }
-            if inner.status[tx].queued {
-                inner.status[tx].queued = false;
-                self.dec_ready();
-            }
-            self.bind_owner(worker, tx);
-            self.set_phase(&mut inner, tx, Phase::Executing);
+            self.take_over(&mut inner, worker, tx);
             let inc = inner.status[tx].incarnation;
             return Some((tx, inc));
         }
@@ -899,6 +980,7 @@ impl Runtime {
                 inner.status[tx].queued = false;
                 self.dec_ready();
             }
+            self.unqueue(tx);
             self.set_phase(&mut inner, tx, Phase::Sticky);
             inner.sticky[worker].push(tx);
             self.sticky_flag[worker].store(true, Ordering::Release);
@@ -977,7 +1059,7 @@ impl Runtime {
             inner.status[tx].queued = true;
             self.ready_depth.fetch_add(1, Ordering::Relaxed);
         }
-        self.deques[worker].push_bottom(tx);
+        self.deques[worker].push(tx);
         drop(inner);
         self.poke_work();
     }
@@ -989,8 +1071,25 @@ impl Runtime {
         }
         st.queued = true;
         self.ready_depth.fetch_add(1, Ordering::Relaxed);
-        self.deques[worker].push_bottom(tx);
+        self.deques[worker].push(tx);
         true
+    }
+
+    /// Put an executing handoff back on this worker's private slot.
+    ///
+    /// The commit frontier was claimed in its place. The handoff stays ahead
+    /// of this worker's ordinary pops.
+    pub(crate) fn return_sticky(&self, worker: usize, tx: TxIdx) {
+        if worker >= self.workers || tx >= self.n {
+            return;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        if inner.status[tx].phase != Phase::Executing {
+            return;
+        }
+        self.set_phase(&mut inner, tx, Phase::Sticky);
+        inner.sticky[worker].push(tx);
+        self.sticky_flag[worker].store(true, Ordering::Release);
     }
 
     /// Park `tx` until `pred` has executed, or until that incarnation is final
@@ -1007,7 +1106,7 @@ impl Runtime {
         bump_inc: bool,
         until_final: bool,
     ) -> bool {
-        let publish = {
+        let (publish, parked) = {
             let mut inner = self.inner.lock().unwrap();
             if tx >= self.n || pred >= self.n {
                 return false;
@@ -1024,12 +1123,14 @@ impl Runtime {
                 self.dec_ready();
             }
             let mut publish = false;
+            let mut parked = false;
             let pred_done = self.pred_satisfied(&inner, pred, until_final);
             if pred_done {
                 self.set_phase(&mut inner, tx, Phase::Ready);
                 super::timeline::note_wake(tx);
                 publish |= self.enqueue_locked(&mut inner, worker, tx);
             } else {
+                parked = true;
                 self.set_phase(&mut inner, tx, Phase::Parked { pred, until_final });
                 inner.status[tx].queued = false;
                 if !inner.dependents[pred].contains(&tx) {
@@ -1045,8 +1146,17 @@ impl Runtime {
                     publish |= self.enqueue_locked(&mut inner, worker, pred);
                 }
             }
-            publish
+            (publish, parked)
         };
+        if parked {
+            let (reason, loc) = super::timeline::block_wait();
+            let reason = if reason == 0 {
+                super::timeline::OTHER
+            } else {
+                reason
+            };
+            super::timeline::open_park(tx, pred, loc, 0, reason);
+        }
         if publish {
             self.poke_work();
         }
@@ -1118,19 +1228,20 @@ impl Runtime {
             }
             match inner.status[tx].phase {
                 Phase::Executing => {
-                    // Phase is set at the pop, before `handler.run`. Waiting
-                    // on an owner who has gone idle parks on a task that is
-                    // not running. An owner still in the pre-check is about
-                    // to enter; stealing from them bounces the task.
-                    if self.interpreter_running(tx) {
+                    // Inside `handler.run`, or the owner is in the pre-check of
+                    // this task. Anywhere else the task is queued on a busy
+                    // worker and the waiter runs it.
+                    if self.interpreter_running(tx) || self.owner_busy_on(tx) {
                         return Claim::Wait(tx);
                     }
-                    if self.owner_is_idle(tx) && self.steal_unstarted(worker, tx) {
+                    if self.exec_gate[tx].load(Ordering::Acquire) == 0 {
+                        self.bind_owner(worker, tx);
                         let inc = inner.status[tx].incarnation;
                         return Claim::Run(tx, inc);
                     }
-                    if self.interpreter_running(tx) {
-                        return Claim::Wait(tx);
+                    if self.steal_unstarted(worker, tx) {
+                        let inc = inner.status[tx].incarnation;
+                        return Claim::Run(tx, inc);
                     }
                     return Claim::Wait(tx);
                 }
@@ -1161,6 +1272,7 @@ impl Runtime {
     }
 
     fn take_over(&self, inner: &mut Inner, worker: usize, tx: TxIdx) {
+        self.unqueue(tx);
         if inner.status[tx].queued {
             inner.status[tx].queued = false;
             self.dec_ready();
@@ -1614,5 +1726,53 @@ mod tests {
             rt.maybe_grow();
         }
         assert_eq!(rt.active_now(), 4, "in-flight work must hold the set");
+    }
+
+    #[test]
+    fn pop_returns_the_lowest_ready_index() {
+        let rt = Runtime::new(8, 1);
+        rt.seed();
+        rt.boost(0, 7);
+        assert_eq!(rt.pop(0).unwrap().0, 0);
+        assert_eq!(rt.pop(0).unwrap().0, 1);
+        assert_eq!(rt.pop(0).unwrap().0, 2);
+    }
+
+    #[test]
+    fn pre_check_is_not_stolen() {
+        let rt = Runtime::new(4, 2);
+        rt.seed();
+        assert_eq!(rt.pop(0).unwrap().0, 0);
+        rt.set_idle(0, false);
+        assert!(!rt.in_interpreter(0));
+        assert!(matches!(rt.claim_blocker(1, 0), Claim::Wait(0)));
+    }
+
+    #[test]
+    fn executing_owner_busy_on_a_later_tx_is_claimed() {
+        let rt = Runtime::new(4, 2);
+        rt.seed();
+        assert_eq!(rt.pop(0).unwrap().0, 0);
+        assert_eq!(rt.pop(0).unwrap().0, 2);
+        rt.set_idle(0, false);
+        match rt.claim_blocker(1, 0) {
+            Claim::Run(0, inc) => assert_eq!(inc, 0),
+            other => panic!("expected to run the unstarted predecessor, {other:?}"),
+        }
+        assert!(rt.try_enter_interp(1, 0));
+    }
+
+    #[test]
+    fn frontier_is_taken_from_a_busy_workers_queue() {
+        let rt = Runtime::new(8, 2);
+        rt.seed();
+        assert_eq!(rt.pop(0).unwrap().0, 0);
+        rt.defer(0);
+        assert_eq!(rt.pop(0).unwrap().0, 2);
+        assert!(rt.try_enter_interp(0, 2));
+        assert!(rt.rescue(0));
+        let (front, _) = rt.claim_commit_frontier(1).unwrap();
+        assert_eq!(front, 0);
+        assert!(rt.try_enter_interp(1, 0));
     }
 }

@@ -228,8 +228,15 @@ where
         let mut pending_close: Vec<TxIdx> = Vec::new();
         let mut idle_ticket = 0usize;
         while rt.committed() < n && !rt.aborted() {
+            let _iter = super::timeline::WorkSpan::begin();
             let popped = if let Some(pair) = immediate.take() {
-                Some(pair)
+                match rt.claim_commit_frontier(worker) {
+                    Some(front) if front.0 != pair.0 => {
+                        rt.return_sticky(worker, pair.0);
+                        Some(front)
+                    }
+                    _ => Some(pair),
+                }
             } else {
                 rt.set_idle(worker, true);
                 let inactive = rt.wait_inactive(worker);
