@@ -479,6 +479,9 @@ where
                 match vm.execute(tx, 0, unsafe { &mut *results.slot(tx) }) {
                     Step::Done => {
                         rt.commit_serial(tx);
+                        // Profile rows use kind=1 as the committed attempt.
+                        // The parallel prefix does this inside try_commit.
+                        trace.note_committed(tx, 0);
                         break;
                     }
                     Step::Retry | Step::Yield | Step::Block(_) => continue,
