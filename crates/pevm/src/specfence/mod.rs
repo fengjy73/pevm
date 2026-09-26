@@ -10,6 +10,7 @@
 //! The interpreter charges that static gas before the handler, and stock
 //! `SLOAD` does not charge it again.
 
+mod bloom;
 mod buckets;
 mod deque;
 mod engine;

@@ -78,6 +78,14 @@ struct VmDb<'a, S: crate::Storage> {
     track: bool,
     /// Worker-local copy. Timed runs leave this false and skip the timeline clock.
     tl_on: bool,
+    /// Base state this worker has already fetched. Used when the location
+    /// has no writer in the block. Not consulted for a location the filter hit.
+    basic_cache: HashMap<Address, Option<AccountBasic>, rustc_hash::FxBuildHasher>,
+    code_hash_cache: HashMap<Address, Option<B256>, rustc_hash::FxBuildHasher>,
+    code_cache: HashMap<B256, Bytecode, rustc_hash::FxBuildHasher>,
+    slot_cache: HashMap<(Address, U256), U256, rustc_hash::FxBuildHasher>,
+    /// `new_bytecodes` length last time the code caches were filled.
+    code_seen: usize,
 }
 
 impl<'a, S: crate::Storage> VmDb<'a, S> {
@@ -312,6 +320,26 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
             return self.code_hash_untracked(address);
         }
         let location_hash = hash_deterministic(MemoryLocation::CodeHash(address));
+        self.mv.note_reader(location_hash);
+        if self.cold_location(location_hash) {
+            super::buckets::hit(super::buckets::READ_COLD);
+            self.note_storage_origin(location_hash)?;
+            let hash = if let Some(hit) = self.code_hash_cache.get(&address) {
+                *hit
+            } else {
+                let _b = super::buckets::Guard::start(super::buckets::READ_BASE);
+                let hash = self
+                    .storage
+                    .code_hash(&address)
+                    .map_err(|err| ReadError::StorageError(err.to_string()))?;
+                self.code_hash_cache.insert(address, hash);
+                hash
+            };
+            if self.cold_location(location_hash) {
+                return Ok(hash);
+            }
+            self.read_set.remove(&location_hash);
+        }
         let serial = self.serial;
         self.coordinate(location_hash)?;
         let read_origins = self.read_set.entry(location_hash).or_default();
@@ -459,7 +487,7 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
         } else {
             self.code_hash_untracked(address)?
         };
-        let code = code_for(self, code_hash)?;
+        let code = self.cached_code(code_hash)?;
         self.read_accounts
             .insert(location_hash, (account.clone(), code_hash));
         Ok(Some(AccountInfo {
@@ -490,6 +518,146 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
         self.storage
             .storage(&address, &index)
             .map_err(|err| ReadError::StorageError(err.to_string()))
+    }
+}
+
+impl<'a, S: crate::Storage> VmDb<'a, S> {
+    /// No chain slot and no multi-version write has been published for `location`.
+    fn cold_location(&self, location: u64) -> bool {
+        if self.serial || !self.track {
+            return false;
+        }
+        !self.mv.might_hold(location) && !self.chain.might_hold(location)
+    }
+
+    /// Storage origin for a speculative cold read.
+    ///
+    /// A committed prefix cannot grow a lower write, so the origin would only
+    /// name storage. Validation still compares a recorded storage origin if a
+    /// lower transaction publishes after this read.
+    fn note_storage_origin(&mut self, location: u64) -> Result<(), ReadError> {
+        if self.rt.committed() >= self.tx_idx {
+            return Ok(());
+        }
+        let _b = super::buckets::Guard::start(super::buckets::READ_ORIGIN);
+        let origins = self.read_set.entry(location).or_default();
+        if origins.is_empty() {
+            origins.push(SfReadOrigin::Storage);
+        } else if !matches!(origins.last(), Some(SfReadOrigin::Storage)) {
+            return Err(ReadError::InconsistentRead);
+        }
+        Ok(())
+    }
+
+    fn cached_basic(&mut self, address: &Address) -> Result<Option<AccountBasic>, ReadError> {
+        if let Some(hit) = self.basic_cache.get(address) {
+            return Ok(hit.clone());
+        }
+        let _b = super::buckets::Guard::start(super::buckets::READ_BASE);
+        let basic = self
+            .storage
+            .basic(address)
+            .map_err(|err| ReadError::StorageError(err.to_string()))?;
+        self.basic_cache.insert(*address, basic.clone());
+        Ok(basic)
+    }
+
+    fn cached_code(&mut self, code_hash: Option<B256>) -> Result<Option<Bytecode>, ReadError> {
+        let Some(code_hash) = code_hash else {
+            return Ok(None);
+        };
+        let len = self.mv.new_bytecodes.len();
+        if len != self.code_seen {
+            self.code_cache.clear();
+            self.code_hash_cache.clear();
+            self.code_seen = len;
+        }
+        if let Some(code) = self.code_cache.get(&code_hash) {
+            return Ok(Some(code.clone()));
+        }
+        let _b = super::buckets::Guard::start(super::buckets::READ_CODE);
+        if let Some(code) = self.mv.new_bytecodes.get(&code_hash) {
+            let code = code.clone();
+            self.code_cache.insert(code_hash, code.clone());
+            return Ok(Some(code));
+        }
+        match self.storage.code_by_hash(&code_hash) {
+            Ok(Some(evm_code)) => {
+                let code = Bytecode::from(evm_code);
+                self.code_cache.insert(code_hash, code.clone());
+                Ok(Some(code))
+            }
+            Ok(None) => Ok(None),
+            Err(err) => Err(ReadError::StorageError(err.to_string())),
+        }
+    }
+
+    fn basic_cold(
+        &mut self,
+        address: Address,
+        location_hash: MemoryLocationHash,
+    ) -> Result<Option<AccountInfo>, ReadError> {
+        self.note_storage_origin(location_hash)?;
+        let Some(account) = self.cached_basic(&address)? else {
+            return Ok(None);
+        };
+        if self.has_nonce && location_hash == self.from_hash && self.tx.nonce != account.nonce {
+            return Err(self.sender_block());
+        }
+        let code_hash = if Some(location_hash) == self.to_hash {
+            self.to_code_hash
+        } else {
+            self.code_hash_cold(address)?
+        };
+        let code = self.cached_code(code_hash)?;
+        self.read_accounts
+            .insert(location_hash, (account.clone(), code_hash));
+        Ok(Some(AccountInfo {
+            balance: account.balance,
+            nonce: account.nonce,
+            code_hash: code_hash.unwrap_or(KECCAK_EMPTY),
+            code,
+            account_id: None,
+        }))
+    }
+
+    fn code_hash_cold(&mut self, address: Address) -> Result<Option<B256>, ReadError> {
+        let location_hash = hash_deterministic(MemoryLocation::CodeHash(address));
+        self.mv.note_reader(location_hash);
+        if !self.cold_location(location_hash) {
+            return self.get_code_hash(address);
+        }
+        super::buckets::hit(super::buckets::READ_COLD);
+        self.note_storage_origin(location_hash)?;
+        if let Some(hit) = self.code_hash_cache.get(&address) {
+            return Ok(*hit);
+        }
+        let _b = super::buckets::Guard::start(super::buckets::READ_BASE);
+        let hash = self
+            .storage
+            .code_hash(&address)
+            .map_err(|err| ReadError::StorageError(err.to_string()))?;
+        self.code_hash_cache.insert(address, hash);
+        Ok(hash)
+    }
+
+    fn storage_cold(
+        &mut self,
+        address: Address,
+        index: U256,
+        location_hash: MemoryLocationHash,
+    ) -> Result<U256, ReadError> {
+        self.note_storage_origin(location_hash)?;
+        if let Some(value) = self.slot_cache.get(&(address, index)) {
+            return Ok(*value);
+        }
+        let _b = super::buckets::Guard::start(super::buckets::READ_BASE);
+        let value = self
+            .storage
+            .storage(&address, &index)
+            .map_err(|err| ReadError::StorageError(err.to_string()))?;
+        self.slot_cache.insert((address, index), value);
+        Ok(value)
     }
 }
 
@@ -646,10 +814,24 @@ impl<S: crate::Storage> Database for VmDb<'_, S> {
         if !self.track {
             return self.basic_untracked(address, location_hash);
         }
+        self.mv.note_reader(location_hash);
+        if self.cold_location(location_hash) {
+            super::buckets::hit(super::buckets::READ_COLD);
+            let cold = self.basic_cold(address, location_hash)?;
+            if self.cold_location(location_hash) {
+                return Ok(cold);
+            }
+            // A lower write landed during the base read. Drop the storage
+            // origin and take the chain path with the published value.
+            self.read_set.remove(&location_hash);
+        }
 
         self.coordinate(location_hash)?;
 
-        let read_origins = self.read_set.entry(location_hash).or_default();
+        let read_origins = {
+            let _b = super::buckets::Guard::start(super::buckets::READ_ORIGIN);
+            self.read_set.entry(location_hash).or_default()
+        };
         let has_prev_origins = !read_origins.is_empty();
         let replay_folded =
             has_prev_origins && matches!(read_origins.first(), Some(SfReadOrigin::Folded(_)));
@@ -661,9 +843,15 @@ impl<S: crate::Storage> Database for VmDb<'_, S> {
         let mut lazy_ops: Vec<(TxIdx, bool, U256)> = Vec::new();
         let mut base_tx: Option<(TxIdx, usize)> = None;
 
-        if self.tx_idx > 0
-            && let Some(written_transactions) = self.mv.data.get(&location_hash)
-        {
+        let written_transactions = {
+            let _b = super::buckets::Guard::start(super::buckets::READ_MV);
+            if self.tx_idx > 0 {
+                self.mv.data.get(&location_hash)
+            } else {
+                None
+            }
+        };
+        if let Some(written_transactions) = written_transactions {
             let mut iter = written_transactions.range(..self.tx_idx);
             loop {
                 match iter.next_back() {
@@ -828,7 +1016,7 @@ impl<S: crate::Storage> Database for VmDb<'_, S> {
             } else {
                 self.get_code_hash(address)?
             };
-            let code = code_for(self, code_hash)?;
+            let code = self.cached_code(code_hash)?;
             self.read_accounts
                 .insert(location_hash, (account.clone(), code_hash));
             return Ok(Some(AccountInfo {
@@ -856,12 +1044,8 @@ impl<S: crate::Storage> Database for VmDb<'_, S> {
     }
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        match self
-            .storage
-            .code_by_hash(&code_hash)
-            .map_err(|err| ReadError::StorageError(err.to_string()))?
-        {
-            Some(evm_code) => Ok(Bytecode::from(evm_code)),
+        match self.cached_code(Some(code_hash))? {
+            Some(code) => Ok(code),
             None => Ok(Bytecode::default()),
         }
     }
@@ -871,11 +1055,30 @@ impl<S: crate::Storage> Database for VmDb<'_, S> {
         if !self.track {
             return self.storage_untracked(address, index, location_hash);
         }
+        self.mv.note_reader(location_hash);
+        if self.cold_location(location_hash) {
+            super::buckets::hit(super::buckets::READ_COLD);
+            let cold = self.storage_cold(address, index, location_hash)?;
+            if self.cold_location(location_hash) {
+                return Ok(cold);
+            }
+            self.read_set.remove(&location_hash);
+        }
         let serial = self.serial;
         self.coordinate(location_hash)?;
-        let read_origins = self.read_set.entry(location_hash).or_default();
-        if self.tx_idx > 0
-            && let Some(written_transactions) = self.mv.data.get(&location_hash)
+        let read_origins = {
+            let _b = super::buckets::Guard::start(super::buckets::READ_ORIGIN);
+            self.read_set.entry(location_hash).or_default()
+        };
+        let written_transactions = {
+            let _b = super::buckets::Guard::start(super::buckets::READ_MV);
+            if self.tx_idx > 0 {
+                self.mv.data.get(&location_hash)
+            } else {
+                None
+            }
+        };
+        if let Some(written_transactions) = written_transactions
             && let Some((closest_idx, entry)) =
                 written_transactions.range(..self.tx_idx).next_back()
         {
@@ -931,23 +1134,6 @@ impl<S: crate::Storage> Database for VmDb<'_, S> {
     }
 }
 
-fn code_for<S: crate::Storage>(
-    db: &VmDb<'_, S>,
-    code_hash: Option<B256>,
-) -> Result<Option<Bytecode>, ReadError> {
-    if let Some(code_hash) = &code_hash {
-        if let Some(code) = db.mv.new_bytecodes.get(code_hash) {
-            return Ok(Some(code.clone()));
-        }
-        match db.storage.code_by_hash(code_hash) {
-            Ok(code) => Ok(code.map(Bytecode::from)),
-            Err(err) => Err(ReadError::StorageError(err.to_string())),
-        }
-    } else {
-        Ok(None)
-    }
-}
-
 pub(crate) struct SfVm<'a, S: crate::Storage, C: PevmChain> {
     chain: &'a C,
     is_eip_161_enabled: bool,
@@ -975,6 +1161,7 @@ impl<'a, S: crate::Storage, C: PevmChain> SfVm<'a, S, C> {
         rt: &'a Runtime,
         trace: &'a Trace,
         prev_sender: &'a [Option<TxIdx>],
+        fast: bool,
     ) -> Self {
         let db = VmDb {
             storage,
@@ -993,9 +1180,14 @@ impl<'a, S: crate::Storage, C: PevmChain> SfVm<'a, S, C> {
             read_accounts: HashMap::with_capacity_and_hasher(2, BuildIdentityHasher::default()),
             prev_sender,
             accepted_pred: Cell::new(u32::MAX),
-            serial: rt.worker_count() == 1,
-            track: rt.worker_count() != 1 || trace.profile() || trace.enabled(),
+            serial: fast,
+            track: !fast || trace.profile() || trace.enabled(),
             tl_on: super::timeline::vm_enabled(),
+            basic_cache: HashMap::with_hasher(rustc_hash::FxBuildHasher),
+            code_hash_cache: HashMap::with_hasher(rustc_hash::FxBuildHasher),
+            code_cache: HashMap::with_hasher(rustc_hash::FxBuildHasher),
+            slot_cache: HashMap::with_hasher(rustc_hash::FxBuildHasher),
+            code_seen: 0,
         };
         Self {
             chain,
@@ -1062,6 +1254,14 @@ impl<'a, S: crate::Storage, C: PevmChain> SfVm<'a, S, C> {
 
         drop(_pre);
         drop(_c_pre);
+        let class_bucket = if self.evm.ctx().db().is_lazy {
+            super::buckets::CLASS_PLAIN
+        } else if self.live.is_hot_contract(tx_idx) {
+            super::buckets::CLASS_HOT
+        } else {
+            super::buckets::CLASS_OTHER
+        };
+        let class_t0 = super::buckets::stamp();
         let exec_result = {
             let _b = super::buckets::Guard::start(super::buckets::INTERP);
             match NoBeneficiaryHandler::<C, _>::default().run(&mut self.evm) {
@@ -1088,6 +1288,10 @@ impl<'a, S: crate::Storage, C: PevmChain> SfVm<'a, S, C> {
                 }
             }
         };
+        super::buckets::add_since(class_bucket, class_t0);
+        if incarnation > 0 {
+            super::buckets::add_since(super::buckets::CLASS_REEXEC, class_t0);
+        }
 
         let _c_write =
             super::timeline::CycGuard::enter(exec_span.hot(), super::timeline::CYC_WRITE);
@@ -1216,10 +1420,16 @@ impl<'a, S: crate::Storage, C: PevmChain> SfVm<'a, S, C> {
             let read_keys: Vec<u64> = read_set.keys().copied().collect();
             write_set
                 .iter()
-                .map(|(location, value)| {
+                .filter_map(|(location, value)| {
                     let lazy_credit = matches!(value, MemoryValue::LazyRecipient(_));
                     let rmw = read_keys.contains(location) && !is_lazy_value(value);
-                    (*location, rmw, lazy_credit)
+                    // A key with no chain and no reader stays in multi-version
+                    // memory until commit. Publishing it would only take the
+                    // directory lock. An armed chain, a reader, or a
+                    // read-then-write still publishes so the next hop can wait.
+                    let needed =
+                        rmw || self.live.might_hold(*location) || self.mv.reader_seen(*location);
+                    needed.then_some((*location, rmw, lazy_credit))
                 })
                 .collect()
         };

@@ -24,7 +24,25 @@ pub(crate) const SCHED: usize = 13;
 pub(crate) const TEMPLATE: usize = 14;
 pub(crate) const PRE: usize = 15;
 pub(crate) const WRITESET: usize = 16;
-pub(crate) const N: usize = 17;
+/// DashMap walk inside a tracked read. Nested in `interpreter`.
+pub(crate) const READ_MV: usize = 17;
+/// Read-origin map update inside a tracked read. Nested in `interpreter`.
+pub(crate) const READ_ORIGIN: usize = 18;
+/// Base-state fetch inside a tracked read. Nested in `interpreter`.
+pub(crate) const READ_BASE: usize = 19;
+/// Bytecode fetch inside a tracked read. Nested in `interpreter`.
+pub(crate) const READ_CODE: usize = 20;
+/// Interpreter time of plain transfers (no code on the callee).
+pub(crate) const CLASS_PLAIN: usize = 21;
+/// Interpreter time of the largest contract class.
+pub(crate) const CLASS_HOT: usize = 22;
+/// Interpreter time of every other transaction.
+pub(crate) const CLASS_OTHER: usize = 23;
+/// Interpreter time of incarnations above zero. Also counted in a class bucket.
+pub(crate) const CLASS_REEXEC: usize = 24;
+/// Tracked reads that skipped the directory and multi-version map.
+pub(crate) const READ_COLD: usize = 25;
+pub(crate) const N: usize = 26;
 
 const NAMES: [&str; N] = [
     "alloc_chain",
@@ -44,6 +62,15 @@ const NAMES: [&str; N] = [
     "mv_template",
     "pre_interp",
     "writeset",
+    "read_mv",
+    "read_origin",
+    "read_base",
+    "read_code",
+    "class_plain",
+    "class_hot",
+    "class_other",
+    "class_reexec",
+    "read_cold",
 ];
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -77,6 +104,30 @@ impl Drop for Guard {
         };
         NS[self.bucket].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         CALLS[self.bucket].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Clock for a class split. `None` when buckets are off.
+#[inline]
+pub(crate) fn stamp() -> Option<Instant> {
+    on().then(Instant::now)
+}
+
+/// Add one sample. A `None` stamp is the buckets-off path.
+#[inline]
+pub(crate) fn add_since(bucket: usize, t0: Option<Instant>) {
+    let Some(t0) = t0 else {
+        return;
+    };
+    NS[bucket].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    CALLS[bucket].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Count a cold read without a nested clock.
+#[inline]
+pub(crate) fn hit(bucket: usize) {
+    if on() {
+        CALLS[bucket].fetch_add(1, Ordering::Relaxed);
     }
 }
 

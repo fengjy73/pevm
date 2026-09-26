@@ -70,13 +70,20 @@ pub(crate) struct Runtime {
     woken: AtomicUsize,
     idle_window: AtomicUsize,
     busy_window: AtomicUsize,
-    /// Half-life moving averages, nanoseconds.
+    /// Half-life moving averages, nanoseconds. Diagnostics only: a hop gap
+    /// does not change the active set.
     gap_ema: AtomicU64,
     exec_ema: AtomicU64,
-    /// Idle fraction, in 1/256, above which the active set shrinks.
-    idle_hi_q8: AtomicU64,
+    /// Ready-queue width, in 1/256 of a transaction. The active set follows this.
+    width_ema_q8: AtomicU64,
+    grow_streak: AtomicUsize,
+    shrink_streak: AtomicUsize,
     control_tick: AtomicUsize,
     ready_depth: AtomicUsize,
+    /// Tasks moved off a worker that is staying on a chain handoff.
+    injector: Mutex<Vec<TxIdx>>,
+    /// Active-set size at each control decision, in order, capped.
+    active_samples: Mutex<Vec<u16>>,
     /// Bumped under `mu` on every wake of the work condvar.
     work_seq: AtomicUsize,
     sticky_flag: Vec<AtomicBool>,
@@ -116,9 +123,13 @@ impl Runtime {
             busy_window: AtomicUsize::new(0),
             gap_ema: AtomicU64::new(0),
             exec_ema: AtomicU64::new(1),
-            idle_hi_q8: AtomicU64::new(128),
+            width_ema_q8: AtomicU64::new(0),
+            grow_streak: AtomicUsize::new(0),
+            shrink_streak: AtomicUsize::new(0),
             control_tick: AtomicUsize::new(0),
             ready_depth: AtomicUsize::new(0),
+            injector: Mutex::new(Vec::new()),
+            active_samples: Mutex::new(Vec::new()),
             work_seq: AtomicUsize::new(0),
             sticky_flag: (0..workers).map(|_| AtomicBool::new(false)).collect(),
         }
@@ -128,6 +139,10 @@ impl Runtime {
     /// high-to-low so the owner LIFO runs the lowest index first. The first
     /// wave is transactions `0..C`, which lets a class head publish before
     /// later strides start.
+    ///
+    /// A commit window that hid the tail was measured on 15274915. Readers
+    /// three transactions apart still aborted, and the hot-chain gap grew,
+    /// so the whole block stays on the deques.
     pub(crate) fn seed(&self) {
         let mut inner = self.inner.lock().unwrap();
         for w in 0..self.workers {
@@ -145,6 +160,7 @@ impl Runtime {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn worker_count(&self) -> usize {
         self.workers
     }
@@ -205,7 +221,9 @@ impl Runtime {
     }
 
     /// Chain-hop gap and the execution that just finished, both in nanoseconds.
-    /// A gap longer than execution shrinks the active set by half, once per sample.
+    ///
+    /// The averages stay for the trace. They do not shrink the active set:
+    /// one hot chain's wait is not a measure of how much other work is ready.
     pub(crate) fn observe_hop_time(&self, gap_ns: u64, exec_ns: u64) {
         fn ema(slot: &AtomicU64, sample: u64) {
             let prev = slot.load(Ordering::Relaxed);
@@ -218,86 +236,98 @@ impl Runtime {
         }
         ema(&self.gap_ema, gap_ns);
         ema(&self.exec_ema, exec_ns.max(1));
-        let gap = self.gap_ema.load(Ordering::Relaxed);
-        let exec = self.exec_ema.load(Ordering::Relaxed).max(1);
-        if gap > exec.saturating_mul(8) && gap > 100_000 {
-            self.shrink_active();
-        }
     }
 
-    fn shrink_active(&self) {
-        let now = self.active.load(Ordering::Relaxed);
-        if now <= 1 {
+    /// Active-set samples taken at control decisions, in order.
+    pub(crate) fn active_samples(&self) -> Vec<u16> {
+        self.active_samples.lock().unwrap().clone()
+    }
+
+    fn record_sample(&self, active: usize) {
+        let mut log = self.active_samples.lock().unwrap();
+        // Keep the whole block. When the log fills, drop every other sample
+        // so the tail is still visible instead of only the opening.
+        if log.len() == 64 {
+            let kept: Vec<u16> = log.iter().copied().step_by(2).collect();
+            *log = kept;
+        }
+        log.push(active as u16);
+    }
+
+    /// Move this worker's stealable tasks onto the shared injector.
+    ///
+    /// Called when the worker is about to stay on a chain handoff. Those
+    /// tasks would otherwise sit under the handoff until this worker popped
+    /// again. Only the owner pops its bottom, so the move is safe.
+    pub(crate) fn spill_owned(&self, worker: usize) {
+        if worker >= self.workers {
             return;
         }
-        let next = (now + 1) / 2;
-        if self
-            .active
-            .compare_exchange(now, next.max(1), Ordering::Release, Ordering::Relaxed)
-            .is_ok()
-        {
-            self.peak_active.fetch_max(now, Ordering::Relaxed);
+        let mut moved = Vec::new();
+        while let Some(tx) = self.deques[worker].pop_bottom() {
+            moved.push(tx);
         }
+        if moved.is_empty() {
+            return;
+        }
+        self.injector.lock().unwrap().extend(moved);
+        self.poke_work();
     }
 
-    /// Grow by one when the active workers are busy, the chain is not waiting,
-    /// and there is still queued work. Shrink when they are idle.
+    fn pop_injector(&self) -> Option<TxIdx> {
+        self.injector.lock().unwrap().pop()
+    }
+
+    /// Grow and shrink from the measured ready width.
+    ///
+    /// The width is an exponential moving average of the ready queue. One
+    /// sample above the set grows it. Shrinking waits for two decisions where
+    /// the average sits at least two below the set and the live queue is
+    /// smaller than the set. A chain hop is not an input.
     pub(crate) fn maybe_grow(&self) {
+        let ready = self.ready_now();
+        let prev = self.width_ema_q8.load(Ordering::Relaxed);
+        let sample = (ready as u64).saturating_mul(256);
+        let next = if prev == 0 {
+            sample
+        } else {
+            prev - prev / 4 + sample / 4
+        };
+        self.width_ema_q8.store(next, Ordering::Relaxed);
+
         let tick = self.control_tick.fetch_add(1, Ordering::Relaxed);
-        let period = self
-            .active
-            .load(Ordering::Relaxed)
-            .saturating_mul(4)
-            .clamp(8, 64);
-        if !tick.is_multiple_of(period) {
+        let period = self.active.load(Ordering::Relaxed).clamp(1, 8);
+        if tick % period != period - 1 {
             return;
         }
-        let idle = self.idle_window.swap(0, Ordering::Relaxed);
-        let busy = self.busy_window.swap(0, Ordering::Relaxed);
-        let denom = idle + busy;
-        if denom == 0 {
-            return;
-        }
-        let idle_q8 = idle.saturating_mul(256) / denom;
-        let gap = self.gap_ema.load(Ordering::Relaxed);
-        let exec = self.exec_ema.load(Ordering::Relaxed).max(1);
-        let stalled = gap > exec;
-        let hi = self.idle_hi_q8.load(Ordering::Relaxed) as usize;
+        let width = ((next + 128) / 256) as usize;
         let mut active = self.active.load(Ordering::Relaxed);
         let cap = self.workers;
-        if (stalled || idle_q8 > hi) && active > 1 {
-            active = if stalled {
-                (active + 1) / 2
-            } else {
-                active - 1
-            };
-            let next_hi = hi.saturating_sub(8).max(32);
-            self.idle_hi_q8.store(next_hi as u64, Ordering::Relaxed);
-        } else if !stalled
-            && idle_q8.saturating_mul(2) < hi
-            && active < cap
-            && self.ready_now() > active
-        {
-            // The queue is deeper than the workers already running. Double
-            // while that is true so the set reaches the ready width in a few
-            // steps, then add one.
-            let ready = self.ready_now();
-            let step = if ready > active.saturating_mul(2) {
-                active.max(1)
-            } else {
-                1
-            };
-            active = active.saturating_add(step).min(cap).min(ready.max(active));
-            let next_hi = (hi + 4).min(220);
-            self.idle_hi_q8.store(next_hi as u64, Ordering::Relaxed);
+        if width > active {
+            self.shrink_streak.store(0, Ordering::Relaxed);
+            self.grow_streak.fetch_add(1, Ordering::Relaxed);
+            active = width.min(cap);
+        } else if active > 1 && width + 1 < active && ready < active {
+            self.grow_streak.store(0, Ordering::Relaxed);
+            let streak = self.shrink_streak.fetch_add(1, Ordering::Relaxed) + 1;
+            if streak >= 2 {
+                let floor = ready.max(1);
+                active = width.max(floor).min(active - 1).max(1);
+                self.shrink_streak.store(0, Ordering::Relaxed);
+            }
+        } else {
+            self.grow_streak.store(0, Ordering::Relaxed);
+            self.shrink_streak.store(0, Ordering::Relaxed);
         }
         active = active.clamp(1, cap);
-        let _guard = self.mu.lock().unwrap();
-        let prev = self.active.swap(active, Ordering::Release);
+        let guard = self.mu.lock().unwrap();
+        let prev_active = self.active.swap(active, Ordering::Release);
         self.peak_active.fetch_max(active, Ordering::Relaxed);
-        if active > prev {
+        if active > prev_active {
             self.sleep_cv.notify_all();
         }
+        drop(guard);
+        self.record_sample(active);
     }
 
     /// Park until this worker is inside the active set or holds a chain handoff.
@@ -486,18 +516,21 @@ impl Runtime {
     pub(crate) fn pop(&self, worker: usize) -> Option<(TxIdx, usize)> {
         let limit = self.n.saturating_mul(2).max(64);
         for _ in 0..limit {
-            let tx = self.deques[worker].pop_bottom().or_else(|| {
-                let n = self.workers;
-                let mut found = None;
-                for k in 1..n {
-                    let victim = (worker + k) % n;
-                    if let Some(tx) = self.deques[victim].pop_top() {
-                        found = Some(tx);
-                        break;
+            let tx = self.deques[worker]
+                .pop_bottom()
+                .or_else(|| {
+                    let n = self.workers;
+                    let mut found = None;
+                    for k in 1..n {
+                        let victim = (worker + k) % n;
+                        if let Some(tx) = self.deques[victim].pop_top() {
+                            found = Some(tx);
+                            break;
+                        }
                     }
-                }
-                found
-            })?;
+                    found
+                })
+                .or_else(|| self.pop_injector())?;
             let mut inner = self.inner.lock().unwrap();
             if tx >= self.n {
                 continue;
@@ -945,16 +978,48 @@ mod tests {
     }
 
     #[test]
-    fn chain_wait_shrinks_the_active_set() {
-        let rt = Runtime::new(32, 32);
+    fn hop_gap_does_not_shrink_while_other_work_is_ready() {
+        let rt = Runtime::new(32, 8);
         rt.seed();
-        for _ in 0..80 {
-            rt.note_busy();
-            rt.maybe_grow();
-        }
+        rt.maybe_grow();
         let before = rt.active_now();
         assert!(before > 1, "active={before}");
         rt.observe_hop_time(2_000_000, 20_000);
-        assert!(rt.active_now() < before);
+        assert_eq!(rt.active_now(), before);
+        assert!(rt.ready_now() > 0);
+    }
+
+    #[test]
+    fn ready_width_shrinks_only_after_the_queue_drains() {
+        let rt = Runtime::new(8, 8);
+        rt.seed();
+        rt.maybe_grow();
+        assert_eq!(rt.active_now(), 8);
+        for w in 0..8 {
+            while rt.pop(w).is_some() {}
+        }
+        assert_eq!(rt.ready_now(), 0);
+        for _ in 0..64 {
+            rt.maybe_grow();
+        }
+        assert!(rt.active_now() < 8, "active={}", rt.active_now());
+        assert!(rt.active_now() >= 1);
+    }
+
+    #[test]
+    fn sticky_owner_spills_its_deque() {
+        let rt = Runtime::new(8, 2);
+        rt.seed();
+        let (tx, _) = rt.pop(0).unwrap();
+        assert_eq!(tx, 0);
+        rt.spill_owned(0);
+        let mut got = Vec::new();
+        while let Some((tx, _)) = rt.pop(1) {
+            got.push(tx);
+        }
+        assert!(
+            got.iter().any(|tx| *tx == 2 || *tx == 4 || *tx == 6),
+            "spilled={got:?}"
+        );
     }
 }

@@ -211,6 +211,11 @@ struct RunOut {
     hot_gap_max_ns: u64,
     hot_exec_ns: u64,
     hot_span_ns: u64,
+    active_samples: Vec<u16>,
+    gap_location: u64,
+    gap_tx: u32,
+    gap_prev_worker: u32,
+    gap_reason: u8,
     delta_notes: Vec<pevm::specfence::DeltaNote>,
     attempts: Vec<SfAttempt>,
 }
@@ -289,6 +294,11 @@ fn run_once(loaded: &Loaded, engine: &str, workers: usize, seq_cpus: &[usize]) -
         hot_gap_max_ns: 0,
         hot_exec_ns: 0,
         hot_span_ns: 0,
+        active_samples: Vec::new(),
+        gap_location: 0,
+        gap_tx: 0,
+        gap_prev_worker: 0,
+        gap_reason: 0,
         delta_notes: Vec::new(),
         attempts: Vec::new(),
     };
@@ -322,6 +332,11 @@ fn run_once(loaded: &Loaded, engine: &str, workers: usize, seq_cpus: &[usize]) -
         out.hot_gap_max_ns = trace.hot_gap_max_ns;
         out.hot_exec_ns = trace.hot_exec_ns;
         out.hot_span_ns = trace.hot_span_ns;
+        out.active_samples = trace.active_samples;
+        out.gap_location = trace.gap_location;
+        out.gap_tx = trace.gap_tx;
+        out.gap_prev_worker = trace.gap_prev_worker;
+        out.gap_reason = trace.gap_reason;
         out.delta_notes = trace.delta_notes;
         out.attempts = trace.attempts;
     }
@@ -414,6 +429,11 @@ fn write_row(
         "hot_gap_max_ns": row.hot_gap_max_ns,
         "hot_exec_ns": row.hot_exec_ns,
         "hot_span_ns": row.hot_span_ns,
+        "active_samples": row.active_samples,
+        "gap_location": row.gap_location,
+        "gap_tx": row.gap_tx,
+        "gap_prev_worker": row.gap_prev_worker,
+        "gap_reason": row.gap_reason,
         "delta_notes": row.delta_notes.iter().map(|note| serde_json::json!({
             "reader": note.reader,
             "location": note.location,
@@ -463,6 +483,12 @@ fn write_row(
         row.hot_exec_ns as f64 / 1000.0,
         row.class_key,
     );
+    if engine == "sf" && (row.gap_location != 0 || !row.active_samples.is_empty()) {
+        println!(
+            "CTRL active={:?} gap_loc={:#x} gap_tx={} gap_prev={} gap_reason={}",
+            row.active_samples, row.gap_location, row.gap_tx, row.gap_prev_worker, row.gap_reason,
+        );
+    }
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -622,6 +648,39 @@ fn main() {
         )
         .expect("write steptrace");
         println!("STEPTRACE stage1 no opcode hook");
+        return;
+    }
+    if which == "spawn" {
+        // Same `thread::scope` shape as `Pevm::execute_revm_parallel`, without
+        // entering the upstream scheduler. The clock is spawn plus join.
+        let k = env_usize("SPECFENCE_INFLATION_K", 10);
+        let list =
+            std::env::var("SPECFENCE_SPAWN_LIST").unwrap_or_else(|_| "4,8,16,32".to_string());
+        for part in list.split(',') {
+            let c: usize = part.trim().parse().unwrap_or(0);
+            if c == 0 {
+                continue;
+            }
+            let mut samples = Vec::with_capacity(k);
+            for _ in 0..k {
+                let started = Instant::now();
+                std::thread::scope(|scope| {
+                    for _ in 0..c {
+                        scope.spawn(|| {
+                            std::hint::black_box(c);
+                        });
+                    }
+                });
+                samples.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let mid = samples[samples.len() / 2];
+            println!(
+                "SPAWN workers={c} k={k} median_ms={mid:.4} min_ms={:.4} max_ms={:.4}",
+                samples[0],
+                samples[samples.len() - 1],
+            );
+        }
         return;
     }
     if which == "seqcheck" || which == "occcheck" {
