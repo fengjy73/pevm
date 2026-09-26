@@ -16,6 +16,9 @@ use super::mv::SfMv;
 use super::trace::Trace;
 
 pub(crate) const EXEC: u8 = 1;
+/// Kind 2. The interpreter no longer records an inline spin. The number stays
+/// so older traces and `scripts/specfence_timeline_attrib.py` keep their mapping.
+#[allow(dead_code)]
 pub(crate) const INLINE: u8 = 2;
 pub(crate) const VALIDATE: u8 = 3;
 pub(crate) const IDLE: u8 = 4;
@@ -541,26 +544,6 @@ pub(crate) fn close_park(tx: TxIdx) {
     } else {
         push(PARK, reason, tx as u32, pred, loc, class, start, t1);
     }
-}
-
-pub(crate) fn inline_wait(tx: TxIdx, pred: TxIdx, loc: u64, reason: u8, t0: u64) {
-    if t0 == 0 {
-        return;
-    }
-    let Some(inner) = inner() else {
-        return;
-    };
-    let class = 0;
-    push(
-        INLINE,
-        reason,
-        tx as u32,
-        pred as u32,
-        loc,
-        class,
-        t0,
-        now_ns(inner.base),
-    );
 }
 
 pub(crate) fn stamp() -> u64 {

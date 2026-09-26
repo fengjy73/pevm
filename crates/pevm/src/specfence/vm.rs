@@ -204,42 +204,15 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
             if !armed && !self.chain.should_wait(location, pred, executing) {
                 return Ok(());
             }
+            // Park instead of sleeping in the interpreter. The old 40×50µs
+            // condvar loop was thread time charged to the interpreter and
+            // grew with the number of workers, because a reader only entered
+            // it while its predecessor was executing on another core.
             let reason = if armed {
                 super::timeline::ARMED
             } else {
                 super::timeline::UNARMED
             };
-            if !executing {
-                super::timeline::set_block(reason, location);
-                return Err(ReadError::Blocking(pred));
-            }
-            // Overlap only while the predecessor is inside the interpreter.
-            // 40 × 50µs is the cap; a longer spin holds the worker off the prefix.
-            let t_inline = if self.tl_on {
-                super::timeline::stamp()
-            } else {
-                0
-            };
-            self.rt.waiting_add(1);
-            for _ in 0..40 {
-                if self.settled(location, pred)
-                    || self.finished_without_write(location, pred)
-                    || !self.rt.is_executing(pred)
-                    || self.rt.all_executors_waiting()
-                {
-                    break;
-                }
-                self.rt.wait_brief();
-            }
-            self.rt.waiting_add(-1);
-            super::timeline::inline_wait(self.tx_idx, pred, location, reason, t_inline);
-            if self.settled(location, pred) {
-                return Ok(());
-            }
-            if self.finished_without_write(location, pred) {
-                self.chain.clear_hole(location, pred);
-                continue;
-            }
             super::timeline::set_block(reason, location);
             return Err(ReadError::Blocking(pred));
         }

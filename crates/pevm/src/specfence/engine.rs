@@ -438,6 +438,14 @@ where
                             };
                             match rt.claim_blocker(worker, pred) {
                                 super::rt::Claim::Done => rt.retry_now(worker, tx),
+                                super::rt::Claim::Seal(done_tx) => {
+                                    // The predecessor has left the interpreter.
+                                    // Seal it here instead of parking on it.
+                                    let _ = seal_fast(
+                                        worker, done_tx, n, rt, mv, live, trace, commit_mu,
+                                    );
+                                    rt.retry_now(worker, tx);
+                                }
                                 super::rt::Claim::Run(root, inc) => {
                                     // The predecessor chain is not in the
                                     // interpreter. Wait on the root this
@@ -680,7 +688,9 @@ fn depend(
     reason: u8,
 ) -> Depend {
     match rt.claim_blocker(worker, pred) {
-        super::rt::Claim::Done => {
+        super::rt::Claim::Done | super::rt::Claim::Seal(_) => {
+            // Admission, anchor, and class waits release on execution, not
+            // finality. A finished predecessor is enough.
             rt.retry_now(worker, tx);
             Depend::Retry
         }

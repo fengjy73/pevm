@@ -42,8 +42,10 @@ const PH_PARK: u8 = 5;
 pub(crate) enum Claim {
     /// `tx` is marked `Executing` for this worker. Run it before the reader resumes.
     Run(TxIdx, usize),
-    /// `tx` is inside the interpreter (or being sealed). Park on it.
+    /// `tx` is inside the interpreter. Park on it.
     Wait(TxIdx),
+    /// `tx` has finished executing and is not final. The reader seals it.
+    Seal(TxIdx),
     /// The predecessor already finished. Retry the reader.
     Done,
 }
@@ -71,7 +73,6 @@ pub(crate) struct Runtime {
     /// final origins or storage, and validation kept that incarnation.
     validated: Vec<AtomicUsize>,
     executing: AtomicUsize,
-    waiting: AtomicUsize,
     mu: Mutex<()>,
     /// Idle workers inside the active set wait here.
     cv: Condvar,
@@ -130,7 +131,6 @@ impl Runtime {
             committed: AtomicUsize::new(0),
             validated: (0..n).map(|_| AtomicUsize::new(usize::MAX)).collect(),
             executing: AtomicUsize::new(0),
-            waiting: AtomicUsize::new(0),
             mu: Mutex::new(()),
             cv: Condvar::new(),
             sleep_cv: Condvar::new(),
@@ -415,25 +415,6 @@ impl Runtime {
             self.executing
                 .fetch_sub((-delta) as usize, Ordering::Relaxed);
         }
-    }
-
-    pub(crate) fn waiting_add(&self, delta: isize) {
-        if delta > 0 {
-            self.waiting.fetch_add(delta as usize, Ordering::Relaxed);
-        } else {
-            self.waiting.fetch_sub((-delta) as usize, Ordering::Relaxed);
-        }
-    }
-
-    pub(crate) fn all_executors_waiting(&self) -> bool {
-        let waiting = self.waiting.load(Ordering::Relaxed);
-        let executing = self.executing.load(Ordering::Relaxed);
-        executing > 0 && waiting >= executing
-    }
-
-    pub(crate) fn wait_brief(&self) {
-        let guard = self.mu.lock().unwrap();
-        let _ = self.cv.wait_timeout(guard, Duration::from_micros(50));
     }
 
     #[allow(dead_code)]
@@ -907,7 +888,9 @@ impl Runtime {
                     if self.is_final_inc(tx, inc) {
                         return Claim::Done;
                     }
-                    return Claim::Wait(tx);
+                    // Finished, not final. The reader seals it. Waiting here
+                    // parks on a transaction that is not in the interpreter.
+                    return Claim::Seal(tx);
                 }
                 Phase::Parked { pred: next, .. } => {
                     if next == tx || next >= self.n {
@@ -1272,6 +1255,19 @@ mod tests {
             "parked on {parked_on}, which is not executing"
         );
         assert_eq!(parked_on, 0);
+    }
+
+    #[test]
+    fn executed_predecessor_is_sealed_instead_of_parked() {
+        let rt = Runtime::new(2, 2);
+        rt.seed();
+        let (tx, _) = rt.pop(0).unwrap();
+        assert_eq!(tx, 0);
+        rt.finish_ok(0, 0);
+        assert!(
+            matches!(rt.claim_blocker(1, 0), Claim::Seal(0)),
+            "a finished predecessor is not a park target"
+        );
     }
 
     #[test]
