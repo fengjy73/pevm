@@ -1131,6 +1131,7 @@ impl Runtime {
                 publish |= self.enqueue_locked(&mut inner, worker, tx);
             } else {
                 parked = true;
+                self.unqueue(tx);
                 self.set_phase(&mut inner, tx, Phase::Parked { pred, until_final });
                 inner.status[tx].queued = false;
                 if !inner.dependents[pred].contains(&tx) {
