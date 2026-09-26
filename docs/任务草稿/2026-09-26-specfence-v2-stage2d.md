@@ -25,8 +25,8 @@
 1. **已完成** — 分配器：去掉运行时包装。默认 system；`specfence-mimalloc` 直接安装 `MiMalloc`。SEQ ab：PR72 3.769 ms，Stage 2c 包装 4.870 ms，新默认 3.790 ms（1.006×）。
 2. **已完成** — 提交前缀空洞。旧时间线 C=4：tx 11→12 空 4.722 ms，四名工人在跑更高序号，tx 12 的执行只有 7 µs。原因是 LIFO/窃取不优先提交前缀，加上 `notify_one`、`park` 不唤醒、`active` 从 1 起步。修复：每次取任务前认领提交前缀；`poke_work` 改为 `notify_all` 并把活跃集抬到 ready+executing；`seed` 一开始就把活跃集设满；`park`/`rescue` 入队后唤醒；condvar 超时 500 µs。新时间线：无 >0.5 ms 的提交空洞，最长空闲 0.368 ms 且当时 ready=0。
 3. **已完成** — tx 102 停在未进解释器的 tx 101 上。相位在 pop 时就标成 Executing，`close_from` 又夹在 `depend` 和 `handler.run` 之间。现在先 `close_from`，只有 `in_interpreter` 才 Wait；属主已 idle 且未进解释器则窃取执行。单测 `estimate_claim_runs_a_predecessor_that_is_not_in_the_interpreter`。新时间线里 tx 102→101 的 213 µs 停放落在 tx 101 的执行跨度内。
-4. **进行中** — 等待桶与膨胀榜、干净 K=10、集成测试、sched 桶。
-5. **待做** — `docs/specfence-v2-stage2d.md`、经验记录、提交并开草稿 PR。
+4. **已完成** — 等待进 `wait_*`。15274915 `(to, selector)` 解释器中位 C=1/4/8 为 2.750/4.851/5.449 ms；plain 0.466/0.741/0.847 ms（1046 笔，约 0.45/0.71 µs）。榜的和比 1.421。sched 中位 C=4 为 0.646 ms（1118 次），C=8 为 0.757 ms。C=16 的 11 ms 是空 sticky 槽每次都拿调度锁。
+5. **已完成** — 干净 K=10 与三个集成测试。数字和门禁在 `docs/specfence-v2-stage2d.md`。本机 SF(4) 仍高于 SF(1)（6.703 vs 5.076）。草稿待用户验收后删除。
 
 ## 初步做法
 
