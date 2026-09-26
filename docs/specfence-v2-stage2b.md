@@ -1,5 +1,7 @@
 # SpecFence v2, stage 2b
 
+Draft PR: https://github.com/fengjy73/pevm/pull/72
+
 Stage 2b starts from Stage 2 (`cursor/specfence-v2-stage2-afe4`, `3164d51`, PR #71). SpecFence stays in `crates/pevm/src/specfence/` and compiles only with `--features specfence`. Upstream `vm.rs`, `mv_memory.rs`, `scheduler.rs`, and `pevm.rs` are byte-identical to that commit. Opcode `static_gas()` is unchanged. Hooks run only on the SpecFence path.
 
 ict21 Stage 2 (CPUs 128–255, fat LTO, K=10, no warm-up) is the problem. On block 15274915, `(to, selector)`, SF was 4.88 ms at C=1 and 9.07 / 7.77 / 8.96 / 11.8 ms at C=4/8/16/32, against OCC 3.03 ms at C=4. Every C>1 was slower than SF(1). Thread time at C=4 put the interpreter at 8.7–10.2 ms against about 2.5 ms at C=1. The learned active set ended at 1. The longest gap over all chains was 9.8 ms at C=4, while the hot chain `0xabd6bb3978815b97` stayed 76/76 on one worker. SF matched SEQ. `delta_mismatch` was 0.
