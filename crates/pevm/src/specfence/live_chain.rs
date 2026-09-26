@@ -26,6 +26,29 @@ const P_CEIL: f64 = 0.95;
 const CLASS_HIT_FLOOR: f64 = 0.15;
 const C_ABORT_MIN: u64 = 5_000;
 const C_ABORT_MAX: u64 = 2_000_000;
+const SEEN_SHARDS: usize = 32;
+
+/// One mutex per cache line so adjacent transactions do not bounce a lock.
+#[repr(align(64))]
+struct PadMutex<T> {
+    inner: Mutex<T>,
+}
+
+impl<T> PadMutex<T> {
+    fn new(value: T) -> Self {
+        Self {
+            inner: Mutex::new(value),
+        }
+    }
+}
+
+impl<T> std::ops::Deref for PadMutex<T> {
+    type Target = Mutex<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
 
 /// The transaction was runnable. The gap is scheduling, not a chain park.
 pub(crate) const DELAY_NONE: u8 = 0;
@@ -76,6 +99,7 @@ pub(crate) struct ClassGroup {
     pub(crate) contract: bool,
 }
 
+#[repr(align(64))]
 struct Chain {
     member: Vec<AtomicU64>,
     radar: Vec<AtomicU64>,
@@ -322,7 +346,7 @@ pub(crate) struct LiveChain {
     /// Same-class head and sibling prediction stay off until this block records
     /// a validation failure or abort for that class.
     class_barrier: Vec<AtomicBool>,
-    membership: Vec<Mutex<SmallVec<[SlotRef; 4]>>>,
+    membership: Vec<PadMutex<SmallVec<[SlotRef; 4]>>>,
     /// Abort cost estimate in nanoseconds. Moves inside [`C_ABORT_MIN`, `C_ABORT_MAX`].
     c_abort_ns: AtomicU64,
     /// Multiplier on the wait threshold. Grows when workers are idle.
@@ -331,8 +355,8 @@ pub(crate) struct LiveChain {
     aborted: AtomicUsize,
     idle_polls: AtomicUsize,
     busy_polls: AtomicUsize,
-    /// Locations seen once. The second writer allocates a chain and backfills both.
-    seen: Mutex<HashMap<u64, Sighting, FxBuildHasher>>,
+    /// Locations seen once, sharded by hash. The second writer allocates a chain.
+    seen: Vec<PadMutex<HashMap<u64, Sighting, FxBuildHasher>>>,
     /// Beneficiary basic-account hash. Every transaction writes it lazily;
     /// chaining it would report a chain of length `n` and hide real spines.
     skip: std::sync::atomic::AtomicU64,
@@ -407,14 +431,16 @@ impl LiveChain {
             class_miss: Vec::new(),
             class_open: Vec::new(),
             class_barrier: Vec::new(),
-            membership: (0..n).map(|_| Mutex::new(SmallVec::new())).collect(),
+            membership: (0..n).map(|_| PadMutex::new(SmallVec::new())).collect(),
             c_abort_ns: AtomicU64::new(50_000),
             wait_scale_q8: AtomicU64::new(256),
             finished: AtomicUsize::new(0),
             aborted: AtomicUsize::new(0),
             idle_polls: AtomicUsize::new(0),
             busy_polls: AtomicUsize::new(0),
-            seen: Mutex::new(HashMap::with_hasher(FxBuildHasher)),
+            seen: (0..SEEN_SHARDS)
+                .map(|_| PadMutex::new(HashMap::with_hasher(FxBuildHasher)))
+                .collect(),
             skip: std::sync::atomic::AtomicU64::new(0),
             skip_on: AtomicBool::new(false),
             serial: false,
@@ -460,7 +486,7 @@ impl LiveChain {
             aborted: AtomicUsize::new(0),
             idle_polls: AtomicUsize::new(0),
             busy_polls: AtomicUsize::new(0),
-            seen: Mutex::new(HashMap::with_hasher(FxBuildHasher)),
+            seen: Vec::new(),
             skip: std::sync::atomic::AtomicU64::new(0),
             skip_on: AtomicBool::new(false),
             serial: true,
@@ -1392,9 +1418,9 @@ impl LiveChain {
         } else {
             self.classes[class as usize].members.len()
         };
-        // Hold `seen` across slot allocation so a peer cannot record a
-        // sighting that misses the new chain.
-        let mut seen = self.seen.lock().unwrap();
+        // Hold this location's shard across slot allocation so a peer cannot
+        // record a sighting that misses the new chain.
+        let mut seen = self.seen[(location as usize) % SEEN_SHARDS].lock().unwrap();
         if let Some(idx) = self.slot_of(location) {
             drop(seen);
             self.mark_published(idx, tx, incarnation, rmw, lazy_credit);
@@ -1412,7 +1438,7 @@ impl LiveChain {
                 self.mark_published(idx, tx, incarnation, rmw, lazy_credit);
                 return;
             }
-            let mut seen = self.seen.lock().unwrap();
+            let mut seen = self.seen[(location as usize) % SEEN_SHARDS].lock().unwrap();
             if let Some(idx) = self.slot_of(location) {
                 drop(seen);
                 self.mark_published(idx, tx, incarnation, rmw, lazy_credit);

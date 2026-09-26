@@ -55,7 +55,10 @@ pub(crate) const WAIT_CHAIN: usize = 28;
 pub(crate) const WAIT_ADMIT: usize = 29;
 /// Shard or cache lock held by a read. Excluded from `interpreter`.
 pub(crate) const WAIT_LOCK: usize = 30;
-pub(crate) const N: usize = 31;
+/// `Database` callback time: multi-version lookup, worker cache, storage fallback.
+/// Excluded from `interpreter`, so that bucket is opcode time.
+pub(crate) const DB_READ: usize = 31;
+pub(crate) const N: usize = 32;
 
 const NAMES: [&str; N] = [
     "alloc_chain",
@@ -89,6 +92,7 @@ const NAMES: [&str; N] = [
     "wait_chain",
     "wait_admit",
     "wait_lock",
+    "db_read",
 ];
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -111,6 +115,7 @@ fn timing() -> bool {
 thread_local! {
     static IN_INTERP: Cell<bool> = const { Cell::new(false) };
     static EXCLUDE: Cell<u64> = const { Cell::new(0) };
+    static DB_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
 pub(crate) struct Guard {
@@ -187,6 +192,50 @@ impl Drop for WaitGuard {
         if on() {
             NS[self.bucket].fetch_add(ns, Ordering::Relaxed);
             CALLS[self.bucket].fetch_add(1, Ordering::Relaxed);
+        }
+        // Nested inside a database callback. That guard already excludes its
+        // whole elapsed time, including this wait.
+        if IN_INTERP.with(Cell::get) && DB_DEPTH.with(Cell::get) == 0 {
+            EXCLUDE.with(|cell| cell.set(cell.get().saturating_add(ns)));
+        }
+    }
+}
+
+/// Time inside a `Database` method. The outermost guard is one `db_read` sample
+/// and, during the interpreter, one exclusion. Inner waits do not exclude again.
+pub(crate) struct DbGuard {
+    t0: Option<Instant>,
+}
+
+impl DbGuard {
+    #[inline]
+    pub(crate) fn start() -> Self {
+        if timing() {
+            DB_DEPTH.with(|cell| cell.set(cell.get().saturating_add(1)));
+        }
+        Self {
+            t0: timing().then(Instant::now),
+        }
+    }
+}
+
+impl Drop for DbGuard {
+    fn drop(&mut self) {
+        let Some(t0) = self.t0 else {
+            return;
+        };
+        let ns = t0.elapsed().as_nanos() as u64;
+        let depth = DB_DEPTH.with(|cell| {
+            let depth = cell.get();
+            cell.set(depth.saturating_sub(1));
+            depth
+        });
+        if depth != 1 {
+            return;
+        }
+        if on() {
+            NS[DB_READ].fetch_add(ns, Ordering::Relaxed);
+            CALLS[DB_READ].fetch_add(1, Ordering::Relaxed);
         }
         if IN_INTERP.with(Cell::get) {
             EXCLUDE.with(|cell| cell.set(cell.get().saturating_add(ns)));

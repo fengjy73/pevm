@@ -641,6 +641,17 @@ def analyze(row: dict) -> dict:
     lazy_ns = sum_kind(spans, POST, LAZY)
     parallel = max(0, wall - setup_ns - rescan_ns - lazy_ns)
     worker_accounted = exec_ns + validate_ns + idle_ns + spin_ns
+    # Drive-loop POST/WORK spans cover each worker, including time outside
+    # the interpreter. Union per worker, then divide by the parallel phase.
+    work_cover = []
+    for w in range(workers):
+        iv = [
+            (sp["t0"], sp["t1"])
+            for sp in spans
+            if sp["worker"] == w and sp["kind"] in (EXEC, VALIDATE, IDLE, SPIN, POST, QUEUE)
+        ]
+        work_cover.append(merge_coverage(iv))
+    loop_cover = (sum(work_cover) / (workers * parallel)) if parallel else None
     # exec_ns includes inline. Bookkeeping is whatever the workers did not stamp.
     book_ns = max(0, workers * parallel - worker_accounted)
     excess = armed_excess(parks, txs)
@@ -700,6 +711,7 @@ def analyze(row: dict) -> dict:
             "book_residual": ms(book_ns),
             "parallel_phase": ms(parallel),
             "accounted_over_capacity": (worker_accounted / (workers * parallel)) if parallel else None,
+            "loop_cover": loop_cover,
         },
         "post_ms": post,
         "park_ms": {k: ms(v) for k, v in park_by.items()},

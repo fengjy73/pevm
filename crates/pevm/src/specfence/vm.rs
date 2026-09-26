@@ -84,8 +84,6 @@ struct VmDb<'a, S: crate::Storage> {
     code_hash_cache: HashMap<Address, Option<B256>, rustc_hash::FxBuildHasher>,
     code_cache: HashMap<B256, Bytecode, rustc_hash::FxBuildHasher>,
     slot_cache: HashMap<(Address, U256), U256, rustc_hash::FxBuildHasher>,
-    /// `new_bytecodes` length last time the code caches were filled.
-    code_seen: usize,
 }
 
 impl<'a, S: crate::Storage> VmDb<'a, S> {
@@ -530,26 +528,27 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
     }
 
     fn cached_basic(&mut self, address: &Address) -> Result<Option<AccountBasic>, ReadError> {
-        if super::share::cache_on() {
-            if let Some(hit) = self.mv.base.lookup_basic(address) {
-                return Ok(hit);
-            }
-            let _b = super::buckets::Guard::start(super::buckets::READ_BASE);
-            let basic = self
-                .storage
-                .basic(address)
-                .map_err(|err| ReadError::StorageError(err.to_string()))?;
-            self.mv.base.insert_basic(*address, basic.clone());
-            return Ok(basic);
-        }
         if let Some(hit) = self.basic_cache.get(address) {
             return Ok(hit.clone());
         }
-        let _b = super::buckets::Guard::start(super::buckets::READ_BASE);
-        let basic = self
-            .storage
-            .basic(address)
-            .map_err(|err| ReadError::StorageError(err.to_string()))?;
+        let basic = if super::share::cache_on() {
+            if let Some(hit) = self.mv.base.lookup_basic(address) {
+                hit
+            } else {
+                let _b = super::buckets::Guard::start(super::buckets::READ_BASE);
+                let basic = self
+                    .storage
+                    .basic(address)
+                    .map_err(|err| ReadError::StorageError(err.to_string()))?;
+                self.mv.base.insert_basic(*address, basic.clone());
+                basic
+            }
+        } else {
+            let _b = super::buckets::Guard::start(super::buckets::READ_BASE);
+            self.storage
+                .basic(address)
+                .map_err(|err| ReadError::StorageError(err.to_string()))?
+        };
         self.basic_cache.insert(*address, basic.clone());
         Ok(basic)
     }
@@ -558,12 +557,9 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
         let Some(code_hash) = code_hash else {
             return Ok(None);
         };
-        let len = self.mv.new_bytecodes.len();
-        if len != self.code_seen {
-            self.code_cache.clear();
-            self.code_hash_cache.clear();
-            self.code_seen = len;
-        }
+        // A hit is this worker's copy. `DashMap::len` walks every shard, so it
+        // stays off the hit path. Code is content-addressed: a hash this worker
+        // already holds does not change when another hash is published.
         if let Some(code) = self.code_cache.get(&code_hash) {
             return Ok(Some(code.clone()));
         }
@@ -630,26 +626,27 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
         }
         super::buckets::hit(super::buckets::READ_COLD);
         self.note_storage_origin(location_hash)?;
-        if super::share::cache_on() {
-            if let Some(hit) = self.mv.base.lookup_code_hash(&address) {
-                return Ok(hit);
-            }
-            let _b = super::buckets::Guard::start(super::buckets::READ_BASE);
-            let hash = self
-                .storage
-                .code_hash(&address)
-                .map_err(|err| ReadError::StorageError(err.to_string()))?;
-            self.mv.base.insert_code_hash(address, hash);
-            return Ok(hash);
-        }
         if let Some(hit) = self.code_hash_cache.get(&address) {
             return Ok(*hit);
         }
-        let _b = super::buckets::Guard::start(super::buckets::READ_BASE);
-        let hash = self
-            .storage
-            .code_hash(&address)
-            .map_err(|err| ReadError::StorageError(err.to_string()))?;
+        let hash = if super::share::cache_on() {
+            if let Some(hit) = self.mv.base.lookup_code_hash(&address) {
+                hit
+            } else {
+                let _b = super::buckets::Guard::start(super::buckets::READ_BASE);
+                let hash = self
+                    .storage
+                    .code_hash(&address)
+                    .map_err(|err| ReadError::StorageError(err.to_string()))?;
+                self.mv.base.insert_code_hash(address, hash);
+                hash
+            }
+        } else {
+            let _b = super::buckets::Guard::start(super::buckets::READ_BASE);
+            self.storage
+                .code_hash(&address)
+                .map_err(|err| ReadError::StorageError(err.to_string()))?
+        };
         self.code_hash_cache.insert(address, hash);
         Ok(hash)
     }
@@ -661,26 +658,27 @@ impl<'a, S: crate::Storage> VmDb<'a, S> {
         location_hash: MemoryLocationHash,
     ) -> Result<U256, ReadError> {
         self.note_storage_origin(location_hash)?;
-        if super::share::cache_on() {
-            if let Some(value) = self.mv.base.lookup_slot(&address, &index) {
-                return Ok(value);
-            }
-            let _b = super::buckets::Guard::start(super::buckets::READ_BASE);
-            let value = self
-                .storage
-                .storage(&address, &index)
-                .map_err(|err| ReadError::StorageError(err.to_string()))?;
-            self.mv.base.insert_slot(address, index, value);
-            return Ok(value);
-        }
         if let Some(value) = self.slot_cache.get(&(address, index)) {
             return Ok(*value);
         }
-        let _b = super::buckets::Guard::start(super::buckets::READ_BASE);
-        let value = self
-            .storage
-            .storage(&address, &index)
-            .map_err(|err| ReadError::StorageError(err.to_string()))?;
+        let value = if super::share::cache_on() {
+            if let Some(value) = self.mv.base.lookup_slot(&address, &index) {
+                value
+            } else {
+                let _b = super::buckets::Guard::start(super::buckets::READ_BASE);
+                let value = self
+                    .storage
+                    .storage(&address, &index)
+                    .map_err(|err| ReadError::StorageError(err.to_string()))?;
+                self.mv.base.insert_slot(address, index, value);
+                value
+            }
+        } else {
+            let _b = super::buckets::Guard::start(super::buckets::READ_BASE);
+            self.storage
+                .storage(&address, &index)
+                .map_err(|err| ReadError::StorageError(err.to_string()))?
+        };
         self.slot_cache.insert((address, index), value);
         Ok(value)
     }
@@ -820,6 +818,7 @@ impl<S: crate::Storage> Database for VmDb<'_, S> {
     type Error = ReadError;
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        let _db = super::buckets::DbGuard::start();
         let location_hash = self.hash_basic(&address);
         let serial = self.serial;
         if self.is_lazy {
@@ -1070,6 +1069,7 @@ impl<S: crate::Storage> Database for VmDb<'_, S> {
     }
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        let _db = super::buckets::DbGuard::start();
         match self.cached_code(Some(code_hash))? {
             Some(code) => Ok(code),
             None => Ok(Bytecode::default()),
@@ -1077,6 +1077,7 @@ impl<S: crate::Storage> Database for VmDb<'_, S> {
     }
 
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        let _db = super::buckets::DbGuard::start();
         let location_hash = hash_deterministic(MemoryLocation::Storage(address, index));
         if !self.track {
             return self.storage_untracked(address, index, location_hash);
@@ -1214,7 +1215,6 @@ impl<'a, S: crate::Storage, C: PevmChain> SfVm<'a, S, C> {
             code_hash_cache: HashMap::with_hasher(rustc_hash::FxBuildHasher),
             code_cache: HashMap::with_hasher(rustc_hash::FxBuildHasher),
             slot_cache: HashMap::with_hasher(rustc_hash::FxBuildHasher),
-            code_seen: 0,
         };
         Self {
             chain,

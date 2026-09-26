@@ -195,7 +195,6 @@ where
     let results = Results::new(n);
     let abort: OnceLock<AbortKind> = OnceLock::new();
     let commit_mu = Mutex::new(());
-    super::timeline::post_span(super::timeline::SETUP, t_setup);
     let started = Instant::now();
     let deadline = Duration::from_secs(120);
     let tl = super::timeline::vm_enabled();
@@ -208,6 +207,9 @@ where
     let commit_mu = &commit_mu;
     let drive = |worker: usize| {
         super::timeline::bind(worker);
+        // One span for the closure. Per-iteration spans missed VM setup and
+        // left the worker timeline short of the parallel phase.
+        let _life = super::timeline::WorkSpan::begin();
         let mut vm = SfVm::new(
             chain,
             spec_id,
@@ -229,7 +231,13 @@ where
         let mut idle_ticket = 0usize;
         while rt.committed() < n && !rt.aborted() {
             let popped = if let Some(pair) = immediate.take() {
-                Some(pair)
+                match rt.claim_commit_frontier(worker) {
+                    Some(front) if front.0 != pair.0 => {
+                        rt.return_sticky(worker, pair.0);
+                        Some(front)
+                    }
+                    _ => Some(pair),
+                }
             } else {
                 rt.set_idle(worker, true);
                 let inactive = rt.wait_inactive(worker);
@@ -528,6 +536,7 @@ where
         }
     };
     if serial {
+        super::timeline::post_span(super::timeline::SETUP, t_setup);
         super::timeline::bind(0);
         let mut vm = SfVm::new(
             chain,
@@ -584,9 +593,11 @@ where
     } else if workers == 1 {
         // Forced parallel path on the calling thread. The pool is for C>1.
         hold_chains(rt, live, n);
+        super::timeline::post_span(super::timeline::SETUP, t_setup);
         drive(0);
     } else {
         hold_chains(rt, live, n);
+        super::timeline::post_span(super::timeline::SETUP, t_setup);
         super::pool::dispatch(workers, &drive);
     }
 

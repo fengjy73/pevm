@@ -37,6 +37,8 @@ pub(crate) const OTHER: u8 = 7;
 pub(crate) const RESCAN: u8 = 8;
 pub(crate) const LAZY: u8 = 9;
 pub(crate) const SETUP: u8 = 10;
+/// One drive-loop iteration. Covers the worker time outside interpreter spans.
+pub(crate) const WORK: u8 = 11;
 
 pub(crate) const CYC_COORD: usize = 0;
 pub(crate) const CYC_SCHED: usize = 1;
@@ -483,6 +485,11 @@ pub(crate) fn open_park(tx: TxIdx, pred: TxIdx, loc: u64, class: u16, reason: u8
         return;
     }
     let slot = &inner.open[tx];
+    // A second opener keeps the first reason and start. `park` records every
+    // wait; the caller that opened first already stored the precise class.
+    if slot.t0.load(Ordering::Acquire) != 0 {
+        return;
+    }
     slot.pred.store(pred as u32, Ordering::Relaxed);
     slot.loc.store(loc, Ordering::Relaxed);
     slot.class.store(u32::from(class), Ordering::Relaxed);
@@ -594,6 +601,32 @@ pub(crate) fn idle_span(t0: u64, waited: bool, ready: usize) {
         t0,
         now_ns(inner.base),
     );
+}
+
+/// Drive-loop coverage. Drop records a `POST`/`WORK` span on this worker.
+pub(crate) struct WorkSpan {
+    t0: u64,
+}
+
+impl WorkSpan {
+    #[inline]
+    pub(crate) fn begin() -> Self {
+        Self {
+            t0: if on() { stamp() } else { 0 },
+        }
+    }
+}
+
+impl Drop for WorkSpan {
+    fn drop(&mut self) {
+        if self.t0 == 0 {
+            return;
+        }
+        let Some(inner) = inner() else {
+            return;
+        };
+        push(POST, WORK, 0, 0, 0, 0, self.t0, now_ns(inner.base));
+    }
 }
 
 pub(crate) fn post_span(reason: u8, t0: u64) {
