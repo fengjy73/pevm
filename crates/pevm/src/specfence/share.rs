@@ -62,6 +62,7 @@ impl CodeShare {
     }
 
     pub(crate) fn get(&self, hash: &B256) -> Option<Bytecode> {
+        let _wait = super::buckets::WaitGuard::start(super::buckets::WAIT_LOCK);
         self.map.get(hash).map(|code| code.clone())
     }
 
@@ -87,6 +88,7 @@ impl BaseShare {
     }
 
     pub(crate) fn lookup_basic(&self, address: &Address) -> Option<Option<AccountBasic>> {
+        let _wait = super::buckets::WaitGuard::start(super::buckets::WAIT_LOCK);
         let guard = self.basic[shard_addr(address)].map.read().unwrap();
         guard.get(address).cloned()
     }
@@ -97,6 +99,7 @@ impl BaseShare {
     }
 
     pub(crate) fn lookup_code_hash(&self, address: &Address) -> Option<Option<B256>> {
+        let _wait = super::buckets::WaitGuard::start(super::buckets::WAIT_LOCK);
         let guard = self.code_hash[shard_addr(address)].map.read().unwrap();
         guard.get(address).copied()
     }
@@ -107,6 +110,7 @@ impl BaseShare {
     }
 
     pub(crate) fn lookup_slot(&self, address: &Address, index: &U256) -> Option<U256> {
+        let _wait = super::buckets::WaitGuard::start(super::buckets::WAIT_LOCK);
         let key = (*address, *index);
         let shard = (address.0[0] as usize ^ address.0[19] as usize) % SHARDS;
         let guard = self.slots[shard].map.read().unwrap();

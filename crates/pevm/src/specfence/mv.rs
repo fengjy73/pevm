@@ -163,6 +163,16 @@ pub(crate) struct SfMv {
 }
 
 impl SfMv {
+    /// Location chain under the shard lock. The hold is a wait, not interpreter time.
+    pub(crate) fn read_location(
+        &self,
+        location: &MemoryLocationHash,
+    ) -> Option<dashmap::mapref::one::Ref<'_, MemoryLocationHash, BTreeMap<TxIdx, MemoryEntry>>>
+    {
+        let _wait = super::buckets::WaitGuard::start(super::buckets::WAIT_LOCK);
+        self.data.get(location)
+    }
+
     pub(crate) fn new(
         block_size: usize,
         estimated_locations: impl IntoIterator<Item = (MemoryLocationHash, Vec<TxIdx>)>,

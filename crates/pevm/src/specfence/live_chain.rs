@@ -1197,6 +1197,7 @@ impl LiveChain {
         if self.serial || !self.any.load(Ordering::Relaxed) || tx == 0 {
             return None;
         }
+        let _wait = super::buckets::WaitGuard::start(super::buckets::WAIT_ADMIT);
         let mem = self.membership[tx].lock().unwrap();
         let mut best: Option<TxIdx> = None;
         for entry in mem.iter().filter(|entry| entry.admit) {

@@ -231,7 +231,10 @@ where
             let popped = if let Some(pair) = immediate.take() {
                 Some(pair)
             } else {
-                if rt.wait_inactive(worker) {
+                rt.set_idle(worker, true);
+                let inactive = rt.wait_inactive(worker);
+                rt.set_idle(worker, false);
+                if inactive {
                     break;
                 }
                 spins = spins.wrapping_add(1);
@@ -250,7 +253,8 @@ where
                 let found = {
                     let _c = super::timeline::CycGuard::enter(tl, super::timeline::CYC_SCHED);
                     let _b = super::buckets::Guard::start(super::buckets::SCHED);
-                    rt.take_sticky(worker).or_else(|| rt.pop(worker))
+                    rt.claim_commit_frontier(worker)
+                        .or_else(|| rt.take_sticky(worker).or_else(|| rt.pop(worker)))
                 };
                 found
             };
@@ -259,13 +263,19 @@ where
                 live.note_idle(false);
                 if tl {
                     if idle_since != 0 {
-                        super::timeline::idle_span(idle_since, idle_waited);
+                        super::timeline::idle_span(idle_since, idle_waited, rt.ready_now());
                         idle_since = 0;
                         idle_waited = false;
                     }
                     super::timeline::close_park(tx);
                 }
                 if !serial {
+                    // Close the previous chain before claiming the next root.
+                    // Doing it after `depend` left that root Executing, and not
+                    // inside the interpreter, for the whole validation walk.
+                    for done_tx in pending_close.drain(..) {
+                        close_from(worker, done_tx, n, rt, mv, live, trace, commit_mu, tl);
+                    }
                     if let Some(anchor) = live.lazy_anchor(tx) {
                         let anchor_done = rt.is_executed(anchor) || rt.is_committed(anchor);
                         let loc = live.to_hash_of(tx);
@@ -284,20 +294,18 @@ where
                             ) {
                                 immediate = Some((root, inc));
                             }
-                            for done_tx in pending_close.drain(..) {
-                                close_from(worker, done_tx, n, rt, mv, live, trace, commit_mu, tl);
-                            }
                             continue;
                         }
                     }
                     if let Some(pred) = live.admission_predecessor(tx)
-                        && !rt.is_executing(pred)
+                        && !rt.in_interpreter(pred)
                         && !rt.is_committed(pred)
                         && !rt.is_executed(pred)
                     {
-                        // Not admitted: the predecessor has not started.
-                        // Tier A still starts the tx once the predecessor is executing;
-                        // that case falls through because `is_executing` is true.
+                        // Not admitted: the predecessor is not inside the interpreter.
+                        // A popped-but-not-started predecessor used to look executing,
+                        // so the reader ran anyway and the predecessor sat unclaimed.
+                        // Tier A still starts once `handler.run` has begun.
                         live.set_delay(tx, super::live_chain::DELAY_ADMIT);
                         if let Depend::Run(root, inc) = depend(
                             rt,
@@ -311,9 +319,6 @@ where
                             super::timeline::ADMIT,
                         ) {
                             immediate = Some((root, inc));
-                        }
-                        for done_tx in pending_close.drain(..) {
-                            close_from(worker, done_tx, n, rt, mv, live, trace, commit_mu, tl);
                         }
                         continue;
                     }
@@ -338,11 +343,15 @@ where
                         ) {
                             immediate = Some((root, inc));
                         }
-                        for done_tx in pending_close.drain(..) {
-                            close_from(worker, done_tx, n, rt, mv, live, trace, commit_mu, tl);
-                        }
                         continue;
                     }
+                }
+                if !rt.try_enter_interp(worker, tx) {
+                    // A blocked reader stole this unstarted task and will run it.
+                    for done_tx in pending_close.drain(..) {
+                        close_from(worker, done_tx, n, rt, mv, live, trace, commit_mu, tl);
+                    }
+                    continue;
                 }
                 rt.executing_add(1);
                 let t0 = started.elapsed().as_nanos() as u64;
@@ -507,13 +516,15 @@ where
                     break;
                 }
                 if !rt.rescue(worker) {
+                    rt.set_idle(worker, true);
                     rt.wait_work(ticket);
+                    rt.set_idle(worker, false);
                     idle_waited = true;
                 }
             }
         }
         if tl && idle_since != 0 {
-            super::timeline::idle_span(idle_since, idle_waited);
+            super::timeline::idle_span(idle_since, idle_waited, rt.ready_now());
         }
     };
     if serial {
