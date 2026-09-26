@@ -507,6 +507,16 @@ pub struct SfTrace {
     pub hot_exec_ns: u64,
     /// First RMW start to last RMW end on that location.
     pub hot_span_ns: u64,
+    /// Active-set size at each control decision, in order.
+    pub active_samples: Vec<u16>,
+    /// Location of the longest RMW gap, which may not be the hottest chain.
+    pub gap_location: u64,
+    /// Transaction that started after that gap.
+    pub gap_tx: u32,
+    /// Worker that finished the previous hop.
+    pub gap_prev_worker: u32,
+    /// Why `gap_tx` waited. `0` means it was runnable and had not been scheduled.
+    pub gap_reason: u8,
     /// Up to eight folded mismatches, with the reader, location, and reason.
     pub delta_notes: Vec<DeltaNote>,
     /// Profile attempts. Empty unless `SPECFENCE_INFLATION` is set.
@@ -562,6 +572,11 @@ impl Trace {
             hot_gap_max_ns: self.hot_gap.load(Ordering::Relaxed),
             hot_exec_ns: self.hot_exec.load(Ordering::Relaxed),
             hot_span_ns: self.hot_span.load(Ordering::Relaxed),
+            active_samples: Vec::new(),
+            gap_location: 0,
+            gap_tx: 0,
+            gap_prev_worker: 0,
+            gap_reason: 0,
             delta_notes: self.delta_notes.lock().unwrap().clone(),
             attempts,
         }

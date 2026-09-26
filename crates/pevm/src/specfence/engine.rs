@@ -85,6 +85,11 @@ enum AbortKind {
     Fatal(ExecutionError),
 }
 
+fn force_parallel() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SPECFENCE_FORCE_PARALLEL").ok().as_deref() == Some("1"))
+}
+
 /// Execute one block with `SpecFence`.
 ///
 /// Upstream [`crate::Pevm::execute_revm_parallel`] is not used and is not modified.
@@ -107,7 +112,10 @@ where
 
     let n = txs.len();
     let workers = usize::from(options.concurrency).max(1).min(n.max(1));
-    let serial = workers == 1;
+    // `SPECFENCE_FORCE_PARALLEL` keeps the tracked read path on one worker so
+    // a profile can separate hook cost from cross-core misses. The fast path
+    // stays the default for `workers == 1`.
+    let serial = workers == 1 && !force_parallel();
     let timeline = super::timeline::Timeline::start(n, workers);
     super::timeline::bind(0);
     let t_setup = super::timeline::stamp();
@@ -145,11 +153,12 @@ where
     };
     live.skip_location(beneficiary);
     if !serial {
-        let (groups, class_of, to_of, values, plain) = {
+        let (groups, class_of, to_of, from_of, values, plain) = {
             let _b = super::buckets::Guard::start(super::buckets::CLASS);
             build_classes(chain, storage, &txs, options.class_key)
         };
         live.install_classes(groups, class_of, to_of);
+        live.install_senders(from_of);
         live.install_credits(values, plain);
         let _b = super::buckets::Guard::start(super::buckets::PRESEED);
         live.preseed_recipients();
@@ -200,6 +209,7 @@ where
             rt,
             trace,
             prev_sender_slice,
+            serial,
         );
         let mut spins = 0u32;
         let mut idle_since = 0u64;
@@ -208,7 +218,6 @@ where
         let mut pending_close: Vec<TxIdx> = Vec::new();
         let mut idle_ticket = 0usize;
         while rt.committed() < n && !rt.aborted() {
-            let handed = immediate.is_some();
             let popped = if let Some(pair) = immediate.take() {
                 Some(pair)
             } else {
@@ -251,6 +260,8 @@ where
                         let anchor_done = rt.is_executed(anchor) || rt.is_committed(anchor);
                         let loc = live.to_hash_of(tx);
                         if !anchor_done && !mv.data.contains_key(&loc) {
+                            live.set_delay(tx, super::live_chain::DELAY_ANCHOR);
+                            rt.boost(worker, anchor);
                             if tl {
                                 super::timeline::open_park(
                                     tx,
@@ -275,6 +286,8 @@ where
                         // Not admitted: the predecessor has not started.
                         // Tier A still starts the tx once the predecessor is executing;
                         // that case falls through because `is_executing` is true.
+                        live.set_delay(tx, super::live_chain::DELAY_ADMIT);
+                        rt.boost(worker, pred);
                         if tl {
                             super::timeline::open_park(
                                 tx,
@@ -297,6 +310,8 @@ where
                         // The class head publishes read-then-write locations
                         // before classmates read them. Incarnation stays: this
                         // attempt has not entered the interpreter.
+                        live.set_delay(tx, super::live_chain::DELAY_CLASS);
+                        rt.boost(worker, head);
                         if tl {
                             super::timeline::open_park(
                                 tx,
@@ -318,7 +333,9 @@ where
                 let hop = if serial {
                     None
                 } else {
-                    live.observe_rmw_start(tx, worker, t0)
+                    let hop = live.observe_rmw_start(tx, worker, t0);
+                    live.clear_delay(tx);
+                    hop
                 };
                 let incarnation = inc;
                 let mut guard = 0;
@@ -356,8 +373,13 @@ where
                                 && seal_fast(worker, tx, n, rt, mv, live, trace, commit_mu)
                             {
                                 if let Some(next) = rt.take_sticky(worker) {
+                                    // The chain stays on this worker. Anything
+                                    // else on its deque is free for the other
+                                    // workers; otherwise it waits out the chain.
+                                    rt.spill_owned(worker);
                                     pending_close.push(tx);
                                     immediate = Some(next);
+                                    rt.maybe_grow();
                                 } else {
                                     pending_close.push(tx);
                                     for done_tx in pending_close.drain(..) {
@@ -365,9 +387,7 @@ where
                                             worker, done_tx, n, rt, mv, live, trace, commit_mu, tl,
                                         );
                                     }
-                                    if !handed {
-                                        rt.maybe_grow();
-                                    }
+                                    rt.maybe_grow();
                                 }
                             } else {
                                 rt.unstick(worker);
@@ -389,6 +409,18 @@ where
                             // incarnation is final, which is not its commit.
                             let (reason, loc) = super::timeline::block_wait();
                             let until_final = reason != super::timeline::UNARMED;
+                            let delay = if reason == super::timeline::NONCE {
+                                super::live_chain::DELAY_NONCE
+                            } else {
+                                super::live_chain::DELAY_BLOCK
+                            };
+                            live.set_delay(tx, delay);
+                            // The predecessor is why this transaction cannot
+                            // run. Put it on this worker's deque so the wait
+                            // is one execution, not the rest of that worker's
+                            // stride. A copy already queued elsewhere is skipped
+                            // when it is popped, because only Ready starts.
+                            rt.boost(worker, pred);
                             let owner = live.chain_owner(loc).filter(|owner| *owner != worker);
                             if let Some(owner) = owner
                                 && rt.handoff_sticky(owner, tx)
@@ -461,6 +493,7 @@ where
             rt,
             trace,
             prev_sender_slice,
+            true,
         );
         for tx in 0..n {
             if started.elapsed() > deadline {
@@ -501,6 +534,10 @@ where
                 break;
             }
         }
+    } else if workers == 1 {
+        // Forced parallel path on the calling thread. The pool is for C>1.
+        hold_chains(rt, live, n);
+        drive(0);
     } else {
         hold_chains(rt, live, n);
         super::pool::dispatch(workers, &drive);
@@ -575,12 +612,19 @@ where
         prev_sender_slice,
         trace,
     );
-    let snap = trace.snapshot(
+    let mut snap = trace.snapshot(
         live.max_chain_len(),
         live.armed_locations(),
         options.class_key.as_str(),
         beneficiary,
     );
+    snap.active_samples = rt.active_samples();
+    if let Some((loc, tx, prev, reason, _)) = live.longest_gap() {
+        snap.gap_location = loc;
+        snap.gap_tx = tx as u32;
+        snap.gap_prev_worker = prev as u32;
+        snap.gap_reason = reason;
+    }
     *LAST_TRACE.lock().unwrap() = Some(snap);
     Ok(fully)
 }
@@ -914,6 +958,26 @@ fn abort_one(
         let state = live_tx
             .map(|writer| live.writer_state(loc, writer).0 as u8)
             .unwrap_or(0);
+        let kind = live_tx
+            .and_then(|writer| {
+                mv.data.get(&loc).and_then(|written| {
+                    written.get(&writer).map(|entry| match entry {
+                        MemoryEntry::Estimate => "estimate",
+                        MemoryEntry::Data(_, MemoryValue::Basic(_)) => "basic",
+                        MemoryEntry::Data(_, MemoryValue::Storage(_)) => "storage",
+                        MemoryEntry::Data(_, MemoryValue::LazySender(_)) => "lazy_sender",
+                        MemoryEntry::Data(_, MemoryValue::LazyRecipient(_)) => "lazy_recip",
+                        MemoryEntry::Data(_, MemoryValue::CodeHash(_)) => "code",
+                        MemoryEntry::Data(_, MemoryValue::SelfDestructed) => "destruct",
+                    })
+                })
+            })
+            .unwrap_or("missing");
+        let writer_to = live_tx.is_some_and(|writer| live.to_hash_of(writer) == loc);
+        eprintln!(
+            "ABORT_KIND reader={tx} kind={kind} writer_to={writer_to} class={}",
+            live.class_id(tx)
+        );
         trace.note_abort(AbortNote {
             reader: tx as u32,
             location: loc,
@@ -968,10 +1032,18 @@ fn build_classes<S: Storage, C: PevmChain>(
     storage: &S,
     txs: &[C::EvmTx],
     kind: ClassKeyKind,
-) -> (Vec<ClassGroup>, Vec<u16>, Vec<u64>, Vec<U256>, Vec<bool>) {
+) -> (
+    Vec<ClassGroup>,
+    Vec<u16>,
+    Vec<u64>,
+    Vec<u64>,
+    Vec<U256>,
+    Vec<bool>,
+) {
     let mut groups: HashMap<u64, (bool, Vec<TxIdx>), FxBuildHasher> =
         HashMap::with_hasher(FxBuildHasher);
     let mut to_of = Vec::with_capacity(txs.len());
+    let mut from_of = Vec::with_capacity(txs.len());
     let mut values = Vec::with_capacity(txs.len());
     let mut plain = Vec::with_capacity(txs.len());
     for (i, tx) in txs.iter().enumerate() {
@@ -989,6 +1061,7 @@ fn build_classes<S: Storage, C: PevmChain>(
             .map(|addr| hash_deterministic(MemoryLocation::Basic(addr)))
             .unwrap_or(0);
         to_of.push(to_hash);
+        from_of.push(hash_deterministic(MemoryLocation::Basic(env.caller)));
         values.push(env.value);
         let code_empty = match to {
             Some(addr) => match storage.code_hash(&addr) {
@@ -1028,7 +1101,7 @@ fn build_classes<S: Storage, C: PevmChain>(
         }
         out.push(ClassGroup { members, contract });
     }
-    (out, class_of, to_of, values, plain)
+    (out, class_of, to_of, from_of, values, plain)
 }
 
 fn evaluate_lazy<S: Storage, C: PevmChain>(

@@ -152,6 +152,10 @@ pub(crate) struct SfMv {
     track_reads: AtomicBool,
     /// Insert readers into the location index. Serial never validates concurrently.
     index_reads: AtomicBool,
+    /// Locations inserted into [`Self::data`]. A miss skips the map.
+    present: super::bloom::LocBloom,
+    /// Locations a transaction has read. Writers publish these.
+    readers: super::bloom::LocBloom,
 }
 
 impl SfMv {
@@ -161,7 +165,9 @@ impl SfMv {
         lazy_addresses: impl IntoIterator<Item = Address>,
     ) -> Self {
         let data = DashMap::default();
+        let present = super::bloom::LocBloom::new(1 << 16);
         for (location_hash, estimated_tx_idxs) in estimated_locations {
+            present.insert(location_hash);
             data.insert(
                 location_hash,
                 estimated_tx_idxs
@@ -179,7 +185,22 @@ impl SfMv {
             new_bytecodes: DashMap::default(),
             track_reads: AtomicBool::new(true),
             index_reads: AtomicBool::new(true),
+            present,
+            readers: super::bloom::LocBloom::new(1 << 16),
         }
+    }
+
+    /// A miss means no write of this location has been published into the map.
+    pub(crate) fn might_hold(&self, location: MemoryLocationHash) -> bool {
+        self.present.may_contain(location)
+    }
+
+    pub(crate) fn note_reader(&self, location: MemoryLocationHash) {
+        self.readers.insert(location);
+    }
+
+    pub(crate) fn reader_seen(&self, location: MemoryLocationHash) -> bool {
+        self.readers.may_contain(location)
     }
 
     pub(crate) fn set_track_reads(&self, on: bool) {
@@ -236,6 +257,7 @@ impl SfMv {
 
         let mut wrote_new_location = false;
         for (location, value) in write_set {
+            self.present.insert(location);
             self.data.entry(location).or_default().insert(
                 tx_version.tx_idx,
                 MemoryEntry::Data(tx_version.tx_incarnation, value),

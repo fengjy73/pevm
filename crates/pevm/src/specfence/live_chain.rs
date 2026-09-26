@@ -7,7 +7,8 @@
 //! Chain budget and the wait threshold move inside safety bounds from the
 //! block's abort rate, idle rate, and per-class hit rate.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, RwLock};
 
 use alloy_primitives::U256;
@@ -25,6 +26,21 @@ const P_CEIL: f64 = 0.95;
 const CLASS_HIT_FLOOR: f64 = 0.15;
 const C_ABORT_MIN: u64 = 5_000;
 const C_ABORT_MAX: u64 = 2_000_000;
+
+/// The transaction was runnable. The gap is scheduling, not a chain park.
+pub(crate) const DELAY_NONE: u8 = 0;
+/// Parked on a blocking predecessor inside the interpreter.
+pub(crate) const DELAY_BLOCK: u8 = 1;
+/// Waiting for the class head.
+pub(crate) const DELAY_CLASS: u8 = 2;
+/// Not admitted until a predecessor starts.
+pub(crate) const DELAY_ADMIT: u8 = 3;
+/// Nonce or balance depends on the previous same-sender transaction.
+pub(crate) const DELAY_NONCE: u8 = 4;
+/// Plain credit waiting for the anchor write.
+pub(crate) const DELAY_ANCHOR: u8 = 5;
+
+static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 const ST_EMPTY: u64 = 0;
 const ST_PREDICTED: u64 = 1;
@@ -297,6 +313,8 @@ pub(crate) struct LiveChain {
     class_of_tx: Vec<u16>,
     /// `Basic(to)` hash per transaction. `0` is a create or an unknown target.
     to_of: Vec<u64>,
+    /// `Basic(caller)` hash per transaction. Empty on the fast path.
+    from_of: Vec<u64>,
     classes: Vec<ClassGroup>,
     class_hit: Vec<AtomicU64>,
     class_miss: Vec<AtomicU64>,
@@ -329,6 +347,34 @@ pub(crate) struct LiveChain {
     /// Lowest plain writer that must publish before this tx can run lazily.
     /// `usize::MAX` means there is no gate.
     anchor: Vec<AtomicUsize>,
+    /// Locations that own a chain slot. A miss skips the directory lock.
+    present: super::bloom::LocBloom,
+    /// Largest contract class. `u16::MAX` when the block has none.
+    hot_class: u16,
+    /// Why a transaction last waited before it entered the interpreter.
+    delay_reason: Vec<AtomicU8>,
+    /// Longest RMW gap in the block, and the location it belongs to.
+    gap_ns: AtomicU64,
+    gap_loc: AtomicU64,
+    gap_tx: AtomicUsize,
+    gap_prev: AtomicUsize,
+    gap_reason: AtomicU8,
+    /// Identifies this block's directory for the worker-local slot cache.
+    epoch: u64,
+}
+
+struct SlotCache {
+    epoch: u64,
+    used: usize,
+    map: HashMap<u64, u32, FxBuildHasher>,
+}
+
+thread_local! {
+    static SLOT_CACHE: RefCell<SlotCache> = RefCell::new(SlotCache {
+        epoch: 0,
+        used: usize::MAX,
+        map: HashMap::with_hasher(FxBuildHasher),
+    });
 }
 
 impl LiveChain {
@@ -348,6 +394,7 @@ impl LiveChain {
             any: AtomicBool::new(false),
             class_of_tx: vec![u16::MAX; n],
             to_of: vec![0; n],
+            from_of: Vec::new(),
             classes: Vec::new(),
             class_hit: Vec::new(),
             class_miss: Vec::new(),
@@ -367,6 +414,15 @@ impl LiveChain {
             plain: Vec::new(),
             credits: Vec::new(),
             anchor: (0..n).map(|_| AtomicUsize::new(usize::MAX)).collect(),
+            present: super::bloom::LocBloom::new(1 << 16),
+            hot_class: u16::MAX,
+            delay_reason: (0..n).map(|_| AtomicU8::new(DELAY_NONE)).collect(),
+            gap_ns: AtomicU64::new(0),
+            gap_loc: AtomicU64::new(0),
+            gap_tx: AtomicUsize::new(0),
+            gap_prev: AtomicUsize::new(0),
+            gap_reason: AtomicU8::new(DELAY_NONE),
+            epoch: NEXT_EPOCH.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -383,6 +439,7 @@ impl LiveChain {
             any: AtomicBool::new(false),
             class_of_tx: Vec::new(),
             to_of: Vec::new(),
+            from_of: Vec::new(),
             classes: Vec::new(),
             class_hit: Vec::new(),
             class_miss: Vec::new(),
@@ -402,6 +459,15 @@ impl LiveChain {
             plain: Vec::new(),
             credits: Vec::new(),
             anchor: Vec::new(),
+            present: super::bloom::LocBloom::new(64),
+            hot_class: u16::MAX,
+            delay_reason: Vec::new(),
+            gap_ns: AtomicU64::new(0),
+            gap_loc: AtomicU64::new(0),
+            gap_tx: AtomicUsize::new(0),
+            gap_prev: AtomicUsize::new(0),
+            gap_reason: AtomicU8::new(DELAY_NONE),
+            epoch: 0,
         }
     }
 
@@ -458,27 +524,85 @@ impl LiveChain {
         self.class_miss = (0..n).map(|_| AtomicU64::new(1)).collect();
         self.class_open = (0..n).map(|_| AtomicBool::new(true)).collect();
         self.class_barrier = (0..n).map(|_| AtomicBool::new(false)).collect();
+        self.hot_class = classes
+            .iter()
+            .enumerate()
+            .filter(|(_, group)| group.contract)
+            .max_by_key(|(_, group)| group.members.len())
+            .map(|(idx, _)| idx as u16)
+            .unwrap_or(u16::MAX);
         self.classes = classes;
         self.class_of_tx = class_of_tx;
         self.to_of = to_of;
     }
 
-    /// Before any worker runs, every repeated `Basic(to)` is an armed chain.
+    /// Caller accounts. Unioned with recipients in [`Self::preseed_recipients`].
+    pub(crate) fn install_senders(&mut self, from_of: Vec<u64>) {
+        self.from_of = from_of;
+    }
+
+    /// The transaction belongs to the largest contract class in the block.
+    pub(crate) fn is_hot_contract(&self, tx: TxIdx) -> bool {
+        self.hot_class != u16::MAX && self.class_of_tx.get(tx).copied() == Some(self.hot_class)
+    }
+
+    /// A miss means the directory cannot contain this location.
+    pub(crate) fn might_hold(&self, location: u64) -> bool {
+        !self.serial && self.present.may_contain(location)
+    }
+
+    pub(crate) fn set_delay(&self, tx: TxIdx, reason: u8) {
+        if let Some(slot) = self.delay_reason.get(tx) {
+            slot.store(reason, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn clear_delay(&self, tx: TxIdx) {
+        self.set_delay(tx, DELAY_NONE);
+    }
+
+    /// `(location, tx, previous worker, reason, gap_ns)` for the longest hop.
+    pub(crate) fn longest_gap(&self) -> Option<(u64, usize, usize, u8, u64)> {
+        let gap = self.gap_ns.load(Ordering::Relaxed);
+        if gap == 0 {
+            return None;
+        }
+        Some((
+            self.gap_loc.load(Ordering::Relaxed),
+            self.gap_tx.load(Ordering::Relaxed),
+            self.gap_prev.load(Ordering::Relaxed),
+            self.gap_reason.load(Ordering::Relaxed),
+            gap,
+        ))
+    }
+
+    /// Before any worker runs, every repeated `Basic(to)` or `Basic(caller)` is
+    /// an armed chain.
     ///
+    /// A later transaction that reads the account waits for the lower member
+    /// instead of taking a base-state origin that validation then revokes.
     /// Members are `Predicted` and are not admission edges. A later
     /// read-then-write can set the admit bit. Blind and lazy publishes do not.
     pub(crate) fn preseed_recipients(&self) {
         let mut groups: HashMap<u64, Vec<TxIdx>, FxBuildHasher> =
             HashMap::with_hasher(FxBuildHasher);
-        for (tx, &location) in self.to_of.iter().enumerate() {
-            if location == 0 {
-                continue;
-            }
-            if self.skip_on.load(Ordering::Relaxed) && self.skip.load(Ordering::Relaxed) == location
-            {
-                continue;
+        let skip = self.skip_on.load(Ordering::Relaxed);
+        let skipped = self.skip.load(Ordering::Relaxed);
+        let push = |groups: &mut HashMap<u64, Vec<TxIdx>, FxBuildHasher>, tx, location: u64| {
+            if location == 0 || (skip && location == skipped) {
+                return;
             }
             groups.entry(location).or_default().push(tx);
+        };
+        for (tx, &location) in self.to_of.iter().enumerate() {
+            push(&mut groups, tx, location);
+        }
+        for (tx, &location) in self.from_of.iter().enumerate() {
+            push(&mut groups, tx, location);
+        }
+        for members in groups.values_mut() {
+            members.sort_unstable();
+            members.dedup();
         }
         let mut groups: Vec<_> = groups
             .into_iter()
@@ -616,6 +740,19 @@ impl LiveChain {
                 chain.hop_same.fetch_add(1, Ordering::Relaxed);
             }
             chain.hop_gap_max.fetch_max(gap, Ordering::Relaxed);
+            let prev_best = self.gap_ns.fetch_max(gap, Ordering::Relaxed);
+            if gap > prev_best {
+                self.gap_loc
+                    .store(chain.loc.load(Ordering::Relaxed), Ordering::Relaxed);
+                self.gap_tx.store(tx, Ordering::Relaxed);
+                self.gap_prev.store(prev_worker, Ordering::Relaxed);
+                let reason = self
+                    .delay_reason
+                    .get(tx)
+                    .map(|slot| slot.load(Ordering::Relaxed))
+                    .unwrap_or(DELAY_NONE);
+                self.gap_reason.store(reason, Ordering::Relaxed);
+            }
             if best.is_none_or(|(_, prev_gap, _)| gap >= prev_gap) {
                 best = Some((same, gap, pipelined));
             }
@@ -763,6 +900,7 @@ impl LiveChain {
                 self.chains[idx].pinned.store(true, Ordering::Relaxed);
             }
             self.used.store(used + 1, Ordering::Relaxed);
+            self.present.insert(location);
             dir.index.insert(location, idx);
             self.any.store(true, Ordering::Release);
             return Some(idx);
@@ -796,6 +934,7 @@ impl LiveChain {
                 self.chains[idx].pinned.store(true, Ordering::Relaxed);
             }
             dir.index.retain(|_, v| *v != idx);
+            self.present.insert(location);
             dir.index.insert(location, idx);
             self.any.store(true, Ordering::Release);
             return Some(idx);
@@ -804,10 +943,32 @@ impl LiveChain {
     }
 
     fn slot_of(&self, location: u64) -> Option<usize> {
-        if !self.any.load(Ordering::Relaxed) {
+        if !self.any.load(Ordering::Relaxed) || self.serial {
             return None;
         }
-        self.dir.read().unwrap().index.get(&location).copied()
+        // A clear bloom means the directory cannot contain the location.
+        // The read lock stays off the cold path.
+        if !self.present.may_contain(location) {
+            return None;
+        }
+        let used = self.used.load(Ordering::Relaxed);
+        let epoch = self.epoch;
+        SLOT_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.epoch != epoch || cache.used != used {
+                cache.map.clear();
+                cache.epoch = epoch;
+                cache.used = used;
+            }
+            if let Some(&idx) = cache.map.get(&location) {
+                return (idx != u32::MAX).then_some(idx as usize);
+            }
+            let found = self.dir.read().unwrap().index.get(&location).copied();
+            cache
+                .map
+                .insert(location, found.map(|idx| idx as u32).unwrap_or(u32::MAX));
+            found
+        })
     }
 
     pub(crate) fn nearest_lower(&self, location: u64, tx: TxIdx) -> Option<TxIdx> {
@@ -1599,6 +1760,22 @@ impl LiveChain {
 mod tests {
     use super::*;
     use alloy_primitives::U256;
+
+    #[test]
+    fn preseed_unions_repeated_senders_with_recipients() {
+        let n = 4;
+        let mut live = LiveChain::new(n, ClassKeyKind::ToSelector);
+        live.install_classes(Vec::new(), vec![u16::MAX; n], vec![10, 0, 0, 7]);
+        live.install_senders(vec![1, 10, 10, 3]);
+        live.preseed_recipients();
+        assert!(live.is_armed(10));
+        assert!(live.might_hold(10));
+        assert_eq!(live.nearest_blocker(10, 2), Some(1));
+        assert_eq!(live.nearest_blocker(10, 1), Some(0));
+        assert!(!live.might_hold(1));
+        assert!(!live.might_hold(3));
+        assert!(!live.might_hold(7));
+    }
 
     #[test]
     fn preseed_arms_recipient_without_admission() {
